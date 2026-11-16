@@ -136,7 +136,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     README, a cell of a table, the line in which a run says what it compared. The three numbers of the set count what a
     complete stack launches; a text that gives them says how many of the entries a stack calls today. Byte equality
     with a target kernel is the entry's own record (the census names where it stands: `tie_out`, `differences`), never
-    a measurement of the sample. A section is `claimed` only on a `recorded` basis and only when no row selected on it
+    a measurement of the sample. A form may hold a field only the port has; the row and the census then name the value
+    the port's byte comparison ran with, the census lists under `differences` what the target kernel does there, and
+    the family README says so beside the row. A section is `claimed` only on a `recorded` basis and only when no row selected on it
     is a fallback; until then a run prints `NOT CLAIMED` with every reason that applies, and a section of one GPU
     class, SM count, row count or set of layer widths is never used for another. `EQUAL` says what was compared: a
     claimed section records the launch shape of every target kernel but a tuner's pick and a stand-in, and a fact the
@@ -388,3 +390,16 @@ Each of these passed every test and every GPU run of the first version; a host t
   starts on that release and waits before it reads the norm's codes, the fused step starts on the in-projection's
   release and waits before it reads the projection's rows. Each row says in a comment what the launch before it must
   not write and what the launch after it must wait for; replay and the block check on the device are what hold it.
+- Run a row at the largest row count it claims. The row claims 1 to 32 rows and its first runs went to 16. From 17
+  rows the kernel check of every stack failed on the embedding row: PyTorch's index-select launches another kernel
+  there, which the row's pattern did not name. A pattern names every kernel its operator launches over the row counts
+  a stack serves, and the run table of a row has its first and its last row count.
+- What a report says of a stack follows the plan. The `bytes per step` line counted every weight as a bf16 copy after
+  a block had begun to read its weight on the stored format; the model is now asked with the blocks of the session's
+  own plan that multiply there, and the line says how many bytes are read in the stored format.
+- A table rendered for one GPU class names that class. The second served-by table of the family README is the plan
+  on compute capability 10.0; its heading said 10.x and the sentence under it kept the count of the other classes. A
+  host test now holds the heading and the by-provider sentence to the plan's own line, per class.
+- An option an adapter declines on is tested through the session that hands it over. The adapter's decline for a
+  weight merged at one scale per row was tested on a block built by hand; without the option in the session's plan
+  the decline would have come after the load, as an error about another plan.

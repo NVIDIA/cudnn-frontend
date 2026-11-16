@@ -1894,9 +1894,19 @@ def test_the_census_file_of_the_target_kernel_set():
         "for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0",
         "for the norm entry it was made on compute capability 10.0",
         "for the projection entry it was made on compute capability 10.0",
+        # two fields of the projection row's form are the port's own: the reader is told what the target kernel has there
+        "Two fields of that form are the entry's own, and their values are not the target kernel's: the tensor-memory columns and their release "
+        "(`TMEM_COLS 32`, `HOLD_TMEM True`) are at the values the entry's byte comparison with the target kernel ran, while the target kernel "
+        "allocates 256 columns and releases them right after the accumulator read. The census lists both under `differences`",
+        "32 tensor-memory columns released late (the entry's own two fields: the target kernel allocates 256 and releases them early)",
     ):
         assert sentence in readme, sentence
+    projection = kernels["fp8_projection"]
+    assert (projection["form"]["TMEM_COLS"], projection["form"]["HOLD_TMEM"]) == (32, True), "the values of the entry's byte comparison"
+    assert sum("where the target kernel allocates 256" in item for item in projection["differences"]) == 1, "and what the target kernel has instead"
+    assert sum("the target kernel releases it right after the accumulator read" in item for item in projection["differences"]) == 1
     about = " ".join(target.data["about"])
+    assert "with an entry comes 'form': what the target passes to it and, for a field only the port has, the value the port's byte comparison ran with" in about
     assert "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file" in about
     assert "They count what a complete stack launches" in about
     # every target kernel of the section but a tuner's pick has its launch shape: the section can be claimed without further data
@@ -1943,6 +1953,29 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert whole in readme and reached in readme, "the two lines of the family README are the lines a run prints"
     assert configs.readme_table(QwenDense().calls_text(), "native") in readme, "regenerate the native table of the README from configs.readme_table()"
     assert configs.readme_table(QwenDense().calls_text(), "fe-entries") == configs.readme_table(QwenDense().calls_text(), "native"), "the same rows today"
+    # the table is rendered for one GPU class: its heading names that class, and the sentence under it is the plan's own
+    # by-provider line there; what the other classes plan instead is said with their plans' counts
+    flat = " ".join(readme.split())
+
+    def said(planned, tail=True):
+        line = planned.by_provider().replace("by provider: ", "By provider: ").replace("cuDNN FE ", "cuDNN Frontend ")
+        entries, natural = line.rsplit(" | PyTorch ", 1)
+        return entries.replace(" | ", "; ") + (f"; PyTorch as the natural provider {natural}." if tail else "")
+
+    table = configs.readme_table(QwenDense().calls_text(), "native", (10, 0))
+    heading = "## Who serves each block (stacks `native` and `fe-entries`, compute capability 10.0)"
+    assert (
+        " ".join(f"{heading} {table} {said(plan)}".split()) in flat
+    ), "the heading, the table and the by-provider sentence are those of compute capability 10.0"
+    assert said(plan) == "By provider: cuDNN Frontend 4; fallbacks 6 (cuBLAS over copies 4, PyTorch chains 2); PyTorch as the natural provider 2."
+    for cc, sms in (((10, 3), 152), ((10, 7), 212)):
+        other = said(_target_plan(64, cc=cc, sms=sms)[0], tail=False).replace("By provider: ", "")
+        assert other == "cuDNN Frontend 3; fallbacks 6 (cuBLAS over copies 4, PyTorch chains 2)", cc
+        assert f"On the other 10.x classes the in-projection is the multiply over a copy of `fe-cublas`: {other}." in flat, cc
+    other = said(_target_plan(64, cc=(12, 0), sms=170)[0], tail=False).replace("By provider: ", "")
+    assert f"the reference chains of `fe-cublas` as well: {other}." in flat and other.startswith("cuDNN Frontend 1; fallbacks 8 "), "compute capability 12.x"
+    default = _target_plan(64, stack="fe-cublas")[0]
+    assert f"34 on the four-layer one. {said(default)}" in flat, "the sentence under the table of the default stack"
     shapes = {"embedding": GATHER_SHAPE, "add_norm_quantize": NORM_SHAPE, "linear_attention.step": SHAPE, "attention.gate_quantize": GATE_SHAPE}
     kinds = model.geometry.layer_kinds
     assert claim.recorded == {
@@ -4747,6 +4780,45 @@ def test_the_projection_row_on_other_classes_and_row_counts():
     assert (
         census.check_forms(sites) == [] and sites[2].facts.form["STAGES"] == 7
     ), "the row and its entry agree: the form is the row's, and it is not the census's"
+
+
+def test_a_session_hands_its_merge_rule_to_the_plan(monkeypatch):
+    """A weight merged at one scale per row is not the FP8 projection entry's operand, and the family README says the plan
+    declines the row by name.  The adapter can only decline what its session tells it: the session's merge rule is an
+    option of its plan, so the decline comes from ``plan_table()``, before anything is loaded -- not as an error of the
+    warm-up step behind the load, in a sentence about another plan."""
+    from model_samples import Session, TextIO, blocks
+    from model_samples.qwen_dense import QwenDense
+
+    model = QwenDense.reduced(2)
+    text = TextIO.synthetic(model.geometry.vocab)
+    stated = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    resolve, options = blocks.plan, []
+
+    def on_stated_facts(table, regimes, device, *rest, **named):  # a session on the CPU states no GPU class: the same call on a cc 10.0 part
+        options.append(dict(named["options"]))
+        return resolve(table, regimes, stated, *rest, **named)
+
+    monkeypatch.setattr(blocks, "plan", on_stated_facts)
+    monkeypatch.setattr(model, "load", lambda *args, **kwargs: pytest.fail("a plan that declines loads nothing"))
+    session = Session(model, text, sequences=1, stack="native", device="cpu", capacity=16, merge_rule="own_scale")
+    with pytest.raises(
+        NotImplementedError,
+        match=r"^cudnn.Fp8ProjectionDecode takes one scale per weight; the merge rule 'own_scale' keeps one per weight row: load with the merge rule "
+        r'"largest_scale", or select another declared row of the block with --provider$',
+    ):
+        session.plan_table()
+    assert options[-1]["merge_rule"] == "own_scale" and session.plan is None and session.weights is None, "declined in the plan, with the session's rule"
+    # the same session with the row selected away plans (a multiply over a copy applies a scale per row), and so does the default rule
+    selected = Session(
+        model, text, sequences=1, stack="native", device="cpu", capacity=16, merge_rule="own_scale", overrides={"projection.fp8.in": "cublas.bf16_dequantized"}
+    )
+    assert selected.resolve().rows["projection.fp8.in"].key == "cublas.bf16_dequantized" and options[-1]["merge_rule"] == "own_scale"
+    default = Session(model, text, sequences=1, stack="native", device="cpu", capacity=16)
+    assert default.resolve().rows["projection.fp8.in"].key == "fe.fp8_projection_decode" and options[-1]["merge_rule"] == "largest_scale"
+    assert Session(model, text, sequences=1, stack="fe-cublas", device="cpu", capacity=16, merge_rule="own_scale").resolve().rows["projection.fp8.in"].key == (
+        "cublas.bf16_dequantized"
+    ), "a stack without the row takes either rule"
 
 
 def test_the_projection_row_through_a_session_and_what_fails_it(monkeypatch):
