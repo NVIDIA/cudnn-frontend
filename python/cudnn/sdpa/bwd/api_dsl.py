@@ -1387,7 +1387,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
-        self._check_native_device((major, minor), device)
+        self._device_cc = (int(major), int(minor))
+        self._check_native_device(self._device_cc, device)
         self._check_native_tiles()
 
         self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v, self._native_flavor_dims)
@@ -1483,7 +1484,6 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
         reason = part_mismatch(capability, "SdpaBwdDslSm80")
         self._value_error_if(reason is not None, f"{reason} on {device}")
-        self._device_cc = tuple(capability)
 
     _native_flavor_dims = _SM80_BWD_FLAVOR_DIMS
 
@@ -1900,9 +1900,9 @@ DQ_SINGLE_LAUNCH: bool = True
 # CALL time (``compile``), not a knob and not an env var: it must never differ per plan.
 THD_STAGE3_TRIM: bool = True
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
-# The Rubin line as ``engines._RUBIN`` spells it (cc 10.7 up to the SM100 line's end): the 2x2 twin's ring levers
-# (8 chunk stages / 2 cast stages / 325 KiB) follow the line, not the one cc that exists today.
-_RUBIN_SM = (107, 119)
+# The Rubin line as ``engines._RUBIN`` spells it: the 2x2 twin's ring levers (8 chunk stages / 2 cast stages / 325 KiB)
+# follow the line.  Thor (cc 11.0) is an SM100-class part and takes the SM100 levers.
+_RUBIN_SM = (107, 109)
 
 
 def _rubin_line(sm: int) -> bool:

@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional, Tuple
 import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+from cudnn.sdpa.native_sm80 import SM80_ROW_PARTS
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import band
 from .kernels.sm90.d64_f16_one_wg import contract as _sm90_d64_owner
@@ -4767,7 +4768,7 @@ def _sm80_spec() -> EngineSpec:
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             # Explicit geometry is admitted by the shared native flavor domains
             # above. Leave the row domains empty to preserve A/FALLBACK choices.
-            delegated_exact=frozenset(((8, 0), shape) for shapes in _SM80_HALF_SHAPES.values() for shape in shapes),
+            delegated_exact=frozenset((cc, shape) for cc in SM80_ROW_PARTS for shapes in _SM80_HALF_SHAPES.values() for shape in shapes),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )

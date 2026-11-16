@@ -134,3 +134,52 @@ def test_dsl_target_requirement_names_the_part(monkeypatch):
     assert buffers.cutedsl_arch_requirement_error((11, 0)) is None
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     assert "SM107 requires a CuTe DSL build supporting sm_107a" in buffers.cutedsl_arch_requirement_error((10, 7))
+
+
+def test_sm80_policy_row_delegates_on_every_admitted_part():
+    policy = _row(fwd_engines.ENGINE_SPECS, "sdpa_fwd_prefill_sm80")
+    for cc in native_sm80.SM80_ROW_PARTS:
+        for d_qk, d_v in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512), (576, 512)):
+            reason = fwd_engines.mismatch(policy, _fwd_facts(device_cc=cc, d_qk=d_qk, d_v=d_v))
+            assert reason is not None and "owned by the explicit implementation" in reason, (cc, d_qk, d_v, reason)
+
+
+def _thd_api(case_kwargs, api_type):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    from d128_thd_test_utils import make_api, make_case
+
+    return make_api(make_case((65, 0, 3), (17, 129, 0), **case_kwargs), api_type=api_type)
+
+
+@pytest.mark.parametrize(
+    "module,name,case_kwargs",
+    [
+        ("cudnn.sdpa.bwd.api_dsl_sm120_thd", "SdpaBwdDslSm120Thd", {}),
+        ("cudnn.sdpa.bwd.api_dsl_sm120_wide", "SdpaBwdDslSm120Wide", dict(heads=6, kv_heads=2, d_qk=512, d_v=512, causal=True, bottom_right=True)),
+    ],
+)
+def test_sm120_backward_check_support_records_the_part(monkeypatch, module, name, case_kwargs):
+    import importlib
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (12, 0))
+    api = _thd_api(case_kwargs, getattr(importlib.import_module(module), name))
+    assert api.check_support() is True
+    assert api._device_cc == (12, 0) and api._smem_levers is None
+
+
+def test_d192_thd_backward_requires_the_dsl_target(monkeypatch):
+    from cudnn.frost import device as frost_device
+    from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
+
+    api = _thd_api(dict(d_qk=192, d_v=128), SdpaBwdDslSm100D192)
+    monkeypatch.setattr(frost_device, "compute_capability", lambda device: (11, 0))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm110", lambda: False)
+    with pytest.raises(NotImplementedError, match="sm_110a"):
+        api.check_support()
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm110", lambda: True)
+    assert api.check_support() is True

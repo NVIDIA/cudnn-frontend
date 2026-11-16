@@ -62,7 +62,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
 
 ### FROST support matrix (python engines, FP16 / BF16)
 
-FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_*`, `sdpa_bwd_*`) that the frontend ranks beside the cuDNN backend plans; a graph every FROST row declines runs on the backend. The table covers the FP16 / BF16 rows for dense, padded (dense inputs with `use_padding_mask`) and ragged (THD) graphs; the FP8 / MXFP8 rows are documented with their kernels under `docs/operations/attention/`. Head dims are the native tiles; smaller multiples of 8 ride the next envelope.
+FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_*`, `sdpa_bwd_*`) that the frontend ranks beside the cuDNN backend plans; a graph every FROST row declines runs on the backend. The table covers the FP16 / BF16 rows for dense, padded (dense inputs with `use_padding_mask`) and ragged (THD) graphs; the FP8 / MXFP8 rows are documented with their kernels under `docs/operations/attention/`. Head dims are the native tiles; smaller multiples of 8 ride the next envelope. The per-architecture eligibility record is the [FROST support index](../../python/cudnn/sdpa/frost/support/README.md) and its pages.
 
 | Arch | Fprop | Bprop | Deterministic bprop⁶ | Padded | Ragged (THD) | Head dim |
 |-----------|-------------|-------------|-------------|-------------|-------------|------|
