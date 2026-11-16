@@ -3542,9 +3542,10 @@ def test_determinism_two_streams(backend, variant):
 
 @pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("variant", ["kda", "mamba2"])
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_same_graph_two_streams(backend, variant, dtype):
-    """Two backwards of one variant on two streams stay bitwise stable under repeated overlap."""
+    """Two backwards of one variant on two streams stay bitwise stable under repeated overlap, for every variant
+    and both engines that serve it."""
     case_a = make_case(variant, dtype, T=512, seed=SEED)
     case_b = make_case(variant, dtype, T=512, seed=SEED + 1)
     leaves_a = [tensor.requires_grad_(True) for tensor in thd_tensors(case_a)]
