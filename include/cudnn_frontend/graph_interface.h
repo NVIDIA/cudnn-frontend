@@ -1407,6 +1407,13 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(kernel_cache->build(operation_graph->get_raw_desc()));
         }
 
+        // Bound implicit kernel residency to this graph's plans instead of the process-wide cache.
+        if (!kernel_cache && detail::get_backend_version() >= 90500) {
+            auto scoped_cache = std::make_shared<KernelCache>();
+            CHECK_CUDNN_FRONTEND_ERROR(scoped_cache->build(operation_graph->get_raw_desc()));
+            plans.set_kernel_cache(std::move(scoped_cache));
+        }
+
         CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH ALL OK === ");
 
         return {error_code_t::OK, ""};
@@ -4102,7 +4109,9 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
 
         plans.set_tag(operation_graph->getTag());
         plans.enqueue_engine_configs(op_graph_to_configs);
-        plans.set_kernel_cache(kernel_cache);
+        if (kernel_cache) {
+            plans.set_kernel_cache(kernel_cache);
+        }
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());
