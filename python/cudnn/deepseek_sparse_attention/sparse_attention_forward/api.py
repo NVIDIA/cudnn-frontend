@@ -40,14 +40,17 @@ class SparseAttentionForward(APIBase):
     JIT. The SM100 interface retains its concrete-tensor cache. Runtime
     sequence and top-k extents remain dynamic on both architectures.
 
-    The KV pool is a ``(S_kv, D_qk)`` tensor of Q's dtype, or, with
-    ``kv_format``, the ``torch.uint8`` rows ``(S_kv, record_bytes)`` of a
-    packed cache (formats in ``_kv_formats``). ``sample_extra_kv`` declares
-    a second pool with its own token ids (``sample_extra_topk_idxs``, and
+    The KV pool is a ``(S_kv, D_qk)`` tensor of Q's dtype; a
+    ``float8_e4m3fn`` ``(S_kv, D_qk)`` tensor with its FP32 ``(1,)``
+    per-tensor descale (``sample_descale_kv``); or, with ``kv_format``, the
+    ``torch.uint8`` rows ``(S_kv, record_bytes)`` of a packed cache (formats
+    in ``_kv_formats``). ``sample_extra_kv`` declares a second pool, of any
+    of these kinds, with its own token ids (``sample_extra_topk_idxs``, and
     optionally ``sample_extra_topk_length``): every query attends to its
     ``topk_idxs`` slots of ``sample_kv`` and its ``extra_topk_idxs`` slots of
-    ``sample_extra_kv`` under one softmax. No architecture serves a packed
-    cache or a second pool yet: declaring one raises ``NotImplementedError``.
+    ``sample_extra_kv`` under one softmax. No architecture serves an FP8 or
+    packed pool or a second pool yet: declaring one raises
+    ``NotImplementedError``.
     """
 
     def __init__(
@@ -65,6 +68,8 @@ class SparseAttentionForward(APIBase):
         extra_kv_format: Optional[str] = None,  # packed cache format of sample_extra_kv
         sample_extra_topk_idxs: Optional[torch.Tensor] = None,  # (total_S_q, extra_K) INT32 token ids in sample_extra_kv
         sample_extra_topk_length: Optional[torch.Tensor] = None,  # (total_S_q,) INT32, clamped to [0, extra_K]
+        sample_descale_kv: Optional[torch.Tensor] = None,  # (1,) FP32 per-tensor descale of a float8_e4m3fn sample_kv
+        sample_descale_extra_kv: Optional[torch.Tensor] = None,  # (1,) FP32 per-tensor descale of a float8_e4m3fn sample_extra_kv
     ):
         """Capture a sparse-attention declaration for support checking and compilation."""
         super().__init__()
@@ -73,6 +78,8 @@ class SparseAttentionForward(APIBase):
         self.extra_kv_desc = self._make_tensor_desc(sample_extra_kv, name="sample_extra_kv")
         self.extra_topk_idxs_desc = self._make_tensor_desc(sample_extra_topk_idxs, name="sample_extra_topk_idxs")
         self.extra_topk_length_desc = self._make_tensor_desc(sample_extra_topk_length, name="sample_extra_topk_length")
+        self.descale_kv_desc = self._make_tensor_desc(sample_descale_kv, name="sample_descale_kv")
+        self.descale_extra_kv_desc = self._make_tensor_desc(sample_descale_extra_kv, name="sample_descale_extra_kv")
         self.kv_format = kv_format
         self.extra_kv_format = extra_kv_format
         self.topk_idxs_desc = self._make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs")
@@ -101,7 +108,7 @@ class SparseAttentionForward(APIBase):
         del total_s_kv
 
         self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
-        kv_fmt = self._check_kv_storage(self.kv_desc, self.kv_format, name="KV", format_arg="kv_format")
+        kv_fmt = self._check_kv_storage(self.kv_desc, self.kv_format, self.descale_kv_desc, name="KV", format_arg="kv_format", descale_arg="descale_kv")
         self._check_dtype(self.topk_idxs_desc, torch.int32, name="topk_idxs")
         if kv_fmt is None:
             self._value_error_if(kv_head_dim != head_dim, f"KV head dimension ({kv_head_dim}) must match Q ({head_dim})")
@@ -112,7 +119,11 @@ class SparseAttentionForward(APIBase):
 
         ref_device = self.q_desc.device
         descs = [self.q_desc, self.kv_desc, self.topk_idxs_desc]
-        descs += [desc for desc in (self.extra_kv_desc, self.extra_topk_idxs_desc, self.extra_topk_length_desc) if desc is not None]
+        descs += [
+            desc
+            for desc in (self.extra_kv_desc, self.extra_topk_idxs_desc, self.extra_topk_length_desc, self.descale_kv_desc, self.descale_extra_kv_desc)
+            if desc is not None
+        ]
         if self.attn_sink_desc is not None:
             descs.append(self.attn_sink_desc)
         if self.topk_length_desc is not None:
@@ -180,6 +191,10 @@ class SparseAttentionForward(APIBase):
             f"SparseAttentionForward does not serve kv_format={self.kv_format!r} on {arch}; pass a (total_S_kv, D_qk) pool of Q's dtype",
         )
         self._not_implemented_error_if(
+            kv_fmt is None and self.kv_desc.dtype == torch.float8_e4m3fn,
+            f"SparseAttentionForward does not serve a per-tensor-scaled FP8 KV pool (descale_kv) on {arch}; pass a (total_S_kv, D_qk) pool of Q's dtype",
+        )
+        self._not_implemented_error_if(
             self.extra_kv_desc is not None and self.indexer_topk != 0,
             "SparseAttentionForward does not serve indexer_topk > 0 (lse_indexer) with a second KV pool (extra_kv); pass indexer_topk=0",
         )
@@ -193,15 +208,26 @@ class SparseAttentionForward(APIBase):
         self._is_supported = True
         return True
 
-    def _check_kv_storage(self, desc, kv_format: Optional[str], *, name: str, format_arg: str) -> Optional[KvFormat]:
-        """Check a pool's dtype against its format, Q's dtype without one and ``torch.uint8`` rows with one; return the format."""
+    def _check_kv_storage(self, desc, kv_format: Optional[str], descale_desc, *, name: str, format_arg: str, descale_arg: str) -> Optional[KvFormat]:
+        """Check a pool's dtype against its format and descale; return its packed format, or ``None`` for a typed pool.
+
+        A typed pool holds Q's dtype, or ``float8_e4m3fn`` with an FP32 ``(1,)`` per-tensor descale. A packed pool is the
+        ``torch.uint8`` rows of a named format, which carry their own scales.
+        """
         if kv_format is None:
+            if desc.dtype == torch.float8_e4m3fn:
+                self._value_error_if(descale_desc is None, f"a float8_e4m3fn {name} pool needs {descale_arg}, its FP32 (1,) per-tensor descale")
+                self._check_dtype(descale_desc, torch.float32, name=descale_arg)
+                self._value_error_if(descale_desc.shape != (1,), f"{descale_arg} must have shape (1,), got {descale_desc.shape}")
+                return None
+            self._value_error_if(descale_desc is not None, f"{descale_arg} is the descale of a float8_e4m3fn {name} pool, but {name} is {desc.dtype}")
             hint = f"; a packed torch.uint8 cache also needs {format_arg}" if desc.dtype == torch.uint8 else ""
             self._check_dtype(desc, self.q_desc.dtype, name=name, extra_error_msg=f"{name} must have same dtype as Q{hint}")
             return None
         fmt = KV_FORMATS.get(kv_format) if isinstance(kv_format, str) else None
         self._value_error_if(fmt is None, f"unknown {format_arg} {kv_format!r}; the packed KV cache formats are {tuple(KV_FORMATS)}")
         self._check_dtype(desc, torch.uint8, name=name, extra_error_msg=f"a {fmt.name} cache is passed as the torch.uint8 tensor of its rows")
+        self._value_error_if(descale_desc is not None, f"{descale_arg} does not apply to a {fmt.name} cache, which carries its own scales")
         return fmt
 
     def _check_packed_kv_width(self, desc, fmt: KvFormat, head_dim: int, *, name: str) -> None:
@@ -219,13 +245,20 @@ class SparseAttentionForward(APIBase):
         if desc is None:
             given = [
                 name
-                for name, value in (("extra_kv_format", self.extra_kv_format), ("extra_topk_idxs", idxs_desc), ("extra_topk_length", length_desc))
+                for name, value in (
+                    ("extra_kv_format", self.extra_kv_format),
+                    ("extra_topk_idxs", idxs_desc),
+                    ("extra_topk_length", length_desc),
+                    ("descale_extra_kv", self.descale_extra_kv_desc),
+                )
                 if value is not None
             ]
             self._value_error_if(bool(given), f"{', '.join(given)} describe a second KV pool, but extra_kv is not given")
             return
         self._value_error_if(desc.ndim != 2, f"extra_kv must be 2-D (total_S_extra_kv, D_qk), got {desc.shape}")
-        fmt = self._check_kv_storage(desc, self.extra_kv_format, name="extra_kv", format_arg="extra_kv_format")
+        fmt = self._check_kv_storage(
+            desc, self.extra_kv_format, self.descale_extra_kv_desc, name="extra_kv", format_arg="extra_kv_format", descale_arg="descale_extra_kv"
+        )
         if fmt is None:
             self._value_error_if(desc.shape[1] != head_dim, f"extra_kv head dimension ({desc.shape[1]}) must match Q ({head_dim})")
         else:
@@ -275,6 +308,8 @@ class SparseAttentionForward(APIBase):
         extra_kv: Optional[torch.Tensor] = None,
         extra_topk_idxs: Optional[torch.Tensor] = None,
         extra_topk_length: Optional[torch.Tensor] = None,
+        descale_kv: Optional[torch.Tensor] = None,
+        descale_extra_kv: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Execute a compiled sparse-attention plan.
 
@@ -287,9 +322,10 @@ class SparseAttentionForward(APIBase):
 
         ``current_stream`` is either ``None`` for PyTorch's current stream or
         a concrete CUDA driver stream on Q's device. SM100 retains its existing
-        direct execution behavior. ``extra_kv``, ``extra_topk_idxs`` and
-        ``extra_topk_length`` are each given exactly when the plan was
-        declared with their ``sample_`` counterparts.
+        direct execution behavior. ``extra_kv``, ``extra_topk_idxs``,
+        ``extra_topk_length``, ``descale_kv`` and ``descale_extra_kv`` are each
+        given exactly when the plan was declared with their ``sample_``
+        counterparts.
         """
         if self._compiled_kernel is None:
             raise ValueError("SparseAttentionForward kernel not compiled")
@@ -297,6 +333,8 @@ class SparseAttentionForward(APIBase):
             ("extra_kv", extra_kv, self.extra_kv_desc),
             ("extra_topk_idxs", extra_topk_idxs, self.extra_topk_idxs_desc),
             ("extra_topk_length", extra_topk_length, self.extra_topk_length_desc),
+            ("descale_kv", descale_kv, self.descale_kv_desc),
+            ("descale_extra_kv", descale_extra_kv, self.descale_extra_kv_desc),
         ):
             if (given is not None) != (declared is not None):
                 raise ValueError(f"{name} must be given exactly when the plan was declared with sample_{name}")
@@ -368,6 +406,8 @@ def sparse_attention_forward_wrapper(
     extra_kv_format: Optional[str] = None,
     extra_topk_idxs: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    descale_kv: Optional[torch.Tensor] = None,
+    descale_extra_kv: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Allocate, normalize, and run SM90/SM100 sparse-prefill attention.
 
@@ -379,15 +419,17 @@ def sparse_attention_forward_wrapper(
     When ``topk_length`` is present, rows shorter than ``indexer_topk`` retain
     the source kernel's ``+inf`` ``lse_indexer`` sentinel.
 
-    ``kv_format`` declares a packed cache, and ``extra_kv``,
-    ``extra_kv_format``, ``extra_topk_idxs`` and ``extra_topk_length`` a
-    second pool with its own token ids, as on ``SparseAttentionForward``. No
-    architecture serves either yet, and the wrapper never copies them.
+    ``kv_format`` declares a packed cache and ``descale_kv`` the descale of an
+    FP8 ``kv``; ``extra_kv``, ``extra_kv_format``, ``extra_topk_idxs``,
+    ``extra_topk_length`` and ``descale_extra_kv`` declare a second pool with
+    its own token ids, as on ``SparseAttentionForward``. No architecture
+    serves these yet, and the wrapper never copies them.
     """
 
     scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else float(softmax_scale)
     capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else None
-    if capability is not None and capability[0] == 9 and kv_format is None and extra_kv is None:
+    staged = kv_format is None and extra_kv is None and descale_kv is None
+    if capability is not None and capability[0] == 9 and staged:
         dsl_error = sm90_dsa_cutedsl_requirement_error()
         if dsl_error is not None:
             raise RuntimeError(dsl_error)
@@ -416,6 +458,8 @@ def sparse_attention_forward_wrapper(
         extra_kv_format,
         None if extra_topk_idxs is None else extra_topk_idxs.dtype,
         extra_topk_length is not None,
+        None if descale_kv is None else descale_kv.dtype,
+        None if descale_extra_kv is None else descale_extra_kv.dtype,
     )
     obj = _cache_of_sparse_attention_forward_objects.get(key)
     if obj is None:
@@ -431,6 +475,8 @@ def sparse_attention_forward_wrapper(
             extra_kv_format=extra_kv_format,
             sample_extra_topk_idxs=extra_topk_idxs,
             sample_extra_topk_length=extra_topk_length,
+            sample_descale_kv=descale_kv,
+            sample_descale_extra_kv=descale_extra_kv,
         )
         obj.check_support()
         obj.compile()
@@ -459,5 +505,7 @@ def sparse_attention_forward_wrapper(
         extra_kv=extra_kv,
         extra_topk_idxs=extra_topk_idxs,
         extra_topk_length=extra_topk_length,
+        descale_kv=descale_kv,
+        descale_extra_kv=descale_extra_kv,
     )
     return TupleDict(out=out, max_logits=max_logits, lse=lse, lse_indexer=lse_indexer)

@@ -8,7 +8,8 @@ channels, their block scales and, at ``D_qk = 576``, the 64 channels only K
 reads. It is passed as the ``torch.uint8`` tensor of those rows, shape
 ``(S_kv, record_bytes)``, together with the name of its format; a cache with
 padded rows is passed as that view of its buffer (``stride(0)`` is the pitch).
-Without a format name the pool is a ``(S_kv, D_qk)`` tensor of Q's dtype.
+Without a format name the pool is a typed ``(S_kv, D_qk)`` tensor: Q's
+dtype, or ``float8_e4m3fn`` with a per-tensor descale.
 
 One name fixes one byte layout and one rule for recovering channel values; a
 variant that changes either is a new name, and names are only ever appended.
@@ -36,6 +37,13 @@ Byte offsets are within one row; V reads channels ``[0, 512)``.
     at byte ``320 + 8 * (b % 4) + b // 4``.
     ``value[c] = e2m1(code[c]) * e4m3(sf[c // 16])`` for ``c < 512``, else the
     E4M3 value.
+
+``fp8_528`` (``D_qk = 512``)
+    ``fp8_bf16rope_656`` without its last 64 channels: ``[0, 512)``: E4M3
+    codes; ``[512, 528)``: one FP32 scale per 128 channels.
+    ``value[c] = e4m3(code[c]) * sf[c // 128]``. It has the width of
+    ``mxfp8_528`` but not its layout, so a format is never inferred from a
+    width.
 """
 
 from __future__ import annotations
@@ -60,5 +68,6 @@ KV_FORMATS: Dict[str, KvFormat] = {
         KvFormat("nvfp4_288", head_dim_qk=512, record_bytes=288),
         KvFormat("fp8_bf16rope_656", head_dim_qk=576, record_bytes=656),
         KvFormat("nvfp4_fp8rope_352", head_dim_qk=576, record_bytes=352),
+        KvFormat("fp8_528", head_dim_qk=512, record_bytes=528),
     )
 }
