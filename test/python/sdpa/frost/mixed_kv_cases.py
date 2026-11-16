@@ -23,7 +23,7 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(io)
     stats.set_output(True).set_dim((2, 8, 256, 1)).set_stride((2048, 256, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     default_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
-    if cc == (10, 7):
+    if engine_name is None and cc == (10, 7):
         from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
 
         default_name = select_sm107_half_geometry(ga.analyze(graph), engines.SdpaFwdKnobs(cga=cga)).implementation
