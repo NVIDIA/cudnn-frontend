@@ -217,8 +217,9 @@ def test_bias_dbias_sink_and_padding(dtype, d, dv, bias_batch, deterministic):
 
     if deterministic and bias_batch == 1:
         # A broadcast bias reduces dBias over B through unordered atomics, so the deterministic claim declines it.
-        # Above D128 nothing else serves the graph; at D128 the backend does, and the row simply offers no plan.
-        declined = "deterministic dBias requires a per-batch bias" if d > 128 else f"no plan for engine '{ENGINE}'"
+        # Backend availability also depends on version and Stats strides, not just D128. If every engine
+        # declines, planning reports Ada's specific reason; otherwise the strict selector reports its missing plan.
+        declined = f"{ENGINE}: deterministic dBias requires a per-batch bias|no plan for engine '{ENGINE}'"
         with pytest.raises((cudnn.cudnnGraphNotSupportedError, AssertionError), match=declined):
             _case(d, dv, dtype=dtype, features=True, bias_batch=bias_batch, deterministic=deterministic, engine=ENGINE)
         return
