@@ -76,19 +76,52 @@ class GraphType(Enum):
 
     MATMUL = "matmul"
     BLOCK_SCALE_MATMUL = "block_scale_matmul"
+    # Linear (not F8_128x4-reordered) scales of any dtype and block shape, applied to the accumulator.
+    GENERAL_BLOCK_SCALE_MATMUL = "general_block_scale_matmul"
     MOE = "moe"
     MOE_SWAP_AB = "moe_grouped_matmul_swap_ab"
     MOE_BLOCK_SCALE = "moe_block_scale"
     MOE_BLOCK_SCALE_SWAP_AB = "moe_grouped_block_scale_matmul_swap_ab"
+    # The grouped pipelines with linear scales, applied to the accumulator as the general dense template does.
+    GENERAL_MOE_BLOCK_SCALE = "general_moe_block_scale"
+    GENERAL_MOE_BLOCK_SCALE_SWAP_AB = "general_moe_grouped_block_scale_matmul_swap_ab"
     CONVOLUTION = "convolution"  # placeholder — no template yet
+
+
+# The graph types whose scales the promotion warps apply to the accumulator.
+GENERAL_BLOCK_SCALE_GRAPH_TYPES = frozenset(
+    {GraphType.GENERAL_BLOCK_SCALE_MATMUL, GraphType.GENERAL_MOE_BLOCK_SCALE, GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB}
+)
+
+# Scale-factor dtypes the block-scaled MMA kinds read.
+_NATIVE_SF_DTYPES = frozenset({"fp8_e8m0", "fp8_e4m3"})
+
+
+def _moe_general_block_scale(chain: FusionChain) -> bool:
+    """A grouped block-scale graph whose scales are all linear runs the general grouped templates.
+
+    Two linear cases stay with the block-scaled MMA pipelines (and their verdicts): data the plain tcgen05.mma has
+    no kind for, such as FP4, and a GATHER graph whose only scale tensor is a native-dtype token scale, which
+    GATHER reads linear itself."""
+    mm, bs = chain.matmul, chain.block_scale
+    if not bs.linear_scales or (mm.a_dtype, mm.b_dtype) not in _GENERAL_BLOCK_SCALE_DATA_CASES:
+        return False
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    token_scaled, weight_scaled = (bs.b_scaled, bs.a_scaled) if swapped else (bs.a_scaled, bs.b_scaled)
+    token_sf_dtype = bs.sf_dtype_b if swapped else bs.sf_dtype_a
+    return not (chain.moe.mode == "gather" and token_scaled and not weight_scaled and token_sf_dtype in _NATIVE_SF_DTYPES)
 
 
 def classify_graph_type(chain: FusionChain) -> GraphType:
     """Stage-1 classifier: which graph type this chain is."""
     if isinstance(chain.moe, MoeSwapAbSpec):
-        return GraphType.MOE_BLOCK_SCALE_SWAP_AB if chain.has_block_scale else GraphType.MOE_SWAP_AB
+        if not chain.has_block_scale:
+            return GraphType.MOE_SWAP_AB
+        return GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB if _moe_general_block_scale(chain) else GraphType.MOE_BLOCK_SCALE_SWAP_AB
     if chain.has_moe and chain.has_block_scale:
-        return GraphType.MOE_BLOCK_SCALE
+        return GraphType.GENERAL_MOE_BLOCK_SCALE if _moe_general_block_scale(chain) else GraphType.MOE_BLOCK_SCALE
+    if chain.has_block_scale and chain.block_scale.linear_scales:
+        return GraphType.GENERAL_BLOCK_SCALE_MATMUL
     if chain.has_block_scale:
         return GraphType.BLOCK_SCALE_MATMUL
     if chain.has_moe:
@@ -190,11 +223,95 @@ _MATMUL_CASES = frozenset(
     }
 )
 
+# General block scale: the operand pairs one plain tcgen05.mma kind takes (the partial accumulator is fp32,
+# or int32 for int8), and the linear scale dtypes the promotion warps widen to fp32. uint8 is left out: the
+# DSL widens a loaded Uint8 scalar as signed.
+_GENERAL_BLOCK_SCALE_DATA_CASES = frozenset(
+    {
+        ("bf16", "bf16"),
+        ("fp16", "fp16"),
+        ("int8", "int8"),
+        ("fp8_e4m3", "fp8_e4m3"),
+        ("fp8_e4m3", "fp8_e5m2"),
+        ("fp8_e5m2", "fp8_e4m3"),
+        ("fp8_e5m2", "fp8_e5m2"),
+    }
+)
+GENERAL_BLOCK_SCALE_SF_DTYPES = frozenset({"fp32", "bf16", "fp16", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "int8", "int32"})
+# The int8 kind assembles only for sm_100a and sm_110a (ptxas rejects it on sm_103a and every family target).
+_GENERAL_BLOCK_SCALE_ARCH_CASES = {("int8", "int8"): ((100, 101), (110, 111))}
+
+
+def general_block_scale_mma_inst_k(dtype: str) -> int:
+    """K elements of one 32-byte tcgen05.mma instruction for an 8- or 16-bit operand."""
+    from .dtypes import DTYPE_BYTES
+
+    return 32 // DTYPE_BYTES[dtype]
+
+
+def general_block_scale_reject(chain: FusionChain) -> str | None:
+    """Why the general block-scale template cannot apply ``chain``'s scales, or ``None``.
+
+    Each scale must be constant over every MMA instruction, so the scale K block must be a multiple of the
+    instruction's K extent; the M/N extents of a block and the scale dtype are free."""
+    mm, bs = chain.matmul, chain.block_scale
+    if (mm.a_dtype, mm.b_dtype) not in _GENERAL_BLOCK_SCALE_DATA_CASES:
+        return f"general block scale has no plain tcgen05.mma kind for {mm.a_dtype} x {mm.b_dtype} data"
+    if mm.accum_dtype != "fp32":
+        return f"general block scale accumulates in fp32; the matmul computes in {mm.accum_dtype}"
+    if chain.is_multi_gemm:
+        return f"general block scale runs one GEMM; the graph has {chain.num_gemms}"
+    inst_k = general_block_scale_mma_inst_k(mm.a_dtype)
+    # A grouped matmul's weight is one matrix per expert, and so is its scale tensor; its tokens are one matrix.
+    a_batch, b_batch = mm.a_batch, mm.b_batch
+    if chain.has_moe:
+        a_batch, b_batch = (chain.moe.num_experts, 1) if isinstance(chain.moe, MoeSwapAbSpec) else (1, chain.moe.num_experts)
+    sides = (
+        ("A", bs.a_scaled, bs.sf_dtype_a, bs.a_scale_block, bs.block_size_a, bs.dequant_compute_a, bs.dequant_out_a, 2, bs.sfa_dim, (a_batch, mm.M, mm.K)),
+        ("B", bs.b_scaled, bs.sf_dtype_b, bs.b_scale_block, bs.block_size_b, bs.dequant_compute_b, bs.dequant_out_b, 1, bs.sfb_dim, (b_batch, mm.K, mm.N)),
+    )
+    # The side GATHER routes, and where its rows sit in that side's [k, n] / [m, k] block shape.
+    gathered, rows_axis = None, 0
+    if chain.has_moe and chain.moe.mode == "gather":
+        gathered, rows_axis = ("B", 1) if isinstance(chain.moe, MoeSwapAbSpec) else ("A", 0)
+    for side, scaled, sf_dtype, block, declared, compute, out, k_axis, sf_dim, extents in sides:
+        if not scaled:
+            continue
+        if sf_dtype not in GENERAL_BLOCK_SCALE_SF_DTYPES:
+            return f"general block scale reads {', '.join(sorted(GENERAL_BLOCK_SCALE_SF_DTYPES))} scales; {side} has {sf_dtype}"
+        if block is None or any(b < 1 for b in block):
+            return f"general block scale needs a positive block of rank <= 3 over {side}; got {declared}"
+        if block[0] != 1:
+            return f"general block scale needs one scale block per batch; {side} blocks {block[0]} batches"
+        if block[k_axis] % inst_k:
+            return f"{side}'s scale K block {block[k_axis]} is not a multiple of the {inst_k}-element MMA instruction K for {mm.a_dtype} data"
+        if compute != "fp32" or out != "fp32":
+            return f"general block scale dequantizes in fp32; {side} computes in {compute} and produces {out}"
+        expected = tuple(-(-extent // b) for extent, b in zip(extents[1:], block[1:]))
+        if sf_dim is not None and len(sf_dim) == 3 and side == gathered:
+            # GATHER routes rows out of a token tensor of any row count: its scale has that tensor's rows, which
+            # the call checks against the operand it binds.
+            expected = tuple(sf_dim[1 + i] if i == rows_axis else e for i, e in enumerate(expected))
+        if sf_dim is None or len(sf_dim) != 3 or sf_dim[0] not in (1, extents[0]) or tuple(sf_dim[1:]) != expected:
+            return f"{side}'s scale tensor must have shape [1 or {extents[0]}, {expected[0]}, {expected[1]}] for block {block[1:]}; got {sf_dim}"
+    special = _GENERAL_BLOCK_SCALE_ARCH_CASES.get((mm.a_dtype, mm.b_dtype))
+    if special is not None:
+        from . import compiler as C
+
+        arch = C._current_arch()
+        if arch is not None and not any(lo <= arch < hi for lo, hi in special):
+            spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in special)
+            return f"the {mm.a_dtype}x{mm.b_dtype} MMA instruction exists only on {spans}, but the active GPU is sm_{arch}"
+    return None
+
+
 _MMA_BASE_GRAPH_TYPE: dict[GraphType, GraphType] = {
     GraphType.MOE: GraphType.MATMUL,
     GraphType.MOE_SWAP_AB: GraphType.MATMUL,
     GraphType.MOE_BLOCK_SCALE: GraphType.BLOCK_SCALE_MATMUL,
     GraphType.MOE_BLOCK_SCALE_SWAP_AB: GraphType.BLOCK_SCALE_MATMUL,
+    GraphType.GENERAL_MOE_BLOCK_SCALE: GraphType.GENERAL_BLOCK_SCALE_MATMUL,
+    GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB: GraphType.GENERAL_BLOCK_SCALE_MATMUL,
 }
 
 _MMA_KEY_FNS: dict[GraphType, object] = {
@@ -206,6 +323,8 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
     "sm100": {
         GraphType.MATMUL: _MATMUL_CASES,
         GraphType.BLOCK_SCALE_MATMUL: _BLOCK_SCALE_CASES,
+        # The data pairs only: general_block_scale_reject checks the scales.
+        GraphType.GENERAL_BLOCK_SCALE_MATMUL: _GENERAL_BLOCK_SCALE_DATA_CASES,
     },
     "sm103": {
         GraphType.BLOCK_SCALE_MATMUL: frozenset(
@@ -297,6 +416,10 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
     from . import compiler as C
 
     base_type = _MMA_BASE_GRAPH_TYPE.get(graph_type, graph_type)
+    if base_type is GraphType.GENERAL_BLOCK_SCALE_MATMUL:
+        if MMA_TYPE_SUPPORT.get(template_pipeline, {}).get(base_type) is None:
+            return f"the {template_pipeline} family has no {graph_type.value} pipeline"
+        return general_block_scale_reject(chain)
     key_fn = _MMA_KEY_FNS.get(base_type)
     if key_fn is None:
         return f"graph type {graph_type.value!r} has no kernel pipeline yet"
@@ -418,7 +541,12 @@ class KernelTemplate:
         except NotImplementedError as e:
             return str(e)
         try:
-            if self.block_scale:
+            if self.graph_type in GENERAL_BLOCK_SCALE_GRAPH_TYPES:
+                # The TMEM / SMEM plan is the sm100 tree's; another tree declines the template here.
+                C._check_own_family(self)
+                C._check_dtype_config_compat(chain, config)
+                C._general_block_scale_plan(chain, config)
+            elif self.block_scale:
                 from .tile_config import validate_block_scale_config
 
                 bs = chain.block_scale
@@ -854,6 +982,13 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         supports_cluster_k_reduce=True,
     ),
     _mm(
+        "sm100_general_block_scale_matmul.py",
+        graph_type=GraphType.GENERAL_BLOCK_SCALE_MATMUL,
+        # Two warpgroups of promotion warps after the block-scale template's eight.
+        warps_per_cta=16,
+        supports_multi_gemm=False,
+    ),
+    _mm(
         "sm100_moe_grouped_matmul_fwd.py",
         # + the per-CTA TMA tensormap scratch the per-group descriptor patch needs.
         smem_fixed_reserve=4096,
@@ -871,6 +1006,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # + the per-CTA TMA tensormap scratch the per-group descriptor patch needs.
         smem_fixed_reserve=4096,
         graph_type=GraphType.MOE_BLOCK_SCALE,
+    ),
+    _mm(
+        "sm100_general_moe_grouped_block_scale_matmul_fwd.py",
+        # + the per-CTA TMA tensormap scratch the per-group descriptor patch needs.
+        smem_fixed_reserve=4096,
+        graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE,
+        # Two warpgroups of promotion warps after the grouped template's eight.
+        warps_per_cta=16,
+        supports_multi_gemm=False,
+    ),
+    _mm(
+        "sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode.py",
+        graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE,
+        # The source template's twenty: its eight scale-factor copy / pack warps become the promotion warps.
+        warps_per_cta=20,
+        smem_fixed_reserve=4096,
+        supports_multi_gemm=False,
+        async_gather=True,
     ),
     _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py",
@@ -892,9 +1045,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         async_gather=True,
     ),
     _mm(
+        "sm100_general_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+        smem_fixed_reserve=4096,
+        graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB,
+        warps_per_cta=16,
+        supports_multi_gemm=False,
+    ),
+    _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
         smem_fixed_reserve=4096,
         graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+    ),
+    _mm(
+        "sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py",
+        graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB,
+        warps_per_cta=20,
+        smem_fixed_reserve=4096,
+        supports_multi_gemm=False,
+        async_gather=True,
     ),
     _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py",
@@ -965,6 +1133,8 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     """MMA-inst K width the auto path should build ``chain`` with."""
     mm = chain.matmul
     dense_fp8 = mm.a_dtype.startswith("fp8_") and mm.b_dtype.startswith("fp8_")
+    if classify_graph_type(chain) in GENERAL_BLOCK_SCALE_GRAPH_TYPES:
+        return 32  # the general templates issue 32-byte K instructions only
     if not dense_fp8 and classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
         return 32
     from . import compiler as C

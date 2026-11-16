@@ -1390,8 +1390,13 @@ def _build_multi_moe_chain(
         a0 = a_caps[a_ids[gemm_operands[0][0]]]
         b0 = b_caps[b_ids[gemm_operands[0][1]]]
 
+        # The block-scaled MMA pipelines gather a linear token scale in a packed layout. A graph whose scales are
+        # all linear runs the general templates instead (kernel_registry._moe_general_block_scale), which read a
+        # scale through its own strides: no layout to check.
+        weight_linear = any(cap["sf_id"] is not None and cap["sf_reorder"] is None for cap in b_caps.values())
         for cap in a_caps.values():
-            if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None:
+            packed_token_sf = cap["sf_id"] is not None and not weight_linear and meta[cap["sf_id"]].dtype in ("fp8_e8m0", "fp8_e4m3")
+            if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None and packed_token_sf:
                 from .kernel_registry import linear_token_sf_reject
 
                 sf = meta[cap["sf_id"]]

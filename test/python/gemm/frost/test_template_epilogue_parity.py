@@ -37,33 +37,46 @@ _PLAIN_2 = [
     ("sm100_matmul.py", 2),
     ("sm100_matmul_mainloop.py", 2),
 ]
+# The general template drains the main accumulator its promotion warps fill with the block-scale epilogue verbatim.
 _BS_1 = [
     ("sm100_block_scale_matmul.py", 1),
+    ("sm100_general_block_scale_matmul.py", 1),
     ("sm103_block_scale_matmul.py", 1),
 ]
 _BS_2 = [
     ("sm100_block_scale_matmul.py", 2),
+    ("sm100_general_block_scale_matmul.py", 2),
     ("sm103_block_scale_matmul.py", 2),
 ]
 _MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 1)]
 _MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 2)]
+# The general grouped templates are derived from the block-scale ones: their promotion warps fill the main
+# accumulator, and the source template's epilogue drains it verbatim.
 _MOE_BS_1 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 1),
     ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 1),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd.py", 1),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 1),
 ]
 _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
     ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 2),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd.py", 2),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 2),
 ]
 _MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 1)]
 _MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 2)]
 _MOE_SWAP_1 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1),
     ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 1),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 1),
 ]
 _MOE_SWAP_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2),
     ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 2),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2),
+    ("sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 2),
 ]
 
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
@@ -114,6 +127,9 @@ _DRAIN_GROUPS = {
 }
 
 _BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2 + _MOE_SWAP_1 + _MOE_SWAP_2}
+# Block-scale templates whose MMA reads scale factors through SMEM descriptors; the general templates'
+# promotion warps read linear scale tensors from global memory instead.
+_SF_SMEM = {f for f in _BLOCK_SCALE if "_general_" not in f}
 
 
 def _templates():
@@ -369,10 +385,13 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
             continue
 
-        # Dense block-scale's MMA warp tracks SFB sub-tiles; indexed mainloop
-        # transforms also track their own raster in addition to TMA/epilogue.
+        # Dense block-scale's MMA warp tracks SFB sub-tiles, and the general
+        # template's promotion warps their tiles; indexed mainloop transforms
+        # also track their own raster in addition to TMA/epilogue.
         expected_count = (
-            1 if path.name == "sm100_matmul_mainloop.py" else 4 if path.name.startswith("sm103_") or path.name == "sm100_block_scale_matmul.py" else 3
+            1
+            if path.name == "sm100_matmul_mainloop.py"
+            else 4 if path.name.startswith("sm103_") or path.name in ("sm100_block_scale_matmul.py", "sm100_general_block_scale_matmul.py") else 3
         )
         if len(calls) != expected_count:
             offenders.append(f"{path.name} (cta_group={cta_group}): expected {expected_count} L2-swizzle calls, found {len(calls)}")
@@ -447,7 +466,7 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
         if path.name in _STANDALONE:
             # warp-scoped MMA reads SMEM through ldmatrix, not an SMEM descriptor.
             expected_bases = []
-        elif path.name in _BLOCK_SCALE:
+        elif path.name in _SF_SMEM:
             expected_bases = sorted(("smem_a_list[i]", "smem_b_list[j]", "smem_sfa_list[i]", "smem_sfb_list[j]"))
         elif "mainloop" in path.name:
             expected_bases = ["smem_a", "smem_b"]
@@ -494,7 +513,7 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
                 ("desc_a_root" if "mainloop" in path.name else "desc_a_roots"): {"stage"},
                 ("desc_b_root" if "mainloop" in path.name else "desc_b_roots"): {"stage"},
             }
-            if path.name in _BLOCK_SCALE:
+            if path.name in _SF_SMEM:
                 expected_root_stages.update({"desc_sfa_roots": {"stage"}, "desc_sfb_roots": {"stage"}})
 
         advance_calls = [
@@ -710,7 +729,7 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
             target="n_rank",
             preferred=(
                 "(cta_rank_in_cluster >> _preferred_cluster_m_shift) & (cluster_shape_mnk[1] - 1)"
-                if path.name in ("sm100_matmul.py", "sm100_block_scale_matmul.py")
+                if path.name in ("sm100_matmul.py", "sm100_block_scale_matmul.py", "sm100_general_block_scale_matmul.py")
                 else "cta_rank_in_cluster >> _preferred_cluster_m_shift"
             ),
             fallback="cta_rank_in_cluster >> _fallback_cluster_m_shift",

@@ -9,7 +9,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from operator import index
-from math import prod
+from math import gcd, prod
 from typing import Literal
 
 Dtype = Literal[
@@ -777,6 +777,51 @@ class BlockScaleSpec:
         if fmt is None:
             raise NotImplementedError(f"no MMA scale_format encoding for block-scale SF dtype {self.sf_dtype!r}")
         return fmt
+
+    @property
+    def a_scaled(self) -> bool:
+        """A reads a real scale tensor (a fake dequant is a unit scale with no tensor)."""
+        return self.sf_dtype_a is not None and not self.fake_dequant_a
+
+    @property
+    def b_scaled(self) -> bool:
+        """B reads a real scale tensor."""
+        return self.sf_dtype_b is not None and not self.fake_dequant_b
+
+    @property
+    def linear_scales(self) -> bool:
+        """Every real scale tensor is a plain strided tensor (no swizzled reorder layout).
+
+        The block-scaled MMA kinds read only swizzled F8_128x4 factors; linear scales of any dtype and block
+        shape are applied to the accumulator by the general block-scale template instead."""
+        return (not self.a_scaled or self.sfa_reorder is None) and (not self.b_scaled or self.sfb_reorder is None)
+
+    @property
+    def a_scale_block(self) -> "tuple[int, int, int] | None":
+        """A's scale block as (batch, M, K) extents, or None when A is unscaled."""
+        return _rank3_block(self.block_size_a) if self.a_scaled else None
+
+    @property
+    def b_scale_block(self) -> "tuple[int, int, int] | None":
+        """B's scale block as (batch, K, N) extents, or None when B is unscaled."""
+        return _rank3_block(self.block_size_b) if self.b_scaled else None
+
+    @property
+    def promotion_k(self) -> int:
+        """K elements over which every real scale is constant: one accumulator promotion window."""
+        k_blocks = []
+        if self.a_scale_block is not None:
+            k_blocks.append(self.a_scale_block[2])
+        if self.b_scale_block is not None:
+            k_blocks.append(self.b_scale_block[1])
+        return gcd(*k_blocks)
+
+
+def _rank3_block(block: "tuple[int, ...] | None") -> "tuple[int, int, int] | None":
+    """A dequantize block shape over the rank-3 operand: missing leading extents block nothing (1)."""
+    if block is None or not block or len(block) > 3:
+        return None
+    return (1,) * (3 - len(block)) + tuple(int(b) for b in block)
 
 
 @dataclass(frozen=True)

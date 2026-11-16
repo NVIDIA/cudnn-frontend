@@ -541,6 +541,28 @@ def _tma_alignment_reject(
     return None
 
 
+def _general_moe_scale_reject(chain, a_bufs, b_bufs, sfa, sfb, K: int) -> str | None:
+    """Why a grouped call's linear scale tensors do not cover its operands, or ``None``.
+
+    The call binds A as ``[L, M, K]`` and B as ``[L, N, K]``; each scale is its operand's shape in blocks,
+    ``[1 or L, ceil(rows / block), ceil(K / block)]``, which is what the promotion warps index."""
+    bs = chain.block_scale
+    sides = (
+        ("A", a_bufs, sfa if bs.a_scaled else [], bs.a_scale_block and (bs.a_scale_block[1], bs.a_scale_block[2])),
+        ("B", b_bufs, sfb if bs.b_scaled else [], bs.b_scale_block and (bs.b_scale_block[2], bs.b_scale_block[1])),
+    )
+    for side, operands, scales, block in sides:
+        for i, (operand, scale) in enumerate(zip(operands, scales)):
+            expected = (-(-int(operand.shape[1]) // block[0]), -(-K // block[1]))
+            shape = tuple(int(d) for d in scale.shape)
+            if len(shape) != 3 or shape[0] not in (1, int(operand.shape[0])) or shape[1:] != expected:
+                return (
+                    f"{side} scale[{i}] must have shape [1 or {int(operand.shape[0])}, {expected[0]}, {expected[1]}] "
+                    f"for a {tuple(int(d) for d in operand.shape)} operand with {block[0]} x {block[1]} blocks; got {shape}"
+                )
+    return None
+
+
 def _partial_scale_block_reject(K: int, block_size: int) -> str | None:
     """Reject a block-scale K that ends inside a scale block."""
     if K % block_size == 0:
@@ -1137,12 +1159,13 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         ins = tuple(((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs)))
         outs = tuple(((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs))
         auxs = tuple((x.index, x.align, x.mainloop_scale, x.access_rule) for x in r.aux)
-        sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf))
+        sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch, s.linear) for s in r.sf))
         tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = (r.shared_layout, r.seeds)
         a_pos, b_pos, a_kpack = (r.a_at, r.b_at, r.a.kpack)
         block_size, batch = (r.block_size, r.batch)
-        whole_scale_blocks = self._validate_whole_scale_blocks
+        # A linear scale tensor holds ceil(K / block) blocks: a partial last block is addressable.
+        whole_scale_blocks = self._validate_whole_scale_blocks and not any(s.linear is not None for s in r.sf)
         device, launchable, refuse = (r.device, self._launchable, self.explain)
         k_pad_plan = self if self._launchable_k_pad is not None else None
         fill_word, fill_plan, apply_fill = (backend.buffers.fill_word_async, backend.buffers.strided_fill_plan, backend.buffers.apply_fill_plan)
@@ -1253,8 +1276,13 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     gave_up["partial scale block"] += 1
                     return refuse(original_operands, graph_order)
                 k4 = (k // block_size + 3) // 4
-                for idx, is_a, sf_batch in sfs:
+                for idx, is_a, sf_batch, linear in sfs:
                     v = operands[idx]
+                    if linear is not None:
+                        if linear.reject(v, is_a, m if is_a else n, k) is not None:
+                            gave_up["scale tensor"] += 1
+                            return refuse(original_operands, graph_order)
+                        continue
                     count = int(v.numel())
                     if (
                         len(v.shape) != 3
@@ -1332,7 +1360,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         mnk, axes = recipe.problem(operands, graph_order)
         backend.check_shapes(recipe, operands, mnk, axes)
         backend.check_alignment(recipe, operands, axes)
-        if self._validate_whole_scale_blocks and self.chain.block_scale is not None:
+        if self._validate_whole_scale_blocks and self.chain.block_scale is not None and not any(s.linear is not None for s in recipe.sf):
             reason = _partial_scale_block_reject(int(mnk[2]), self.chain.block_scale.block_size)
             if reason is not None:
                 raise ValueError(reason)
@@ -1675,7 +1703,14 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         _r = backend._alignment_reject(_named)
         if _r is not None:
             raise ValueError(_r)
-        if sfa or sfb:
+        # Linear scales are read through their strides by the promotion warps: what has to hold is their shape.
+        _general = getattr(backend, "_is_general_block_scale", None)
+        _general = bool(_general is not None and _general(self.chain))
+        if _general:
+            _r_sf = _general_moe_scale_reject(self.chain, a_bufs, b_bufs, sfa or [], sfb or [], int(snk[2]))
+            if _r_sf is not None:
+                raise ValueError(_r_sf)
+        elif sfa or sfb:
             _S, _N, _K = (snk[0], snk[1], snk[2])
             if self._validate_whole_scale_blocks:
                 _r_k = _partial_scale_block_reject(int(_K), self.chain.block_scale.block_size)

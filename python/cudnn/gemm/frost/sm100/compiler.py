@@ -1591,6 +1591,422 @@ def _render_block_scale_tile_constants(
     return "\n".join(lines)
 
 
+# fp32 TMEM columns per promotion load: one tcgen05.ld.32x32b.x32, one register per column.
+_GENERAL_BS_PROMO_COLS = 32
+# Warpgroups of promotion warps: each one promotes its share of the accumulator columns.
+_GENERAL_BS_PROMO_GROUPS = 2
+# A promotion thread keeps its running sum in registers when its share has at most this many accumulator columns
+# and the sum, the load in flight and the scale products it holds leave this many registers for everything else.
+_GENERAL_BS_REG_SUM_MAX_COLS = 64
+_GENERAL_BS_PROMO_SPARE_REGS = 28
+# The dense template keeps a register sum next to at most this many scale products per window; a grouped thread
+# with more column runs than this takes them from its warpgroup's scale table.
+_GENERAL_BS_REG_SUM_MAX_SCALES = 8
+# Columns per promotion load when a 32-column one does not fit in the thread's registers next to its sum.
+_GENERAL_BS_NARROW_PROMO_COLS = 16
+# A/B stages of a grouped template whose (graph) K spans this many K tiles or more. Every tile streams its own
+# expert weights from global memory, and with long tiles more loads in flight than this were slower on B200 (a
+# 128x16 swapped tile over 32 experts of 4096 rows: K=7168 152 us at 6..8 stages against 156..159 us at 9..11,
+# K=4096 92 against 95 us); short tiles (K=2048, 3072) ran the same or a little faster with every stage that fits.
+_GENERAL_BS_MOE_MAX_AB_STAGES = 8
+_GENERAL_BS_MOE_LONG_K_TILES = 32
+# Partial accumulators beyond this many only add TMEM the MMA never gets far enough ahead to use.
+_GENERAL_BS_MAX_PARTIAL_STAGES = 4
+# Registers a thread raises itself to (setmaxnreg): with the producer warps lowered to their 24, the CTA's
+# threads have 64K registers between them.
+_GENERAL_BS_PROMO_REGS = 152
+_GENERAL_BS_EPI_REGS = 168
+# The async GATHER pipelines run 640 threads on a 96-register entry pool. The control warpgroup lowers itself to
+# 48 per thread (the sources' 64 left the promotion warps of a 2-CTA plan spilling to the stack) and the token-copy
+# warps keep 96 or more: the epilogue and promotion warps share the rest.
+_GENERAL_BS_GATHER_CTL_REGS = 48
+_GENERAL_BS_GATHER_POOL = 640 * 96 - 4 * 32 * _GENERAL_BS_GATHER_CTL_REGS
+_GENERAL_BS_GATHER_EPI_REGS = 112
+
+
+def _is_general_block_scale(chain: FusionChain) -> bool:
+    """The chain's scales are linear: the promotion warps of a general template apply them (dense or grouped)."""
+    from ..kernel_registry import GENERAL_BLOCK_SCALE_GRAPH_TYPES, classify_graph_type
+
+    return classify_graph_type(chain) in GENERAL_BLOCK_SCALE_GRAPH_TYPES
+
+
+def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
+    """TMEM, SMEM and MMA plan of the general block-scale templates; NotImplementedError when one cannot run."""
+    from ..kernel_registry import GENERAL_BLOCK_SCALE_GRAPH_TYPES, general_block_scale_mma_inst_k, general_block_scale_reject, select_template
+    from ..tile_config import CtaPairTileConfig, smem_ab_budget_bytes, smem_ab_stages
+
+    reason = general_block_scale_reject(chain)
+    if reason is not None:
+        raise NotImplementedError(reason)
+    if not isinstance(cfg, CtaPairTileConfig) or cfg.pipeline != "sm100":
+        raise NotImplementedError(f"general block scale runs the sm100 pipeline; config {cfg.name!r} is {cfg.pipeline}")
+    # A grouped chain is swapped as a whole (MoeSwapAbSpec), scales included; a dense plan's swap_ab is not.
+    if cfg.swap_ab and not isinstance(chain.moe, MoeSwapAbSpec):
+        raise NotImplementedError("general block scale reads its scale tensors in graph order; swapAB plans are not supported")
+    if cfg.mma_tile_k_bytes != 32:
+        raise NotImplementedError(f"general block scale issues 32-byte K instructions; config {cfg.name!r} has mma_tile_k_bytes={cfg.mma_tile_k_bytes}")
+    # One 128-B swizzled SMEM row per K tile, as in the block-scale template.
+    if cfg.cta_tile_k_bytes != 128:
+        raise NotImplementedError(f"general block scale needs cta_tile_k_bytes == 128; config {cfg.name!r} has {cfg.cta_tile_k_bytes}")
+    # A promotion thread owns one TMEM lane, so every MMA must fill all 128 lanes of its CTA.
+    if cfg.mma_tile_m != 128:
+        raise NotImplementedError(f"general block scale needs 128 MMA rows per CTA; config {cfg.name!r} has mma_tile_m={cfg.mma_tile_m}")
+    if cfg.mma_tile_n % 16 or cfg.cta_tile_n % 16:
+        raise NotImplementedError(f"an M=128 tcgen05.mma needs N % 16 == 0; config {cfg.name!r} has mma_tile_n={cfg.mma_tile_n}, cta_tile_n={cfg.cta_tile_n}")
+    tmpl = select_template(chain, cfg)
+    if tmpl.graph_type not in GENERAL_BLOCK_SCALE_GRAPH_TYPES:
+        raise NotImplementedError(f"{tmpl.file} does not serve general block scales")
+
+    mm, bs = chain.matmul, chain.block_scale
+    cta_group = cfg.cta_group
+    cta_m, cta_n = cfg.cta_tile_m, cfg.cta_tile_n
+    elem_bits = DTYPE_BITS[mm.a_dtype]
+    cta_k = cfg.cta_tile_k_bytes * 8 // elem_bits
+    inst_k = general_block_scale_mma_inst_k(mm.a_dtype)
+    promotion_k = bs.promotion_k
+    if promotion_k % inst_k:
+        raise NotImplementedError(f"the promotion window {promotion_k} is not a multiple of the {inst_k}-element MMA instruction K")
+
+    def _desc_params(is_mn_major, mn_extent, name, cta_k_bytes, inst_k_bytes):
+        if not is_mn_major:
+            return 16, 8 * min(cta_k_bytes, 128), inst_k_bytes, 1
+        group = cta_k_bytes // (elem_bits // 8)
+        if mn_extent < group or mn_extent % group:
+            raise NotImplementedError(
+                f"config {cfg.name!r} cannot use {name}-major input: SMEM extent {mn_extent} is not a multiple of the {group}-element swizzle group"
+            )
+        return cta_k_bytes * group, 8 * group * (elem_bits // 8), inst_k_bytes * group, group
+
+    k_bytes = cfg.cta_tile_k_bytes
+    a_desc = _desc_params(mm.a_major == "m", cta_m, "M", k_bytes, cfg.mma_tile_k_bytes)
+    b_desc = _desc_params(mm.b_major == "n", cta_n // cta_group, "N", k_bytes, cfg.mma_tile_k_bytes)
+
+    # TMEM: main accumulator stages (drained by the epilogue) and partial accumulators (one per window).
+    total_tmem = _tmem_cols_for_arch()
+    epi_cols_per_mma_m = _epi_tile_cols(cfg)
+    acc_cols = cfg.mma_size_m * epi_cols_per_mma_m
+    slots = total_tmem // acc_cols
+    if slots < 2:
+        raise NotImplementedError(
+            f"general block scale {cfg.name!r}: a main and a partial accumulator need {2 * acc_cols} TMEM columns, but only {total_tmem} exist"
+        )
+    # Two main stages let the MMA open the next tile while the epilogue drains this one; the rest hold windows.
+    # (One main and three partial stages measured the same on a 128-column accumulator.)
+    acc_stages = 2 if slots >= 4 else 1
+    partial_stages = min(_GENERAL_BS_MAX_PARTIAL_STAGES, slots - acc_stages)
+
+    # Promotion: each warpgroup's threads own promo_cols accumulator columns of their lane, which are promo_n_cols
+    # tile columns in each of promo_mi_count MMA row blocks.
+    promo_groups = _GENERAL_BS_PROMO_GROUPS
+    if acc_cols % promo_groups:
+        raise NotImplementedError(f"general block scale {cfg.name!r}: {acc_cols} accumulator columns do not split over {promo_groups} promotion warpgroups")
+    promo_cols = acc_cols // promo_groups
+    promo_n_cols = min(promo_cols, epi_cols_per_mma_m)
+    if promo_cols % promo_n_cols or epi_cols_per_mma_m % promo_n_cols or promo_n_cols % 2:
+        raise NotImplementedError(
+            f"general block scale {cfg.name!r}: a promotion warpgroup's {promo_cols} accumulator columns are not whole, even runs of the {epi_cols_per_mma_m} tile columns"
+        )
+    promo_mi_count = promo_cols // promo_n_cols
+    # A thread's tile columns start at a multiple of promo_n_cols, so runs of gcd(block_n, promo_n_cols) share a B scale.
+    b_block = bs.b_scale_block
+    sfb_group_cols = math.gcd(b_block[2], promo_n_cols) if b_block is not None else promo_n_cols
+    sfb_groups = promo_n_cols // sfb_group_cols
+
+    # Registers. The dense and the plain grouped templates run 16 warps; the async GATHER ones their source's 20,
+    # whose token-copy warps size themselves by the token rows a lane caches (16-byte chunks).
+    promo_regs, epi_regs, copy_regs = _GENERAL_BS_PROMO_REGS, _GENERAL_BS_EPI_REGS, 0
+    if tmpl.async_gather:
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        token_rows = (cta_n // cta_group) if swapped else cta_m
+        copy_regs = (128 if swapped else 112) if token_rows * cfg.cta_tile_k_bytes // (128 * 16) > 8 else 96
+        epi_regs = _GENERAL_BS_GATHER_EPI_REGS
+        promo_regs = (_GENERAL_BS_GATHER_POOL - 4 * 32 * copy_regs - 4 * 32 * epi_regs) // (8 * 32) // 8 * 8
+    # A promotion thread holds its running sum, the columns of the TMEM load in flight (narrower when the wide load
+    # does not fit next to the sum) and the scale products of the column runs it is folding.
+    promo_chunk_cols = math.gcd(promo_n_cols, _GENERAL_BS_PROMO_COLS)
+    if promo_cols + promo_chunk_cols + 4 * promo_mi_count + _GENERAL_BS_PROMO_SPARE_REGS > promo_regs:
+        promo_chunk_cols = math.gcd(promo_n_cols, _GENERAL_BS_NARROW_PROMO_COLS)
+    all_scales = promo_mi_count * sfb_groups
+    # A grouped thread with many column runs reads their scales from a shared-memory table that the first warp of
+    # its warpgroup writes per window, instead of loading (or shuffling) them itself.
+    promo_scale_table = chain.moe is not None and b_block is not None and sfb_groups > _GENERAL_BS_REG_SUM_MAX_SCALES
+    held = promo_cols + promo_chunk_cols + _GENERAL_BS_PROMO_SPARE_REGS
+    if chain.moe is None:
+        # The dense template builds every run's product ahead of the MMA.
+        promo_scales_ahead = True
+        promo_in_registers = promo_cols <= _GENERAL_BS_REG_SUM_MAX_COLS and sfb_groups <= _GENERAL_BS_REG_SUM_MAX_SCALES and held + all_scales <= promo_regs
+    elif promo_scale_table:
+        # A column pair's scales come from the warpgroup's table as the pair is folded: one 16-byte load in flight.
+        promo_scales_ahead = False
+        promo_in_registers = promo_cols <= _GENERAL_BS_REG_SUM_MAX_COLS and held + 4 * promo_mi_count <= promo_regs
+    else:
+        # A thread with few runs shuffles every run's scale out of its warp's grid while it waits for the MMA when
+        # its registers hold them all, and otherwise a column pair's as it folds the pair.
+        promo_scales_ahead = held + all_scales <= promo_regs
+        live_scales = all_scales if promo_scales_ahead else 2 * promo_mi_count
+        promo_in_registers = promo_cols <= _GENERAL_BS_REG_SUM_MAX_COLS and held + live_scales <= promo_regs
+
+    # SMEM: the A/B rings of the block-scale template, without scale-factor rings.
+    use_tma_store_epi = _use_tma_store_epi(chain, cfg)
+    epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else _combine_smem_bytes(chain, cfg)
+    ab_reserved = epi_reserved + _cluster_split_k_smem_bytes(chain, cfg)
+    ring_stage_bytes = [cta_m * k_bytes, (cta_n // cta_group) * k_bytes]
+    fixed_reserve = tmpl.smem_fixed_reserve
+    if tmpl.async_gather:
+        # As the source pipeline: tensor-map scratch grows with the token operands and the TMA outputs.
+        token_descs = chain.num_b_operands if isinstance(chain.moe, MoeSwapAbSpec) else chain.num_a_operands
+        fixed_reserve = max(fixed_reserve, align_up(2048 + 128 * (token_descs + len(_tma_slots_for(chain, cfg))), 1024))
+    if promo_scale_table:
+        # A scale table (32 fp32 runs per lane load) and its barrier per (promotion warpgroup, partial stage).
+        fixed_reserve += align_up(promo_groups * partial_stages * (4 * 32 * -(-sfb_groups // 32) + 8), 1024)
+    stages = smem_ab_stages(sum(ring_stage_bytes), smem_fixed_reserve=fixed_reserve, extra_smem_bytes=ab_reserved)
+    if chain.moe is not None and mm.K >= _GENERAL_BS_MOE_LONG_K_TILES * cta_k:
+        stages = min(stages, _GENERAL_BS_MOE_MAX_AB_STAGES)
+    budget = smem_ab_budget_bytes(fixed_reserve)
+    while stages:
+        ring_bytes = 0
+        for stage_bytes in ring_stage_bytes:
+            ring_bytes = align_up(ring_bytes, 1024) + stage_bytes * stages
+        if use_tma_store_epi:
+            ring_bytes = align_up(ring_bytes, 1024)
+        if ring_bytes + ab_reserved <= budget:
+            break
+        stages -= 1
+    if stages < 1:
+        raise NotImplementedError(f"general block scale {cfg.name!r}: no AB stage fits in SMEM including buffer alignment padding")
+    budget_stages = stages
+
+    def _roots(n):
+        return _block_scale_smem_desc_roots(header_bytes=fixed_reserve, rings=[("A[0]", ring_stage_bytes[0] * n), ("B[0]", ring_stage_bytes[1] * n)])
+
+    roots = _roots(stages)
+    while stages > 1 and max(roots.values()) >= _TCGEN05_DESC_BUILD_ADDR_LIMIT:
+        stages -= 1
+        roots = _roots(stages)
+    _check_block_scale_desc_roots(cfg, stages, roots)
+
+    return dict(
+        cta_k=cta_k,
+        inst_k=inst_k,
+        num_k_insts=cta_k // inst_k,
+        insts_per_window=promotion_k // inst_k,
+        a_desc=a_desc,
+        b_desc=b_desc,
+        acc_cols=acc_cols,
+        epi_cols_per_mma_m=epi_cols_per_mma_m,
+        acc_stages=acc_stages,
+        partial_stages=partial_stages,
+        promo_groups=promo_groups,
+        promo_cols=promo_cols,
+        promo_n_cols=promo_n_cols,
+        promo_mi_count=promo_mi_count,
+        promo_in_registers=promo_in_registers,
+        promo_scales_ahead=promo_scales_ahead,
+        promo_scale_table=promo_scale_table,
+        sfb_group_cols=sfb_group_cols,
+        sfb_groups=sfb_groups,
+        promo_chunk_cols=promo_chunk_cols,
+        promo_regs=promo_regs,
+        epi_regs=epi_regs,
+        gather_copy_regs=copy_regs,
+        ab_stages=stages,
+        budget_stages=budget_stages,
+        desc_roots=roots,
+        num_tmem_alloc_cols=total_tmem,
+    )
+
+
+def _render_general_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, tmpl) -> str:
+    """Tile and resource constants of the general block-scale template."""
+    _check_own_family(tmpl)
+    cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
+    plan = _general_block_scale_plan(chain, cfg)
+    mm, bs = chain.matmul, chain.block_scale
+    use_tma_store_epi = _use_tma_store_epi(chain, cfg)
+    fallback_cluster = _mixed_cga_fallback(cfg, tmpl.file)
+    cta_group = cfg.cta_group
+    cta_m, cta_n, cta_k = cfg.cta_tile_m, cfg.cta_tile_n, plan["cta_k"]
+    k_bytes = cfg.cta_tile_k_bytes
+    elem_bits = DTYPE_BITS[mm.a_dtype]
+    a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(chain, cfg)
+    a_lbo, a_sbo, a_k_step, a_group = plan["a_desc"]
+    b_lbo, b_sbo, b_k_step, b_group = plan["b_desc"]
+    swizzle = {128: ("s128b", "SWIZZLE_128B"), 64: ("s64b", "SWIZZLE_64B"), 32: ("s32b", "SWIZZLE_32B")}[k_bytes]
+    acc_stages, acc_cols = plan["acc_stages"], plan["acc_cols"]
+    epi_store_dt = _epi_store_dtype(chain, cfg)
+    out_dt = chain.output_dtype
+    a_block, b_block = bs.a_scale_block, bs.b_scale_block
+    chunk = plan["promo_chunk_cols"]
+    mma_acc = "cutlass.Int32" if mm.a_dtype == "int8" else "cutlass.Float32"
+    promo_regs, epi_regs = plan["promo_regs"], plan["epi_regs"]
+    gather_lines = []
+    if tmpl.async_gather:
+        side = "b" if isinstance(chain.moe, MoeSwapAbSpec) else "a"
+        gather_lines = [
+            f"{side}_gather_copy_bytes = 16",
+            f"{side}_gather_swizzle_bits = {int(math.log2(min(k_bytes, 128) // 16))}",
+            f"gather_ctl_reg_count = {_GENERAL_BS_GATHER_CTL_REGS}",
+        ]
+    lines = [
+        f"# General block-scale config: {cfg.name} data={mm.a_dtype}x{mm.b_dtype} "
+        f"scale A={bs.sf_dtype_a if bs.a_scaled else None}{a_block} B={bs.sf_dtype_b if bs.b_scaled else None}{b_block}",
+        f"cta_group = {cta_group}",
+        f"cta_tile_mnk = ({cta_m}, {cta_n // cta_group}, {cta_k})",
+        f"mma_size_m = {cfg.mma_size_m}",
+        f"mma_size_n = {cfg.mma_size_n}",
+        f"mma_size_k = {cfg.mma_size_k}",
+        f"cgrp_tile_mnk = ({cta_m * cfg.cga_size_m}, {cta_n * cfg.cga_size_n}, {cta_k * cfg.cga_size_k})",
+        f"cgrp_tile_m = {cta_m * cfg.cga_size_m}",
+        f"cgrp_tile_n = {cta_n * cfg.cga_size_n}",
+        f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n_for_chain(cfg, chain))}",
+        f"threads_per_cta = {tmpl.warps_per_cta * 32}",
+        f"cluster_shape_mnk = {cfg.cluster_shape}",
+        f"cluster_k_reduce = {cfg.cluster_k_reduce}",
+        f"cluster_reduce_elems = {_cluster_split_k_chunk_elems(chain, cfg) if cfg.cluster_k_reduce else 0}",
+        f"matmul_a_batch = {mm.a_batch}",
+        f"matmul_b_batch = {mm.b_batch}",
+        f"ab_stages = {plan['ab_stages']}",
+        f"# tcgen05 SMEM descriptor roots (bytes; each must stay < {_TCGEN05_DESC_BUILD_ADDR_LIMIT}): "
+        + " ".join(f"{name}={off}" for name, off in plan["desc_roots"].items()),
+        *(
+            [f"# ab_stages trimmed from {plan['budget_stages']} so every Tcgen05SmemDesc.build() root stays in range"]
+            if plan["ab_stages"] != plan["budget_stages"]
+            else []
+        ),
+        f"acc_stages = {acc_stages}",
+        "use_acc_overlap = False",
+        f"acc_stage_stride = {acc_cols}",
+        "acc_overlap_subtiles = 0",
+        "num_gemms = 1",
+        "num_a_operands = 1",
+        "num_b_operands = 1",
+        "gemm_a_idx = (0,)",
+        "gemm_b_idx = (0,)",
+        f"acc_region_cols = {acc_cols}",
+        f"acc_gemm_stride = {acc_stages * acc_cols}",
+        f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}",
+        f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
+        f"multicast_a = {cfg.multicast_a}",
+        f"multicast_b = {cfg.multicast_b}",
+        f"a_mcast_slices = {a_mcast_slices}",
+        f"a_tma_box_m = {_a_tma_box_m(cfg, a_mcast_slices)}",
+        f"b_mcast_slices = {b_mcast_slices}",
+        f"ab_empty_full_mask = {ab_empty_full_mask}",
+        "",
+        "# operand SMEM",
+        f"a_dtype = {DTYPE_TO_CUTLASS[mm.a_dtype]}",
+        f"b_dtype = {DTYPE_TO_CUTLASS[mm.b_dtype]}",
+        "a_smem_dtype = a_dtype",
+        "b_smem_dtype = b_dtype",
+        f"ab_max_data_bits = {elem_bits}",
+        "a_fake_dtype = a_dtype",
+        "b_fake_dtype = b_dtype",
+        f"a_packed_per_row = {cta_k}",
+        f"b_packed_per_row = {cta_k}",
+        f"sA_packed_elems = {cta_m * cta_k}",
+        f"sB_packed_elems = {(cta_n // cta_group) * cta_k}",
+        f"sA_tma_bytes = {cta_m * k_bytes}",
+        f"sB_tma_bytes = {(cta_n // cta_group) * k_bytes}",
+        "a_tma_desc_dtype = a_dtype",
+        "b_tma_desc_dtype = b_dtype",
+        "a_tma_format = None",
+        "b_tma_format = None",
+        f"a_tma_swizzle = _tma.TensorMapSwizzle.{swizzle[0]}",
+        f"b_tma_swizzle = _tma.TensorMapSwizzle.{swizzle[0]}",
+        f"a_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{swizzle[1]}",
+        f"b_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{swizzle[1]}",
+        f"a_smem_desc_leading_byte_offset = {a_lbo}",
+        f"a_smem_desc_stride_byte_offset = {a_sbo}",
+        f"a_smem_k_step_bytes = {a_k_step}",
+        f"a_tma_group_elems = {a_group}",
+        f"b_smem_desc_leading_byte_offset = {b_lbo}",
+        f"b_smem_desc_stride_byte_offset = {b_sbo}",
+        f"b_smem_k_step_bytes = {b_k_step}",
+        f"b_tma_group_elems = {b_group}",
+        f"a_is_m_major = {mm.a_major == 'm'}",
+        f"b_is_n_major = {mm.b_major == 'n'}",
+        f"mma_a_major = {1 if mm.a_major == 'm' else 0}",
+        f"mma_b_major = {1 if mm.b_major == 'n' else 0}",
+        f"a_smem_m_step_bytes = {(cta_m // cfg.mma_size_m) * k_bytes}",
+        "",
+        "# output",
+        f"cd_dtype = {DTYPE_TO_CUTLASS[out_dt]}",
+        f"epi_store_dtype = {DTYPE_TO_CUTLASS[epi_store_dt]}",
+        f"vec_bytes_epi = {_epi_vec_bytes(chain, cfg)}",
+        f"split_k_slices = {cfg.split_k_slices}",
+        *([f"splitk_reduce_elems = {_splitk_reduce_elems(chain)}"] if cfg.workspace_split_k else []),
+        f"frost_compile_options = {_frost_compile_options()!r}",
+        f"n_tma_outputs = {1 if (cfg.workspace_split_k and use_tma_store_epi) else len(_tma_slots_for(chain, cfg))}",
+        f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}",
+        f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}",
+        f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}",
+        f"epi_stage_rows = {_epi_stage_rows(cfg)}",
+        f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store_epi)}",
+        *_epi_swizzle_lines(cfg, epi_store_dt, chain),
+        f"epi_cols_per_mma_m = {plan['epi_cols_per_mma_m']}",
+        # The epilogue drains the fp32 main accumulator whatever the MMA accumulates.
+        "mma_c_dtype = cutlass.Float32",
+        f"num_tmem_alloc_cols = {plan['num_tmem_alloc_cols']}",
+        f"tmem_alloc_exclusive = {plan['num_tmem_alloc_cols'] > _MAX_NON_EXCLUSIVE_TMEM_COLS}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
+        "",
+        f"# plain MMA: {plan['num_k_insts']} instructions of K={plan['inst_k']} per K tile",
+        f"mma_kind = {DTYPE_TO_MMA_KIND[mm.a_dtype]}",
+        f"mma_a_dtype = {DTYPE_TO_CUTLASS[mm.a_dtype]}",
+        f"mma_b_dtype = {DTYPE_TO_CUTLASS[mm.b_dtype]}",
+        f"mma_acc_dtype = {mma_acc}",
+        f"mma_m_dim = {cfg.mma_tile_m * cta_group}",
+        f"mma_n_dim = {cfg.mma_tile_n}",
+        f"num_k_insts = {plan['num_k_insts']}",
+        f"mma_inst_k_elems = {plan['inst_k']}",
+        "",
+        f"# promotion: every scale is constant over {bs.promotion_k} K elements = {plan['insts_per_window']} MMA instruction(s)",
+        f"insts_per_window = {plan['insts_per_window']}",
+        f"partial_stages = {plan['partial_stages']}",
+        f"partial_col_base = {acc_stages * acc_cols}",
+        f"num_promo_groups = {plan['promo_groups']}",
+        f"promo_cols = {plan['promo_cols']}",
+        f"promo_mi_count = {plan['promo_mi_count']}",
+        f"promo_n_cols = {plan['promo_n_cols']}",
+        f"promo_in_registers = {plan['promo_in_registers']}",
+        f"promo_scales_ahead = {plan['promo_scales_ahead']}",
+        f"promo_scale_table = {plan['promo_scale_table']}",
+        f"promo_chunk_cols = {chunk}",
+        f"promo_chunks = {plan['promo_n_cols'] // chunk}",
+        f"promo_reg_count = {promo_regs}",
+        f"epi_reg_count = {epi_regs}",
+        f"sfa_present = {a_block is not None}",
+        f"sfb_present = {b_block is not None}",
+    ]
+    if a_block is not None:
+        lines += [
+            f"sfa_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype_a]}",
+            f"sfa_block_m = {a_block[1]}",
+            f"sfa_block_k = {a_block[2]}",
+            f"sfa_batch_broadcast = {bs.sfa_dim is not None and bs.sfa_dim[0] == 1}",
+        ]
+    if b_block is not None:
+        lines += [
+            f"sfb_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype_b]}",
+            f"sfb_block_k = {b_block[1]}",
+            f"sfb_block_n = {b_block[2]}",
+            f"sfb_batch_broadcast = {bs.sfb_dim is not None and bs.sfb_dim[0] == 1}",
+        ]
+    sfb_group_cols = plan["sfb_group_cols"]
+    lines += [
+        f"sfb_group_cols = {sfb_group_cols}",
+        f"sfb_groups = {plan['sfb_groups']}",
+    ]
+    if chain.has_moe:
+        lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+    lines.extend(gather_lines)
+    lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
+    lines.extend(_quant_device_imports(chain))
+    return "\n".join(lines)
+
+
 def _render_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
@@ -1810,7 +2226,8 @@ def _render_block_scale_template(
     host_aux_pass = _aux_call_block(aux_tensors)
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_out_vec_bytes(chain, config, use_tma)))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
-    tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
+    general = _is_general_block_scale(chain)
+    tile_constants = (_render_general_block_scale_tile_constants if general else _render_block_scale_tile_constants)(config, chain, tmpl)
     tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
     tile_constants += f"\nmoe_combine = {chain.has_moe and chain.moe.mode == 'combine'}"
     tile_constants += f"\nmoe_combine_bulk_enabled = {_use_bulk_combine(chain, config)}"
@@ -1842,23 +2259,26 @@ def _render_block_scale_template(
     na, nb = chain.num_a_operands, chain.num_b_operands
     bs = chain.block_scale
     assert bs is not None
-    nsa = 0 if bs.fake_dequant_a else na
-    nsb = 0 if bs.fake_dequant_b else nb
+    # A fake (raw FP8) or unscaled side reads no scale tensor.
+    nsa = na if bs.a_scaled else 0
+    nsb = nb if bs.b_scaled else 0
     _G = "cutlass.GridConstant[_tma.TensorMap]"
-    kernel_ab_desc_params = (
-        ",\n".join(
-            [f"tma_a_desc_{i}: {_G}" for i in range(na)]
-            + [f"tma_b_desc_{j}: {_G}" for j in range(nb)]
-            + [f"tma_sfa_desc_{i}: {_G}" for i in range(nsa)]
-            + [f"tma_sfb_desc_{j}: {_G}" for j in range(nsb)]
+    if general:
+        # The promotion warps index the scale tensors themselves: no tensor maps.
+        sf_kernel_params = [f"mSFA_{i}: cute.Tensor" for i in range(nsa)] + [f"mSFB_{j}: cute.Tensor" for j in range(nsb)]
+        sf_lists = "sfa_tensors = [" + ", ".join(f"mSFA_{i}" for i in range(nsa)) + "]\nsfb_tensors = [" + ", ".join(f"mSFB_{j}" for j in range(nsb)) + "]"
+        sf_kernel_pass = [f"_sfa_operands[{i}]" for i in range(nsa)] + [f"_sfb_operands[{j}]" for j in range(nsb)]
+    else:
+        sf_kernel_params = [f"tma_sfa_desc_{i}: {_G}" for i in range(nsa)] + [f"tma_sfb_desc_{j}: {_G}" for j in range(nsb)]
+        sf_lists = (
+            "tma_sfa_descs = [" + ", ".join(f"tma_sfa_desc_{i}" for i in range(nsa)) + "]\n"
+            "tma_sfb_descs = [" + ", ".join(f"tma_sfb_desc_{j}" for j in range(nsb)) + "]"
         )
-        + ","
-    )
+        sf_kernel_pass = [f"tma_sfa_desc_list[{i}]" for i in range(nsa)] + [f"tma_sfb_desc_list[{j}]" for j in range(nsb)]
+    kernel_ab_desc_params = ",\n".join([f"tma_a_desc_{i}: {_G}" for i in range(na)] + [f"tma_b_desc_{j}: {_G}" for j in range(nb)] + sf_kernel_params) + ","
     ab_desc_lists = (
         "tma_a_descs = [" + ", ".join(f"tma_a_desc_{i}" for i in range(na)) + "]\n"
-        "tma_b_descs = [" + ", ".join(f"tma_b_desc_{j}" for j in range(nb)) + "]\n"
-        "tma_sfa_descs = [" + ", ".join(f"tma_sfa_desc_{i}" for i in range(nsa)) + "]\n"
-        "tma_sfb_descs = [" + ", ".join(f"tma_sfb_desc_{j}" for j in range(nsb)) + "]"
+        "tma_b_descs = [" + ", ".join(f"tma_b_desc_{j}" for j in range(nb)) + "]\n" + sf_lists
     )
     host_ab_params = (
         ",\n".join(
@@ -1875,15 +2295,7 @@ def _render_block_scale_template(
         "_sfa_operands = [" + ", ".join(f"sfa_{i}" for i in range(nsa)) + "]\n"
         "_sfb_operands = [" + ", ".join(f"sfb_{j}" for j in range(nsb)) + "]"
     )
-    host_kernel_desc_pass = (
-        ",\n".join(
-            [f"tma_a_desc_list[{i}]" for i in range(na)]
-            + [f"tma_b_desc_list[{j}]" for j in range(nb)]
-            + [f"tma_sfa_desc_list[{i}]" for i in range(nsa)]
-            + [f"tma_sfb_desc_list[{j}]" for j in range(nsb)]
-        )
-        + ","
-    )
+    host_kernel_desc_pass = ",\n".join([f"tma_a_desc_list[{i}]" for i in range(na)] + [f"tma_b_desc_list[{j}]" for j in range(nb)] + sf_kernel_pass) + ","
     compile_ab_fakes = "\n".join(
         [f"fake_a_{i} = _make_fake_a()" for i in range(na)]
         + [f"fake_b_{j} = _make_fake_b()" for j in range(nb)]
@@ -2005,11 +2417,18 @@ def _render_block_scale_template(
                 "INJECT_MOE_KERNEL_MA_PARAMS": moe_kernel_ma_params,
                 "INJECT_MOE_MA_LIST": moe_ma_list,
                 "INJECT_MOE_HOST_MA_PASS": moe_host_ma_pass,
-                "INJECT_MOE_KERNEL_MSFA_PARAMS": moe_kernel_msfa_params,
-                "INJECT_MOE_MSFA_LIST": moe_msfa_list,
-                "INJECT_MOE_HOST_MSFA_PASS": moe_host_msfa_pass,
             }
         )
+        # The general grouped templates take the scale tensors with the operand descriptors (sfa_tensors /
+        # sfb_tensors); only the block-scaled MMA pipelines patch a scale-factor descriptor per group.
+        if not general:
+            replacements.update(
+                {
+                    "INJECT_MOE_KERNEL_MSFA_PARAMS": moe_kernel_msfa_params,
+                    "INJECT_MOE_MSFA_LIST": moe_msfa_list,
+                    "INJECT_MOE_HOST_MSFA_PASS": moe_host_msfa_pass,
+                }
+            )
 
     if _use_bulk_combine(chain, config):
         # The template stages COMBINE fragments and reduces each complete row.
@@ -2902,16 +3321,42 @@ def _precheck_block_scale(
     _check_own_family(select_template(chain, config))
 
 
-def _precheck_moe_block_scale(
+def _precheck_general_block_scale(
     chain: FusionChain,
     config: TileConfig,
 ) -> None:
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
+    reason = mma_arch_reject(chain, GraphType.GENERAL_BLOCK_SCALE_MATMUL, config.pipeline)
+    if reason is not None:
+        raise NotImplementedError(reason)
+    _check_input_alignment(chain)
+    for red in chain.reductions:
+        if red.compute_dtype != "fp32" or red.dtype != "fp32":
+            raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
+    tmpl = select_template(chain, config)
+    _check_own_family(tmpl)
+    reason = tmpl.active_reject(config)
+    if reason is not None:
+        raise NotImplementedError(reason)
+    _check_dtype_config_compat(chain, config)
+    _general_block_scale_plan(chain, config)
+    _compute_output_vec_bytes(chain)
+    _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
+
+
+def _precheck_moe_block_scale(
+    chain: FusionChain,
+    config: TileConfig,
+) -> None:
+    from ..kernel_registry import GraphType, classify_graph_type, mma_arch_reject, select_template
+
     _check_executable(chain)
-    # Ahead of mma_arch_reject, whose GATHER token-SF check would name a floor(K / block_size) shape.
-    _check_whole_scale_blocks(chain)
-    reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
+    general = _is_general_block_scale(chain)
+    if not general:
+        # Ahead of mma_arch_reject, whose GATHER token-SF check would name a floor(K / block_size) shape.
+        _check_whole_scale_blocks(chain)
+    reason = mma_arch_reject(chain, classify_graph_type(chain) if general else GraphType.MOE_BLOCK_SCALE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
     token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
@@ -2937,6 +3382,8 @@ def precheck_path(
     """Every gate the matching ``_jit_*`` path runs before it renders anything."""
     if chain.has_moe and chain.has_block_scale:
         _precheck_moe_block_scale(chain, config)
+    elif chain.has_block_scale and _is_general_block_scale(chain):
+        _precheck_general_block_scale(chain, config)
     elif chain.has_block_scale:
         _precheck_block_scale(chain, config)
     elif chain.has_moe:
@@ -2975,7 +3422,9 @@ def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | No
 
     state = _state_from_graph(graph)
     chain, binding = _analyze_state(state)
-    _check_block_scale_sign(state)
+    # The general template multiplies the accumulator by each scale's signed value.
+    if not (chain.has_block_scale and _is_general_block_scale(chain)):
+        _check_block_scale_sign(state)
     return chain, binding
 
 
@@ -3321,7 +3770,10 @@ def _jit_block_scale(
     binding: "GemmBinding | None" = None,
 ) -> CompiledFusedGemm:
     """JIT path for block-scaled (FP4 / FP8 + per-block SF) matmul."""
-    _precheck_block_scale(chain, config)
+    if _is_general_block_scale(chain):
+        _precheck_general_block_scale(chain, config)
+    else:
+        _precheck_block_scale(chain, config)
     return _compile_fused_gemm(chain, config, binding=binding)
 
 
@@ -3374,8 +3826,15 @@ def _jit_moe_block_scale(
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
+        # One descriptor per token operand, one per token scale factor the block-scaled MMA pipelines load
+        # (the general templates read their scales without a descriptor), one per TMA output.
         _desc_slots_per_cta=token_operands
-        + (0 if (chain.block_scale.fake_dequant_b if isinstance(chain.moe, MoeSwapAbSpec) else chain.block_scale.fake_dequant_a) else token_operands)
+        + (
+            0
+            if _is_general_block_scale(chain)
+            or (chain.block_scale.fake_dequant_b if isinstance(chain.moe, MoeSwapAbSpec) else chain.block_scale.fake_dequant_a)
+            else token_operands
+        )
         + len([m for m in store_modes if m == "tma"]),
         store_modes=store_modes,
         use_tma_store=use_tma,
