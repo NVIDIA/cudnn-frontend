@@ -120,6 +120,7 @@ def test_sm80_backward_rows_decline_the_envelopes_that_cannot_fit():
 
 def test_thor_rides_the_sm100_rows():
     thor = (11, 0)
+    assert thor in fwd_engines._THD_ORIGIN_CCS
     assert _served(_family(fwd_engines.ENGINE_SPECS, 100), fwd_engines.mismatch, _fwd_facts(device_cc=thor))
     rubin_fwd = _family(fwd_engines.ENGINE_SPECS, 107) + [
         _row(fwd_engines.ENGINE_SPECS, n) for n in ("sdpa_fwd_prefill_sm107_mxfp8", "sdpa_fwd_prefill_sm107_fp8")

@@ -241,6 +241,7 @@ _LOG = logging.getLogger(__name__)
 _BLACKWELL = (100, 119)
 _RUBIN = (107, 109)
 _THOR = 110
+_THD_ORIGIN_CCS = ((10, 0), (10, 3), (11, 0))  # the SM100-line parts whose THD graphs compile the independent-origin specialization
 _BLACKWELL_GEFORCE = (120, 129)
 
 
@@ -5238,7 +5239,7 @@ def lower_dsl_prefill(
             facts.thd
             and not getattr(api, "thd_decode_leg", False)
             and facts.epilogue_gate_t is None
-            and (facts.device_cc in ((10, 0), (10, 3)) or (facts.device_cc == (10, 7) and facts.d_qk == 128 and not (facts.is_fp8 or facts.is_mxfp8)))
+            and (facts.device_cc in _THD_ORIGIN_CCS or (facts.device_cc == (10, 7) and facts.d_qk == 128 and not (facts.is_fp8 or facts.is_mxfp8)))
             and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
             and (
                 (

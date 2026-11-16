@@ -165,7 +165,7 @@ def test_adapter_is_the_sm100_chain_over_the_cc107_twin(monkeypatch):
         if not twin:
             base = api_dsl.SdpaBwdDslSm100._stage2_record(None, fields)
             assert type(base) is TemplateParams, "the 4x1 record is the BASE TemplateParams (its PTX md5 is pinned)"
-    assert api_dsl._rubin_line(107) and api_dsl._rubin_line(119) and not api_dsl._rubin_line(106) and not api_dsl._rubin_line(120)
+    assert api_dsl._rubin_line(107) and api_dsl._rubin_line(109) and not api_dsl._rubin_line(106) and not api_dsl._rubin_line(110)
     assert Path(_kernel_path()).is_file() and Path(_kernel_path(_SM100_FILE)).is_file()
 
 
