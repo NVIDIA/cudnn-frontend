@@ -9,7 +9,7 @@ module.
 """
 
 from cudnn._cutlass_compat import SmemAllocator, TmemAllocator, get_num_tmem_alloc_cols, get_smem_capacity_in_bytes
-from cudnn.frost.device import device_context
+from cudnn.frost.device import build_target, device_context
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal, Optional, Tuple, Type, Union
@@ -40,7 +40,6 @@ from cutlass.cutlass_dsl import if_generate as _if_generate
 from cutlass._mlir.dialects import nvvm
 
 from .epilogue import get_epilogue_op
-from .._cutedsl import build_target
 from ..tile_config import ConvTileConfig, _get_config
 
 
@@ -3628,7 +3627,7 @@ def _compile_cached(
     """Compile an SM100 NVFP4 convolution from plan-time graph metadata.
 
     The input/filter/output shapes, the resolved tile configuration and the
-    build device with its target (``_cutedsl.build_target``) form the cache
+    build device with its target (``cudnn.frost.device.build_target``) form the cache
     key. Padding, stride, and dilation remain runtime launch arguments;
     configurations producing the same tensor shapes share one artifact.
     Aligned fake tensors define the TVM-FFI launch ABI, so compilation never

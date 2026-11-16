@@ -8,6 +8,8 @@ from dataclasses import replace
 
 import pytest
 
+from cudnn.conv.frost.utils import _channels_last_3d_stride
+
 from utils import make_input, requires_dense_cutedsl, requires_sm100, select_and_build_frost_plan
 from test_conv_shapes import ConvCase, _SHAPE_CASES, test_frost_conv_supported_shapes_and_geometry as run_shape
 
@@ -146,7 +148,7 @@ def test_separate_graphs_reuse_and_replay(monkeypatch, dynamic, cta_group, dtype
 def test_dynamic_plan_rejects_changed_binding_before_launch(monkeypatch, bad_role, bad_field):
     from types import SimpleNamespace
     import cudnn
-    from cudnn.conv.frost import engine
+    from cudnn.conv.frost import fprop_engine as engine
     from cudnn.engines.base import ExecutionContext
 
     shapes = [(1, 64, 3, 5, 7), (40, 64, 1, 2, 3), (1, 40, 3, 4, 5)]
@@ -156,7 +158,7 @@ def test_dynamic_plan_rejects_changed_binding_before_launch(monkeypatch, bad_rol
     plan = engine._Sm100FrostConvPlan(lambda *a: calls.append(a), declarations, 0, ((0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1)))
     operands = []
     for index, shape in enumerate(shapes):
-        stride = engine._channels_last_3d_stride(shape)
+        stride = _channels_last_3d_stride(shape)
         operand = SimpleNamespace(shape=shape, dtype="bfloat16", stride=lambda stride=stride: stride, data_ptr=lambda: 16, permute=lambda *a: object())
         if index == bad_role:
             if bad_field == "shape":

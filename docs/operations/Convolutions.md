@@ -199,3 +199,76 @@ dW.set_output(True).set_dim(list(W.get_dim())).set_stride(list(W.get_stride()))
 ```
 
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
+
+### Experimental FROST weight gradient
+
+`frost_conv_wgrad` executes a single `graph.conv_wgrad(image=X, loss=dY, ...)`
+through the existing graph planning and execution API. Enable experimental
+engines with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; this engine remains behind
+backend plans in automatic ranking. Select its plan explicitly when qualifying
+it. Forward convolution and weight gradients have separate engine families;
+`frost_conv_wgrad` owns slot 0 of the weight-gradient family (engine ID 21200).
+Public engine/knob records can be replayed with `create_execution_plan`.
+
+The functional implementation accepts:
+
+- SM100 or SM103 and CuTeDSL 4.9 or newer. SM100 has execution evidence;
+  SM103 and other compiler versions/flavors remain unverified.
+- Matching X/dY storage from FP16, BF16, FP32 (TF32 MMA), FP8 E4M3, or
+  FP8 E5M2, independently combined with any of those five dW storage types.
+  Accumulation is FP32. FP8 is unscaled; scale tensors are not accepted.
+- Positive rank-5 compact channels-last tensors: logical NCDHW for X,
+  NKZPQ for dY, and KCTRS for dW. Declare dW dimensions and strides explicitly.
+  Ungrouped cross-correlation only.
+- Independent pre/post padding, spatial strides from 1 through 8, and positive
+  dilation. Each axis must satisfy `(filter_extent - 1) * dilation <= 31`.
+  The rank-5 im2col corners are
+  `lower = -padding_before` and
+  `upper = padding_after - (filter_extent - 1) * dilation`, both in `[-16, 15]`.
+  Padding is nonnegative and output dimensions must be positive.
+- Partial channel and reduction tiles. Every tensor address and channel-row
+  pitch must be 16-byte aligned: K must be a multiple of `16 / input_bytes`,
+  and C a multiple of both `16 / input_bytes` and `16 / output_bytes`.
+  `L = N * Z * P * Q` is the reduction length, distinct from output-channel K;
+  L need not fill a reduction stage. Descriptor and signed 32-bit scheduler
+  bounds are checked before compilation.
+- One optional unary epilogue from the existing FROST convolution vocabulary,
+  including ReLU slope/clips, leaky-ReLU slope, and swish beta. Its virtual
+  intermediate and computation must be FP32. The epilogue runs once after
+  the entire reduction, before conversion to dW storage. Extra graph nodes
+  and materialized intermediates are declined.
+
+The conservative default remains `TILE_M=128`, `TILE_N=128`, `TILEK=128`
+(bytes), `CTA_GROUP=1`, and `STAGES=3`. Public knob replay permits M=64/128,
+N=32 through 256 in steps of 32, reduction stages of 64/128 bytes, and
+one-/two-CTA MMA groups. M is per CTA; N is the output width of the MMA
+(the paired CTAs stage half of operand X's N channels each). Two accumulator
+stages and two output-store stages remain fixed.
+
+The implemented TMEM load/store paths impose these epilogue restrictions:
+
+| Per-CTA M | CTA group | dW dtype | Legal TILE_N |
+| --- | --- | --- | --- |
+| 64 | 1 | FP8 E4M3/E5M2 | Multiples of 64 |
+| 64 | 1 | FP16/BF16/FP32 | Multiples of 32 |
+| 64 | 2 | All five | Multiples of 64 |
+| 128 | 1 or 2 | All five | Multiples of 32 |
+
+Every work item completes the unsplit reduction for one `(K, C)` output tile
+and one filter position. The persistent kernel uses tiled dY TMA loads,
+im2col X TMA loads, MN-major MMA operands, and tiled dW TMA stores. TF32 uses
+128-byte swizzling with 32-byte atomicity. Rank-5 im2col filter offsets are
+five bits; the engine rejects larger offsets before kernel compilation. Execution
+launches one kernel on the caller's stream, needs zero workspace bytes, and
+supports CUDA-graph capture.
+
+Tensor dimensions and convolution geometry are runtime values. Supported shapes
+share one compiled artifact per device/target, input/output dtype, pipeline
+configuration, and epilogue (including scalar attributes). Unsupported
+configurations decline before JIT compilation. There is no performance-based
+configuration selector in this milestone.
+
+Replay determinism and batch-reduction invariance are separate: dW reduces the
+batch axis, so splitting or reordering that reduction can change FP32 rounding.
+See the [determinism support page](/operations/determinism) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/determinism.md))
+and [qualification report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient-milestone-2).

@@ -5,8 +5,8 @@
 
 The analyzer deliberately separates graph matching from kernel compilation so
 new fusion patterns can be added without growing conditionals in the engine.
-Currently accepted patterns are a single convolution and a convolution whose
-output feeds one supported unary pointwise epilogue.
+Forward convolutions support the fusion patterns described by ``analyze_fprop``;
+weight gradients accept a convolution with an optional unary epilogue.
 """
 
 from __future__ import annotations
@@ -81,6 +81,46 @@ class ConvGraph:
     epilogue_node: Optional[Node] = None
     block_scale_data: BlockScaleData | None = None
     output_quantize_data: OutputQuantizeData | None = None
+
+
+@dataclass(frozen=True)
+class WgradGraph:
+    """The materialized X, dY, and dW tensors for a weight-gradient graph."""
+
+    context: GraphContext
+    conv_node: Node
+    image: Tensor
+    loss: Tensor
+    weight: Tensor
+    epilogue: str = "identity"
+    epilogue_attrs: tuple[tuple[str, float], ...] = ()
+    epilogue_node: Optional[Node] = None
+
+
+def analyze_wgrad(graph: pygraph) -> WgradGraph:
+    """Match wgrad and an optional unary suffix without importing the kernel."""
+    convs = [n for n in graph.nodes if n.node_type == NodeType.CONV_WGRAD]
+    if len(convs) != 1:
+        raise NotImplementedError("frost_conv_wgrad requires one CONV_WGRAD node")
+    node = convs[0]
+    if set(node.inputs) != {"image", "loss"} or set(node.outputs) != {"DW"}:
+        raise NotImplementedError("frost_conv_wgrad requires image, loss, and DW ports")
+    x, dy, dw = node.inputs["image"], node.inputs["loss"], node.outputs["DW"]
+    mode, attrs, epi = "identity", (), None
+    output = dw
+    if match := _match_pointwise_epilogue_node(graph, dw):
+        mode, attrs, epi, output = match
+        if len(epi.inputs) != 1 or len(epi.outputs) != 1:
+            raise NotImplementedError("frost_conv_wgrad requires a unary epilogue with one input and one output")
+        if not dw.is_virtual:
+            raise NotImplementedError("frost_conv_wgrad requires a virtual intermediate before its unary epilogue")
+        if tuple(dw.dim) != tuple(output.dim) or tuple(dw.stride) != tuple(output.stride):
+            raise NotImplementedError("frost_conv_wgrad epilogue must preserve dW shape and layout")
+    if any(n not in (node, epi) for n in graph.nodes):
+        raise NotImplementedError("frost_conv_wgrad supports only a unary epilogue")
+    if any(t.is_virtual for t in (x, dy, output)):
+        raise NotImplementedError("frost_conv_wgrad requires materialized X, dY and dW")
+    return WgradGraph(graph.context, node, x, dy, output, mode, attrs, epi)
 
 
 def _conv_operands(node: Node) -> tuple[Tensor, Tensor, Tensor]:
@@ -181,7 +221,7 @@ def _match_block_scale_quantize(graph: pygraph, tensor: Tensor) -> Optional[tupl
     return output_quantize_data, graph_output
 
 
-def analyze(graph: pygraph) -> ConvGraph:
+def analyze_fprop(graph: pygraph) -> ConvGraph:
     """Describe a structurally supported Frost convolution graph.
 
     The accepted graph grammar is one convolution, optionally followed by one
@@ -285,4 +325,4 @@ def analyze(graph: pygraph) -> ConvGraph:
     )
 
 
-__all__ = ["BlockScaleData", "ConvGraph", "OutputQuantizeData", "SUPPORTED_UNARY_EPILOGUES", "analyze"]
+__all__ = ["BlockScaleData", "ConvGraph", "OutputQuantizeData", "SUPPORTED_UNARY_EPILOGUES", "WgradGraph", "analyze_fprop", "analyze_wgrad"]

@@ -11,216 +11,55 @@ its graph-specialized block-scale template.
 """
 
 from math import prod
-from typing import Optional, Sequence
 
 import cudnn
 import cutlass
 from cuda.bindings import driver as _cuda
-from cudnn import behavior_note, GraphContext, data_type
-from cudnn.datatypes import _cudnn_to_frost_dtype_name
+from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig, require_stream
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 from cudnn.frost.device import current_device
-from cudnn.conv.frost.graph_analyzer import analyze, ConvGraph
+from cudnn.conv.frost.graph_analyzer import analyze_fprop, ConvGraph
 from cudnn._pygraph import pygraph
 
-from ._cutedsl import BLOCK_SCALE_CUTEDSL_MIN_VERSION, DENSE_CUTEDSL_MIN_VERSION, requirement_error as cutedsl_requirement_error
+from .checks import (
+    BLOCK_SCALE_CUTEDSL_MIN_VERSION,
+    DENSE_CUTEDSL_MIN_VERSION,
+    _check_sm100,
+    _check_cutedsl,
+    _check_5d_inputs,
+    _check_matching_channels,
+    _check_conv_mode,
+    _check_3d_conv_geometry,
+    _check_output_shapes,
+    _check_alignment,
+    _check_channels_last_3d_layout,
+    _check_fp32_compute_type,
+)
+from cudnn.frost.buffers import (
+    FP4_RUNTIME_DTYPES as _FP4_RUNTIME_DTYPES,
+    ceil_div as _ceil_div,
+    dense_span as _dense_span,
+    logical_storage_bytes as _logical_storage_bytes,
+    operand_storage_bytes as _operand_storage_bytes,
+    reordering_name as _reordering_name,
+    runtime_dtype_names as _runtime_dtype_names,
+)
+from .utils import (
+    _BLOCK_SCALE_OUTPUT_SPECS,
+    _CUTLASS_STORAGE_DTYPES,
+    _ONE,
+    _ZERO,
+    _storage_dtype_name,
+    _input_channel_tile,
+    _tuple_param,
+    _channels_last_3d_stride,
+    _physical_channel_shape,
+    _cutlass_block_scale_output_dtype,
+)
 
 _MISSING_DEVICE = object()
-_ZERO = (0, 0, 0)
-_ONE = (1, 1, 1)
-_CUTLASS_STORAGE_DTYPES = {
-    "float16": cutlass.Float16,
-    "bfloat16": cutlass.BFloat16,
-    "float32": cutlass.Float32,
-    "float8_e4m3fn": cutlass.Float8E4M3FN,
-    "float8_e5m2": cutlass.Float8E5M2,
-}
-_FP4_RUNTIME_DTYPES = frozenset(("code17_4", "float4_e2m1fn_x2"))
-_BLOCK_SCALE_OUTPUT_SPECS = {
-    cudnn.data_type.FLOAT: ("float32", 32),
-    cudnn.data_type.HALF: ("float16", 16),
-    cudnn.data_type.BFLOAT16: ("bfloat16", 16),
-    cudnn.data_type.FP8_E4M3: ("float8_e4m3fn", 8),
-    cudnn.data_type.FP8_E5M2: ("float8_e5m2", 8),
-    cudnn.data_type.FP4_E2M1: ("float4_e2m1fn_x2", 4),
-}
-
-
-def _storage_dtype_name(data_type) -> Optional[str]:
-    name = _cudnn_to_frost_dtype_name(data_type)
-    return name if name in _CUTLASS_STORAGE_DTYPES else None
-
-
-def _input_channel_tile(dtype_name: str) -> int:
-    """Channel elements covered by the narrowest supported mainloop K tile."""
-    return 128 // buffers.DTYPE_ITEMSIZE[dtype_name]
-
-
-def _tuple_param(node, name: str, default: Sequence[int]) -> tuple[int, ...]:
-    value = node.params.get(name)
-    return tuple(default if value is None else value)
-
-
-def _channels_last_3d_stride(dim: Sequence[int]) -> tuple[int, ...]:
-    """Compact NCDHW/KCTRS stride with channel (axis 1) contiguous."""
-    _n, c, d, h, w = (int(x) for x in dim)
-    return (c * d * h * w, 1, h * w * c, w * c, c)
-
-
-def _expected_output_shape(image, weight, pre_padding, post_padding, stride, dilation) -> tuple[int, ...]:
-    spatial = tuple((image[i] + pre_padding[i - 2] + post_padding[i - 2] - dilation[i - 2] * (weight[i] - 1) - 1) // stride[i - 2] + 1 for i in range(2, 5))
-    return (image[0], weight[0], *spatial)
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
-
-
-def _reordering_name(tensor) -> Optional[str]:
-    reordering = getattr(tensor, "reordering_type", None)
-    name = getattr(reordering, "name", None)
-    if name in (None, "NONE"):
-        return None
-    return name
-
-
-def _dense_span(shape, stride) -> int:
-    return 1 + sum((int(extent) - 1) * int(step) for extent, step in zip(shape, stride))
-
-
-def _logical_storage_bytes(shape: Sequence[int], bits: int) -> int:
-    """Storage bytes for a compact logical tensor, including sub-byte types."""
-    total_bits = prod(int(extent) for extent in shape) * int(bits)
-    if total_bits % 8:
-        raise ValueError(f"frost_conv: logical shape {tuple(shape)} at {bits} bits per element is not byte-packable")
-    return total_bits // 8
-
-
-def _physical_channel_shape(shape: Sequence[int], bits: int) -> tuple[int, ...]:
-    """Translate a logical channels-first graph shape to its runtime carrier."""
-    shape = tuple(int(extent) for extent in shape)
-    if bits != 4:
-        return shape
-    if shape[1] % 2:
-        raise ValueError(f"frost_conv: packed FP4 channel extent must be even; got {shape[1]}")
-    return (shape[0], shape[1] // 2, *shape[2:])
-
-
-def _runtime_dtype_names(dtype_name: str, bits: int) -> frozenset[str]:
-    return _FP4_RUNTIME_DTYPES if bits == 4 else frozenset((dtype_name,))
-
-
-def _operand_storage_bytes(operand) -> int:
-    """Runtime span in bytes without consulting the byte-only shared dtype map."""
-    if operand.dtype in _FP4_RUNTIME_DTYPES:
-        # Native DLPack FP4 reports a four-bit element whose C++ element_size()
-        # is zero. Runtime shapes are already packed two logical values/byte.
-        return int(operand.numel())
-    return int(operand.numel()) * int(operand.element_size())
-
-
-def _check_sm100():
-    sm = buffers.current_sm()
-    if sm not in (100, 103):  # the SM100-family kernels compile for the device's own target
-        raise NotImplementedError(f"frost_conv requires SM100 or SM103, but found {sm}")
-
-
-def _check_cutedsl(what: str, minimum_version: tuple[int, int]) -> None:
-    error = cutedsl_requirement_error(what, minimum_version)
-    if error is not None:
-        raise NotImplementedError(error)
-
-
-def _cutlass_block_scale_output_dtype(data_type):
-    if data_type == cudnn.data_type.FP4_E2M1:
-        return cutlass.Float4E2M1FN
-
-    dtype_name = _storage_dtype_name(data_type)
-    if dtype_name is None:
-        raise NotImplementedError(f"frost_conv: unsupported block-scaled convolution output dtype {data_type}")
-    return _CUTLASS_STORAGE_DTYPES[dtype_name]
-
-
-def _check_5d_inputs(tensors) -> None:
-    """Require positive rank-5 logical tensors, naming every offender."""
-    bad_rank = tuple(role for role, tensor in tensors if len(tensor.dim) != 5)
-    if bad_rank:
-        raise NotImplementedError(f"frost_conv: tensors {bad_rank} must be rank-5")
-    bad_extents = tuple(role for role, tensor in tensors if any(int(extent) <= 0 for extent in tensor.dim))
-    if bad_extents:
-        raise NotImplementedError(f"frost_conv: tensors {bad_extents} must have positive extents")
-
-
-def _check_matching_channels(image, weight) -> None:
-    if image.dim[1] != weight.dim[1]:
-        raise NotImplementedError(f"frost_conv: image/filter channels differ ({image.dim[1]} vs {weight.dim[1]})")
-
-
-def _check_conv_mode(node, expected_mode=cudnn._pybind_module.convolution_mode.CROSS_CORRELATION):
-    """Checks if the convolution mode of node matches expected_mode."""
-    conv_mode = node.params.get("convolution_mode", cudnn._pybind_module.convolution_mode.CROSS_CORRELATION)
-    if conv_mode != expected_mode:
-        raise NotImplementedError(f"frost_conv: expect convolution mode to be {expected_mode} but got {conv_mode}")
-
-
-def _check_3d_conv_geometry(node, image, weight):
-    """Validate shared 3D im2col limits and return the output shape."""
-    pre_padding = _tuple_param(node, "pre_padding", _ZERO)
-    post_padding = _tuple_param(node, "post_padding", _ZERO)
-    stride = _tuple_param(node, "stride", _ONE)
-    dilation = _tuple_param(node, "dilation", _ONE)
-    params = (pre_padding, post_padding, stride, dilation)
-    if any(len(value) != 3 for value in params):
-        raise NotImplementedError("frost_conv requires three spatial convolution parameters")
-    if any(value < 0 for value in (*pre_padding, *post_padding)):
-        raise NotImplementedError("frost_conv requires non-negative padding")
-    if any(value <= 0 for value in (*stride, *dilation)):
-        raise NotImplementedError("frost_conv requires positive stride and dilation")
-    if any(value > 8 for value in stride):
-        raise NotImplementedError("frost_conv requires spatial strides at most 8")
-    for filter_extent, lower_pad, upper_pad, dilation_extent in zip(weight.dim[2:], pre_padding, post_padding, dilation):
-        lower_corner = -lower_pad
-        upper_corner = upper_pad - (filter_extent - 1) * dilation_extent
-        if not (-16 <= lower_corner <= 15 and -16 <= upper_corner <= 15):
-            raise NotImplementedError("frost_conv requires rank-5 im2col TMA filter-window corners in [-16, 15]; " f"got ({lower_corner}, {upper_corner})")
-
-    output_shape = _expected_output_shape(image.dim, weight.dim, pre_padding, post_padding, stride, dilation)
-    if any(extent <= 0 for extent in output_shape):
-        raise NotImplementedError(f"frost_conv: convolution parameters produce invalid output shape {output_shape}")
-    return output_shape
-
-
-def _check_output_shapes(expected_shape, tensors) -> None:
-    for role, tensor in tensors:
-        if tuple(tensor.dim) != expected_shape:
-            raise NotImplementedError(f"frost_conv: {role} shape must be {expected_shape}; got {tuple(tensor.dim)}")
-
-
-def _check_alignment(image, weight, *, input_bits: int, output_bits: int, input_dtype: str, output_dtype: str) -> None:
-    """Check the 16-byte contiguous channel units required by TMA."""
-    input_multiple = 128 // input_bits
-    output_multiple = 128 // output_bits
-    if image.dim[1] % input_multiple:
-        raise NotImplementedError(f"frost_conv requires input channels to be a multiple of {input_multiple} for {input_dtype}; got {image.dim[1]}")
-    if weight.dim[0] % output_multiple:
-        raise NotImplementedError(f"frost_conv requires output channels to be a multiple of {output_multiple} for {output_dtype}; got {weight.dim[0]}")
-
-
-def _check_channels_last_3d_layout(tensors, *, logical: bool = False) -> None:
-    qualifier = "logical " if logical else ""
-    for role, tensor in tensors:
-        expected_stride = _channels_last_3d_stride(tensor.dim)
-        if tuple(tensor.stride) != expected_stride:
-            raise NotImplementedError(
-                f"frost_conv: {role} must use compact {qualifier}channels-last layout; expected stride {expected_stride}, got {tuple(tensor.stride)}"
-            )
-
-
-def _check_fp32_compute_type(context: GraphContext):
-    if context.compute_data_type != cudnn.data_type.FLOAT:
-        raise NotImplementedError("frost conv: compute type must be FP32")
 
 
 class _Sm100FrostConvPlan(CompiledPlan):
@@ -656,12 +495,12 @@ class FrostConvEngine(BaseEngine):
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph: "pygraph") -> None:
-        analysis = analyze(graph)
+        analysis = analyze_fprop(graph)
         plan_type = _Sm100FrostBlockScaleConvPlan if analysis.block_scale_data is not None else _Sm100FrostConvPlan
         plan_type.check_support(analysis)
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
-        analysis = analyze(graph)
+        analysis = analyze_fprop(graph)
         node = analysis.conv_node
         image, weight, output = analysis.image, analysis.weight, analysis.output
         ncdhw = tuple(image.dim)
@@ -714,8 +553,8 @@ class FrostConvEngine(BaseEngine):
             return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device(), (post_padding, pre_padding, stride, dilation))
 
 
-def FrostConvEngines(ids: dict[str, int]) -> list[BaseEngine]:
-    """The convolution engines the manifest asked for, with assigned ids."""
+def FrostConvFpropEngines(ids: dict[str, int]) -> list[BaseEngine]:
+    """The forward-convolution engines the manifest asked for, with assigned ids."""
     out = []
     for cls in (FrostConvEngine,):
         if cls.name in ids:

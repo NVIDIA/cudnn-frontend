@@ -202,7 +202,7 @@ def test_frost_conv_supported_shapes_and_geometry(monkeypatch, case: ConvCase) -
 
 
 def test_frost_conv_rejects_narrow_channel_rows() -> None:
-    from cudnn.conv.frost.engine import FrostConvEngine
+    from cudnn.conv.frost.fprop_engine import FrostConvEngine
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,

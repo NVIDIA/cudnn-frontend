@@ -9,7 +9,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.conv.frost.engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvEngine
 from cudnn.conv.frost.graph_analyzer import SUPPORTED_UNARY_EPILOGUES
 from epilogue_cases import EPILOGUE_CASES, EpilogueCase
 from utils import make_input, requires_dense_cutedsl, requires_sm100, select_and_build_frost_plan

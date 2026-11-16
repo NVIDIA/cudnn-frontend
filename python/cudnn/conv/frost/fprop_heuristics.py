@@ -1,19 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep newly covered C96 convolutions behind the backend's ranked plans."""
+"""Rank the FROST forward-convolution family, keeping C96 behind backend plans."""
 
 from cudnn import data_type
 from cudnn.engines.base import PlanConfig
 from cudnn.engines.heuristics import BACKEND
 
-from .graph_analyzer import ConvGraph, analyze
+from .graph_analyzer import ConvGraph, analyze_fprop
 
 
 def analyze_facts(graph):
     """Return supported graph structure, or leave an unmatched graph to cuDNN."""
     try:
-        return analyze(graph)
+        return analyze_fprop(graph)
     except NotImplementedError:
         return None
 

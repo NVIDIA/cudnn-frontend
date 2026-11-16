@@ -9,7 +9,8 @@ import pytest
 import torch
 import cudnn
 
-from cudnn.conv.frost._cutedsl import BLOCK_SCALE_CUTEDSL_MIN_VERSION, DENSE_CUTEDSL_MIN_VERSION, requirement_error as cutedsl_requirement_error
+from cudnn.conv.frost.checks import BLOCK_SCALE_CUTEDSL_MIN_VERSION, DENSE_CUTEDSL_MIN_VERSION
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 
 def _active_sm() -> int | None:
@@ -31,7 +32,7 @@ requires_sm100 = pytest.mark.skipif(
 
 
 def _requires_cutedsl(what: str, minimum_version: tuple[int, int]):
-    error = cutedsl_requirement_error(what, minimum_version)
+    error = cutedsl_requirement_error(what, minimum_version, require_installed=True)
     return pytest.mark.skipif(error is not None, reason=error or "CuTeDSL version is supported")
 
 

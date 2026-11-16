@@ -172,7 +172,7 @@ def test_frost_conv_c96_oracle_detects_wrong_padding_and_missing_tail():
 @pytest.mark.parametrize("unsupported", ["c32", "c80", "c95", "c97", "c112", "c160", "k128", "half", "stride2", "filter1", "symmetric", "ncdhw", "relu"])
 def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
     """Reject unsupported channels, types, geometry, layouts, and fused epilogues."""
-    from cudnn.conv.frost.engine import FrostConvEngine
+    from cudnn.conv.frost.fprop_engine import FrostConvEngine
 
     c = int(unsupported[1:]) if unsupported.startswith("c") else 96
     k = 128 if unsupported == "k128" else 96

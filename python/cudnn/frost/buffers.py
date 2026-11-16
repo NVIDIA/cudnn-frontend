@@ -21,9 +21,11 @@ import ctypes
 from contextlib import nullcontext
 from functools import lru_cache
 import logging
+from math import prod
 import re as _re
 import struct
 import sys
+from typing import Optional, Sequence
 
 from cudnn import _pybind_module
 
@@ -98,6 +100,45 @@ _TYPESTR = {"<f4": "float32", "<f2": "float16", "<f8": "float64", "<i8": "int64"
 _CODE_BITS = {v: k for k, v in DTYPES.items()}
 
 DTYPE_ITEMSIZE = {name: bits // 8 for name, (code, bits) in DTYPES.items()}
+FP4_RUNTIME_DTYPES = frozenset(("code17_4", "float4_e2m1fn_x2"))
+
+
+def ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def reordering_name(tensor) -> Optional[str]:
+    """SF reorder layout name (e.g. ``F8_128x4``) of a tensor, or ``None`` (default)."""
+    reordering = getattr(tensor, "reordering_type", None)
+    name = getattr(reordering, "name", None)
+    if name in (None, "NONE"):
+        return None
+    return name
+
+
+def dense_span(shape, stride) -> int:
+    return 1 + sum((int(extent) - 1) * int(step) for extent, step in zip(shape, stride))
+
+
+def logical_storage_bytes(shape: Sequence[int], bits: int) -> int:
+    """Storage bytes for a compact logical tensor, including sub-byte types."""
+    total_bits = prod(int(extent) for extent in shape) * int(bits)
+    if total_bits % 8:
+        raise ValueError(f"logical shape {tuple(shape)} at {bits} bits per element is not byte-packable")
+    return total_bits // 8
+
+
+def runtime_dtype_names(dtype_name: str, bits: int) -> frozenset[str]:
+    return FP4_RUNTIME_DTYPES if bits == 4 else frozenset((dtype_name,))
+
+
+def operand_storage_bytes(operand) -> int:
+    """Runtime span in bytes without consulting the byte-only shared dtype map."""
+    if operand.dtype in FP4_RUNTIME_DTYPES:
+        # Native DLPack FP4 reports a four-bit element whose C++ element_size()
+        # is zero. Runtime shapes are already packed two logical values/byte.
+        return int(operand.numel())
+    return int(operand.numel()) * int(operand.element_size())
 
 
 def dtype_name(buf) -> str:
@@ -601,7 +642,8 @@ def cutedsl_too_old(version, floor=CUTEDSL_MIN_VERSION):
     # A short public version ("4.6") means the omitted components are zero
     # ("4.6.0"), so it compares against the floor instead of slipping past it.
     parts += [0] * (3 - len(parts))
-    return tuple(parts) < tuple(floor)
+    floor_parts = tuple(floor) + (0,) * (3 - len(floor))
+    return tuple(parts) < floor_parts
 
 
 # The parts whose kernels compile for a family-specific target a DSL build may lack.
@@ -682,16 +724,20 @@ def cutedsl_primitives_error(what):
     )
 
 
-def cutedsl_requirement_error(what, floor=CUTEDSL_MIN_VERSION):
+def cutedsl_requirement_error(what, floor=CUTEDSL_MIN_VERSION, *, require_installed: bool = False):
     """Message naming the installed DSL version when it is below ``floor``, else None.
 
     ``floor`` is the library floor unless a kernel passes its own, higher one.
     Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
     version problem, not as a missing dependency, even when an environment
-    bypasses the package dependency floor (see AGENTS.md Rule 7).
+    bypasses the package dependency floor (see AGENTS.md Rule 7). When
+    ``require_installed=True``, also return an actionable message when the DSL
+    package is absent.
     """
     installed, version = cutedsl_state()
     if not installed:
+        if require_installed:
+            return f"{what} requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed"
         return None
     floor_text = ".".join(str(x) for x in floor)
     if cutedsl_too_old(version, floor):

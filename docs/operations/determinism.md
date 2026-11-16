@@ -69,6 +69,7 @@ arbitrary user callbacks.
 | --- | --- | --- | --- | --- | --- |
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
+| `graph.conv_wgrad` pinned to `frost_conv_wgrad` | wgrad | Matching FP16/BF16/FP32 (TF32)/FP8 E4M3/E5M2 inputs; independently any of those five dW types; FP32 accumulation | Unsupported | SM100: Replay only (fixed configuration); SM103: Unverified | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
 | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_wgrad_wrapper_sm100`, empty-expert output contract | wgrad | NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 or FP32 dW | Unsupported | Supported for empty experts (SM100); general nonempty determinism and SM103 unverified | Unverified |
@@ -1308,3 +1309,18 @@ forward/backward calls on SM90 and SM100. This case has no bias. General batch
 invariance, dBias determinism, FP16 byte determinism, concurrency, golden hashes,
 and other GPUs (including SM103) remain unverified.
 This does not establish determinism for frontend kernel plans.
+
+## FROST convolution weight gradients
+
+`frost_conv_wgrad` always completes each output tile's reduction within one MMA
+CTA group, without split-K or atomic output accumulation. Each spatial axis must
+satisfy `(filter_extent - 1) * dilation <= 31`. Replay status refers
+to fixed inputs, shapes, geometry, epilogue, and public knobs. dW sums over batch;
+reordering or splitting batch changes addition order and is not guaranteed to
+preserve its bytes. This engine implements weight gradients only; forward uses
+the separate `frost_conv` engine, and dgrad/higher derivatives are unsupported.
+
+The current SM100 evidence covers all five input and output types, single and
+paired CTAs, fresh allocations, concurrent work, and capture/replay. SM103 and
+other compiler/dependency lanes remain unverified. See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient-milestone-2)
+for measured configurations and coverage gaps.

@@ -17,7 +17,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn._torch_stream import as_torch_stream, stream_context
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, tensor_byte_span
-from cudnn.conv.frost._cutedsl import requirement_error as cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 TensorLike = torch.Tensor | TensorDesc
 _CUTEDSL_MIN_VERSION = (4, 9)
@@ -129,7 +129,7 @@ class _Conv3dPostOpsSm100(APIBase):
 
     def check_support(self) -> bool:
         """Validate the DSL version, GPU, tensor metadata, and selected fusion contract."""
-        error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION)
+        error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION, require_installed=True)
         self._not_implemented_error_if(error is not None, error or "")
 
         input_desc = self.descs["input"]
@@ -391,7 +391,7 @@ class CausalConv3dWithCacheSm100(APIBase):
 
     def check_support(self) -> bool:
         """Validate the DSL/GPU and the C12-to-C160 causal packing and cache contract."""
-        error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION)
+        error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION, require_installed=True)
         self._not_implemented_error_if(error is not None, error or "")
         input_desc = self.descs["input"]
         if input_desc is None:
@@ -836,7 +836,7 @@ class RmsNormSiluPadSm100(APIBase):
 
     def check_support(self) -> bool:
         """Validate the DSL/GPU and the standalone normalization, padding, and cache contract."""
-        error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION)
+        error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION, require_installed=True)
         self._not_implemented_error_if(error is not None, error or "")
 
         input_desc = self.descs["input"]

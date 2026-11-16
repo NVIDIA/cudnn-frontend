@@ -8,7 +8,7 @@ from contextlib import contextmanager
 import cudnn
 import pytest
 
-from cudnn.conv.frost.engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvEngine
 from cudnn.frost import buffers
 from utils import requires_dense_cutedsl
 

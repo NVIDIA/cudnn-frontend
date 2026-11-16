@@ -35,6 +35,8 @@ PORTABLE_ELEMENTWISE_CCS = ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1))
 #: Parts with the FP4 (e2m1x2) converts the fp4 RoPE QDQ emits, run on each: B200, B300, RTX PRO 6000 and
 #: GB10 (DGX Spark, SM121).
 FP4_CONVERT_CCS = ((10, 0), (10, 3), (12, 0), (12, 1))
+#: Default SM100-family CuTe target names keyed by compute capability.
+SM100_FAMILY_TARGETS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 # The device a frost BUILD targets, scoped in by build_device() from the
 # cudnn.Handle the graph was built with. Every device-derived kernel constant
@@ -96,6 +98,16 @@ def current_device() -> int:
     if override is not None:
         return override
     return ambient_device()
+
+
+def build_target(targets: dict[tuple[int, int], str] = SM100_FAMILY_TARGETS, default: str = "sm_100a") -> tuple[int, str]:
+    """The device a FROST plan built now targets (the handle's, inside ``build_device``) and its CuTe target.
+
+    A compiled kernel belongs to that device: its arch-specific cubin, the max active clusters it bakes in and the
+    context it loads into. Both values therefore join every compile-cache key, and the compile runs under that device's
+    context with an explicit ``--gpu-arch``. A part outside ``targets`` (which the engine declines) reads as ``default``."""
+    device = current_device()
+    return device, targets.get(tuple(compute_capability(device)), default)
 
 
 def resolve_device(device=None) -> int:

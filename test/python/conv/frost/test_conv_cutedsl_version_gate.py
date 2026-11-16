@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cudnn.conv.frost import _cutedsl
+from cudnn.conv.frost import checks
 from cudnn.frost import buffers
 
 pytestmark = pytest.mark.L0
@@ -24,14 +24,14 @@ def dsl_state(monkeypatch):
 def test_cutedsl_4_8_serves_block_scale_but_declines_dense(dsl_state) -> None:
     dsl_state(True, ("nvidia-cutlass-dsl", "4.8.0.dev0"))
 
-    assert _cutedsl.requirement_error("block-scale", _cutedsl.BLOCK_SCALE_CUTEDSL_MIN_VERSION) is None
-    dense_error = _cutedsl.requirement_error("dense", _cutedsl.DENSE_CUTEDSL_MIN_VERSION)
+    assert buffers.cutedsl_requirement_error("block-scale", checks.BLOCK_SCALE_CUTEDSL_MIN_VERSION, require_installed=True) is None
+    dense_error = buffers.cutedsl_requirement_error("dense", checks.DENSE_CUTEDSL_MIN_VERSION, require_installed=True)
     assert "requires nvidia-cutlass-dsl >= 4.9" in dense_error
     assert "found 4.8.0.dev0" in dense_error
 
 
 def test_plan_support_checks_apply_the_flavor_floor_first(dsl_state) -> None:
-    from cudnn.conv.frost.engine import _Sm100FrostBlockScaleConvPlan, _Sm100FrostConvPlan
+    from cudnn.conv.frost.fprop_engine import _Sm100FrostBlockScaleConvPlan, _Sm100FrostConvPlan
 
     dsl_state(True, ("nvidia-cutlass-dsl", "4.8.0.dev0"))
     with pytest.raises(NotImplementedError, match=r"dense convolution requires nvidia-cutlass-dsl >= 4\.9; found 4\.8\.0\.dev0"):
@@ -51,7 +51,7 @@ def test_plan_support_checks_apply_the_flavor_floor_first(dsl_state) -> None:
     ids=("dense", "block-scale"),
 )
 def test_build_plan_gates_before_importing_the_template(dsl_state, monkeypatch, block_scale_data, version, error) -> None:
-    from cudnn.conv.frost import engine
+    from cudnn.conv.frost import fprop_engine as engine
 
     analysis = SimpleNamespace(
         conv_node=SimpleNamespace(params={}),
@@ -61,7 +61,8 @@ def test_build_plan_gates_before_importing_the_template(dsl_state, monkeypatch, 
         block_scale_data=block_scale_data,
     )
     dsl_state(True, ("nvidia-cutlass-dsl", version))
-    monkeypatch.setattr(engine, "analyze", lambda graph: analysis)
+    monkeypatch.setattr(engine, "analyze_fprop", lambda graph: analysis)
+    monkeypatch.setattr(engine, "build_device", lambda device: nullcontext())
 
     with pytest.raises(NotImplementedError, match=error):
         engine.FrostConvEngine().build_plan(None, None)
@@ -70,5 +71,5 @@ def test_build_plan_gates_before_importing_the_template(dsl_state, monkeypatch, 
 def test_missing_cutedsl_declines_both_variants(dsl_state) -> None:
     dsl_state(False, None)
 
-    for minimum_version in (_cutedsl.BLOCK_SCALE_CUTEDSL_MIN_VERSION, _cutedsl.DENSE_CUTEDSL_MIN_VERSION):
-        assert "not installed" in _cutedsl.requirement_error("frost_conv", minimum_version)
+    for minimum_version in (checks.BLOCK_SCALE_CUTEDSL_MIN_VERSION, checks.DENSE_CUTEDSL_MIN_VERSION):
+        assert "not installed" in buffers.cutedsl_requirement_error("frost_conv", minimum_version, require_installed=True)
