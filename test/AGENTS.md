@@ -1631,3 +1631,14 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+A flattened CUDA launch must account for every runtime work factor before
+narrowing dimensions. For ragged work, bound the physical grid and iterate
+Int64 owners/live vectors instead of scanning the declared maximum for every
+empty sequence. Keep live canaries past grid.x's limit and past 2^32; a wrapped
+launch can succeed while leaving outputs unwritten. The THD-fold complete-grid
+regression keeps the maximum sequence length as a runtime argument. Compile
+these Int64 loop forms on the installed compiler as well as newer targets.
+An architecture enum alone does not prove compiler support: skip only its
+explicit unsupported-target diagnostic and preserve other compile errors.

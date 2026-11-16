@@ -38,16 +38,23 @@ def _compile(parts, outputs, meta, origins, batch, max_skv, group, arch=None):
     # This wrapper fixes immutable launch facts for both the original and new
     # host, so a parent-source negative control keeps exactly the same test ABI.
     @cute.jit
-    def entry(pk, pv, dk, dv, metadata, physical_origins, stream):
-        dkv_reduce_thd_origins_host(pk, pv, dk, dv, metadata, physical_origins, batch, max_skv, 0, 1, dk_dim, group, io_dtype, stream)
+    def entry(pk, pv, dk, dv, metadata, physical_origins, runtime_skv, stream):
+        dkv_reduce_thd_origins_host(pk, pv, dk, dv, metadata, physical_origins, batch, runtime_skv, 0, 1, dk_dim, group, io_dtype, stream)
 
     arch = arch or f"sm_{_SM}" + ("a" if _SM >= 90 else "")
-    return cute.compile(
+    compiled = cute.compile(
         entry,
         *[fake(t) for t in (*parts, *outputs, meta, origins)],
+        cutlass.Int32(max_skv),
         make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch {arch}",
     )
+
+    def launch(*args, max_skv_override=None):
+        runtime_skv = max_skv if max_skv_override is None else max_skv_override
+        return compiled(*args[:-1], cutlass.Int32(runtime_skv), args[-1])
+
+    return launch
 
 
 def _fixture(batch, heads, last_length, dk_dim, dv_dim, dtype, partial):
@@ -186,3 +193,66 @@ def test_thd_fold_grid_replay_and_isolation(dtype, partial, dk_dim, dv_dim, batc
         graph.reset()
     if batch == 3:
         assert_golden(f"sdpa_bwd_thd_fold_grid_{str(dtype).split('.')[-1]}_{partial}_dk{dk_dim}_dv{dv_dim}", frozen, result)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "batch,heads,length,dk_dim,dv_dim",
+    [(65536, 32, 4097, 512, 256), (65536, 32, 8193, 512, 256), (65536, 1, 2097184, 64, 64), (1, 1, 2097184, 64, 64)],
+    ids=["above-grid-x-limit", "above-uint32-grid", "runtime-long-sequence", "ordinary-grid-stride"],
+)
+def test_thd_fold_complete_grid_product_keeps_last_live_owner(dtype, batch, heads, length, dk_dim, dv_dim):
+    """A compact valid allocation has live work beyond the old narrowed grid.
+
+    Most declared sequences are empty. The first sequence crosses the runtime
+    block limit and the last sequence/head is a canary for lost ownership.
+    No full large-batch attention-chain claim follows from this helper test.
+    """
+    lengths = torch.zeros(batch, dtype=torch.int64)
+    lengths[0] = length
+    if batch > 1:
+        lengths[-1] = 1
+    prefix = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    total = int(prefix[-1])
+    meta = torch.cat((lengths, torch.zeros(batch + 1, dtype=torch.int64), prefix)).int().cuda()
+    origin_cpu = torch.zeros((2, batch), dtype=torch.int64)
+    origin_cpu[0, 0], origin_cpu[1, 0] = 3, 2
+    if batch > 1:
+        origin_cpu[0, -1], origin_cpu[1, -1] = 0, total + 4
+    origins = origin_cpu.cuda()
+    parts = [torch.ones((1, total, heads, dim), device="cuda", dtype=torch.float32) for dim in (dk_dim, dv_dim)]
+    outputs = [torch.full((1, total + 7, heads, dim), 123.0, device="cuda", dtype=dtype) for dim in (dk_dim, dv_dim)]
+    fn = _compile(parts, outputs, meta, origins, batch, length, 1)
+
+    def launch():
+        fn(*parts, *outputs, meta, origins, torch.cuda.current_stream().cuda_stream)
+        return dict(zip(("dk", "dv"), outputs))
+
+    def check(value):
+        for port, output in enumerate(outputs):
+            ref = torch.full_like(output, 123.0)
+            for sequence in ([0, batch - 1] if batch > 1 else [0]):
+                begin, count = int(origin_cpu[port, sequence]), int(lengths[sequence])
+                ref[:, begin : begin + count] = value
+            torch.testing.assert_close(output, ref, rtol=0, atol=0)
+
+    launch()
+    torch.cuda.synchronize()
+    check(1)
+    before = snapshot(launch())
+    for output in outputs:
+        output.fill_(123.0)
+    assert_bitwise(snapshot(launch()), before, "complete-grid replay")
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(captured):
+            launch()
+        for part in parts:
+            part.fill_(2)
+        for output in outputs:
+            output.fill_(123.0)
+        captured.replay()
+        torch.cuda.synchronize()
+        check(2)
+    finally:
+        captured.reset()
