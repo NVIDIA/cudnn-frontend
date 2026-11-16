@@ -509,7 +509,7 @@ a row alone and inside a batch under the entry's own picks.
   FP8 are outside these rows.
 - Use a compatible CuTe DSL runtime, including `sm_107a` support for SM107.
 
-Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
+Other linear-attention backends, FP16 indexer inputs, MXFP4, NVFP4, paged indexer,
 separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, distributed execution, and the block-sparse attention blk128,
 KPage and FP8 paths are outside this status page's scope.

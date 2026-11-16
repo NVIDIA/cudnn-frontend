@@ -27,11 +27,14 @@ SUPPORTED_QHEAD_PER_KV_HEAD_BF16 = (4, 8, 16, 32, 64)
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (4, 8, 16, 32, 64)
 # The MXFP4 kernel differs from the MXFP8 one only in its MMA, so it serves the same groups.
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4 = SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8
+# The NVFP4 kernel differs from the MXFP4 one only in its scales (E4M3 per 16 values), so it serves the same groups.
+SUPPORTED_QHEAD_PER_KV_HEAD_NVFP4 = SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4
 # Head groups keyed by precision.
 _SUPPORTED_QHEAD_PER_KV_HEAD = {
     "bf16": SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
     "mxfp8": SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8,
     "mxfp4": SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4,
+    "nvfp4": SUPPORTED_QHEAD_PER_KV_HEAD_NVFP4,
 }
 
 

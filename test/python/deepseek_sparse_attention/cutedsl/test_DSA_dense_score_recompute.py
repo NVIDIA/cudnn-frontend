@@ -11,8 +11,8 @@ from test_utils import torch_fork_set_rng
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
     _require_sm100_indexer,
     dsa_init,
+    indexer_scale_format,
     make_random_indexer_input,
-    make_random_mxfp4,
     pack_mxfp8_scales_thd,
     with_dsa_score_recompute_params,
 )
@@ -651,12 +651,12 @@ def test_DSA_dense_score_recompute_wrapper(
 
 def _with_precisions(precisions, cases):
     """Cross ``precisions`` with ``cases`` (each a ``pytest.param`` whose first value is the score type); the dense attention
-    score has no MXFP4 kernel."""
+    score has no packed-FP4 (MXFP4 / NVFP4) kernel."""
     return [
         pytest.param(precision, *case.values, marks=case.marks, id=f"{case.id}-{precision}")
         for case in cases
         for precision in precisions
-        if not (case.values[0] == "attention" and precision == "mxfp4")
+        if not (case.values[0] == "attention" and precision in ("mxfp4", "nvfp4"))
     ]
 
 
@@ -664,7 +664,7 @@ def _with_precisions(precisions, cases):
 @pytest.mark.parametrize(
     "precision,score_type,qhead_per_kv_head,b,s_q,s_k,head_dim,ratio,offsets",
     _with_precisions(
-        ("bf16", "mxfp8", "mxfp4"),
+        ("bf16", "mxfp8", "mxfp4", "nvfp4"),
         [
             pytest.param("indexer", 64, 1, 128, 128, 128, 4, (16,), marks=pytest.mark.L0, id="indexer_qh64"),
             pytest.param("indexer", 32, 1, 5, 128, 128, 4, (16,), marks=pytest.mark.L0, id="indexer_qh32_query_tail"),
@@ -689,7 +689,7 @@ def _with_precisions(precisions, cases):
     ),
 )
 def test_DSA_dense_score_recompute_wrapper_matches_dequant_reference(precision, score_type, qhead_per_kv_head, b, s_q, s_k, head_dim, ratio, offsets):
-    """SM100 BF16 / MXFP8 / MXFP4 dense indexer and attention scores and denominators match an FP32 reference on the
+    """SM100 BF16 / MXFP8 / MXFP4 / NVFP4 dense indexer and attention scores and denominators match an FP32 reference on the
     (dequantized) inputs; signed indexer weights pin the ReLU before weighting."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
@@ -748,7 +748,7 @@ def test_DSA_dense_score_recompute_wrapper_matches_dequant_reference(precision, 
 @pytest.mark.parametrize(
     "precision,score_type,head_dim,h_q,shapes,offsets,q_alignment",
     _with_precisions(
-        ("mxfp8", "mxfp4"),
+        ("mxfp8", "mxfp4", "nvfp4"),
         [
             # Segment 0's ratio-causal limit (up to 47) exceeds its 32 keys.
             pytest.param("indexer", 128, 64, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L0, id="indexer_qh64_kv_clamp"),
@@ -763,7 +763,7 @@ def test_DSA_dense_score_recompute_wrapper_matches_dequant_reference(precision, 
     ),
 )
 def test_DSA_dense_score_recompute_wrapper_thd_block_scaled_compact_padded_scales(precision, score_type, head_dim, h_q, shapes, offsets, q_alignment):
-    """THD MXFP8 / MXFP4 dense indexer and attention scores and denominators match the per-segment reference through
+    """THD MXFP8 / MXFP4 / NVFP4 dense indexer and attention scores and denominators match the per-segment reference through
     compact padded scale prefixes; columns past a segment's own keys stay -inf."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
@@ -846,8 +846,8 @@ def test_DSA_dense_score_recompute_wrapper_thd_block_scaled_compact_padded_scale
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "score_type,precision",
-    [("indexer", "mxfp8"), ("indexer", "mxfp4"), ("attention", "mxfp8")],
-    ids=["indexer-mxfp8", "indexer-mxfp4", "attention-mxfp8"],
+    [("indexer", "mxfp8"), ("indexer", "mxfp4"), ("indexer", "nvfp4"), ("attention", "mxfp8")],
+    ids=["indexer-mxfp8", "indexer-mxfp4", "indexer-nvfp4", "attention-mxfp8"],
 )
 def test_DSA_dense_score_recompute_wrapper_block_scaled_rejects_mismatched_inputs(score_type, precision):
     """Block-scaled dense indexer / attention score inputs that break the contract are refused on the host."""
@@ -885,14 +885,15 @@ def test_DSA_dense_score_recompute_wrapper_block_scaled_rejects_mismatched_input
         score(q.view(torch.uint8), k.view(torch.uint8), aux, **common)
     with pytest.raises(TypeError, match=aux_error):
         score(q, k, wrong_aux, **common)
-    with pytest.raises(ValueError, match="sf_vec_size=32"):
-        score(q, k, aux, sf_vec_size=16, **common)
+    sf_vec_size = indexer_scale_format(precision).sf_vec_size
+    with pytest.raises(ValueError, match=f"sf_vec_size={sf_vec_size}"):
+        score(q, k, aux, sf_vec_size=48 - sf_vec_size, **common)
     with pytest.raises(ValueError, match="q_scale packed shape"):
         score(q, k, aux, **{**common, "q_scale": k_scale})
-    if precision != "mxfp4":
+    if precision not in ("mxfp4", "nvfp4"):
         return
 
-    # Unpacked E4M3 Q/K under precision='mxfp4' are named as a dtype error, not as a doubled head_dim.
+    # Unpacked E4M3 Q/K under a packed-FP4 precision are named as a dtype error, not as a doubled head_dim.
     q8, k8 = (torch.randn(*t.shape[:-1], d, device=device).to(torch.float8_e4m3fn) for t in (q, k))
     with pytest.raises(TypeError, match="q and k"):
         score(q8, k8, aux, **common)
@@ -925,13 +926,13 @@ def test_DSA_dense_score_recompute_wrapper_block_scaled_rejects_mismatched_input
     with pytest.raises(ValueError, match="stored as q/k last dim 64"):
         score(q_wide, k_wide, aux, **common)
     # The block-scaled dense indexer score packs 32 or 64 heads per KV head.
-    q16, _, q16_scale_logical = make_random_mxfp4((b, s_q, 16, d), device=device, seed=3)
+    q16, _, q16_scale_logical = make_random_indexer_input(precision, (b, s_q, 16, d), device=device, seed=3)
     q16_scale = scale_utils.pack_q_scale_bshd(q16_scale_logical, qhead_per_kv_head=16)
-    with pytest.raises(ValueError, match="precision='mxfp4' dense indexer requires qhead_per_kv_head=32 or 64"):
+    with pytest.raises(ValueError, match=f"precision={precision!r} dense indexer requires qhead_per_kv_head=32 or 64"):
         score(q16, k, aux[..., :16], **{**common, "qhead_per_kv_head": 16, "q_scale": q16_scale})
-    # The dense attention score has no MXFP4 kernel.
+    # The dense attention score has no packed-FP4 kernel.
     lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device=device)
-    with pytest.raises(ValueError, match="precision must be 'bf16' or 'mxfp8', got 'mxfp4'"):
+    with pytest.raises(ValueError, match=f"precision must be 'bf16' or 'mxfp8', got {precision!r}"):
         DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, **common)
 
 
@@ -946,8 +947,8 @@ def test_DSA_dense_indexer_score_recompute_wrapper_sm90_declines_block_scales(mo
     q = torch.zeros(1, 8, 64, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(1, 8, 1, 128, dtype=torch.bfloat16, device="cuda")
     w = torch.zeros(1, 8, 64, dtype=torch.bfloat16, device="cuda")
-    declined = r"Dense indexer score with block scales \(precision='mxfp8' or 'mxfp4'\) is SM100-only"
-    for precision in ("mxfp8", "MXFP4"):
+    declined = r"Dense indexer score with block scales \(precision='mxfp8', 'mxfp4' or 'nvfp4'\) is SM100-only"
+    for precision in ("mxfp8", "MXFP4", "nvfp4"):
         with pytest.raises(NotImplementedError, match=declined):
             api.dense_indexer_score_recompute_wrapper(q, k, w, precision=precision)
     with pytest.raises(NotImplementedError, match=declined):

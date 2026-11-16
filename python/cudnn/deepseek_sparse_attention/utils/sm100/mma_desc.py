@@ -7,7 +7,8 @@
 #
 # `make_blockscaled_instr_desc` mirrors the SM100 tcgen05 blockscaled idesc
 # layout used by CUTLASS/CuTe for `tcgen05.mma.kind::mxf8f6f4.block_scale`
-# (MXFP8) and the packed-FP4 `tcgen05.mma.kind::mxf4.block_scale` (MXFP4).
+# (MXFP8) and the packed-FP4 `tcgen05.mma.kind::mxf4.block_scale` (MXFP4) and
+# `tcgen05.mma.kind::mxf4nvf4.block_scale` (NVFP4).
 
 
 from enum import IntEnum
@@ -61,8 +62,13 @@ class MXF8F6F4Format(IntEnum):
     E2M1 = 5
 
 
-class MXF4Format(IntEnum):  # A/B element type field for .kind::mxf4
+class MXF4Format(IntEnum):  # A/B element type field for .kind::mxf4 / .kind::mxf4nvf4
     E2M1 = 1
+
+
+class ScaleFormat(IntEnum):  # 1-bit scale factor type field (bit 23)
+    UE4M3 = 0
+    UE8M0 = 1
 
 
 class MaxShift(IntEnum):
@@ -102,14 +108,23 @@ def to_UMMA_format(cutlass_type) -> int:
 def to_blockscaled_UMMA_format(cutlass_type, packed_fp4: bool) -> int:
     """A/B element format of a block-scaled MMA.
 
-    ``packed_fp4`` selects the ``.kind::mxf4`` format codes, whose E2M1 operands
-    are packed two per byte in SMEM; otherwise the ``.kind::mxf8f6f4`` codes apply.
+    ``packed_fp4`` selects the ``.kind::mxf4`` / ``.kind::mxf4nvf4`` format codes, whose
+    E2M1 operands are packed two per byte in SMEM; otherwise the ``.kind::mxf8f6f4`` codes apply.
     """
     if packed_fp4:
         if cutlass_type is not getattr(cutlass, "Float4E2M1FN", None):
             raise TypeError(f"Packed-FP4 block-scaled MMA expects Float4E2M1FN operands, got {cutlass_type!r}")
         return MXF4Format.E2M1
     return to_UMMA_format(cutlass_type)
+
+
+def to_scale_format(cutlass_type) -> ScaleFormat:
+    """Scale factor type field of a block-scaled MMA: UE8M0 (MX formats) or UE4M3 (NVFP4)."""
+    if cutlass_type is getattr(cutlass, "Float8E8M0FNU", None):
+        return ScaleFormat.UE8M0
+    if cutlass_type is getattr(cutlass, "Float8E4M3FN", None):
+        return ScaleFormat.UE4M3
+    raise TypeError(f"Unsupported CUTLASS scale factor type: {cutlass_type!r}")
 
 
 def to_C_format(cutlass_type) -> int:
@@ -179,21 +194,27 @@ def make_blockscaled_instr_desc(
     b_major: Major,
     a_sf_id: int = 0,
     b_sf_id: int = 0,
-    scale_format: int = 1,
+    scale_format: ScaleFormat = ScaleFormat.UE8M0,
     is_sparse: bool = False,
     packed_fp4: bool = False,
+    scale_vec: int | None = None,
 ) -> int:
     """Build the idesc used by SM100 blockscaled UMMA.
 
     ``a_sf_id`` and ``b_sf_id`` select the per-K-slice scale-factor registers
     for operand A and B. The MXFP8 forward kernel uses the same id for both
     operands because K/SFA and Q/SFB occupy matching TMEM scale slots.
-    ``packed_fp4`` selects the ``.kind::mxf4`` A/B format codes instead of the
-    ``.kind::mxf8f6f4`` ones; its ``scale_vec::2X`` MMA reads a pair of scales,
-    so the ids must be 0 or 2.
+    ``packed_fp4`` selects the ``.kind::mxf4`` / ``.kind::mxf4nvf4`` A/B format
+    codes instead of the ``.kind::mxf8f6f4`` ones. ``scale_vec`` is the number of
+    scales one MMA reads per row (``scale_vec::NX``; by default 2 with
+    ``packed_fp4``, else 1): a ``2X`` MMA reads a pair of scales, so its ids
+    must be 0 or 2; a ``4X`` MMA (``.kind::mxf4nvf4``, packed FP4 only) reads
+    all four bytes of a scale column, so its ids must be 0.
     """
     a_fmt = int(to_blockscaled_UMMA_format(a_type, packed_fp4))
     b_fmt = int(to_blockscaled_UMMA_format(b_type, packed_fp4))
+    if scale_vec is None:
+        scale_vec = 2 if packed_fp4 else 1
 
     if M not in (128, 256):
         raise ValueError("Blockscaled M must be 128 or 256")
@@ -201,8 +222,11 @@ def make_blockscaled_instr_desc(
         raise ValueError("N must be a multiple of 8 in the range 8-256")
     if a_sf_id < 0 or a_sf_id > 3 or b_sf_id < 0 or b_sf_id > 3:
         raise ValueError("Blockscaled scale factor IDs must be in [0, 3]")
-    if packed_fp4 and (a_sf_id % 2 or b_sf_id % 2):
-        raise ValueError("kind::mxf4 scale_vec::2X scale factor IDs must be 0 or 2")
+    if scale_vec not in (1, 2, 4) or (scale_vec > 1) != packed_fp4:
+        raise ValueError(f"scale_vec must be 1 for kind::mxf8f6f4 and 2 or 4 for packed FP4, got {scale_vec} with packed_fp4={packed_fp4}")
+    if a_sf_id % scale_vec or b_sf_id % scale_vec:
+        valid_ids = " or ".join(str(i) for i in range(0, 4, scale_vec))
+        raise ValueError(f"scale_vec::{scale_vec}X scale factor IDs must be {valid_ids}")
 
     m_dim = M >> 4
     n_dim = N >> 3
@@ -239,6 +263,16 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
     )
 
 
+def blockscaled_scale_vec(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp) -> int:
+    """Scales one block-scaled MMA reads per row: one E8M0 (``kind::mxf8f6f4``, K=32), two E8M0
+    (``kind::mxf4``, K=64) or four (``kind::mxf4nvf4`` with 16-value blocks, K=64)."""
+    if isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4NVF4Op):
+        return 4
+    if isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4Op):
+        return 2
+    return 1
+
+
 def blockscaled_mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp, sf_id: int):
     return make_blockscaled_instr_desc(
         op.a_dtype,
@@ -249,7 +283,9 @@ def blockscaled_mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp, sf_
         Major.K if op.b_major_mode == OperandMajorMode.K else Major.MN,
         a_sf_id=sf_id,
         b_sf_id=sf_id,
-        packed_fp4=isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4Op),
+        scale_format=to_scale_format(op.sf_dtype),
+        packed_fp4=isinstance(op, (cute.nvgpu.tcgen05.mma.MmaMXF4Op, cute.nvgpu.tcgen05.mma.MmaMXF4NVF4Op)),
+        scale_vec=blockscaled_scale_vec(op),
     )
 
 

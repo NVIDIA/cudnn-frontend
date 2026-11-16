@@ -31,17 +31,17 @@ def _require_sm100_family():
         pytest.skip("SM100 or SM103 GPU required")
 
 
-def _require_mxfp4_indexer():
-    """Skip unless the GPU, torch build and CuTe DSL support the MXFP4 indexer."""
+def _require_mxfp4_indexer(format_name: str = "MXFP4"):
+    """Skip unless the GPU, torch build and CuTe DSL support the packed-FP4 (``format_name``: MXFP4 or NVFP4) indexer."""
     _require_sm100()
     if getattr(torch, "float4_e2m1fn_x2", None) is None:
-        pytest.skip("MXFP4 indexer requires torch.float4_e2m1fn_x2")
+        pytest.skip(f"{format_name} indexer requires torch.float4_e2m1fn_x2")
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
     from cudnn.deepseek_sparse_attention.utils.compiler import gpu_arch_flag
 
     if not cutedsl_state()[0]:
-        pytest.skip("MXFP4 indexer requires CuTe DSL")
-    requirement_error = cutedsl_requirement_error("MXFP4 DSA indexer")
+        pytest.skip(f"{format_name} indexer requires CuTe DSL")
+    requirement_error = cutedsl_requirement_error(f"{format_name} DSA indexer")
     if requirement_error is not None:
         pytest.skip(requirement_error)
     arch_error = cutedsl_arch_requirement_error(torch.cuda.get_device_capability())
@@ -54,9 +54,9 @@ def _require_mxfp4_indexer():
 
 
 def _require_sm100_indexer(precision: str):
-    """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("bf16", "mxfp8" or "mxfp4") indexer."""
-    if precision == "mxfp4":
-        _require_mxfp4_indexer()
+    """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("bf16", "mxfp8", "mxfp4" or "nvfp4") indexer."""
+    if precision in ("mxfp4", "nvfp4"):
+        _require_mxfp4_indexer(precision.upper())
         return
     from cudnn.tensor_adapter import has_tcgen05
 
@@ -217,6 +217,19 @@ def expand_mxfp8_scale(
     return scale.float().repeat_interleave(sf_vec_size, dim=-1)[..., :head_dim]
 
 
+def indexer_scale_format(precision: str):
+    """Block-scaled indexer ``precision``'s storage contract (data / scale dtypes, ``sf_vec_size``) from the library table."""
+    from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import BLOCK_SCALED_FORMATS
+
+    return BLOCK_SCALED_FORMATS[precision]
+
+
+def make_empty_indexer_scale(precision: str, shape_prefix: Tuple[int, ...], head_dim: int, *, device: torch.device | str) -> torch.Tensor:
+    """Uninitialized logical ``(*shape_prefix, head_dim // sf_vec_size)`` scales of block-scaled ``precision``."""
+    fmt = indexer_scale_format(precision)
+    return torch.empty((*shape_prefix, head_dim // fmt.sf_vec_size), dtype=fmt.scale_dtype, device=device)
+
+
 def quantize_mxfp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Quantize a tensor to E4M3 using logical MXFP8 E8M0 scales."""
     return (x.float() / expand_mxfp8_scale(scale, x.shape[-1])).to(torch.float8_e4m3fn)
@@ -232,7 +245,8 @@ def quantize_e2m1(
     scale: torch.Tensor,
     sf_vec_size: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``x`` to packed E2M1 using logical block scales (MXFP4: E8M0, one per 32 elements).
+    """Quantize ``x`` to packed E2M1 using logical block scales (MXFP4: E8M0, one per 32 elements; NVFP4: E4M3, one per
+    16 elements, ``sf_vec_size=16``).
 
     Rounds to the nearest E2M1 value (ties to even, saturating at 6). Returns ``(packed, dequantized)``:
     ``packed`` is ``torch.float4_e2m1fn_x2`` with element ``2i`` in the low nibble of byte ``i``;
@@ -273,6 +287,37 @@ def make_random_mxfp4(
     return packed, dequantized, scale
 
 
+def make_random_nvfp4_scale(shape: Tuple[int, ...], *, device: torch.device | str, seed: int) -> torch.Tensor:
+    """Random positive E4M3 NVFP4 block scales in [2^-2, 2^3], with mantissa bits (not only powers of two).
+
+    ``exp(x ln 2)`` rather than ``torch.exp2``: torch runs ``exp2`` on CUDA through its NVRTC jiterator, which rejects
+    the cc 10.7 target of some toolkits.
+    """
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    exponents = torch.empty(shape, device=device).uniform_(-2.0, 3.0, generator=generator)
+    return torch.exp(exponents * math.log(2.0)).to(torch.float8_e4m3fn)
+
+
+def make_random_nvfp4(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random NVFP4 values of ``shape`` (last dim = logical head_dim) with E4M3 scales per 16 elements.
+
+    Returns ``(packed, dequantized, scale)`` like :func:`make_random_mxfp4`, the scales ``(..., head_dim // 16)``
+    ``float8_e4m3fn``. No per-tensor global scale: the reference is the E2M1 code times its block scale.
+    """
+    scale = make_random_nvfp4_scale((*shape[:-1], shape[-1] // 16), device=device, seed=seed)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + 1)
+    values = torch.randn(shape, device=device, generator=generator)
+    packed, dequantized = quantize_e2m1(values * expand_mxfp8_scale(scale, shape[-1], 16), scale, sf_vec_size=16)
+    return packed, dequantized, scale
+
+
 def make_random_mxfp8(
     shape: Tuple[int, ...],
     *,
@@ -295,14 +340,14 @@ def make_random_indexer_input(
     device: torch.device | str,
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Random indexer Q / K of ``precision`` ("bf16", "mxfp8" or "mxfp4"): ``(data, FP32 value, logical E8M0 scales)``,
-    the scales ``None`` for BF16."""
+    """Random indexer Q / K of ``precision`` ("bf16", "mxfp8", "mxfp4" or "nvfp4"): ``(data, FP32 value, logical
+    scales)``, the scales ``None`` for BF16."""
     if precision == "bf16":
         generator = torch.Generator(device=device)
         generator.manual_seed(seed)
         data = torch.randn(shape, device=device, generator=generator).bfloat16()
         return data, data.float(), None
-    make = {"mxfp8": make_random_mxfp8, "mxfp4": make_random_mxfp4}[precision]
+    make = {"mxfp8": make_random_mxfp8, "mxfp4": make_random_mxfp4, "nvfp4": make_random_nvfp4}[precision]
     return make(shape, device=device, seed=seed)
 
 
@@ -316,7 +361,7 @@ def pack_mxfp8_scales_thd(
     q_alignment: Optional[int] = None,
     k_alignment: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build padded prefixes and packed Q/K scales for THD MXFP8 and MXFP4 tests."""
+    """Build padded prefixes and packed Q/K scales for THD MXFP8, MXFP4 and NVFP4 tests."""
     from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
 

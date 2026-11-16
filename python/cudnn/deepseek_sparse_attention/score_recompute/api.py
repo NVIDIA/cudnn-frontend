@@ -1147,7 +1147,7 @@ def dense_indexer_score_recompute_wrapper(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'out': scores, 'denom': logsumexp}``.
@@ -1156,7 +1156,9 @@ def dense_indexer_score_recompute_wrapper(
     precision: ``"mxfp8"`` (E4M3 Q/K) or ``"mxfp4"``
     (``torch.float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``), both with
     one E8M0 scale per 32 head_dim values (``head_dim // 32`` per row, for
-    MXFP4 too). Block-scaled precisions take packed
+    MXFP4 too), or ``"nvfp4"`` (packed E2M1 Q/K as for MXFP4, one non-negative
+    E4M3 scale per 16 head_dim values; its per-tensor global scales are folded
+    into ``sm_scale``). Block-scaled precisions take packed
     ``q_scale`` / ``k_scale`` (and, for THD, ``cu_seqlens_*_scale_padded``).
 
     THD (``cu_seqlens_q``/``cu_seqlens_k`` given) runs natively on SM100+; on

@@ -22,8 +22,9 @@ from deepseek_sparse_attention.cutedsl.dsa_utils import (
     _require_sm100 as _require_sm100_family,
     dsa_init,
     expand_mxfp8_scale,
+    indexer_scale_format,
+    make_empty_indexer_scale,
     make_random_indexer_input,
-    make_random_mxfp4,
     pack_mxfp8_scales_thd,
     quantize_e2m1,
     quantize_fp8_1x128,
@@ -472,7 +473,7 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=5)
 @pytest.mark.parametrize("h_q", [4, 64], ids=["qh4", "qh64"])
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4", "nvfp4"])
 def test_DSA_indexer_forward_wrapper_zero_key_query_tail(precision, h_q):
     """The geometry the trailing-query rule admits at its edge: a query shorter than one compressed block (S_q 3 at ratio 4)
     has NO compressed key yet (S_k 0). The dense wrapper returns the empty (B, S_q, 0) scores -- nothing to score, nothing
@@ -496,7 +497,7 @@ def test_DSA_indexer_forward_wrapper_zero_key_query_tail(precision, h_q):
     k = k_full[:, :s_k].contiguous()
     common = dict(ratio=ratio, qhead_per_kv_head=h_q, precision=precision)
     if precision != "bf16":
-        common["k_scale"] = torch.empty((b, s_k, d // 32), dtype=torch.float8_e8m0fnu, device=device)
+        common["k_scale"] = make_empty_indexer_scale(precision, (b, s_k), d, device=device)
 
     q, w, q_kwargs = inputs(s_q, 11)
     scores = DSA.indexer_forward_wrapper(q, k, w, **common, **q_kwargs)["scores"]
@@ -671,7 +672,7 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
 
 
 @torch_fork_set_rng(seed=21)
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize(
     "qhead_per_kv_head,b_default,s_q_default,s_kv_default,ratio,offsets",
     [
@@ -705,7 +706,7 @@ def test_DSA_indexer_forward_wrapper_matches_dequant_reference(
     ratio,
     offsets,
 ):
-    """SM100 dense and compressed BF16 / MXFP8 / MXFP4 scores match an FP32 reference on the (dequantized) inputs, across
+    """SM100 dense and compressed BF16 / MXFP8 / MXFP4 / NVFP4 scores match an FP32 reference on the (dequantized) inputs, across
     the tile geometries of the case table (query / key tails, full and partial KV splits, persistent multi-tile CTAs,
     small head groups)."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
@@ -789,7 +790,7 @@ _DENSE = "test_DSA_dense_score_recompute.py"
 @pytest.mark.parametrize(
     "target,case",
     [
-        # Indexer score: BF16, MXFP8 and MXFP4 kernels, including the persistent W handoff.
+        # Indexer score: BF16, MXFP8, MXFP4 and NVFP4 kernels, including the persistent W handoff.
         pytest.param(
             _IDX, "test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh64_ratio4_persistent_mixed_blocks-bf16]", id="idx-bf16-h64-persistent"
         ),
@@ -800,6 +801,10 @@ _DENSE = "test_DSA_dense_score_recompute.py"
         pytest.param(_IDX, "test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh4_b3_key_tail-mxfp4]", id="idx-mxfp4-h4-empty-tail"),
         pytest.param(
             _IDX, "test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh64_ratio4_persistent_mixed_blocks-mxfp4]", id="idx-mxfp4-h64-persistent"
+        ),
+        pytest.param(_IDX, "test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh4_b3_key_tail-nvfp4]", id="idx-nvfp4-h4-empty-tail"),
+        pytest.param(
+            _IDX, "test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh64_ratio4_persistent_mixed_blocks-nvfp4]", id="idx-nvfp4-h64-persistent"
         ),
         # Attention score: BF16 and MXFP8 with more tiles than SMs, so CTAs reuse the LSE slot and the reduce scratch, at
         # two and one queries per tile.
@@ -864,7 +869,7 @@ def test_DSA_score_sm100_sanitizer(target, case, tool):
 
 
 @torch_fork_set_rng(seed=23)
-@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize(
     "h_q",
     [
@@ -874,7 +879,7 @@ def test_DSA_score_sm100_sanitizer(target, case, tool):
     ],
 )
 def test_DSA_indexer_forward_wrapper_thd_block_scaled_compact_padded_scales(precision, h_q):
-    """THD MXFP8 / MXFP4 scores with 256-token padded scale spans match an FP32 reference on the dequantized inputs."""
+    """THD MXFP8 / MXFP4 / NVFP4 scores with 256-token padded scale spans match an FP32 reference on the dequantized inputs."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
     _require_sm100_indexer(precision)
@@ -945,35 +950,49 @@ def test_DSA_indexer_forward_wrapper_thd_block_scaled_compact_padded_scales(prec
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=25)
-def test_DSA_indexer_forward_wrapper_mxfp4_scale_group_routing():
-    """Q/K data confined to one 32-element group is scaled by that group's E8M0 scales, for each of the four groups."""
+@pytest.mark.parametrize("precision", ["mxfp4", "nvfp4"])
+def test_DSA_indexer_forward_wrapper_fp4_scale_group_routing(precision):
+    """Q/K data confined to one scale group is scaled by that group's scales, for each group: the four 32-value E8M0 groups
+    of MXFP4 (two per MMA, selected by scale id) and the eight 16-value E4M3 groups of NVFP4 (four per MMA, one TMEM column
+    per MMA)."""
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_mxfp4_indexer()
+    _require_sm100_indexer(precision)
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
+    fmt = indexer_scale_format(precision)
+    vec = fmt.sf_vec_size
     device = "cuda"
     h_q, d, s_q, s_k, ratio = 64, 128, 128, 128, 4
-    # Every (Q group, K group) pair has a distinct exponent sum, so a scale read from the wrong group moves the score by
-    # a power of two, and data read from the wrong group is zero and zeroes it.
-    q_exponents = torch.tensor([-6.0, -2.0, 2.0, 6.0], device=device)
-    k_exponents = torch.tensor([-1.0, 0.0, 1.0, 2.0], device=device)
-    q_scale_logical = torch.ldexp(torch.ones_like(q_exponents), q_exponents).expand(1, s_q, h_q, d // 32).contiguous().to(torch.float8_e8m0fnu)
-    k_scale_logical = torch.ldexp(torch.ones_like(k_exponents), k_exponents).expand(1, s_k, 1, d // 32).contiguous().to(torch.float8_e8m0fnu)
+    groups = d // vec
+    # Both rows of scales strictly increase, so every (Q group, K group) pair has a distinct scale product: a scale read
+    # from the wrong group moves the score, and data read from the wrong group is zero and zeroes it.  The E4M3 scales
+    # carry mantissa bits (1.25, 1.5, 1.75 x 2^e), which an exponent-only read would drop.
+    if precision == "mxfp4":
+        q_values = torch.ldexp(torch.ones(groups, device=device), torch.tensor([-6.0, -2.0, 2.0, 6.0], device=device))
+        k_values = torch.ldexp(torch.ones(groups, device=device), torch.tensor([-1.0, 0.0, 1.0, 2.0], device=device))
+    else:
+        q_values = torch.tensor([0.1875, 0.25, 0.625, 1.0, 1.5, 2.5, 3.5, 6.0], device=device)
+        k_values = torch.tensor([0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0], device=device)
+    q_scale_logical = q_values.expand(1, s_q, h_q, groups).contiguous().to(fmt.scale_dtype)
+    k_scale_logical = k_values.expand(1, s_k, 1, groups).contiguous().to(fmt.scale_dtype)
+    assert torch.equal(q_scale_logical[0, 0, 0].float(), q_values) and torch.equal(k_scale_logical[0, 0, 0].float(), k_values)
     q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q)
     k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
     w = torch.rand(1, s_q, h_q, dtype=torch.bfloat16, device=device) + 0.5
     q_causal_offsets = torch.tensor([ratio * s_k - s_q], dtype=torch.int32, device=device)
 
-    for group in range(d // 32):
+    for group in range(groups):
         # Non-negative data: no head's dot product is hidden by the ReLU.
-        in_group = (torch.arange(d, device=device) // 32 == group).float()
-        q, q_deq = quantize_e2m1(torch.rand(1, s_q, h_q, d, device=device) * 6 * in_group * expand_mxfp8_scale(q_scale_logical, d), q_scale_logical)
-        k, k_deq = quantize_e2m1(torch.rand(1, s_k, 1, d, device=device) * 6 * in_group * expand_mxfp8_scale(k_scale_logical, d), k_scale_logical)
+        in_group = (torch.arange(d, device=device) // vec == group).float()
+        q_full = torch.rand(1, s_q, h_q, d, device=device) * 6 * in_group * expand_mxfp8_scale(q_scale_logical, d, vec)
+        k_full = torch.rand(1, s_k, 1, d, device=device) * 6 * in_group * expand_mxfp8_scale(k_scale_logical, d, vec)
+        q, q_deq = quantize_e2m1(q_full, q_scale_logical, vec)
+        k, k_deq = quantize_e2m1(k_full, k_scale_logical, vec)
 
-        result = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=q_causal_offsets, precision="mxfp4", q_scale=q_scale, k_scale=k_scale)
+        result = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=q_causal_offsets, precision=precision, q_scale=q_scale, k_scale=k_scale)
         torch.cuda.synchronize()
 
         scores = result["scores"]
@@ -983,44 +1002,47 @@ def test_DSA_indexer_forward_wrapper_mxfp4_scale_group_routing():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=27)
-def test_DSA_indexer_forward_mxfp4_two_k_chunks(monkeypatch):
-    """64-wide K chunks split the 128 head dim in two: each chunk's K=64 MXFP4 MMA reads its own pair of E8M0 scale
-    groups, and the second chunk accumulates at its K-phase offset (the H64 forward builds 128-wide chunks by default)."""
+@pytest.mark.parametrize("precision", ["mxfp4", "nvfp4"])
+def test_DSA_indexer_forward_fp4_two_k_chunks(monkeypatch, precision):
+    """64-wide K chunks split the 128 head dim in two: each chunk's K=64 MMA reads its own scales -- MXFP4 the next pair of
+    E8M0 scale ids, NVFP4 the next E4M3 TMEM column -- and the second chunk accumulates at its K-phase offset (the H64
+    forward builds 128-wide chunks by default)."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
-    _require_mxfp4_indexer()
+    _require_sm100_indexer(precision)
     from cudnn.deepseek_sparse_attention.indexer_forward import _interface
     from cudnn.deepseek_sparse_attention.score_recompute import _block_scaled
-    from cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp4 import IndexerScoreUnifiedSm100Mxfp4
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
     constructed = []
+    fmt = _block_scaled.BLOCK_SCALED_FORMATS[precision]
 
-    class NarrowKChunk(IndexerScoreUnifiedSm100Mxfp4):
+    class NarrowKChunk(fmt.kernel_cls):
         def __init__(self, *args, **kwargs):
             constructed.append(kwargs)
             super().__init__(*args, **{**kwargs, "k_block_size": 64})
 
-    monkeypatch.setitem(_block_scaled.BLOCK_SCALED_FORMATS, "mxfp4", dataclasses.replace(_block_scaled.BLOCK_SCALED_FORMATS["mxfp4"], kernel_cls=NarrowKChunk))
+    monkeypatch.setitem(_block_scaled.BLOCK_SCALED_FORMATS, precision, dataclasses.replace(fmt, kernel_cls=NarrowKChunk))
     monkeypatch.setattr(_interface, "_compile_cache", {})
 
     device = "cuda"
     h_q, d, s_q, s_k, ratio = 64, 128, 128, 384, 4
-    q, q_ref, q_scale_logical = make_random_mxfp4((1, s_q, h_q, d), device=device, seed=211)
-    k, k_ref, k_scale_logical = make_random_mxfp4((1, s_k, 1, d), device=device, seed=213)
+    q, q_ref, q_scale_logical = make_random_indexer_input(precision, (1, s_q, h_q, d), device=device, seed=211)
+    k, k_ref, k_scale_logical = make_random_indexer_input(precision, (1, s_k, 1, d), device=device, seed=213)
     q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q)
     k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
     w = torch.randn(1, s_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
     q_causal_offsets = torch.tensor([ratio * s_k - s_q], dtype=torch.int32, device=device)
 
-    result = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=q_causal_offsets, precision="mxfp4", q_scale=q_scale, k_scale=k_scale)
+    result = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=q_causal_offsets, precision=precision, q_scale=q_scale, k_scale=k_scale)
     torch.cuda.synchronize()
-    assert constructed, "the MXFP4 indexer did not build the 64-wide K-chunk kernel"
+    assert constructed, f"the {precision.upper()} indexer did not build the 64-wide K-chunk kernel"
     check_ref_indexer_forward(q_ref, k_ref, w, result["scores"], ratio, q_causal_offsets=q_causal_offsets, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.L0
 def test_DSA_indexer_forward_imports_without_block_scaled_torch_dtypes():
-    """The indexer still imports, and names the missing dtypes, on a torch without E8M0 or packed FP4."""
+    """The indexer still imports, and names the missing dtypes, on a torch without E8M0 or packed FP4 (NVFP4's E4M3 scale
+    dtype is always present)."""
     import os
     import subprocess
     import sys
@@ -1046,7 +1068,7 @@ def test_DSA_indexer_forward_imports_without_block_scaled_torch_dtypes():
         f"assert _block_scaled.__file__ == {_block_scaled.__file__!r}, _block_scaled.__file__\n"
         "import cudnn.deepseek_sparse_attention.indexer_forward\n"
         "assert _block_scaled.validate_indexer_precision('bf16') == 'bf16'\n"
-        "for precision, dtypes in (('mxfp8', ('float8_e8m0fnu',)), ('mxfp4', ('float4_e2m1fn_x2', 'float8_e8m0fnu'))):\n"
+        "for precision, dtypes in (('mxfp8', ('float8_e8m0fnu',)), ('mxfp4', ('float4_e2m1fn_x2', 'float8_e8m0fnu')), ('nvfp4', ('float4_e2m1fn_x2',))):\n"
         "    try:\n"
         "        _block_scaled.validate_indexer_precision(precision)\n"
         "    except NotImplementedError as exc:\n"
@@ -1063,50 +1085,57 @@ def test_DSA_indexer_forward_imports_without_block_scaled_torch_dtypes():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("block_scale", [1.0, 0.125, 4.0])
-def test_quantize_e2m1_rounds_ties_to_even(block_scale):
-    """``quantize_e2m1`` rounds signed E2M1 midpoints to the even code and saturates at 6, one E8M0 scale per 32 elements."""
-    if getattr(torch, "float4_e2m1fn_x2", None) is None:
-        pytest.skip("requires torch.float4_e2m1fn_x2")
+@pytest.mark.parametrize("sf_vec_size,scale_dtype", [(32, "float8_e8m0fnu"), (16, "float8_e4m3fn")], ids=["mxfp4", "nvfp4"])
+def test_quantize_e2m1_rounds_ties_to_even(block_scale, sf_vec_size, scale_dtype):
+    """``quantize_e2m1`` rounds signed E2M1 midpoints to the even code and saturates at 6, one scale per ``sf_vec_size``
+    elements (E8M0 per 32 for MXFP4, E4M3 per 16 for NVFP4)."""
+    if getattr(torch, "float4_e2m1fn_x2", None) is None or getattr(torch, scale_dtype, None) is None:
+        pytest.skip(f"requires torch.float4_e2m1fn_x2 and torch.{scale_dtype}")
     values = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 7.0, -0.75, -5.0, 0.3, -2.9, 0.0, 6.0, 0.1, -0.1])
     rounded = torch.tensor([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 6.0, -1.0, -4.0, 0.5, -3.0, 0.0, 6.0, 0.0, -0.0])
-    # Two 32-element groups, the second with twice the scale: each is quantized against its own scale.
+    # Two groups, the second with twice the scale: each is quantized against its own scale.
     group_scales = torch.tensor([block_scale, 2 * block_scale])
-    x = torch.cat([values, -values]).repeat(2) * group_scales.repeat_interleave(32)
-    packed, dequantized = quantize_e2m1(x.unsqueeze(0), group_scales.unsqueeze(0).to(torch.float8_e8m0fnu))
-    expected = torch.cat([rounded, -rounded]).repeat(2) * group_scales.repeat_interleave(32)
+    x = torch.cat([values, -values])[:sf_vec_size].repeat(2) * group_scales.repeat_interleave(sf_vec_size)
+    packed, dequantized = quantize_e2m1(x.unsqueeze(0), group_scales.unsqueeze(0).to(getattr(torch, scale_dtype)), sf_vec_size)
+    expected = torch.cat([rounded, -rounded])[:sf_vec_size].repeat(2) * group_scales.repeat_interleave(sf_vec_size)
     assert torch.equal(dequantized, expected.unsqueeze(0))
     codes = packed.view(torch.uint8)
-    assert codes.shape == (1, 32)
+    assert codes.shape == (1, sf_vec_size)
     # Element 2i in the low nibble: 0.25 -> code 0 (low), 0.75 -> 1.0 = code 2 (high).
     assert int(codes[0, 0]) == 0x20
 
 
 @pytest.mark.L0
-def test_DSA_indexer_forward_wrapper_mxfp4_rejects_mismatched_inputs():
-    """MXFP4 inputs that break the contract are refused on the host."""
+@pytest.mark.parametrize("precision", ["mxfp4", "nvfp4"])
+def test_DSA_indexer_forward_wrapper_fp4_rejects_mismatched_inputs(precision):
+    """MXFP4 / NVFP4 inputs that break the contract are refused on the host, including the other packed-FP4 format's scale
+    dtype and scale vector size; the format's own sf_vec_size, spelled out, is accepted like the default."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
-    _require_mxfp4_indexer()
+    _require_sm100_indexer(precision)
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
+    fmt = indexer_scale_format(precision)
+    other = indexer_scale_format("nvfp4" if precision == "mxfp4" else "mxfp4")
     device = "cuda"
     b, s_q, s_k, h_q, d = 1, 8, 128, 64, 128
-    q, _, q_scale_logical = make_random_mxfp4((b, s_q, h_q, d), device=device, seed=1)
-    k, _, k_scale_logical = make_random_mxfp4((b, s_k, 1, d), device=device, seed=2)
+    q, _, q_scale_logical = make_random_indexer_input(precision, (b, s_q, h_q, d), device=device, seed=1)
+    k, _, k_scale_logical = make_random_indexer_input(precision, (b, s_k, 1, d), device=device, seed=2)
     w = torch.rand(b, s_q, h_q, dtype=torch.bfloat16, device=device)
     q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q)
     k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
-    common = dict(precision="mxfp4", q_scale=q_scale, k_scale=k_scale)
+    common = dict(precision=precision, q_scale=q_scale, k_scale=k_scale)
 
     q_e4m3 = torch.zeros(b, s_q, h_q, d, dtype=torch.float8_e4m3fn, device=device)
     k_e4m3 = torch.zeros(b, s_k, 1, d, dtype=torch.float8_e4m3fn, device=device)
     for wrapper, options in ((DSA.indexer_forward_wrapper, {}), (DSA.indexer_forward_top_k_wrapper, {"top_k": 16})):
         with pytest.raises(TypeError, match="requires q and k to be torch.float4_e2m1fn_x2"):
             wrapper(q_e4m3, k_e4m3, w, **options, **common)
-        with pytest.raises(TypeError, match="requires q_scale and k_scale to be torch.float8_e8m0fnu"):
-            wrapper(q, k, w, **options, **{**common, "k_scale": k_scale.view(torch.float8_e4m3fn)})
-        with pytest.raises(ValueError, match="requires sf_vec_size=32"):
-            wrapper(q, k, w, sf_vec_size=16, **options, **common)
+        with pytest.raises(TypeError, match=f"requires q_scale and k_scale to be {fmt.scale_dtype}"):
+            wrapper(q, k, w, **options, **{**common, "k_scale": k_scale.view(other.scale_dtype)})
+        with pytest.raises(ValueError, match=f"requires sf_vec_size={fmt.sf_vec_size}"):
+            wrapper(q, k, w, sf_vec_size=other.sf_vec_size, **options, **common)
+        wrapper(q, k, w, sf_vec_size=fmt.sf_vec_size, **options, **common)
         with pytest.raises(ValueError, match="requires n_heads_kv=1"):
             wrapper(q, torch.cat([k, k], dim=2), w, **options, **common)
     with pytest.raises(TypeError, match="w to be torch.bfloat16"):
@@ -1150,7 +1179,7 @@ def test_DSA_indexer_forward_wrapper_rejects_mismatched_qk_last_dim():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4", "nvfp4"])
 def test_DSA_indexer_forward_wrapper_sm90_rejects_block_scaled_precisions(monkeypatch, precision):
     """On SM90 a block-scaled precision, in either case, fails the SM90 precision check, and its scale prefixes are SM100-only."""
     api = pytest.importorskip("cudnn.deepseek_sparse_attention.indexer_forward.api", reason="Environment not supported: cudnn[cutedsl] not installed")

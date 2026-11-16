@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA-only MXFP8 and MXFP4 scale packing helpers for the SM100 Indexer DSL path.
+"""CUDA-only MXFP8, MXFP4 and NVFP4 scale packing helpers for the SM100 Indexer DSL path.
 
 MXFP8 and MXFP4 share the E8M0 scale format, one byte per 32 logical head_dim
 values: ``G = head_dim // 32`` scales per row (4 for head_dim 128), also for
-MXFP4, whose ``float4_e2m1fn_x2`` rows hold ``head_dim // 2`` elements.
+MXFP4, whose ``float4_e2m1fn_x2`` rows hold ``head_dim // 2`` elements.  NVFP4
+has one E4M3 byte per 16 values (``G = head_dim // 16``, 8 for head_dim 128);
+the packers move any one-byte scale and keep its dtype.
 Runtime packing requires contiguous one-byte CUDA inputs, a supported GPU, and
 the CuTe DSL version required by the DSA kernels. PyTorch reference packing is
 kept in the test suite and is deliberately not a runtime fallback.

@@ -270,7 +270,7 @@ def indexer_fwd_compress_topk(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     topk_block_threads: int = -1,
     topk_indices_global: bool = False,
     cand_buffer: Optional[torch.Tensor] = None,
@@ -290,9 +290,10 @@ def indexer_fwd_compress_topk(
 ) -> tuple[torch.Tensor, ...]:
     """Compress-logits + top-k (CuTe DSL, BSHD).
 
-    ``precision`` is ``"bf16"`` (default), ``"mxfp8"``, or ``"mxfp4"``.  The
-    block-scaled precisions take blockscaled-packed E8M0 ``q_scale``/``k_scale``
-    (same packing as ``indexer_fwd``).  Microbatching is bf16-only.
+    ``precision`` is ``"bf16"`` (default), ``"mxfp8"``, ``"mxfp4"`` or ``"nvfp4"``.
+    The block-scaled precisions take blockscaled-packed ``q_scale``/``k_scale``
+    (E8M0, or E4M3 for NVFP4; same packing as ``indexer_fwd``).  Microbatching is
+    bf16-only.
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K
     from a page pool ``(num_pages, page_size, 1, head_dim)`` instead of a dense
@@ -383,7 +384,7 @@ def indexer_fwd_compress_topk(
     if is_block_scaled:
         # A dtype/device mismatch would otherwise fail cryptically at compile or run time.
         validate_block_scaled_inputs(precision, q, k, w, q_scale, k_scale)
-    validate_sf_vec_size(precision, sf_vec_size)
+    sf_vec_size = validate_sf_vec_size(precision, sf_vec_size)
 
     bs, seqlen_q, n_heads_q, head_dim = q.shape
     paged = _check_paged_args(block_table, kv_lens)
@@ -668,7 +669,6 @@ def indexer_fwd_compress_topk(
         n_block_size,
         unified_k_block_size,
         sf_vec_size,
-        float(sm_scale),
         seqlen_q,
         None if paged else seqlen_k,  # paged: the key extent is a runtime bound
         page_size,
@@ -1012,7 +1012,6 @@ def _run_compress_gemm_varlen(
             m_block_size,
             n_block_size,
             sf_vec_size,
-            float(sm_scale),
             int(max_seqlen_q),
             int(max_seqlen_k),
             q_causal_offsets is not None,
@@ -1102,7 +1101,6 @@ def _run_compress_gemm_varlen(
         m_block_size,
         n_block_size,
         unified_k_block_size,
-        float(sm_scale),
         int(max_seqlen_q),
         None if page_size else int(max_seqlen_k),  # paged: a runtime bound, not a layout parameter
         q_causal_offsets is not None,
@@ -1196,7 +1194,7 @@ def _indexer_fwd_compress_topk_thd(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     topk_block_threads: int = -1,
     topk_indices_global: bool = True,
     cand_buffer: Optional[torch.Tensor] = None,
@@ -1219,9 +1217,10 @@ def _indexer_fwd_compress_topk_thd(
     is then ``None`` and ``max_seqlen_k`` defaults to ``max_pages * page_size``.
 
     A block-scaled ``precision`` runs the blockscaled logits GEMM with
-    blockscaled-packed E8M0 scales: for ``'mxfp8'``, ``q``/``k`` are
-    ``float8_e4m3fn``; for ``'mxfp4'``, they are packed ``float4_e2m1fn_x2``
-    (last dim ``head_dim // 2``).
+    blockscaled-packed scales: for ``'mxfp8'``, ``q``/``k`` are
+    ``float8_e4m3fn`` with E8M0 scales; for ``'mxfp4'`` and ``'nvfp4'``, they are
+    packed ``float4_e2m1fn_x2`` (last dim ``head_dim // 2``) with E8M0 scales per
+    32 values (MXFP4) or E4M3 scales per 16 (NVFP4).
     THD requires both scale-padded prefixes and concatenates per-sequence scale regions
     along ``MN``. The user-provided prefix values are consumed verbatim; spans may
     exceed the logical lengths, but each Q span times ``qhead_per_kv_head`` and
@@ -1274,7 +1273,7 @@ def _indexer_fwd_compress_topk_thd(
         raise ValueError(f"Block scales and scale padded cu_seqlens require precision={BLOCK_SCALED_PRECISION_NAMES}")
     # The THD scale contract (regions concatenated along MN, addressed by the padded
     # prefixes, L = KV head only) is validated below once bs/head metadata is known.
-    validate_sf_vec_size(precision, sf_vec_size)
+    sf_vec_size = validate_sf_vec_size(precision, sf_vec_size)
     paged = _check_paged_args(block_table, kv_lens)
     if q.ndim != 3 or k.ndim != (4 if paged else 3) or w.ndim != 2:
         raise ValueError("THD compressed-logits top-k expects q (T_q,H,D), k (T_k,Hkv,D) or a page pool (num_pages,page,Hkv,D), w (T_q,H)")
