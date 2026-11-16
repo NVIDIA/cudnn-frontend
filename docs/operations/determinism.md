@@ -128,6 +128,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_backward`, fixed D256 and D192/V128 half implementations (20607, 20610, 20632, 20633) | bprop | matching FP16/BF16 inputs and gradients | Unsupported for these engines | SM100: repeatability and batch isolation verified at causal S=257, MHA/GQA; general batch invariance and SM103 unverified | Repeatability and batch isolation verified at causal S=257, MHA/GQA for the three fixed owners; general batch invariance unverified; deterministic-mode declarations unchanged |
 | `pygraph.sdpa_backward`, FROST SM107 D512 fixed implementation (20608) | bprop | matching FP16/BF16 inputs and gradients | Unsupported for this engine | Unsupported for this engine | Repeatability and batch isolation verified for dense causal D384 GQA / D512 MHA in FP16/BF16; general batch invariance unverified; the graph does not advertise deterministic mode |
 | `pygraph.sdpa_fp8_backward` / `sdpa_mxfp8_backward`, fixed SM107 implementations (20605, 20606) | bprop | E4M3 inputs with tensor/block scales; BF16 gradients in these checks | Unsupported for these engines | Unsupported for these engines | Fixed-plan repeatability, record rebuild and changed-input capture verified at causal D256, S=257, MHA/GQA; general batch invariance unverified; deterministic-mode declarations unchanged |
+| `pygraph.sdpa_fp8_backward`, SM100/SM103 native D256 owner (20637) | bprop | E4M3/E5M2 payloads and FP32 tensor scales; E4M3/E5M2/FP16/BF16 gradients | Unsupported for this engine | Supported (SM100 and SM103, tested dense causal GQA configurations with fixed payloads/scales) | Unsupported for this engine |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
@@ -1023,3 +1024,18 @@ Stats-stride-override or batch-invariance claim.
 See the [SM107 support reference](../../python/cudnn/sdpa/frost/support/sm107.md)
 for the implementation boundaries and the
 [coverage report](../../test/python/determinism_goldens/README.md) for measured scope.
+
+
+## SM100/SM103 per-tensor FP8 D256 backward
+
+The native D256 owner preserves all three gradients and four amax outputs
+under repeated execution, reordered and duplicated batches, and changed
+neighbor upstream gradients in the tested SM100 and SM103 configurations. Retained
+CUDA Graph replay reads changed input data, and rebuilding the public engine
+record preserves the output bytes. Quantized payloads and all scalar scales
+stay fixed when the batch changes; amax is the maximum across the selected
+sequences. Numerical references are checked independently of byte equality.
+
+The L0 suite also exercises refilled shared-memory stages with an unsafe
+control on both architectures. This engine's claim is
+backward only; forward support is documented separately.

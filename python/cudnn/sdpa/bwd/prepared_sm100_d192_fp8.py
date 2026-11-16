@@ -10,7 +10,7 @@ from .kernels.sm100.prepared_d128_accum_fp8_host import FP8_AMAX
 from .prepared_sm100_d128_fp8 import ATTRIBUTES_FP8_D128, ROLES_FP8_D128, _GuardedEntry
 
 
-def compile_plan(api):
+def compile_plan(api, *, compile_host=None):
     import cutlass
     import torch
 
@@ -40,8 +40,16 @@ def compile_plan(api):
     operands += [scalar if flag else None for flag in requested]
     device = resolve_device(api.q_desc.device)
     cc = compute_capability(device)
-    grad_dtype = {torch.float8_e4m3fn: cutlass.Float8E4M3FN, torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[api.grad_dtype]
-    from .kernels.sm100.prepared_d192_fp8_host import compile_host, workspace_layout
+    grad_dtype = {
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float16: cutlass.Float16,
+    }[api.grad_dtype]
+    from .kernels.sm100.prepared_d192_fp8_host import workspace_layout
+
+    if compile_host is None:
+        from .kernels.sm100.prepared_d192_fp8_host import compile_host
 
     regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max)
 

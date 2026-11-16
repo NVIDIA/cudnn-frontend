@@ -56,6 +56,7 @@ _OFFERED = {
     "sdpa_bwd_sm100_d128_fp8_accumulation": 20623,
     "sdpa_bwd_sm100_mxfp8_pair": 20624,
     "sdpa_bwd_sm100_d256_mxfp8": 20625,
+    "sdpa_bwd_sm100_d256_fp8": 20637,
 }
 
 
@@ -217,10 +218,17 @@ def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(monkeypatch, 
     assert all(p.mode is None and p.cpp_index is None for p in plans)
 
 
-@pytest.mark.parametrize("cc, want", [((10, 7), [20605]), ((10, 0), []), ((12, 0), [])], ids=["sm107", "sm100", "sm120"])
-def test_sm107_fp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
-    """The per-tensor FP8 d256 backward row (slot 5 -> 20605): one knob-less entry for an E4M3 ``sdpa_fp8_backward``
-    graph with FP8 gradients on Rubin; no python row serves that graph off the Rubin line."""
+@pytest.mark.parametrize(
+    "cc, want",
+    [((10, 7), [20605]), ((10, 0), [20637]), ((10, 3), [20637]), ((10, 1), []), ((12, 0), [])],
+    ids=["sm107", "sm100", "sm103", "sm101", "sm120"],
+)
+def test_fp8_d256_rows_list_arch_specific_knobless_entries(cc, want):
+    """Each offered native D256 row stays on its own architecture.
+
+    The offered subset contains Rubin and SM100/SM103 per-tensor FP8 rows;
+    it intentionally omits the separate SM120 FP8 row.
+    """
     assert any(s.name == "sdpa_bwd_sm107_fp8" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_fp8 is not registered (plan s7)"
     facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True, causal=True, device_cc=cc)
     plans = recommend("A", facts, _OFFERED)

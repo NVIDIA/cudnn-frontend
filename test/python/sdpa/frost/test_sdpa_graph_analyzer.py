@@ -3693,16 +3693,21 @@ def test_fp8_bwd_dtype_facts():
     assert (facts.h_q, facts.h_kv) == (H, H // 4)
 
 
-@pytest.mark.parametrize("cc", [(10, 7), (10, 0), (12, 0), (8, 0)], ids=["sm107", "sm100", "sm120", "sm80"])
+@pytest.mark.parametrize("cc", [(10, 7), (10, 0), (10, 3), (12, 0), (8, 0)], ids=["sm107", "sm100", "sm103", "sm120", "sm80"])
 def test_fp8_bwd_every_other_row_declines_by_message(monkeypatch, cc):
-    """The native Rubin and SM120 rows serve D256 per-tensor FP8 backward;
+    """The native Rubin, SM100/SM103 and SM120 rows serve D256 per-tensor FP8 backward;
     every other backward row and every forward row declines with a reason.
     A row in the device's SM range reaches the quantization-family gate.
     """
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     g, _ = _mk_fp8_bwd_graph(use_causal_mask=True)
     facts = _facts(g)
-    served = {(10, 7): {"sdpa_bwd_sm107_fp8"}, (12, 0): {"sdpa_bwd_sm120_fp8"}}.get(cc, set())
+    served = {
+        (10, 7): {"sdpa_bwd_sm107_fp8"},
+        (10, 0): {"sdpa_bwd_sm100_d256_fp8"},
+        (10, 3): {"sdpa_bwd_sm100_d256_fp8"},
+        (12, 0): {"sdpa_bwd_sm120_fp8"},
+    }.get(cc, set())
     assert _bwd_eligible(g) == served and not _eligible(g)
     sm = cc[0] * 10 + cc[1]
     for spec in bwd_engines.ENGINE_SPECS:

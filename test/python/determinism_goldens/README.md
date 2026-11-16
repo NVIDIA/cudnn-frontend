@@ -7438,3 +7438,76 @@ comes from the frozen implementation revisions; subsequent parent integration
 preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
+
+
+### SM100/SM103 D256 per-tensor FP8 backward qualification (2026-11-16)
+
+The new `test_sdpa_bwd_d256_fp8.py`, `test_sdpa_bwd_d256_fp8_contract.py` and
+`test_sdpa_bwd_d256_fp8_determinism.py` cover explicit engine 20637. On
+SM100 (P2021, 68 SMs), Torch 2.14.1+cu130, cuDNN 9.28.0.38 and CuTe DSL
+4.8.0 with CUDA 12.9, the current source passes **95 tests, zero skips**.
+The source is based on develop `f1b7ee0751a69307622958241d205288a2f14ae7`;
+these are the tests and implementation delivered together in this change.
+
+The 85 contract/numerical cases include E4M3 and E5M2 inputs, E4M3/E5M2/FP16/
+BF16 gradients, optional amax outputs, graph/direct bounds, tile tails and
+fully masked window tails. The reported B2/H8/S1024 default-plan case failed
+before registration for both input dtypes with the opt-in flag unset, zero
+and one (six missing-plan failures), and passes after registration.
+
+Eight determinism cases compare all gradients and amax values, fixed inputs,
+standalone versus graph, batches 1/3/4/129, reordering, duplication, changed
+neighbors, retained capture and synchronous-read detection. Their reviewed
+SM100 JSON records are under `3bada6ccd1cb05e1/`; strict comparison is included
+in the 95-pass run. Two additional warm-stress cases each complete 3,000 warm
+and 3,000 shared-memory-poisoned launches without a differing byte. The
+unsafe control fails 200/200 launches on this GPU. Stress byte references
+come from cold launches; the same cases also pass the independent numerical
+oracle before stress. These launch counts are not additional pytest cases.
+
+Run from `test/python` after verifying that `cudnn.__file__` resolves to the
+checkout under test:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -n 0 -m L0 -q -ra \
+  sdpa/frost/test_sdpa_bwd_d256_fp8_contract.py \
+  sdpa/frost/test_sdpa_bwd_d256_fp8.py \
+  sdpa/frost/test_sdpa_bwd_d256_fp8_determinism.py
+```
+
+SM103 (B300, 148 SMs), actual cuDNN 9.24.0.43, Torch 2.11.0+cu130 and
+CuTe DSL 4.8.0 with CUDA 13.4 separately passes the same 95 cases, followed
+by eight strict golden comparisons (records `104472d5f9694663/`) and
+26 neighboring D128/D192/D512 FP8 and D256 MXFP8 numerical cases. SM100 on
+actual cuDNN 9.24 separately passes 85 new contract/numerical cases plus
+the same 26 neighboring cases (111 total, zero skips). Initial local failures from nested template
+loading, a reserved pytest parameter, masked Stats handling, and the test's
+graph-window-length to standalone-radius conversion were retained and fixed
+before the passing qualification; none was skipped or treated as a kernel pass.
+
+The final stress geometry uses B16/H8/Hkv4/Q257/K385: 512 thread blocks,
+7.53 per SM on SM100 and 3.46 per SM on SM103, with eleven stage refills
+per launch. Both input dtypes pass this strengthened two-case packet on
+each architecture, including the 3,000 warm and 3,000 poisoned launches
+and a 200/200 failing unsafe control. The earlier 95-case packets used B8;
+the final B16 stress results replace those two stress qualifications rather
+than adding new unique cases.
+
+The final SM100 run uses a native extension whose 1,837 source/build inputs
+match the current base, and passes the 95 new cases plus all 87 backward
+heuristic cases (182 passes, zero skips). SM103 separately rechecks the six
+default-plan cases and eight strict goldens with that matching extension
+(14 passes, zero skips). The earlier SM103 full and stress packets use the
+same production Python/kernel bytes; their reused older native extension
+lacks an unrelated nonpaged THD-origin binding, which this dense path does
+not consume. These results do not establish an installed-release-wheel test.
+
+Shared analyzer/geometry checks exposed two old registration expectations,
+which now name the new SM100/SM103 row while retaining other-architecture
+and forward refusals. A newly offered-row expectation was updated with the
+same positive and negative controls. Eighteen initial forward THD geometry
+failures disappear with the matching native extension; a cold subprocess
+check also passes after pinning its import to the actual checkout. Original
+failures are retained separately from the corrected qualifications.
