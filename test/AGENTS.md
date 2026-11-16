@@ -382,6 +382,12 @@ check that changing either the delta or a shared barrier still fails the test.
 
 ### Conventions for new tests
 
+- **Test launch bounds against each actual scheduler.** A `B`/`H` limit for
+  grid.y/z does not apply to a flat grid.x scheduler. Exercise 65535 and 65536
+  independently for batch and heads, in graph admission and standalone checks;
+  retain legal flat-grid controls and inspect auxiliary launches too.
+  `sdpa/frost/test_sdpa_bwd_launch_grid.py` covers half backward on SM80/SM120.
+
 - Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
   for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
   inputs. A flat (N,) fixture can be rejected before kernel execution. Preserve
@@ -1623,3 +1629,16 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+### Backend workspace capacity
+
+A non-null pointer does not establish sufficient workspace capacity. Test the
+observed byte extent at every mapping/ordered/index transport, including the
+native ordered fast path, Python-only producers, deserialization and effective
+shape overrides. Warm the same plan with a valid buffer before replacing it
+with a short view. Keep that view inside a fully sized owned backing for the
+RED control; assert rejection before either FE scratch initialization or output
+writes. Exact capacity, larger carriers of a different element width, and raw
+integer pointers with unknown capacity are positive controls. See
+`core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.

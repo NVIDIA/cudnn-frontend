@@ -2163,10 +2163,11 @@ class pygraph:
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             if tensor_uids is not None:
                 pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index)
+                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
             uid_to_data = self._uid_to_data(tensor_dict)
-            var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
+            var_pack, _ = self._native_var_pack(uid_to_data, None)
+            ws_ptr, ws_bytes = self._workspace_extent(workspace)
+            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         return self._execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, index=index, **kwargs)
 
@@ -2192,8 +2193,10 @@ class pygraph:
                          Must include both input and output tensors.
                          With ``tensor_uids``, a tuple/list of buffers instead.
                          No additional preparation call is required.
-            workspace: Workspace buffer (python engines receive it via the
-                       ExecutionContext; plans that need one require it)
+            workspace: Caller-owned contiguous scratch buffer. Its observed byte
+                       capacity must cover the selected plan's requirement for
+                       this call's shapes. Integer addresses have unknown capacity
+                       and remain the caller's responsibility.
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: runtime geometry for the backend or a
@@ -2355,7 +2358,11 @@ class pygraph:
                 return
             variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
-                variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
+                variant_pack.native,
+                variant_pack.workspace,
+                to_backend_handle(handle) or 0,
+                -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
@@ -2371,14 +2378,18 @@ class pygraph:
                 variant_pack.workspace,
                 to_backend_handle(handle) or 0,
                 -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
-        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        var_pack, _ = self._native_var_pack(uid_to_data, None)
+        ws_ptr, ws_bytes = self._workspace_extent(workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+            self._lowered_graph._execute_plan_at_index(
+                var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes
+            )
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
@@ -2469,6 +2480,14 @@ class pygraph:
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
         return workspace_ptr, _byte_size(workspace_tensor)
 
+    def _workspace_extent(self, workspace):
+        if workspace is None:
+            return 0, 0
+        extent = _pybind_module.read_buffer_extent(workspace)
+        # A byte count is a byte range only for dense storage. Fallback also
+        # preserves the unknown extent of a caller-sized integer pointer.
+        return self._workspace_extent_fallback(workspace) if extent is None else extent
+
     def _normalize_ordered(self, buffers, tensor_uids, workspace, override_uids=None, override_shapes=None, override_strides=None):
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
@@ -2558,15 +2577,7 @@ class pygraph:
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
-        workspace_ptr, workspace_bytes = 0, 0
-        if workspace is not None:
-            extent = _pybind_module.read_buffer_extent(workspace)
-            if extent is None:  # a bare address, a non-dense buffer, or no vtable
-                # An engine carves the workspace by byte offset, so a byte
-                # COUNT is only a byte RANGE when the buffer is dense.
-                workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
-            else:
-                workspace_ptr, workspace_bytes = extent
+        workspace_ptr, workspace_bytes = self._workspace_extent(workspace)
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
 
     def _declared_layout(self, order: List[int]):
