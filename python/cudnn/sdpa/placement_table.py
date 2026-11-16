@@ -771,6 +771,18 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", False): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", True): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
+    # study sm80_d512_decode_20261116 (A100 40GB PCIe, cuDNN 9.24.0.43; benchmark/attention_inference's generation graph, d512
+    # absorbed MLA over one KV head, h_q 16-128, b 1-64, dense and paged page 64; s_q 1 / 4 (mtp); 216 train cells on and off the
+    # 128-key tile + a 48-cell seeded holdout (24 off-tile, 24 on-tile) scored once: 1.004 geomean regret vs 8.51 for the
+    # measured default, worst 1.18; its one cell above the default ran the default's own plan (same-plan spread))
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", False): Entry("always", None, "sm80_d512_decode_20261116"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", True): Entry("always", None, "sm80_d512_decode_20261116"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm80_d512_decode_20261116"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm80_d512_decode_20261116"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.006, "sm80_d512_decode_20261116"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", True): Entry("ge", 8.0, "sm80_d512_decode_20261116", "rows"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 8.0, "sm80_d512_decode_20261116", "rows"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 8.0, "sm80_d512_decode_20261116", "rows"),
     # study sm90_decode_20261112 (H200 700 W, cuDNN 9.30.0.4; the same graphs and lattice as sm80_decode_20261112 without d64 /
     # D576, which the SM90 row does not serve, plus d512 absorbed MLA dense and paged page 64; 820 train cells + an 88-cell holdout:
     # mtp / verify 0.01-0.20 geomean, d512 q1 0.25-0.33, d256 paged q1 0.94. Dense verify d128 lost 1.08-1.14x at 40/8 b24-96
