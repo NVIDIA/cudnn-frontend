@@ -374,7 +374,7 @@ C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
 ### JAX execution
 
 With JAX arrays, the wrapper runs the contiguous-weight MXFP8 fusion
-through `cudnn.jax.call`, eagerly or under `jax.jit`. All operands are ordinary
+through `cutlass.jax.cutlass_call`, eagerly or under `jax.jit`. All operands are ordinary
 JAX arrays managed by XLA. Torch and JAX calls return `TupleDict` with the same
 key order and tuple-unpacking behavior. The JAX path registers this output type
 as a JAX pytree.

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import cudnn
-from cudnn.jax.call import call, zeros_init
+from cudnn._jax import call, zeros_init
 
 PRIMAL_NAMES = ("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias")
 GRADIENT_NAMES = ("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias")

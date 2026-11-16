@@ -19,7 +19,7 @@ if requirement_error:
 import cutlass
 import cutlass.cute as cute
 
-from cudnn.jax import call, zeros_init
+from cudnn._jax import call, zeros_init
 from cudnn.tensor_adapter import get_compute_capability
 from .compressor_sm100 import (
     _BWD_ROWS,

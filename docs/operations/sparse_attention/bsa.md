@@ -734,10 +734,9 @@ toward Speed of Light.
 
 `cudnn.ops.block_sparse_attention_forward_jax` and
 `cudnn.ops.block_sparse_attention_backward_jax` provide explicit forward/backward;
-`cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+`cudnn.block_sparse_attention.jax_api.block_sparse_attention` adds first-order reverse-mode differentiation.
 All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
-`cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
-have been removed; use the `cudnn.ops` names.
+The `cudnn.jax` namespace has been removed; use the `cudnn.ops` names.
 
 The JAX implementation reuses the SM100/SM103 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
@@ -778,7 +777,7 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn.jax import block_sparse_attention as attention
+from cudnn.block_sparse_attention.jax_api import block_sparse_attention as attention
 from cudnn.ops import (
     block_sparse_attention_forward_jax as forward,
     block_sparse_attention_backward_jax as backward,
