@@ -25,7 +25,6 @@ cudnn.gemm.ops
 cudnn.gnn
 cudnn.hstu.hstu_attention
 cudnn.hstu.hstu_lmsd
-cudnn.jax
 cudnn.linear_attention
 cudnn.linear_attention.ops
 cudnn.moe_ep

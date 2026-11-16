@@ -14,6 +14,7 @@ import torch
 from cudnn.api_base import TupleDict
 
 if TYPE_CHECKING:
+    from ._bwd_metadata import BsaBackwardMetadata
     from .kpage import KPageLayout
 
 
@@ -493,6 +494,7 @@ def block_sparse_attention_backward(
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
     kpage: Union[bool, "KPageLayout"] = False,
+    metadata: Optional["BsaBackwardMetadata"] = None,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
@@ -502,6 +504,13 @@ def block_sparse_attention_backward(
     ``kpage`` selects the KPage backward (see ``block_sparse_attention_forward``);
     it takes ``block_sizes`` and requires ``do_tensor`` to be zero on padding
     rows.  The forward may have run with or without ``kpage``.
+
+    ``metadata`` takes the :class:`BsaBackwardMetadata` that
+    :func:`block_sparse_attention_prepare_backward` built from these metadata
+    tensors (SM90 blk64 only): the backward then launches no metadata kernels.
+    It must describe the same tensors, shapes and ``bucket_size_blocks``;
+    an object built from other metadata, or from these tensors before an
+    in-place change, is rejected with ``ValueError``.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -525,6 +534,10 @@ def block_sparse_attention_backward(
             raise NotImplementedError("kpage does not take bucket_size_blocks; use kpage_prepare_layout(bwd_kv_groups=...)")
         if sparse_block_size != 128:
             raise NotImplementedError("the KPage backward requires sparse_block_size=128 (the blk64 KPage path is forward only)")
+        if metadata is not None:
+            raise NotImplementedError("metadata (block_sparse_attention_prepare_backward) and kpage are exclusive; a KPageLayout already holds its metadata")
+    if metadata is not None and (arch_family != 9 or sparse_block_size != 64):
+        raise NotImplementedError("block_sparse_attention_prepare_backward metadata serves the SM90 blk64 backward only")
     if arch_family == 9 and head_dim != 128:
         raise NotImplementedError("SM90 backward requires head_dim=128")
     if sparse_block_size == 64 and head_dim != 128:
@@ -617,8 +630,87 @@ def block_sparse_attention_backward(
             bucket_size_blocks=bucket_size_blocks,
             sparse_block_size=sparse_block_size,
             layout=layout,
+            metadata=metadata,
         )
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
+
+
+def block_sparse_attention_prepare_backward(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: Optional[int] = None,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    *,
+    seqlen_q: int,
+    seqlen_k: int,
+    sparse_block_size: int = 64,
+    bucket_size_blocks: Optional[int] = None,
+) -> "BsaBackwardMetadata":
+    """Build the metadata of the SM90 blk64 ``block_sparse_attention_backward`` once, for reuse through ``metadata=``.
+
+    The positional arguments have the same meaning as in
+    ``block_sparse_attention_backward``.  The backward's metadata kernels
+    (the bucketed K-to-Q CSR build and, on the paired-KV path, the pair
+    bitsets, matching, refinement and partitioned CSR) depend on these tensors
+    and on ``seqlen_q`` / ``seqlen_k`` only, never on Q/K/V/dO, so a mask that
+    serves several backward passes (every layer of a training step, or the
+    backward of the forward that has just been launched) pays for them once,
+    off the backward's critical path.  The kernels run on the current stream
+    of the metadata's device and nothing synchronizes the host, so the call
+    can be issued on a side stream while the forward runs; order the stream
+    that runs the backward after it with an event as usual.  The backward
+    records the object's tensors on its own stream when it consumes them, so
+    the object may be released as soon as that call returns, even when it
+    was built on another stream.
+
+    The returned :class:`BsaBackwardMetadata` fixes the batch, the heads, the
+    sequence lengths and ``bucket_size_blocks`` (``None`` selects the SM90
+    default, as in the backward) and remembers the storage, shape, strides
+    and in-place version counters of the metadata tensors, which it keeps
+    alive.  ``block_sparse_attention_backward(..., metadata=obj)`` requires
+    the same tensors unchanged and rejects anything else with ``ValueError``;
+    rebuild the object after an in-place change of the metadata.  Only
+    ``sparse_block_size=64`` on SM90 is served.
+    """
+    if not isinstance(q2k_block_index, torch.Tensor) or not q2k_block_index.is_cuda:
+        raise ValueError("q2k_block_index must be a CUDA tensor")
+    arch = _device_arch(q2k_block_index)
+    if arch // 10 != 9 or sparse_block_size != 64:
+        raise NotImplementedError(
+            f"block_sparse_attention_prepare_backward serves the SM90 blk64 backward only (sparse_block_size=64); found SM{arch}, {sparse_block_size}"
+        )
+    if seqlen_q < 1 or seqlen_k < 1:
+        raise ValueError(f"seqlen_q and seqlen_k must be positive, got {seqlen_q} and {seqlen_k}")
+    if q2k_block_index.ndim != 4:
+        raise ValueError("q2k_block_index must be a rank-4 int32 tensor")
+    batch, num_heads = int(q2k_block_index.shape[0]), int(q2k_block_index.shape[1])
+    expected_prefix = (batch, num_heads, (seqlen_q + sparse_block_size - 1) // sparse_block_size)
+    _validate_sparse_metadata(
+        q2k_block_index,
+        q2k_block_nums,
+        block_sizes,
+        expected_prefix=expected_prefix,
+        num_kv_blocks=(seqlen_k + sparse_block_size - 1) // sparse_block_size,
+        device=q2k_block_index.device,
+        allowed_block_size_ranks=(1, 2),
+    )
+    if block_sparse_num is None:
+        block_sparse_num = int(q2k_block_index.shape[-1])
+    if q2k_block_nums is None:
+        _validate_fixed_block_count(block_sparse_num, q2k_block_index.shape[-1], require_even=False)
+
+    with torch.cuda.device(q2k_block_index.device):
+        from . import _interface
+
+        return _interface.sm90_blk64_prepare_backward(
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes,
+            q2k_block_nums,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            bucket_size_blocks=bucket_size_blocks,
+        )
 
 
 def kpage_prepare_layout(
@@ -688,5 +780,6 @@ __all__ = [
     "block_sparse_attention_forward",
     "block_sparse_attention_fp8_forward",
     "block_sparse_attention_backward",
+    "block_sparse_attention_prepare_backward",
     "kpage_prepare_layout",
 ]

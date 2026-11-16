@@ -3,6 +3,8 @@
 
 """Native Hopper Q128/KV128 attention with shared KV and warp specialization."""
 
+from typing import Optional
+
 from cudnn.block_sparse_attention.csrc.utils.sm90_barriers import named_barrier_sync, named_barrier_arrive
 
 import cuda.bindings.driver as cuda
@@ -15,17 +17,30 @@ from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 from cudnn.block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90 import (
     gemm_zero_acc,
     mask,
+    mask_from_limit,
     layout_acc_mn,
     make_acc_into_op,
     reduce_max,
     rescale_o_for_next_acc,
+    rescale_o_if_needed,
     get_final_ratio_and_lse_empty_safe,
 )
 
 
 class BlockSparseAttnForwardSm90Blk128:
     def __init__(
-        self, head_dim, value_dim, gqa_ratio=1, variable_count=False, block_sizes_mode=0, num_splits=1, stages=2, scale_nonpositive=False, has_kv_tail=False
+        self,
+        head_dim,
+        value_dim,
+        gqa_ratio=1,
+        variable_count=False,
+        block_sizes_mode=0,
+        num_splits=1,
+        stages=2,
+        scale_nonpositive=False,
+        has_kv_tail=False,
+        lean_consumer_loop=True,
+        has_tile_order=False,
     ):
         self.head_dim = head_dim
         self.value_dim = value_dim
@@ -36,6 +51,18 @@ class BlockSparseAttnForwardSm90Blk128:
         self.num_splits = num_splits
         self.stages = stages
         self.scale_nonpositive = scale_nonpositive
+        # Lean consumer loop (every configuration; False keeps the plain loop). Two bit-exact changes to a list step:
+        # - a full KV block (128 valid tokens) skips the partial-block mask, whose selects then change nothing;
+        # - the O rescale by softmax[i]'s ratio moves from the end of step i to just after the QK issue of step i + 1,
+        #   where it overlaps that QK, and one warp vote skips it when no row of the warp raised its running max (the
+        #   ratio is then exactly 1.0 and x * 1.0 == x).
+        self.lean_consumer_loop = lean_consumer_loop
+        # Longest-list-first CTA order (variable counts, non-split kernel only): CTA x of head h processes Q tile
+        # order[x, h, b], a per-(b, h) permutation built on the device by the host wrapper (stable descending sort of the
+        # list lengths), so every head starts with its long lists, the grid ends with short ones and lists nested in
+        # each other are walked at the same time. Off, the kernel keeps the identity order and its code.
+        assert not has_tile_order or (variable_count and num_splits == 1), "the tile order is for variable counts without KV splits"
+        self.has_tile_order = has_tile_order
 
     @cute.jit
     def __call__(
@@ -48,6 +75,7 @@ class BlockSparseAttnForwardSm90Blk128:
         indices: cute.Tensor,
         counts: cute.Tensor,
         sizes: cute.Tensor,
+        order: cute.Tensor,  # (q tiles, heads, batch): Q tile of CTA (x, h, b); read only when has_tile_order
         scale: cutlass.Float32,
         fixed_count: cutlass.Int32,
         stream: cuda.CUstream,
@@ -103,6 +131,7 @@ class BlockSparseAttnForwardSm90Blk128:
             indices,
             counts,
             sizes,
+            order if self.has_tile_order else None,
             aq,
             ak,
             av,
@@ -135,6 +164,7 @@ class BlockSparseAttnForwardSm90Blk128:
         indices: cute.Tensor,
         counts: cute.Tensor,
         sizes: cute.Tensor,
+        order: Optional[cute.Tensor],
         aq: cute.CopyAtom,
         ak: cute.CopyAtom,
         av: cute.CopyAtom,
@@ -177,6 +207,16 @@ class BlockSparseAttnForwardSm90Blk128:
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 8),
             tx_count=128 * self.value_dim * self.dtype.width // 8,
         )
+        lists = indices
+        if cutlass.const_expr(self.has_tile_order):
+            # One load per CTA, at the first use of the Q tile; the shuffle keeps the index uniform. The CTA's list is
+            # then one row view, and the tile index is loaded again behind the list loop (see there): the loop holds
+            # the row's address and nothing else that derives from this load. Loaded at the top of the kernel, or kept
+            # across the loop, the same kernel ran 0.4 to 2.3 % more SM cycles per list step with an identity order (ptxas
+            # then forms each PV descriptor right in front of its wgmma instead of one wgmma ahead).
+            cta_x = qb
+            qb = cute.arch.make_warp_uniform(cutlass.Int32(order[cta_x, h, b]))
+            lists = indices[None, qb, h, b]
         gq = cute.local_tile(q[None, None, h, b], (128, self.head_dim), (qb, 0))
         gk = cute.local_tile(k[None, None, kh, b], (128, self.head_dim), (None, 0))
         gv = cute.local_tile(v[None, None, kh, b], (self.value_dim, 128), (0, None))
@@ -211,13 +251,19 @@ class BlockSparseAttnForwardSm90Blk128:
                 state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
                 if begin < end:
                     # K leads V by one list position, matching QK[i+1] / PV[i].
-                    previous_block = indices[begin, qb, h, b]
+                    if cutlass.const_expr(self.has_tile_order):
+                        previous_block = lists[begin]
+                    else:
+                        previous_block = indices[begin, qb, h, b]
                     kpipe.producer_acquire(state)
                     cute.copy(ak, tk_g[None, previous_block], tk_s[None, state.index], tma_bar_ptr=kpipe.producer_get_barrier(state))
                     for slot in cutlass.range(begin + 1, end, unroll=1):
                         vstate = state.clone()
                         state.advance()
-                        block = indices[slot, qb, h, b]
+                        if cutlass.const_expr(self.has_tile_order):
+                            block = lists[slot]
+                        else:
+                            block = indices[slot, qb, h, b]
                         kpipe.producer_acquire(state)
                         cute.copy(ak, tk_g[None, block], tk_s[None, state.index], tma_bar_ptr=kpipe.producer_get_barrier(state))
                         vpipe.producer_acquire(vstate)
@@ -240,6 +286,11 @@ class BlockSparseAttnForwardSm90Blk128:
             scores = cute.make_rmem_tensor(qm.partition_shape_C((128, 128)), cutlass.Float32)
             out = cute.make_rmem_tensor(pm.partition_shape_C((128, self.value_dim)), cutlass.Float32)
             coords = qm.partition_C(cute.make_identity_tensor((128, 128)))
+            coords0 = None
+            if cutlass.const_expr(self.lean_consumer_loop):
+                # Thread 0's coordinate partition: its columns are trace-time constants, and every thread's column is that
+                # constant plus the thread's own first column, so the mask compares one limit per thread (mask_from_limit).
+                coords0 = qk.get_slice(0).partition_C(cute.make_identity_tensor((128, 128)))
             stat_layout = cute.make_layout(cute.size(layout_acc_mn(pv, out.layout), mode=[0]))
             mx = cute.make_rmem_tensor(stat_layout, cutlass.Float32)
             den = cute.make_rmem_tensor(stat_layout, cutlass.Float32)
@@ -259,8 +310,13 @@ class BlockSparseAttnForwardSm90Blk128:
                 cute.nvgpu.warpgroup.wait_group(0)
                 kpipe.consumer_release(kstate)
                 kstate.advance()
-                self.softmax(qk, scores, coords, mx, den, indices, sizes, begin, qb, h, b, k.shape[0], scale, softmax_scale, is_first=True)
+                self.softmax(qk, scores, coords, coords0, mx, den, lists, sizes, begin, qb, h, b, k.shape[0], scale, softmax_scale, is_first=True)
                 rp = make_acc_into_op(scores, pv.tv_layout_A, self.dtype)
+                if cutlass.const_expr(self.lean_consumer_loop):
+                    # alpha carries softmax[i]'s ratio to step i + 1 (and the last one to the drain), where it rescales O
+                    # between the QK and PV issues. O is zero until the first PV, so it starts at 1.0.
+                    alpha = cute.make_rmem_tensor_like(mx)
+                    alpha.fill(1.0)
 
                 # The second compute WG seeds the first WG's scheduler token.
                 # IDs 2/3 are independent of the shared-output barrier (ID 1).
@@ -276,8 +332,15 @@ class BlockSparseAttnForwardSm90Blk128:
                     cute.nvgpu.warpgroup.fence()
                     gemm_zero_acc(qk, ra, rb[None, None, None, kstate.index], scores)
                     cute.nvgpu.warpgroup.commit_group()
+                    if cutlass.const_expr(self.lean_consumer_loop):
+                        # O is free here: the previous step waited for its PV. The FMULs, when the vote takes them,
+                        # overlap the QK just issued.
+                        rescale_o_if_needed(pv, out, alpha)
                     if wg == 0:
                         vpipe.consumer_wait(vstate)
+                    if cutlass.const_expr(self.lean_consumer_loop):
+                        # O was rescaled after the QK fence.
+                        cute.nvgpu.warpgroup.fence()
                     pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
                     cute.gemm(pv, out, rp, rv[None, None, None, vstate.index], out)
                     cute.nvgpu.warpgroup.commit_group()
@@ -287,15 +350,20 @@ class BlockSparseAttnForwardSm90Blk128:
                     cute.nvgpu.warpgroup.wait_group(1)
                     kpipe.consumer_release(kstate)
                     kstate.advance()
-                    ratio = self.softmax(qk, scores, coords, mx, den, indices, sizes, slot, qb, h, b, k.shape[0], scale, softmax_scale)
+                    ratio = self.softmax(qk, scores, coords, coords0, mx, den, lists, sizes, slot, qb, h, b, k.shape[0], scale, softmax_scale)
                     cute.nvgpu.warpgroup.wait_group(0)
                     vpipe.consumer_release(vstate)
                     vstate.advance()
                     # Do not overwrite P or rescale O until the preceding PV retires.
                     cute.make_tensor(rp.iterator, scores.layout).store(scores.load().to(self.dtype))
-                    rescale_o_for_next_acc(pv, out, ratio)
+                    if cutlass.const_expr(self.lean_consumer_loop):
+                        alpha.store(ratio.load())
+                    else:
+                        rescale_o_for_next_acc(pv, out, ratio)
 
                 # Drain the last P/V pair; an empty list never acquires either ring.
+                if cutlass.const_expr(self.lean_consumer_loop):
+                    rescale_o_if_needed(pv, out, alpha)
                 vpipe.consumer_wait(vstate)
                 cute.nvgpu.warpgroup.fence()
                 pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
@@ -303,10 +371,16 @@ class BlockSparseAttnForwardSm90Blk128:
                 cute.nvgpu.warpgroup.commit_group()
             # Final statistics do not read O and can overlap the last PV.
             ratio, logsum = get_final_ratio_and_lse_empty_safe(mx, den, softmax_scale)
+            # Keep this wait outside `if has_blocks:`. The rescale below reads the PV accumulators, and a read that some
+            # path reaches without a wgmma wait makes ptxas serialize every wgmma of the kernel (remarks C7514/C7517:
+            # a wait injected after each of the 16 issues of a step). With nothing pending the wait is a no-op.
+            cute.nvgpu.warpgroup.wait_group(0)
             if has_blocks:
-                cute.nvgpu.warpgroup.wait_group(0)
                 vpipe.consumer_release(vstate)
             rescale_o_for_next_acc(pv, out, ratio)
+            if cutlass.const_expr(self.has_tile_order):
+                # The LSE rows and the O store take the tile index from a second load, see the first one.
+                qb = cute.arch.make_warp_uniform(cutlass.Int32(order[cta_x, h, b]))
             cmn = cute.make_tensor(coords.iterator, layout_acc_mn(qk, coords.layout))
             if cute.arch.lane_idx() % 4 == 0:
                 for r in cutlass.range_constexpr(cute.size(logsum)):
@@ -335,11 +409,17 @@ class BlockSparseAttnForwardSm90Blk128:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
-    def softmax(self, qk, scores, coords, mx, den, indices, sizes, slot, qb, h, b, seqlen_k, scale, softmax_scale, is_first: cutlass.Constexpr = False):
+    def softmax(
+        self, qk, scores, coords, coords0, mx, den, indices, sizes, slot, qb, h, b, seqlen_k, scale, softmax_scale, is_first: cutlass.Constexpr = False
+    ):
         if cutlass.const_expr(self.scale_nonpositive):
             scores.store(scores.load() * scale)
         if cutlass.const_expr(self.block_sizes_mode != 0 or self.has_kv_tail):
-            block = indices[slot, qb, h, b]
+            if cutlass.const_expr(self.has_tile_order):
+                # With a tile order the caller passes the CTA's own list row.
+                block = indices[slot]
+            else:
+                block = indices[slot, qb, h, b]
             valid = cutlass.min(128, seqlen_k - block * 128)
             if cutlass.const_expr(self.block_sizes_mode == 1):
                 valid = cutlass.min(valid, sizes[block])
@@ -347,7 +427,13 @@ class BlockSparseAttnForwardSm90Blk128:
                 valid = cutlass.min(valid, sizes[b, block])
             elif cutlass.const_expr(self.block_sizes_mode == 3):
                 valid = cutlass.min(valid, sizes[b, h, block])
-            mask(qk, scores, coords, valid)
+            if cutlass.const_expr(self.lean_consumer_loop):
+                # valid is the same in every thread of the CTA; a full block needs no select.
+                if valid < 128:
+                    cmn = cute.make_tensor(coords.iterator, layout_acc_mn(qk, coords.layout))
+                    mask_from_limit(qk, scores, coords0, valid - cmn[0, 0][1])
+            else:
+                mask(qk, scores, coords, valid)
         scores_mn = cute.make_tensor(scores.iterator, layout_acc_mn(qk, scores.layout))
         previous_max = cute.make_rmem_tensor_like(mx)
         previous_max.store(mx.load())

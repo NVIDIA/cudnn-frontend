@@ -193,7 +193,7 @@ def _paged_pool(args, kv_lens, make):
     pages = (kv_lens + ps - 1) // ps
     total = int(pages.sum())
     perm = torch.randperm(total, generator=torch.Generator().manual_seed(1)).to(torch.int32)
-    table = torch.zeros(len(kv_lens), int(pages.max()), dtype=torch.int32)
+    table = torch.zeros(len(kv_lens), block_table_pages(args, kv_lens), dtype=torch.int32)
     start = 0
     for i, n in enumerate(pages.tolist()):
         table[i, :n] = perm[start : start + n]
@@ -206,6 +206,11 @@ def _paged_pool(args, kv_lens, make):
 def declared_max_kv(args, kv_lens):
     """The KV maximum a paged graph declares: the row's ``kv_len``, as FlashInfer's ``max_sequence_kv``, not the drawn lengths'."""
     return max(int(args.kv_len), int(kv_lens.max()))
+
+
+def block_table_pages(args, kv_lens):
+    """Pages per request in the direct graph's block table: cuDNN checks the table against the declared KV maximum."""
+    return -(-declared_max_kv(args, kv_lens) // args.page_size)
 
 
 def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
@@ -356,7 +361,12 @@ def _built_plan_name(graph) -> str:
     """Name of the plan build_plans() settled on ('backend_heuristics' = the
     backend's own OSS candidate space)."""
     try:
-        return graph.get_plan_name_at_index(graph._plan_index)
+        name = graph.get_plan_name_at_index(graph._plan_index)
+        compiled = getattr(graph._compiled_plans.get(graph._plan_index), "_compiled", None)
+        resolved = getattr(compiled, "implementation_config", None)
+        if resolved:
+            name += " resolved=" + ";".join(f"{key}:{value}" for key, value in resolved.items())
+        return name
     except Exception:
         return "unknown"
 
@@ -515,6 +525,8 @@ def setup_flashinfer(args, dtype, fi_backend=None):
     if args.phase == "context" and args.kv_layout == "paged":
         return _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace)
     if args.phase == "context":
+        if args.has_sink:
+            raise NotImplementedError("the flashinfer ragged prefill leg does not pass sinks")
         # Ragged (contiguous) batch prefill, per-request lengths.
         q_lens, kv_lens = request_lens(args)
         q_gpu = torch.randn(int(q_lens.sum()), hq, dqk, device="cuda", dtype=dtype) * 0.1
@@ -576,6 +588,8 @@ def setup_flashinfer(args, dtype, fi_backend=None):
 
         return fn, f"flashinfer mla backend={getattr(wrapper, '_backend', mla_backend)}"
 
+    if dvo != dqk:
+        raise NotImplementedError("the flashinfer decode legs run V / O at the Q / K width")
     kv_dtype = torch.float8_e4m3fn if args.kv_cache_dtype == "fp8_e4m3" else dtype
     _, kv_lens = request_lens(args)
     total, kv_indptr, kv_indices, last_page_len, block_tables = _paged_kv_layout(kv_lens, args.page_size)

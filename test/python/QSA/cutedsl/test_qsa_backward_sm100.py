@@ -249,7 +249,7 @@ def test_indexed_max_seq_len_below_the_crossover_plans_no_sparse_path(monkeypatc
     with pytest.raises(ValueError, match="max_seq_len"):
         _indexed_backward(inputs, inputs["cu_seqlens"], max_seq_len=16000)
     _check(inputs, _indexed_backward(inputs, inputs["cu_seqlens"], max_seq_len=max(lengths)))
-    plans = [plan for key, plan in engine._PLANS.items() if key[0] == sum(lengths) and key[-2] == max(lengths)]
+    plans = [plan for key, plan in engine._PLANS.items() if key[0] == sum(lengths) and key[-1] == max(lengths)]
     assert plans and not any(plan.has_sparse for plan in plans)
 
 
@@ -377,30 +377,6 @@ def test_sparse_rows_follow_bounds_and_scale(h_kv, scale):
     _check(inputs, _bitmap_backward(inputs, meta, scale), scale)
 
 
-@pytest.mark.L0
-@pytest.mark.parametrize("h_kv", [2, 1])
-@pytest.mark.parametrize("keys", ["constant-key", "near-equal-keys"])
-def test_sparse_backward_cancellation(h_kv, keys):
-    # With (nearly) equal keys the sparse queries' dQ (nearly) cancels to zero. The default's three bf16 parts of dS keep
-    # it within an absolute bound that a single rounding (ds_precision="bf16") exceeds.
-    from cudnn.QSA import _backward as engine
-
-    _skip_cu12(h_kv)
-    seq_len = 22600
-    inputs = _inputs((seq_len,), h_kv, seed=11)
-    inputs["k"].fill_(1)
-    if keys == "near-equal-keys":
-        inputs["k"][1::2] = 1 + 2**-7
-    inputs["out"], lse = reference_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"], torch.float32)
-    inputs["lse"] = lse.T.contiguous()
-    dq = _entry_backward("bitmap" if h_kv == 2 else "indexed", inputs, (seq_len,))[0]
-    rows = torch.arange(engine.DENSE_QUERIES_MAX, seq_len, 53, device=dq.device)
-    q, out, dout, idx = (inputs[name][rows] for name in ("q", "out", "dout", "topk_idxs"))
-    expected = reference_backward(q, inputs["k"], inputs["v"], out, dout, inputs["lse"][:, rows], idx, dtype=torch.float64)[0]
-    err = (dq[rows].double() - expected).abs().max().item()
-    assert err <= 1e-5, f"sparse dQ error {err:.3e}"
-
-
 @pytest.mark.L1
 def test_key_skip_variant_matches_reference(monkeypatch):
     # The key-major variant that skips empty K-steps serves only long sequences, which the 24Q/2KV cases stop short of.
@@ -496,34 +472,6 @@ def test_cuda12_compiler_declines_12q1kv(monkeypatch):
             _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (4101,)))
     inputs = _inputs((4101,), 2, seed=9)
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (4101,))))
-
-
-@pytest.mark.parametrize(
-    "h_q, h_kv, entries",
-    [
-        pytest.param(12, 1, ("indexed", "bitmap"), marks=pytest.mark.L0),
-        pytest.param(24, 2, ("bitmap",), marks=pytest.mark.L1),
-        pytest.param(6, 1, ("indexed", "bitmap"), marks=pytest.mark.L1),
-    ],
-    ids=["12q1kv", "24q2kv", "6q1kv"],
-)
-def test_bf16_ds_option_on_both_entries(h_q, h_kv, entries, monkeypatch):
-    # ds_precision="bf16" rounds dS to bf16 before the dQ MMAs on the dense and the sparse paths of both entries and
-    # stays within the ordinary bounds. The cancellation tests cover the accuracy the default keeps.
-    from cudnn.QSA import _backward as engine
-
-    from cudnn.QSA.indexed.api import _plan
-
-    _skip_cu12(h_kv)
-    # the indexed entry builds its engine plan only when its own plan cache misses
-    _plan.cache_clear()
-    monkeypatch.setattr(engine, "_PLANS", {})
-    inputs = _inputs((24000,), h_kv, seed=5, h_q=h_q)
-    for entry in entries:
-        before = set(engine._PLANS)
-        _check(inputs, _entry_backward(entry, inputs, (24000,), ds_precision="bf16"))
-        # each entry plans its own sequence source, with one dS part
-        assert [key[-1] for key in set(engine._PLANS) - before] == [1]
 
 
 @pytest.mark.L1

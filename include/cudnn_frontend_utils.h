@@ -705,6 +705,10 @@ NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                                  {HeurMode_t::OPENSOURCE, "OPENSOURCE"},
                              })
 
+// Frontend-only behavior notes use a separate append-only band. These values
+// may be serialized and filtered by FE, but have no backend enum equivalent.
+constexpr int64_t FRONTEND_BEHAVIOR_NOTE_BASE = 1000;
+
 enum class BehaviorNote_t {
     NOT_SET,
 
@@ -713,7 +717,14 @@ enum class BehaviorNote_t {
     REQUIRES_BIAS_INT8x32_REORDER,
     SUPPORTS_CUDA_GRAPH_NATIVE_API,
     CUBLASLT_DEPENDENCY,
+
+    SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE = FRONTEND_BEHAVIOR_NOTE_BASE,
 };
+
+static_assert(static_cast<int64_t>(BehaviorNote_t::CUBLASLT_DEPENDENCY) == 5,
+              "existing behavior-note integers are append-only");
+static_assert(static_cast<int64_t>(BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE) == FRONTEND_BEHAVIOR_NOTE_BASE,
+              "frontend-only behavior notes start at FRONTEND_BEHAVIOR_NOTE_BASE");
 
 NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                              {
@@ -723,6 +734,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                                  {BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER, "REQUIRES_BIAS_INT8x32_REORDER"},
                                  {BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API, "SUPPORTS_CUDA_GRAPH_NATIVE_API"},
                                  {BehaviorNote_t::CUBLASLT_DEPENDENCY, "CUBLASLT_DEPENDENCY"},
+                                 {BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE,
+                                  "SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE"},
                              })
 
 enum class NumericalNote_t {
@@ -1539,6 +1552,9 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
 static inline cudnnStatus_t
 convert_to_cudnn_type(cudnn_frontend::BehaviorNote_t const mode, cudnnBackendBehaviorNote_t& cudnn_mode) {
     switch (mode) {
+        case BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE:
+            // FE-only capability: never manufacture a backend enum value.
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
         case BehaviorNote_t::RUNTIME_COMPILATION:
             cudnn_mode = CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;

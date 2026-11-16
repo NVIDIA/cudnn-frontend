@@ -20,7 +20,7 @@ the workspace carve unchanged by the read.
 
 cc 10.0 cells (``requires_blackwell``, 2026-10-29; the SM100 line of ``DENSE_SERVING_CCS``, functional only): the same oracle matrix at
 every served group x ``S_q`` 1 .. 5 with ``fuse_gate=False`` (the sm100 row claims no gate epilogue: stage (5) its own launch) on the
-SM100 decode tile (``sm100/decode_d256_f16.py``: the 16-column tile packed, the 16-column tile UNPACKED at groups 6 / 12 past 16 rows,
+SM100 decode tile (``sm100/d256_f16_swap_ab/kernel.py``: the 16-column tile packed, the 16-column tile UNPACKED at groups 6 / 12 past 16 rows,
 the paged prefill tile packed at groups 16 / 8 / 4 -- the line's own rule, pinned on the compiled module), the 27B geometry (24 / 4 at
 ``d_model`` 5120) at ``S_q`` 1 / 4, the pool matrix, capture / replay, two launches; the Rubin-only knobs declined by name there.
 
@@ -1628,11 +1628,11 @@ def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
     assert rb["adapter_split"] == case.blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
     assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == _ROUTE_TABLE[group][s_q], (r, _ROUTE_TABLE[group][s_q])
     if r.decode_tile:
-        assert rb["file"].endswith("/sm107/decode_d256_f16.py") and rb["heads_per_tile"] == (group if r.pack_gqa else 1), rb
+        assert rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py") and rb["heads_per_tile"] == (group if r.pack_gqa else 1), rb
         assert rb["n_q"] == r.n_q and rb["split"] == case.blk.decode_split_kv, rb
         assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2, "the gate rides the COMBINE, never the tile"
     else:
-        assert r.prefill_tile and rb["file"].endswith("/sm100/prefill_d256_f16.py") and rb["heads_per_tile"] == group and rb["n_q"] is None, rb
+        assert r.prefill_tile and rb["file"].endswith("/sm100/d256_f16_lookahead/kernel.py") and rb["heads_per_tile"] == group and rb["n_q"] is None, rb
         assert rb["epilogue_gate"] is True and case.blk.gate_fused and case.blk.decode_split_kv == 1, "the gate rides the paged body's epilogue"
     assert r.claimed is (
         s_q <= DECODE_CLAIMED_MAX_S_Q and r.pack_gqa and r.decode_tile and r.n_q <= DECODE_CLAIMED_MAX_N_Q
@@ -1687,7 +1687,7 @@ def test_s_q_five_rides_the_prefill_tile_at_sixteen_the_64_column_tile_at_twelve
     fill.check_against_oracle(what="prefill route at the fill")
     r, rb = fill.blk.decode_route, fill.route_readback()
     assert r.prefill_tile and r.tile == rb["template"] and r.batch == 32 and r.kv_streams == 1 and r.token_units == 0 and r.n_q == 0, (r, rb)
-    assert rb["heads_per_tile"] == 16 and rb["adapter_pack"] is True and rb["file"].endswith("sm100/prefill_d256_f16.py"), rb
+    assert rb["heads_per_tile"] == 16 and rb["adapter_pack"] is True and rb["file"].endswith("sm100/d256_f16_lookahead/kernel.py"), rb
 
 
 def test_past_s_q_32_the_step_is_a_typed_decline_the_envelope_predicts():
@@ -1761,7 +1761,7 @@ def test_qwen35_shards_decode_match_the_oracle(name):
     case.check_against_oracle(what=f"{name} p{page} out")
     r, rb = case.blk.decode_route, case.route_readback()
     assert r.claimed and r.pack_gqa and r.n_q == 16 and r.token_units == 1, r
-    assert rb["template"] == r.tile == DECODE_TILE and rb["file"].endswith("/sm107/decode_d256_f16.py"), rb
+    assert rb["template"] == r.tile == DECODE_TILE and rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py"), rb
     assert rb["heads_per_tile"] == group and rb["adapter_pack"] is True and rb["n_q"] == 16, rb
     assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2, "the gate rides the COMBINE, never the tile"
     assert case.geom.d_model == _D_MODEL_397B and case.geom.h_kv == 1 and case.k_cache.shape[1] == 1
@@ -2215,7 +2215,7 @@ def test_decode_s_q_four_on_the_64_column_tile_matches_the_oracle(group):
     case = _w64_case(group)
     r, rb = case.blk.decode_route, case.route_readback()
     assert (r.n_q, r.token_units, r.pack_gqa, r.served, r.tile) == (64, 1, True, True, DECODE_TILE), r
-    assert rb["template"] == DECODE_TILE and rb["file"].endswith("/sm107/decode_d256_f16.py"), rb
+    assert rb["template"] == DECODE_TILE and rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py"), rb
     assert (rb["n_q"], rb["heads_per_tile"], rb["adapter_pack"]) == (64, group, True), rb
     assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2 and rb["split"] == case.blk.decode_split_kv, rb
     case.run()
@@ -2732,7 +2732,7 @@ def test_an_explicit_fuse_cache_write_false_keeps_the_separate_launch_under_the_
 # ---------------------------------------------------------------------------
 #
 # The block's dense bf16 / f16 serving forms are admitted on cc 10.0 through the shared SM100 d256 kernels: the SM100 decode tile
-# (sm100/decode_d256_f16.py) under the line's own route (_SM100_ROUTE_TABLE), the paged prefill tile packed, the split combine in the
+# (sm100/d256_f16_swap_ab/kernel.py) under the line's own route (_SM100_ROUTE_TABLE), the paged prefill tile packed, the split combine in the
 # combine module's own forms, the sigmoid gate as its own launch (fuse_gate=True is a typed decline: the sm100 row claims no gate
 # epilogue), PDL off by default.  Functional cells only -- nothing measured there; every Rubin-only knob a typed decline by name.
 
@@ -2928,10 +2928,10 @@ def _sm100_pin(case, want):
     assert rb["template"] == r.tile and rb["adapter_split"] == case.blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
     assert not case.blk.gate_fused and isinstance(case.blk._gate, _SigmoidGate) and not case.blk._sdpa.fuse_gate
     if r.decode_tile:
-        assert rb["file"].endswith("/sm100/decode_d256_f16.py") and rb["heads_per_tile"] == (r.group if r.pack_gqa else 1), rb
+        assert rb["file"].endswith("/sm100/d256_f16_swap_ab/kernel.py") and rb["heads_per_tile"] == (r.group if r.pack_gqa else 1), rb
         assert rb["n_q"] == r.n_q and rb["split"] == case.blk.decode_split_kv and rb["epilogue_gate"] is False, rb
     else:
-        assert r.prefill_tile and rb["file"].endswith("/sm100/prefill_d256_f16.py") and rb["heads_per_tile"] == r.group and rb["n_q"] is None, rb
+        assert r.prefill_tile and rb["file"].endswith("/sm100/d256_f16_lookahead/kernel.py") and rb["heads_per_tile"] == r.group and rb["n_q"] is None, rb
         assert bool(rb["epilogue_gate"]) is False and case.blk.decode_split_kv == 1, rb
     k0, v0 = case.block0_bits
     assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
@@ -3171,7 +3171,7 @@ def test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_
     r = case.blk.decode_route
     if _cc() == _SM107:
         assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT][6][s_q] and case.blk.gate_fused, r
-        assert case.route_readback()["file"].endswith("/sm107/decode_d256_f16.py")
+        assert case.route_readback()["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py")
     else:
         _sm100_pin(case, _SM100_ROUTE_TABLE[6][s_q])
 
@@ -3268,7 +3268,7 @@ def _mode_pin(case):
     if _cc() == _SM107:
         assert r.device_cc == _SM107 and (blk.gate_fused == (r.prefill_tile or blk.decode_split_kv >= 2))
         if r.decode_tile:
-            assert rb["file"].endswith("/sm107/decode_d256_f16.py") and rb["n_q"] == r.n_q
+            assert rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py") and rb["n_q"] == r.n_q
     else:
         _sm100_pin(case, _SM100_ROUTE_TABLE[r.group][r.s_q])
     k0, v0 = case.block0_bits

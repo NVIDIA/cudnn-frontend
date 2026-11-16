@@ -50,9 +50,18 @@ def _compiler_targets_available(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
+# (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
+# The SM80 D64 body likewise serves only the plain aligned corner its selector names; test_sdpa_bwd_explicit_engines pins it.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64"})
+
+
 def _rows():
-    """``[(kind, EngineSpec)]`` -- every row the registry actually ships."""
-    return [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
+    """``[(kind, EngineSpec)]`` -- every row the registry actually ships that serves some graph.
+
+    A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample."""
+    rows = [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
+    return [(kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and _dims(kind, spec.capabilities) is not None]
 
 
 def _probe(kind: str):
@@ -72,21 +81,33 @@ def _pick_dtype(dtypes):
 
 def _dims(kind: str, caps):
     if kind == "fwd":
-        shapes = sorted(tuple(s) for s in caps.d_shapes)
+        delegated = {shape for _, shape in caps.delegated_exact}
+        shapes = sorted(tuple(s) for s in caps.d_shapes if tuple(s) not in delegated)
+        if not shapes:
+            # Explicit engines own every exact flavor; the legacy row keeps its padded envelopes. Exercise that domain.
+            return next(((d, d) for d in range(120, 0, -8) if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, d, d))) is None), None)
         # A smaller native flavor can support fewer features than the row's
         # full envelope (SM90 D64 versus D512). Sample the full envelope for
         # the row-wide band claims; dedicated flavor tests pin its restrictions.
+        if caps.implementation in ("sdpa_fwd_sm100_d256_swap_ab", "sdpa_fwd_sm107_d256_lookahead"):
+            # D128 swap-AB only serves paged short queries; D256 also serves
+            # the dense geometry varied by this matrix.
+            return (256, 256)
         return (128, 128) if (128, 128) in shapes else shapes[-1]
     # A backward row lists head dims, not pairs, and may serve only some pairs of
     # them (the SM100 d256 row: exact (256, 256) and dense (192, 128)). Take the
     # first pair the row accepts unmasked, so a head-dim rule never stands in
     # for a band decision.
     dims = sorted(caps.d)
+    if caps.implementation == "sdpa_bwd_sm100_d128_accumulation":
+        # D64 serves this owner's sliding-window domain; D128 is unwindowed.
+        return (64, 64)
     pairs = ([(128, 128)] if 128 in dims else []) + [(d, d) for d in reversed(dims)] + [(a, b) for a in reversed(dims) for b in dims if a != b]
     for pair in pairs:
         if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, *pair))) is None:
             return pair
-    return pairs[0]
+    # A row that delegated every body it would select keeps only its policy, as above; its explicit engines are sampled.
+    return None if caps.delegated else pairs[0]
 
 
 def declaration_reason(kind: str, caps, facts) -> Optional[str]:
@@ -95,12 +116,34 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
     sentence may be the probe's first reason; None when the row has no check or the check accepts."""
     check = getattr(caps, "declaration_check", None)
     if check is None:
+        if kind == "fwd":
+            contract = fwd_engines._SMALL_FP8_CONTRACTS.get(caps.implementation) or fwd_engines._HALF_CONTRACTS.get(caps.implementation)
+            if contract is not None:
+                return contract.mismatch(facts, None)
+            for contract in (fwd_engines._sm107_small_half, fwd_engines._sm107_mid_half, fwd_engines._sm107_shared_half):
+                if caps.implementation in contract.IMPLEMENTATIONS:
+                    return contract.mismatch(caps.implementation, facts, None)
+
+            for owner in (
+                fwd_engines._sm107_small_fp8_owner,
+                fwd_engines._sm107_swap_fp8_owner,
+                fwd_engines._sm107_d192_fp8_owner,
+                fwd_engines._sm107_d256_fp8_owner,
+                fwd_engines._sm107_d512_fp8_owner,
+            ):
+                if caps.implementation == owner.NAME:
+                    return owner.mismatch(facts, None)
         return None
     if kind == "fwd":
         return check(facts)
     from cudnn.frost.buffers import cutedsl_state
 
-    return check(facts, cutedsl_state()[1])
+    reason = check(facts, cutedsl_state()[1])
+    if reason is None and caps.delegated and bwd_engines._declared_mismatch(caps, facts, None) is None:
+        # A partially migrated row can transfer only some masks to another
+        # owner. Keep testing its bands, while recognizing that transfer.
+        return bwd_engines.mismatch(caps, facts)
+    return reason
 
 
 def probe_matches(kind: str, caps, facts, expected) -> bool:
@@ -112,6 +155,22 @@ def probe_matches(kind: str, caps, facts, expected) -> bool:
     return actual in ({decl} if expected is None else {expected, decl})
 
 
+@dataclasses.dataclass(frozen=True)
+class _DeclaredTensor:
+    dim: tuple
+    dtype: object
+
+    def get_dim(self):
+        return self.dim
+
+    def get_stride(self):
+        _, h, seq, d = self.dim
+        return (seq * h * d, d, h * d, 1)
+
+    def get_data_type(self):
+        return self.dtype
+
+
 def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     """Facts that satisfy every NON-mask constraint of this row.
 
@@ -120,6 +179,22 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     """
     values = _values(kind, caps, *_dims(kind, caps))
     values.update(overrides)
+    # Wide native rows validate the actual binding declarations even without
+    # shape overrides. Keep the non-mask baseline legal after geometry changes.
+    b, hq, hk = values["b"], values["h_q"], values["h_kv"]
+    sq, sk, dq, dv = (values[k] for k in ("s_q", "s_kv", "d_qk", "d_v"))
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm107_small_batch_pair":
+        # This body always includes a batch-broadcast bias. Preserve that
+        # legal declaration when the band matrix varies sequence lengths.
+        bias_pitch = (sk + 7) // 8 * 8
+        values.update(has_bias=True, bias_dim=(1, hq, sq, sk), bias_stride=(hq * sq * bias_pitch, sq * bias_pitch, bias_pitch, 1), bias_dtype=values["dtype"])
+    for role, dim, dtype in (
+        ("q_t", (b, hq, sq, dq), values["dtype"]),
+        ("k_t", (b, hk, sk, dq), values["dtype"]),
+        ("v_t", (b, hk, sk, dv), values["dtype"]),
+        ("o_t", (b, hq, sq, dv), values["dtype_o"]),
+    ):
+        values.setdefault(role, _DeclaredTensor(dim, dtype))
     return ga.SdpaGraphFacts(**values)
 
 
@@ -150,6 +225,23 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
         device_sm_count=1024,
         scale=0.1,
     )
+    if getattr(caps, "implementation", "") in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab"}:
+        # This body has eight live query columns. A 128-row sample would
+        # exercise its implementation boundary before any mask decision.
+        values["s_q"] = 1
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d64_quadrant":
+        # Quadrant cooperation serves at most 32 live query rows. Keep the
+        # baseline inside that domain before varying any mask axis.
+        values["s_q"] = 32
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_single_q" and (d_qk, d_v) == (192, 128):
+        # D192 single-Q is THD-only; the same body also serves dense small heads.
+        values.update(thd=True, padded=True)
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm107_shared_d256_lookahead":
+        # Its nonpaged domain is THD split, not the native dense lookahead.
+        values.update(thd=True, padded=True)
+    if getattr(caps, "implementation", "") == "sdpa_bwd_sm100_d128_accumulation_2cta":
+        # Two-CTA accumulation owns grouped attention; MHA has no such body.
+        values["h_kv"] = 2
     return values
 
 
@@ -266,7 +358,7 @@ def test_a_window_coupling_is_declared_and_decided_after_the_anchor():
     ):
         with pytest.raises(ValueError):
             band.BandSupport(right=right, left=left, window_right=window_right)
-    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8")
+    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8_pair")
     assert caps.band.window_right == frozenset({band.RIGHT_CAUSAL}) and caps.swa and caps.causal
     assert caps.band.as_dict()["window_right"] == [band.RIGHT_CAUSAL]
     reason = band.window_right_reason(caps.band.window_right)
@@ -446,11 +538,16 @@ def test_geometry_relations_do_not_change_the_band_decision():
     for kind, spec in _rows():
         caps = spec.capabilities
         expected = None if declares(caps, right=band.RIGHT_CAUSAL) else band.feature_reason(band.LABEL_RIGHT_CAUSAL)
-        for s_q, s_kv in ((128, 128), (64, 128), (256, 128)):
-            reason = _probe(kind)(caps, legal_facts(kind, caps, s_q=s_q, s_kv=s_kv, **band_causal_top_left()))
-            assert reason == expected, (spec.name, s_q, s_kv, reason)
+        geometries = ((128, 128), (64, 128), (256, 128))
+        if getattr(caps, "implementation", "") in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab"}:
+            # Exercise all three relations within the eight-column domain.
+            geometries = ((4, 4), (4, 8), (8, 4))
+        for s_q, s_kv in geometries:
+            facts = legal_facts(kind, caps, s_q=s_q, s_kv=s_kv, **band_causal_top_left())
+            reason = _probe(kind)(caps, facts)
+            assert probe_matches(kind, caps, facts, expected), (spec.name, s_q, s_kv, reason)
             # ... and the unmasked decision is geometry-independent too.
-            assert _probe(kind)(caps, legal_facts(kind, caps, s_q=s_q, s_kv=s_kv, **band_unmasked())) is None, spec.name
+            assert probe_matches(kind, caps, legal_facts(kind, caps, s_q=s_q, s_kv=s_kv, **band_unmasked()), None), spec.name
 
 
 def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
@@ -485,8 +582,17 @@ def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
         tile = int(caps.skv_tile)
         s_kv = tile * 2 - 1  # not a tile multiple: the tail rule is live
         uncovered = legal_facts(kind, caps, s_q=tile * 2, s_kv=s_kv, **band_causal_top_left())
+        if caps.implementation in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab", "sdpa_fwd_sm100_d64_quadrant"}:
+            # Keep Q inside the body's live-query limit. An unmasked KV tail
+            # is also uncovered and reaches the same tile-tail gate.
+            uncovered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_unmasked())
         covered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_causal_top_left())
         reason = _probe(kind)(caps, uncovered)
+        if uncovered.thd:
+            # Packed per-sequence lengths mask their own tails. A scalar
+            # dense S_kv alignment restriction is not this body's contract.
+            assert reason is None and _probe(kind)(caps, covered) is None, name
+            continue
         assert reason is not None and "must be a multiple of" in reason, (name, reason)
         assert _probe(kind)(caps, covered) is None, name
 
@@ -522,7 +628,10 @@ def test_negative_right_bound_is_still_refused_by_the_forward_probe():
         caps = spec.capabilities
         reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, **band_right(-1)))
         if kind == "fwd":
-            assert reason == "negative diagonal_band_right_bound (-1) is not supported", spec.name
+            # A row that has no finite-band path rejects that feature before
+            # validating its bound; rows serving it retain the value diagnostic.
+            expected = "negative diagonal_band_right_bound (-1) is not supported" if caps.right_band_widening else band.feature_reason(band.LABEL_RIGHT_FINITE)
+            assert reason == expected, spec.name
         else:
             # The backward probe has no such early value guard: the row's band
             # claim decides, so a row that serves widening still serves -1 (the
@@ -627,7 +736,7 @@ def test_length_metadata_decisions_follow_the_row_claims():
         )
         for overrides, expected in cases:
             sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), **overrides})
-            assert _probe(kind)(caps, sample) == expected, (spec.name, overrides, _probe(kind)(caps, sample))
+            assert probe_matches(kind, caps, sample, expected), (spec.name, overrides, _probe(kind)(caps, sample))
         if kind == "fwd":
             # fwd-only combination: a padding mask plus generate_stats needs the
             # row's padded_stats claim; the padding gate itself comes first.
@@ -649,6 +758,11 @@ def test_length_metadata_decisions_follow_the_row_claims():
 def test_dense_layout_envelope_decisions():
     for kind, spec in _rows():
         caps = spec.capabilities
+        baseline = legal_facts(kind, caps)
+        if baseline.thd:
+            # A THD-only implementation has no dense envelope to exercise.
+            assert _probe(kind)(caps, dataclasses.replace(baseline, thd=False, padded=False)) is not None
+            continue
         layouts = getattr(caps, "layouts", frozenset({"bshd"}))
         cases = (
             (dict(bshd_layout=True, packed_layout=True, dense_layout=True), True),
@@ -732,8 +846,9 @@ def test_non_mask_rejections_keep_their_own_vocabulary():
         ):
             if getattr(caps, cap_attr, False):
                 continue
-            reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, **{**band_unmasked(), **overrides}))
-            assert reason == f"graph uses {label}, which this engine does not support", (spec.name, label, reason)
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_unmasked(), **overrides})
+            reason = _probe(kind)(caps, sample)
+            assert probe_matches(kind, caps, sample, f"graph uses {label}, which this engine does not support"), (spec.name, label, reason)
         # The band model is not consulted for a wrong-pass probe.
         other = bwd_engines.mismatch if kind == "fwd" else fwd_engines.mismatch
         assert "serves sdpa" in other(caps, legal_facts(kind, caps, s_kv=128, **band_unmasked()))
@@ -742,8 +857,12 @@ def test_non_mask_rejections_keep_their_own_vocabulary():
 def test_arch_gate_precedes_the_band_decision():
     for kind, spec in _rows():
         caps = spec.capabilities
-        reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, device_cc=(5, 0), **band_causal_top_left()))
-        assert reason is not None and reason.startswith("requires SM"), (spec.name, reason)
+        facts = legal_facts(kind, caps, s_kv=128, device_cc=(5, 0), **band_causal_top_left())
+        reason = _probe(kind)(caps, facts)
+        assert reason is not None and (reason.startswith("requires SM") or (reason == declaration_reason(kind, caps, facts) and "SM" in reason)), (
+            spec.name,
+            reason,
+        )
 
 
 # ---------------------------------------------------------------------------

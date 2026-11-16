@@ -280,7 +280,6 @@ def test_a_narrower_buffer_covering_the_slot_count_but_not_the_bytes_is_not_re_d
 
 
 @pytest.mark.L0
-@pytest.mark.L0
 def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
     """FlashInfer binds packed fp4 as uint8 and the e4m3 scale blob as uint8:
     the declaration names the dtype, the buffer only has to be as wide. A
@@ -329,6 +328,7 @@ def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
     assert pack.dtype(0) == (17, 4)
 
 
+@pytest.mark.L0
 def test_storage_geometry_packs_fp4_two_per_slot():
     from cudnn.graph_types import storage_geometry as _storage_geometry
 

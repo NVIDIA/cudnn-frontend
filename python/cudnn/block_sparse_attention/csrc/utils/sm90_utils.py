@@ -55,15 +55,20 @@ def gemm(
     zero_init: cutlass.Constexpr[bool] = False,
     wg_wait: cutlass.Constexpr[int] = 0,
     swap_AB: cutlass.Constexpr[bool] = False,
+    k_begin: cutlass.Constexpr[int] = 0,
+    k_end: cutlass.Constexpr[Optional[int]] = None,
 ) -> None:
     if const_expr(swap_AB):
-        gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False)
+        gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False, k_begin=k_begin, k_end=k_end)
         return
 
     warpgroup.fence()
     mma_atom = cute.make_mma_atom(tiled_mma.op)
     mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
-    for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+    # [k_begin, k_end) restricts the contraction to a static sub-range of the k-blocks: a K slice of the operands,
+    # which for SS/RS wgmma is only a base offset of the smem descriptors (default: the whole K extent).
+    k_stop = cute.size(tCrA.shape[2]) if const_expr(k_end is None) else k_end
+    for k in cutlass.range_constexpr(k_begin, k_stop):
         cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
         mma_atom.set(warpgroup.Field.ACCUMULATE, True)
     warpgroup.commit_group()
@@ -80,13 +85,15 @@ def gemm_zero_init(
     B_idx: Optional[Int32] = None,
     wg_wait: int = -1,
     swap_AB: bool = False,
+    k_begin: int = 0,
+    k_end: Optional[int] = None,
 ) -> cute.Tensor:
     if const_expr(swap_AB):
-        return gemm_zero_init(tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False)
+        return gemm_zero_init(tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False, k_begin=k_begin, k_end=k_end)
     acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
     rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
     rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
-    gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait)
+    gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait, k_begin=k_begin, k_end=k_end)
     return acc
 
 

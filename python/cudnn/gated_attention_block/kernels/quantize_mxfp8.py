@@ -4,7 +4,7 @@
 """MXFP8 block quantization pass over ``[T, H, D]``: e4m3 codes + F8_128x4 E8M0 scale factors.
 
 The block's MXFP8 pipeline hands the production Rubin SDPA
-(``sdpa/fwd/kernels/sm107/prefill_d256_mxfp8.py``) Q/K/V as e4m3 codes plus one
+(``sdpa/fwd/kernels/sm107/d256_mxfp8_single_q/kernel.py``) Q/K/V as e4m3 codes plus one
 E8M0 scale per 32-element block, in cuDNN's F8_128x4 swizzled order.  Q and K
 are quantized ROWWISE (blocks along D, the BMM1 contraction), V COLUMNWISE
 (blocks along S, the BMM2 contraction).  This is that pass, forked from the

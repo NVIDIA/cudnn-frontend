@@ -26,3 +26,12 @@ updates:
     labels:
       - cat-routine-update
       - area:packaging
+
+  - package-ecosystem: pip
+    directory: /samples/models
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - cat-routine-update
+      - area:packaging

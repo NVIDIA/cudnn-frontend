@@ -870,7 +870,7 @@ def make_cfg_d512(params: TemplateParams) -> CfgBwdD512:
 
 # ---------------------------------------------------------------------------
 # The 2x2-datapath twin of the stage-2 geometry (sibling kernel
-# ``kernels/sm100/bprop_d512_f16_2x2.py``).  APPEND-ONLY: the only line above
+# ``kernels/sm100/d512_f16_2x2/kernel.py``).  APPEND-ONLY: the only line above
 # this one that changed when it landed is the ``typing`` import (``NamedTuple``,
 # ``Tuple`` added for ``Slab2x2``) -- ``TemplateParams``, ``CfgBwdD512``,
 # ``_validate_cfg_d512`` and ``make_cfg_d512`` render the 4x1 kernel exactly as

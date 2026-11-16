@@ -176,6 +176,10 @@ class RequestLensTest(unittest.TestCase):
         _, kv = request_lens(args)
         self.assertLess(int(kv.max()), 2048)
         self.assertEqual(declared_max_kv(args, kv), 2048)
+        # the direct graph's block table covers the declared maximum, or cuDNN rejects the page-table dims
+        from benchmark.attention_inference.benchmark_single_attention import block_table_pages
+
+        self.assertEqual(block_table_pages(SimpleNamespace(**vars(args), page_size=16), kv), 2048 // 16)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,7 @@ import torch
 
 from test_utils import torch_fork_set_rng
 
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, _dsl_installed, requires_blackwell, select_engine
+from frost_test_utils import _SM, _dsl_installed, half_engine_names, requires_blackwell, select_engine
 
 pytestmark = [requires_blackwell, pytest.mark.skipif(_SM not in (100, 103), reason="the single-CTA THD leg is the SM100 / SM103 line's")]
 
@@ -112,7 +111,7 @@ def _run(q_lens, kv_lens, *, h_q, h_kv, s_max_q, s_max_kv, mask="bottom_right", 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(arch="sm100"))
+    plan = select_engine(g, half_engine_names("sm100"))
     g.check_support()
     g.build_plans()
     ws = torch.zeros(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

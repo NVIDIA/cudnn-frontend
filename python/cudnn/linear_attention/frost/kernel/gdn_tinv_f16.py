@@ -141,7 +141,7 @@ def make_bars(cfg) -> GdnTinvBars:
         mb_gate_ready=MBarrier(alloc(GATE_RING), try_wait=True, stages=GATE_RING, init_count=GATE_WARP, producer=Producer.THREAD),
         mb_gate_done=MBarrier(alloc(GATE_RING), try_wait=True, stages=GATE_RING, init_count=GROUP_THREADS, producer=Producer.THREAD),
         mb_acc_ready=MBarrier(alloc(cfg.tmem_acc_stages), try_wait=True, stages=cfg.tmem_acc_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_acc_done=MBarrier(alloc(cfg.tmem_acc_stages), try_wait=True, stages=cfg.tmem_acc_stages, init_count=GROUP_WARPS, producer=Producer.THREAD),
+        mb_acc_done=MBarrier(alloc(cfg.tmem_acc_stages), try_wait=True, stages=cfg.tmem_acc_stages, init_count=GROUP_THREADS, producer=Producer.THREAD),
         mb_tile_ready=MBarrier(alloc(TILE_RING), try_wait=True, stages=TILE_RING, init_count=ONE_LANE, producer=Producer.THREAD),
         mb_tile_done=MBarrier(alloc(TILE_RING), try_wait=True, stages=TILE_RING, init_count=ONE_LANE, producer=Producer.THREAD),
     )
@@ -504,7 +504,6 @@ def compute_warp_group(
     tmem_row_hi_addr = cutlass.Int32(16) << 16
     ACC_STAGE_COLS = cfg.b_t
     storer = tidx == cutlass.Int32(cfg.compute_group_warp_ids[group][0] * cfg.threads_per_warp)
-    elect_one = nvvm.elect_sync()
     tmem_base = tmem_col
 
     mask_zero = opaque_f32_zero()
@@ -595,8 +594,7 @@ def compute_warp_group(
             kk_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(tmem_row_lo_addr + acc_col, cutlass.Float32), num=8)
             kk_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(tmem_row_hi_addr + acc_col, cutlass.Float32), num=8)
             nvvm.tcgen05_wait("load")
-            if elect_one:
-                bars.mb_acc_done[acc_stage].arrive()
+            bars.mb_acc_done[acc_stage].arrive()
             for u in cutlass.range_constexpr(2):
                 kk_vec = kk_vec_hi if cutlass.const_expr(u == 1) else kk_vec_lo
                 kk_pack = []
@@ -613,8 +611,7 @@ def compute_warp_group(
                         nvvm.MMALayout.ROW,
                     )
         else:
-            if elect_one:
-                bars.mb_acc_done[acc_stage].arrive()
+            bars.mb_acc_done[acc_stage].arrive()
 
         # ---- pair inverse: warps 0-1 own matrix 0, warps 2-3 matrix 1 ----------------
         inv_base = tinv0_base
@@ -703,12 +700,16 @@ def emit_tinv_rows(
     mRows: cute.Tensor,
     mCount: cute.Tensor,
     lane_idx,
+    seq_lo=None,
 ) -> None:
     """One warp: the chunk-factor pass's row table, one (chunk, batch, batch_start, batch_end) entry per valid chunk row in
     tile-row order, and the valid row count; lanes scan the chunk counts of 32 sequences at a time and write their rows."""
+    first = 0
+    if cutlass.const_expr(seq_lo is not None):
+        first = seq_lo
     n_batch = cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(1)
     carry = cutlass.Int32(0)
-    for b0 in cutlass.range(0, n_batch, 32, unroll=1):
+    for b0 in cutlass.range(first, n_batch, 32, unroll=1):
         b = b0 + lane_idx
         n_chunks = cutlass.Int32(0)
         batch_start = cutlass.Int32(0)
@@ -1383,13 +1384,6 @@ def chunk_gdn_tinv(
 
     cache["compiled"](k, workspace, gate, a_log, dt_bias, beta, cu_seqlens, tinv, row_table, row_count, cu_stream)
     return cache
-
-
-def run_tinv(cache, k, gate, beta, cu_seqlens, tinv, workspace, stream, a_log=None, dt_bias=None, *, row_table, row_count) -> None:
-    """Replay the compiled plan (the prologue launch, then the pass).  The caller owns the
-    contract, which the plan validated at build, so nothing here raises."""
-    cu_stream = cuda.CUstream(int(stream))
-    cache["compiled"](k, workspace, gate, a_log, dt_bias, beta, cu_seqlens, tinv, row_table, row_count, cu_stream)
 
 
 frost_gdn_tinv_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

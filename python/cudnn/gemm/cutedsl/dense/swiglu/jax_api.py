@@ -3,7 +3,7 @@
 
 """JAX-native (XLA custom call) entry point for the GEMM + SwiGLU kernels.
 
-Built on :func:`cudnn.jax.call` (CuTeDSL's native JAX bridge). Both the standard and
+Built on :func:`cudnn._jax.call` (CuTeDSL's native JAX bridge). Both the standard and
 the blockscaled (MXFP8) quantized kernels are supported: the quantized kernel's
 optional amax/sfc/norm_const parameters are compile-time ``None`` constants inside the
 ``@cute.jit`` adapter for the JAX-reachable configurations.
@@ -20,7 +20,7 @@ import cutlass.utils
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec
+from cudnn._jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec
 from .api import GemmSwigluSm100
 
 # config_key -> (kernel instance, max_active_clusters). The instance does not vary

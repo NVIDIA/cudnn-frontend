@@ -13,7 +13,7 @@ import torch
 import cudnn
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd import engines as fwd_engines
-from frost_test_utils import requires_dsl, select_engine
+from frost_test_utils import half_engine_names, requires_dsl, select_engine, sm80_owner
 
 _SM80 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
@@ -129,7 +129,7 @@ def _build_plan(graph):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, _ENGINE)
+    select_engine(graph, half_engine_names("sm80"))
     graph.check_support()
     graph.build_plans()
 
@@ -194,7 +194,7 @@ def test_graph_thd_forward_unequal_lengths(dtype, hkv, d, dv, causal, bottom_rig
         torch.testing.assert_close(offset_buffers[f"{name}_ro"], expected)
     facts = ga.analyze(graph)
     assert facts is not None and facts.thd and facts.packed_layout
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     assert fwd_engines.mismatch(caps, facts) is None
 
     workspace = _plan(graph)
@@ -294,7 +294,7 @@ def test_graph_thd_zero_kv_and_poisoned_tail():
 def test_graph_thd_all_kv_empty():
     graph, vp, nodes, _ = _make_graph((96, 144), (0, 0), skv_max=128)
     facts = ga.analyze(graph)
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     assert fwd_engines.mismatch(caps, facts) is None
     graph.execute(vp, _plan(graph))
     torch.cuda.synchronize()
@@ -305,7 +305,7 @@ def test_graph_thd_all_kv_empty():
 def test_graph_thd_all_q_empty():
     graph, vp, nodes, _ = _make_graph((0, 0), (96, 144), sq_max=128)
     facts = ga.analyze(graph)
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     assert fwd_engines.mismatch(caps, facts) is None
     graph.execute(vp, _plan(graph))
     torch.cuda.synchronize()
@@ -635,7 +635,7 @@ def test_graph_thd_respects_handle_stream_and_captures():
 def test_graph_thd_head_dim_envelope(d, accepted):
     graph, _, _, _ = _make_graph((144, 96), (160, 128), d=d)
     facts = ga.analyze(graph)
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     reason = fwd_engines.mismatch(caps, facts)
     if accepted:
         assert reason is None
@@ -647,7 +647,7 @@ def test_graph_thd_head_dim_envelope(d, accepted):
 def test_graph_thd_declines_linear_grid_schedulers(sched_policy):
     graph, _, _, _ = _make_graph((144, 96), (160, 128), causal=True)
     facts = ga.analyze(graph)
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     reason = fwd_engines.mismatch(caps, facts, fwd_engines.SdpaFwdKnobs(sched_policy=sched_policy))
     assert reason is not None and "natural scheduler" in reason
 
@@ -656,7 +656,7 @@ def test_graph_thd_declines_dense_padded_stats():
     graph, _, nodes, _ = _make_graph((144, 96), (160, 128))
     nodes[4].set_ragged_offset(None)
     facts = ga.analyze(graph)
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     reason = fwd_engines.mismatch(caps, facts)
     assert reason is not None and "ragged stats offsets" in reason
 
@@ -666,7 +666,7 @@ def test_graph_thd_declines_overlapping_token_stride():
     q = nodes[0]
     q.set_stride((7, 128, 248, 1))
     facts = ga.analyze(graph)
-    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
+    caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == sm80_owner(facts.d_qk, facts.d_v))
     reason = fwd_engines.mismatch(caps, facts)
     assert reason is not None and "Q" in reason and "non-overlapping" in reason
 

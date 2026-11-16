@@ -75,6 +75,20 @@ class FrostSdpaFwdEngine(BaseEngine):
             return str(exc)
         return reason
 
+    def get_behavior_notes(self, graph: "pygraph", plan: PlanConfig) -> tuple:
+        from .engines import analyze_for, supports_stats_stride_override
+
+        knobs = plan.knobs
+        if isinstance(knobs, dict):
+            knobs = self.knobs_from_public(knobs)
+        try:
+            facts, reason = analyze_for(self._spec, graph, knobs)
+        except ValueError:
+            return self.behavior_notes
+        if reason is None and supports_stats_stride_override(self._spec, facts, knobs):
+            return self.behavior_notes + (behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE,)
+        return self.behavior_notes
+
     def check_support(self, graph: "pygraph") -> None:
         reason = self._decline_reason(graph, None)
         if reason is not None:
@@ -105,7 +119,11 @@ class FrostSdpaFwdEngine(BaseEngine):
         if isinstance(knobs, dict):  # a replayed public record, not yet converted
             knobs = self.knobs_from_public(knobs)
         try:
-            return _FrostSdpaFwdPlan(self.name, build(self._spec, graph, knobs))
+            compiled = build(self._spec, graph, knobs)
+            if behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE in self.get_behavior_notes(graph, plan):
+                if not getattr(compiled.prepared, "supports_stats_stride_override", False):
+                    raise RuntimeError(f"{self.name}: advertised Stats stride override without the matching prepared binder")
+            return _FrostSdpaFwdPlan(self.name, compiled)
         except (NotImplementedError, ValueError, ImportError) as exc:
             # ImportError: the DSL adapter resolves at build time now (support
             # checks must not pay for it), so a missing cutedsl extra surfaces

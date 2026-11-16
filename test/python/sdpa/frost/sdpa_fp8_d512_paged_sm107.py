@@ -10,21 +10,26 @@ import torch
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def paged_capture(hnd, split, dtype, monkeypatch):
-    from test_sdpa_prepared_fp8_paged import test_prepared_fp8_paged_strides_and_capture
-    from cudnn.sdpa.fwd import api_dsl
+    import test_sdpa_prepared_fp8_paged as prepared
 
-    original = api_dsl._load_kernel_template
+    original = prepared._case
     observed = []
 
-    def checked(path, *args, **kwargs):
-        if "prefill_d512" in path:
-            assert path == "sm107/prefill_d512_fp8.py"
-            observed.append(path)
-        return original(path, *args, **kwargs)
+    def checked(**kwargs):
+        result = original(**kwargs)
+        graph = result[0]
+        compiled = graph._compiled_plans[graph._plan_index]._compiled
+        assert graph.selected_engine.name == "sdpa_fwd_sm107_d512_fp8_role_split"
+        assert compiled.kernel_module.__file__.endswith("sm107/d512_fp8_role_split/kernel.py")
+        assert (compiled.kernel_module.CFG.CGA_M, compiled.kernel_module.CFG.CTA_MMA) == (4, 2)
+        observed.append(compiled)
+        return result
 
-    monkeypatch.setattr(api_dsl, "_load_kernel_template", checked)
-    test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, 512, monkeypatch)
-    assert observed, "the plan must compile the native SM107 D512 body"
+    # Inspect the artifact used by the shared test, including cache hits. A
+    # selected implementation loads directly and need not enter the old router.
+    monkeypatch.setattr(prepared, "_case", checked)
+    prepared.test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, 512, monkeypatch)
+    assert observed, "the test must execute the native SM107 D512 artifact"
 
 
 def native_paged_contract():
@@ -56,7 +61,6 @@ def native_paged_contract():
     from cudnn.sdpa.fwd import engines
     import cudnn
 
-    caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == engines.engine_name(arch="sm107", fp8=True))
     facts = ga.SdpaGraphFacts(
         b=2,
         h_q=4,
@@ -75,11 +79,22 @@ def native_paged_contract():
     )
     for dims in ((512, 512), (384, 320)):
         selected = replace(facts, d_qk=dims[0], d_v=dims[1])
-        assert engines.mismatch(caps, selected) is None
+        selected_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d512_fp8_role_split")
+        assert engines.mismatch(selected_caps, selected) is None
     for dims in ((64, 64), (128, 128), (192, 128), (256, 256)):
-        reason = engines.mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]))
-        assert reason is not None and "paged KV is wired" in reason
-    assert "THD" in engines.mismatch(caps, replace(facts, thd=True))
+        name = {
+            (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
+            (128, 128): "sdpa_fwd_sm107_d128_fp8_multi_q",
+            (192, 128): "sdpa_fwd_sm107_d192_fp8_multi_q",
+            (256, 256): "sdpa_fwd_sm107_d256_fp8_single_q",
+        }[dims]
+        selected_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
+        selected = replace(facts, d_qk=dims[0], d_v=dims[1])
+        assert engines.mismatch(selected_caps, replace(selected, has_paged_kv=False, page_size=0, padded=False)) is None
+        reason = engines.mismatch(selected_caps, selected)
+        assert reason is not None and "paged attention" in reason
+    owner = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d512_fp8_role_split")
+    assert "THD" in engines.mismatch(owner, replace(facts, thd=True))
 
 
 @pytest.mark.parametrize("split", [1, 4])

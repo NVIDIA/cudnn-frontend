@@ -3,8 +3,8 @@
 
 """PTX helpers shared by the SM120 SDPA-forward kernels.
 
-``sm120/prefill_f16.py``, ``sm120/prefill_fp8.py``, ``sm120/prefill_mxfp8.py``,
-and the D=256 specialization ``sm120/prefill_d256_f16.py`` are self-contained
+``sm120/f16_general/kernel.py``, ``sm120/fp8_general/kernel.py``, ``sm120/mxfp8_general/kernel.py``,
+and the D=256 specialization ``sm120/d256_f16_all_compute/kernel.py`` are self-contained
 kernels that differ in head-tile geometry, MMA shape, and warp roles; the
 lane-level primitives below are shared between them (``sfo_atom_offset`` by the
 two block-scaled-O kernels, FP8 and MXFP8; ``zero_dead_q_rows`` by the three D=512
@@ -195,6 +195,7 @@ def load_paged_half_tile(
     head_tile: cutlass.Constexpr[int],
     chunk_elems: cutlass.Constexpr[int],
     producer_warps: cutlass.Constexpr[int] = 1,
+    async_publication: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Fill one paged half tile, then publish every producer arrival."""
     copy_paged_half_tile(
@@ -205,7 +206,8 @@ def load_paged_half_tile(
         prims.mbarrier_arrive(mbar)
     else:
         prims.cp_async_commit_group()
-        prims.cp_async_wait_group(0)
+        if cutlass.const_expr(not async_publication):
+            prims.cp_async_wait_group(0)
         # Async-tracked arrivals publish cp.async writes; .noinc accounts
         # for all producer lanes counted by barrier initialization/rearm.
         prims.cp_async_mbarrier_arrive(mbar, noinc=True)

@@ -27,7 +27,7 @@ def test_rectangular_raw_stage2_frame(dt, fused):
     params = TemplateParams2x2(
         datapath_2x2_profile=1, head_dim_qk=192, head_dim_v=128, dtype_qkv=DTYPE_BF16 if dt == torch.bfloat16 else DTYPE_FP16, fuse_dk=fused
     )
-    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), params, tag="d192_raw_frame")
+    mod = load_template(_sm100_kernel_path("sm100/d256_f16_2x2/kernel.py"), params, tag="d192_raw_frame")
     fn = mod.compile(b=b, qh=h, kh=h, sq=sq, skv=sk)
     gen = torch.Generator(device="cpu").manual_seed(81)
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The ROW-MAX FORM of the bias / kv_mask softmax body on the Rubin (SM107) f16/bf16 small head-dim tiles --
-``TemplateParams.bias_max_form`` (``CFG.BIAS_MAX_FORM``) of ``sm107/prefill_d128_f16.py``: 0 = the SOFTWARE row max over the biased,
+``TemplateParams.bias_max_form`` (``CFG.BIAS_MAX_FORM``) of ``sm107/d128_f16_multi_q/kernel.py``: 0 = the SOFTWARE row max over the biased,
 -inf-masked scores (the body as built), 1 = the HARDWARE UPPER BOUND -- the plain body's fused ``tcgen05.ld.red...max`` over the RAW
 scores plus the thread's per-ROW bias-tile max in the packed 16-bit domain (``max.bf16x2`` / ``max.f16x2`` over the words the FFMA
 reads), the online softmax on ``max_k S + max_k bias >= max_k (S + bias)``.  Any m >= the true row max is valid for the online softmax
@@ -143,7 +143,9 @@ def test_adapter_kwarg_is_appended_and_declines_typed():
     from cudnn.sdpa.fwd import api_dsl
 
     sig = inspect.signature(api_dsl.SdpaFwdDslSm100.__init__)
-    assert list(sig.parameters)[-2:] == ["bias_max_form", "softmax_wgs"] and sig.parameters["bias_max_form"].default is None
+    names = list(sig.parameters)
+    names = names[: names.index("swap_ab") + 1]  # Later appended parameters are legal.
+    assert names[-3:] == ["bias_max_form", "softmax_wgs", "swap_ab"] and sig.parameters["bias_max_form"].default is None
     assert "bias_max_form=self._resident_arm_bias_max_form()" in Path(api_dsl.__file__).read_text()
 
 

@@ -8,8 +8,9 @@ ONE result (``out``; no scratch, no state, no saved statistic).  There is NO bac
 function -- so this module holds no backward cell; that direction is unsupported by contract, not skipped.
 
 WHAT IS PINNED, per served byte class ``(geometry, split_k)`` -- ``(4608, 8192)`` at split 4 and at split 2, ``(8192, 2048)`` at split
-2 -- and for EVERY served row count 1 .. 32 (the kernel is specialised on the row count, so each count is its own rendering and gets its
-own cells; nothing here is a sampled set):
+2, ``(5120, 6144)`` at split 4 and at split 2, ``(16384, 5120)`` and ``(14336, 5120)`` at split 1 (one K slice per weight tile: no
+cluster reduction) -- and for EVERY served row count 1 .. 32 (the kernel is specialised on the row count, so each count is its own
+rendering and gets its own cells; nothing here is a sampled set):
 
 * replay: eight executions on fresh output buffers under side-stream contention, then the independent fp64 reference;
 * two fresh entries on two operand sets drawn afresh (the compile, the buffers and the operands all new);
@@ -20,9 +21,12 @@ own cells; nothing here is a sampled set):
   tile, 31 -> 32 reaches the ceiling) leaves every other row's bytes as they were, and the inserted row writes its alone bytes; read
   the other way round it is the removal of that row;
 * a duplicated row (both copies write the alone bytes) and neighbours redrawn around a fixed row at each token tile;
-* the measured pick is byte-neutral: every form the pick returns on other parts' readings (fewer SMs, less shared memory per SM: other
+* the pick is byte-neutral: every form the pick returns on other parts' readings (fewer SMs, less shared memory per SM: other
   ring depths, three to nine CTAs per SM) and every band of the pick's own table applied to every row count -- a form that takes two
-  waves among them -- writes the bytes of this part's pick;
+  waves among them -- writes the bytes of this part's pick.  A class that runs its table row as written returns that row on every SM
+  count, so its arms are fixed: two shallower rings and the other weight tile under the pick's late tensor-memory release, the depth
+  a part with less shared memory lowers the row to, and the pick's early-release twin -- the two release orders are compared at
+  every row count of those classes;
 * the operands hold their bytes after the launches; 32 -> 33 rows is the typed decline, never another provider;
 * goldens: one small case per byte class and token tile (rows 3 / 12 / 20), compared only after the replay and the reference passed.
   Record a missing set into a NEW directory with ``CUDNN_DETERMINISM_RECORD``; a golden belongs to the one runtime that recorded it.
@@ -32,6 +36,8 @@ correctness check (``fp8_projection_decode_utils.error_over_bound``).  The opera
 operand set do not depend on the device that runs the test.  The remaining performance knobs (weight tile, tensor-memory columns,
 a wider token tile, the weight loader's wait, the tensor-memory release, the dependent-launch attribute and release) are bitwise with
 the default in ``test_fp8_projection_decode.py``, which also holds the CUDA-graph replay and the warm-launch stress."""
+
+from dataclasses import replace
 
 import pytest
 
@@ -209,31 +215,50 @@ PICK_MODELS = {
 }
 
 
+# The ring depths of the fixed arms of a class that runs its table row as written.  The pick of such a class is the table row on every
+# SM count, so the modelled parts above give it at most ONE other form (the ring lowered to fit a part with less shared memory); two
+# shallower rings and the other weight tile, each under the pick's own tensor-memory release, are added as forms of their own.
+AS_WRITTEN_ARM_STAGES = (2, 4)
+
+
 def pick_arms(numerics, rows, default):
-    """The forms the pick function can return for ``rows`` other than this part's ``default``: the pick on each modelled part and every
-    band of the pick's own table (the band a row count is not in included).  ``{form: [where it comes from, ...]}``."""
+    """The forms ``rows`` is compared under besides this part's ``default``: the pick on each modelled part and every band of the pick's
+    own table (the band a row count is not in included) -- for a class run as written the band of its one row is the pick's
+    early-release twin -- and, for a class run as written, the fixed arms above.  ``{form: [where it comes from, ...]}``."""
     arms = {}
     for name, (sm_count, smem_per_sm, smem_optin) in PICK_MODELS.items():
         arms.setdefault(kcfg.pick(numerics, rows, sm_count, smem_per_sm, smem_optin), []).append(name)
     for lo, hi, mma_m, stages in kcfg.PICKS[numerics]:
         arms.setdefault(Form(MMA_M=mma_m, STAGES=stages, TMEM_COLS=kcfg.tmem_cols_for(kcfg.token_tile_for(rows))), []).append(f"the band of rows {lo}-{hi}")
+    if numerics not in kcfg.ONE_WAVE_CLASSES:
+        for stages in AS_WRITTEN_ARM_STAGES:
+            arms.setdefault(replace(default, STAGES=stages), []).append(f"a ring of {stages} stages")
+        other = next(m for m in kcfg.WEIGHT_TILES if m != default.MMA_M)
+        arms.setdefault(replace(default, MMA_M=other, STAGES=AS_WRITTEN_ARM_STAGES[-1]), []).append(f"the {other}-row weight tile")
     arms.pop(default, None)
     return arms
 
 
 def test_pick_arms_cover_other_ring_depths_at_every_class():
-    """Host: the arms of :func:`test_pick_is_byte_neutral` are not vacuous -- at every served class the modelled parts make the pick
-    return at least two ring depths other than the default's, a pick never names a split, and every arm is a form the reference part
-    validates at the row count it is used at."""
+    """Host: the arms of :func:`test_pick_is_byte_neutral` are not vacuous -- at every served class they hold at least two ring depths
+    OTHER than the depth of the pick they are compared with (the early-release twin of a class run as written has the pick's depth and
+    is not counted), an arm never names a split, and every arm is a form the reference part validates at the row count it is used at.
+    A class run as written has, at every row count, its early-release twin, both weight tiles and both fixed depths among its arms."""
     part = kcfg.part_readings(kcfg.SM100_SMEM_PER_SM_BYTES, kcfg.SM100_SMEM_OPTIN_BYTES, kcfg.SM100_SM_COUNT)
     for numerics in CLASSES:
         depths = set()
         for rows in ALL_ROWS:
             default = kcfg.pick(numerics, rows, kcfg.SM100_SM_COUNT, kcfg.SM100_SMEM_PER_SM_BYTES, kcfg.SM100_SMEM_OPTIN_BYTES)
-            for form in pick_arms(numerics, rows, default):
+            arms = pick_arms(numerics, rows, default)
+            for form in arms:
                 assert isinstance(form, Form) and not hasattr(form, "SPLIT_K")
                 kcfg.validate_cfg(kcfg.resolve_form(numerics, rows, form, part))
-                depths.add(form.STAGES)
+                if form.STAGES != default.STAGES:
+                    depths.add(form.STAGES)
+            if numerics not in kcfg.ONE_WAVE_CLASSES:
+                assert default.HOLD_TMEM and replace(default, HOLD_TMEM=False) in arms, (cid(numerics), rows)
+                assert {form.MMA_M for form in arms} == set(kcfg.WEIGHT_TILES), (cid(numerics), rows)
+                assert set(AS_WRITTEN_ARM_STAGES) <= {form.STAGES for form in arms if form.MMA_M == default.MMA_M and form.HOLD_TMEM}, (cid(numerics), rows)
         assert len(depths) >= 2, (cid(numerics), sorted(depths))
 
 
@@ -242,12 +267,14 @@ def test_pick_is_byte_neutral(numerics):
     """The pick function reads the row count and the part's readings and returns a performance form; no form it can return changes a
     byte.  For EVERY served row count: this part's pick against the pick on each modelled part (fewer SMs or less shared memory lower
     the ring depth: three to nine CTAs per SM) and against every band of the pick's table (a deep ring at the wider token tiles takes
-    one CTA per SM and two waves), each built as the entry's ``form`` on this part."""
+    one CTA per SM and two waves), each built as the entry's ``form`` on this part.  A class run as written is compared with its
+    fixed arms as well (two shallower rings, the other weight tile) and, through the band of its one table row, with its
+    early-release twin: both tensor-memory release orders and both weight tiles at every row count."""
     dev = device_or_skip()
     ops = _ops(dev, numerics.GEOM)
     default = _entry(dev, numerics)
     part = default.readings
-    compared, forms, waves = 0, set(), set()
+    compared, forms, waves, releases = 0, set(), set(), set()
     for rows in ALL_ROWS:
         x = ops["activation"][:rows]
         want = snapshot(run(default, ops, x))
@@ -261,8 +288,12 @@ def test_pick_is_byte_neutral(numerics):
             compared += 1
             forms.add((form.MMA_M, form.STAGES))
             waves.add(cfg.WAVES)
-    print(f"{did(numerics)}: {compared} (rows, form) cells bitwise with this part's pick; ring depths {sorted(s for _, s in forms)}; waves {sorted(waves)}")
+            releases.add(cfg.HOLD_TMEM)
+    depths, tiles = sorted({s for _, s in forms}), sorted({m for m, _ in forms})
+    print(f"{did(numerics)}: {compared} (rows, form) cells bitwise with this part's pick; ring depths {depths}; weight tiles {tiles}; waves {sorted(waves)}")
     assert compared >= MAX_ROWS and len(forms) >= 2, (compared, sorted(forms))
+    if numerics not in kcfg.ONE_WAVE_CLASSES:
+        assert releases == {False, True} and tiles == sorted(kcfg.WEIGHT_TILES), (sorted(releases), tiles)
 
 
 @pytest.mark.parametrize("numerics", CLASSES, ids=did)

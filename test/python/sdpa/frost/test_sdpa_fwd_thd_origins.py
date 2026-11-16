@@ -58,15 +58,28 @@ def test_independent_thd_origins_rebind_and_capture(
     import cudnn
     import torch
 
-    sm120 = engine_name in ("sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8")
-    fp8 = engine_name.endswith("_fp8")
-    mxfp8 = engine_name.endswith("_mxfp8")
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == engine_name)
+    sm120 = caps.sm_lo == 120
+    fp8, mxfp8 = caps.is_fp8, caps.is_mxfp8
     quantized = fp8 or mxfp8
     arches = ((12, 0), (12, 1)) if sm120 else (((10, 7),) if "sm107" in engine_name else ((10, 0), (10, 3)))
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in arches:
         pytest.skip(f"{engine_name} physical THD origin path")
     torch.manual_seed(117)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (256, 256):
+        engine_name = "sdpa_fwd_sm100_d256_lookahead"
+    if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (192, 128):
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d192_multi_q"
+    if engine_name == "sdpa_fwd_prefill_sm100" and d_qk == d_v and d_qk in (32, 64, 128):
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if splits > 1 and cga in (None, 1) else "sdpa_fwd_sm100_d128_multi_q"
+    if sm120:
+        from frost_test_utils import sm120_owner
+
+        # THD never runs the decode tile, so exact half D256 is the all-compute owner.
+        engine_name = sm120_owner(engine_name, d_qk, d_v, tile_m=128)
     batch, heads, kv_heads, maximum = 4, (heads_override or (24 if d_qk == 576 else 8)), 2, 256
     if batch_override is not None:
         assert batch_override == 1
@@ -228,12 +241,15 @@ def test_independent_thd_origins_rebind_and_capture(
     elif cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
         from cudnn.engines.manifest import family_for
 
+        if engine_name == "sdpa_fwd_prefill_sm100" and d_qk == 576 and torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+            engine_name = "sdpa_fwd_sm100_d512_2x2"
         graph.create_execution_plan(
             family_for(graph).offered_ids()[engine_name],
             {
                 cudnn.knob_type.TILE_CGA_M: cga if cga is not None else (1 if d_qk == 128 and splits > 1 else 2),
                 cudnn.knob_type.PACK_GQA: int(pack_gqa),
                 cudnn.knob_type.SPLIT_KV: splits,
+                **({cudnn.knob_type.TILE_M: 64} if engine_name == "sdpa_fwd_sm100_d512_2x2" else {}),
             },
         )
         graph.select_plan(0)
@@ -469,7 +485,8 @@ def test_compact_thd_origins_use_single_load_maps(dim):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+    expected_engine = "sdpa_fwd_sm100_d256_lookahead" if dim == 256 else "sdpa_fwd_sm100_d128_multi_q"
+    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(expected_engine))
     graph.select_plan(index)
     graph.check_support()
     graph.build_plans()
