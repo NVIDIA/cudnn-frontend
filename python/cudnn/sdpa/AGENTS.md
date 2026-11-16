@@ -1093,6 +1093,15 @@ Backward (d512 stage 2):
 
 ## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
 
+- **A workspace budget does not bound the launch grid.** Check the final
+  GEMM's batch/head product even when stage 2 uses a persistent scheduler.
+  THD's storage batch is one, but its GEMM uses the actual sequence count.
+  Preserve dense half batch chunking and the qualified subgroup path rather
+  than applying a common batch cap to half, FP8 and MXFP8. Detectors in
+  `test_sdpa_bwd_d256_chunk_grid.py` pair impossible whole-group declarations
+  with legal large-batch controls, then check actual THD head chunks and
+  dense whole-group batch chunks against an independent reference and replay.
+
 - **A head subgroup is legal only when the final reduction covers all global
   per-query-head partials.** The dense BF16 SM100 d256 chain can divide one GQA
   group after whole-group choices exceed its workspace target. Every chunk must

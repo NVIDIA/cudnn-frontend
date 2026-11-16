@@ -1,5 +1,7 @@
 # FROST SDPA — legacy support tracker
 
+Current shared D192/D256 backward chunk and launch bounds are documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
+
 Current nonpaged D256 split physical-origin support is documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
 
 > **Historical reference; migration in progress.** Current support documentation
