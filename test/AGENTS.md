@@ -1623,3 +1623,16 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+### Backend workspace capacity
+
+A non-null pointer does not establish sufficient workspace capacity. Test the
+observed byte extent at every mapping/ordered/index transport, including the
+native ordered fast path, Python-only producers, deserialization and effective
+shape overrides. Warm the same plan with a valid buffer before replacing it
+with a short view. Keep that view inside a fully sized owned backing for the
+RED control; assert rejection before either FE scratch initialization or output
+writes. Exact capacity, larger carriers of a different element width, and raw
+integer pointers with unknown capacity are positive controls. See
+`core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
