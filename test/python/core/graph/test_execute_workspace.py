@@ -102,10 +102,13 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
     graph, tensors, values = _build(cudnn_handle, True)
     # Exercise an actual effective-shape change rather than echoing the
     # declaration. This plan's FE ALiBi scratch remains required at B=1.
-    if overriding:
-        values = [value[:1] for value in values]
+    # Keep the full declared storage even when execution uses a smaller extent.
     overrides = (
-        dict(override_uids=[t.get_uid() for t in tensors], override_shapes=[list(t.shape) for t in values], override_strides=[list(t.stride()) for t in values])
+        dict(
+            override_uids=[t.get_uid() for t in tensors],
+            override_shapes=[list(t[:1].shape) for t in values],
+            override_strides=[list(t.stride()) for t in values],
+        )
         if overriding
         else {}
     )
@@ -115,7 +118,7 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
     cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
     _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
     torch.cuda.synchronize()
-    expected = values[-1].clone()
+    expected = (values[-1][:1] if overriding else values[-1]).clone()
     assert torch.isfinite(expected).all().item()
     for null_workspace in (None, 0, torch.empty(0, device="cuda", dtype=torch.uint8)):
         values[-1].fill_(123)
@@ -125,7 +128,7 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
         assert torch.all(values[-1] == 123).item()
         _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
         torch.cuda.synchronize()
-        torch.testing.assert_close(values[-1], expected, atol=0, rtol=0)
+        torch.testing.assert_close(values[-1][:1] if overriding else values[-1], expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index", "raw", "cpp_candidate"])
@@ -164,10 +167,13 @@ def test_short_backend_workspace_rejects_before_any_write(entry, overriding, dty
 
 
 def _assert_short_workspace(graph, tensors, values, entry, overriding, producer, cudnn_handle):
-    if overriding:
-        values = [value[:1] for value in values]
+    # Keep the full declared storage even when execution uses a smaller extent.
     overrides = (
-        dict(override_uids=[t.get_uid() for t in tensors], override_shapes=[list(t.shape) for t in values], override_strides=[list(t.stride()) for t in values])
+        dict(
+            override_uids=[t.get_uid() for t in tensors],
+            override_shapes=[list(t[:1].shape) for t in values],
+            override_strides=[list(t.stride()) for t in values],
+        )
         if overriding
         else {}
     )
@@ -181,7 +187,7 @@ def _assert_short_workspace(graph, tensors, values, entry, overriding, producer,
     cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
     _call(graph, tensors, values, wrap(full), cudnn_handle, entry, overrides)
     torch.cuda.synchronize()
-    expected = values[-1].clone()
+    expected = (values[-1][:1] if overriding else values[-1]).clone()
     assert torch.isfinite(expected).all().item()
     for length in (1, required - 1):
         backing.fill_(165)
@@ -197,7 +203,7 @@ def _assert_short_workspace(graph, tensors, values, entry, overriding, producer,
         values[-1].fill_(float("nan"))
         _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
         torch.cuda.synchronize()
-        torch.testing.assert_close(values[-1], expected, atol=0, rtol=0)
+        torch.testing.assert_close(values[-1][:1] if overriding else values[-1], expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index"])

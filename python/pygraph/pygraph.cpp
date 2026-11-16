@@ -1549,6 +1549,29 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("workspace_bytes")  = std::nullopt)
         .def("_prepare_variant_pack_template", &PyGraph::prepare_variant_pack_template)
         .def("_get_variant_pack_uids_sorted", &PyGraph::get_variant_pack_uids_sorted)
+        .def("_get_buffer_bounds",
+             [](PyGraph& self) {
+                 py::list bounds;
+                 for (auto uid : self.graph->get_variant_pack_uids_sorted()) {
+                     graph::Tensor_attributes tensor;
+                     auto status = self.graph->query_tensor_attributes_of_uid(uid, tensor);
+                     throw_if(status.is_bad(), status.get_code(), status.get_message());
+                     // Dense affine ranges are descriptor facts. Ragged offsets and
+                     // reordered/vectorized layouts require their operation's storage
+                     // contract; their logical envelope is not an allocation size.
+                     const bool affine = !tensor.get_ragged_offset() &&
+                                         tensor.get_reordering_type() == TensorReordering_t::NONE &&
+                                         tensor.get_vector_count() == 1;
+                     bounds.append(py::make_tuple(
+                         uid,
+                         tensor.get_dim(),
+                         tensor.get_stride(),
+                         tensor.get_data_type(),
+                         affine ? cudnn_frontend::detail::get_element_size_in_bits(tensor.get_data_type()) : 0,
+                         self.graph->context.get_override_shape_enabled()));
+                 }
+                 return bounds;
+             })
         .def("_execute_with_raw_ptrs",
              &PyGraph::execute_with_raw_ptrs,
              py::arg("user_ptrs_array"),
