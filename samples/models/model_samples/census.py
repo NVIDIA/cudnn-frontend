@@ -178,13 +178,17 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
-    ("embedding_gather", re.compile(r"\bat::native::(?:\(anonymous namespace\)::)?indexSelect(?:Small|Large)Index<")),
+    # ``torch.index_select`` launches one of three kernels, by the number of rows it gathers and the size of a table row: the
+    # small-index kernel up to 16 rows, and from 17 the large-index kernel or PyTorch's vectorized gather (seen on a bf16
+    # table of 5120 columns with int32 ids)
+    ("embedding_gather", re.compile(r"\bat::native::(?:\(anonymous namespace\)::)?(?:indexSelect(?:Small|Large)Index|vectorized_gather_kernel)<")),
     ("cublas", re.compile(r"cublas|^nvjet_|\bcutlass::Kernel2?<cutlass_|^(?:maxwell|volta|ampere)_\w*gem[mv]", re.IGNORECASE)),
     ("pytorch", re.compile(r"\bat::native::|\(anonymous namespace\)::(?:softmax_warp_forward|elementwise_kernel_with_index)<")),
 )
 #: a kernel with an id of its own that is also a member of a family.  Where a plan has an exact row for it, every launch of
 #: it in a step is held against that row (a chain that launched the same kernel would count as an extra launch: no chain of
-#: this area does); where it has none, the kernel counts as its family's
+#: this area does -- the embedding is the one ``index_select`` of a step, and a chain that gathers rows indexes its tensor,
+#: which is another kernel of PyTorch); where it has none, the kernel counts as its family's
 FAMILY_OF = {"embedding_gather": "pytorch"}
 FAMILY_IDS = ("cublas", "pytorch")
 COPY = "copy"

@@ -504,7 +504,7 @@ On the stack `fe-cublas` two blocks launch a kernel that is judged one by one:
 | block | kernel | held |
 |---|---|---|
 | linear-attention step | `gdn_decode_fused`, the kernel of `cudnn.GdnDecodeFused` | one launch per layer and step, in the wiring order; its name is the symbol the entry compiled for this run's row count; grid, block and shared memory equal the entry's own launch shape exactly; and the form the provider row names (`PDL False`, `PDL_RELEASE False`: the entry's pick per row count, launched without a wait on its predecessor and without an early release of its successor) equals the entry's own form, compared on the objects, and the entry instance that served each call of the traced steps states the same (the call log, written after each call from the object that was called) |
-| token embedding lookup | `embedding_gather`, PyTorch's index-select kernel | one launch per step, first in the step, known by its name; no launch shape is declared for it |
+| token embedding lookup | `embedding_gather`, the kernel PyTorch's index-select launches: one of three, by the number of rows and the size of a table row (a run launched the small-index kernel up to 16 rows and the vectorized gather from 17) | one launch per step, first in the step, known by its name; no launch shape is declared for it |
 
 Every other block of this stack is a fallback row: a reference chain or a multiply over a bf16 copy. What such a row
 launches is PyTorch's and cuBLAS's own choice by shape, row count and GPU, so its launches are attributed by family
@@ -540,7 +540,9 @@ the run without the flag. A traced step of the two-layer model is 471 kernel lau
 judged one by one: the gather, and the fused step, which the entry states and the profiler recorded as grid (96, 1, 1),
 block (256, 1, 1) and 42,112 B of shared memory at 1 row, and grid (48, 4, 1), block (256, 1, 1) and 74,848 B at 4
 rows. The other 469 are attributed by family: 16 or 17 of them are cuBLAS's, by the length of the cache, the rest
-PyTorch's. The 40 copies are the host read and copies inside the fallback rows. The check has not been run on
+PyTorch's. The 40 copies are the host read and copies inside the fallback rows. At 17 sequences (2026-11-16, the same
+part) it is `[00] PASS` as well, with 469 launches a step: from 17 rows PyTorch's index-select launches its vectorized
+gather, and the embedding row's pattern names that kernel beside the two of fewer rows. The check has not been run on
 another GPU class, and not with a checkpoint (where a traced step of this stack has about twelve thousand launches
 and the trace the check reads grows accordingly): a class or a model it has not run on is uncovered, not passing.
 

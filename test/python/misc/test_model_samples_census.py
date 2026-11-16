@@ -80,6 +80,8 @@ COMPARED_2 = (
 )
 WHOLE = "the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): "
 GATHER = "void at::native::(anonymous namespace)::indexSelectSmallIndex<BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<...>)"
+# the kernel torch.index_select launched for the embedding from 17 rows (compute capability 10.0, PyTorch 2.13.0), as recorded
+GATHER_VECTORIZED = "void at::native::vectorized_gather_kernel<16, int>(char*, char*, int*, int, long, long, long, long, bool)"
 ELEMENTWISE = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<double>, std::array<char*, 2ul> >(int, ...)"
 ARGMAX = "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<BFloat16, at::native::ArgMaxOps<BFloat16>, unsigned int, long, 4, 4> >(...)"
 SOFTMAX = "void (anonymous namespace)::softmax_warp_forward<double, double, double, 3, false, false, 32>(double*, double const*, int, int, int, ...)"
@@ -174,6 +176,8 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
     assert kernel(PROJECTION_SYMBOL) != kernel(NVJET), "the entry's symbol is its own, whatever of a library's name it holds further on"
     assert kernel("cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrue_0") == "cudnn_fe", "a cuDNN Frontend kernel no pattern names is no family's member"
     assert kernel(GATHER) == "embedding_gather" and kernel(GATHER.replace("SmallIndex", "LargeIndex")) == "embedding_gather"
+    assert kernel(GATHER_VECTORIZED) == "embedding_gather", "from 17 rows the index-select of the embedding is PyTorch's vectorized gather"
+    assert kernel("void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<...> >(long, ...)") == "pytorch", "indexing is not the gather"
     assert census.FAMILY_OF["embedding_gather"] == "pytorch", "the gather is a PyTorch kernel with an id of its own"
     for name in (ELEMENTWISE, ARGMAX, SOFTMAX, ARANGE, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_alignedK_contig<...>(...)"):
         assert kernel(name) == "pytorch", name
@@ -349,6 +353,13 @@ def test_a_clean_step_passes_and_says_what_it_attributed():
     assert details[1] == step + f"the entry states grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B and the kernel {SYMBOL}"
     assert details[2].startswith("chosen by a library inside the fallback rows (printed, not gated): cublas: ") and NVJET + " x 1" in details[2]
     assert not any("pytorch" in line for line in details[2:]), "PyTorch's own kernels are not a library's choice"
+    # from 17 rows the embedding's index-select is another kernel of PyTorch: the row holds it by name as it holds the other two
+    many = [record._replace(name=GATHER_VECTORIZED, grid=(17, 3, 1), block=(256, 1, 1)) if record.name == GATHER else record for record in _step()]
+    traced = census.Traced.of(sites, _log(sites, 1), many, 1, "", rows=17)
+    assert traced.judge() == (census.PASS, []) and "2 on exact rows, in the wiring order; 7 attributed by family" in traced.summary()
+    unnamed = [record._replace(name="void at::native::some_other_gather<16, int>(char*)") if record.name == GATHER_VECTORIZED else record for record in many]
+    status, lines = census.Traced.of(sites, _log(sites, 1), unnamed, 1, "", rows=17).judge()
+    assert status == census.FAIL and lines[0].startswith("step 0: embedding did not launch embedding_gather: the step has 0 launch(es) of embedding_gather")
 
 
 def test_every_constructed_defect_fails_with_its_own_sentence():
