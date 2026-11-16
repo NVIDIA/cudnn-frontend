@@ -382,6 +382,12 @@ check that changing either the delta or a shared barrier still fails the test.
 
 ### Conventions for new tests
 
+- **Test launch bounds against each actual scheduler.** A `B`/`H` limit for
+  grid.y/z does not apply to a flat grid.x scheduler. Exercise 65535 and 65536
+  independently for batch and heads, in graph admission and standalone checks;
+  retain legal flat-grid controls and inspect auxiliary launches too.
+  `sdpa/frost/test_sdpa_bwd_launch_grid.py` covers half backward on SM80/SM120.
+
 - Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
   for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
   inputs. A flat (N,) fixture can be rejected before kernel execution. Preserve
