@@ -145,6 +145,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
         _deterministic: bool = False,
+        power_m: float = 2.0,
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -183,7 +184,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             FP32x2 specialization; non-default dSiTU-GLU uses scalar FP32.
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
-        :param act_func: Activation function, one of "dswiglu", "dgeglu", or "dsituglu"
+        :param act_func: Activation function, one of "dswiglu", "dgeglu", "dsituglu", or "dpowlu"
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param epilogue_op: Optional epilogue operation. Valid: None, "none", "identity", "relu", "srelu"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
@@ -198,6 +199,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             ``act_func == "dswiglu"``.
         :param situ_beta1: Compile-time gate tanh scale for dSiTU-GLU.
         :param situ_beta2: Compile-time up-branch tanh scale for dSiTU-GLU.
+        :param power_m: Compile-time positive dPowLU exponent numerator.
         """
         from cudnn.tensor_adapter import detect_framework
 
@@ -323,6 +325,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.glu_clamp_min = glu_clamp_min
         self.situ_beta1 = float(situ_beta1)
         self.situ_beta2 = float(situ_beta2)
+        self.power_m = float(power_m)
         # Internal (set by grouped_gemm_dglu_wrapper_sm100): dprob is one slot per N-tile,
         # (valid_m, n_slots, 1), which the wrapper reduces in a fixed order.
         self._deterministic = _deterministic
@@ -334,6 +337,11 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             self._value_error_if(
                 not math.isfinite(self.situ_beta2) or self.situ_beta2 <= 0.0,
                 f"situ_beta2 must be finite and positive, got {self.situ_beta2}",
+            )
+        if self.act_func == "dpowlu":
+            self._value_error_if(
+                not math.isfinite(self.power_m) or self.power_m <= 0.0,
+                f"power_m must be finite and positive, got {self.power_m}",
             )
 
         self._interpret_uint8_as_fp4x2 = True
@@ -362,6 +370,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 act_func=self.act_func,
                 use_dynamic_sched=self.use_dynamic_sched,
                 **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+                **({"power_m": self.power_m} if not self._is_rubin_kernel else {}),
                 **({"deterministic": True} if self._deterministic else {}),
                 **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
                 # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
@@ -677,12 +686,12 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Activation function validation ----
         self._value_error_if(
-            self.act_func not in ["dswiglu", "dgeglu", "dsituglu"],
-            f"act_func must be 'dswiglu', 'dgeglu', or 'dsituglu', got {self.act_func}",
+            self.act_func not in ["dswiglu", "dgeglu", "dsituglu", "dpowlu"],
+            f"act_func must be 'dswiglu', 'dgeglu', 'dsituglu', or 'dpowlu', got {self.act_func}",
         )
         self._not_implemented_error_if(
-            self._is_rubin_kernel and self.act_func == "dsituglu",
-            "Rubin grouped GEMM dGLU does not support dsituglu",
+            self._is_rubin_kernel and self.act_func in ("dsituglu", "dpowlu"),
+            f"Rubin grouped GEMM dGLU does not support {self.act_func}",
         )
 
         # ---- Discrete-mode-specific validation ----

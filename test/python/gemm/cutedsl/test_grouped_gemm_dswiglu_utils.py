@@ -382,6 +382,7 @@ def run_grouped_gemm_dswiglu_ref(
     act_func: str = "dswiglu",
     situ_beta1: float = 4.0,
     situ_beta2: float = 25.0,
+    power_m: float = 2.0,
 ) -> Dict[str, torch.Tensor]:
     """Run reference implementation for grouped GEMM dGLU backward.
 
@@ -476,6 +477,29 @@ def run_grouped_gemm_dswiglu_ref(
         prob = prob_tensor.expand(-1, n, -1)
         ab = ref * prob * gate_value * up_grad
         dswiglu = ref * prob * up_value * gate_grad
+    elif act_func == "dpowlu":
+        safe_gate = torch.where(c_gate > 0, c_gate.clamp_min(torch.finfo(torch.float32).tiny), torch.ones_like(c_gate))
+        sqrt_gate = safe_gate.sqrt()
+        denominator = sqrt_gate + 1.0
+        exponent = power_m / denominator
+        power = torch.pow(safe_gate, exponent)
+        positive_value = power * sig
+        value = torch.where(c_gate > 0, positive_value, c_gate * sig)
+        exponent_grad = -power_m / (2.0 * sqrt_gate * denominator.square())
+        positive_grad = (
+            torch.pow(safe_gate, exponent - 1.0) * exponent * sig + positive_value * exponent_grad * safe_gate.log() + positive_value * torch.sigmoid(-c_gate)
+        )
+        negative_grad = sig * (1.0 + c_gate * torch.sigmoid(-c_gate))
+        value_grad = torch.where(c_gate > 0, positive_grad, negative_grad)
+        ref_dprob = value * c_input * ref
+        ref_dprob = torch.where(ref == 0, torch.zeros_like(ref_dprob), ref_dprob)
+        prob = prob_tensor.expand(-1, n, -1)
+        scaled_ref = ref * prob
+        scaled_ref = torch.where((ref == 0) | (prob == 0), torch.zeros_like(scaled_ref), scaled_ref)
+        ab = scaled_ref * value
+        dswiglu = scaled_ref * c_input * value_grad
+        ab = torch.where(scaled_ref == 0, torch.zeros_like(ab), ab)
+        dswiglu = torch.where(scaled_ref == 0, torch.zeros_like(dswiglu), dswiglu)
     else:
         swish = c_gate * sig
         ref_dprob = swish * c_input * ref
@@ -585,6 +609,7 @@ def check_ref_grouped_gemm_dswiglu(
         act_func=cfg.get("act_func", "dswiglu"),
         situ_beta1=cfg.get("situ_beta1", 4.0),
         situ_beta2=cfg.get("situ_beta2", 25.0),
+        power_m=cfg.get("power_m", 2.0),
     )
 
     torch.cuda.synchronize()

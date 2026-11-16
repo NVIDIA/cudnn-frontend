@@ -697,6 +697,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
     act_func="swiglu",
     situ_beta1=4.0,
     situ_beta2=25.0,
+    power_m=2.0,
     skip_reference=False,
 ):
     try:
@@ -724,6 +725,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
     cfg["act_func"] = act_func
     cfg["situ_beta1"] = situ_beta1
     cfg["situ_beta2"] = situ_beta2
+    cfg["power_m"] = power_m
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -777,6 +779,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 act_func=act_func,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
@@ -809,6 +812,28 @@ def test_grouped_gemm_glu_dense_wrapper_situglu_mxfp8(request):
         request=request,
         act_func="situglu",
         skip_reference=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_grouped_gemm_glu_dense_wrapper_powlu_mxfp8(request):
+    """Validate PowLU with MXFP8 row/column output."""
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        act_func="powlu",
+        power_m=2.5,
     )
 
 
@@ -1282,6 +1307,7 @@ def _test_grouped_gemm_glu_discrete_wrapper(
     use_dynamic_sched=False,
     situ_beta1=4.0,
     situ_beta2=25.0,
+    power_m=2.0,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -1307,6 +1333,7 @@ def _test_grouped_gemm_glu_discrete_wrapper(
     )
     cfg["situ_beta1"] = situ_beta1
     cfg["situ_beta2"] = situ_beta2
+    cfg["power_m"] = power_m
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1351,6 +1378,7 @@ def _test_grouped_gemm_glu_discrete_wrapper(
                 act_func=cfg["act_func"],
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
             )
@@ -1392,6 +1420,28 @@ def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, sf_dtype, 
         b_major="k",
         situ_beta1=situ_beta1,
         situ_beta2=situ_beta2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=9)
+def test_grouped_gemm_glu_discrete_wrapper_powlu_mxfp8(request):
+    _test_grouped_gemm_glu_discrete_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="powlu",
+        request=request,
+        b_major="k",
+        power_m=2.5,
     )
 
 

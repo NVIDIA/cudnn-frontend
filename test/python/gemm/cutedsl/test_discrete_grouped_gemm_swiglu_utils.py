@@ -372,6 +372,7 @@ def run_discrete_grouped_gemm_ref(
     act_func: str = "swiglu",
     situ_beta1: float = 4.0,
     situ_beta2: float = 25.0,
+    power_m: float = 2.0,
 ) -> Dict[str, torch.Tensor]:
     """Run reference implementation for discrete grouped GEMM GLU (SwiGLU).
 
@@ -440,13 +441,21 @@ def run_discrete_grouped_gemm_ref(
     if act_func == "situglu":
         ref_gate = situ_beta1 * torch.tanh(ref_gate / situ_beta1) * torch.sigmoid(ref_gate)
         ref_up = situ_beta2 * torch.tanh(ref_up / situ_beta2)
+    elif act_func == "powlu":
+        safe_gate = torch.where(ref_gate > 0, ref_gate.clamp_min(torch.finfo(torch.float32).tiny), torch.ones_like(ref_gate))
+        exponent = power_m / (safe_gate.sqrt() + 1.0)
+        positive = torch.pow(safe_gate, exponent) * torch.sigmoid(ref_gate)
+        ref_gate = torch.where(ref_gate > 0, positive, ref_gate * torch.sigmoid(ref_gate))
     else:
         # SwiGLU: up * (gate * sigmoid(gate))
         ref_gate = ref_gate * torch.sigmoid(ref_gate)
     ref_after_swiglu = ref_up * ref_gate
 
     # Step 4: Apply prob
-    ref_after_swiglu = ref_after_swiglu * prob_tensor.expand(-1, n_out, -1)
+    prob = prob_tensor.expand(-1, n_out, -1)
+    ref_after_swiglu = ref_after_swiglu * prob
+    if act_func == "powlu":
+        ref_after_swiglu = torch.where(prob == 0, torch.zeros_like(ref_after_swiglu), ref_after_swiglu)
     ref_tensors["d_ref"] = ref_after_swiglu.clone()
 
     if generate_amax:
@@ -508,6 +517,7 @@ def check_ref_discrete_grouped_gemm(
         act_func=cfg.get("act_func", "swiglu"),
         situ_beta1=cfg.get("situ_beta1", 4.0),
         situ_beta2=cfg.get("situ_beta2", 25.0),
+        power_m=cfg.get("power_m", 2.0),
     )
 
     torch.cuda.synchronize()

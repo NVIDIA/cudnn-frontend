@@ -138,6 +138,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         use_single_group_runtime_offsets: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        power_m: float = 2.0,
     ):
         """Initialize the GroupedGemmGluSm100 API.
 
@@ -173,9 +174,10 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param vector_f32: Use vectorized f32 operations
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
-        :param act_func: Activation function, one of "swiglu", "geglu", or "situglu"
+        :param act_func: Activation function, one of "swiglu", "geglu", "situglu", or "powlu"
         :param situ_beta1: Compile-time gate tanh scale for SiTU-GLU. The default
             ``4.0`` enables an exact sigmoid-reuse specialization.
+        :param power_m: Compile-time positive PowLU exponent numerator.
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
@@ -269,10 +271,16 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self.discrete_col_sfd = discrete_col_sfd
         self.act_func = act_func
         self.situ_beta1 = float(situ_beta1)
+        self.power_m = float(power_m)
         if self.act_func == "situglu":
             self._value_error_if(
                 not math.isfinite(self.situ_beta1) or self.situ_beta1 <= 0.0,
                 f"situ_beta1 must be finite and positive, got {self.situ_beta1}",
+            )
+        if self.act_func == "powlu":
+            self._value_error_if(
+                not math.isfinite(self.power_m) or self.power_m <= 0.0,
+                f"power_m must be finite and positive, got {self.power_m}",
             )
         if self.weight_mode == MoEWeightMode.DENSE:
             self.b_major = b_major  # stored for both modes
@@ -559,12 +567,12 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         # ---- Activation function validation (both modes) ----
         self._value_error_if(
-            self.act_func not in ["swiglu", "geglu", "situglu"],
-            f"act_func must be 'swiglu', 'geglu', or 'situglu', got {self.act_func}",
+            self.act_func not in ["swiglu", "geglu", "situglu", "powlu"],
+            f"act_func must be 'swiglu', 'geglu', 'situglu', or 'powlu', got {self.act_func}",
         )
         self._not_implemented_error_if(
-            self._is_rubin_kernel and self.act_func == "situglu",
-            "Rubin grouped GEMM GLU does not support situglu",
+            self._is_rubin_kernel and self.act_func in ("situglu", "powlu"),
+            f"Rubin grouped GEMM GLU does not support {self.act_func}",
         )
 
         # ---- Discrete-mode-specific validation ----
@@ -716,6 +724,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             enable_bias=self._has_bias,
             use_dynamic_sched=self.use_dynamic_sched,
             **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+            **({"power_m": self.power_m} if not self._is_rubin_kernel else {}),
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
             # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
             # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected

@@ -30,6 +30,7 @@ And both backward activation functions:
 - **dSwiGLU**: `act_func="dswiglu"` (default)
 - **dGeGLU**: `act_func="dgeglu"`
 - **dSiTU-GLU**: `act_func="dsituglu"` (block-scaled SM100/SM103 only)
+- **dPowLU**: `act_func="dpowlu"` (block-scaled SM100/SM103 only)
 
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
@@ -43,6 +44,8 @@ Groups are contiguous in the M dimension and described by `padded_offsets` (cumu
 Mixed families and unsupported pairs are rejected before allocation or
 compilation. Each backend's argument contract is described below.
 `dsituglu` is not available on the BF16 or Rubin backends.
+`dpowlu` is supported only by the block-scaled SM100/SM103 backend through the
+torch wrapper; the BF16, Rubin, and JAX paths reject it.
 The block-scaled dGeGLU path supports configurable activation alpha, clamp
 bounds, and linear offset on both Blackwell and Rubin in dense and discrete
 weight modes. These values are constructor configuration and remain part of
@@ -226,6 +229,45 @@ the wrapper returns D_row/D_col `(M, 2N)` and contiguous physical SFD buffers. L
 layouts are unchanged. The wrapper advertises `supports_canonical_layouts`.
 
 ### Equations
+
+For dPowLU, reuse the forward gate function
+
+$$
+P_m(G)=\begin{cases}
+G^{e(G)}\sigma(G), & G>0,\\
+G\sigma(G), & G\le0,
+\end{cases}
+\qquad e(G)=\frac{m}{\sqrt{G}+1}.
+$$
+
+For `G > 0`,
+
+$$
+e'(G)=-\frac{m}{2\sqrt{G}(\sqrt{G}+1)^2},
+$$
+
+$$
+P'_m(G)=G^{e-1}\sigma(G)e
+          +G^e\sigma(G)e'(G)\log(G)
+          +G^e\sigma(G)\sigma(-G).
+$$
+
+For `G <= 0`, $P'_m(G)=\sigma(G)(1+G\sigma(-G))$. Let $R=\partial L/\partial D$
+be the upstream gradient entering this epilogue. The kernel computes
+
+$$
+\frac{\partial L}{\partial G}=R\,\mathrm{prob}\,U\,P'_m(G),\qquad
+\frac{\partial L}{\partial U}=R\,\mathrm{prob}\,P_m(G),
+$$
+
+$$
+\frac{\partial L}{\partial \mathrm{prob}}
+=\sum_N R\,U\,P_m(G).
+$$
+
+The two activation gradients are then quantized into the existing rowwise and
+columnwise MXFP8 outputs. The same native CuTeDSL math operations as forward
+are used; `power_m` defaults to `2.0` and is a compiled-kernel cache parameter.
 
 For dSiTU-GLU, define
 
