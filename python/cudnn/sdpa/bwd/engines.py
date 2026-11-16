@@ -2526,10 +2526,19 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
     )
 
 
-def _d512_fp8_environment_mismatch(facts, version):
-    from .d512_fp8_contract import environment_error
+def _d512_quantized_declaration_mismatch(facts, version):
+    from .d128_contract import validate_accumulation_scale, validate_dense_bounds
+    from .d512_fp8_contract import environment_error, launch_error
 
-    return environment_error(facts.device_cc, version)
+    error = environment_error(facts.device_cc, version)
+    if error is not None:
+        return error
+    try:
+        validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, facts.window_left)
+        validate_accumulation_scale(512**-0.5 if facts.scale is None else facts.scale)
+    except ValueError as error:
+        return str(error)
+    return launch_error(facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv)
 
 
 def _d512_fp8_spec() -> EngineSpec:
@@ -2543,7 +2552,7 @@ def _d512_fp8_spec() -> EngineSpec:
             sm_lo=100,
             sm_hi=107,
             d=frozenset({512}),
-            declaration_check=_d512_fp8_environment_mismatch,
+            declaration_check=_d512_quantized_declaration_mismatch,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             is_fp8=True,
             out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
@@ -2560,7 +2569,7 @@ def _d512_fp8_spec() -> EngineSpec:
 
 
 def _d512_mxfp8_mismatch(facts, version):
-    error = _d512_fp8_environment_mismatch(facts, version)
+    error = _d512_quantized_declaration_mismatch(facts, version)
     if error is not None:
         return error
     if facts.window_left is not None and facts.s_q > facts.s_kv + facts.window_left:

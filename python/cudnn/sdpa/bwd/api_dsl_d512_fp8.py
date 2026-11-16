@@ -7,7 +7,7 @@ import torch
 
 from .api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8, _GRAD_DTYPES
 from .d128_contract import ACCUMULATION, validate_accumulation_scale, validate_dense_bounds
-from .d512_fp8_contract import environment_error
+from .d512_fp8_contract import environment_error, launch_error
 
 D_QK = D_V = 512
 
@@ -78,10 +78,8 @@ class SdpaBwdDslD512Fp8(SdpaBwdDslSm100D192Fp8):
         self.head_dim_qk, self.head_dim_v = D_QK, D_V
         self.scale_softmax = D_QK**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax > 0, "attn_scale must be finite and positive")
-        require(max(h, hk, b) <= 65535, "batch/head grid dimensions must fit CUDA grid.y/z")
-        require(4 * ((max(sq, sk) + 127) // 128) <= 2**31 - 1, "gradient tile grid exceeds CUDA grid.x")
-        require(b * h * ((sq + 127) // 128 * 128) <= 2**31 - 1, "rounded delta index exceeds the Int32 range")
-        require(max(sq, sk) * h * 512 * 2 < 2**40, "BSHD byte strides exceed TMA limits")
+        error = launch_error(b, h, hk, sq, sk)
+        require(error is None, error)
         self._implementation = ACCUMULATION
         self._is_supported = True
         return True
