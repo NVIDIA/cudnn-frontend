@@ -626,6 +626,9 @@ def test_a_row_serves_the_layer_widths_it_names():
     assert not two.serves_model(wide) and two.widths_text(wide) == "mlp 96" and two.widths_text() == "hidden 5120, mlp 17408", "every width it names"
     with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves compute capability 10.x; this device is 12.0$"):
         select_row("b", rows[:1], DeviceFacts((12, 0)), 1, 1, "native", model=narrow)  # the class is said first
+    elsewhere = ProviderRow(("cc12.x",), (1, None), (1, None), "fe.gdn_decode_fused", "native", serves="rows 1-8")  # a row of another class in front
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves hidden 5120; this model has hidden 4096$"):
+        select_row("b", [elsewhere, rows[0]], facts, 1, 1, "native", model=narrow)  # the width is said of the row that serves the class
     with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves rows 1-8, hidden 5120; this run has 9 sequences x 1 tokens per sequence$"):
         select_row("b", [replace(rows[0], rows=(1, 8))], facts, 9, 1, "native", model=wide)
 
