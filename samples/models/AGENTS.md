@@ -59,7 +59,10 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    (`Block.twin`): a reference block written at the kernel's rounding points, in the reference's accumulation precision.
    The reference is matched to the kernel's documented arithmetic; the band is then the kernel's own contract, never a
    width that covers the distance between two chains. A band names the outputs it applies to; an output it does not name
-   is judged by its dtype, and state a call updates byte for byte. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   is judged by its dtype, and state a call updates byte for byte. An adapter launches its entry and nothing else:
+   what a consumer on a fallback row needs beyond the kernel's bytes -- a gather out of the kernel's scale layout, a
+   quantisation the target does with a launch of its own -- is launched by that consumer, when it reads its operand
+   (`weights.dequantize`). A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -111,6 +114,11 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     pattern of `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name.
     The host tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there
     must fail with its own sentence, and the last line of a run is held by running `main()` to its end.
+    An entry that a step calls in several forms has them in its row, by call site (`sites`: the further fields of the
+    form at each site); the family's wiring names the site of every call (`sites()`), and the step hands that name to
+    the block. The adapter holds one entry instance per form and serves a call with the instance of its site; which
+    form serves which call is never its choice. Every item of the check then holds per call site, and a call is found
+    by its place in the wiring, not by its block and layer: a block can be called twice in a layer.
 16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
     target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
@@ -306,3 +314,33 @@ Each of these passed every test and every GPU run of the first version; a host t
 - An entry gates the installed toolchain where it builds its kernel, not where it is constructed or asked for a launch
   shape. Planned without a build, a GPU whose target the installed CuTe DSL cannot assemble passed the plan, read 55 GiB
   of weights and ended in a traceback that blamed the adapter. The entry's first use belongs to the plan.
+
+## What building the norm row taught
+
+- One block, several forms. The target calls the add + RMSNorm + quantise kernel in five forms in a step, and a launch
+  record cannot tell them apart: one kernel id, one grid, one block, one shared memory. So the form of a call is data
+  at three places that a host test holds to each other -- the row (per call site), the wiring (the site of every
+  call), the census (the form of every call) -- and it is observed in one: the call log, which says which entry
+  instance served the call. A wrong form shows there and nowhere else.
+- A block that is called twice in a layer is not found by its block and layer. The first version of the census dump
+  looked a call up that way and reported, for a layer's input norm, the form of the layer's second norm call. A call
+  is the one at its place in the wiring.
+- A kernel that updates an operand in place changes what the next caller of the tie-out sees. The norm kernel adds
+  into the residual stream; the reference block and the run of one sequence alone must each start from the stream as
+  it was. Declare such an operand as state of the block (`state_args`), so that it is saved, restored and compared.
+- A kernel breaks an exact rounding tie its own way. A bf16 value over a block scale times a scale such as 1/336 is
+  an exact 4-bit midpoint more often than chance suggests (2 elements in 1,000 on random rows), and there the code
+  follows the kernel's own reciprocal. The reference quantiser and a kernel's chain differed by a whole code on 6
+  elements in 10,000. So the twin of such a kernel keeps a bracket, and the band is the kernel's documented
+  contract; a tolerance on codes would have been the wrong tool, and "equal to the reference quantiser" the wrong
+  claim. On rows 64 wide, in a host test, one such code moved a logit by seven bf16 units.
+- What a kernel hands to a block that is not a kernel yet is not the adapter's to convert. A gather, a quantisation
+  or a copy inside the adapter is a launch in the span of a row that declares one kernel; next to another exactly
+  judged row the check fails it, and next to a fallback row it would pass as that row's. Hand the bytes over as they
+  are and let the consumer convert when it reads them.
+- Attribution by family cannot see everything. A launch more in front of the first norm of a step fails the check,
+  because the gather before it is judged one by one; the same launch in front of a norm that follows a fallback row
+  is counted as that row's. The check is exact where two exactly judged rows meet, and it gets sharper with every
+  row that leaves its fallback.
+- A sentence counted once per occurrence, not once per step, read "and 7 more of the 4 traced steps" as soon as a
+  block could fail twice in a step.
