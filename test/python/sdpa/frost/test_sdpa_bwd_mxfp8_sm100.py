@@ -214,10 +214,11 @@ def _run(
     repeat_outputs=0,
     d=None,
     dv=None,
+    pin=True,
     **sdpa_kwargs,
 ):
-    """Quantize random operands, build the graph, pin the engine, execute, and
-    compare dQ/dK/dV against the MXFP8 backward reference (``dv`` = D_V, default D_QK)."""
+    """Quantize random operands, build the graph, pin the engine (``pin=False``: take the default walk), execute,
+    and compare dQ/dK/dV against the MXFP8 backward reference (``dv`` = D_V, default D_QK)."""
     from sdpa.mxfp8_ref import compute_ref, compute_ref_backward
 
     torch.manual_seed(seed)
@@ -278,9 +279,10 @@ def _run(
         sdpa_kwargs["use_causal_mask"] = True
     g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, hq, hkv, sq, skv, d, dv=dv, out_dt=out_dt, scale=None if omit_scale else scale, **sdpa_kwargs)
     g.create_execution_plans([cudnn.heur_mode.A])
-    idx = _plan_index(g)
-    assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
-    g.select_plan(idx)
+    if pin:
+        idx = _plan_index(g)
+        assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
+        g.select_plan(idx)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -429,6 +431,28 @@ def test_deterministic_flag():
     """Both kernels own their output tiles (no atomics), so the row honors
     use_deterministic_algorithm; the result must be bitwise stable."""
     _run(use_deterministic_algorithm=True)
+
+
+@pytest.mark.L0
+def test_default_planning_serves_d256(monkeypatch):
+    """Flag unset, nothing pinned: the backend declines D256 (9.24 through 9.30), so the walk reaches the trailing
+    D256 chain (20625) and its gradients pass the reference."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    run = _run(hq=8, hkv=2, sq=257, skv=256, causal=True, pin=False)
+    engine = run.graph.selected_engine
+    assert engine is not None and engine.name == "sdpa_bwd_sm100_d256_mxfp8", engine
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128)], ids=["d128", "d192"])
+def test_default_planning_keeps_backend_widths_on_the_backend(monkeypatch, d, dv):
+    """Control for the D256 case: where the backend plans, default planning still selects it."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, *_ = _build_graph(1, 2, 2, 256, 256, d=d, dv=dv, scale=d**-0.5)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine is None, g.selected_engine.name
 
 
 @pytest.mark.L0
