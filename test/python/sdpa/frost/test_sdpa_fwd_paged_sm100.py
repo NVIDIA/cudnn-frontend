@@ -242,6 +242,8 @@ def _run_graph(
             if d == d_v and d in (32, 64, 128):
                 # Explicit layout fixtures request the single-Q or multi-Q body directly.
                 explicit_name = "sdpa_fwd_sm100_d128_single_q" if explicit_knobs.cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+        if arch == "sm107" and (d, d_v) == (256, 256):
+            explicit_name = "sdpa_fwd_sm107_d256_swap_ab" if explicit_knobs.tile_m in (16, 32, 64) else "sdpa_fwd_sm107_d256_lookahead"
         if arch == "sm107" and (d, d_v) in ((512, 512), (576, 512)):
             from dataclasses import replace
 

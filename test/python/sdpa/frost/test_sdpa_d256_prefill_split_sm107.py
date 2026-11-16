@@ -40,6 +40,7 @@ _CASES = [
     # name, B, H, HK, SQ, SKV, split, causal, bottom-right, left, sink, Stats, scheduler, head pair
     ("unsplit_plain", 2, 4, 2, 256, 512, 1, False, False, None, False, True, 0, (256, 256)),
     ("unsplit_window_sink", 2, 4, 2, 385, 257, 1, True, True, 63, True, False, 0, (256, 256)),
+    ("past_decode_boundary", 2, 4, 4, 33, 256, 2, False, False, None, False, True, 0, (256, 256)),
     ("plain", 2, 4, 2, 256, 512, 2, False, False, None, False, True, 0, (256, 256)),
     ("empty_partitions", 2, 4, 4, 257, 128, 16, False, False, None, False, False, 0, (256, 256)),
     ("top_left_tail", 2, 4, 2, 129, 257, 4, True, False, None, False, True, 0, (256, 256)),
