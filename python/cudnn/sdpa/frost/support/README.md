@@ -15,7 +15,7 @@ features.** It means this new reference has not yet been checked for that scope.
 |---|---|---|
 | SM80 (cc 8.0) | [SM80 support](sm80.md) | FP16/BF16 forward and backward implementation identities documented; full backward feature reference pending |
 | SM89 (cc 8.9) | [SM89 support](sm89.md) | FP16/BF16 backward fixed-body identities and inherited feature scope documented; forward reference pending |
-| SM90 (cc 9.0) | [SM90 support](sm90.md) | Forward documented; no FROST SDPA backward engine |
+| SM90 (cc 9.0) | [SM90 support](sm90.md) | Forward and the opt-in FP16/BF16 D64/D128 backward chain documented |
 | SM100 / SM103 (cc 10.0 / 10.3) | [SM100 / SM103 support](sm100.md) | Forward and FP16/BF16 D64/D128 recompute/pair/accumulation, D192/V128 accumulation, D192/V128–D256 two-by-two and D264–D512 backward documented; other backward paths pending migration |
 | SM107 (cc 10.7) | [SM107 support](sm107.md) | Forward, shared D64/D128 recompute and D128 accumulation, native D192/V128, D256 and D264–D512 half backward, plus native per-tensor FP8 and MXFP8 backward documented; shared quantized feature reference pending |
 | SM120 / SM121 (cc 12.0, 12.1) | [SM120 support](sm120.md) | Forward and backward implementation identities documented; full backward feature reference pending |
