@@ -58,7 +58,6 @@ def test_full_ownership_preserves_policy_candidates_and_placement(dims, features
         dict(thd=True),
         dict(has_sink=True),
         dict(window_left=16),
-        dict(padded=True),
         dict(has_paged_kv=True, padded=True, page_size=16),
         dict(s_q=1),
         dict(causal=True, bottom_right=True, s_kv=128),
@@ -210,3 +209,8 @@ def test_owned_artifact_reloads_without_jit_in_fresh_process(tmp_path, owner, th
     from test_sdpa_prepared_sm90 import test_prepared_artifact_reloads_in_fresh_process
 
     test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, d=d, owner=owner)
+
+
+def test_d128_dense_lengths_are_admitted_before_lowering():
+    for over in (dict(padded=True), dict(padded=True, causal=True, bottom_right=True, s_kv=128)):
+        assert engines.mismatch(SPECS[d128.NAME].capabilities, _facts(**over)) is None

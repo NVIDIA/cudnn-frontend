@@ -380,6 +380,8 @@ class SM90FusedMultiHeadAttentionForward:
         persistent_ctas: int = 0,
         causal_walk: int = 0,
         causal_claim: int = 0,
+        seq_q_lens_present: bool = False,
+        seq_kv_lens_present: bool = False,
     ):
         """Initialize the SM90 D128 FMHA prefill kernel configuration.
 
@@ -407,6 +409,9 @@ class SM90FusedMultiHeadAttentionForward:
         :param persistent_ctas: The persistent grid's CTA cap (the SM count); 0 when not persistent.
         :param causal_walk: A persistent causal record's walk: 0 the stride by the grid, 1 the paired walk
             (causal_walk_plan, which may keep the stride).
+        :param seq_q_lens_present: Read device Q lengths and zero every trimmed output row.
+        :param seq_kv_lens_present: Read device KV lengths, including empty sequences.
+            Per-batch lengths use one work tile per CTA, without the persistent walk.
         :param causal_claim: A persistent causal record's claim counter (config_sm90.D128_CLAIM_*): 0 off, 1 every
             item after a CTA's first from the workspace counter with a group's Q tiles in NATURAL order. Requires
             causal_walk 0 and sched_policy NATURAL.
@@ -434,6 +439,10 @@ class SM90FusedMultiHeadAttentionForward:
         self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
         self.stats_log2 = stats_log2
         self.intra_wg_overlap = intra_wg_overlap
+        self.dense_q_lengths = seq_q_lens_present
+        self.dense_kv_lengths = seq_kv_lens_present
+        if persistent and (seq_q_lens_present or seq_kv_lens_present):
+            raise ValueError("prefill_d128_f16_sm90: per-batch lengths require one work tile per CTA")
         self.persistent = persistent
         self.persistent_ctas = persistent_ctas
         if persistent:
@@ -480,7 +489,7 @@ class SM90FusedMultiHeadAttentionForward:
         self.heads = self.h_q
         # Every launched Q row is real only when the declared Q length is whole tiles;
         # online_softmax's row-validity test and the partial-tile walk fold away.
-        self.q_rows_full = self.s_q % self.Q_TILE == 0
+        self.q_rows_full = self.s_q % self.Q_TILE == 0 and not self.dense_q_lengths
         # SMEM elements: one Q_TILE x HEAD_TILE tile sizes Q, O and each K/V stage, and a
         # compute warpgroup's O half is WG_ROWS x HEAD_TILE.
         self.tile_elems = self.Q_TILE * self.HEAD_TILE
@@ -1680,7 +1689,7 @@ class SM90FusedMultiHeadAttentionForward:
             self.compute_persistent(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg - 1, claim)
 
     @cute.jit
-    def _run_unit(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch):
+    def _run_unit(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, seq_q_lens, seq_kv_lens, sQ, sK, sV, sO, bars, wg, tile, head, batch):
         """Resolve one (Q tile, head, batch) work tile and run this thread's role on it.
 
         ``wg`` selects the role -- WG0 load, WG1 and WG2 compute -- and each role sets its
@@ -1689,10 +1698,21 @@ class SM90FusedMultiHeadAttentionForward:
         """
         q_base = tile * self.Q_TILE
         q_len, kv_len = cutlass.Int32(self.s_q), cutlass.Int32(self.s_kv)
+        # Read lengths on device for this batch, including after graph replay.
+        # Keep the same envelope clamps as the general Hopper implementation.
+        if cutlass.const_expr(self.dense_q_lengths):
+            q_len = cute.math.min(cute.math.max(cutlass.Int32(cutlass.make_array_view(seq_q_lens)[batch]), cutlass.Int32(0)), cutlass.Int32(self.s_q))
+        if cutlass.const_expr(self.dense_kv_lengths):
+            kv_len = cute.math.min(cute.math.max(cutlass.Int32(cutlass.make_array_view(seq_kv_lens)[batch]), cutlass.Int32(0)), cutlass.Int32(self.s_kv))
         # The reverse KV loop visits tiles [0, right). right is clipped by the KV length and,
         # under causal, by the diagonal of the CTA's last row.
         bounds = compute_kv_loop_bounds(q_base, q_len, kv_len, 0, self.mask_flags, self.KV_TILE, self.Q_TILE, bottom_right=self.kv_loop_bottom_right)
         iterations = cute.math.max(cutlass.Int32(0), bounds.right)
+        if cutlass.const_expr(self.dense_q_lengths):
+            # All roles skip the same empty work. Compute still owns the declared
+            # output rows and writes O=0 / Stats=-inf without waiting on Q or KV.
+            if q_base >= q_len:
+                iterations = cutlass.Int32(0)
         work = SimpleNamespace(
             batch=batch,
             head=head,
@@ -1700,7 +1720,7 @@ class SM90FusedMultiHeadAttentionForward:
             q_base=q_base,
             q_len=q_len,
             kv_len=kv_len,
-            q_output_limit=q_len,
+            q_output_limit=cutlass.Int32(self.s_q),
             iterations=iterations,
             kv_right=iterations,
         )
@@ -1720,6 +1740,8 @@ class SM90FusedMultiHeadAttentionForward:
         tma_o_desc: cutlass.GridConstant[cuda.TensorMap],
         lse,
         scale: cutlass.Float32,
+        seq_q_lens,
+        seq_kv_lens,
         claim_ctr,
         release_zero_arg: cutlass.Int32,
     ):
@@ -1892,7 +1914,7 @@ class SM90FusedMultiHeadAttentionForward:
             elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
                 tile, head, batch = lpt_tile_coords(tile, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
             wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
-            self._run_unit(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch)
+            self._run_unit(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, seq_q_lens, seq_kv_lens, sQ, sK, sV, sO, bars, wg, tile, head, batch)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -1925,11 +1947,13 @@ class SM90FusedMultiHeadAttentionForward:
 
         Only the compiled pointer host calls this internal view-building entry, with the
         D512 template's argument list; the shared prepared binder validates runtime buffers
-        before launch. ``sinks``, the length views, the THD arguments (lengths and the
+        before launch. Declared per-batch Q/KV lengths are read by the device kernel.
+        ``sinks``, the THD arguments (lengths and the
         ``thd_ro_q`` .. ``thd_ro_lse`` ragged offsets, ``None`` while ``thd_origins`` is) and
         the page tables (``block_table``, ``block_table_v``, never passed while ``page_size``
-        is 0) are unread: a D128 specialization declares none of them. ``seq_kv_lens`` is read
-        only by a claim-counter record (causal_claim), as its work-item counter: word 0 of the
+        is 0) are unread: a D128 specialization declares none of them. Without per-batch
+        lengths, a claim-counter record (causal_claim) instead reads ``seq_kv_lens`` as
+        its work-item counter: word 0 of the
         caller's workspace, which the launcher binds as ``meta_ptr`` and zeroes on the launch
         stream before every launch.
 
@@ -1977,7 +2001,9 @@ class SM90FusedMultiHeadAttentionForward:
         # (python/cudnn/AGENTS.md: without it ptxas may drop every setmaxnreg silently).
         claim_ctr = seq_kv_lens if cutlass.const_expr(self.causal_claim) else None
         # The release-zero (tile_dsl.consume, kernel's last argument): the literal 0, the only value ever passed.
-        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, claim_ctr, cutlass.Int32(0)).launch(
+        q_lengths = seq_q_lens if cutlass.const_expr(self.dense_q_lengths) else None
+        kv_lengths = seq_kv_lens if cutlass.const_expr(self.dense_kv_lengths) else None
+        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, q_lengths, kv_lengths, claim_ctr, cutlass.Int32(0)).launch(
             grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream, min_blocks_per_mp=1
         )
 
@@ -2061,6 +2087,8 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         persistent_ctas=persistent_ctas,
         causal_walk=PARAMS.causal_walk,
         causal_claim=PARAMS.causal_claim,
+        seq_q_lens_present=PARAMS.seq_q_lens_present,
+        seq_kv_lens_present=PARAMS.seq_kv_lens_present,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel

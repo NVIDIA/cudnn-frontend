@@ -20,7 +20,7 @@ FP16/BF16 subset. `sdpa_fwd_sm90_f16_three_wg` (20540) owns the existing
 64 x 64 tile domain: exact D64 paged KV, wider native heads and bounded
 head envelopes, with the same dense/THD/paged/split/packing restrictions.
 `sdpa_fwd_sm90_d128_multi_q` (20541) owns the dedicated dense 128 x 128
-D128 pipeline. Each public record fixes its body; shared binding, caching
+D128 pipeline, including dense device lengths as described in [SM90 support](support/sm90.md). Each public record fixes its body; shared binding, caching
 and launch services remain common.
 
 Legacy ID 20517 is retired, reserved and never reused. Old recipes must

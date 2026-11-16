@@ -5949,7 +5949,7 @@ def _sm90_specs():
                 cu_seq_len=False,
                 right_band_widening=False,
                 swa=False,
-                padded=False,
+                padded=owner is _sm90_d128_owner,
                 paged_kv=False,
                 sink=False,
                 decode=owner is _sm90_d64_owner,

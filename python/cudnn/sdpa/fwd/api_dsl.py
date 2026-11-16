@@ -6036,6 +6036,11 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
         # D128 only, read at call time (the module constants above); causal plans as D128_PERSISTENT_CAUSAL_WALK says.
         persistent, causal_walk = _sm90_d128_persistence(self.flavor, band["causal"])
+        if self.seq_q_lens_present or self.seq_kv_lens_present:
+            # Runtime lengths can make any item empty. The dedicated D128
+            # persistent loop requires KV work in every item; use its existing
+            # one-tile pipeline, which owns and writes empty output rows too.
+            persistent, causal_walk = False, 0
         # A causal record of the walk's rule walks NATURAL unless the caller pinned an order: the stride it may keep
         # then runs a group's Q tiles in one round (D128_PERSISTENT_CAUSAL_WALK's comment). The one-tile record keeps
         # the order above (causal_sched), which a routed plan takes back.
