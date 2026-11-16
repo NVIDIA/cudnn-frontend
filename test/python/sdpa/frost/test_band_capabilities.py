@@ -117,10 +117,32 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
 
     The band axes are then varied one at a time on top of this, so an arch /
     dtype / envelope / layout rejection can never stand in for a mask decision.
+    A row whose declaration pins the sequence geometry (``_pinned_geometry``)
+    keeps it whatever lengths a case asks for: the geometry axes then cannot
+    move its decisions, which is what the geometry cases assert.
     """
     values = _values(kind, caps, *_dims(kind, caps))
     values.update(overrides)
+    values.update(_pinned_geometry(kind, caps))
     return ga.SdpaGraphFacts(**values)
+
+
+def _pinned_geometry(kind: str, caps) -> dict:
+    """Sequence lengths a row's declaration check requires of every graph, or ``{}``.
+
+    A row serving S_q == S_kv only (``sdpa_bwd_sm103_d128_mxfp8``) accepts the matrix's baseline but declines every
+    unequal pair, so its samples keep the baseline lengths."""
+    base = _values(kind, caps, *_dims(kind, caps))
+    if declaration_reason(kind, caps, ga.SdpaGraphFacts(**base)) is not None:
+        return {}
+    if declaration_reason(kind, caps, ga.SdpaGraphFacts(**{**base, "s_kv": 2 * base["s_kv"]})) is None:
+        return {}
+    return dict(s_q=base["s_q"], s_kv=base["s_kv"])
+
+
+def band_served(caps) -> dict:
+    """A band every row's claim admits for the non-band cases: causal top-left where the row claims it, else unmasked."""
+    return band_causal_top_left() if declares(caps, right=band.RIGHT_CAUSAL) else band_unmasked()
 
 
 def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
@@ -626,12 +648,12 @@ def test_length_metadata_decisions_follow_the_row_claims():
             (dict(seq_q_trim=True), None if getattr(caps, "seq_q_trim", False) else trim_reason),
         )
         for overrides, expected in cases:
-            sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), **overrides})
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_served(caps), **overrides})
             assert _probe(kind)(caps, sample) == expected, (spec.name, overrides, _probe(kind)(caps, sample))
         if kind == "fwd":
             # fwd-only combination: a padding mask plus generate_stats needs the
             # row's padded_stats claim; the padding gate itself comes first.
-            sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), "padded": True, "wants_stats": True})
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_served(caps), "padded": True, "wants_stats": True})
             if not claims_padding:
                 expected = padding_reason
             elif getattr(caps, "padded_stats", False):
@@ -656,7 +678,7 @@ def test_dense_layout_envelope_decisions():
             (dict(bshd_layout=False, packed_layout=True, dense_layout=False), False),
         )
         for layout, ok in cases:
-            sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), **layout})
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_served(caps), **layout})
             reason = _probe(kind)(caps, sample)
             assert (reason is None) == ok, (spec.name, layout, reason)
             if not ok:

@@ -33,6 +33,62 @@ pytest core/test_determinism_utils.py
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
+| `sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py` | `sdpa_mxfp8_backward` on the `sdpa_bwd_sm103_d128_mxfp8` row (SM103, D128) | — (backward only) | BF16 dQ, dK, dV; FP32 amax_dQ / dK / dV when requested |
+
+### SM103 D128 MXFP8 backward — qualification, 2026-11-13 (UTC)
+
+`sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py` covers the cc 10.3-only CuTeDSL
+chain (prep, dK/dV, persistent dQ) behind `sdpa_mxfp8_backward`. The only atomics
+are the dQ kernel's work counter and the amax maximum. The counter decides which
+cluster computes a unit, not the order the unit sums in, and a maximum is exact in
+any order. Every plan fixes the dK/dV walk split, so repeated calls are bitwise
+identical. Under `use_deterministic_algorithm` the walk
+split is decided from one batch element, so results are also batch invariant.
+Without that request a large batch may keep the walk unsplit: a different order,
+still repeatable ([status page](../../../docs/operations/determinism.md)).
+
+The checks:
+- Repeats into NaN-poisoned outputs, eager and CUDA-graph replay, compare raw
+  bytes (dense, tail, causal, and causal + tail + amax).
+- Batch invariance: B = 2 against two B = 1 problems on the same data, and, where
+  the default plan differs (dense, tail, causal), the deterministic B = 8 plan.
+- Concurrent load and fresh allocations; a warm execute that compiles, allocates
+  and synchronizes nothing; a first build inside a capture.
+- A warm stress of the dQ kernel's `ld.shared`-released stages.
+- An L1 case past 2^32-byte offsets: the last batch element of B = 34 is bitwise
+  the B = 1 problem on its data.
+- Accuracy against the repo's MXFP8 reference, and error against FP32 matched to
+  the cuDNN backend's.
+
+`test_golden` holds one golden per distinct numerical path of the chain:
+- the walk-split dK/dV plan (B = 1, S = 1024, deterministic request);
+- the unsplit plan (B = 8, default request);
+- causal with an odd block count (S = 1152);
+- a sequence tail with amax (S = 1000, all three amax outputs).
+
+Each case passes the MXFP8 reference check and three replays before its bytes are
+hashed. The four records were written into a new directory under
+`CUDNN_DETERMINISM_RECORD` and passed a strict `CUDNN_DETERMINISM_GOLDENS` check in a
+fresh process (4 passed) before they were copied to `76371bd3c67774a8/`. That runtime
+is B300, CUDA driver API 13.4, Torch 2.11.0+cu130, cuDNN 9.28, CuTe DSL 4.8.1 and
+TVM FFI 0.1.15.post2. Other runtimes skip the comparison until a reviewed baseline is
+recorded for them.
+
+Qualification on 2026-11-14: B300 SXM6 AC (148 SMs), driver 615.71.10, Torch
+2.11.0+cu130, cuDNN 9.28.0, CuTe DSL 4.8.1 (compiling with CUDA 13.4). The row
+module passes **55 tests** at L0 + L1 with zero skips, the four goldens included. The
+GPU-free eligibility module passes **42**. The warm stress has 0 mismatches in 3000
+warm and 3000 poisoned launches; its unsafe control fails 200 / 200 on the same GPU.
+From `test/python`:
+
+```bash
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m "L0 or L1" \
+  sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128_eligibility.py
+```
+
+Compute Sanitizer has not run on this row: the 12.9 sanitizer (2025.2.1) reports the B300 as
+an unsupported device, and a CUDA 13 build was not available on the test node.
 
 ### D128 paged live-column decode — qualification, 2026-11-12 (UTC)
 

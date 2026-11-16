@@ -1,5 +1,6 @@
 # SMOKE tier, cc 10.3 (Blackwell Ultra B300 / GB300): the cells of smoke_cc100.txt that run on cc 10.3 -- the same engine rows, their
-# sm100 bodies compiled for sm_103a; the rules are in README.md.  The code path each id stands for is in smoke_cc103_code_paths.tsv.
+# sm100 bodies compiled for sm_103a -- plus the cc 10.3-only rows (sdpa_bwd_sm103_d128_mxfp8, under its own section line); the rules
+# are in README.md.  The code path each id stands for is in smoke_cc103_code_paths.tsv.
 # conftest.py marks these ids `smoke`:
 #   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= $(grep -v '^#' tiers/smoke_cc103.txt) -- the @file form would pass these comment lines as arguments and collects nothing)
 # Not listed (15 cc 10.0 cells): the cc 10.7 / SM120 kernels and bindings (9); the native dense, prefill, sink and split bindings'
@@ -147,6 +148,15 @@ sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_dense[bf16]
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_causal
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_gqa
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_ragged_tails
+# --- MXFP8 backward, cc 10.3 only (sdpa_bwd_sm103_d128_mxfp8): dense, sequence tail, causal, causal + tail, causal MHA
+# with an odd block count (no walk split), amax, and B = 8 (the unsplit and the split dK/dV plan) (2026-11-13) ---
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_dense[gqa]
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_sequence_tails[s100]
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_causal[gqa-512]
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_causal[gqa-1000]
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_causal[mha-384]
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_amax
+sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py::test_large_batch_plans
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]

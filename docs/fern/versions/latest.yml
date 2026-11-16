@@ -48,6 +48,9 @@ navigation:
           - page: SDPA Backward (SM100/SM103, d = 128)
             path: ../../operations/attention/sdpa_bwd_sm100_d128.md
             slug: sdpa_bwd_sm100_d128
+          - page: SDPA MXFP8 Backward (SM103, d = 128)
+            path: ../../operations/attention/sdpa_bwd_sm103_d128_mxfp8.md
+            slug: sdpa_bwd_sm103_d128_mxfp8
           - page: SDPA Backward (SM107, d = 256–512)
             path: ../../operations/attention/sdpa_bwd_sm107.md
             slug: sdpa_bwd_sm107

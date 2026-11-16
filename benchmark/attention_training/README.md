@@ -9,6 +9,7 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
 - `Dockerfile` - Docker container setup for running benchmarks
 - `benchmark_single_sdpa.py` - Single SDPA benchmark script
 - `benchmark_nvfp4_qat_backward.py` - Triton NVFP4 QAT backward benchmark
+- `benchmark_mxfp8_bwd_sm103_d128.py` - Compare SM103 D128 MXFP8 backward with the cuDNN backend and FROST SM100 engine.
 - `configs/` - Benchmark configuration files
   - `llama.py` - Llama 3.1 GQA benchmarks (causal + non-causal)
   - `dsv3.py` - DeepSeek V3 MLA benchmarks (asymmetric head dims, causal + non-causal)
