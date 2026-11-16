@@ -103,6 +103,12 @@ body's barrier sites separately, including both ordinary and batch-pair work.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
+When an SDPA harness stores ragged offsets in scaled units, preserve the multiplier
+on backward inputs and gradient outputs too: Q/K/dQ/dK use d_qk, V/O/dO/dV use d_v,
+while Stats keeps its own element units. Check real descriptors before launching
+an old-code negative control; incorrect units can otherwise execute invalid offsets.
+`sdpa/graph/test_ragged_offset_multiplier.py` covers unequal widths, ordinary-offset
+controls, the FP8 execution call site, and declared token-stride gaps.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
 Columnwise F8_128x4 scale atoms span all B*H scale rows along their column
