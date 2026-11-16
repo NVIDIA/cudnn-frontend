@@ -1932,8 +1932,9 @@ partition, legal-tuple ranking, identities and
 `test_sm80_selector_is_the_adapters_d64_rule`.
 
 Moving a body into its implementation directory changes what a relative import
-resolves against (`from . import _bprop_mxfp8_masks` in `sm100/d256_mxfp8/`
-looked in the new package). An AST comparison of the moved file passes, and
+resolves against (after #2617 moved the D256 MXFP8 bodies into
+`sm100/d256_mxfp8/`, their `from . import _bprop_mxfp8_masks` looked in the new
+package instead of `sm100/`). An AST comparison of the moved file passes, and
 host suites never import template bodies, so import every moved module
 (`importlib.import_module`) before the GPU run. After delegating a row, diff
 failing test ids across every file under `test/python/sdpa` against the parent:
