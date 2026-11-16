@@ -7027,9 +7027,9 @@ python -m pytest linear_attention/test_la.py -k "autotune or determinism" -rA
 ```
 
 The two stream-contention tests, `test_determinism_two_streams` (forward,
-every variant) and `test_bwd_same_graph_two_streams` (backward, KDA and
-mamba2, fp16 and bf16), were FROST-only and now run on the cuTile engine as
-well: two instances on two side streams, each repeat compared bitwise with
+every variant) and `test_bwd_same_graph_two_streams` (backward, now every
+variant, fp16 and bf16; it covered KDA and mamba2 before), were FROST-only
+and now run on the cuTile engine as well: two instances on two side streams, each repeat compared bitwise with
 its own single-stream baseline, with the serial baselines warming the hint
 cache so the concurrent repeats never tune. The first run of the backward
 case on cuTile KDA found a stream defect: `chunk_kda_grad` launched its five
@@ -7041,15 +7041,15 @@ saw stream 0 beside the side stream, and a device sync after every launch
 made the zeros disappear). The casts now take the caller's stream; develop
 has the same defect. GDN's backward does not.
 
-Source `2a254355` ran on one GB300 (cc 10.3, 152 SMs) with cuDNN backend
+Source `a06ec348` ran on one GB300 (cc 10.3, 152 SMs) with cuDNN backend
 9.26.0, cuDNN frontend 1.33.0 from the checkout, CuTe DSL 4.8.0, CUDA 13.4
 and driver API 13040, Torch 2.14.0a0 (NGC 26.09), selecting
 `-k "autotune or determinism or two_streams"`:
-**57 passed, 89 skipped, 0 failed.** The passes are `test_determinism_fwd`,
+**65 passed, 93 skipped, 0 failed.** The passes are `test_determinism_fwd`,
 `_bwd`, `_multi_tile_fwd` and `_multi_tile_bwd` (7 each), `_bwd_all_grads`
 (11), `test_determinism_two_streams` (7: five FROST variants, cuTile GDN and
-KDA), `test_bwd_same_graph_two_streams` (6: FROST KDA and mamba2, cuTile KDA,
-two dtypes each), `test_beta_guard_bwd_determinism` (1), plus the two
+KDA), `test_bwd_same_graph_two_streams` (14: the five FROST variants and cuTile
+GDN and KDA, two dtypes each), `test_beta_guard_bwd_determinism` (1), plus the two
 autotune tests for GDN and KDA (2 each). The skips are the `hopper` and
 `hopper_cuda` rows and cuTile's gdn2, gdp and mamba2 rows, which have no
 plan on this GPU; `test_multi_graph_stress` is not selected. After the cast
