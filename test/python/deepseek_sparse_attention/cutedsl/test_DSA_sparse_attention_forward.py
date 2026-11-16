@@ -832,6 +832,108 @@ def test_DSA_sparse_attention_forward_compile_cache_separates_structural_special
     assert next(iter(interface_sm100._compile_cache.values())) is first_compiled
 
 
+@pytest.mark.L0
+def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_forward._kv_formats import KV_FORMATS
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    queries = {d: torch.empty((1, 64, d), dtype=torch.bfloat16, device=device) for d in (512, 576)}
+    q = queries[512]
+    kv = torch.empty((2, 512), dtype=torch.bfloat16, device=device)
+    topk = torch.zeros((1, 640), dtype=torch.int32, device=device)
+
+    # Every format: its byte rows, also as the view of a padded buffer, are validated, then declined until a kernel serves them.
+    for fmt in KV_FORMATS.values():
+        q_fmt = queries[fmt.head_dim_qk]
+        rows = torch.empty((2, fmt.record_bytes), dtype=torch.uint8, device=device)
+        padded = torch.empty((2, fmt.record_bytes + 32), dtype=torch.uint8, device=device)[:, : fmt.record_bytes]
+        for pool in (rows, padded):
+            with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}' on SM10"):
+                DSA.SparseAttentionForward(q_fmt, pool, topk, kv_format=fmt.name).check_support()
+        with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}'"):
+            DSA.sparse_attention_forward_wrapper(q_fmt, rows, topk, kv_format=fmt.name)
+        with pytest.raises(ValueError, match=f"must be the \\(total_S_kv, {fmt.record_bytes}\\) byte rows"):
+            DSA.SparseAttentionForward(q_fmt, rows[:, :-1], topk, kv_format=fmt.name).check_support()
+        other_d = 576 if fmt.head_dim_qk == 512 else 512
+        with pytest.raises(ValueError, match=f"{fmt.name} rows hold D_qk={fmt.head_dim_qk} channels, but Q has D_qk={other_d}"):
+            DSA.SparseAttentionForward(queries[other_d], rows, topk, kv_format=fmt.name).check_support()
+        with pytest.raises(ValueError, match="KV dtype mismatch: expected torch.uint8"):
+            DSA.SparseAttentionForward(q_fmt, rows.view(torch.float8_e4m3fn), topk, kv_format=fmt.name).check_support()
+
+    # Unknown names, scattered row bytes, and a uint8 cache without its format.
+    rows = torch.empty((2, 528), dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="unknown kv_format 'mxfp8'; the packed KV cache formats are"):
+        DSA.SparseAttentionForward(q, rows, topk, kv_format="mxfp8").check_support()
+    with pytest.raises(ValueError, match="each row's bytes contiguous"):
+        DSA.SparseAttentionForward(q, torch.empty((528, 2), dtype=torch.uint8, device=device).t(), topk, kv_format="mxfp8_528").check_support()
+    with pytest.raises(ValueError, match="KV must have same dtype as Q; a packed torch.uint8 cache also needs kv_format"):
+        DSA.SparseAttentionForward(q, rows, topk).check_support()
+
+    # A second pool with its own token ids: validated like kv, then declined until a kernel serves it.
+    extra = torch.empty((3, 288), dtype=torch.uint8, device=device)
+    extra_bf16 = torch.empty((3, 512), dtype=torch.bfloat16, device=device)
+    extra_idxs = torch.zeros((1, 512), dtype=torch.int32, device=device)
+    extra_len = torch.zeros((1,), dtype=torch.int32, device=device)
+    packed_extra = dict(sample_extra_kv=extra, extra_kv_format="nvfp4_288", sample_extra_topk_idxs=extra_idxs)
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool \\(extra_kv\\) on SM10"):
+        DSA.SparseAttentionForward(q, kv, topk, **packed_extra, sample_extra_topk_length=extra_len).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra_bf16, sample_extra_topk_idxs=extra_idxs).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
+        DSA.sparse_attention_forward_wrapper(q, kv, topk, extra_kv=extra, extra_kv_format="nvfp4_288", extra_topk_idxs=extra_idxs, extra_topk_length=extra_len)
+    with pytest.raises(NotImplementedError, match="does not serve kv_format='mxfp8_528'"):
+        DSA.sparse_attention_forward_wrapper(q, rows, topk, kv_format="mxfp8_528", extra_kv=extra, extra_kv_format="nvfp4_288", extra_topk_idxs=extra_idxs)
+    with pytest.raises(NotImplementedError, match="indexer_topk > 0 \\(lse_indexer\\) with a second KV pool"):
+        DSA.SparseAttentionForward(q, kv, topk, indexer_topk=512, **packed_extra).check_support()
+
+    # The pool's token ids and format travel with it.
+    with pytest.raises(ValueError, match="extra_kv needs extra_topk_idxs"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra, extra_kv_format="nvfp4_288").check_support()
+    for orphan in (dict(extra_kv_format="nvfp4_288"), dict(sample_extra_topk_idxs=extra_idxs), dict(sample_extra_topk_length=extra_len)):
+        with pytest.raises(ValueError, match="describe a second KV pool, but extra_kv is not given"):
+            DSA.SparseAttentionForward(q, kv, topk, **orphan).check_support()
+    with pytest.raises(ValueError, match="unknown extra_kv_format 'nvfp4'"):
+        DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "extra_kv_format": "nvfp4"}).check_support()
+    with pytest.raises(ValueError, match="extra_kv in format nvfp4_288 must be the \\(total_S_kv, 288\\) byte rows"):
+        DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "sample_extra_kv": extra[:, :-1]}).check_support()
+    with pytest.raises(ValueError, match="extra_kv must have same dtype as Q; a packed torch.uint8 cache also needs extra_kv_format"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra, sample_extra_topk_idxs=extra_idxs).check_support()
+    with pytest.raises(ValueError, match="extra_kv head dimension \\(576\\) must match Q \\(512\\)"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra_bf16.new_empty((3, 576)), sample_extra_topk_idxs=extra_idxs).check_support()
+    for bad_idxs, message in (
+        (extra_idxs.long(), "extra_topk_idxs dtype mismatch: expected torch.int32"),
+        (extra_idxs[0], "extra_topk_idxs must be 2-D"),
+        (extra_idxs.new_zeros((2, 512)), "extra_topk_idxs first dimension \\(2\\) must match Q \\(1\\)"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "sample_extra_topk_idxs": bad_idxs}).check_support()
+    with pytest.raises(ValueError, match="extra_topk_length must have shape \\(1,\\)"):
+        DSA.SparseAttentionForward(q, kv, topk, **packed_extra, sample_extra_topk_length=extra_len.new_zeros((2,))).check_support()
+
+    # A plan declared without a second pool refuses one at execute rather than ignoring it.
+    plan = DSA.SparseAttentionForward(q, kv, topk)
+    assert plan.check_support()
+    plan.compile()
+    for name, value in (("extra_kv", extra_bf16), ("extra_topk_idxs", extra_idxs), ("extra_topk_length", extra_len)):
+        with pytest.raises(ValueError, match=f"{name} must be given exactly when"):
+            plan.execute(q, kv, topk, **{name: value})
+
+    # The new parameters are keyword-only, so positional callers keep their meaning.
+    with pytest.raises(TypeError):
+        DSA.SparseAttentionForward(q, rows, topk, None, None, None, 0, "mxfp8_528")
+
+    # The architecture gate runs before the packed-cache decline.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
+    with pytest.raises(RuntimeError, match="requires an SM90 or SM100-family GPU"):
+        DSA.SparseAttentionForward(q, rows, topk, kv_format="mxfp8_528").check_support()
+
+
 @pytest.mark.L1
 def test_DSA_sparse_attention_forward_nondefault_stream_layout_normalization_runtime_scale_cache():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:

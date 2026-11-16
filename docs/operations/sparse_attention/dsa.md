@@ -172,13 +172,60 @@ attention sink participates only in the output denominator, not in any stats.
 
 - **Inputs**
   - `q`: `(total_S_q, H, D_qk)` FP16 or BF16
-  - `kv`: `(total_S_kv, D_qk)`, with the same dtype as `q` (K = V latent; MQA)
+  - `kv`: `(total_S_kv, D_qk)`, with the same dtype as `q` (K = V latent; MQA),
+    or the `torch.uint8` rows of a packed cache named by `kv_format`
   - `topk_idxs`: `(total_S_q, K)` INT32 global token ids; K may be any
     nonnegative value. SM100 pads a tail internally; SM90 masks it in place.
   - `attn_sink` (optional): `(H,)` FP32
   - `topk_length` (optional): `(total_S_q,)` INT32, clamped to `[0, K]`
   - `softmax_scale` (optional runtime float): defaults to `1 / sqrt(D_qk)`
   - `indexer_topk`: compile-time prefix length
+  - `kv_format` (optional, keyword-only): the format of a packed `kv`. See
+    *Packed KV caches*.
+  - `extra_kv`, `extra_kv_format`, `extra_topk_idxs`, `extra_topk_length`
+    (optional, keyword-only; `sample_extra_kv`, `sample_extra_topk_idxs` and
+    `sample_extra_topk_length` on the class): a second pool and its own token
+    ids. See *Packed KV caches*.
+- **Packed KV caches** — a packed cache keeps each token's row in one run of
+  bytes: the quantized channels, their block scales and, at `D_qk = 576`, the
+  64 channels only K reads. Pass the `torch.uint8` tensor of its rows, shape
+  `(total_S_kv, record_bytes)`, and name the format with `kv_format`. A cache
+  with padded rows is passed as that view of its buffer, so `stride(0)` is
+  the row pitch. V reads channels `[0, 512)` in every format.
+
+  | `kv_format` | `D_qk` | Bytes per token | Row layout (byte offsets) | Value of channel `c` | Served |
+  |---|---|---|---|---|---|
+  | `mxfp8_528` | 512 | 528 | `[0, 512)` E4M3 codes; `[512, 528)` one UE8M0 scale per 32 channels | `e4m3(code[c]) * 2^(sf[c/32] - 127)` | not yet |
+  | `nvfp4_288` | 512 | 288 | `[0, 256)` E2M1 codes, channel `2i` in the low nibble of byte `i`; `[256, 288)` one E4M3 scale per 16 channels | `e2m1(code[c]) * e4m3(sf[c/16])` | not yet |
+  | `fp8_bf16rope_656` | 576 | 656 | `[0, 512)` E4M3 codes of channels `[0, 512)`; `[512, 528)` one FP32 scale per 128 of them; `[528, 656)` channels `[512, 576)` as BF16 | `e4m3(code[c]) * sf[c/128]` for `c < 512`, else the BF16 value | not yet |
+  | `nvfp4_fp8rope_352` | 576 | 352 | `[0, 256)` E2M1 codes of channels `[0, 512)`, as in `nvfp4_288`; `[256, 320)` channels `[512, 576)` as unscaled E4M3; `[320, 352)` one E4M3 scale per 16 of channels `[0, 512)`, block `b` at byte `320 + 8 * (b % 4) + b // 4` | `e2m1(code[c]) * e4m3(sf[c/16])` for `c < 512`, else the E4M3 value | not yet |
+
+  DeepSeek-V4.1 keeps its window cache as `mxfp8_528` and its compressed
+  cache as `nvfp4_288`. `fp8_bf16rope_656` and `nvfp4_fp8rope_352` hold a
+  DeepSeek-V3.2-style record: a 512-channel latent and 64 RoPE channels.
+
+  `extra_kv` is a second pool, for models that attend to tokens of two
+  caches. It has its own token ids: `extra_topk_idxs` `(total_S_q, extra_K)`
+  INT32, with an optional `extra_topk_length` `(total_S_q,)` clamped to
+  `[0, extra_K]`, index `extra_kv` as `topk_idxs` and `topk_length` index
+  `kv`. Each query attends to both sets of slots under one softmax and one
+  sink. Each pool has its own format: `extra_kv_format` names a packed
+  `extra_kv`, and without it `extra_kv` is a `(total_S_extra_kv, D_qk)`
+  tensor of `q`'s dtype. `indexer_topk > 0` is not served with a second
+  pool. For DeepSeek-V4.1, `kv` is the window cache and `extra_kv` the
+  compressed cache:
+
+  ```python
+  result = DSA.sparse_attention_forward_wrapper(
+      q, window_rows, window_idxs, topk_length=window_lens, kv_format="mxfp8_528",
+      extra_kv=compressed_rows, extra_kv_format="nvfp4_288",
+      extra_topk_idxs=compressed_idxs, extra_topk_length=compressed_lens,
+      attn_sink=attn_sink,
+  )
+  ```
+
+  Declaring a packed cache or a second pool raises `NotImplementedError`
+  until a kernel serves it.
 - **Outputs** — stable `TupleDict` keys:
   - `out`: `(total_S_q, H, 512)`, with the same dtype as `q`
   - `max_logits`: `(total_S_q, H)` FP32
