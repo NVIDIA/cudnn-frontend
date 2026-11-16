@@ -81,8 +81,8 @@ def _graph(data, o, stats, scale, causal, deterministic, lengths, ragged):
 @pytest.mark.parametrize("ragged", [False, True], ids=["padded", "thd"])
 def test_explicit_padding_keeps_correct_native_paths(dtype, scale, causal, deterministic, ragged):
     cc = torch.cuda.get_device_capability()
-    if ragged and cc[0] == 8:
-        pytest.skip("native SM8X THD backward does not support packed LSE")
+    if ragged and cc[0] in (8, 12):
+        pytest.skip("native SM8X/SM12X THD backward does not support packed LSE")
     if deterministic and cc[0] == 10 and cudnn.backend_version() < 91800:
         pytest.skip("Blackwell deterministic backward requires cuDNN 9.18 or newer")
     value = 0.125 if scale == "tensor" else scale

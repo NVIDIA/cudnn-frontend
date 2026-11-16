@@ -53,8 +53,8 @@ def _backward_reference(data, ref, stats, scale, causal):
 @pytest.mark.parametrize("deterministic", [False, True], ids=["default", "deterministic"])
 @pytest.mark.parametrize("fill", [0.0, float("nan")], ids=["zero-init", "nan-init"])
 def test_backward_tail_plans_match_independent_oracle(geometry, dtype, scale, causal, deterministic, fill):
-    if geometry[3] > 128 and torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("native Ampere/Ada backward supports head dimensions up to 128")
+    if geometry[3] > 128 and torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("native SM8X/SM12X backward supports head dimensions up to 128")
     if geometry[3] == 256 and torch.cuda.get_device_capability()[0] == 10 and cudnn.backend_version() < 92300:
         pytest.skip("native Blackwell D256 backward requires cuDNN 9.23 or newer")
     if deterministic and torch.cuda.get_device_capability()[0] == 10 and cudnn.backend_version() < 91800:
