@@ -416,6 +416,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         # (cudnn.sdpa.bwd.heuristics), so the record pins the kernel.
         heuristics=("cudnn.sdpa.bwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+        backend_engine_guard=("cudnn.sdpa.bwd.backend_guard", "backend_engine_guard"),
     ),
     EngineFamily(
         FROST_CONV_ID_BASE,
