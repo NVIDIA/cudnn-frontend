@@ -11,7 +11,7 @@ import jax.numpy as jnp
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-from cudnn.jax import call, gemm_operand_spec, zeros_init
+from cudnn._jax import call, gemm_operand_spec, zeros_init
 from .cutedsl import jax_kernels as kernels
 
 

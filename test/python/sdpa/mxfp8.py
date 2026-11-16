@@ -1455,6 +1455,14 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
         graph_bwd.execute(variant_pack_bwd, workspace_bwd, handle=cudnn_handle)
         torch.cuda.synchronize()
 
+        # exact_equal permits matching NaNs, which cannot validate an amax output.
+        for name, actual, previous in (
+            ("dQ", dQ_amax_gpu, dQ_amax_gpu_rerun),
+            ("dK", dK_amax_gpu, dK_amax_gpu_rerun),
+            ("dV", dV_amax_gpu, dV_amax_gpu_rerun),
+        ):
+            assert torch.isfinite(actual).all() and torch.isfinite(previous).all(), f"{name} amax must be finite on both executions"
+
         determin_err_count = 0
         determin_err_count += exact_equal(dQ_gpu, dQ_gpu_rerun, tag="dQ_determin", disp_elems=request.config.getoption("--diffs"))
         determin_err_count += exact_equal(dK_gpu, dK_gpu_rerun, tag="dK_determin", disp_elems=request.config.getoption("--diffs"))

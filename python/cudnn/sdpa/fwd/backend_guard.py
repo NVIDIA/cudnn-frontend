@@ -57,7 +57,11 @@ from typing import Dict, Optional
 # version no contract may crash, and the per-contract record is printed under "measured" in the run's terminal summary
 # (the CI job log).  Record a version only after the whole matrix is clean on it, and leave the graphs the row serves
 # on the row: this constant lifts the GUARD, not the placement verdict (``placement._place_sm107_mxfp8``).
-SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = None
+#
+# Recorded: the 9.30.0.5 nightly runs the whole matrix clean through planning and building on cc 10.0, cc 10.3
+# (B300) and cc 10.7 (Rubin), 2026-11-12. Its earlier 9.30.0 nightlies (.2-.4) still crash and report the same 93000; only
+# those pre-release builds are uncovered.
+SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = 93000
 
 # The devices the crash is measured on.  cc 10.0 and 10.3 build the plan through the SM100 decode emitter and segfault in
 # it (emit_code_native_sdpa_decode_sm100, which has no MXFP8 scale-factor path) for a dense d128 graph on every build

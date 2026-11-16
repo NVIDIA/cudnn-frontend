@@ -19,29 +19,30 @@ from cudnn.engines import is_python_engine
 pytestmark = pytest.mark.L1
 
 
-def _frost_shape():
-    """(S, D) a FROST forward row serves on this device; the SM90 row serves d512 only."""
+def _frost_shapes():
+    """(S, D) per FROST forward flavor this device serves: on SM90 the D512 body and, at exact (128, 128), the dedicated
+    D128 template (#378), whose 128 x 128 plans lead there. Its one-tile NATURAL grid is the same (q_tiles, heads, b); a
+    persistent non-causal plan's grid is flat, but launch_grid_mismatch still declines the pinned NATURAL plan."""
     if not torch.cuda.is_available():
-        return None
+        return []
     major, minor = torch.cuda.get_device_capability(0)
     if (major, minor) == (9, 0):
-        return 64, 512
+        return [(64, 512), (64, 128)]
     if (major, minor) == (8, 0) or (major == 10 and minor <= 6):
-        return 128, 64
-    return None
+        return [(128, 64)]
+    return []
 
 
-if _frost_shape() is None:
+SHAPES = _frost_shapes()
+if not SHAPES:
     pytest.skip("needs an A100, H100 or SM100 device for the FROST forward rows", allow_module_level=True)
-S, D = _frost_shape()
-SCALE = 1.0 / math.sqrt(D)
 
 
-def _graph(b, h):
+def _graph(b, h, S, D):
     g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     stride = [S * h * D, D, h * D, 1]
     q, k, v = (g.tensor(name=n, dim=[b, h, S, D], stride=stride, data_type=cudnn.data_type.HALF) for n in "qkv")
-    o, _ = g.sdpa(q, k, v, is_inference=True, attn_scale=SCALE)
+    o, _ = g.sdpa(q, k, v, is_inference=True, attn_scale=1.0 / math.sqrt(D))
     o.set_output(True).set_data_type(cudnn.data_type.HALF).set_dim([b, h, S, D]).set_stride(stride)
     g.validate()
     g.build_operation_graph()
@@ -49,10 +50,11 @@ def _graph(b, h):
     return g, (q, k, v, o)
 
 
+@pytest.mark.parametrize("S,D", SHAPES, ids=[f"d{d}" for _, d in SHAPES])
 @pytest.mark.parametrize("b,h", [(65536, 1), (1, 65536)], ids=["batch", "heads"])
-def test_frost_forward_past_65535_runs_on_the_flat_grid(monkeypatch, b, h):
+def test_frost_forward_past_65535_runs_on_the_flat_grid(monkeypatch, b, h, S, D):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-    g, ports = _graph(b, h)
+    g, ports = _graph(b, h, S, D)
     frost = [i for i, plan in enumerate(g.plans) if is_python_engine(plan.engine_id)]
     if not frost:
         pytest.skip("no FROST forward row claims this graph here")
@@ -76,5 +78,5 @@ def test_frost_forward_past_65535_runs_on_the_flat_grid(monkeypatch, b, h):
     g.execute(dict(zip(ports, (q, k, v, o))), workspace)
     torch.cuda.synchronize()
     for bi, hi in ((0, 0), (b - 1, h - 1), (b // 2, h // 2)):
-        p = torch.softmax((q[bi, hi].double() @ k[bi, hi].double().T) * SCALE, dim=-1)
+        p = torch.softmax((q[bi, hi].double() @ k[bi, hi].double().T) / math.sqrt(D), dim=-1)
         torch.testing.assert_close(o[bi, hi].float(), (p @ v[bi, hi].double()).float(), atol=2e-3, rtol=1e-2)

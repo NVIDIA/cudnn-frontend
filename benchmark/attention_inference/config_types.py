@@ -132,6 +132,13 @@ class InferenceBenchmarkConfig:
     # Generation: per-request KV lengths drawn (seeded) from [fill * kv_len, kv_len], one case per entry; 1.0 = every
     # request at kv_len. Applies to the paged cudnn legs and flashinfer.
     kv_min_fills: List[float] = field(default_factory=lambda: [1.0])
+    # Serving prefill cases, one dict each (run in addition to the context_seqlens / context_chunked_shapes product): a batch
+    # of requests under a declared envelope -- batch_size, q_tokens and kv_len (the maxima), optional kv_min_fill / q_min_fill
+    # (per-request lengths drawn from [fill * max, max]) and page_size. Appended, defaulted.
+    context_cases: List[dict] = field(default_factory=list)
+    # cudnn paged prefill graphs: "exact" declares the batch's total query tokens (max_total_seq_len_q); "none" leaves it
+    # undeclared, as FlashInfer's paged prefill does. Appended, defaulted.
+    cudnn_context_total_q: str = "exact"
 
 
 @dataclass
@@ -168,6 +175,8 @@ class BenchmarkResult:
     kv_min_fill: float = 1.0
     attn_mask: str = "no_mask"  # the training suite's vocabulary: top_left / bottom_right / no_mask
     has_sink: bool = False
+    q_min_fill: float = 1.0
+    cudnn_total_q: Optional[str] = None  # cudnn paged prefill legs: "exact" / "none" (see cudnn_context_total_q)
 
 
 def attn_mask(phase: str, context_causal: bool, q_tokens: int, kv_len: int, sliding_window_size: Optional[int]) -> str:

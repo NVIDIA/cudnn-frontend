@@ -235,16 +235,19 @@ def gemm_ptx_partial_mxfp8(
     zero_init: bool | Boolean = False,
     kphase_offset: cutlass.Constexpr[int] = 0,
 ) -> None:
-    """Issue blockscaled MXFP8 or MXFP4 QK MMA with explicit scale TMEM operands.
+    """Issue blockscaled MXFP8, MXFP4 or NVFP4 QK MMA with explicit scale TMEM operands.
 
     The Indexer forward path uses K as operand A and packed Q as operand B, so
-    K scales are SFA and Q scales are SFB.  All of a row's E8M0 scales share one
-    TMEM column, and the instruction descriptor's scale factor id selects the
-    ones each MMA reads: ``kind::mxf8f6f4`` (K=32) reads one scale, at id
-    ``kphase``; ``kind::mxf4`` (packed E2M1, K=64) reads two, at id
-    ``2 * kphase``.  ``kphase_offset`` is the index of this chunk's first MMA
-    along K.  This helper has no inline mbarrier wait path; callers must pass
-    warp-uniform, fully populated SFA/SFB TMEM tensors for the current MMA.
+    K scales are SFA and Q scales are SFB.  A row's E8M0 scales (MXFP8 / MXFP4)
+    share one TMEM column, and the instruction descriptor's scale factor id
+    selects the ones each MMA reads: ``kind::mxf8f6f4`` (K=32) reads one scale,
+    at id ``kphase``; ``kind::mxf4`` (packed E2M1, K=64) reads two, at id
+    ``2 * kphase``.  ``kind::mxf4nvf4`` with 16-value blocks (NVFP4, packed
+    E2M1, K=64) reads four E4M3 scales, a whole column, so each MMA takes its
+    own SFA/SFB column (``tSFA[None, None, kphase]``) at id 0.
+    ``kphase_offset`` is the index of this chunk's first MMA along K.  This
+    helper has no inline mbarrier wait path; callers must pass warp-uniform,
+    fully populated SFA/SFB TMEM tensors for the current MMA.
     """
     sA_layout = sA.layout
     sB_layout = sB.layout
@@ -272,18 +275,26 @@ def gemm_ptx_partial_mxfp8(
     smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
     smem_desc_b_hi = const_expr(smem_desc_b_hi)
 
-    offset_a = [cute.crd2idx((0, 0, k), tCrA.layout) for k in range(cute.size(tCrA.shape[2]))]
+    num_k = cute.size(tCrA.shape[2])
+    offset_a = [cute.crd2idx((0, 0, k), tCrA.layout) for k in range(num_k)]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
-    # kind::mxf4 (packed E2M1, K=64) reads two E8M0 scales per row per MMA, kind::mxf8f6f4 (K=32) one.
-    is_mxf4 = isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4Op)
-    mma_kind = "kind::mxf4.block_scale.scale_vec::2X" if const_expr(is_mxf4) else "kind::mxf8f6f4.block_scale.scale_vec::1X"
-    sf_ids_per_mma = 2 if const_expr(is_mxf4) else 1
-    idescs = [const_expr(sm100_desc.blockscaled_mma_op_to_idesc(op, (k + kphase_offset) * sf_ids_per_mma)) for k in range(cute.size(tCrA.shape[2]))]
+    # Scales one MMA reads per row: kind::mxf8f6f4 (K=32) one E8M0, kind::mxf4 (packed E2M1, K=64) two E8M0,
+    # kind::mxf4nvf4 (packed E2M1 in 16-value blocks, K=64) four E4M3 -- a whole column, so one column per MMA.
+    scale_vec = sm100_desc.blockscaled_scale_vec(op)
+    mma_kind = {
+        1: "kind::mxf8f6f4.block_scale.scale_vec::1X",
+        2: "kind::mxf4.block_scale.scale_vec::2X",
+        4: "kind::mxf4nvf4.block_scale.scale_vec::4X",
+    }[scale_vec]
+    sf_column_per_mma = scale_vec == 4
+    sf_ids = [0 if const_expr(sf_column_per_mma) else (k + kphase_offset) * scale_vec for k in range(num_k)]
+    idescs = [const_expr(sm100_desc.blockscaled_mma_op_to_idesc(op, sf_ids[k])) for k in range(num_k)]
 
     smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator))
     smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
-    tmem_sfa = tSFA[None, None, kphase_offset].iterator.toint()
-    tmem_sfb = tSFB[None, None, kphase_offset].iterator.toint()
+    # SFA/SFB TMEM addresses, operands $4/$5 for the first MMA and, with a column per MMA, $6/$7, ... for the rest.
+    sf_kphases = [k + kphase_offset for k in range(num_k)] if const_expr(sf_column_per_mma) else [kphase_offset]
+    sf_operands = [Int32(cute.arch.make_warp_uniform(tsf[None, None, kp].iterator.toint())).ir_value() for kp in sf_kphases for tsf in (tSFA, tSFB)]
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
 
     llvm.inline_asm(
@@ -293,8 +304,7 @@ def gemm_ptx_partial_mxfp8(
             Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
             Int32(not zero_init).ir_value(),
             Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(tmem_sfa)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(tmem_sfb)).ir_value(),
+            *sf_operands,
         ],
         "{\n\t"
         ".reg .pred leader_thread;\n\t"
@@ -325,14 +335,15 @@ def gemm_ptx_partial_mxfp8(
                 f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
                 f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                 f"mov.b32 idesc, {hex(idescs[k])};\n\t"
-                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
-                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                + (f"mov.b32 tmem_sfa, ${4 + 2 * k};\n\t" f"mov.b32 tmem_sfb, ${5 + 2 * k};\n\t" if sf_column_per_mma else "")
+                + "mov.b64 smem_desc_a, {smem_desc_a_lo, smem_desc_a_hi};\n\t"
+                "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
                 f"@leader_thread tcgen05.mma.cta_group::1.{mma_kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
             )
-            for k in range(1, cute.size(tCrA.shape[2]))
+            for k in range(1, num_k)
         )
         + "}\n",
-        "r,r,r,r,r,r",
+        ",".join(["r"] * (4 + len(sf_operands))),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

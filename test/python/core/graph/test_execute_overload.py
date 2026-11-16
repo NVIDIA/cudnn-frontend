@@ -9,7 +9,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.engines.engine_ids import is_backend_engine
+from cudnn.engines.engine_ids import FAMILY_BLOCK, FROST_SDPA_FWD_ID_BASE, is_backend_engine
 
 _B, _HQ, _HK, _D = 2, 4, 2, 128
 _Q, _KV = 32, 64
@@ -76,7 +76,7 @@ def _select_provider(graph, provider):
     for index, config in enumerate(graph.plans):
         if provider == "backend" and is_backend_engine(config.engine_id):
             candidates.append(index)
-        elif provider == "frost" and graph.get_plan_name_at_index(index).startswith("sdpa_fwd_prefill_sm100"):
+        elif provider == "frost" and FROST_SDPA_FWD_ID_BASE <= config.engine_id < FROST_SDPA_FWD_ID_BASE + FAMILY_BLOCK:
             candidates.append(index)
     for index in candidates:
         graph.select_plan(index)
@@ -86,6 +86,8 @@ def _select_provider(graph, provider):
             continue
         assert (graph.selected_engine is None) == (provider == "backend")
         return index
+    if provider == "frost":
+        pytest.fail("No FROST plan built for the supported ordered-binding fixture")
     pytest.skip(f"No {provider} plan supports the representative attention graph")
 
 
@@ -150,6 +152,13 @@ def _assert_result(buffers, q_len=_Q, kv_len=_KV):
         expected_lse = logits.logsumexp(-1).transpose(0, 1)
         torch.testing.assert_close(buffers["o"][batch * q_len : (batch + 1) * q_len].double(), expected_o, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(buffers["lse"][batch * q_len : (batch + 1) * q_len].double(), expected_lse, atol=2e-3, rtol=2e-3)
+
+
+@pytest.fixture(autouse=True)
+def _provider_test_opt_in(monkeypatch):
+    # These tests explicitly choose a provider, including when switching plans
+    # on one graph. Keep coverage independent of default admission and names.
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
 
 
 @pytest.fixture(autouse=True)

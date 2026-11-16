@@ -192,11 +192,16 @@ def _gpu_arch():
 
 
 def _case(*, fp8=False, layout="bsh", arch=None):
-    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, engine_name
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
     from frost_test_utils import select_engine
 
     arch = arch or _gpu_arch()
-    row = next(row for row in ENGINE_SPECS if row.name == engine_name(arch=arch, fp8=fp8))
+    owner = {
+        "sm100": "sdpa_fwd_sm100_d128_fp8_multi_q" if fp8 else "sdpa_fwd_sm100_d128_multi_q",
+        "sm107": "sdpa_fwd_sm107_d128_fp8_multi_q" if fp8 else "sdpa_fwd_sm107_d128_multi_q",
+        "sm120": "sdpa_fwd_sm120_fp8_general" if fp8 else "sdpa_fwd_sm120_f16_general",
+    }[arch]
+    row = next(row for row in ENGINE_SPECS if row.name == owner)
     if not row.capabilities.thd_padded_stats:
         pytest.skip(f"{row.name} currently requires packed THD Stats")
     b, h, hk, sq, sk, d = 2, 8 if layout == "product" else 4, 2, 64, 96, 128
@@ -256,7 +261,7 @@ def _case(*, fp8=False, layout="bsh", arch=None):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name(arch=arch, fp8=fp8), pack_gqa=False)
+    select_engine(g, owner, pack_gqa=False)
     g.check_support()
     g.build_plans()
     ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)

@@ -55,20 +55,20 @@ def compile_plan(api):
     window = 0 if api.window_size_left is None else api.window_size_left + 1
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.
     if api._implementation == ACCUMULATION:
-        from .kernels.sm100.prepared_d128_host import compile_host_accum
+        from .kernels.sm100.d128_f16_accum.prepared_host import compile_host_accum
 
         regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
         with torch.cuda.device(device):
             entry = compile_host_accum(tuple(geometry), regions, dtype, api.is_causal, sm, window)
     elif api._implementation == PAIR:
-        from .kernels.sm100.prepared_d128_host import compile_host_pair
+        from .kernels.sm100.d128_f16_pair.prepared_host import compile_host_pair
 
         split = api._pair_split
         regions, required = pair_workspace_layout(api.batch_size, api.h_q, api.s_q_max, split, api.h_kv, api.s_k_max, api.head_dim_qk)
         with torch.cuda.device(device):
             entry = compile_host_pair(tuple(geometry), regions, dtype, api.is_causal, sm, window, api.h_q // api.h_kv, split)
     else:
-        from .kernels.sm100.prepared_d128_host import compile_host_recompute
+        from .kernels.sm100.d128_f16_recompute.prepared_host import compile_host_recompute
 
         with torch.cuda.device(device):
             entry = compile_host_recompute(tuple(geometry), dtype, api.is_causal, sm, window)
@@ -86,7 +86,7 @@ def compile_plan(api):
         required,
         device,
         api.scale_softmax,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         roles=ROLES[:9],
         attributes=ATTRIBUTES[:9],
         scale_log2=False,

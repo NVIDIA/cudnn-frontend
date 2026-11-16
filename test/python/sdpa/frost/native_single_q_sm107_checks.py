@@ -12,7 +12,7 @@ def _verify_plan(graph):
 
     plan = graph._compiled_plans[graph._plan_index]
     module = plan._compiled.kernel_module
-    assert module.__file__.endswith("sm107/prefill_d256_f16.py")
+    assert module.__file__.endswith("sm107/d256_f16_lookahead/kernel.py")
     assert module.CFG.TILE_K == module.CFG.TILE_O == 128
     assert module.CFG.TILES_Q == module.CFG.SOFTMAX_WARPGROUPS == 1
     assert module.CFG.THREADS_PER_CTA == 384 and module.CFG.CTA_MMA == 1
@@ -55,7 +55,7 @@ def test_one_q_origins(dtype_name, stats_layout, policy, total_hints, monkeypatc
     monkeypatch.setattr(cudnn.pygraph, "create_execution_plan", select)
     monkeypatch.setattr(cudnn.pygraph, "build_plans", verify)
     monkeypatch.setattr(cudnn.pygraph, "execute", execute_without_sync)
-    run(128, dtype_name, stats_layout, total_hints, False, 1, engine_name="sdpa_fwd_prefill_sm107", cga=1)
+    run(128, dtype_name, stats_layout, total_hints, False, 1, engine_name="sdpa_fwd_sm107_d256_lookahead", cga=1)
     assert checked
 
 
@@ -73,7 +73,7 @@ def test_one_q_public_identity_and_domain(monkeypatch):
 
     _fake_cc(monkeypatch, (10, 7))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d256_lookahead")
     facts = _f16_facts(thd=True, padded=True)
     knobs = SdpaFwdKnobs(cga=1, warp_spec_cfg=1)
     assert engines.mismatch(caps, facts, knobs) is None
@@ -175,7 +175,7 @@ def test_one_q_forced_rescale(dtype_name, bottom_right, window_left, window_righ
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plan(
-        family_for(graph).offered_ids()["sdpa_fwd_prefill_sm107"],
+        family_for(graph).offered_ids()["sdpa_fwd_sm107_d256_lookahead"],
         {cudnn.knob_type.WARP_SPEC_CFG: 1, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SCHED_POLICY: policy},
     )
     graph.select_plan(0)

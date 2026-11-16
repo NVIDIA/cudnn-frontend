@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The additive attention bias and the per-key boolean mask on the Rubin (SM107) f16/bf16 small head-dim tiles -- the RESIDENT
-row-block arm of ``sm107/prefill_d128_f16.py`` (``TemplateParams.bias_mode = 1`` / ``kv_mask_form = 1``).
+row-block arm of ``sm107/d128_f16_multi_q/kernel.py`` (``TemplateParams.bias_mode = 1`` / ``kv_mask_form = 1``).
 
 One work item (a CTA's ``TILES_Q x TILE_M = 256`` query rows of one (batch, head)) loads its bias rows x its whole KV range into
 SMEM ONCE (the TMA-LDG warp, after the item's Q / K / V prologue loads; one ``expect_tx`` for the FULL boxes of every tile), and
@@ -45,7 +45,8 @@ from frost_test_utils import assert_no_new_spills, make_dense_stats, requires_ds
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
+_ROWS = (_ROW, "sdpa_fwd_sm107_d128_multi_q", "sdpa_fwd_sm107_small_batch_pair", "sdpa_fwd_sm107_shared_single_q")
+_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "d128_f16_multi_q" / "kernel.py"
 _RENDERINGS = Path(__file__).resolve().parent / "renderings"
 # (head-dim tile, cga) -> the resident block's S_kv budget, DERIVED by config_sm107 from the carveout (pinned here as the
 # numbers the row and the adapter must agree on).
@@ -99,10 +100,21 @@ def _mask_kw(b=2, s_kv=256, dt=None):
     return dict(has_kv_mask=True, kv_mask_t=_IrTensor(dt), kv_mask_dim=(b, 1, 1, s_kv), kv_mask_stride=(s_kv, s_kv, s_kv, 1), kv_mask_dtype=dt)
 
 
-def _caps():
+def _owner(facts=None, knobs=None):
+    from cudnn.sdpa.fwd import engines, heuristics
+    from cudnn.sdpa.fwd.kernels.sm107.small_half_contract import in_domain
+
+    if facts is None:
+        return "sdpa_fwd_sm107_d128_multi_q"
+    if not in_domain(facts):
+        return _ROW
+    return heuristics.select_sm107_half_geometry(facts, knobs or engines.SdpaFwdKnobs()).implementation
+
+
+def _caps(facts=None, knobs=None):
     from cudnn.sdpa.fwd import engines
 
-    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[_ROW]
+    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[_owner(facts, knobs)]
 
 
 def test_row_claims_the_bias_on_the_derived_shapes_and_budgets():
@@ -217,9 +229,9 @@ def test_row_accepts_and_declines_the_bias_and_kv_mask(name, fkw, kkw, accept):
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-    caps = _caps()
     f = _facts(**_resolve_dtypes(fkw))
     knobs = SdpaFwdKnobs(**kkw) if kkw else None
+    caps = _caps(f, knobs)
     why = engines.mismatch(caps, f, knobs)
     assert (why is None) == accept, (name, why)
     if accept and (f.has_bias or f.has_kv_mask):
@@ -235,7 +247,7 @@ def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
     block: it keeps the tile's own width (cga1) at every S_kv."""
     from cudnn.sdpa.fwd.heuristics import recommend
 
-    offered = {_ROW: 20599}
+    offered = {name: 20590 + i for i, name in enumerate(_ROWS)}
     for fkw, want in (
         (dict(d_qk=64, d_v=64, **_bias_kw(b=2)), {2}),
         (dict(d_qk=64, d_v=64, **_bias_kw()), {1}),
@@ -747,7 +759,7 @@ def _build(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len
 
 def _frost_plans(g):
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    return names, [i for i, n in enumerate(names) if n == _ROW or n.startswith(_ROW + "[")]
+    return names, [i for i, n in enumerate(names) if any(n == row or n.startswith(row + "[") for row in _ROWS)]
 
 
 def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None, tile_n=None):
@@ -774,6 +786,14 @@ def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_k
             record[cudnn.knob_type.TILE_CGA_M] = want_cga
         if want_tile_n != picked_tile_n:
             record[cudnn.knob_type.TILE_N] = want_tile_n
+        # A requested width can cross the ordinary/batch-pair boundary. Select
+        # the implementation before creating the record; its host stays fixed.
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.graph_analyzer import analyze
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        owner = _owner(analyze(g), SdpaFwdKnobs.from_public(record))
+        engine_id = family_for(g).offered_ids(g)[owner]
         g.create_execution_plan(engine_id, record)
         idx = g.get_execution_plan_count() - 1
         picked_cga, picked_tile_n = want_cga, want_tile_n
@@ -1017,7 +1037,7 @@ def test_signed_attn_scale_keeps_the_additive_arms_sign(sign, form):
     _check_signed_scale(_run(q, k, v, **kw), ref)
 
 
-_D128_HOST_FILES = {"sm100": _KERNEL.parents[1] / "sm100" / "prefill_d128_f16.py", "sm107": _KERNEL}
+_D128_HOST_FILES = {"sm100": _KERNEL.parents[2] / "sm100" / "d128_f16_multi_q" / "kernel.py", "sm107": _KERNEL}
 
 
 def _dense_plan_stand_in(kernel_file, *, scale):

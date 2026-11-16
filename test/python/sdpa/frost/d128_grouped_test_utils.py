@@ -284,7 +284,7 @@ def adapter_arguments(case):
     return args
 
 
-def make_graph(case):
+def make_graph(case, engine_name="sdpa_bwd_sm100_d128_accumulation", engine_id=20630, record=None):
     import cudnn
     from frost_test_utils import select_engine
 
@@ -336,15 +336,24 @@ def make_graph(case):
         attach_offsets(role, tensor)
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_bwd_sm100_d128")
+    if record is None:
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(graph, engine_name)
+    else:
+        graph.create_execution_plan(*record)
+        graph.select_plan(0)
     engine, _ = graph.get_engine_and_knobs_at_index(graph._plan_index)
-    assert engine == 20609, engine
+    assert engine == engine_id, engine
     graph.check_support()
     graph.build_plans()
     spec = graph._compiled_plans[graph._plan_index]._prepared.spec
     assert spec.native is not None
-    assert spec.artifact.implementation == implementation(case)
+    expected = implementation(case)
+    if engine_id == 20631:
+        from cudnn.sdpa.bwd.d128_grouped_2cta_contract import IMPLEMENTATIONS
+
+        expected = IMPLEMENTATIONS["thd" if case.thd else "dense"]
+    assert spec.artifact.implementation == expected
     return graph, refs
 
 

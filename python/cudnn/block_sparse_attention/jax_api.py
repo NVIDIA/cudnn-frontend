@@ -17,7 +17,7 @@ if requirement_error:
     raise ImportError(requirement_error)
 
 from cudnn.api_base import TupleDict
-from cudnn.jax import TensorSpec, call, zeros_init
+from cudnn._jax import TensorSpec, call, zeros_init
 from .jax_kernels import Forward, Backward
 
 

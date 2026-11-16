@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native d128 THD MHA: ragged storage, CPU FP64 numerics and prepared replay.
 
-Graph tests strictly pin engine 20609. The standalone smoke exercises the same
+Graph tests strictly pin one-CTA engine 20630. The standalone smoke exercises the same
 native adapter before graph capability admission; no test patches capabilities.
 These tests make no GQA/MQA support or performance claim.
 """

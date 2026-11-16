@@ -18,8 +18,18 @@ pytestmark = pytest.mark.L0
 
 _REPO = Path(__file__).resolve().parents[3]
 _PKG_ROOT = _REPO / "python"
-# Not package data: sources, their bytecode, docs, and the extension built in place.
+# Not package data: sources, bytecode, docs, development metadata, and the
+# extension built in place.
 _NOT_DATA = {".py", ".pyc", ".md", ".so", ".pyd"}
+_NOT_DATA_NAMES = {
+    ".gitignore",
+    ".clang-format",
+    "VENDORED_MHC.json",
+    "VENDORED_GQA.json",
+    "VENDORED_DSA_INDEXER.json",
+    "VENDORED_DSA_SPARSE.json",
+    "VENDORED_DSA_DET.json",
+}
 
 
 def _package_data():
@@ -42,6 +52,10 @@ def test_every_runtime_data_file_is_package_data():
         package_dir = _PKG_ROOT / package.replace(".", "/")
         for pattern in patterns:
             covered.update(p.resolve() for p in package_dir.glob(pattern) if p.is_file())
-    shipped = [p.resolve() for p in (_PKG_ROOT / "cudnn").rglob("*") if p.is_file() and p.suffix not in _NOT_DATA and "__pycache__" not in p.parts]
+    shipped = [
+        p.resolve()
+        for p in (_PKG_ROOT / "cudnn").rglob("*")
+        if p.is_file() and p.suffix not in _NOT_DATA and p.name not in _NOT_DATA_NAMES and "__pycache__" not in p.parts
+    ]
     missing = sorted(str(p.relative_to(_PKG_ROOT)) for p in shipped if p not in covered)
     assert not missing, f"add these to [tool.setuptools.package-data] in pyproject.toml: {missing}"

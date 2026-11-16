@@ -75,13 +75,26 @@ def test_paged_thd_origins_rebind_and_capture(
     if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
         pytest.skip(reason)
     native_rubin_shape = (dim in (64, 128) and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
-    if rubin and (not native_rubin_shape or splits != 1):
-        pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2, unsplit")
-    engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
-    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+    native_rubin_split = dim == 64 and cga == 1 and splits > 1
+    if rubin and not ((native_rubin_shape and splits == 1) or native_rubin_split):
+        pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2 unsplit, or D64 CGA1 split")
+    engine = "sdpa_fwd_sm107_d128_multi_q" if rubin else "sdpa_fwd_prefill_sm100"
+    if dim != 64 and cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    if not rubin and (d_qk, d_v) == (256, 256):
+        engine = "sdpa_fwd_sm100_d256_lookahead"
+    elif not rubin and (d_qk, d_v) == (192, 128):
+        engine = "sdpa_fwd_sm100_d192_multi_q"
+    elif not rubin and (d_qk, d_v) == (576, 512):
+        engine = "sdpa_fwd_sm100_d512_2x2"
+    elif not rubin and d_qk == d_v and d_qk in (32, 64, 128):
+        engine = (
+            "sdpa_fwd_sm100_d128_single_q"
+            if cga == 1 and (splits > 1 or single_q or (d_qk <= 64 and q_bound is not None and q_bound <= 128 and not pack_gqa))
+            else "sdpa_fwd_sm100_d128_multi_q"
+        )
     batch, heads, kv_heads, maximum, page, kv_max = (
         2,
         (24 if d_qk in (192, 576) else 16),
@@ -249,6 +262,14 @@ def test_paged_thd_origins_rebind_and_capture(
             knobs[cudnn.knob_type.TILE_N] = tile_n
         if sched_policy is not None:
             knobs[cudnn.knob_type.SCHED_POLICY] = sched_policy
+        if rubin:
+            from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+            from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+            from cudnn.sdpa.graph_analyzer import analyze
+
+            requested = SdpaFwdKnobs.from_public(knobs)
+            geometry = select_sm107_half_geometry(analyze(graph), requested)
+            engine, knobs = geometry.implementation, geometry.canonical_knobs(requested).to_public()
         graph.create_execution_plan(family_for(graph).offered_ids()[engine], knobs)
         graph.select_plan(0)
     graph.check_support()
@@ -256,7 +277,7 @@ def test_paged_thd_origins_rebind_and_capture(
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
     if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
         plan = graph._compiled_plans[graph._plan_index]
-        decode_tile = splits > 1 or (cga != 2 and maximum * (heads // kv_heads if pack_gqa else 1) <= 128)
+        decode_tile = splits > 1 or (cga != 2 and not pack_gqa and maximum <= 128)
         expected_template = ("decode_d128_f16" if decode_tile else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
         assert plan._compiled.kernel_template == expected_template
         assert plan._prepared.spec.native is not None
@@ -265,12 +286,20 @@ def test_paged_thd_origins_rebind_and_capture(
         import inspect
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
-        assert api._k_mod.__file__.endswith("sm107/prefill_d256_f16.py" if single_q else "sm107/prefill_d128_f16.py")
-        assert api._k_mod.CFG.STAGES_KV == (4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
+        expected_template = (
+            "sm100/d128_f16_single_q/kernel.py"
+            if native_rubin_split
+            else "sm107/d256_f16_lookahead/kernel.py" if single_q else "sm107/d128_f16_multi_q/kernel.py"
+        )
+        assert api._k_mod.__file__.endswith(expected_template)
+        assert api._k_mod.CFG.STAGES_KV == (3 if native_rubin_split else 4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
         if tile_n is not None:
             assert api._k_mod.CFG.TILE_N == tile_n
-            if single_q:
+            if native_rubin_split:
+                assert api._k_mod.CFG.S_SLOTS == 1 and api._k_mod.CFG.TILES_Q == 1
+                assert api._k_mod._FP32_PARTIALS and api._k_mod.SPLIT_KV == splits
+            elif single_q:
                 assert api._k_mod.PARAMS.s_slots == 2 and api._k_mod.CFG.TILES_Q == 1
             else:
                 assert api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)

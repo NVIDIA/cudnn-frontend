@@ -34,7 +34,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine, sm120_owner
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
 
@@ -285,13 +285,13 @@ def _run(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if quantized_qkv is None:
-        chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+        chosen = _select_engine(g, sm120_owner(engine_name(arch="sm120", fp8=True), D, D_v), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
     else:
         # Kernel qualification holds the plan fixed independently of ranked offerings.
         from cudnn.engines.manifest import family_for
 
         g.create_execution_plan(
-            family_for(g).offered_ids()[engine_name(arch="sm120", fp8=True)],
+            family_for(g).offered_ids()[sm120_owner(engine_name(arch="sm120", fp8=True), D, D_v)],
             {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
         )
         g.select_plan(len(g.plans) - 1)
@@ -951,7 +951,7 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, D_v=None, sink=False, layo
         # The op itself may refuse the shape before any engine is consulted;
         # for "this cell must not claim it" that is the same answer.
         return False
-    return offers_engine(g, engine_name(arch="sm120", fp8=True))
+    return offers_engine(g, sm120_owner(engine_name(arch="sm120", fp8=True), D, D_v))
 
 
 @pytest.mark.L0
@@ -1096,7 +1096,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     if mask == "padded":
         kw["seq_kv_lens_present"] = True
         seq_kv_lens = [S, S - 73]  # batch 1 ends inside a KV tile at an odd offset
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm120/prefill_fp8.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm120/fp8_general/kernel.py")
     module = load_template(path, TemplateParams(**kw), tag=f"fp8_tail_d{D}_d{D_v}_{mask}")
     fn = module.compile(compute_capability=torch.cuda.get_device_capability(), b=B, qh=H, kh=H, sq=S, skv=S, d_qk=D, d_v=D_v, has_lse=False)
 
@@ -1143,6 +1143,8 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         one.data_ptr(),
         one.data_ptr(),
         amax_o.data_ptr(),
+        None,
+        None,
         None,
         cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
     )
@@ -1464,7 +1466,7 @@ def _run_thd_fp8(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True))
+    _select_engine(g, sm120_owner(engine_name(arch="sm120", fp8=True), D, D))
     g.check_support()
     g.build_plans()
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))

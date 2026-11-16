@@ -276,6 +276,99 @@ def paged_host(
 
 
 @cute.jit
+def bias_host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int64,
+    scale_softmax: cutlass.Float32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    n_thd_units: cutlass.Int32,
+    kernel: cutlass.Constexpr,
+    qh: cutlass.Constexpr[int],
+    kh: cutlass.Constexpr[int],
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    persistent_ctas: cutlass.Constexpr[int],
+    thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_ptrs: cutlass.Constexpr,
+    thd_origin_caps: cutlass.Constexpr,
+    thd_origin_specs: cutlass.Constexpr,
+    bias_ptr: cute.Pointer,
+    bias_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    bias_extents: Tuple[cutlass.Int32, cutlass.Int32],
+    stream: cuda_driver.CUstream,
+):
+    q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        seq_q_lens_addr,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        n_thd_units,
+        kernel,
+        qh,
+        kh,
+        d_qk,
+        d_v,
+        persistent_ctas,
+        thd_max_sq,
+        thd_origin_caps,
+    )
+    b, _, _, sq, skv, _ = problem_size
+    bias = cute.make_tensor(bias_ptr, cute.make_layout((*bias_extents, sq, skv), stride=(*bias_strides, cutlass.Int64(1))))
+    kernel(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        sinks,
+        q_lens,
+        kv_lens,
+        # The bias arm forms natural-unit logits; never pre-scale this value
+        # by log2(e), which can overflow for a finite attention scale.
+        cutlass.Float32(1.4426950408889634),
+        cutlass.Int32(thd_max_sq),
+        thd_q_lens,
+        thd_kv_lens,
+        thd_lens_form,
+        n_ctas,
+        stream,
+        prepared=True,
+        bias=bias,
+        score_scale=cute.math.abs(scale_softmax),
+    )
+
+
+@cute.jit
 def fp8_host(
     q_ptr: cute.Pointer,
     k_ptr: cute.Pointer,
@@ -413,6 +506,7 @@ def compile_host(
     sfo_geometry=None,
     kv_dtype=None,
     thd_origin_specs=None,
+    bias_dtype=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -424,9 +518,11 @@ def compile_host(
         return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
     fp8 = output_dtype is not None
+    if bias_dtype is not None and (fp8 or getattr(kernel, "page_size", 0) or thd_origin_specs is not None):
+        raise NotImplementedError("SM120 additive bias requires dense unpaged FP16/BF16 without THD origins")
     strides = (cutlass.Int64(0),) * 3
     return compile_cached(
-        fp8_host if fp8 else (paged_host if getattr(kernel, "page_size", 0) else host),
+        fp8_host if fp8 else (bias_host if bias_dtype is not None else (paged_host if getattr(kernel, "page_size", 0) else host)),
         ptr(dtype),
         ptr(dtype if kv_dtype is None else kv_dtype),
         ptr(dtype if kv_dtype is None else kv_dtype),
@@ -479,6 +575,7 @@ def compile_host(
         ),
         (cutlass.Int64(0),) * 5 if thd_origin_specs is not None else None,
         thd_origin_specs,
+        *((ptr(bias_dtype), strides, (cutlass.Int32(0), cutlass.Int32(0))) if bias_dtype is not None else ()),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

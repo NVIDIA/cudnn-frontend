@@ -11,7 +11,8 @@ import torch
 
 from frost_test_utils import _SM, requires_dsl
 
-ENGINE, ENGINE_ID = "sdpa_bwd_sm89", 20619
+ENGINE, ENGINE_ID = "sdpa_bwd_sm89", 20635
+D64_ENGINE, D64_ENGINE_ID = "sdpa_bwd_sm89_f16_d64", 20636
 _ON_SM89 = pytest.mark.skipif(_SM != 89, reason="requires SM89")
 _GPU = [requires_dsl, _ON_SM89]
 
@@ -23,18 +24,32 @@ def _spec(name):
 
 
 @pytest.mark.L0
-def test_row_is_the_sm80_claim_on_cc_8_9_only():
+@pytest.mark.parametrize("name,engine_id", [(ENGINE, ENGINE_ID), (D64_ENGINE, D64_ENGINE_ID)])
+def test_rows_preserve_the_sm80_domain_with_fixed_ada_owners(name, engine_id):
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
 
-    sm80, sm89 = _spec("sdpa_bwd_sm80").capabilities, _spec(ENGINE).capabilities
+    sm80, sm89 = _spec("sdpa_bwd_sm80").capabilities, _spec(name).capabilities
     assert (sm89.sm_lo, sm89.sm_hi) == (89, 89)
-    assert {f: getattr(sm89, f) for f in sm89.__dataclass_fields__ if f not in ("sm_lo", "sm_hi")} == {
-        f: getattr(sm80, f) for f in sm80.__dataclass_fields__ if f not in ("sm_lo", "sm_hi")
+    ownership = {"sm_lo", "sm_hi", "implementation", "select_implementation", "delegated"}
+    assert {f: getattr(sm89, f) for f in sm89.__dataclass_fields__ if f not in ownership} == {
+        f: getattr(sm80, f) for f in sm80.__dataclass_fields__ if f not in ownership
     }
-    family = next(f for f in MANIFEST if ENGINE in f.slots)
-    assert family.offered_ids()[ENGINE] == ENGINE_ID
-    assert ENGINE in TRAIL_ONLY_ROWS
+    assert sm89.implementation == name and not sm89.delegated
+    family = next(f for f in MANIFEST if name in f.slots)
+    assert family.offered_ids()[name] == engine_id
+    assert _spec(name).policy in TRAIL_ONLY_ROWS
+
+
+@pytest.mark.L0
+@_ON_SM89
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sq,skv", [(64, 128), (128, 256)])
+def test_fixed_d64_owner_rebind_replay(dtype, sq, skv):
+    from test_sdpa_bwd_prepared_sm80 import _case, _check
+
+    _check(_case(64, hk=4, dtype=dtype, causal=False, layout="bshd", sq=sq, skv=skv, engine=D64_ENGINE))
 
 
 @pytest.mark.L0

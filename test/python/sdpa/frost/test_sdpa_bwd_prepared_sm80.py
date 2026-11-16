@@ -9,7 +9,7 @@ import cudnn
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, select_engine
+from frost_test_utils import SM80_BWD_OWNERS, requires_dsl, select_engine
 from sdpa.frost.test_sdpa_bwd_dsl_sm120 import _ref_bwd
 
 pytestmark = [requires_dsl, pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0), reason="requires SM80")]
@@ -89,7 +89,7 @@ def _case(
     padding=None,
     bias_batch=1,
     scale=None,
-    engine="sdpa_bwd_sm80",
+    engine=SM80_BWD_OWNERS,
 ):
     dv = d if dv is None else dv
     scale = d**-0.5 if scale is None else scale

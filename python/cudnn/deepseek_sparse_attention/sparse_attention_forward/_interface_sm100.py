@@ -89,16 +89,21 @@ def _launch_context(device: torch.device, stream):
 # tensors: it does the work of 128 heads, and the second launch rewrites heads
 # [32, 64). The kernel takes its rescale decision per 32-head warp, so windows
 # that start at multiples of 32 give those heads the same group, and the
-# second launch writes the bytes the first one wrote.
-_HEAD64_WINDOW_STARTS = {64: (0,), 96: (0, 32)}
+# second launch writes the bytes the first one wrote. H128 shapes that the
+# dedicated H128 kernel does not serve (D576, and D512 with indexer_topk=2048)
+# launch it on the disjoint windows [0, 64) and [64, 128).
+_HEAD64_WINDOW_STARTS = {64: (0,), 96: (0, 32), 128: (0, 64)}
 _HEAD64_KERNEL_HEADS = 64
+_HEAD64_INDEXER_TOPKS = (0, 512, 1024, 2048)
+# indexer_topk values of the dedicated H128 D512 small-top-k kernel.
+_HEAD128_SMALL_TOPK_INDEXER_TOPKS = (0, 512, 1024)
 
 
-def _kernel_variant(num_heads: int, head_dim: int) -> str:
+def _kernel_variant(num_heads: int, head_dim: int, indexer_topk: int = 0) -> str:
+    if num_heads == 128 and head_dim == 512 and indexer_topk in _HEAD128_SMALL_TOPK_INDEXER_TOPKS:
+        return "head128_small_topk_prefill"
     if num_heads in _HEAD64_WINDOW_STARTS and head_dim in (512, 576):
         return "head64_regular"
-    if num_heads == 128 and head_dim == 512:
-        return "head128_small_topk_prefill"
     raise ValueError(f"Unsupported SparseAttentionForward variant H={num_heads}, D_qk={head_dim}")
 
 
@@ -271,8 +276,8 @@ def _normalize_and_validate(
         raise ValueError(f"KV head dimension ({kv.shape[1]}) must match Q ({head_dim})")
     if topk_idxs.shape[0] != total_s_q:
         raise ValueError(f"topk_idxs first dimension ({topk_idxs.shape[0]}) must match Q ({total_s_q})")
-    variant = _kernel_variant(num_heads, head_dim)
-    valid_indexer = (0, 512, 1024, 2048) if variant == "head64_regular" else (0, 512, 1024)
+    variant = _kernel_variant(num_heads, head_dim, indexer_topk)
+    valid_indexer = _HEAD64_INDEXER_TOPKS if variant == "head64_regular" else _HEAD128_SMALL_TOPK_INDEXER_TOPKS
     if indexer_topk not in valid_indexer:
         raise ValueError(f"indexer_topk={indexer_topk} is unsupported for H={num_heads}; expected one of {valid_indexer}")
     logical_topk = topk_idxs.shape[1]
@@ -389,7 +394,8 @@ def sparse_attention_forward_sm100(
         # ``to_cute_tensor`` makes the sequence/top-k extents and their
         # normalized layouts runtime-dynamic.  Cache only properties that
         # change the generated kernel or its optional-argument signature.
-        # H64 and H96 share one compiled H64 kernel; H96 launches it per window.
+        # H64, H96 and the windowed H128 shapes share one compiled H64 kernel,
+        # launched once per window.
         if variant == "head64_regular":
             kernel_heads, window_starts = _HEAD64_KERNEL_HEADS, _HEAD64_WINDOW_STARTS[num_heads]
         else:

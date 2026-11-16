@@ -329,7 +329,16 @@ def compile_plan(api, main, mm_dk, mm_dq):
         symbol=f"frost_{api._NAME}_prepared",
     )
     return _spec(
-        api, entry, operands, offset, api._NAME, ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,), native_binding=True
+        api,
+        entry,
+        operands,
+        offset,
+        getattr(api, "_BINDING_NAME", api._NAME),
+        ROLES_F16,
+        ATTRIBUTES_F16,
+        scale_log2=False,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        native_binding=True,
     )
 
 
@@ -479,7 +488,7 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
         entry,
         operands,
         offset,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         ROLES_F16_THD + (RAGGED_ROLES if origins else ()),
         ATTRIBUTES_F16_THD + (RAGGED_ROLES if origins else ()),
         scale_log2=False,

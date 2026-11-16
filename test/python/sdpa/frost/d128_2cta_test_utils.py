@@ -19,7 +19,7 @@ from frost_test_utils import ptx_kernel_md5s
 from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 
 _ADAPTER_MODULE = "cudnn.sdpa.bwd.api_dsl_sm100_d128_2cta"
-_HOST_MODULE = "cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host"
+_HOST_MODULE = "cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host"
 _IMPLEMENTATION = "accumulation_grouped_thd_2cta"
 _IMPLEMENTATIONS = {True: _IMPLEMENTATION, False: "accumulation_grouped_dense_2cta"}  # by the case's layout: packed | the dense compact-BSHD twin
 RECORD_ARCH = "sm_100a"  # the arch every committed rendering record is pinned on (frost_test_utils.read_kernel_record's default)
@@ -211,7 +211,7 @@ EXPECTED_BASE = {
 
 def _setmaxnreg_of():
     """The setmaxnreg immediates the register split renders: inc x (softmax + epilogue roles = 2 sites), dec x (service roles = 5 sites)."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG
 
     return sorted([("inc", CFG.SOFTMAX_REGS), ("inc", CFG.EPILOGUE_REGS)] + [("dec", CFG.SERVICE_REGS)] * (CFG.SERVICE_WARPS + 1))
 

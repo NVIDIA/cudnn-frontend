@@ -9,6 +9,9 @@ navigation:
   - page: Samples
     path: ../../samples.mdx
     slug: samples
+  - page: Model Samples
+    path: ../../model-samples.mdx
+    slug: model-samples
   - link: Release Notes
     href: https://github.com/NVIDIA/cudnn-frontend/releases
   - section: API Reference
@@ -160,6 +163,9 @@ navigation:
               - page: FP8 Projection for Decode Rows (SM100-class)
                 path: ../../operations/gemm_fusions/fp8_projection_decode.md
                 slug: fp8_projection_decode
+              - page: SwiGLU FP4 Gate / Up Product for Decode Rows (SM100-class)
+                path: ../../operations/gemm_fusions/swiglu_fp4_decode.md
+                slug: swiglu_fp4_decode
               - page: GEMM + Amax (SM100)
                 path: ../../operations/gemm_fusions/gemm_amax.md
                 slug: gemm_amax
@@ -225,12 +231,18 @@ navigation:
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
         contents:
+          - page: LayerNorm and RMSNorm in JAX
+            path: ../../operations/normalizations/norm_jax.md
+            slug: norm_jax
           - page: RMSNorm + RHT + Amax (SM100)
             path: ../../operations/normalizations/rmsnorm_rht_amax.md
             slug: rmsnorm_rht_amax
           - page: Fused RMSNorm + SiLU
             path: ../../operations/normalizations/rmsnorm_silu.md
             slug: rmsnorm_silu
+          - page: Add + RMSNorm + Quantize Decode Step (SM100-class)
+            path: ../../operations/normalizations/add_norm_quant_decode.md
+            slug: add_norm_quant_decode
       - section: Pointwise and Reduction
         path: ../../operations/Pointwise.md
         slug: operations/Pointwise

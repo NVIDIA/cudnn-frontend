@@ -110,19 +110,36 @@ def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, i
     )
 
 
+def _rs_asm(n, kind, accumulate_bit, transpose_bit):
+    """Return the inline-asm text and constraint string of one RS ``m64n{n}k16`` WGMMA.
+
+    Plain Python, no DSL values. A thread holds ``n/2`` C slots: outputs
+    ``$0..$(n/2-1)``, the tied accumulator inputs ``$(n/2)..$(n-1)``, the four A
+    words ``$n..$(n+3)`` and the B descriptor ``$(n+4)``. ``kind`` is formatted
+    into the shape suffix exactly as given.
+    """
+    if n not in (64, 128, 256):
+        raise ValueError(f"_rs_asm: the RS form serves n64, n128 or n256, got n{n}")
+    slots = n // 2
+    a_words = ",".join(f"${n + i}" for i in range(4))
+    registers = "{" + ",".join(f"${i}" for i in range(slots)) + "}, {" + a_words + "}, " + f"${n + 4}"
+    asm = f"wgmma.mma_async.sync.aligned.m64n{n}k16.f32.{kind}.{kind} {registers}, {accumulate_bit}, 1, 1, {transpose_bit};"
+    constraints = ",".join(["=f"] * slots + [str(i) for i in range(slots)] + ["r"] * 4 + ["l"])
+    return asm, constraints
+
+
 def _wgmma_rs(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, ip):
     """Issue the native-width RS form through LLVM inline assembly."""
-    # Each C output has one tied input; A/B follow both sets of operands.
-    # Side effects keep the instruction between the caller's fence/commit.
-    count = len(acc)
-    registers = "{" + ",".join(f"${i}" for i in range(count)) + "}, {" + ",".join(f"${2 * count + i}" for i in range(4)) + f"}}, ${2 * count + 4}"
+    # _rs_asm numbers the C outputs, their tied inputs, A and B from N. Side
+    # effects keep the instruction between the caller's fence/commit.
     accumulate_bit = int(cutlass.const_expr(accumulate))
     transpose_bit = int(cutlass.const_expr(transpose_b))
+    asm, constraints = _rs_asm(2 * len(acc), kind, accumulate_bit, transpose_bit)
     return llvm.inline_asm(
         acc_type,
         acc + [v.ir_value(loc=loc, ip=ip) for v in (*a.to_elements(), b_desc)],
-        f"wgmma.mma_async.sync.aligned.m64n{2 * count}k16.f32.{kind}.{kind} {registers}, {accumulate_bit}, 1, 1, {transpose_bit};",
-        ",".join(["=f"] * count + [str(i) for i in range(count)] + ["r"] * 4 + ["l"]),
+        asm,
+        constraints,
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
