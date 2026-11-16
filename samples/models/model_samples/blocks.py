@@ -5,8 +5,9 @@
 served-by table a sample prints before it runs.
 
 A model family declares, per block, an ordered list of :class:`ProviderRow`.  :func:`plan` picks, for every block, the FIRST row
-whose GPU classes, sequence range, tokens-per-sequence range and stack contain the run, builds its :class:`Block` and asks it
-whether it serves the run.  Nothing is chosen at run time and nothing falls back on failure:
+whose GPU classes, sequence range, tokens-per-sequence range and stack contain the run -- and, for a row that names the layer
+widths its entry serves (``widths``), whose widths are the model's -- builds its :class:`Block` and asks it whether it serves
+the run.  Nothing is chosen at run time and nothing falls back on failure:
 
 * ``NotImplementedError`` from a selection or from ``Block.check_support`` means "not served here": the sample prints
   ``[NN] SKIP <sentence>`` and exits 0;
@@ -54,6 +55,9 @@ class ProviderRow:
     rows: Tuple[int, Optional[int]] = (1, None)  # a third selection range: rows = sequences x tokens per sequence
     # an entry that is called in several forms: (call site of the model's wiring, the further fields of the entry's form there)
     sites: Tuple[Tuple[str, Tuple[Tuple[str, object], ...]], ...] = ()
+    # the layer widths the row's entry serves, where it serves some only: (field of the model's geometry, value) pairs.  A
+    # model that differs in one of them is not this row's, and the next row of the block is asked
+    widths: Tuple[Tuple[str, int], ...] = ()
 
     @property
     def stacks(self) -> Tuple[str, ...]:
@@ -75,6 +79,19 @@ class ProviderRow:
 
     def serves_run(self, sequences: int, tokens: int) -> bool:
         return _inside(self.sequences, sequences) and _inside(self.tokens, tokens) and _inside(self.rows, sequences * tokens)
+
+    def serves_model(self, model) -> bool:
+        """Whether the row serves ``model``: a row that names layer widths (``widths``) serves a model whose geometry has every
+        one of them -- so not a plan without a model -- and a row that names none serves any."""
+        geometry = getattr(model, "geometry", None)
+        return all(getattr(geometry, name, None) == value for name, value in self.widths)
+
+    def widths_text(self, model=None) -> str:
+        """The widths the row names, ``hidden 5120``; with ``model``, what that model has in the ones that differ."""
+        if model is None:
+            return ", ".join(f"{name} {value}" for name, value in self.widths)
+        geometry = getattr(model, "geometry", None)
+        return ", ".join(f"{name} {getattr(geometry, name, 'none')}" for name, value in self.widths if getattr(geometry, name, None) != value)
 
     def classes_text(self) -> str:
         if "any" in self.classes:
@@ -284,8 +301,11 @@ def parse_overrides(pairs: Sequence[str]) -> Dict[str, str]:
     return out
 
 
-def select_row(block: str, rows: Sequence[ProviderRow], facts: DeviceFacts, sequences: int, tokens: int, stack: str, key: Optional[str] = None) -> ProviderRow:
-    """The row that serves ``block`` in this run: the first match of the stack's rows, or of the rows with ``key``."""
+def select_row(
+    block: str, rows: Sequence[ProviderRow], facts: DeviceFacts, sequences: int, tokens: int, stack: str, key: Optional[str] = None, model=None
+) -> ProviderRow:
+    """The row that serves ``block`` in this run: the first match of the stack's rows, or of the rows with ``key``.  A row
+    that names layer widths matches the ``model`` that has them."""
     if key is not None:
         candidates = [r for r in rows if r.key == key]
         if not candidates:
@@ -295,11 +315,16 @@ def select_row(block: str, rows: Sequence[ProviderRow], facts: DeviceFacts, sequ
         if not candidates:
             raise NotImplementedError(f"block {block} has no provider row in stack {stack}")
     for row in candidates:
-        if row.serves_class(facts.cc) and row.serves_run(sequences, tokens):
+        if row.serves_class(facts.cc) and row.serves_model(model) and row.serves_run(sequences, tokens):
             return row
     first = candidates[0]
-    if not any(r.serves_class(facts.cc) for r in candidates):
+    of_class = [r for r in candidates if r.serves_class(facts.cc)]
+    if not of_class:
         raise NotImplementedError(f"{entry_name(first.key)} serves {first.classes_text()}; this device is {facts.cc[0]}.{facts.cc[1]}")
+    if not any(r.serves_model(model) for r in of_class):
+        narrow = of_class[0]
+        has = f"this model has {narrow.widths_text(model)}" if model is not None else "this plan names no model"
+        raise NotImplementedError(f"{entry_name(narrow.key)} serves {narrow.widths_text()}; {has}")
     raise NotImplementedError(f"{entry_name(first.key)} serves {first.serves}; this run has {sequences} sequences x {tokens} tokens per sequence")
 
 
@@ -322,7 +347,8 @@ def plan(
     source: str = "the family's configs.py",
     factories: Optional[Mapping[str, Callable]] = None,
 ) -> Plan:
-    """Resolve the provider table for (GPU class, sequences, tokens per sequence, stack) and build the blocks.
+    """Resolve the provider table for (GPU class, sequences, tokens per sequence, stack) and the model's layer widths, and
+    build the blocks.
 
     ``device`` is a :class:`DeviceFacts` or a device to probe.  ``overrides`` maps a block to the key of one of its declared rows.
     ``model`` and ``options`` are handed to the block factories (geometry, norm epsilon, the reference precision).  Raises
@@ -343,7 +369,7 @@ def plan(
         for r in rows:
             if r.key not in KEYS:
                 raise ValueError(f"block {block}: provider key {r.key!r} is not in the closed list of provider keys")
-        row = select_row(block, rows, facts, sequences, tokens, stack, overrides.get(block))
+        row = select_row(block, rows, facts, sequences, tokens, stack, overrides.get(block), model)
         built = build[row.key](row, model, facts, dict(options or {}))
         built.check_support(sequences, tokens)
         blocks[block], selected[block] = built, row

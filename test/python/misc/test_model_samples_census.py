@@ -550,6 +550,90 @@ def test_provider_rows_state_a_form_and_a_rows_range():
     assert step.form == (("PDL", False), ("PDL_RELEASE", False)), "the fe-cublas row says what the entry does when nothing is passed"
 
 
+def test_a_row_serves_the_layer_widths_it_names():
+    """An entry that serves some layer widths only has them in its row (``widths``: fields of the model's geometry).  A
+    model of the family with another width is not that row's: the next row of the block is asked, and where there is none
+    the decline is a ``NotImplementedError`` that names both -- a SKIP, never "the provider table is wrong".  The norm
+    entry serves one hidden width; its row says so, and a checkpoint with another one plans on the reference chain on a
+    real device, with no kernel identity stated: what the family README says of such a checkpoint."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import cudnn
+
+    from model_samples.blocks import DeviceFacts, ProviderRow, plan, select_row
+    from model_samples.qwen_dense import QwenDense, configs
+
+    facts = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    wide, narrow = (SimpleNamespace(geometry=SimpleNamespace(hidden=hidden, mlp=96)) for hidden in (5120, 4096))
+    rows = [
+        ProviderRow(("cc10.x",), (1, None), (1, None), "fe.add_norm_quant_decode", "native", serves="rows 1-8, hidden 5120", widths=(("hidden", 5120),)),
+        ProviderRow(("any",), (1, None), (1, None), "torch_ref.add_norm_quantize", "native", serves="any", fallback="reference chain"),
+    ]
+    assert rows[0].serves_model(wide) and not rows[0].serves_model(narrow) and not rows[0].serves_model(None), "no model: no widths to hold"
+    assert rows[1].widths == () and rows[1].serves_model(narrow) and rows[1].serves_model(None), "a row that names no widths serves any model"
+    assert rows[0].widths_text() == "hidden 5120" and rows[0].widths_text(narrow) == "hidden 4096" and rows[0].widths_text(wide) == ""
+    assert select_row("b", rows, facts, 1, 1, "native", model=wide).key == "fe.add_norm_quant_decode"
+    assert select_row("b", rows, facts, 1, 1, "native", model=narrow).key == "torch_ref.add_norm_quantize", "another width: the next row of the block"
+    assert select_row("b", rows, facts, 1, 1, "native").key == "torch_ref.add_norm_quantize"
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves hidden 5120; this model has hidden 4096$"):
+        select_row("b", rows[:1], facts, 1, 1, "native", model=narrow)
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves hidden 5120; this model has hidden 4096$"):
+        select_row("b", rows, facts, 1, 1, "native", key="fe.add_norm_quant_decode", model=narrow)  # --provider cannot widen an entry
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves hidden 5120; this plan names no model$"):
+        select_row("b", rows[:1], facts, 1, 1, "native")
+    two = replace(rows[0], widths=(("hidden", 5120), ("mlp", 17408)))
+    assert not two.serves_model(wide) and two.widths_text(wide) == "mlp 96" and two.widths_text() == "hidden 5120, mlp 17408", "every width it names"
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves compute capability 10.x; this device is 12.0$"):
+        select_row("b", rows[:1], DeviceFacts((12, 0)), 1, 1, "native", model=narrow)  # the class is said first
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves rows 1-8, hidden 5120; this run has 9 sequences x 1 tokens per sequence$"):
+        select_row("b", [replace(rows[0], rows=(1, 8))], facts, 9, 1, "native", model=wide)
+
+    # the family's table says what the entry serves: the row's width is one the entry builds for, and the entry declines another by name
+    row = configs.PROVIDERS["add_norm_quantize"][0]
+    assert row.key == "fe.add_norm_quant_decode" and row.widths == (("hidden", 5120),) and row.serves == "rows 1-1,024, hidden 5120"
+    assert all(not r.widths for rows in configs.PROVIDERS.values() for r in rows if r is not row), "the one row of the table whose entry serves one width"
+    form = dict(add=True, bf16=False, quant="nvfp4")
+    assert cudnn.AddNormQuantDecode("cpu", dict(row.widths)["hidden"], 1e-6, **form).form_for(1)["HIDDEN"] == 5120
+    with pytest.raises(NotImplementedError, match=r"serves hidden 5120 \(validated\); got hidden 4096$"):
+        cudnn.AddNormQuantDecode("cpu", 4096, 1e-6, **form)
+
+    # a model of the family with other layer widths, on a device with memory (the real entries are asked for their launch): the norm
+    # block is the reference chain's in the target stacks, the plan holds, and the run states no kernel identity
+    reduced = QwenDense.reduced(2).geometry
+    other = QwenDense(replace(reduced, hidden=4096, la_key_heads=8, la_value_heads=32, attn_heads=16), ("other widths",))
+    reason = (
+        "no recorded section for this model's widths on cc 10.0 / 148 SMs: hidden 4096 (recorded 5120), la_key_heads 8 (recorded 16), "
+        "la_value_heads 32 (recorded 48), attn_heads 16 (recorded 24)"
+    )
+    for stack in configs.TARGET_STACKS:
+        planned = plan(other.provider_table, other.regimes, facts, 1, 1, stack, model=other, options={"device": "cpu"})
+        assert planned.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and planned.rows["add_norm_quantize"].fallback == "reference chain"
+        assert planned.rows["attention.gate_quantize"].key == "fe.attention_gate_quant_decode", "an entry that serves the width keeps its row"
+        claim = QwenDense.target().claim(planned, other, installed=RECORDED)
+        assert claim.coverage() == [f"kernel identity: not stated for this run ({reason})"] and not claim.known
+        line = next(line for line in planned.table().splitlines() if line.split()[0] == "add_norm_quantize")
+        assert "torch_ref.add_norm_quantize" in line and line.endswith("fallback: reference chain"), line
+        assert "by provider: cuDNN FE 2 | fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3) | PyTorch 2" in planned.table()
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves hidden 5120; this model has hidden 4096$"):
+        plan(
+            other.provider_table,
+            other.regimes,
+            facts,
+            1,
+            1,
+            "native",
+            {"add_norm_quantize": "fe.add_norm_quant_decode"},
+            model=other,
+            options={"device": "cpu"},
+        )
+    # the published widths, the same device: the entry's row, and the table prints the width with what the row serves
+    served, _, _ = _target_plan(2)
+    assert served.rows["add_norm_quantize"] is row
+    line = next(line for line in served.table().splitlines() if line.split()[0] == "add_norm_quantize")
+    assert "cudnn.AddNormQuantDecode" in line and "rows 1-1,024, hidden 5120" in line, line
+
+
 def _plan(sequences=1, layers=2, table=None, **kwargs):
     from model_samples.blocks import DeviceFacts, plan
     from model_samples.qwen_dense import QwenDense
@@ -786,7 +870,23 @@ def _tiny_model():
         attn_head_dim=8,
         rotary_dim=4,
     )
-    return QwenDense(geometry, reductions=("tiny geometry",))
+    model = QwenDense(geometry, reductions=("tiny geometry",))
+    model.provider_table = _table_of(geometry)
+    return model
+
+
+def _table_of(geometry):
+    """The family's provider table with the layer widths a row names re-stated for ``geometry``: the stand-in entries of this
+    module serve whatever the widths, so the rows of the published widths are the rows of the tiny geometry (as
+    ``_census_of`` re-states the census section)."""
+    from dataclasses import replace
+
+    from model_samples.qwen_dense import configs
+
+    return {
+        block: [replace(row, widths=tuple((name, getattr(geometry, name)) for name, _ in row.widths)) for row in rows]
+        for block, rows in configs.PROVIDERS.items()
+    }
 
 
 def _census_of(model):
@@ -2677,7 +2777,9 @@ def test_a_section_holds_for_the_layer_widths_it_was_recorded_with():
     plan, model, _ = _target_plan(2)
     assert target.claim(plan, model, installed=RECORDED).known and len(target.claim(plan, model, installed=RECORDED).recorded) == 8
 
-    stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)  # stated facts: no entry is built for these widths
+    # stated facts: no entry is built.  The same plan on a device with memory, where the entries are asked for their launch, is
+    # held in test_a_row_serves_the_layer_widths_it_names: the norm block of such a model is the reference chain's
+    stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)
     other = QwenDense(replace(reduced, hidden=4096, la_key_heads=8, la_value_heads=32, attn_heads=16), ("other widths",))
     planned = make_plan(other.provider_table, other.regimes, stated, 1, 1, "native", model=other, options={"device": "cpu"})
     claim = target.claim(planned, other, installed=RECORDED)
@@ -3521,6 +3623,8 @@ def test_the_norm_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     with pytest.raises(ValueError, match=declined):  # through the plan: a ValueError, which a sample prints as an ERROR
         plan(dict(model.provider_table), model.regimes, real, 4, 1, "native", model=model, options=options)
     monkeypatch.setattr(fe, "_ENTRIES", {})
+    # the adapter handed a model of a width its entry declines: a table whose row does not name the width it serves.  (The
+    # family's row names it, so a plan never hands this adapter such a model: test_a_row_serves_the_layer_widths_it_names)
     narrow = QwenDense.reduced(2)
     narrow.geometry = replace(narrow.geometry, hidden=4096)
     with pytest.raises(ValueError) as wrong:

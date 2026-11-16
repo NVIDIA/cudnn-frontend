@@ -4,7 +4,8 @@
 """The provider table and the regime table of the dense Qwen family, as data.
 
 For every block the rows are ordered; the first row whose GPU classes, sequence range, tokens-per-sequence range and stack
-contain the run serves the block.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
+contain the run serves the block.  A row whose entry serves some layer widths only names them (``widths``): a model of the
+family with another width is not that row's, and the next row is asked.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
 reference chain or a multiply over a dequantised copy; ``band`` is the tie-out band of the row against the reference block
 (``model_samples.tie_out.BANDS``) and is never widened in place.  ``form`` is what the row's adapter passes to its entry: fields
 of the entry's own form, which the kernel check compares with the entry's answer.  A row whose entry a step calls in several
@@ -63,7 +64,7 @@ PROVIDERS = {
             (1, None),
             "fe.add_norm_quant_decode",
             TARGET_STACKS,
-            serves="rows 1-1,024",
+            serves="rows 1-1,024, hidden 5120",
             band="add_norm_quant",
             batch_invariant=("cc10.0",),
             # the target's launch form at every call site: the kernel waits for its predecessor after it has loaded the norm
@@ -73,6 +74,9 @@ PROVIDERS = {
             form=(("PDL", True), ("PDL_RELEASE", True)),
             rows=(1, 1024),
             sites=NORM_FORMS,
+            # the row width the entry serves (its page: 5120, the published model's).  A checkpoint of the family with another
+            # hidden width keeps the block on the reference chain below, and its run states no kernel identity
+            widths=(("hidden", 5120),),
         ),
         ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain"),
     ],
