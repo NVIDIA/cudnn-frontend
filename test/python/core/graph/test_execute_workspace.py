@@ -256,3 +256,125 @@ def test_conv_wgrad_checks_workspace_capacity(entry, dtype, cudnn_handle):
             _assert_short_workspace(graph, tensors, values, entry, False, "native", cudnn_handle)
             return
     pytest.fail(f"No backend wgrad plan with scratch: {errors}")
+
+
+def _workspace_query_cache_probe(trace_path, dtype_name):
+    """Child-process API trace: detect repeated backend work, not cache internals."""
+    import copy
+    import json
+    from pathlib import Path
+
+    trace = Path(trace_path)
+    marker = "function cudnnGetExecutionPlanWorkspaceSize() called:"
+    handle = cudnn.create_handle()
+    other_handle = cudnn.create_handle()
+    try:
+        graph, tensors, values = _build(handle, True, getattr(torch, dtype_name))
+        overrides = dict(
+            override_uids=[t.get_uid() for t in tensors],
+            override_shapes=[list(v.shape) for v in values],
+            override_strides=[list(v.stride()) for v in values],
+        )
+        observations = []
+
+        def observe(label, expected_query, changes=overrides, selected_handle=handle):
+            before = trace.stat().st_size
+            required = graph.get_workspace_size(handle=selected_handle, **changes)
+            with trace.open() as file:
+                file.seek(before)
+                calls = file.read().count(marker)
+            # Some backend versions log nested entry points as well. The
+            # contract is zero calls on a hit, at least one on a miss.
+            assert (calls > 0) == expected_query, (label, calls, expected_query)
+            observations.append((label, required, calls))
+            return required
+
+        required = observe("cold", True)
+        assert observe("same_geometry", False) == required
+        assert observe("other_handle", True, selected_handle=other_handle) == required
+        observe("other_handle_hit", False, selected_handle=other_handle)
+        observe("restore_handle", True)
+
+        changed_shape = copy.deepcopy(overrides)
+        for shape in changed_shape["override_shapes"]:
+            shape[0] = 1
+        observe("changed_shape", True, changed_shape)
+        observe("changed_shape_hit", False, changed_shape)
+        changed_stride = copy.deepcopy(changed_shape)
+        for stride in changed_stride["override_strides"]:
+            stride[0] *= 2
+        observe("changed_stride", True, changed_stride)
+        observe("changed_stride_hit", False, changed_stride)
+        reordered = {key: list(reversed(value)) for key, value in changed_stride.items()}
+        observe("reordered_uids", True, reordered)
+        observe("reordered_uids_hit", False, reordered)
+        observe("restore_geometry", True)
+
+        malformed = copy.deepcopy(overrides)
+        malformed["override_shapes"].pop()
+        with pytest.raises(RuntimeError, match="same size"):
+            graph.get_workspace_size(handle=handle, **malformed)
+        observe("invalid_query_did_not_poison", False)
+
+        # Both transports must continue observing the *current* workspace,
+        # even after the geometry has hit this cache repeatedly.
+        cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+        backing = torch.empty(required + 256, device="cuda", dtype=torch.uint8)
+        for entry in ("mapping", "ordered", "mapping_at_index", "ordered_at_index"):
+            _call(graph, tensors, values, backing[:required], handle, entry, overrides)
+            torch.cuda.synchronize()
+            expected = values[-1].clone()
+            backing.fill_(165)
+            values[-1].fill_(123)
+            with pytest.raises(ValueError, match="-byte workspace but received a 1-byte buffer"):
+                _call(graph, tensors, values, backing[:1], handle, entry, overrides)
+            torch.cuda.synchronize()
+            assert torch.all(backing == 165).item()
+            assert torch.all(values[-1] == 123).item()
+            fresh = torch.empty_like(backing)
+            _call(graph, tensors, values, fresh, handle, entry, overrides)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(values[-1], expected, atol=0, rtol=0)
+        observe("execute_keeps_geometry_warm", False)
+
+        # Replacing the finalized plan in the same graph invalidates its entry;
+        # plan indices, engine IDs and serialized geometry can all be identical.
+        graph.deserialize(graph.serialize())
+        assert observe("deserialized_plan", True) == required
+        observe("deserialized_plan_hit", False)
+        print("WORKSPACE_CACHE_TRACE", json.dumps(observations), flush=True)
+    finally:
+        cudnn.destroy_handle(other_handle)
+        cudnn.destroy_handle(handle)
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+def test_runtime_workspace_query_reuses_only_finalized_plan_geometry(tmp_path, dtype_name):
+    """Warm execute avoids a second backend query without caching buffer capacity."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    if cudnn.backend_version() < 92600 or torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("The ALiBi native control requires Hopper+ and cuDNN 9.26+")
+    # Logging is initialized once by cuDNN: isolate it from the pytest process.
+    # Pin the currently tested package, including editable/worktree installs.
+    root = Path(cudnn.__file__).resolve().parent.parent
+    trace = tmp_path / "workspace-query.log"
+    script = """
+import runpy, sys
+sys.meta_path[:] = [f for f in sys.meta_path if 'editable' not in str(f).lower()]
+sys.path.insert(0, sys.argv[1])
+runpy.run_path(sys.argv[2])['_workspace_query_cache_probe'](sys.argv[3], sys.argv[4])
+"""
+    env = {**os.environ, "CUDNN_LOGLEVEL_DBG": "3", "CUDNN_LOGDEST_DBG": str(trace)}
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(root), str(Path(__file__).resolve()), str(trace), dtype_name],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "WORKSPACE_CACHE_TRACE" in proc.stdout

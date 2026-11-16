@@ -71,6 +71,24 @@ class Graph : public ICudnn, public INode {
     int64_t fe_workspace_size = 0;
     uint64_t gid;
 
+    // A finalized plan's backend scratch requirement depends only on its runtime
+    // geometry. Keep one successful query per Graph (copies may share it), never
+    // workspace storage, operand pointers or streams. The weak plan identity
+    // prevents a rebuilt/deserialized plan from inheriting an address-reused hit.
+    struct RuntimeWorkspaceCache {
+        struct Entry {
+            std::weak_ptr<ExecutionPlan_v8> plan;
+            cudnnBackendDescriptor_t descriptor = nullptr;
+            cudnnHandle_t handle                = nullptr;
+            std::vector<int64_t> uids;
+            std::vector<std::vector<int64_t>> shapes;
+            std::vector<std::vector<int64_t>> strides;
+            size_t backend_bytes = 0;
+        } entry;
+        std::mutex mutex;
+    };
+    std::shared_ptr<RuntimeWorkspaceCache> runtime_workspace_cache = std::make_shared<RuntimeWorkspaceCache>();
+
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
     std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
@@ -1501,6 +1519,19 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
+        auto const &plan = plans.execution_plans[plan_index];
+        auto &cache      = *runtime_workspace_cache;
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto const &entry = cache.entry;
+        if (entry.plan.lock() == plan && entry.descriptor == plan->get_raw_desc() && entry.handle == handle &&
+            entry.uids == override_uids && entry.shapes == override_shapes && entry.strides == override_strides) {
+            // FE-owned scratch can change independently of the backend plan.
+            cudnn_workspace_size = entry.backend_bytes + fe_workspace_size;
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size
+                                                                     << " (runtime override shape)");
+            return {error_code_t::OK, ""};
+        }
+
         detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
         RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
@@ -1535,6 +1566,18 @@ class Graph : public ICudnn, public INode {
         size_t cudnn_ws = 0;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_execution_plan_workspace_size(
             handle, plans.execution_plans[plan_index]->get_raw_desc(), variant_pack_descriptor.get_ptr(), &cudnn_ws));
+        // Reuse the key's vector capacity when geometry changes on every call.
+        // Invalidate first: a failed key copy must never expose a partial hit.
+        // Backend-query failures above leave the preceding entry untouched.
+        auto &next = cache.entry;
+        next.plan.reset();
+        next.uids            = override_uids;
+        next.shapes          = override_shapes;
+        next.strides         = override_strides;
+        next.descriptor      = plan->get_raw_desc();
+        next.handle          = handle;
+        next.backend_bytes   = cudnn_ws;
+        next.plan            = plan;
         cudnn_workspace_size = cudnn_ws + fe_workspace_size;
         CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size
                                                                  << " (runtime override shape)");
