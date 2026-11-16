@@ -78,6 +78,9 @@ knob; updating architecture-local body tests alone misses these consumers.
 When a fixture changes an unsplit record into a split record, select its
 implementation after computing the final knobs. Small-head SM100 paged THD
 split uses single-Q even when the ranked unsplit candidate used multi-Q.
+SM107 D128 THD split also uses shared single-Q with mixed half-Q/FP8-KV;
+its native multi-Q owner must decline the packed-split record before lowering.
+Check mixed-storage ownership separately from uniform-dtype controls.
 `test_paged_thd_split_capture_lengths_and_stats` and
 `test_native_paged_thd_capture_and_rebind` cover that transition, including
 default cluster, packed heads, Stats layouts, fresh bindings and retained replay.

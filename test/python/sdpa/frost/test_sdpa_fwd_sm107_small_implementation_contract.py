@@ -99,6 +99,34 @@ def test_paged_d192_and_shared_single_q_boundaries():
     assert mismatch(MULTI_Q, facts(64, thd=True), SdpaFwdKnobs(cga=1, split_kv=3))
 
 
+@pytest.mark.parametrize("qdtype,kvdtype", [("HALF", "FP8_E4M3"), ("BFLOAT16", "FP8_E5M2")])
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("cga", [1, 2])
+@pytest.mark.parametrize("splits", [1, 5])
+def test_mixed_kv_packed_split_has_one_fixed_owner(qdtype, kvdtype, thd, paged, cga, splits):
+    import cudnn
+    from cudnn.sdpa.fwd.kernels.sm107 import shared_half_contract as shared
+
+    f = facts(
+        128,
+        dtype=getattr(cudnn.data_type, qdtype),
+        kv_dtype=getattr(cudnn.data_type, kvdtype),
+        uniform_dtype=False,
+        uniform_qo_dtype=True,
+        thd=thd,
+        has_paged_kv=paged,
+    )
+    k = SdpaFwdKnobs(cga=cga, split_kv=splits)
+    reason = mismatch(MULTI_Q, f, k)
+    if thd and cga == 1 and splits > 1:
+        assert reason and "shared SM100 single-Q body" in reason
+        assert shared.mismatch(shared.SINGLE_Q, f, k) is None
+    else:
+        # Keep native mixed dense, unsplit THD and paired-CTA declarations.
+        assert reason is None, reason
+
+
 def test_three_group_chunk_and_padding_are_preserved():
     f = biased(32, s_kv=4096)
     k = SdpaFwdKnobs(tile_n=64)
