@@ -959,7 +959,9 @@ def _softmax_warp_group(
                         jg = col0 + cutlass.Int32(h * O_HALF + jj)
                         val = _select_f32(dead_cols[jj], ZERO, cutlass.Float32(o_vals[jj]) * inv_cols[jj])
                         if live_cols[jj]:
-                            o_row = oo[o_batch, tok0 + jg // G, head_idx * G + (jg % G), :]
+                            # Array slicing uses each coordinate's width for its
+                            # stride product, even with an Int64 tensor layout.
+                            o_row = oo[cutlass.Int64(o_batch), cutlass.Int64(tok0 + jg // G), cutlass.Int64(head_idx * G + (jg % G)), :]
                             o_row[d_idx] = val.to(o_tensor.element_type)
 
     if cutlass.const_expr(lse_tensor is not None):
