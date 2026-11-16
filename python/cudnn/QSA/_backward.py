@@ -3,7 +3,7 @@
 
 """The launch sequence of the Qwen Sparse Attention (QSA) backward: its plan, compiled kernels and launch.
 
-The kernels come from ``kernels/bprop_sm100.py``. On SM107 the query-major, key-major and dense pair kernels of
+The kernels come from ``kernels/bprop_sm100.py``. On SM107 the key-major and dense pair kernels of
 ``kernels/bprop_sm107.py`` take their place when the driver offers the oversized shared memory carveout.
 """
 
@@ -93,8 +93,8 @@ class LaunchPlan:
 
     ``seq_mode`` SEQ_SINGLE treats the T rows as one sequence, SEQ_CU takes the caller's ``cu_seqlens`` of ``num_seqs``
     sequences, SEQ_ORIGIN derives the sequences on the device from the per-token origins (at most ``num_seqs`` of
-    them). The per-sequence dense / sparse split is decided on the device. ``rubin`` runs the query-major, key-major and
-    dense pair kernels of ``bprop_sm107`` (SM107 only).
+    them). The per-sequence dense / sparse split is decided on the device. ``rubin`` runs the key-major and dense pair
+    kernels of ``bprop_sm107`` (SM107 only).
     """
 
     def __init__(
@@ -297,11 +297,11 @@ def _fake(dtype, shape, sym, align=16):
 def _compile_args(hkv: int, gq: int, rubin: bool, det: int) -> dict:
     """Storage-free kernel signatures, reused across plans. The shared cache owns the CUDA objects."""
     HQ = gq * hkv
-    query_host, key_host, dense_host = _sparse_query_host, _sparse_key_host, _dpair_host
+    key_host, dense_host = _sparse_key_host, _dpair_host
     if rubin:
         from .kernels import bprop_sm107
 
-        query_host, key_host, dense_host = bprop_sm107._sparse_query_host, bprop_sm107._sparse_key_host, bprop_sm107._dpair_host
+        key_host, dense_host = bprop_sm107._sparse_key_host, bprop_sm107._dpair_host
     sym_t = cute.sym_int64()
     f_q = _fake(BF16, (None, HQ, D), sym_t)
     f_kv = _fake(BF16, (None, hkv, D), sym_t)
@@ -399,7 +399,7 @@ def _compile_args(hkv: int, gq: int, rubin: bool, det: int) -> dict:
         "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
         "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
         "query": lambda: (
-            query_host,
+            _sparse_query_host,
             f_q,
             f_kv,
             f_kv,
