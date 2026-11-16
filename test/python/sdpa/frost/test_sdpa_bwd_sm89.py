@@ -14,7 +14,6 @@ from frost_test_utils import _SM, requires_dsl
 ENGINE, ENGINE_ID = "sdpa_bwd_sm89", 20635
 D64_ENGINE, D64_ENGINE_ID = "sdpa_bwd_sm89_f16_d64", 20636
 _ON_SM89 = pytest.mark.skipif(_SM != 89, reason="requires SM89")
-_GPU = [requires_dsl, _ON_SM89]
 
 
 def _spec(name):
