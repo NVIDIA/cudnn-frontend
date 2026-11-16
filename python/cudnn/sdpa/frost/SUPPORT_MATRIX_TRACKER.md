@@ -852,8 +852,8 @@ It supports unmasked and causal attention (either anchor), finite `attn_scale` i
 and optional FP32 `amax_dQ/dK/dV`. Every plan is repeatable; `use_deterministic_algorithm`
 also preserves gradient batch invariance. Padding, THD, windows, widened bands, bias,
 sinks, dropout, E5M2, FP16, other layouts and decode are declined.
-See the [engine documentation](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/attention/sdpa_bwd_sm100_d128_mxfp8.md)
-for the three-kernel implementation, performance and validation coverage.
+MQA with few key blocks (H_kv = 1 at S = 2K to 4K) is slower than the backend engine; the row still offers itself
+there, so select another plan by name if such graphs dominate a workload.
 
 The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
 front**: the seven F8_128x4 scale tensors are repacked into the kernels'

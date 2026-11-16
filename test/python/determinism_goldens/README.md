@@ -77,7 +77,7 @@ recorded for them.
 Qualification on 2026-11-14: B300 SXM6 AC (148 SMs), driver 615.71.10, Torch
 2.11.0+cu130, cuDNN 9.28.0, CuTe DSL 4.8.1 (compiling with CUDA 13.4). The row
 module passes **55 tests** at L0 + L1 with zero skips, the four goldens included. The
-GPU-free eligibility module passes **43**. The warm stress has 0 mismatches in 3000
+GPU-free eligibility module passes **42**. The warm stress has 0 mismatches in 3000
 warm and 3000 poisoned launches; its unsafe control fails 200 / 200 on the same GPU.
 From `test/python`:
 
@@ -86,6 +86,10 @@ CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUDNN_DETERMINISM_GOLDENS="$PWD/determinis
   python -m pytest -q -m "L0 or L1" \
   sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128_eligibility.py
 ```
+
+On 2026-11-16, after the row was extended to cc 10.0, the same B300 runtime passed the row module (55, the
+goldens included), the eligibility module (43, with the new cc 10.0 admission case) and `test_band_capabilities.py`
+(26) with zero skips.
 
 B200 qualification on 2026-11-16 (UTC): B200 (148 SMs), driver 615.71.10, otherwise the
 runtime above. The four cells were recorded into a new directory under
