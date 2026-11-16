@@ -42,12 +42,15 @@ def facts(**overrides):
     return SdpaGraphFacts(**values)
 
 
-def test_registry_slots_are_opt_in_like_the_row_they_split():
+def test_registry_slots_trail_the_backend_and_the_row_they_split_stays_opt_in():
     from cudnn.engines.manifest import MANIFEST
 
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     assert {name: family.engine_id + family.slots[name].slot for name in OFFERED} == OFFERED
-    assert all(family.slots[name].opt_in for name in OFFERED)
+    # The explicit owners are default since 2026-11-16, behind the backend (placement.TRAIL_ONLY_ROWS).
+    owners = (mx.SLICE_RECOMPUTE, mx.RETAINED_P)
+    assert family.slots[mx.LEGACY_ROW].opt_in and not any(family.slots[name].opt_in for name in owners)
+    assert set(owners) <= placement.TRAIL_ONLY_ROWS
 
 
 @pytest.mark.parametrize(

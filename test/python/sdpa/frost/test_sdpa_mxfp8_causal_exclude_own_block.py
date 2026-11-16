@@ -85,6 +85,7 @@ def _reason(graph, name, knobs=None):
 
 
 _MXFP8_ROW = "sdpa_fwd_sm100_d128_mxfp8_multi_q"
+_OPT_IN_ROW = "sdpa_fwd_prefill_sm100_mxfp8"  # the opt-in row the SM100 MXFP8 owners split
 
 
 @pytest.mark.L0
@@ -113,7 +114,7 @@ def test_malformed_block_size_is_invalid(fake_sm100, value):
 @pytest.mark.L0
 def test_zero_is_plain_causal(monkeypatch, fake_sm100):
     """``causal_exclude_own_block=0`` is the off value (the kernel's default): the same facts as an
-    unset attribute, backend-lowerable, and no unlocking of the opt-in slot."""
+    unset attribute, backend-lowerable, and no unlocking of the opt-in row."""
     from cudnn.engines import manifest
 
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
@@ -121,7 +122,7 @@ def test_zero_is_plain_causal(monkeypatch, fake_sm100):
     facts = ga.analyze(g)
     assert facts.invalid is None and facts.causal_exclude_own_block == 0
     assert g._unlowerable_node() is None
-    assert _PIN not in manifest.family_for(g).offered_ids(g)
+    assert _OPT_IN_ROW not in manifest.family_for(g).offered_ids(g)
 
 
 @pytest.mark.L0
@@ -213,9 +214,10 @@ def test_band_form_of_causal_is_accepted(fake_sm100):
 
 @pytest.mark.L0
 def test_offered_without_the_opt_in_flag(monkeypatch, fake_sm100):
-    """The SM100 MXFP8 slot is opt-in, but it is the attribute's only server (the backend cannot lower the
-    graph), so a graph that SETS causal_exclude_own_block is offered it with the flag unset -- as a
-    candidate, as a pin, and to the facts/validator path.  Graphs without the attribute keep the gate."""
+    """The attribute's server (the backend cannot lower the graph) is offered with the flag unset -- as a
+    candidate, as a pin, and to the facts/validator path.  The D128 owner is offered by default since
+    2026-11-16; the opt-in MXFP8 row it splits is unlocked only for a graph that SETS
+    causal_exclude_own_block, and graphs without the attribute keep that row's gate."""
     from cudnn.engines import manifest
 
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
@@ -223,12 +225,14 @@ def test_offered_without_the_opt_in_flag(monkeypatch, fake_sm100):
     plain = _mxfp8_graph(use_causal_mask=True)
     family = manifest.family_for(own)
     slot = family.engine_id + family.slots[_PIN].slot
-    assert family.offered_ids(own)[_PIN] == slot
-    assert _PIN not in family.offered_ids(plain) and _PIN not in family.offered_ids()
+    assert family.offered_ids(own)[_PIN] == slot and family.offered_ids(plain)[_PIN] == slot
     assert _PIN in {e.name for e in own._candidate_engines()}
-    assert _PIN not in {e.name for e in plain._candidate_engines()}
     assert manifest.engine_for_id(slot, own).name == _PIN
-    assert manifest.engine_for_id(slot, plain) is None and manifest.engine_for_id(slot) is None
+    row = family.engine_id + family.slots[_OPT_IN_ROW].slot
+    assert family.offered_ids(own)[_OPT_IN_ROW] == row
+    assert _OPT_IN_ROW not in family.offered_ids(plain) and _OPT_IN_ROW not in family.offered_ids()
+    assert manifest.engine_for_id(row, own).name == _OPT_IN_ROW
+    assert manifest.engine_for_id(row, plain) is None and manifest.engine_for_id(row) is None
 
 
 # ---------------------------------------------------------------------------

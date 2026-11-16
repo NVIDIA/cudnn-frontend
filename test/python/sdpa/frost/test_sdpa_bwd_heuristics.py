@@ -41,6 +41,7 @@ _OFFERED = {
     "sdpa_bwd_sm107_d256_f16_4x1": 20632,
     "sdpa_bwd_sm107_fp8": 20605,
     "sdpa_bwd_sm107_mxfp8": 20606,
+    "sdpa_bwd_sm107_d192": 20610,
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
@@ -323,7 +324,7 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
 
 
 def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
-    """The default 16-bit rows with no measured lead shard sit after the LAST_RESORT marker: behind every requested mode's
+    """The default rows with no measured lead shard sit after the LAST_RESORT marker: behind every requested mode's
     backend block (a correctness fallback for graphs the backend declines); the FROST opt-in keeps them first."""
     from cudnn.engines.base import PlanConfig
     from cudnn.engines.heuristics import is_backend_block, is_last_resort
