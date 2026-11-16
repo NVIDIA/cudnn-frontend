@@ -34,6 +34,12 @@ The kernel check (:func:`check_forms`, :func:`compare`; a sample runs it with ``
 6. Copies are listed.  Declared are the one host read that ends a step and the copies a fallback or host row makes; a copy
    between two exact rows is not.
 
+**An entry that a step calls in several forms.**  A provider row may name the call sites of its block (``ProviderRow.sites``:
+per site the further fields of the entry's form there), and the family names the site of every call of its wiring
+(``model.sites()``).  Every item above then holds per call site: a site carries the form of ITS call, the facts of the entry
+instance of that form, and the call log says which instance served it.  A call served by the instance of a neighbouring
+form fails item 0 with its own sentence, although the kernel's name and launch shape may be the same.
+
 **A kernel name proves nothing about a form.**  A generated kernel symbol is the kernel's name followed by the text of its
 compile-time arguments, cut at a fixed length: two forms of one kernel can share a symbol, and they can share a launch shape
 too.  So the form is compared on the objects (item 0), never read out of a name; the name and the launch shape (item 5) show
@@ -149,10 +155,16 @@ class Site:
     form: tuple = ()  # the provider row's form
     facts: Optional[Facts] = None  # of an entry that states its launch
     wrong: str = ""  # why such an entry stated none: a wrong table
+    site: str = ""  # the call site, for a block whose entry is called in several forms (``form`` and ``facts`` are this site's)
 
     @property
     def name(self) -> str:
         return self.block if self.layer < 0 else f"{self.block} (layer {self.layer})"
+
+    @property
+    def row(self) -> str:
+        """The block and, where its row names several, the call site: what a sentence about the row's form names."""
+        return f"{self.block} at {self.site}" if self.site else self.block
 
 
 # ---------------------------------------------------------------------------------------------------------- canonical ids
@@ -162,6 +174,7 @@ class Site:
 FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("gdn_decode_fused", re.compile(r"^cudnn_kernel_frost_gdn_decode_fused_")),
     ("gate_quant", re.compile(r"^cudnn_kernel_frost_attention_gate_quant_")),
+    ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
     ("embedding_gather", re.compile(r"\bat::native::(?:\(anonymous namespace\)::)?indexSelect(?:Small|Large)Index<")),
     ("cublas", re.compile(r"cublas|^nvjet_|\bcutlass::Kernel2?<cutlass_|^(?:maxwell|volta|ampere)_\w*gem[mv]", re.IGNORECASE)),
@@ -287,27 +300,43 @@ def split_steps(records: Sequence[Launch]) -> Tuple[List[List[Launch]], List[Lau
 
 
 # ---------------------------------------------------------------------------------------------------------- the plan's side
+def call_sites(model) -> Tuple[str, ...]:
+    """The call site of every call of ``model.wiring()``, as the family names it (``model.sites()``): ``""`` for a call of a
+    block that is called in one form everywhere, and for every call of a model that names no sites."""
+    wiring = tuple(model.wiring())
+    named = getattr(model, "sites", None)
+    sites = tuple(named()) if callable(named) else ("",) * len(wiring)
+    if len(sites) != len(wiring):
+        raise ValueError(f"the model names {len(sites)} call sites for the {len(wiring)} calls of its wiring")
+    return sites
+
+
 def expected(plan, model, rows: Optional[int] = None) -> List[Site]:
     """The block calls of one step in the model's wiring order (``model.wiring()``), each with its block's census entries, the
-    provider row's form and -- for an entry that states its launch -- the entry's facts at ``rows`` (default: the plan's
-    sequences x tokens).  An entry that declines to state them for a row count its row claims is recorded on the site
-    (``wrong``): the check then fails, because the table is wrong."""
+    provider row's form at that call site (``ProviderRow.site_form``) and -- for an entry that states its launch -- the entry's
+    facts there at ``rows`` (default: the plan's sequences x tokens).  An entry that declines to state them for a row count
+    its row claims, or a call site the row has no form for, is recorded on the site (``wrong``): the check then fails,
+    because the table is wrong."""
     rows = plan.sequences * plan.tokens if rows is None else rows
-    stated: Dict[str, Tuple[Optional[Facts], str]] = {}
+    stated: Dict[Tuple[str, str], Tuple[tuple, Optional[Facts], str]] = {}
     sites = []
-    for name, layer in model.wiring():
+    for (name, layer), at in zip(model.wiring(), call_sites(model)):
         block = plan[name]
-        if name not in stated:
-            facts, wrong = None, ""
-            if any(kernel.shape == "entry" for kernel in block.kernels):
+        if (name, at) not in stated:
+            form, facts, wrong = (), None, ""
+            try:
+                form = tuple(plan.rows[name].site_form(at))
+            except ValueError as error:
+                wrong = str(error)
+            if not wrong and any(kernel.shape == "entry" for kernel in block.kernels):
                 try:
-                    facts = block.launch_facts(rows)
+                    facts = block.launch_facts(rows, at) if at else block.launch_facts(rows)
                 except (ValueError, NotImplementedError) as error:
                     wrong = str(error)
                 if facts is None and not wrong:
                     wrong = "the adapter states no launch facts"
-            stated[name] = (facts, wrong)
-        sites.append(Site(name, layer, tuple(block.kernels), block.entry, tuple(plan.rows[name].form), *stated[name]))
+            stated[(name, at)] = (form, facts, wrong)
+        sites.append(Site(name, layer, tuple(block.kernels), block.entry, *stated[(name, at)], at))
     return sites
 
 
@@ -331,28 +360,34 @@ def check_forms(sites: Sequence[Site], call_log: Sequence[Sequence[Call]] = ()) 
     row's form (``Call.form``: what the adapter read from the object it called).  Returns the sentences of what does not
     hold."""
     failures = []
-    for site in {site.block: site for site in sites}.values():
+    for site in {(site.block, site.site): site for site in sites}.values():
         if site.wrong:
-            failures.append(f"{site.block}: {site.entry} states no launch for this run ({site.wrong}): the provider table is wrong")
+            failures.append(f"{site.row}: {site.entry} states no launch for this run ({site.wrong}): the provider table is wrong")
         if not site.form and any(kernel.shape == "entry" for kernel in site.kernels):
-            failures.append(f"{site.block}: the row names no form; {site.entry} would be called on its own pick")
+            failures.append(f"{site.row}: the row names no form; {site.entry} would be called on its own pick")
         if site.facts is None:
             continue
         for name, value in site.form:
             if name not in site.facts.form:
-                failures.append(f"{site.block}: the row's form names {name}, which the form of {site.entry} does not have")
+                failures.append(f"{site.row}: the row's form names {name}, which the form of {site.entry} does not have")
             elif site.facts.form[name] != value:
-                failures.append(f"{site.block}: the row's form says {name} {value!r}, {site.entry} states {name} {site.facts.form[name]!r} for this run")
-    by_site = {(site.block, site.layer): site for site in sites}
-    served = {}  # (block, the form the serving instance states) -> the first call site: one sentence per kind of difference
+                failures.append(f"{site.row}: the row's form says {name} {value!r}, {site.entry} states {name} {site.facts.form[name]!r} for this run")
+    by_site = {}  # (block, layer) -> its first call of a step: where a step's calls are not the wiring's, a call is found by name
+    for site in sites:
+        by_site.setdefault((site.block, site.layer), site)
+    served = {}  # (block, call site, the form the serving instance states) -> the first call: one sentence per kind of difference
     for calls in call_log:
-        for call in calls:
-            site = by_site.get((call.block, call.layer))
+        for index, call in enumerate(calls):
+            # a block may be called twice in a layer, each call at a site of its own: a call is held against the site at its
+            # own place of the wiring
+            at = sites[index] if index < len(sites) and (sites[index].block, sites[index].layer) == (call.block, call.layer) else None
+            site = at or by_site.get((call.block, call.layer))
             if site is not None and tuple(call.form) != tuple(site.form):
-                served.setdefault((call.block, tuple(call.form)), (site, call))
+                served.setdefault((call.block, site.site, tuple(call.form)), (site, call))
     for site, call in served.values():
+        where = f"{site.name}, the call at {site.site}" if site.site else site.name
         failures.append(
-            f"{site.name}: the adapter served the call with the form{form_text(call.form) or ' []'} ({call.instance or 'no entry instance'}); "
+            f"{where}: the adapter served the call with the form{form_text(call.form) or ' []'} ({call.instance or 'no entry instance'}); "
             f"the row says{form_text(site.form) or ' []'}"
         )
     return failures
@@ -379,7 +414,9 @@ class Comparison:
         """The failures, one line per distinct sentence with the steps it holds for, at most ``limit`` of them."""
         steps: Dict[str, List[int]] = {}
         for step, sentence in self.failures:
-            steps.setdefault(sentence, []).append(step)
+            at = steps.setdefault(sentence, [])
+            if step not in at:  # a block that is called twice in a layer can fail twice in one step with one sentence
+                at.append(step)
         lines = []
         for sentence, at in list(steps.items())[:limit]:
             more = f" (and {len(at) - 1} more of the {self.steps} traced steps)" if len(at) > 1 else ""
@@ -551,8 +588,12 @@ BASES = ("recorded", "planned")
 PARTS = ("prologue", "epilogue", "after_step")
 #: what an entry of a section may state beside its block and its kernel: ``launch`` = [grid, block, shared memory in bytes]
 #: of one launch at the section's row count; ``at`` = the fields of the model's geometry, beyond the section's layer widths,
-#: that this one launch shape was recorded with (the output head's: the vocabulary)
-ENTRY_FACTS = ("launch", "at")
+#: that this one launch shape was recorded with (the output head's: the vocabulary); ``form`` = the fields of the kernel's
+#: form the target passes at THIS call, beyond the form its kernel has everywhere (a kernel that is called in several forms)
+ENTRY_FACTS = ("launch", "at", "form")
+#: an optional part of a section's row count: per block the facts that differ at that block's first call in the model's
+#: first layer (the first norm of a step has no residual to add)
+FIRST_LAYER = "first_layer"
 #: the packages the providers of this area import, as a run names them: of the versions a census records, these are
 #: compared with what is installed.  A change that brings a provider of another package adds the package here
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
@@ -754,8 +795,10 @@ class Target:
       (``recorded`` or ``planned``), what was recorded, ``geometry`` -- the layer widths of the model it holds for, under
       the names of the family's geometry -- and per row count the entries of a step as ``[block, kernel id, facts]``,
       before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
-      ``launch`` = ``[grid, block, shared memory]``, and ``at`` = further fields of the geometry that this one launch
-      shape was recorded with.
+      ``launch`` = ``[grid, block, shared memory]``, ``at`` = further fields of the geometry that this one launch
+      shape was recorded with, and ``form`` = the fields of the kernel's form the target passes at this call beyond the
+      form the kernel has everywhere (a kernel the target calls in several forms).  ``first_layer`` (optional): per
+      block the facts that differ at its first call in the model's first layer.
 
     ``ValueError`` for a file that is not such a census; for a section that says ``claimed`` on a basis that is not
     ``recorded``, without the widths it holds for, or with a target kernel whose launch shape it does not record (only a
@@ -806,6 +849,12 @@ class Target:
                 if section["claimed"] and not geometry:
                     wrong(f"{where}: claimed without the layer widths it holds for")
                 for rows, parts in section["rows"].items():
+                    first = parts.get(FIRST_LAYER, {})
+                    if not isinstance(first, dict) or not all(isinstance(facts, dict) and set(facts) <= set(ENTRY_FACTS) for facts in first.values()):
+                        wrong(f"{where}, {rows} rows: {FIRST_LAYER} is not an object of block: facts ({' and '.join(ENTRY_FACTS)})")
+                    for block, facts in first.items():
+                        if not isinstance(facts.get("form", {}), dict) or ("launch" in facts and not _launch_shape(facts["launch"])):
+                            wrong(f"{where}, {rows} rows, {FIRST_LAYER}: the form of {block} is not an object, or its launch is not a launch shape")
                     for part in (*PARTS, *layers.values()):
                         if not isinstance(parts.get(part), list):
                             wrong(f"{where}, {rows} rows: no entry list {part}")
@@ -821,6 +870,8 @@ class Target:
                             at = facts.get("at", {})
                             if not isinstance(at, dict) or not all(isinstance(v, int) and not isinstance(v, bool) for v in at.values()):
                                 wrong(f"{where}, {rows} rows, {part}: at of {block} is not an object of geometry fields (name: whole number)")
+                            if not isinstance(facts.get("form", {}), dict):
+                                wrong(f"{where}, {rows} rows, {part}: the form of {block} is not an object of form fields")
                             meta = kernels[kernel_id]
                             if section["claimed"] and "launch" not in facts and meta["relation"] == TARGET and "selection" not in meta:
                                 wrong(
@@ -830,12 +881,23 @@ class Target:
         return data
 
     def sequence(self, parts: Mapping, layer_kinds: Sequence[str]) -> List[Tuple[str, str, Mapping]]:
-        """The entries of one step of a model with these layer kinds, in step order: ``(block, kernel id, facts)``."""
+        """The entries of one step of a model with these layer kinds, in step order: ``(block, kernel id, facts)``.  Where
+        the section says what differs in the first layer (``first_layer``), the first call of each block it names there
+        carries those facts, its form merged field by field."""
         try:
-            layers = [entry for kind in layer_kinds for entry in parts[self.data["layers"][kind]]]
+            layers = [[tuple(entry) for entry in parts[self.data["layers"][kind]]] for kind in layer_kinds]
         except KeyError as error:
             raise ValueError(f"{self.name}: the census has no entry list for the layer kind {error.args[0]!r}") from None
-        return [tuple(entry) for entry in (*parts["prologue"], *layers, *parts["epilogue"], *parts["after_step"])]
+        for block, facts in parts.get(FIRST_LAYER, {}).items() if layers else ():
+            at = next((index for index, entry in enumerate(layers[0]) if entry[0] == block), None)
+            if at is None:
+                raise ValueError(f"{self.name}: {FIRST_LAYER} names {block}, which the first layer of this model does not call")
+            _, kernel_id, own = layers[0][at]
+            merged = {**own, **facts}
+            if "form" in facts:
+                merged["form"] = {**own.get("form", {}), **facts["form"]}
+            layers[0][at] = (block, kernel_id, merged)
+        return [tuple(entry) for entry in (*parts["prologue"], *(entry for layer in layers for entry in layer), *parts["epilogue"], *parts["after_step"])]
 
     def kind(self, kernel_id: str) -> str:
         """``code`` or ``port`` for a target kernel, ``""`` for a stand-in."""
@@ -871,12 +933,14 @@ class Target:
                 have = [f"{count} row{'s' if count != '1' else ''}" for count in section["rows"]]
                 reasons.append(f"no recorded section for {rows} row{'s' if rows != 1 else ''} on {claim.device}: recorded is {' and '.join(have) or 'none'}")
             else:
-                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds), model.geometry)
-                for block, identity in dict(zip(claim.blocks, claim.identities)).items():
+                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds), model.geometry, call_sites(model))
+                found = []  # per call, so that a block that is the target's at one call site and not at another is named
+                for block, identity in zip(claim.blocks, claim.identities):
                     if identity.relation == OTHER and block not in getattr(plan, "overridden", ()):
-                        reasons.append(f"not the target set: {block} ({identity.reason})")
+                        found.append(f"not the target set: {block} ({identity.reason})")
                     elif identity.relation in (TARGET, STAND_IN) and identity.reason:
-                        reasons.append(f"no recorded launch shape of {block} for this model: {identity.reason}")
+                        found.append(f"no recorded launch shape of {block} for this model: {identity.reason}")
+                reasons += list(dict.fromkeys(found))
                 reasons += [f"the plan has no block for {block}" for block in dict.fromkeys(block for block, _, _ in claim.absent)]
                 if not reasons and not section["claimed"]:
                     reasons.append("the census does not claim this class yet")
@@ -892,9 +956,10 @@ class Target:
         claim.reasons = reasons
         return claim
 
-    def _identify(self, claim: Claim, plan, wiring, sequence, geometry=None) -> None:
-        """Walk the wiring beside the census's entries of a step and give every block call its identity.  A census entry whose
-        block the plan does not have is kept as absent; any other disagreement of the two orders is a ``ValueError``."""
+    def _identify(self, claim: Claim, plan, wiring, sequence, geometry=None, sites: Sequence[str] = ()) -> None:
+        """Walk the wiring beside the census's entries of a step and give every block call its identity (``sites``: the call
+        site of every call, ``call_sites``).  A census entry whose block the plan does not have is kept as absent; any other
+        disagreement of the two orders is a ``ValueError``."""
         position = 0
         for index, (block, _) in enumerate(wiring):
             declared = tuple(plan[block].kernels)
@@ -911,22 +976,28 @@ class Target:
                 )
             _, kernel_id, facts = sequence[position]
             position += 1
-            claim.identities.append(self._identity(plan, block, kernel_id, facts, geometry))
+            claim.identities.append(self._identity(plan, block, kernel_id, facts, geometry, sites[index] if index < len(sites) else ""))
         for block, kernel_id, _ in sequence[position:]:
             if block in plan:
                 raise ValueError(f"{self.name}: the census does not follow this model's wiring: it has {block} after the last call of a step")
             claim.absent.append((block, kernel_id, self.kind(kernel_id)))
 
-    def _identity(self, plan, block: str, kernel_id: str, facts: Mapping, geometry=None) -> Identity:
+    def _identity(self, plan, block: str, kernel_id: str, facts: Mapping, geometry=None, site: str = "") -> Identity:
         meta, row, kind = self.data["kernels"][kernel_id], plan.rows[block], self.kind(kernel_id)
         exact = [kernel for kernel in plan[block].kernels if kernel.relation == "exact"]
         if not exact:
             return Identity(NOT_YET, kernel_id, kind, row.fallback or "no kernel of its own")
         if len(exact) != 1 or exact[0].id != kernel_id:
             return Identity(OTHER, kernel_id, kind, f"the row launches {', '.join(kernel.id for kernel in exact)}, the target {kernel_id}")
-        want = tuple(meta.get("form", {}).items())
-        if dict(row.form) != dict(want):
-            return Identity(OTHER, kernel_id, kind, f"the row's form is{form_text(row.form) or ' []'}, the target's{form_text(want) or ' []'}")
+        # the target's form at this call: the form its kernel has everywhere and, behind it, what the census names for this call
+        want = tuple({**meta.get("form", {}), **facts.get("form", {})}.items())
+        try:
+            have = tuple(row.site_form(site))
+        except ValueError as error:  # the wiring calls the block at a site its row has no form for
+            return Identity(OTHER, kernel_id, kind, str(error))
+        if dict(have) != dict(want):
+            where = f" at {site}" if site else ""
+            return Identity(OTHER, kernel_id, kind, f"the row's form{where} is{form_text(have) or ' []'}, the target's{form_text(want) or ' []'}")
         launch = facts.get("launch")
         shape = None if launch is None else (tuple(launch[0]), tuple(launch[1]), int(launch[2]))  # JSON lists: rebuilt before any comparison
         # a launch shape recorded with a field of the geometry this model does not share (the output head's: the vocabulary) is
@@ -1001,27 +1072,28 @@ class Traced:
     def details(self) -> List[str]:
         """Per exact row what a step launched, and the kernels a library chose inside the fallback rows (printed, not gated)."""
         lines = []
-        calls = Counter(site.block for site in self.sites)
+        calls = Counter((site.block, site.site) for site in self.sites)
         recorded = {} if self.claim is None else {self.sites[index].block: shape for index, shape in self.claim.recorded.items()}
-        for site in {site.block: site for site in self.sites}.values():
+        for site in {(site.block, site.site): site for site in self.sites}.values():
             for kernel in site.kernels:
                 if kernel.relation != "exact":
                     continue
-                made, total = calls[site.block], calls[site.block] * kernel.launches
+                made, total = calls[(site.block, site.site)], calls[(site.block, site.site)] * kernel.launches
                 count = f"{total} launch{'es' if total != 1 else ''} per step ({made} call{'s' if made != 1 else ''} x {kernel.launches} per call)"
                 if site.facts is not None:
                     symbols = ", ".join(site.facts.symbols) or "none compiled"
                     lines.append(
-                        f"{site.block}: {site.entry}{form_text(site.form)}, {count}; the entry states {shape_text(site.facts.shape)} and the kernel {symbols}"
+                        f"{site.row}: {site.entry}{form_text(site.form)}, {count}; the entry states {shape_text(site.facts.shape)} and the kernel {symbols}"
                     )
                 elif kernel.shape == "entry":
-                    lines.append(f"{site.block}: {site.entry}{form_text(site.form)}, {count}; the entry states no launch for this run")
+                    lines.append(f"{site.row}: {site.entry}{form_text(site.form)}, {count}; the entry states no launch for this run")
                 elif site.block in recorded:  # no entry states its shape; the census of the target records one
                     lines.append(
                         f"{site.block}: {site.entry}, {count}; {kernel.id} by name, and in the launch shape the census records: {shape_text(recorded[site.block])}"
                     )
                 else:
                     lines.append(f"{site.block}: {site.entry}, {count}; {kernel.id} by name (no launch shape is declared for it)")
+        lines += self.served()
         if self.result is not None:
             for family, picks in sorted(self.result.picks.items()):
                 if family == "pytorch":
@@ -1031,6 +1103,23 @@ class Traced:
                 lines.append(f"chosen by a library inside the fallback rows (printed, not gated): {family}: {chosen}{more}")
         if self.claim is not None:  # a stack that declares a target: how much of it this run launched, and the census line
             lines += [*self.claim.coverage(), self.claim.line(self.status)]
+        return lines
+
+    def served(self) -> List[str]:
+        """For every block whose row names several call sites: which entry instance served how many calls of the first traced
+        step, in which form -- counted from the call log, which the adapters wrote after each call from the object they had
+        called.  (Whether each call was served in the form of ITS site is item 0 of the check; this is the count.)"""
+        lines = []
+        if not self.call_log:
+            return lines
+        named = {site.block for site in self.sites if site.site}
+        counts: Dict[str, Counter] = {}
+        for call in self.call_log[0]:
+            if call.block in named:
+                counts.setdefault(call.block, Counter())[(call.instance, tuple(call.form))] += 1
+        for block, by_instance in counts.items():
+            parts = "; ".join(f"{count} x {instance or 'no entry instance'}{form_text(form)}" for (instance, form), count in by_instance.items())
+            lines.append(f"{block}, as the call log of a traced step has it ({sum(by_instance.values())} calls): {parts}")
         return lines
 
     def dump(self) -> dict:
@@ -1045,6 +1134,15 @@ class Traced:
             )
         logged = {(call.block, call.layer): call for calls in self.call_log for call in calls}
         unlogged = Call("", -1, self.rows, "", ())  # of a pass that made no traced step
+        first = self.call_log[0] if self.call_log else []
+
+        def call_at(index: int, site: Site) -> Call:
+            """The call of the first traced step at this place of the wiring (a block may be called twice in a layer), else a
+            call of that block and layer from any step."""
+            if index < len(first) and (first[index].block, first[index].layer) == (site.block, site.layer):
+                return first[index]
+            return logged.get((site.block, site.layer), unlogged)
+
         stated = self.claim is not None and self.claim.known
         return {
             "rows": self.rows,
@@ -1055,11 +1153,12 @@ class Traced:
                 {
                     "block": site.block,
                     "layer": site.layer,
+                    "site": site.site,
                     "entry": site.entry,
                     "identity": self.claim.identities[index].text() if stated else "",
-                    "instance": logged.get((site.block, site.layer), unlogged).instance,
+                    "instance": call_at(index, site).instance,
                     "form": {name: value for name, value in site.form},
-                    "served": {name: value for name, value in logged.get((site.block, site.layer), unlogged).form},
+                    "served": {name: value for name, value in call_at(index, site).form},
                     "kernels": [{"id": k.id, "origin": k.origin, "relation": k.relation, "launches": k.launches, "shape": k.shape} for k in site.kernels],
                     "stated": (
                         None
@@ -1103,13 +1202,16 @@ def table(plan, claim: Optional[Claim] = None) -> str:
         elif kernels:
             chains += _total(calls)
             checked = "by family" + (f"; fallback: {row.fallback}" if row.fallback and claim is None else "")
-        cells = (name, calls, block.provider, block.entry + form_text(row.form), ", ".join(kernel.id for kernel in kernels) or "--", launches, checked)
+        forms = f" + one of {len(row.sites)} forms, by call site" if row.sites else ""
+        cells = (name, calls, block.provider, block.entry + form_text(row.form) + forms, ", ".join(kernel.id for kernel in kernels) or "--", launches, checked)
         lines.append(cells + ((claim.of(name),) if stated else ()))
     widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
     sms = f", {plan.facts.sm_count} SMs" if plan.facts.sm_count else ""
     run = f"stack {plan.stack}, {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}, {plan.facts.class_text}{sms}"
     text = [f"kernels, planned (decided before the load from {plan.source}; {run})"]
     text += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in lines]
+    for name in plan:  # a row whose entry is called in several forms: the form of every call site it names
+        text += [f"  {name} at {site}:{form_text(fields)}" for site, fields in plan.rows[name].sites]
     text.append(
         f"  per step: {exact} launch{'es' if exact != 1 else ''} on {rows} exact row{'s' if rows != 1 else ''}, checked one by one in the wiring order; "
         f"the launches of {chains} fallback call{'s' if chains != 1 else ''} and of the host path are attributed by family"
@@ -1128,14 +1230,17 @@ def stated(plan, rows: Optional[int] = None) -> str:
     for name, block in plan.items():
         if not any(kernel.shape == "entry" for kernel in block.kernels):
             continue
-        try:
-            facts = block.launch_facts(rows)
-        except (ValueError, NotImplementedError) as error:
-            text.append(f"  {name}  {block.entry}: states no launch for this run ({error})")
-            continue
-        symbols = ", ".join(facts.symbols) or "no kernel compiled yet"
-        text.append(f"  {name}  {block.entry}{form_text(plan.rows[name].form)}: {shape_text(facts.shape)}")
-        text.append(f"    {symbols}")
+        row = plan.rows[name]
+        for site in [site for site, _ in row.sites] or [""]:  # an entry that is called in several forms states each one's launch
+            where = f"{name} at {site}" if site else name
+            try:
+                facts = block.launch_facts(rows, site) if site else block.launch_facts(rows)
+            except (ValueError, NotImplementedError) as error:
+                text.append(f"  {where}  {block.entry}: states no launch for this run ({error})")
+                continue
+            symbols = ", ".join(facts.symbols) or "no kernel compiled yet"
+            text.append(f"  {where}  {block.entry}{form_text(row.site_form(site))}: {shape_text(facts.shape)}")
+            text.append(f"    {symbols}")
     if len(text) == 1:
         text.append("  no block of this plan is served by an entry that states its launch")
     return "\n".join(text)

@@ -18,7 +18,9 @@ keeps which blocks were selected that way (``Plan.overridden``).
 
 A row also says in which FORM its entry is called (``form``: the fields of the entry's form the row fixes, which the adapter
 passes on and the kernel check compares with the entry's own answer), and a block declares the kernels it launches as census
-entries (``Block.kernels``, :mod:`model_samples.census`).
+entries (``Block.kernels``, :mod:`model_samples.census`).  An entry that a step calls in several forms has them in its row
+too (``sites``: per call site of the family's wiring the further fields of the form there; ``ProviderRow.site_form``): which
+form serves which call is data of the table, never a choice of the adapter.
 
 This module imports nothing beyond the standard library: a plan on stated device facts (:class:`DeviceFacts`) needs no GPU.
 """
@@ -50,6 +52,8 @@ class ProviderRow:
     ci: bool = True  # False for a row that no test of this repository runs: the table prints "unverified in CI"
     form: Tuple[Tuple[str, object], ...] = ()  # what the adapter passes to the entry: (field of the entry's form, value) pairs
     rows: Tuple[int, Optional[int]] = (1, None)  # a third selection range: rows = sequences x tokens per sequence
+    # an entry that is called in several forms: (call site of the model's wiring, the further fields of the entry's form there)
+    sites: Tuple[Tuple[str, Tuple[Tuple[str, object], ...]], ...] = ()
 
     @property
     def stacks(self) -> Tuple[str, ...]:
@@ -57,6 +61,17 @@ class ProviderRow:
 
     def serves_class(self, cc: Tuple[int, int]) -> bool:
         return any(c == "any" or c == f"cc{cc[0]}.{cc[1]}" or c == f"cc{cc[0]}.x" for c in self.classes)
+
+    def site_form(self, site: str = "") -> Tuple[Tuple[str, object], ...]:
+        """The form the row's entry is called in at ``site`` (a call site as the family's wiring names it, ``model.sites()``):
+        the row's ``form`` and, for a row that names its sites, the fields of that site behind it.  ``ValueError`` for a site
+        such a row does not name: the wiring calls the block where the table says nothing."""
+        if not self.sites:
+            return tuple(self.form)
+        fields = dict(self.sites).get(site)
+        if fields is None:
+            raise ValueError(f"provider row {self.key}: no form for the call site {site!r}; the row names {', '.join(name for name, _ in self.sites)}")
+        return (*self.form, *fields)
 
     def serves_run(self, sequences: int, tokens: int) -> bool:
         return _inside(self.sequences, sequences) and _inside(self.tokens, tokens) and _inside(self.rows, sequences * tokens)
@@ -132,10 +147,11 @@ class Block(Protocol):
         after the call.  The form is read from the object that was called -- the fields of the row's form as that entry
         instance states them -- and never copied from the row; a block without an entry has no instance and passed nothing."""
 
-    def launch_facts(self, rows: int):
+    def launch_facts(self, rows: int, site: str = ""):
         """What the block's entry states about its launch at ``rows`` (``census.Facts``: the symbols of its compiled kernels, its
-        form, its launch shape), or ``None`` for a block without such an entry.  ``ValueError`` / ``NotImplementedError`` when
-        the entry declines to state them for a row count the row claims."""
+        form, its launch shape), or ``None`` for a block without such an entry.  ``site`` names the call site for a row whose
+        entry is called in several forms (``ProviderRow.sites``): each form is an entry instance of its own.  ``ValueError`` /
+        ``NotImplementedError`` when the entry declines to state them for a row count the row claims."""
 
     def __call__(self, *operands):
         """Launch the block on the current stream."""
