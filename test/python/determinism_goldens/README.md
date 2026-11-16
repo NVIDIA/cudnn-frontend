@@ -6989,25 +6989,76 @@ rejected by capability and standalone checks before compilation. An earlier
 config admission failure and a synthetic fixture missing its padding flag
 are retained as development failures; neither is a successful GPU test.
 
-## Linear attention cuTile validation: 2026-11-11 (UTC)
+### Linear attention cuTile launch autotune: fixed-configuration replay and host selection (2026-11-16)
 
-One GB300 (cc 10.3, 152 SMs), CUDA 13.4 driver 13040, torch 2.14.0a0 (nv26.09), nvidia-cutlass-dsl 4.8.0, cudnn-frontend
-source checkout of PR #1735 rebased on develop. From `test/python`:
+The cuTile GDN and KDA engines tune each kernel's launch hints, `occupancy`
+in {1, 2, 3, 4} times `num_worker_warps` in {4, 8}, by timing. The worker-warp
+count selects the cross-warp summation tree of every kernel that reduces a
+tile with `ct.sum`, so two processes that time their own candidates can write
+different bytes. The claim qualified here is narrower than candidate
+agreement: **a fixed launch configuration replays its own bytes**, and a host
+can fix the configuration through two hooks in
+`cutile/kernels/common.py`. `select_hints(kernel, cache_key, configs)` returns
+the candidate to launch and skips the timing; `record_hint(kernel, cache_key,
+winner)` is told each timed winner. The hooks are read only when a launch
+misses the in-process hint cache. A failed or timed-out search launches the
+first candidate (`occupancy=1`, `num_worker_warps=4`) and records nothing.
+Independently timed candidates, batch invariance and cross-architecture
+equality are not claimed.
+
+`test_determinism_cutile_autotune_configs` in `linear_attention/test_la.py`
+replaces the timed search with a stand-in that forces candidate *i* on every
+launch, runs the forward and backward twice per *i* for every *i* the sweep
+has, and compares output, final state and every tensor-input gradient
+bitwise; a failing stand-in covers the tuning-failure fallback. A candidate
+the compiler rejects is excluded for that kernel and reported.
+`test_determinism_cutile_autotune_host_hooks` runs a timed round under
+`record_hint`, asserts that every recorded key holds only ints and strings
+(no device id, so one table serves every rank) and that the recorded winner
+is the first candidate, then asserts that a `record_hint` that raises reaches
+the caller. It then pins every launch to the second candidate through
+`select_hints` with the timed search replaced by a mock that fails if called,
+and compares the pinned bytes with a repeat and with the second candidate
+forced directly. Both tests run for GDN and KDA on a ragged batch of six
+sequences. From `test/python`:
 
 ```bash
 python -m pytest linear_attention/test_la.py -k "autotune or determinism" -rA
 ```
 
-**49 passed, 84 skipped, 0 failed**: `test_determinism_fwd` / `_bwd` / `_multi_tile_fwd` / `_multi_tile_bwd` and
-`test_determinism_bwd_all_grads` on FROST (all five variants) and cuTile (GDN, KDA);
-`test_determinism_cutile_autotune_configs`, which forces every autotune candidate of GDN and KDA in turn and asserts
-that each one, and the tuning-failure fallback, replays its own bytes; and `test_determinism_cutile_autotune_host_hooks`,
-which records the timed winners through `record_hint` and then pins every launch through `select_hints`, asserting that
-the timed search never runs and the bytes are the chosen candidate's. The candidates do not all agree with each other
-(forcing each on GB300: occupancy never moved a bit; `num_worker_warps=8` moved the bits of the kkt solve, dqkwg and
-prepare_wy_repr_bwd kernels), which is why a host pins the pick instead of relying on the timing.
-`test_multi_graph_stress` is not selected by this command. The `hopper` / `hopper_cuda` rows and cuTile's
-gdn2 / gdp / mamba2 rows are waived (no plan on this GPU) and count among the skips.
+Source `20493fe8` ran on one GB300 (cc 10.3, 152 SMs) with cuDNN backend
+9.26.0, cuDNN frontend 1.33.0 from the checkout, CuTe DSL 4.8.0, CUDA 13.4
+and driver API 13040, Torch 2.14.0a0 (NGC 26.09):
+**49 passed, 84 skipped, 0 failed.** The passes are `test_determinism_fwd`,
+`_bwd`, `_multi_tile_fwd` and `_multi_tile_bwd` (7 each), `_bwd_all_grads`
+(11), `_two_streams` (5), `test_beta_guard_bwd_determinism` (1) over the FROST
+variants and cuTile GDN and KDA, plus the two autotune tests for GDN and KDA
+(2 each). The skips are the `hopper` and `hopper_cuda` rows and cuTile's
+gdn2, gdp and mamba2 rows, which have no plan on this GPU;
+`test_multi_graph_stress` is not selected. Forcing each candidate on this
+GPU showed that occupancy never moves a bit and that `num_worker_warps=8`
+moves the bits of the kkt solve, dqkwg and prepare_wy_repr_bwd kernels,
+which is why the host pins the pick instead of relying on the timing.
+
+CI pipeline 82134950 ran the same two autotune tests at source `f080e1fe`
+(identical kernel and host code) on SM80, SM90 and SM100 with cuDNN 9.28.1
+and CuTe DSL 4.8.0: **12 of 12 cases passed, no skips**. SM107 was not
+run. No performance was measured: the sweep is develop's, and the hooks act
+only on a hint-cache miss.
+
+QSA is not changed by this revision; its deterministic backward is develop's
+(#2417). For the record on the same GB300 and source `20493fe8`, the QSA
+L0/L1 determinism and replay selection, goldens deselected, gives
+**75 passed, 9 skipped, 0 failed**. The skips are the batch-invariance
+cases waived under PR #2266 (batch layout changes the saved FP32 output or the
+gradients); no replay case is skipped.
+From `test/python`:
+
+```bash
+python -m pytest QSA/cutedsl/test_qsa.py QSA/cutedsl/test_qsa_backward_sm100.py \
+  QSA/cutedsl/test_qsa_indexed_training.py QSA/cutedsl/test_qsa_determinism.py \
+  -m "L0 or L1" -k "(determinism or deterministic or replay) and not golden" -rA
+```
 
 ## 2026-11-10 — JAX grouped SiTU integration
 
