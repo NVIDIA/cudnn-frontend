@@ -16,7 +16,7 @@ from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer
 from cudnn.frost.tile_dsl.handles import GmemTileTma
 from cudnn.frost.tile_dsl.mma import mma_ss
-from cudnn.frost.tile_dsl.pointwise import abs_max_tree, amax_to_ue8m0_rp
+from cudnn.frost.tile_dsl.pointwise import abs_max_tree, amax_to_ue8m0_rp, opaque_f32_bits
 from cudnn.frost.tile_dsl.tma import tma_load_tile
 from cudnn.sdpa.bwd.kernels.sm100._fp8_common import _join, _output
 from cudnn.sdpa.bwd.kernels.sm100._fp8_common import (
@@ -284,10 +284,12 @@ def kernel(
             _grad(slab, done, math_phase, tmem, live != 0, dq)
             math_phase = math_phase ^ 1
             live = cutlass.Int32(1)
-    one = cutlass.Float32(1.0)
+    # _output feeds these factors to packed inline PTX, which needs registers.
+    one = opaque_f32_bits(0x3F800000)
     _output(slab, tmem, dgmap, owner, head, batch, chunk, TG, one, one, live != 0, dtype, None)
     if cutlass.const_expr(not dq):
-        _output(slab, tmem, dvmap, owner, head, batch, chunk, TV, cutlass.Float32(1.0 / 256.0), one, live != 0, dtype, None)
+        dv_factor = opaque_f32_bits(0x3B800000)  # 1 / 256
+        _output(slab, tmem, dvmap, owner, head, batch, chunk, TV, dv_factor, one, live != 0, dtype, None)
     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
     nvvm.barrier_cta_sync()
     if warp == 0:
