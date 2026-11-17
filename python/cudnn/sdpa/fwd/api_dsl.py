@@ -7820,13 +7820,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
-        tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
-        # Smaller CTAs expose more parallelism for short dense queries. At
-        # D192, 64 rows also shrink the Q/V shared-memory region. Keep sixteen
-        # rows per warp and leave explicit TILE_M requests intact.
+        _, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
+        # The shared rule (the split-KV model reads it too); explicit TILE_M requests stay intact.
+        tile_m_default = _sm80_config.default_tile_m(d_qk, d_v, s_qo, self.thd)
         short_d256 = not self.thd and d_qk == d_v == 256 and s_qo <= 128
-        if short_d256 or (not self.thd and ((d_qk == d_v == 128 and s_qo <= 128) or (d_qk == 192 and d_v == 128 and s_qo <= 64))):
-            tile_m_default = 64
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
         self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
         if self.flavor not in ("wide512", "mla576") and self.kernel_tile_m in (16, 32):

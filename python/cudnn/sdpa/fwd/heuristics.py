@@ -61,6 +61,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd import config_sm80 as _sm80_config
 from cudnn.sdpa.fwd.config_sm90 import d128_causal_route as _sm90_d128_causal_route
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
@@ -277,6 +278,12 @@ _SPLIT_KV_COMBINE_FLOOR = 0.35
 # regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
 _SM120_SPLIT_KV_MIN_TILES = 1
 _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
+# SM80 (A100, 108 SMs), half d128 dense causal graphs on the adapter's 128-row query tile: the model sees that
+# tile and the 64-key KV tile (_sm80_chunk_split), with these two constants. Fitted on a forced split ladder
+# (study sm80_d128_gqa_split_cal_20261117): regret 1.050 -> 1.005 on 99 train cells, 1.025 -> 1.002 on 37
+# holdout cells, no changed cell past 1.04 / 1.01 of today's choice. The 64-row tile keeps the shared model.
+_SM80_SPLIT_KV_CTA_COST = 3.0
+_SM80_SPLIT_KV_COMBINE_COST = 0.02
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
 # S_q of _SERIAL_COMBINE_MIN_SQ and up there. That kernel walks the split axis
@@ -362,6 +369,8 @@ def choose_split_kv(
     combine_floor: Optional[float] = None,
     serial_combine: bool = False,
     serial_combine_cost: float = _SPLIT_KV_SERIAL_COMBINE_COST,
+    cta_cost: Optional[float] = None,
+    combine_cost: Optional[float] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -435,9 +444,14 @@ def choose_split_kv(
     assignment, as happens when D192 uses CGA1 unsplit but requires CGA2 for a
     split. It defaults to the split geometry, preserving the ordinary case.
 
+    ``cta_cost`` / ``combine_cost`` replace CTA_COST / COMBINE_COST for a
+    machine fitted on its own (_SM80_SPLIT_KV_CTA_COST).
+
     Returns 1 when there is nothing to split or nothing beats not splitting.
     ``candidates`` defaults to :func:`split_kv_candidates` for the device.
     """
+    cta_cost = _SPLIT_KV_CTA_COST if cta_cost is None else cta_cost
+    combine_cost = _SPLIT_KV_COMBINE_COST if combine_cost is None else combine_cost
     split_launch = _SplitKvLaunch(q_tiles, heads_q, kv_tiles, ctas_per_tile)
     if unsplit_launch is None:
         unsplit_launch = split_launch
@@ -454,7 +468,7 @@ def choose_split_kv(
     # ... and that one wave costs no less than a lone block's serial walk of
     # its partials: with fewer rows than the machine holds at once there is
     # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
-    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
+    per_partial = max(combine_waves * combine_cost, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -470,7 +484,7 @@ def choose_split_kv(
         waves = _ceil_div(base_ctas * split, sm_count)
         # No combine runs unsplit: the single-pass kernel writes O itself.
         combine = split * per_partial if split > 1 else 0.0
-        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine
+        cost = waves * (_ceil_div(launch.kv_tiles, split) + cta_cost) + combine
         if serial_combine and split > 1:
             cost += split * serial_combine_cost
         if best_cost is None or cost < best_cost:
@@ -2624,10 +2638,28 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     return longest
 
 
+def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.d_qk == facts.d_v == 128
+        and not facts.thd
+        and not facts.has_paged_kv
+        and facts.causal
+        and facts.window_left is None
+        and not facts.has_bias
+        and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 128
+    )
+
+
 def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *, physical: bool = True, split_kv: int = 1) -> _SplitKvLaunch:
     """The launch the wave-cost model sees. ``physical=False`` counts the MMA
     width per cluster (the count the model's constants were fitted with);
     ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
+    if _sm80_chunk_split(caps, facts, tile_m):
+        # One CTA per 128-row tile of packed rows (groups may straddle tiles), walking 64-key tiles.
+        return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, 128), facts.h_q // pack_g, _ceil_div(facts.s_kv, tile_n or _sm80_config.LLAMA_CFG.TILE_N), 1)
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=split_kv)
     if (
         _sm100_f16(caps, facts)
@@ -2845,7 +2877,7 @@ def _split_points(
             **(
                 dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
                 if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
-                else {}
+                else (dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST) if _sm80_chunk_split(caps, facts, tile_m) else {})
             ),
             serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,

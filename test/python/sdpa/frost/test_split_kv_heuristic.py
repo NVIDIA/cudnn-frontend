@@ -1443,3 +1443,39 @@ def test_decode_combine_form_rule_holds_on_the_cc_10_7_line_only(device_cc):
     assert all(walk(*cell) is rule_line for cell in ((32, 24, 1, 2), (128, 24, 1, 2), (32, 24, 4, 3), (128, 24, 4, 2), (32, 32, 4, 3)))
     assert not any(walk(*grid, s) for grid in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (2, 4, 8, 16, 32, 128))
     assert heur.DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS == heur.DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
+
+
+@pytest.mark.parametrize(
+    "b,h_q,h_kv,s_q,s_kv,split",
+    [
+        # 128-row query tile, SM80 constants. A100 80GB PCIe ms by split (study sm80_d128_gqa_split_cal_20261117):
+        (4, 28, 4, 256, 65536, 8),  # 1: 7.86, 4: 6.15, 8: 5.95, 16: 6.05
+        (8, 14, 2, 256, 32768, 8),  # 1: 3.92, 4: 3.12, 8: 3.02, 16: 3.10
+        (1, 16, 8, 2048, 16385, 2),  # 1: 1.87, 2: 1.74, 4: 1.73
+        # 64-row query tile (S_q <= 128): the shared model's choice stands.
+        (8, 14, 2, 17, 131072, 4),
+    ],
+)
+def test_sm80_d128_chunks_split_on_the_adapter_grid(b, h_q, h_kv, s_q, s_kv, split):
+    """The SM80 split model reads the adapter's 128-row x 64-key grid, not the SM100 512-row cluster tile."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm80")
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
