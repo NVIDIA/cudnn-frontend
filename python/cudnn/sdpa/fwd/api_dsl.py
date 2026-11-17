@@ -7753,9 +7753,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
 
         self._not_implemented_error_if(
-            not self.thd and (self.cu_seq_q_lens or self.cu_seq_kv_lens),
-            "SdpaFwdDslSm80 does not serve dense cu_seq_len graphs",
+            not self.thd and self.paged and (self.cu_seq_q_lens or self.cu_seq_kv_lens),
+            "SdpaFwdDslSm80 does not serve dense cu_seq_len graphs with paged KV",
         )
+        if not self.thd:
+            self.seq_q_lens_present = self.seq_q_lens_present or self.cu_seq_q_lens
+            self.seq_kv_lens_present = self.seq_kv_lens_present or self.cu_seq_kv_lens
         if self.thd:
             self._not_implemented_error_if(
                 self.cu_seq_q_lens and self.seq_q_lens_present,
@@ -7940,6 +7943,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             causal_bottom_right=self.causal_bottom_right,
             has_seq_kv_lens=self.seq_kv_lens_present and not self.thd,
             has_seq_q_lens=self.seq_q_lens_present and not self.thd,
+            cu_seq_q_lens=self.cu_seq_q_lens and not self.thd,
+            cu_seq_kv_lens=self.cu_seq_kv_lens and not self.thd,
             has_sink=self.has_sink,
             stats_log2=self.stats_log2,
             has_bias=self._bias_present,

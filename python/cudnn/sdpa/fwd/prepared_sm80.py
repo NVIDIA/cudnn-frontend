@@ -69,8 +69,8 @@ def build_spec(api):
         operands.append(None)
         geometry.append(None)
     for enabled, count, dtype in (
-        (api.seq_kv_lens_present, api.batch_size, "int32"),
-        (api.seq_q_lens_present, api.batch_size, "int32"),
+        (api.seq_kv_lens_present, api.batch_size + int(api.cu_seq_kv_lens), "int32"),
+        (api.seq_q_lens_present, api.batch_size + int(api.cu_seq_q_lens), "int32"),
         (api.has_sink, api.h_q, "float32"),
     ):
         if enabled:
@@ -135,6 +135,10 @@ class PreparedSm80Launch:
         self.spec = spec
         attributes = ("q", "k", "v", "o", "stats", "seq_len_kv", "seq_len_q", "sink_token", "bias", "paged_k_table", "paged_v_table")
         tensors = [getattr(binding, name) for name in attributes[: len(spec.operands)]]
+        for index, name in ((5, "cu_seq_len_kv"), (6, "cu_seq_len_q")):
+            cumulative = getattr(binding, name)
+            if cumulative is not None:
+                tensors[index] = cumulative
         self._roles = [name for name, t in zip(PAGED_ROLES, tensors) if t is not None]
         self._uids = [t.get_uid() for t in tensors if t is not None]
         self._indices = None

@@ -113,6 +113,10 @@ def _host(
     )
 
     if cutlass.const_expr(params.split_kv > 1):
+        combine_q_lens = _view(seq_q, geometry[6]) if cutlass.const_expr(params.has_sink) else None
+        if cutlass.const_expr(params.has_sink and params.cu_seq_q_lens):
+            # The shared reduction already accepts adjacent prefix pairs.
+            combine_q_lens = cute.make_tensor(seq_q, cute.make_layout((b, 2), stride=(1, 1)))
         _launch_combine(
             partial_o,
             partial_stats,
@@ -132,7 +136,7 @@ def _host(
             DECODE_GRID_OFF,
             stream,
             _view(sink, geometry[7]),
-            _view(seq_q, geometry[6]) if cutlass.const_expr(params.has_sink) else None,
+            combine_q_lens,
         )
 
 

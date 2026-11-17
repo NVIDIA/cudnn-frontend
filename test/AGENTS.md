@@ -1665,3 +1665,13 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+
+### Dense cumulative-length readers
+
+A dense CU feature must reach every length consumer, including split/sink
+reduction Q trimming. Keep its B+1 metadata declaration separate from B-length
+carriers and from packed storage origins. Compare ordinary versus cumulative
+forms byte for byte, change device prefixes under capture, and retain
+same-side ambiguity and missing-padding declines. The SM80 detectors are
+`test_sdpa_dense_cu_lengths.py` and its batch-invariance companion.
