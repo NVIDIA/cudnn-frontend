@@ -42,7 +42,7 @@ def _dtype_name(dtype) -> Optional[str]:
     return None
 
 
-DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120"})
+DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80"})
 """Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
 (SM120: the two-kernel dS / dQ split), so those graphs neither share the default classes' entries nor count as unmeasured."""
 
@@ -1267,6 +1267,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm120", (12, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm120_bwd_bf16_20261107"),
     ("sdpa_bwd_sm120", (12, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm120_bwd_bf16_20261107"),
     ("sdpa_bwd_sm120", (12, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm120_bwd_bf16_20261107"),
+    # study sm80_det_bwd_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE ba0b35370; deterministic backward, dense BSHD squares, d64 / d128,
+    # MHA and GQA groups 3-8, no mask / causal / 128- and 1024-key windows, S 1k-8k; 192 train cells and a 48-cell holdout scored
+    # once: 19 changed at 0.17-0.64, worst 1.02). On A100 FROST's deterministic body leads only windowed graphs from S 4096 (d128
+    # MHA on cost); every unwindowed class measured `never` and keeps the hand rule. gpt-oss d64 SWA backward ran engine 7 at 9.1x.
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "gqa", False): Entry("ge", 11.5, "sm80_det_bwd_20261117", "kv"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "gqa", True): Entry("ge", 11.5, "sm80_det_bwd_20261117", "kv"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "gqa", False): Entry("ge", 11.5, "sm80_det_bwd_20261117", "kv"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "gqa", True): Entry("ge", 11.5, "sm80_det_bwd_20261117", "kv"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "mha", False): Entry("ge", 34.5, "sm80_det_bwd_20261117"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "mha", True): Entry("ge", 34.5, "sm80_det_bwd_20261117"),
     # study sm120_det_bwd_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 9bdf9a8ab; deterministic backward, dense BSHD squares,
     # d64 / d128, MHA and GQA 4 / 8, no mask, causal and 128 / 1024-key windows, S 1k-8k; 128 train cells and a 40-cell holdout
     # scored once: 36 changed cells in 16 classes at 0.14-0.92 geomean, worst 0.93; the two class pairs no holdout cell exercised (d128 causal MHA, d64 no-mask GQA) have no entry). FROST's deterministic body (two kernels) runs 0.1-0.9 of the backend's deterministic engine;

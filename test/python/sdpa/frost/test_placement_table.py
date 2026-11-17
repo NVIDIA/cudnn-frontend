@@ -543,7 +543,29 @@ def test_sm120_deterministic_backward_follows_its_study(s):
     assert pt.lookup(row, bwd(s_q=1024, s_kv=1024, **d128)) is False  # the d128 window classes lead from S 2048
     assert pt.lookup(row, bwd(s_q=2048, s_kv=2048, **d128)) is True
     assert pt.lookup(row, bwd(d_qk=128, d_v=128, window_left=None)) is None  # d128 causal MHA: no holdout cell
-    assert pt.class_key("sdpa_bwd_sm80", bwd(device_cc=(8, 0))) is None
+    assert pt.class_key("sdpa_bwd_sm89", bwd(device_cc=(8, 9))) is None  # an unkeyed row: deterministic stays unmeasured
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s", [8192, 5000], ids=["on_tile", "off_tile"])
+def test_sm80_deterministic_backward_follows_its_study(s):
+    """Study sm80_det_bwd_20261117: on A100 deterministic backward is keyed like SM120's; windowed d128 and windowed d64 GQA lead from
+    S 4096, unwindowed classes keep the hand rule (measured `never`), and d64 windowed MHA has no entry yet."""
+    row = "sdpa_bwd_sm80"
+
+    def bwd(**over):
+        base = dict(b=2, h_q=32, h_kv=8, s_q=s, s_kv=s, d_qk=128, d_v=128, causal=True, bottom_right=False, window_left=128)
+        base.update(has_paged_kv=False, device_cc=(8, 0), deterministic=True)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.class_key(row, bwd())[4] == "prefill_det"
+    for over in (dict(), dict(d_qk=64, d_v=64)):
+        assert pt.lookup(row, bwd(**over)) is True, over
+        assert pt.matched_entry(row, bwd(**over)).study == "sm80_det_bwd_20261117"
+    assert pt.lookup(row, bwd(s_q=2048, s_kv=2048)) is False
+    assert pt.lookup(row, bwd(window_left=None)) is None
+    assert pt.lookup(row, bwd(h_q=64, h_kv=64, d_qk=64, d_v=64)) is None
 
 
 @pytest.mark.L0
