@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100 CuTeDSL unified MXFP8 indexer-score kernel (MXFP4 subclasses it).
+"""SM100 CuTeDSL unified MXFP8 indexer-score kernel (MXFP4 and NVFP4 subclass it).
 
 One CTA owns one packed m tile (128 (token, head) rows: 128 // H query tokens) and
 walks its whole ratio-causal K range under CLC persistent scheduling.  SwapAB: K is
@@ -91,9 +91,12 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
     # smallest group (4 heads) packs 32 tokens.
     max_q_tokens_per_tile = 32
     # Block-scaled format of Q/K, named in errors.  E4M3 Q/K run tcgen05
-    # kind::mxf8f6f4, whose MMA reads K=32 values and one E8M0 scale per row.
+    # kind::mxf8f6f4, whose MMA reads K=32 values and one E8M0 scale per row;
+    # each scale covers sf_vec_size head_dim values.
     format_name = "MXFP8"
     mma_inst_k = 32
+    sf_vec_size = 32
+    scale_dtype = cutlass.Float8E8M0FNU
 
     SPLIT = 3  # n blocks (= TMEM accumulators) per KV split
     NUM_SPLIT_STAGES = 3  # KV split ring depth (SMEM)
@@ -111,14 +114,16 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         k_block_size: int | None = None,
         ratio: int = 1,
         is_varlen: bool = False,
-        sf_vec_size: int = 32,
+        sf_vec_size: int | None = None,
         compute_lse: bool = False,
         is_compressed_logits: bool = False,
     ):
         if head_dim != 128:
             raise ValueError(f"SM100 unified indexer {self.format_name} currently requires head_dim=128")
-        if sf_vec_size != 32:
-            raise ValueError(f"SM100 dense score {self.format_name} currently requires sf_vec_size=32")
+        if sf_vec_size is None:
+            sf_vec_size = type(self).sf_vec_size
+        if sf_vec_size != type(self).sf_vec_size:
+            raise ValueError(f"SM100 dense score {self.format_name} currently requires sf_vec_size={type(self).sf_vec_size}")
         if m_block_size != 128 or n_block_size != 128:
             raise ValueError(f"SM100 dense score {self.format_name} currently requires m_block_size=n_block_size=128")
         if qhead_per_kvhead not in (4, 8, 16, 32, 64):
@@ -154,7 +159,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             is_compressed_logits=is_compressed_logits,
         )
         self.sf_vec_size = sf_vec_size
-        self.sf_dtype = cutlass.Float8E8M0FNU
+        self.sf_dtype = self.scale_dtype
         # One full-D128 scale tile per n block (K) / per work tile (Q).
         self.scale_tile_k = self.head_dim_padded
 
@@ -176,7 +181,9 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         self.relu_fadd_all = self.qhead_per_kvhead != 64
 
         # TMEM: SPLIT accumulators of m_block columns, then a NUM_SF_STAGES ring of SPLIT K-scale
-        # (SFA) fields, then the Q-scale (SFB) field.
+        # (SFA) fields, then the Q-scale (SFB) field.  A field reserves tmem_sfa_cols / tmem_sfb_cols
+        # columns; the format's scales fill 4 (one scale per row per MMA K step, MXFP8 / MXFP4) or
+        # 8 (NVFP4) of them, which the kernel checks when it builds the TMEM scale layouts.
         self.tmem_s_stride = self.m_block_size
         self.tmem_sfa_cols = (self.n_block_size // 32) * 4
         self.tmem_sfb_cols = (self.m_block_size // 32) * 4
@@ -213,6 +220,10 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
     ):
         # mDenom is None when compute_lse is off: the slot is compiled out (R3).
         is_varlen = mCuSeqlensQ is not None
+        if const_expr(mQScale.element_type is not self.scale_dtype or mKScale.element_type is not self.scale_dtype):
+            raise TypeError(
+                f"SM100 unified indexer {self.format_name} expects {self.scale_dtype} Q/K scales, got {mQScale.element_type} / {mKScale.element_type}"
+            )
         # The API accepts BSHD or packed THD; the compile key records is_varlen and these asserts make a mismatch
         # fail at compile time instead of silently misreading strides.
         if const_expr(is_varlen):
@@ -500,6 +511,14 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         tCtQSFB_layout = _blockscaled_layout.make_tmem_layout_sfb(
             blockscaled_tiled_mma_qk, (self.n_block_size, self.m_block_size, self.head_dim_padded), self.sf_vec_size, q_scale_smem_layout
         )
+        # Each scale field must fit the TMEM columns reserved for it (see __init__).
+        sfa_cols = tcgen05.find_tmem_tensor_col_offset(cute.make_tensor(sf_tmem_ptr, tCtKSFA_layout))
+        sfb_cols = tcgen05.find_tmem_tensor_col_offset(cute.make_tensor(sf_tmem_ptr, tCtQSFB_layout))
+        if const_expr(sfa_cols > self.tmem_sfa_cols or sfb_cols > self.tmem_sfb_cols):
+            raise ValueError(
+                f"{self.format_name} scale fields need {sfa_cols} (K) / {sfb_cols} (Q) TMEM columns, "
+                f"but {self.tmem_sfa_cols} / {self.tmem_sfb_cols} are reserved"
+            )
         tCtQSFB = cute.make_tensor(sf_tmem_ptr + tmem_sf_offset_scale * self.tmem_q_sfb_offset, tCtQSFB_layout)
         tiled_copy_s2t_qsfb, tCsQSFB_compact_s2t, tCtQSFB_compact_s2t = self._s2t_copy_and_partition(sQScale, tCtQSFB)
 

@@ -14,7 +14,7 @@ features.** It means this new reference has not yet been checked for that scope.
 | Architecture | Current reference | Documentation coverage |
 |---|---|---|
 | SM80 (cc 8.0) | [SM80 support](sm80.md) | FP16/BF16 forward and backward implementation identities documented; full backward feature reference pending |
-| SM89 (cc 8.9) | [SM89 support](sm89.md) | FP16/BF16 forward documented; no FROST SDPA backward engine |
+| SM89 (cc 8.9) | [SM89 support](sm89.md) | FP16/BF16 forward documented; FP16/BF16 backward fixed-body identities and inherited feature scope documented |
 | SM90 (cc 9.0) | [SM90 support](sm90.md) | Forward documented; no FROST SDPA backward engine |
 | SM100 / SM103 (cc 10.0 / 10.3) | [SM100 / SM103 support](sm100.md) | Forward and FP16/BF16 D64/D128 recompute/pair/accumulation, D192/V128 accumulation, D192/V128–D256 two-by-two and D264–D512 backward documented; other backward paths pending migration |
 | SM107 (cc 10.7) | [SM107 support](sm107.md) | Forward, shared D64/D128 recompute and D128 accumulation, native D192/V128, D256 and D264–D512 half backward, plus native per-tensor FP8 and MXFP8 backward documented; shared quantized feature reference pending |
@@ -25,6 +25,17 @@ For a pending section, consult the registered [forward](../../fwd/engines.py) an
 [manifest](../../../engines/manifest.py). The
 [legacy tracker](../SUPPORT_MATRIX_TRACKER.md) remains a historical reference;
 its claims may be stale or conflict with later entries.
+
+## Dense and ragged layout combinations
+
+For nonpaged FROST attention, Q, K and V must all use dense declarations or all
+carry ragged offsets. Mixing ragged queries with dense K/V, or dense queries with
+ragged K/V, is declined by both forward and backward FROST engines. Paged K/V is
+a separate contract: supported rows may combine ragged queries with page pools.
+The shared graph analyzer preserves mixed-layout facts because backend support
+is independent; version-specific backend correctness guards still apply.
+Detector: `test_mixed_ragged_layout_is_provider_support_not_invalid` in
+`test_sdpa_bwd_backend_guard.py`.
 
 ## Reading a support page
 

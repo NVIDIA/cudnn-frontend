@@ -15,7 +15,8 @@ the four-layer one (three + one).
 
 The ``fe-entries`` cell runs the same default run on the stack ``fe-entries``: every cuDNN Frontend row of the stack ``native``
 (the fused linear-attention step in its wait + release form; on compute capability 10.x the attention gate + quantise
-entry, judged against its twin) with every other block on its fallback row -- no package beyond cuDNN Frontend and PyTorch.
+entry and the add + RMSNorm + quantise entry in the form of each call site, each judged against its twin) with every other
+block on its fallback row -- no package beyond cuDNN Frontend and PyTorch.
 That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan,
 the entries' own launch facts and, where the family's kernel census has a section for the GPU, the recorded launch shapes.
 Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entries stack (kernels not observed: <reason>)``:
@@ -64,8 +65,10 @@ def sample(monkeypatch):
 
 
 FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2"
-#: with the gate entry (compute capability 10.x) one more block is cuDNN Frontend's and one reference chain fewer is a fallback
-FE_ENTRIES = "by provider: cuDNN FE 2 | fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3) | PyTorch 2"
+#: with the gate entry and the norm entry (compute capability 10.x) two more blocks are cuDNN Frontend's and two reference chains fewer are fallbacks
+FE_ENTRIES = "by provider: cuDNN FE 3 | fallbacks 6 (cuBLAS over copies 4, PyTorch chains 2) | PyTorch 2"
+#: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
+FE_ENTRIES_CC100 = "by provider: cuDNN FE 4 | fallbacks 6 (cuBLAS over copies 4, PyTorch chains 2) | PyTorch 2"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
@@ -141,14 +144,19 @@ def test_default_run_passes_its_own_checks(sample, capsys):
 @pytest.mark.L0
 def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kernel_check(capsys):
     """The cuDNN Frontend rows of the stack ``native``, on real launches: the fused step in its wait + release form and, on
-    compute capability 10.x, the gate + quantise entry inside its band against its twin; the kernel check on every launch
-    of the traced steps; the census line, which claims nothing while a row is a fallback.  In a fresh interpreter: the
-    kernel check reads kernel names from the profiler, which names them wrongly in a process that has unloaded a kernel
-    module (the module docstring)."""
+    compute capability 10.x, the gate + quantise entry and the add + RMSNorm + quantise entry (four of its forms on the
+    two-layer model, each call served by the instance of its call site) inside their bands against their twins; on
+    compute capability 10.0 the FP8 projection entry for the in-projections (one instance per weight shape) inside the
+    band of the reference multiply, and on every other class that block on its multiply over a copy; the
+    kernel check on every launch of the traced steps; the census line, which claims nothing while a row is a fallback.
+    In a fresh interpreter: the kernel check reads kernel names from the profiler, which names them wrongly in a process
+    that has unloaded a kernel module (the module docstring)."""
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
-    gate = torch.cuda.get_device_capability()[0] == 10  # the gate entry serves compute capability 10.x
-    out = _run(None, capsys, ["--stack", "fe-entries"], "fe-entries", FE_ENTRIES if gate else FE_CUBLAS, unobserved=True)
+    gate = torch.cuda.get_device_capability()[0] == 10  # the gate entry and the norm entry serve compute capability 10.x
+    projection = tuple(torch.cuda.get_device_capability()) == (10, 0)  # the class the row of the FP8 projection entry claims
+    by_provider = FE_ENTRIES_CC100 if projection else (FE_ENTRIES if gate else FE_CUBLAS)
+    out = _run(None, capsys, ["--stack", "fe-entries"], "fe-entries", by_provider, unobserved=True)
     assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "stack fe-entries" in out
     assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the target's form"
     assert out.count("\nkernels, planned (decided before the load") == 2 and out.count("\n  kernels  ") == 2, "the kernel check ran at both sequence counts"
@@ -157,6 +165,26 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert "cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True]" in out
         assert out.count("[band: gate_fp8]  PASS") == 2, "the gate entry was judged against its twin at both sequence counts"
         assert "attention.gate_quantize equal (gated)" in out or "REPORTED" in out
+        assert "cudnn.AddNormQuantDecode [PDL True, PDL_RELEASE True] + one of 6 forms, by call site" in out, "the norm entry, a form per call site"
+        assert out.count("[band: add_norm_quant]  PASS") == 2, "the norm entry was judged against its twin at both sequence counts"
+        assert "add_norm_quantize equal (gated)" in out or "REPORTED" in out
+        served = [line for line in out.splitlines() if line.strip().startswith("add_norm_quantize, as the call log of a traced step has it (5 calls): ")]
+        assert len(served) == 2 and all(
+            line.count(" x cudnn.AddNormQuantDecode #") == 4 for line in served
+        ), "five calls of a step on four forms, each from its instance"
+    multiply = [line for line in out.splitlines() if line.split()[:1] == ["projection.fp8.in"] and "calls" in line and "[band: " in line]
+    assert len(multiply) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in multiply), "the in-projection was judged at both sequence counts"
+    if projection:
+        form = "[SPLIT_K 1, MMA_M 128, STAGES 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True]"
+        assert f"cudnn.Fp8ProjectionDecode {form} + one of 2 forms, by call site" in out, "the FP8 projection entry, the kernel stated whole"
+        assert "projection.fp8.in equal (gated)" in out or "REPORTED" in out
+        served = [line for line in out.splitlines() if line.strip().startswith("projection.fp8.in, as the call log of a traced step has it (2 calls): ")]
+        assert len(served) == 2 and all(line.count(" x cudnn.Fp8ProjectionDecode #") == 2 for line in served), "one instance per weight shape"
+        stated = [line for line in out.splitlines() if line.strip().startswith("projection.fp8.in at ") and "; the entry states " in line]
+        assert len(stated) == 4 and all("block (256, 1, 1), shared memory" in line for line in stated), "both shapes, at both sequence counts"
+    else:
+        assert "cudnn.Fp8ProjectionDecode" not in out, "the row claims compute capability 10.0 only"
+        assert any(line.split()[:1] == ["projection.fp8.in"] and line.endswith("fallback: bf16 copy of 8-bit weights") for line in out.splitlines())
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
     frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
 

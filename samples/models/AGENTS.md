@@ -48,7 +48,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    flags leave no provider block to judge (`[NN] RAN (no provider block was judged)`, the blocks line `REPORTED`):
    `PASS` is kept for a run in which provider blocks were compared with the reference and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
-   classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. To add a provider: add its
+   classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. An entry that serves
+   some layer widths only has them in its row (`widths`: fields of the model's geometry); a model of the family with
+   another width is then the next row's, and the run says that no kernel identity is stated for it -- never `ERROR`. To add a provider: add its
    key to `providers.KEYS` with its factory, add its row above the rows it should win against (and below a row of the
    same key that an existing command selects with `--provider`), name its tie-out band, and regenerate the family
    README's tables (`configs.readme_table`); a host test keeps them in agreement. A third-party
@@ -59,7 +61,12 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    (`Block.twin`): a reference block written at the kernel's rounding points, in the reference's accumulation precision.
    The reference is matched to the kernel's documented arithmetic; the band is then the kernel's own contract, never a
    width that covers the distance between two chains. A band names the outputs it applies to; an output it does not name
-   is judged by its dtype, and state a call updates byte for byte. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   is judged by its dtype, and state a call updates byte for byte. An adapter launches its entry and nothing else:
+   what a consumer on a fallback row needs beyond the kernel's bytes -- a gather out of the kernel's scale layout, a
+   quantisation the target does with a launch of its own -- is launched by that consumer, when it reads its operand
+   (`weights.dequantize`). An adapter that multiplies on the stored format of its weight says so (`stored_weights`):
+   the load of the session then keeps that format beside the bf16 copy for the block, as the loader had it, and the
+   memory sentence counts it; the copy stays, because the reference block and every fallback row read it. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -104,13 +111,22 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. A row of an entry that
     states its launch names at least one field: with none the entry runs on its own pick and nothing is compared, so
     the check fails it. The call log of a traced step is an observation: after each call the adapter says which entry
-    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. The
+    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. A
+    traced pass keeps one such log per traced step, and a step without its log fails the check. The
     check then holds the profiler's record of every launch of the traced steps against the plan. Where those records
     cannot be had the run ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check
     stays `FAIL`. A new adapter comes with its census entries, and a chain that gains an operator whose kernel no
     pattern of `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name.
     The host tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there
     must fail with its own sentence, and the last line of a run is held by running `main()` to its end.
+    An entry that a step calls in several forms has them in its row, by call site (`sites`: the further fields of the
+    form at each site); the family's wiring names the site of every call (`sites()`), and the step hands that name to
+    the block. The adapter holds one entry instance per form and serves a call with the instance of its site; which
+    form serves which call is never its choice. Every item of the check then holds per call site, and a call is found
+    by its place in the wiring, not by its block and layer: a block can be called twice in a layer. A site name
+    belongs to one block (an adapter finds the sites of its row in the wiring by name), and what differs between the
+    sites of a row may be the operand's shape as well as the kernel's form: an entry that is one weight shape per
+    instance has the shape of each site in its row.
 16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
     target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
@@ -120,7 +136,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     README, a cell of a table, the line in which a run says what it compared. The three numbers of the set count what a
     complete stack launches; a text that gives them says how many of the entries a stack calls today. Byte equality
     with a target kernel is the entry's own record (the census names where it stands: `tie_out`, `differences`), never
-    a measurement of the sample. A section is `claimed` only on a `recorded` basis and only when no row selected on it
+    a measurement of the sample. A form may hold a field only the port has; the row and the census then name the value
+    the port's byte comparison ran with, the census lists under `differences` what the target kernel does there, and
+    the family README says so beside the row. A section is `claimed` only on a `recorded` basis and only when no row selected on it
     is a fallback; until then a run prints `NOT CLAIMED` with every reason that applies, and a section of one GPU
     class, SM count, row count or set of layer widths is never used for another. `EQUAL` says what was compared: a
     claimed section records the launch shape of every target kernel but a tuner's pick and a stand-in, and a fact the
@@ -306,3 +324,82 @@ Each of these passed every test and every GPU run of the first version; a host t
 - An entry gates the installed toolchain where it builds its kernel, not where it is constructed or asked for a launch
   shape. Planned without a build, a GPU whose target the installed CuTe DSL cannot assemble passed the plan, read 55 GiB
   of weights and ended in a traceback that blamed the adapter. The entry's first use belongs to the plan.
+
+## What building the norm row taught
+
+- One block, several forms. The target calls the add + RMSNorm + quantise kernel in five forms in a step, and a launch
+  record cannot tell them apart: one kernel id, one grid, one block, one shared memory. So the form of a call is data
+  at three places that a host test holds to each other -- the row (per call site), the wiring (the site of every
+  call), the census (the form of every call) -- and it is observed in the call log, which says which entry
+  instance served the call. A wrong form shows there and, for this entry, in the kernel's symbol, which carries the
+  form's text; never in a launch shape. A check that reads the log must also fail without it: a traced pass with
+  launch records and no call log passed until a host test asked.
+- A block that is called twice in a layer is not found by its block and layer. The first version of the census dump
+  looked a call up that way and reported, for a layer's input norm, the form of the layer's second norm call. A call
+  is the one at its place in the wiring.
+- A kernel that updates an operand in place changes what the next caller of the tie-out sees. The norm kernel adds
+  into the residual stream; the reference block and the run of one sequence alone must each start from the stream as
+  it was. Declare such an operand as state of the block (`state_args`), so that it is saved, restored and compared.
+- A kernel breaks an exact rounding tie its own way. A bf16 value over a block scale times a scale such as 1/336 is
+  an exact 4-bit midpoint more often than chance suggests (2 elements in 1,000 on random rows), and there the code
+  follows the kernel's own reciprocal. The reference quantiser and a kernel's chain differed by a whole code on 6
+  elements in 10,000. So the twin of such a kernel keeps a bracket, and the band is the kernel's documented
+  contract; a tolerance on codes would have been the wrong tool, and "equal to the reference quantiser" the wrong
+  claim. On rows 64 wide, in a host test, one such code moved a logit by seven bf16 units.
+- What a kernel hands to a block that is not a kernel yet is not the adapter's to convert. A gather, a quantisation
+  or a copy inside the adapter is a launch in the span of a row that declares one kernel; next to another exactly
+  judged row the check fails it, and next to a fallback row it would pass as that row's. Hand the bytes over as they
+  are and let the consumer convert when it reads them.
+- Attribution by family cannot see everything. A launch more in front of the first norm of a step fails the check,
+  because the gather before it is judged one by one; the same launch in front of a norm that follows a fallback row
+  is counted as that row's, and a launch behind the norm's kernel is counted as the consumer's at every call site
+  while that consumer is a fallback row. The check is exact where two exactly judged rows meet, and it gets sharper
+  with every row that leaves its fallback. Until then "the adapter launches nothing but its entry" is held on the
+  adapter itself: a host test finds, in what the adapter returns, the very tensors its entry wrote.
+- A row says what its entry serves, also in the model's widths. The norm entry serves one hidden width. The first
+  version of its row did not say so, and a checkpoint of the family with another width ended in "the provider table
+  is wrong" where the README promised a run on the reference chain. The table was wrong: the width is a condition of
+  the row.
+- A sentence counted once per occurrence, not once per step, read "and 7 more of the 4 traced steps" as soon as a
+  block could fail twice in a step.
+
+## What building the projection row taught
+
+- The class of a row is where the target launches the kernel, not where the entry runs. The FP8 projection entry
+  serves compute capability 10.x; the target launches it for the in-projections on 10.0 and a library multiply on the
+  other classes, so the row claims 10.0 and up to 32 rows, and everywhere else the block prints its fallback reason.
+- A row states the kernel whole. This entry picks its own form when none is passed, and the pick may move with the
+  entry; the row names the split, the weight tile, the ring depth, the tensor-memory columns and their release and
+  both launch knobs, the adapter passes the form as one object, and it refuses a row that leaves one of them out.
+- One block, one form, two weight shapes. The in-projection's weight has another shape in each kind of layer and the
+  entry is one shape per instance, so the shape is a field of the row per call site, as a form is for the norm block.
+  Here a launch record does tell the sites apart (one thread block per 128 weight rows), and the census records both.
+- A site name belongs to one block. The first draft named the in-projection's sites by the layer's kind, which the
+  norm block's sites already are; the norm's adapter, which finds the sites of its row in the wiring by name, would
+  have built a form no call of a two-layer model is made in. A host test that pins the forms a run builds holds it.
+- A kernel on the stored format needs the stored format. The loader had the merged 8-bit codes in hand and freed them
+  after the copy; it now keeps them for the blocks that say they multiply on them, asked by the plan of the session
+  and of the sessions that follow on its weights. The copy stays for the reference, so the memory sentence grows, and
+  the allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the
+  stored bytes alone. Measure the sentence against a run whenever what a stack holds changes.
+- With a second exactly judged row behind it, a launch behind a layer's input norm fails the check: it now sits
+  between two rows that are judged one by one. The same launch behind the in-projection fails in a linear-attention
+  layer (the fused step follows) and is counted as the reference chain's in an attention layer. What the check
+  cannot see shrank by those places and no further.
+- A chain of dependent launches is a statement about three kernels. The norm releases at its wait, the in-projection
+  starts on that release and waits before it reads the norm's codes, the fused step starts on the in-projection's
+  release and waits before it reads the projection's rows. Each row says in a comment what the launch before it must
+  not write and what the launch after it must wait for; replay and the block check on the device are what hold it.
+- Run a row at the largest row count it claims. The row claims 1 to 32 rows and its first runs went to 16. From 17
+  rows the kernel check of every stack failed on the embedding row: PyTorch's index-select launches another kernel
+  there, which the row's pattern did not name. A pattern names every kernel its operator launches over the row counts
+  a stack serves, and the run table of a row has its first and its last row count.
+- What a report says of a stack follows the plan. The `bytes per step` line counted every weight as a bf16 copy after
+  a block had begun to read its weight on the stored format; the model is now asked with the blocks of the session's
+  own plan that multiply there, and the line says how many bytes are read in the stored format.
+- A table rendered for one GPU class names that class. The second served-by table of the family README is the plan
+  on compute capability 10.0; its heading said 10.x and the sentence under it kept the count of the other classes. A
+  host test now holds the heading and the by-provider sentence to the plan's own line, per class.
+- An option an adapter declines on is tested through the session that hands it over. The adapter's decline for a
+  weight merged at one scale per row was tested on a block built by hand; without the option in the session's plan
+  the decline would have come after the load, as an error about another plan.

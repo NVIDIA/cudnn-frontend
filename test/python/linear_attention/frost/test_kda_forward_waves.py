@@ -12,8 +12,7 @@ import cudnn
 from cudnn.linear_attention.frost import kda_engine
 from determinism_utils import assert_bitwise, snapshot
 from linear_attention.determinism import pack, sequences
-from linear_attention.frost.test_kda_piece_capacity import _prepared
-from linear_attention.test_la import frost_la_unavailable
+from linear_attention.test_la import frost_la_unavailable, prepared_kda_graph as _prepared
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -135,7 +134,9 @@ def test_forward_wave_checkpoint_autograd(monkeypatch, dtype, cadence):
         pytest.skip(reason)
     from cudnn.linear_attention.ops import kda, kimi_delta_attention
 
-    inputs = pack(sequences("kda", [0, 17, 8193, 513], dtype=dtype, heads=4, value_heads=8, key_dim=64, value_dim=128))
+    lengths = [0, 17, 8193, 513]
+    populated = sum(-(-length // cadence) for length in lengths)
+    inputs = pack(sequences("kda", lengths, dtype=dtype, heads=4, value_heads=8, key_dim=64, value_dim=128))
     inputs["g"].fill_(-0.001)
     names = ("q", "k", "v", "g", "beta", "initial_state")
 
@@ -154,7 +155,7 @@ def test_forward_wave_checkpoint_autograd(monkeypatch, dtype, cadence):
             plan_name="kda_frost",
         )
         grads = torch.autograd.grad((out, state), tuple(leaves.values()), (inputs["do"], inputs["dfs"]))
-        return snapshot({"out": out, "state": state, "checkpoints": checkpoints, **dict(zip(names, grads))})
+        return snapshot({"out": out, "state": state, "checkpoints": checkpoints[:populated], **dict(zip(names, grads))})
 
     monkeypatch.setattr(kda_engine, "_forward_head_divisor", lambda *args: 1)
     expected = call()

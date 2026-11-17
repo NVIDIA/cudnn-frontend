@@ -13,12 +13,14 @@ A block that runs here is not fast and is not meant to be: one launch per PyTorc
 
 from __future__ import annotations
 
+import struct
+
 import torch
 import torch.nn.functional as F
 
 from ..census import Kernel
 from ..sampling import greedy
-from ..weights import Dequantized, ScaledTensor, _e4m3, dequantize, quantize_fp8, quantize_nvfp4
+from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, _e2m1, _e4m3, _e4m3_values, dequantize, quantize_fp8, quantize_nvfp4
 from . import PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
 
 BF16 = torch.bfloat16
@@ -132,18 +134,14 @@ def _bf16_from_bits(bits: torch.Tensor) -> torch.Tensor:
     return bits.to(torch.int16).view(BF16)
 
 
-def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
-    """The gated attention output formed as the QUOTIENT ``o / (1 + exp(-gate))``, accumulated in ``acc`` on the bf16 operands,
-    with its bf16 bracket: ``(nearest, other, margin)``.  ``nearest`` is the round-to-nearest-even bf16 of the quotient,
-    decided by comparing the quotient with the midpoint of the two bf16 values around it (never by a cast that rounds
-    twice); ``other`` is the bf16 value on the other side of the quotient (``nearest`` itself where the quotient is a bf16
-    value); ``margin`` is the distance of the quotient from the midpoint of the two, in fp32 units of the quotient (+inf
-    where it is a bf16 value).  A kernel that forms the same quotient in fp32 rounds to ``nearest`` wherever the margin
-    exceeds its own fp32 error, and to one of the two everywhere.  The exponential is formed as the kernel forms it: where
-    it overflows fp32 it is +inf and the gated value +-0, whatever ``acc`` could still represent."""
-    exponential = torch.exp(-gate.to(acc))
-    exponential = torch.where(exponential > FP32_MAX, torch.full_like(exponential, float("inf")), exponential)
-    t = o.to(acc) / (1.0 + exponential)
+def bf16_bracket(t: torch.Tensor):
+    """The bf16 bracket of a value ``t`` held in the reference's accumulation precision: ``(nearest, other, margin)``.
+    ``nearest`` is the round-to-nearest-even bf16 of ``t``, decided by comparing ``t`` with the midpoint of the two bf16
+    values around it (never by a cast that rounds twice); ``other`` is the bf16 value on the other side of ``t``
+    (``nearest`` itself where ``t`` is a bf16 value); ``margin`` is the distance of ``t`` from the midpoint of the two, in
+    fp32 units of ``t`` (+inf where it is a bf16 value).  A kernel that forms the same value in fp32 rounds to ``nearest``
+    wherever the margin exceeds its own fp32 error, and to one of the two everywhere."""
+    acc = t.dtype
     v = t.float().to(BF16)  # one end of the bracket (both roundings are monotone); which end is decided below, in ``acc``
     bits = _bf16_bits(v)
     sign, magnitude = bits & 0x8000, bits & 0x7FFF
@@ -154,18 +152,78 @@ def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
     oa = other.to(acc)
     exact = t == va
     to_v, to_other = (t - va).abs(), (t - oa).abs()
-    # ``v`` unless the other end is strictly nearer.  A quotient ON the midpoint is exact in fp32, so the cast above has
+    # ``v`` unless the other end is strictly nearer.  A value ON the midpoint is exact in fp32, so the cast above has
     # already rounded it to the even end: at equal distances ``v`` is the nearest-even value
     at_v = exact | (to_v <= to_other)
     nearest = torch.where(at_v, v, other)
     # ... and where the other end is the nearer one, ``v`` stays in the bracket as its second value.  That happens where the
-    # quotient rounds to the midpoint itself in fp32 and the even end is the farther one: ``v`` is then what an fp32 chain
+    # value rounds to the midpoint itself in fp32 and the even end is the farther one: ``v`` is then what an fp32 chain
     # rounds to, and a bracket without it would hold the nearest value twice
     second = torch.where(at_v, other, v)
     exponent = torch.frexp(t.abs()).exponent.clamp(min=-125)
-    unit = torch.pow(torch.tensor(2.0, dtype=acc, device=t.device), (exponent - 24).to(acc))  # one fp32 unit of the quotient
+    unit = torch.pow(torch.tensor(2.0, dtype=acc, device=t.device), (exponent - 24).to(acc))  # one fp32 unit of the value
     margin = torch.where(exact, torch.full_like(t, float("inf")), (t - (va + oa) * 0.5).abs() / unit)
     return nearest, second, margin
+
+
+def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
+    """The gated attention output formed as the QUOTIENT ``o / (1 + exp(-gate))``, accumulated in ``acc`` on the bf16 operands,
+    with its bf16 bracket (:func:`bf16_bracket`): ``(nearest, other, margin)``.  The exponential is formed as the kernel
+    forms it: where it overflows fp32 it is +inf and the gated value +-0, whatever ``acc`` could still represent."""
+    exponential = torch.exp(-gate.to(acc))
+    exponential = torch.where(exponential > FP32_MAX, torch.full_like(exponential, float("inf")), exponential)
+    return bf16_bracket(o.to(acc) / (1.0 + exponential))
+
+
+#: an NVFP4 kernel scales a block by its largest magnitude times this constant: fp32(1 / 6), by its bits
+FP4_SIXTH_BITS = 0x3E2AAAAB
+#: the relative bound of the encode scale of ``cudnn.AddNormQuantDecode``'s NVFP4 codes, which goes through two approximate
+#: reciprocals: one unit in the last place each, doubled, and one fp32 unit for the two multiplications -- the bound the
+#: entry's own suite holds its codes to (``test/python/norm/frost/add_norm_quant_utils.py``)
+NVFP4_ENCODE_BOUND = 5 * 2.0**-23
+
+
+def norm_bracket(branch: torch.Tensor, residual, weight: torch.Tensor, eps: float):
+    """The residual add and the RMSNorm at the rounding points of a kernel that normalises in fp32 and rounds ONCE to bf16
+    (``cudnn.AddNormQuantDecode``): ``(new residual, nearest, other, margin)``.  The new residual is ``bf16(fp32(branch) +
+    fp32(residual))`` (the branch itself where there is no residual yet).  The normalised value is evaluated in fp64 on
+    the bf16 operands -- ``v (1 + w) / sqrt(mean(v^2) + eps)`` with ``v`` the exact sum and ``eps`` the fp32 value the kernel
+    adds -- whatever precision the run's reference accumulates in: the kernel's contract is stated against that
+    evaluation; then its bf16 bracket (:func:`bf16_bracket`)."""
+    if residual is None:
+        v, new_residual = branch.double(), branch
+    else:
+        v, new_residual = residual.double() + branch.double(), (residual.float() + branch.float()).to(BF16)
+    eps32 = struct.unpack("<f", struct.pack("<f", eps))[0]
+    t = v * (1.0 + weight.double()) / torch.sqrt(v.square().mean(-1, keepdim=True) + eps32)
+    nearest, other, margin = bf16_bracket(t)
+    return new_residual, nearest, other, margin
+
+
+def nvfp4_global_scale(scale: float, device) -> torch.Tensor:
+    """The global scale an NVFP4 kernel takes for an operand whose consumer reads ``code * block_scale * scale``: the fp32
+    reciprocal of ``scale``, correctly rounded (the consumer of the kernel's bytes reads ``code * block_scale / global``)."""
+    return torch.ones((), dtype=torch.float32, device=device) / torch.tensor(float(scale), dtype=torch.float32, device=device)
+
+
+def nvfp4_block_scales(largest: torch.Tensor, scale: float) -> torch.Tensor:
+    """The E4M3 block-scale bytes of blocks whose largest magnitudes are ``largest`` (fp32), as the kernel forms them:
+    ``e4m3(global * (largest * fp32(1 / 6)))`` -- two fp32 multiplications and one nearest-even rounding."""
+    sixth = torch.tensor(FP4_SIXTH_BITS, dtype=torch.int32, device=largest.device).view(torch.float32)
+    return _e4m3(nvfp4_global_scale(scale, largest.device) * (largest.float() * sixth))
+
+
+def nvfp4_code_bracket(y: torch.Tensor, scale_bytes: torch.Tensor, scale: float):
+    """``(low, high)``: the two E2M1 codes (one nibble per element, the sign kept on a zero) the kernel can write for the bf16
+    values ``y`` under the stored block scales ``scale_bytes``.  Its encode scale goes through two approximate
+    reciprocals, so with ``q = global / block_scale`` in fp64 a code is ``e2m1(y q (1 - r))`` or ``e2m1(y q (1 + r))``,
+    ``r`` = :data:`NVFP4_ENCODE_BOUND`: two adjacent codes at most, and one wherever ``y q`` is not within ``r`` of a
+    rounding midpoint.  A block whose scale byte is zero holds the codes of the signed zero."""
+    stored = _e4m3_values(scale_bytes, torch.float64).repeat_interleave(BLOCK, dim=-1)
+    live = stored != 0
+    quotient = torch.where(live, nvfp4_global_scale(scale, y.device).double() / torch.where(live, stored, torch.ones_like(stored)), torch.zeros_like(stored))
+    exact = y.double() * quotient  # under a zero block scale: the signed zero of y
+    return _e2m1(exact * (1.0 - NVFP4_ENCODE_BOUND), signed_zero=True), _e2m1(exact * (1.0 + NVFP4_ENCODE_BOUND), signed_zero=True)
 
 
 def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> ScaledTensor:
@@ -237,14 +295,48 @@ class TokenChoice(_Reference):
 class AddNormQuantize(_Reference):
     per_row = (0, 1)
 
-    def __call__(self, branch, residual, weight, quant):
+    def __call__(self, branch, residual, weight, quant, site=""):  # the chain is one function at every call site
         return add_norm_quantize(branch, residual, weight, quant, self.eps, self.acc)
+
+
+class AddNormQuantizeBracket(_Reference):
+    """The residual add + RMSNorm + quantise at the rounding points of a kernel that normalises in fp32, rounds the normed
+    value ONCE to bf16 and forms its codes from that bf16 value (``cudnn.AddNormQuantDecode``).  The reference chain
+    (``add_norm_quantize``) is the same function with its one rounding taken from fp64; the kernel's fp32 value may fall
+    on the other side of a bf16 midpoint, and its 4-bit codes follow its own block scales and reciprocals.  This block is
+    the twin of that entry's adapter, not a row of any table: it writes what the form of the call site writes (``forms``:
+    site -> the fields of the adapter's row there) from the NEAREST bf16 value, and keeps of the last call what the band
+    of the entry is judged with (``tie_out``: ``add_norm_quant``): the names of the outputs it compares (``outputs``),
+    ``bracket`` = the nearest bf16 value, the other one around the normalised value and that value's distance from their
+    midpoint, and the quantisation of the call (``quant``)."""
+
+    entry = "torch_ref.add_norm_quantize at the kernel's rounding points"
+    per_row = (0, 1)
+    forms: dict = {}
+    bracket = None
+    outputs: tuple = ()
+    quant = None
+
+    def __call__(self, branch, residual, weight, quant, site=""):
+        form = self.forms[site]
+        new_residual, nearest, other, margin = norm_bracket(branch, residual, weight, self.eps)
+        self.bracket, self.quant = (nearest, other, margin), quant
+        q, names = None, []
+        if form.get("QUANT") == "e4m3_static":
+            q, names = quantize_fp8(nearest, quant.scale), ["codes"]
+        elif form.get("QUANT") == "nvfp4":
+            scales = nvfp4_block_scales(nearest.float().abs().unflatten(-1, (-1, BLOCK)).amax(-1), quant.scale)
+            low, _ = nvfp4_code_bracket(nearest, scales, quant.scale)
+            q, names = BlockScaledTensor(low[..., 0::2] | (low[..., 1::2] << 4), scales, float(quant.scale)), ["codes", "scales"]
+        normed = nearest if form.get("BF16_OUT") else None
+        self.outputs = (*names, *(["normed"] if normed is not None else []), "residual")
+        return q, normed, new_residual
 
 
 class Linear(_Reference):
     kernels = PYTORCH_CHAIN_WITH_MULTIPLY
 
-    def __call__(self, qx, weight):
+    def __call__(self, qx, weight, site=""):  # the chain is one function at every call site
         return linear(qx, weight, self.acc)
 
 

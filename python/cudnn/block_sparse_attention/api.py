@@ -506,7 +506,7 @@ def block_sparse_attention_backward(
     rows.  The forward may have run with or without ``kpage``.
 
     ``metadata`` takes the :class:`BsaBackwardMetadata` that
-    :func:`block_sparse_attention_prepare_backward` built from these metadata
+    :func:`block_sparse_attention_backward_metadata` built from these metadata
     tensors (SM90 blk64 only): the backward then launches no metadata kernels.
     It must describe the same tensors, shapes and ``bucket_size_blocks``;
     an object built from other metadata, or from these tensors before an
@@ -535,9 +535,9 @@ def block_sparse_attention_backward(
         if sparse_block_size != 128:
             raise NotImplementedError("the KPage backward requires sparse_block_size=128 (the blk64 KPage path is forward only)")
         if metadata is not None:
-            raise NotImplementedError("metadata (block_sparse_attention_prepare_backward) and kpage are exclusive; a KPageLayout already holds its metadata")
+            raise NotImplementedError("metadata (block_sparse_attention_backward_metadata) and kpage are exclusive; a KPageLayout already holds its metadata")
     if metadata is not None and (arch_family != 9 or sparse_block_size != 64):
-        raise NotImplementedError("block_sparse_attention_prepare_backward metadata serves the SM90 blk64 backward only")
+        raise NotImplementedError("block_sparse_attention_backward_metadata serves the SM90 blk64 backward only")
     if arch_family == 9 and head_dim != 128:
         raise NotImplementedError("SM90 backward requires head_dim=128")
     if sparse_block_size == 64 and head_dim != 128:
@@ -635,7 +635,7 @@ def block_sparse_attention_backward(
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
 
 
-def block_sparse_attention_prepare_backward(
+def block_sparse_attention_backward_metadata(
     q2k_block_index: torch.Tensor,
     block_sparse_num: Optional[int] = None,
     block_sizes: Optional[torch.Tensor] = None,
@@ -677,7 +677,7 @@ def block_sparse_attention_prepare_backward(
     arch = _device_arch(q2k_block_index)
     if arch // 10 != 9 or sparse_block_size != 64:
         raise NotImplementedError(
-            f"block_sparse_attention_prepare_backward serves the SM90 blk64 backward only (sparse_block_size=64); found SM{arch}, {sparse_block_size}"
+            f"block_sparse_attention_backward_metadata serves the SM90 blk64 backward only (sparse_block_size=64); found SM{arch}, {sparse_block_size}"
         )
     if seqlen_q < 1 or seqlen_k < 1:
         raise ValueError(f"seqlen_q and seqlen_k must be positive, got {seqlen_q} and {seqlen_k}")
@@ -780,6 +780,6 @@ __all__ = [
     "block_sparse_attention_forward",
     "block_sparse_attention_fp8_forward",
     "block_sparse_attention_backward",
-    "block_sparse_attention_prepare_backward",
+    "block_sparse_attention_backward_metadata",
     "kpage_prepare_layout",
 ]

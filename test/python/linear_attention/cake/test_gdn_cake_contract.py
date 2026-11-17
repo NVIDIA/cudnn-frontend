@@ -75,3 +75,14 @@ def test_strided_port_declines():
     tensor = SimpleNamespace(dim=(97, 2, 128), stride=(512, 128, 1), get_data_type=lambda: cudnn.data_type.BFLOAT16)
     with pytest.raises(NotImplementedError, match="q must be contiguous"):
         check_contract(facts(), SimpleNamespace(inputs={"q": tensor}, outputs={}))
+
+
+def test_old_toolkit_declines(monkeypatch):
+    from cudnn._cake import loader
+    from cudnn.linear_attention.cake.gdn_engine import GdnCakeDetEngine
+
+    monkeypatch.setattr(loader, "device_arch", lambda: "sm_100a")
+    monkeypatch.setattr(loader, "_toolkit", lambda *args: ("nvcc", loader.CudaVersion(13, 3, "13.3.73")))
+    graph = SimpleNamespace(_facts_for=lambda analyzer: facts(), nodes=[SimpleNamespace(inputs={}, outputs={})])
+    with pytest.raises(NotImplementedError, match="gdn_cake_det: .* needs CUDA 13.4"):
+        GdnCakeDetEngine().check_support(graph)

@@ -7880,10 +7880,24 @@ _D512_HALF_FOLD_DTYPES = [pytest.param("bfloat16", id="bf16"), pytest.param("flo
 
 @pytest.fixture
 def _d512_role_split(monkeypatch):
-    """Pin the call-time d512 twin OFF so every half d512 plan built in the test lowers onto the role-split kernel."""
+    """Pin the standalone selector and the explicit graph implementation to role-split."""
     from cudnn.sdpa.fwd import api_dsl
+    from cudnn.engines.manifest import family_for
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from cudnn.sdpa.fwd.kernels.sm107.d512_f16_role_split.contract import NAME, QUERY_TILE
+    import test_sdpa_fwd_dsl_sm100 as dsl
 
     monkeypatch.setattr(api_dsl, "D512_2X2", False)
+    select = dsl._select_engine
+
+    def select_role_split(graph, names, **kwargs):
+        # The role-split engine is explicitly selectable even when heuristics
+        # only proposes the 2x2 implementation for this graph.
+        knobs = SdpaFwdKnobs(tile_m=QUERY_TILE, tile_n=128, pack_gqa=False, split_kv=1, sched_policy=0)
+        graph.create_execution_plan(family_for(graph).offered_ids(graph)[NAME], knobs.to_public())
+        return select(graph, NAME, **kwargs)
+
+    monkeypatch.setattr(dsl, "_select_engine", select_role_split)
     yield
 
 

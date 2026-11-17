@@ -11,7 +11,10 @@ cuDNN Frontend until :func:`factories` is called.
 Every adapter declares its census entries (``kernels``, :class:`model_samples.census.Kernel`): the kernels one call launches.
 An adapter to an entry that states its launch also answers ``launch_facts(rows)`` and says what served its last call
 (``serving()``: the entry instance, and the fields of the row's form as that instance states them), which a traced step writes
-into its call log.  An adapter names the block the tie-out compares it with (``twin``).
+into its call log.  An adapter names the block the tie-out compares it with (``twin``).  An adapter whose row names several
+call sites (``ProviderRow.sites``) holds one entry instance per form and serves each call with the instance of ITS site: the
+family's step hands the site over as the block's last operand, and the adapter decides nothing.  An adapter that multiplies
+on the stored format of its weight says so (``stored_weights``): the loader then keeps that format beside the bf16 copy.
 """
 
 from __future__ import annotations
@@ -25,6 +28,8 @@ from ..census import Kernel
 ENTRY_NAMES: Dict[str, str] = {
     "fe.gdn_decode_fused": "cudnn.GdnDecodeFused",
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
+    "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
+    "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
     "cublas.bf16_dequantized": "torch.matmul over a bf16 copy",
     "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize",
     "torch.index_select": "torch.index_select",
@@ -101,6 +106,9 @@ class BlockBase:
     kernels: Tuple[Kernel, ...] = ()
     per_row: Tuple[int, ...] = (0,)
     state_args: Tuple[int, ...] = ()
+    #: whether the block multiplies on the stored format of its weight: a session's load then keeps that format beside the
+    #: bf16 copy for the block (``weights.Dequantized.stored``), and its memory sentence counts it
+    stored_weights = False
 
     def __init__(self, row, model, facts, options):
         self.row, self.model, self.facts, self.options = row, model, facts, options
@@ -141,8 +149,9 @@ class BlockBase:
         check: nothing carries that form.)  An adapter to an entry answers from the object it called."""
         return "", ()
 
-    def launch_facts(self, rows: int):
-        """What the block's entry states about its launch at ``rows``; ``None``: this block has no entry that states one."""
+    def launch_facts(self, rows: int, site: str = ""):
+        """What the block's entry states about its launch at ``rows`` (at the call site ``site``, for a row whose entry is
+        called in several forms); ``None``: this block has no entry that states one."""
         return None
 
 
@@ -154,6 +163,8 @@ def factories() -> Dict[str, Callable]:
     return {
         "fe.gdn_decode_fused": fe.GdnDecodeFusedBlock,
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
+        "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
+        "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,
         "cublas.bf16_dequantized": library.CublasLinear,
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": library.CublasGateUp,
         "torch.index_select": torch_ref.Embedding,

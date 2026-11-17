@@ -10,8 +10,8 @@ followed by an MLP.  One decode step of ``rows`` sequences, block by block (the 
 block                  operands                                          result
 ====================== ================================================= ==============================================
 embedding              ids ``[rows]`` int32, table                       ``[rows, hidden]`` bf16
-add_norm_quantize      branch, residual, norm weight, ``Quant``          (quantised operand, normed bf16, new residual)
-projection.fp8.in      8-bit operand, weight copy                        ``[rows, 16384 | 14336]`` bf16
+add_norm_quantize      branch, residual, norm weight, ``Quant``, site    (quantised operand, normed bf16, new residual)
+projection.fp8.in      8-bit operand, weight copy, site                  ``[rows, 16384 | 14336]`` bf16
 linear_attention.step  x, z, normed hidden, slot ids, params, slots      8-bit ``[rows, 6144]``; state updated in place
 attention.prepare      QKV row, cache, position, params                  (q, gate); key and value inserted in the cache
 attention.core         q, cache, position                                ``[rows, 6144]`` bf16
@@ -23,8 +23,15 @@ output_head            4-bit operand, weight copy                        logits 
 token_choice           logits                                            ids ``[rows]`` int32
 ====================== ================================================= ==============================================
 
+The norm block is called at several sites of a step, and a kernel that serves it is called in another form at each: ``site``
+names the call by what the normed rows feed (``NORM_SITES``; ``sites()`` lists the site of every call of the wiring).  The
+in-projection is called with another weight shape in each kind of layer, and its site says which
+(``IN_PROJECTION_SITES``).  A reference chain and a multiply over a copy ignore the site.
+
 The weights that feed one multiply are merged at load: the query (with its gate half), key and value projections of an
 attention layer; ``qkv`` and ``z`` of a linear-attention layer; its ``b`` and ``a`` rows, b first; the MLP's gate and up.
+Every multiply reads a bf16 copy of its weight; where a block of the plan multiplies on the stored format (``STORED_WEIGHTS``
+names the blocks this loader can keep them for), the merged codes stay beside the copy.
 
 ``QwenDense.reduced()`` keeps every layer width of the published model and reduces the depth and the vocabulary; every
 reduction is listed in ``reductions`` and printed by a sample.  ``QwenDense.describe(checkpoint)`` takes the geometry from
@@ -37,7 +44,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..blocks import GIB
 from ..providers import AttentionParams, GdnParams, Quant, split_qkvz
@@ -51,6 +58,16 @@ PATTERN = ("linear_attention", "linear_attention", "linear_attention", "full_att
 #: step.  The output head is a seeded permutation of the embedding table, so the greedy token is decided by a wide margin and
 #: the produced ids are a walk through that permutation: the layers move the logits, not the choice.
 BRANCH_GAIN = 0.25
+#: the call sites of the residual add + RMSNorm + quantise block, by what the normed rows feed: the mixer of a layer (the
+#: layer's kind), its MLP, the output head.  The first call of a step has no residual stream yet: ``FIRST`` behind its site
+NORM_SITES = ("linear_attention", "full_attention", "mlp", "output_head")
+FIRST = ".first"
+#: the blocks whose weights the loader keeps on their stored format beside the bf16 copy when a plan asks for them (a
+#: provider that multiplies on the stored format: ``Block.stored_weights``): the merged 8-bit codes of the in-projections
+STORED_WEIGHTS = ("projection.fp8.in",)
+#: the call sites of the in-projection, by the layer's kind: what the merged weight holds there (its shape differs).  A
+#: site name belongs to one block: a provider reads the sites of its row out of ``sites()`` by name
+IN_PROJECTION_SITES = {"linear_attention": "linear_attention.qkvz", "full_attention": "full_attention.qkv"}
 
 
 @dataclass(frozen=True)
@@ -83,6 +100,13 @@ class Geometry:
     @property
     def attn_out(self) -> int:
         return self.attn_heads * self.attn_head_dim
+
+    def in_projection(self, kind: str) -> Tuple[int, int]:
+        """``(out features, in features)`` of the merged in-projection weight of a layer of ``kind``: ``qkv`` and ``z`` of a
+        linear-attention layer; the query (with its gate half), the key and the value projection of an attention layer."""
+        if kind == "linear_attention":
+            return self.qkv_channels + self.la_out, self.hidden
+        return 2 * self.attn_out + 2 * self.attn_kv_heads * self.attn_head_dim, self.hidden
 
 
 @dataclass
@@ -276,6 +300,29 @@ class QwenDense:
         calls += [("add_norm_quantize", len(kinds)), ("output_head", -1), ("token_choice", -1)]
         return tuple(calls)
 
+    def sites(self) -> Tuple[str, ...]:
+        """The call site of every call of ``wiring()``, in its order: for the norm block what its normed rows feed (the layer's
+        kind for a layer's input norm, ``"mlp"``, ``"output_head"``), with ``".first"`` behind the first call of a step, which
+        has no residual stream to add to; for the in-projection the layer's kind and what its merged weight holds
+        (``IN_PROJECTION_SITES``: the weight has another shape in each kind of layer); ``""`` for a block that is called in
+        one form everywhere.  A site name belongs to one block.  ``step`` hands the same names to the two blocks; a
+        provider row names the form of each (``ProviderRow.sites``)."""
+        kinds = self.geometry.layer_kinds
+        sites, seen = [], set()
+        for block, layer in self.wiring():
+            if block == "projection.fp8.in":
+                sites.append(IN_PROJECTION_SITES[kinds[layer]])
+            elif block != "add_norm_quantize":
+                sites.append("")
+            elif layer == len(kinds):
+                sites.append("output_head")
+            elif layer in seen:  # a layer's second call: the norm in front of its MLP
+                sites.append("mlp")
+            else:
+                seen.add(layer)
+                sites.append(kinds[layer] + (FIRST if layer == 0 else ""))
+        return tuple(sites)
+
     def calls_text(self) -> Dict[str, str]:
         return {block: " / ".join(str(c) for c in count) for block, count in self.calls().items()}
 
@@ -348,29 +395,44 @@ class QwenDense:
                 state += 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
         return state
 
-    def memory_bytes(self, sequences: int, capacity: int) -> int:
-        """What a run needs on the GPU besides a kernel's own reservation: the copies, the state and working memory
-        (load-time temporaries, activations, the reference's fp64 temporaries during the checks, the allocator's slack):
-        2 GiB, or an eighth of the copies where that is more.  The slack grows with what the pool holds: with the published
-        checkpoint (50.1 GiB of copies) PyTorch reserved 55.2 GiB and the device grew by 55.4 GiB, 5.3 GiB beyond the copies."""
-        copies = self.copy_bytes()
-        return copies + self.state_bytes(sequences, capacity) + max(2 * GIB, copies // 8)
+    def stored_bytes(self, stored: Sequence[str] = ()) -> int:
+        """Bytes of the weights the loader keeps on their stored format beside the bf16 copies, for the blocks ``stored``
+        (``STORED_WEIGHTS``): one per element of the merged 8-bit in-projections."""
+        if "projection.fp8.in" not in stored:
+            return 0
+        g = self.geometry
+        return sum(g.in_projection(kind)[0] * g.in_projection(kind)[1] for kind in g.layer_kinds)
 
-    def bytes_per_step(self, sequences: int, positions: int) -> Dict[str, int]:
+    def memory_bytes(self, sequences: int, capacity: int, stored: Sequence[str] = ()) -> int:
+        """What a run needs on the GPU besides a kernel's own reservation: the copies, the weights kept on their stored
+        format beside them for the blocks ``stored`` (``stored_bytes``), the state and working memory (load-time
+        temporaries, activations, the reference's fp64 temporaries during the checks, the allocator's slack): 2 GiB, or an
+        eighth of the weights held where that is more.  The slack grows with what the pool holds: with the published
+        checkpoint (50.1 GiB of copies) PyTorch reserved 55.2 GiB and the device grew by 55.4 GiB, 5.3 GiB beyond the
+        copies; with the 4.8 GiB of stored in-projections beside them it reserved 61.7 GiB and the device grew by 61.9 GiB,
+        6.9 GiB beyond the weights held."""
+        held = self.copy_bytes() + self.stored_bytes(stored)
+        return held + self.state_bytes(sequences, capacity) + max(2 * GIB, held // 8)
+
+    def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = ()) -> Dict[str, int]:
         """What one decode step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
         measurement.
 
         * ``weights``: every weight the step reads in full, in its stored format (8-bit: 1 byte per element; 4-bit: 0.5 byte
           per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per sequence;
-        * ``copies``: the same weights as the stacks of this family hold them so far, bf16 at 2 bytes per element;
+        * ``copies``: the same weights as a stack of this family reads them: a bf16 copy at 2 bytes per element -- but the
+          weights of the blocks ``stored`` (the blocks of the stack's plan whose provider multiplies on the stored format:
+          ``STORED_WEIGHTS``) on that format, as the loader kept them beside the copy;
+        * ``stored``: the part of ``copies`` that is read on a stored format (``stored_bytes``); 0 for a stack whose every
+          multiply reads a copy;
         * ``state``: the recurrent state and the conv history of every linear-attention layer, read and written, and the
           cached keys and values of every attention layer up to ``positions`` positions, read."""
         g = self.geometry
-        stored = copies = 0
+        on_disk = copies = 0
         for spec in self.tensor_specs():
             if spec.fmt == "scalar" or spec.name == "embed_tokens.weight":
                 continue
-            stored += spec.stored_bytes
+            on_disk += spec.stored_bytes
             copies += 2 * spec.numel
         embedding = 2 * sequences * g.hidden
         state = 0
@@ -379,7 +441,9 @@ class QwenDense:
                 state += 2 * sequences * (g.la_value_heads * g.la_head_dim**2 * 4 + (g.la_conv_width - 1) * g.qkv_channels * 2)
             else:
                 state += 2 * sequences * g.attn_kv_heads * positions * g.attn_head_dim * 2
-        return {"weights": stored + embedding, "copies": copies + embedding, "state": state}
+        # a block that multiplies on the stored format reads 1 byte per element of its merged 8-bit weight where its copy has 2
+        kept = self.stored_bytes(stored)
+        return {"weights": on_disk + embedding, "copies": copies - kept + embedding, "stored": kept, "state": state}
 
     def state_shapes(self) -> Dict[str, tuple]:
         g = self.geometry
@@ -390,12 +454,20 @@ class QwenDense:
         }
 
     # ------------------------------------------------------------------ load
-    def load(self, checkpoint, device, stages, merge_rule: str = "largest_scale") -> Weights:
-        """Read (or draw), merge and dequantise every weight; each stage's seconds accumulate in ``stages``."""
+    def load(self, checkpoint, device, stages, merge_rule: str = "largest_scale", stored: Sequence[str] = ()) -> Weights:
+        """Read (or draw), merge and dequantise every weight; each stage's seconds accumulate in ``stages``.  ``stored`` names
+        the blocks of the plan whose provider multiplies on the stored format (``STORED_WEIGHTS``): their merged codes
+        are kept beside the bf16 copy (``Dequantized.stored``), which every other reader of the weight still takes."""
         import torch
 
         from ..weights import dequantize, merge_block_scaled, merge_scaled
 
+        unknown = sorted(set(stored) - set(STORED_WEIGHTS))
+        if unknown:
+            raise ValueError(
+                f"this family's loader keeps the stored weights of {', '.join(STORED_WEIGHTS)}; a provider of this run multiplies on those of {', '.join(unknown)}"
+            )
+        keep_in = "projection.fp8.in" in stored
         g = self.geometry
         read = "draw" if getattr(checkpoint, "synthetic_weights", False) else "read"
 
@@ -403,12 +475,15 @@ class QwenDense:
             with stages.stage(read):
                 return checkpoint.load(name, device)
 
-        def copy(parts, merge=None):
+        def copy(parts, merge=None, keep=False):
             if merge is not None:
                 with stages.stage("merge"):
                     parts = [merge(parts)]
             with stages.stage("dequantise"):
-                return dequantize(parts[0])
+                copied = dequantize(parts[0])
+            if keep:  # a block of the plan multiplies on the stored format: the merged codes stay beside the copy
+                copied.stored = parts[0]
+            return copied
 
         def scale(*names):  # the static input scale of merged parts collapses to the largest
             return max(checkpoint.load(n + ".input_scale", device) for n in names)
@@ -444,7 +519,7 @@ class QwenDense:
                 layer = LayerWeights(
                     kind,
                     in_quant=Quant("fp8", scale(a + "in_proj_qkv", a + "in_proj_z")),
-                    in_proj=copy(parts, lambda ps: merge_scaled(ps, merge_rule)),
+                    in_proj=copy(parts, lambda ps: merge_scaled(ps, merge_rule), keep=keep_in),
                     out_proj=copy([stored(a + "out_proj.weight")]),
                     gdn=gdn,
                     **common,
@@ -458,7 +533,7 @@ class QwenDense:
                 layer = LayerWeights(
                     kind,
                     in_quant=Quant("fp8", scale(a + "q_proj", a + "k_proj", a + "v_proj")),
-                    in_proj=copy(parts, lambda ps: merge_scaled(ps, merge_rule)),
+                    in_proj=copy(parts, lambda ps: merge_scaled(ps, merge_rule), keep=keep_in),
                     out_proj=copy([stored(a + "o_proj.weight")]),
                     attn=attn,
                     out_quant=Quant("fp8", scale(a + "o_proj")),
@@ -482,8 +557,9 @@ class QwenDense:
         position = state.position
         branch, residual = call("embedding", -1, ids, weights.embedding), None
         for i, layer in enumerate(weights.layers):
-            q, normed, residual = call("add_norm_quantize", i, branch, residual, layer.input_norm, layer.in_quant)
-            row = call("projection.fp8.in", i, q, layer.in_proj)
+            site = layer.kind if residual is not None else layer.kind + FIRST  # the first norm of a step starts the residual stream
+            q, normed, residual = call("add_norm_quantize", i, branch, residual, layer.input_norm, layer.in_quant, site)
+            row = call("projection.fp8.in", i, q, layer.in_proj, IN_PROJECTION_SITES[layer.kind])
             if layer.kind == "linear_attention":
                 x, z = split_qkvz(row, layer.gdn.qkv_channels, layer.gdn.value_heads, layer.gdn.head_dim)
                 mixed = call("linear_attention.step", i, x, z, normed, state.slot_ids, layer.gdn, state.layers[i])
@@ -492,9 +568,9 @@ class QwenDense:
                 attended = call("attention.core", i, qh, state.layers[i], position)
                 mixed = call("attention.gate_quantize", i, attended, gate, layer.out_quant)
             branch = call("projection.fp8.out", i, mixed, layer.out_proj)
-            q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant)
+            q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
-        q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant)
+        q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
         state.position = position + 1
