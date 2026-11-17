@@ -1699,3 +1699,16 @@ errors, and check that retained alternatives execute against an independent
 reference. Include neighboring dense/prefill and backward controls rather than
 asserting a fixed engine order. Detector:
 `sdpa/frost/test_sdpa_native_decode_candidates.py` (#1084).
+
+For restored-plan metadata, compare plan count, name, engine/knob record, notes
+and workspace against the selected original plan. Native deserialization can
+retain executable plans without a heuristic engine-config list. Query both
+raw and Python entry points, reject neighboring invalid indices, and execute
+with fresh bindings before reporting query failures. Include another operation
+and a FROST control; the shared regression is
+`core/graph/test_restored_plan_metadata.py`.
+
+A backend may materialize implicit default knobs when restoring a compiled
+plan. Preserve every originally offered knob value, then rebuild from the
+complete restored record and check its name, record, workspace and output bytes.
+An extra default knob alone does not prove that a different algorithm ran.

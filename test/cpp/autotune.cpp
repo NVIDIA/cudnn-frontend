@@ -227,17 +227,44 @@ TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[gr
     bindings.check_output();
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-    // Serialized graphs have behavior notes but no engine-config/numeric-note list.
+    // Serialized graphs retain plan metadata without a heuristic engine-config list.
     std::vector<uint8_t> blob;
     REQUIRE(graph->serialize(blob).is_good());
     InspectableGraph reloaded;
     REQUIRE(reloaded.deserialize(handle.value, blob, false, false).is_good());
+    auto restored_metadata = reloaded.metadata(0);
+    CHECK(restored_metadata.engine == expected_winner.engine);
+    for (auto const& [key, value] : expected_winner.knobs) {
+        REQUIRE(restored_metadata.knobs.count(key) == 1);
+        CHECK(restored_metadata.knobs.at(key) == value);
+    }
+    // Compilation can materialize default knobs and refine the candidate's
+    // numerical notes. Compare the restored notes with the compiled plan.
+    std::vector<fe::NumericalNote_t> compiled_notes;
+    for (auto note : graph->built_plans()[0]->getAllNumericNotes()) {
+        compiled_notes.push_back(fe::detail::convert_from_cudnn_type(note));
+    }
+    CHECK(restored_metadata.numeric == compiled_notes);
     REQUIRE(tune(reloaded, handle.value, bindings.pointers, workspace.value).is_good());
+    CHECK(reloaded.metadata(0).engine == restored_metadata.engine);
+    CHECK(reloaded.metadata(0).knobs == restored_metadata.knobs);
+    CHECK(reloaded.metadata(0).name == restored_metadata.name);
     std::vector<fe::BehaviorNote_t> reloaded_notes;
     REQUIRE(reloaded.get_behavior_notes(reloaded_notes).is_good());
     CHECK(reloaded_notes == expected_winner.behavior);
     REQUIRE(cudaMemset(bindings.c.value, 0x7f, 1024) == cudaSuccess);
     REQUIRE(reloaded.execute(handle.value, bindings.pointers, workspace.value).is_good());
+    bindings.check_output();
+
+    auto restored_replay = make_matmul(handle.value);
+    REQUIRE(restored_replay->create_execution_plan(restored_metadata.engine, restored_metadata.knobs).is_good());
+    CHECK(restored_replay->metadata(0).name == restored_metadata.name);
+    CHECK(restored_replay->metadata(0).knobs == restored_metadata.knobs);
+    REQUIRE(restored_replay->build_plan_at_index(0).is_good());
+    CHECK(restored_replay->get_workspace_size() == reloaded.get_workspace_size());
+    DeviceBuffer restored_workspace(static_cast<size_t>(restored_replay->get_workspace_size()));
+    REQUIRE(cudaMemset(bindings.c.value, 0x7f, 1024) == cudaSuccess);
+    REQUIRE(restored_replay->execute(handle.value, bindings.pointers, restored_workspace.value).is_good());
     bindings.check_output();
 #endif
 
