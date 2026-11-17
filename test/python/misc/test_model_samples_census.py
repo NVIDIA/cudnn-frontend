@@ -187,7 +187,10 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
     assert (
         kernel(SWIGLU_SYMBOL) == kernel(SWIGLU_SYMBOL.replace("_t8_", "_t64_").replace("_pdl_", "_nopdl_")) == "swiglu_fp4"
     ), "every form of the fused gate / up kernel"
-    assert kernel("cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrue_0") == "cudnn_fe", "a cuDNN Frontend kernel no pattern names is no family's member"
+    assert (
+        kernel("cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrue_0") == "gdn_verify_fused"
+    ), "the verify step is a kernel of its own, never the decode step's"
+    assert kernel("cudnn_kernel_frost_shared_expert_decode_CfgTOKENS4_0") == "cudnn_fe", "a cuDNN Frontend kernel no pattern names is no family's member"
     assert kernel(GATHER) == "embedding_gather" and kernel(GATHER.replace("SmallIndex", "LargeIndex")) == "embedding_gather"
     assert kernel(GATHER_VECTORIZED) == "embedding_gather", "from 17 rows the index-select of the embedding is PyTorch's vectorized gather"
     assert kernel("void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<...> >(long, ...)") == "pytorch", "indexing is not the gather"
@@ -212,10 +215,16 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
 
     named = [kernel_id for kernel_id, _ in census.FAMILIES]
     judged = {kernel.id for adapter in factories().values() for kernel in adapter.kernels if kernel.relation == "exact"}
-    assert judged == {"gdn_decode_fused", "gate_quant", "add_norm_quant", "fp8_projection", "swiglu_fp4", "embedding_gather"} and judged <= set(
-        named
-    ), "a pattern of its own each"
-    for kernel_id in ("gdn_decode_fused", "gate_quant", "add_norm_quant", "fp8_projection", "swiglu_fp4"):
+    assert judged == {
+        "gdn_decode_fused",
+        "gdn_verify_fused",
+        "gate_quant",
+        "add_norm_quant",
+        "fp8_projection",
+        "swiglu_fp4",
+        "embedding_gather",
+    } and judged <= set(named), "a pattern of its own each"
+    for kernel_id in ("gdn_decode_fused", "gdn_verify_fused", "gate_quant", "add_norm_quant", "fp8_projection", "swiglu_fp4"):
         assert named.index(kernel_id) < named.index("cudnn_fe"), f"{kernel_id}: in front of the catch-all"
     with pytest.raises(ValueError, match="an exact kernel states its launches per call"):
         census.Kernel("k", "PyTorch", "exact")
@@ -437,8 +446,8 @@ def test_every_constructed_defect_fails_with_its_own_sentence():
         "launched 'some_other_library_kernel<float>' between embedding and linear_attention.step (layer 0); no block of the plan launches it",
     )
     one(
-        _compare([step[:-1] + [at("cudnn_kernel_frost_gdn_verify_fused_CfgTPR4_0"), step[-1]]]),
-        "launched 'cudnn_kernel_frost_gdn_verify_fused_CfgTPR4_0' after linear_attention.step (layer 0): the kernel cudnn_fe, "
+        _compare([step[:-1] + [at("cudnn_kernel_frost_shared_expert_decode_CfgTOKENS4_0"), step[-1]]]),
+        "launched 'cudnn_kernel_frost_shared_expert_decode_CfgTOKENS4_0' after linear_attention.step (layer 0): the kernel cudnn_fe, "
         "which no block of the plan declares",
     )
     # a copy between two exact rows
@@ -2111,7 +2120,12 @@ def test_the_census_file_of_the_target_kernel_set():
     # which kernels a stack of this repository calls an entry for is said per kernel, and held here: the three numbers count
     # the complete stack, and a reader of the file must be able to tell what exists today
     kernels = target.data["kernels"]
-    assert {kernel_id for kernel_id, meta in kernels.items() if meta["entry"] is not None} == set(served.values())
+    from model_samples import blocks
+
+    several = blocks.plan(model.provider_table, model.regimes, plan.facts, 1, 6, "native", model=model)  # the plan of a verify step: six tokens per sequence
+    stepped = {kernel.id for block in several.values() for kernel in block.kernels if kernel.relation == "exact"}
+    assert stepped - set(served.values()) == {"gdn_verify_fused"}, "the verify step has one kernel the decode step has not"
+    assert {kernel_id for kernel_id, meta in kernels.items() if meta["entry"] is not None} == set(served.values()) | stepped
     assert all("entry" in meta for meta in kernels.values()), "null where no stack calls an entry for the kernel yet"
     for kernel_id, meta in kernels.items():
         ported = meta.get("kind") == "port" and meta["entry"] is not None

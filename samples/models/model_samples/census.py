@@ -62,6 +62,10 @@ has a seventh item:
 7. Every launch of a block call whose identity is ``target`` has the launch shape the census recorded for it on this GPU
    class, SM count and row count.
 
+A census holds one configuration per kind of step: ``plain`` for the decode step (one token per sequence) and ``verify``
+for the step that feeds several (:func:`configuration_of`); a section of the latter also names the tokens per sequence it
+was recorded with, and holds for no other count.
+
 and one more line: ``target census <configuration> / <class> (recorded <date>): EQUAL (<what was compared>)``, or
 ``NOT CLAIMED (<reasons>)``.  Either way the line says how many launches of a step were compared by launch shape -- as three
 numbers -- and how many by membership alone: ``EQUAL`` never stands for a comparison that was not made.
@@ -174,6 +178,7 @@ class Site:
 #: pattern in the same change: an unnamed kernel fails the kernel check by name.
 FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("gdn_decode_fused", re.compile(r"^cudnn_kernel_frost_gdn_decode_fused_")),
+    ("gdn_verify_fused", re.compile(r"^cudnn_kernel_frost_gdn_verify_fused_")),
     ("gate_quant", re.compile(r"^cudnn_kernel_frost_attention_gate_quant_")),
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
@@ -606,6 +611,16 @@ FIRST_LAYER = "first_layer"
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
 
 
+#: the configurations of a census: the decode step, and the step of several tokens per sequence
+PLAIN, VERIFY = "plain", "verify"
+
+
+def configuration_of(plan) -> str:
+    """The configuration of a census that a plan is held against: ``plain`` for a plan of one token per sequence (the decode
+    step), ``verify`` for a plan of several (the verify step of speculative decoding)."""
+    return PLAIN if getattr(plan, "tokens", 1) == 1 else VERIFY
+
+
 class Identity(NamedTuple):
     """How one block call of a plan stands to the target kernel set: it launches the target's kernel in the target's form
     (``target``, of kind ``code`` or ``port``), a declared stand-in for it, a fallback row (``not yet``), another kernel or
@@ -800,7 +815,8 @@ class Target:
     * ``layers``: which entry list of a section a layer kind of the model reads;
     * ``configurations``: per configuration and per ``ccMAJOR.MINOR/smCOUNT`` a section: ``claimed``, its ``basis``
       (``recorded`` or ``planned``), what was recorded, ``geometry`` -- the layer widths of the model it holds for, under
-      the names of the family's geometry -- and per row count the entries of a step as ``[block, kernel id, facts]``,
+      the names of the family's geometry -- ``tokens`` -- the tokens per sequence of the step it holds for, where that
+      is more than one -- and per row count the entries of a step as ``[block, kernel id, facts]``,
       before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
       ``launch`` = ``[grid, block, shared memory]``, ``at`` = further fields of the geometry that this one launch
       shape was recorded with, and ``form`` = the fields of the kernel's form the target passes at this call beyond the
@@ -855,6 +871,9 @@ class Target:
                     wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number)")
                 if section["claimed"] and not geometry:
                     wrong(f"{where}: claimed without the layer widths it holds for")
+                tokens = section.get("tokens", 1)
+                if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1 or (tokens == 1) != (configuration != VERIFY):
+                    wrong(f"{where}: tokens is the tokens per sequence of the section's step: more than one in {VERIFY}, one (or absent) elsewhere")
                 for rows, parts in section["rows"].items():
                     first = parts.get(FIRST_LAYER, {})
                     if not isinstance(first, dict) or not all(isinstance(facts, dict) and set(facts) <= set(ENTRY_FACTS) for facts in first.values()):
@@ -934,8 +953,11 @@ class Target:
             claim.recorded_on, claim.basis, claim.claimed = str(section.get("recorded", {}).get("date", "")), section["basis"], section["claimed"]
             parts = section["rows"].get(str(rows))
             widths = _other_widths(section["geometry"], model.geometry)
+            tokens = getattr(plan, "tokens", 1)
             if widths:  # a model of the family with other layer widths: other grids, and where an entry picks by width other kernels
                 reasons.append(f"no recorded section for this model's widths on {claim.device}: {widths}")
+            elif section.get("tokens", 1) != tokens:  # a step of another tokens count per sequence: another kernel form, other launch shapes
+                reasons.append(f"no recorded section for {tokens} tokens per sequence on {claim.device}: recorded is {section.get('tokens', 1)}")
             elif parts is None:
                 have = [f"{count} row{'s' if count != '1' else ''}" for count in section["rows"]]
                 reasons.append(f"no recorded section for {rows} row{'s' if rows != 1 else ''} on {claim.device}: recorded is {' and '.join(have) or 'none'}")
@@ -1224,7 +1246,8 @@ def table(plan, claim: Optional[Claim] = None) -> str:
         lines.append(cells + ((claim.of(name),) if stated else ()))
     widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
     sms = f", {plan.facts.sm_count} SMs" if plan.facts.sm_count else ""
-    run = f"stack {plan.stack}, {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}, {plan.facts.class_text}{sms}"
+    several = plan.tokens_text() if hasattr(plan, "tokens_text") else ""
+    run = f"stack {plan.stack}, {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}{several}, {plan.facts.class_text}{sms}"
     text = [f"kernels, planned (decided before the load from {plan.source}; {run})"]
     text += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in lines]
     for name in plan:  # a row whose entry is called in several forms: the form of every call site it names
