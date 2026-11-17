@@ -1196,24 +1196,26 @@ def choose_decode_tile_split_kv(
     return pick
 
 
-def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> int:
+def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int, paged: bool = False) -> int:
     """How many KV chunks the SM120 decode tile cuts each unit into; 1 = do not split.
 
     ``units`` is the launch's CTA count before splitting (Q tiles x batch x
     packed KV-head groups, or query heads unpacked); ``kv_stages`` the K/V
     stages of the longest unit, ``stage_bytes`` each; ``d_v`` the O width the
-    combine reduces.
+    combine reduces; ``paged`` whether the stages gather KV pages.
 
     The tile streams K/V from DRAM, one CTA per SM. Its time is the longer of
     the longest unit's stage chain at one CTA's stream rate and all the units'
     bytes at the DRAM rate, so a split pays until the DRAM bound takes over and
     past it only adds combine work. The rates are an RTX PRO 6000 Blackwell
-    Workstation's. Candidates are :func:`split_kv_candidates`; ties keep the
+    Workstation's; gathering paged KV, one CTA streams about 6x slower and the
+    whole board about 0.6x (studies sm120_decode_split_20261117 and _v2, RTX PRO
+    6000 Server). Candidates are :func:`split_kv_candidates`; ties keep the
     smaller split.
     """
     if min(units, kv_stages, stage_bytes, d_v, sm_count) <= 0:
         return 1
-    cta_rate, dram_rate = 4.0e4, 1.55e6  # bytes / us: one CTA streaming alone; all CTAs together
+    cta_rate, dram_rate = (7.0e3, 9.0e5) if paged else (4.0e4, 1.55e6)  # bytes / us: one CTA streaming alone; all CTAs together
     dram_us = units * kv_stages * stage_bytes / dram_rate
 
     def cost_us(split: int) -> float:
@@ -2795,6 +2797,7 @@ def _split_points(
             stage_bytes=_sm120_decode_stage_bytes(*envelope),
             d_v=envelope[1],
             sm_count=sm_count,
+            paged=facts.has_paged_kv,
         )
         return [split, no_split] if split > 1 else [no_split]
     unsplit_pack_g = None
