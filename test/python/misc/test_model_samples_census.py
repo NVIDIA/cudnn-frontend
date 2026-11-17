@@ -1089,13 +1089,17 @@ def _stand_ins(
     ``projection_shape``), one instance per site, and is compared with the reference multiply.  ``projection_serves(site)``
     replaces what it says served a call; ``projection_defect`` makes it ``"extra"`` (launch one more kernel in front of its
     own), ``"behind"`` (one more behind it), ``"missing"`` (not launch in an attention layer), ``"chain"`` (launch the
-    kernels of a multiply over a copy in place of its own) or write one wrong ``"element"`` per call.
+    kernels of a multiply over a copy in place of its own), write one wrong ``"element"`` per call, or -- ``"writes"`` --
+    write into the stored weight it multiplies on (the first half of its rows are zero from its first call on; a test
+    switches the same on later through the block's ``writes``).
 
     ``on_stored`` (no provider row of the family does this yet: a test's own stand-ins) puts every other multiply on the
     STORED FORMAT of its weight too: the stand-ins of the two multiplies over a copy then say ``stored_weights`` and decode
     the weight's code values from what the loader kept -- 8-bit codes, or packed 4-bit codes times their block scales --
     accumulate in fp32 and round once, while they launch what their row's provider launches.  ``stored_defect`` names the
-    stored container (``"ScaledTensor"``, ``"BlockScaledTensor"``) whose multiplies write one wrong element per call."""
+    stored container (``"ScaledTensor"``, ``"BlockScaledTensor"``) whose multiplies write one wrong element per call; or,
+    ``"writes"``, makes each of them write into its stored weight (the first row of its last tensor -- the block scales of
+    a 4-bit weight, the codes of an 8-bit one -- is zero from its first call on)."""
     from model_samples import loop
     from model_samples.census import Facts, Kernel, Launch
     from model_samples.providers import factories, torch_ref
@@ -1260,6 +1264,7 @@ def _stand_ins(
         provider = "cuDNN FE"
         kernels = (Kernel("fp8_projection", "cuDNN FE", "exact", launches=1, shape="entry"),)
         stored_weights = True
+        writes = projection_defect == "writes"  # into the stored weight it multiplies on
         _site = ""
 
         def _shape(self, site):
@@ -1289,6 +1294,8 @@ def _stand_ins(
                 if projection_defect == "behind":
                     launch(ELEMENTWISE)  # behind its own kernel: in front of its consumer's
             stored = weight.stored  # the merged codes with their one scale, kept by the loader for this block
+            if self.writes:  # the same bytes after every call: the weight the block multiplies on is no longer the loaded one
+                stored.codes[: stored.codes.shape[0] // 2] = 0
             scale = torch.tensor(float(qx.scale), dtype=torch.float32) * torch.tensor(float(stored.scale), dtype=torch.float32)
             out = ((_e4m3_values(qx.codes) @ _e4m3_values(stored.codes).T) * scale).to(torch.bfloat16)
             if projection_defect == "element":
@@ -1301,6 +1308,8 @@ def _stand_ins(
         never read from a copy; both operands' code values multiplied and accumulated in fp32, the fp32 product of the two
         scales, one rounding to bf16."""
         stored = weight.stored
+        if stored_defect == "writes":
+            stored.tensors()[-1][0] = 0
         if isinstance(stored, ScaledTensor):
             values = _e4m3_values(stored.codes)
         else:
@@ -5057,8 +5066,12 @@ def test_the_reference_of_the_checks_makes_its_copy_of_a_weight_for_one_call(mon
         assert checks.ok and kept.ok and all(layer.in_proj.data is None for layer in session.weights.layers), "the weights of the run are as they were"
         on_demand = [line for line in checks.lines if line.startswith("  on demand ")]
         assert len(on_demand) == 1 and not any(line.startswith("  on demand ") for line in kept.lines), "said only where a copy was made"
-        assert [line for line in checks.lines if line not in on_demand] == kept.lines, "every check line is the line of the run that kept its copies"
+        # ... and the line that holds the stored bytes such a copy is made from to those of the load (the test below)
+        held = [line for line in checks.lines if line.startswith("  stored weights ")]
+        assert len(held) == 1 and held[0].endswith("    PASS") and not any(line.startswith("  stored weights ") for line in kept.lines)
+        assert [line for line in checks.lines if line not in (*on_demand, *held)] == kept.lines, "every check line is the line of the run that kept its copies"
         assert checks.lines.index(on_demand[0]) == checks.lines.index(_line(checks, "kernels ")) - 1, "under the four checks, above the kernel check"
+        assert checks.lines.index(held[0]) == checks.lines.index(on_demand[0]) - 1, "the condition of the copies above their cost"
         # one copy per in-projection call of a reference block: the twin's call of the teacher-forced pass and the reference stack's own
         # pass, 2 calls a step over the 7 recorded steps, and the 2 calls of the reference session's warm-up step
         steps = 7
@@ -5090,6 +5103,262 @@ def test_the_reference_of_the_checks_makes_its_copy_of_a_weight_for_one_call(mon
     session, checks = run(2, copies=False, projection_defect="element")
     line = next(line for line in checks.lines if line.strip().startswith("projection.fp8.in ") and "calls" in line)
     assert not checks.ok and line.endswith("[band: bf16_rounding]  FAIL") and checks.on_demand.copies > 0, line
+
+
+def test_the_checks_hold_a_weight_kept_on_its_stored_format_alone_to_the_bytes_of_its_load(monkeypatch):
+    """The reference's copy of a weight a run keeps on its stored format alone is made from the bytes the weight's own
+    block multiplies on.  A block that writes into them moves its reference with it, and its block line passes: the block
+    is compared with a multiply on its own changed weight.  So the loader takes a checksum of every such weight
+    (``weights.stored_checksum``), the checks take it again before their first pass and after their last, and a weight
+    whose stored bytes are not those of the load fails the run, named by block and layer, whatever the block lines say.
+    The same defect in a run that keeps its copies fails the band, as it did before a run could be without them."""
+    from model_samples import Session, tie_out
+    from model_samples.timing import Stages
+    from model_samples.weights import BlockScaledTensor, Checkpoint, ScaledTensor, stored_checksum
+
+    # (1) the checksum on stated tensors: 8-bit codes with one scale, 4-bit codes with their block scales, a scale per row
+    codes = torch.arange(4 * 32, dtype=torch.uint8).reshape(4, 32)
+    scales = (torch.arange(4 * 2, dtype=torch.uint8) + 100).reshape(4, 2)
+    makers = {
+        "eight": (lambda: ScaledTensor(codes.clone(), 0.02), 1, 1),
+        "four": (lambda: BlockScaledTensor(codes[:, :16].clone(), scales.clone(), 0.01), 2, 1),
+        "per row": (lambda: ScaledTensor(codes.clone(), torch.tensor([0.02, 0.03, 0.04, 0.05])), 2, 0),
+    }
+    for name, (make, tensors, floats) in makers.items():
+        stored = make()
+        first = stored_checksum(stored)
+        assert len(first) == 3 * tensors + floats and all(type(value) is int for value in first[: 3 * tensors]), f"{name}: three 64-bit sums per tensor"
+        assert stored_checksum(make()) == first == stored_checksum(stored), f"{name}: the same bytes, the same checksum; taking it changes nothing"
+        for index in range(len(stored.tensors())):
+            for damage in ("one byte", "two rows exchanged", "two bytes exchanged along a row"):
+                changed = make()
+                tensor = changed.tensors()[index]
+                last = tensor.shape[1] - 1
+                if damage == "one byte":
+                    tensor[1, last] ^= 1
+                elif damage == "two rows exchanged":  # every byte is still there
+                    tensor[[0, 3]] = tensor[[3, 0]]
+                else:  # at the same place of two 64-bit words where a row has two: the row's sum stays
+                    other = 8 if tensor.shape[1] >= 16 else last
+                    tensor[2, [0, other]] = tensor[2, [other, 0]]
+                assert stored_checksum(changed) != first, f"{name}, tensor {index}: {damage}"
+    assert stored_checksum(ScaledTensor(codes.clone(), 0.03)) != stored_checksum(ScaledTensor(codes.clone(), 0.02)), "the one scale is part of it"
+    moved = makers["per row"][0]()
+    moved.scale[2] = 0.5
+    assert stored_checksum(moved) != stored_checksum(makers["per row"][0]()), "and a scale per row, by its bytes"
+    # the same bytes give the same sums however the tensor lies in its storage: viewed as 64-bit words, or put together byte by byte
+    odd = torch.arange(100, dtype=torch.uint8)[1:97].reshape(4, 24)
+    assert odd.storage_offset() == 1 and stored_checksum(ScaledTensor(odd, 0.02)) == stored_checksum(ScaledTensor(odd.clone(), 0.02))
+    narrow = ScaledTensor(codes[:, :12].clone(), 0.02)  # rows that are no whole number of words
+    other = ScaledTensor(codes[:, :12].clone(), 0.02)
+    other.codes[3, 11] ^= 0x80
+    assert stored_checksum(narrow) == stored_checksum(ScaledTensor(codes[:, :12].clone(), 0.02)) != stored_checksum(other)
+
+    # (2) the loader: a weight kept on its stored format alone carries the checksum of its stored bytes, and the weights list them
+    model = _tiny_model()
+    layers = len(model.geometry.layer_kinds)
+
+    def load(**forms):
+        stages = Stages(sync=lambda: None)
+        return model.load(Checkpoint.synthetic(model, 0), "cpu", stages, **forms), stages
+
+    plain, stages = load()
+    assert plain.alone == () and "checksum" not in stages.seconds, "a load of copies takes none"
+    assert all(weight.checksum is None and weight.intact() for block in FIVE for weight in _weights_of(plain, block))
+    for block in FIVE:
+        beside, stages = load(stored=(block,))
+        assert beside.alone == () and "checksum" not in stages.seconds, "a weight with its copy has an independent reference: none is taken"
+        assert all(weight.checksum is None and weight.intact() for weight in _weights_of(beside, block))
+        alone, stages = load(stored=(block,), uncopied=(block,))
+        assert "checksum" in stages.seconds, "its own stage of the load"
+        assert [(name, layer) for name, layer, _ in alone.alone] == ([(block, None)] if block == "output_head" else [(block, i) for i in range(layers)])
+        assert all(listed is weight for (_, _, listed), weight in zip(alone.alone, _weights_of(alone, block))), "the handles of the weights themselves"
+        for weight in _weights_of(alone, block):
+            assert weight.data is None and weight.checksum == stored_checksum(weight.stored) and weight.intact()
+            tensor = weight.stored.tensors()[-1]
+            kept = tensor[0, 0].clone()
+            tensor[0, 0] ^= 1
+            assert not weight.intact(), f"{block}: one changed byte of what the block multiplies on"
+            tensor[0, 0] = kept
+            assert weight.intact(), "the loaded bytes again"
+    every, _ = load(stored=FIVE, uncopied=FIVE)
+    assert len(every.alone) == 4 * layers + 1 and {name for name, _, _ in every.alone} == set(FIVE) and tie_out.changed_weights(every) == []
+    every.layers[1].down.stored.block_scales[0, 0] ^= 1
+    every.head.stored.codes[5, 3] ^= 0x10
+    assert tie_out.changed_weights(every) == ["mlp.down of layer 1", "output_head"], "named by block and layer, in the order of the load"
+    assert tie_out.changed_weights(plain) == [] and tie_out.changed_weights(object()) == [], "a family whose loader lists none has none to hold"
+
+    # (3) through a session: a clean run says that the stored bytes are those of the load, above what the copies cost
+    def run(copies=False, late=False, **stand_in):
+        with monkeypatch.context() as scoped:
+            if copies:  # the same plan with its copies kept: the reference reads the copy of the load
+                scoped.setattr(Session, "uncopied_weights", lambda self: ())
+            session = _recorded_run(scoped, sequences=1, stack="native", **stand_in)[0]
+            session.trace(4)
+            if late:  # the block starts to write when the checks start
+                session.plan["projection.fp8.in"].writes = True
+            return session, tie_out.run_checks(session, prompt_tokens=3)
+
+    def lines(checks, start):
+        return [line for line in checks.lines if line.startswith(start)]
+
+    session, checks = run()
+    said = "  stored weights    2 of 2 weights this run keeps on their stored format alone hold the bytes of their load, before the checks and after them: "
+    assert checks.ok and lines(checks, "  stored weights ") == [said + "the reference's copies were made from what was loaded    PASS"]
+    assert tie_out.stored_weights_line(2, [], []) == lines(checks, "  stored weights ")[0]
+    assert [name for name, _, _ in session.weights.alone] == ["projection.fp8.in"] * 2
+
+    # (4) the block writes into its stored weight from its first call on: half of the weight's rows are zero for the block AND for
+    # the copy the reference makes of it, so the block line is the line of a clean run -- and the run fails on the weight
+    def projection_line(checks):
+        return next(line for line in checks.lines if line.strip().startswith("projection.fp8.in ") and "calls" in line)
+
+    session, checks = run(projection_defect="writes")
+    assert "8 of 8 provider blocks inside their bands" in _line(checks, "blocks") and _line(checks, "blocks").endswith("PASS")
+    assert "largest distance 0.00 bf16 units" in projection_line(checks) and projection_line(checks).endswith("[band: bf16_rounding]  PASS")
+    assert _line(checks, "replay").endswith("PASS") and _line(checks, "tokens").endswith("PASS") and checks.kernels == census_pass(), "every other line holds"
+    failed = lines(checks, "  stored weights ")
+    assert not checks.ok and len(failed) == 1, checks.text()
+    assert failed[0] == (
+        "  stored weights    0 of 2 weights this run keeps on their stored format alone hold the bytes of their load; written to since: "
+        "projection.fp8.in of layer 0 (before the checks), projection.fp8.in of layer 1 (before the checks).  The reference's copy of such a weight "
+        "was made from the changed bytes: its block was compared with a reference that moved with it    FAIL"
+    )
+    assert all(not weight.intact() for _, _, weight in session.weights.alone)
+    # ... the same block in the same plan loaded WITH its copies: the reference reads the copy of the load, and the band fails
+    session, checks = run(copies=True, projection_defect="writes")
+    assert session.weights.alone == () and not lines(checks, "  stored weights ") and not checks.ok
+    assert "largest distance 255.00 bf16 units; 50.0% of elements" in projection_line(checks) and projection_line(checks).endswith(
+        "[band: bf16_rounding]  FAIL"
+    )
+    # ... and a block that starts to write during the checks is caught by the second reading, and said so
+    session, checks = run(late=True)
+    failed = lines(checks, "  stored weights ")
+    assert not checks.ok and "projection.fp8.in of layer 0 (during the checks), projection.fp8.in of layer 1 (during the checks)" in failed[0], checks.text()
+    assert failed[0].startswith("  stored weights    0 of 2 weights ") and failed[0].endswith("    FAIL")
+    assert tie_out.stored_weights_line(3, ["a of layer 0"], ["a of layer 0", "b"]).startswith(
+        "  stored weights    1 of 3 weights this run keeps on their stored format alone hold the bytes of their load; written to since: "
+        "a of layer 0 (before the checks), b (during the checks).  "
+    )
+
+    # (5) every multiply on its stored format, each writing into its weight (a test's own blocks; 4-bit: the block scales): the seven
+    # weights of those blocks are named, the output head without a layer; the two of the entry's row are as loaded
+    session = _recorded_run(monkeypatch, sequences=1, stack="native", on_stored=True, stored_defect="writes")[0]
+    session.trace(4)
+    checks = tie_out.run_checks(session, prompt_tokens=3)
+    failed = lines(checks, "  stored weights ")
+    assert not checks.ok and len(failed) == 1 and failed[0].startswith("  stored weights    2 of 9 weights ") and failed[0].endswith("    FAIL")
+    written = failed[0].split("written to since: ", 1)[1].split(".  The reference's copy", 1)[0].split(", ")
+    assert written == [
+        *(f"{block} of layer {layer} (before the checks)" for layer in range(2) for block in ("mlp.gate_up", "mlp.down", "projection.fp8.out")),
+        "output_head (before the checks)",
+    ], written
+
+
+def census_pass():
+    from model_samples import census
+
+    return census.PASS
+
+
+def test_a_copy_made_on_demand_is_gone_when_its_call_returns(monkeypatch):
+    """One copy at a time: the bf16 copy the checks make of a weight for a reference call is the caller's for that call and
+    is gone when the call returns -- through the twin's call of the teacher-forced pass, and through the passes of the
+    reference session and of a second reference.  The memory sentence counts ONE such copy (the largest), so a copy that
+    outlived its call would be memory the sentence does not state.  Held on the tensors themselves: when the next copy
+    is made, and when the checks return, no earlier one is alive."""
+    import gc
+    import weakref
+
+    from model_samples import tie_out
+    from model_samples.weights import OnDemand
+
+    made = []  # a weak reference to the tensor of every copy, in the order they were made
+    alive_at_the_next = []
+    with_copy = OnDemand._with_copy
+
+    def watched(self, weight):
+        alive_at_the_next.append(sum(reference() is not None for reference in made))
+        handle = with_copy(self, weight)
+        assert handle.data is not None and weight.data is None, "the copy is on a handle of its own; the run's weight has none"
+        made.append(weakref.ref(handle.data))
+        return handle
+
+    monkeypatch.setattr(OnDemand, "_with_copy", watched)
+    gc.disable()  # the copies must go by reference count, when the call returns: a collector that runs later would hide one that waits for it
+    try:
+        # two sequences: the tap also runs each block alone; all five multiplies on their stored format: every reference multiply reads a copy
+        session = _recorded_run(monkeypatch, sequences=2, stack="native", on_stored=True)[0]
+        session.trace(4)
+        checks = tie_out.run_checks(session, prompt_tokens=3, second_reference=True)
+        alive_after = sum(reference() is not None for reference in made)
+    finally:
+        gc.enable()
+    assert checks.ok, checks.text()
+    steps, calls = 7, 9  # nine multiplies a step; the twin's call, the reference pass, the second reference; two warm-up steps
+    assert len(made) == checks.on_demand.copies == 2 * calls + 3 * calls * steps
+    assert alive_at_the_next == [0] * len(made), "no copy of an earlier call is alive when the next one is made"
+    assert alive_after == 0, "and none when the checks return"
+    assert all(weight.data is None for block in FIVE for weight in _weights_of(session.weights, block)), "the run's weights hold none"
+    # the reference session alone, outside the checks: a call through Session._call drops its copy with its operands
+    del made[:], alive_at_the_next[:]
+    from model_samples import Session
+
+    cost = OnDemand()
+    reference = Session(session.model, session.text, 2, stack="reference", device="cpu", capacity=16, share=session, on_demand=cost)
+    reference.load()
+    reference.read(reference.prefill([session.text.encode("ab" + str(s)) for s in range(2)]))
+    assert len(made) == cost.copies == calls + 3 * calls and all(reference() is None for reference in made) and alive_at_the_next == [0] * len(made)
+
+
+def test_only_the_reference_session_of_a_runs_checks_makes_copies_per_call(monkeypatch):
+    """A copy made per call is a cast and two synchronisations in front of a block.  The reference session of a run's
+    checks may carry them; a session whose own steps are timed, traced or checked may not, so ``on_demand`` is refused
+    for every other session when it is built, and a session that has it is not traced."""
+    from model_samples import Session, TextIO
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.weights import OnDemand
+
+    build = _stand_ins(monkeypatch)
+    tiny = _tiny_model()
+    text = TextIO.synthetic(tiny.geometry.vocab)
+    facts = DeviceFacts((10, 0), "stated device", 148, 0, 0)
+
+    def session(stack, **options):
+        made = Session(tiny, text, sequences=1, stack=stack, device="cpu", capacity=16, **options)
+        plan_options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": made.check_kernels}
+        made.plan = plan(tiny.provider_table, tiny.regimes, facts, 1, 1, stack, model=tiny, options=plan_options, factories=build)
+        return made
+
+    first = session("native")
+    first.load()
+    assert first.weights.uncopied == ("projection.fp8.in",)
+    refused = "on_demand is for the reference session of a run's checks (stack reference, on the weights of the session it checks: share=); a session of stack "
+    reads = " reads the forms its load kept and never dequantises a weight per call"
+    for stack, options, what in (
+        ("native", {}, "native"),  # the checked session itself: its steps would carry the copies
+        ("fe-cublas", {}, "fe-cublas"),
+        ("reference", {}, "reference"),  # a reference stack on its own load: it holds every copy
+        ("native", {"share": first}, "native on shared weights"),
+        ("fe-entries", {"share": first}, "fe-entries on shared weights"),
+    ):
+        with pytest.raises(ValueError) as error:
+            Session(tiny, text, sequences=1, stack=stack, device="cpu", capacity=16, on_demand=OnDemand(), **options)
+        assert str(error.value) == refused + what + reads, stack
+    # the one session that may: the reference stack on the weights of the session it checks -- and it is not traced
+    cost = OnDemand()
+    reference = session("reference", share=first, on_demand=cost)
+    reference.load()
+    assert reference.read(reference.prefill([text.encode("ab0")])) and cost.copies == 2 + 2 * 3
+    with pytest.raises(
+        ValueError,
+        match=r"^a session that makes bf16 copies of its weights per call \(on_demand\) is the reference of a run's checks; its steps are not traced$",
+    ):
+        reference.trace(2)
+    assert reference.traced is None and cost.copies == 2 + 2 * 3, "nothing ran"
+    # a session without one is built and traced as before
+    plain = session("reference", share=first.__class__(tiny, text, sequences=1, stack="fe-cublas", device="cpu", capacity=16))
+    assert plain.on_demand is None
 
 
 def test_every_multiply_on_its_stored_format_through_a_session(monkeypatch):

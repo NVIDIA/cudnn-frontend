@@ -135,7 +135,10 @@ class LayerWeights:
 class Weights:
     """The weights of one load.  ``stored`` and ``uncopied`` say what that load kept of the multiplied weights, by block
     (``STORED_WEIGHTS``): the blocks whose weights it holds on their stored format, and those of them it holds on that
-    format alone, without a bf16 copy.  A session reads them before its first step: a block must find the form it reads."""
+    format alone, without a bf16 copy.  A session reads them before its first step: a block must find the form it reads.
+    ``alone`` lists the weights of the blocks ``uncopied`` one by one -- ``(block, layer, weight)``, the layer ``None``
+    for the output head -- each with the checksum of its stored bytes at this load (``weights.Dequantized.checksum``):
+    the checks of a run hold these bytes to it, because their reference of such a weight is made from them."""
 
     embedding: object
     layers: List[LayerWeights]
@@ -145,6 +148,7 @@ class Weights:
     copy_bytes: int = 0
     stored: Tuple[str, ...] = ()
     uncopied: Tuple[str, ...] = ()
+    alone: Tuple[tuple, ...] = ()
 
 
 @dataclass
@@ -451,8 +455,8 @@ class QwenDense:
 
         Working memory is load-time temporaries, activations, the reference's fp64 temporaries during the checks and the
         allocator's slack: 2 GiB, or an eighth of the weights held where that is more, and a quarter of the stored
-        tensors kept.  An allowance from runs of the published checkpoint (one sequence, the default prompt), not a
-        bound; what PyTorch reserved and what the device grew by, against the weights held:
+        tensors kept.  An allowance from runs, not a bound.  Of the published checkpoint (one sequence, the default
+        prompt), what PyTorch reserved and what the device grew by, against the weights held:
 
         * every weight as a copy, 50.1 GiB held: 55.2 GiB reserved, 55.4 GiB grown -- 5.3 GiB beyond the weights;
         * the 4.8 GiB of stored in-projections beside every copy, 54.9 GiB held: 61.7 and 61.9 GiB -- 6.9 GiB beyond;
@@ -460,7 +464,14 @@ class QwenDense:
 
         So the room beyond the weights does not shrink with the copies a run leaves out, and it is larger where merged
         stored tensors stay in the pool among the temporaries of the load: an eighth of what is held covered the first
-        two and was 0.5 GiB short of the third."""
+        two and was 0.5 GiB short of the third.
+
+        On the reduced models the 2 GiB apply, and they are an estimate that runs miss by a few tenths of a GiB in
+        either direction, with and without their copies: over runs of one to four layers PyTorch reserved between
+        1.7 and 2.3 GiB beyond the weights, the state and the checks' copy (the family README has the runs).  The
+        room there does not follow the copies left out -- 1.7 GiB with every multiplied weight of the two-layer model
+        on its stored format alone, 2.3 GiB with the in-projections of the four-layer model on theirs, 2.0 GiB with
+        those copies kept -- so nothing is added for them."""
         kept = self.stored_bytes(stored)
         held = self.copy_bytes(uncopied) + kept
         working = max(2 * GIB, held // 8) + kept // 4
@@ -514,11 +525,13 @@ class QwenDense:
         ``stored`` names the blocks (``STORED_WEIGHTS``) a provider of the plans multiplies on the stored format: their
         merged stored tensor is kept (``Dequantized.stored``) -- the 8-bit codes with their one scale, or the packed 4-bit
         codes with their block scales and their global scale, exactly what a copy is made from.  ``uncopied`` names those
-        of them that NO block of the plans reads as a bf16 copy: for them no copy is made.  Every other multiplied weight
-        is dequantised to its bf16 copy, as every stack of this family did.  The returned weights say what was kept."""
+        of them that NO block of the plans reads as a bf16 copy: for them no copy is made, and a checksum of the stored
+        bytes is taken in its place (stage ``checksum``; ``Weights.alone``) -- the reference of the checks will be made
+        from these bytes, so the checks hold them to what they are now.  Every other multiplied weight is dequantised to
+        its bf16 copy, as every stack of this family did.  The returned weights say what was kept."""
         import torch
 
-        from ..weights import Dequantized, dequantize, merge_block_scaled, merge_scaled
+        from ..weights import Dequantized, dequantize, merge_block_scaled, merge_scaled, stored_checksum
 
         unknown = sorted(set(stored) - set(STORED_WEIGHTS))
         if unknown:
@@ -529,6 +542,7 @@ class QwenDense:
         if bare:  # a weight is held in one form at least: without its copy it needs its stored form
             raise ValueError(f"a load that keeps no bf16 copy of the weights of {', '.join(bare)} must keep their stored format, and was not asked to")
         kept, copyless = tuple(stored), tuple(uncopied)
+        alone = []  # (block, layer, weight) of every weight kept on its stored format alone
         g = self.geometry
         read = "draw" if getattr(checkpoint, "synthetic_weights", False) else "read"
 
@@ -536,15 +550,18 @@ class QwenDense:
             with stages.stage(read):
                 return checkpoint.load(name, device)
 
-        def copy(parts, block, merge=None):
-            """The weight of ``block`` in the forms the plans read: its bf16 copy unless no block reads one, its merged
-            stored tensor where a block multiplies on it."""
+        def copy(parts, block, merge=None, layer=None):
+            """The weight of ``block`` (in layer ``layer``) in the forms the plans read: its bf16 copy unless no block reads
+            one, its merged stored tensor where a block multiplies on it."""
             if merge is not None:
                 with stages.stage("merge"):
                     parts = [merge(parts)]
             whole = parts[0]
             if block in copyless:  # every plan of the run multiplies this weight on its stored format: no copy is made
-                return Dequantized(None, whole.scale, whole)
+                with stages.stage("checksum"):  # of the bytes the block multiplies on and the checks' reference is made from
+                    bare = Dequantized(None, whole.scale, whole, stored_checksum(whole))
+                alone.append((block, layer, bare))
+                return bare
             with stages.stage("dequantise"):
                 copied = dequantize(whole)
             if block in kept:  # a block of the plans multiplies on the stored format, another reads the copy: both stay
@@ -562,9 +579,9 @@ class QwenDense:
                 input_norm=stored(p + "input_layernorm.weight"),
                 post_norm=stored(p + "post_attention_layernorm.weight"),
                 mlp_quant=Quant("nvfp4", scale(m + "gate_proj", m + "up_proj")),
-                gate_up=copy([stored(m + "gate_proj.weight"), stored(m + "up_proj.weight")], "mlp.gate_up", merge_block_scaled),
+                gate_up=copy([stored(m + "gate_proj.weight"), stored(m + "up_proj.weight")], "mlp.gate_up", merge_block_scaled, layer=i),
                 down_quant=Quant("nvfp4", scale(m + "down_proj")),
-                down=copy([stored(m + "down_proj.weight")], "mlp.down"),
+                down=copy([stored(m + "down_proj.weight")], "mlp.down", layer=i),
             )
             if kind == "linear_attention":
                 a = p + "linear_attn."
@@ -585,8 +602,8 @@ class QwenDense:
                 layer = LayerWeights(
                     kind,
                     in_quant=Quant("fp8", scale(a + "in_proj_qkv", a + "in_proj_z")),
-                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule)),
-                    out_proj=copy([stored(a + "out_proj.weight")], "projection.fp8.out"),
+                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule), layer=i),
+                    out_proj=copy([stored(a + "out_proj.weight")], "projection.fp8.out", layer=i),
                     gdn=gdn,
                     **common,
                 )
@@ -599,8 +616,8 @@ class QwenDense:
                 layer = LayerWeights(
                     kind,
                     in_quant=Quant("fp8", scale(a + "q_proj", a + "k_proj", a + "v_proj")),
-                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule)),
-                    out_proj=copy([stored(a + "o_proj.weight")], "projection.fp8.out"),
+                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule), layer=i),
+                    out_proj=copy([stored(a + "o_proj.weight")], "projection.fp8.out", layer=i),
                     attn=attn,
                     out_quant=Quant("fp8", scale(a + "o_proj")),
                     **common,
@@ -616,6 +633,7 @@ class QwenDense:
             copy_bytes=self.copy_bytes(copyless),
             stored=kept,
             uncopied=copyless,
+            alone=tuple(alone),  # read after the head's weight was made, two lines up
         )
 
     # ------------------------------------------------------------------ one decode step

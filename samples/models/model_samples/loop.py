@@ -38,6 +38,7 @@ from .state import DecodeState
 from .timing import Report, Stages, now, trace_steps
 
 STACKS = ("fe-cublas", "native", "fe-entries", "reference")
+REFERENCE = "reference"  # the stack of the plain-PyTorch reference blocks: what the checks of a run compare it with
 PREFILL_ROUTES = ("decode-step",)
 
 
@@ -105,9 +106,16 @@ class Session:
         kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them.
         ``on_demand`` (``weights.OnDemand``) is for the reference session of a run's checks, which runs on the weights of the
         session it checks: where that load kept a weight on its stored format alone, the blocks of this session get a bf16
-        copy of it made for the one call and dropped after it, and the object counts what that cost."""
+        copy of it made for the one call and dropped after it, and the object counts what that cost.  It is refused for
+        any other session (``ValueError``): a copy made per call is a cast and two synchronisations in front of a block,
+        which no step of a run that is timed, traced or checked may carry."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
+        if on_demand is not None and (share is None or stack != REFERENCE):
+            raise ValueError(
+                f"on_demand is for the reference session of a run's checks (stack {REFERENCE}, on the weights of the session it checks: share=); "
+                f"a session of stack {stack}{'' if share is None else ' on shared weights'} reads the forms its load kept and never dequantises a weight per call"
+            )
         if prefill not in PREFILL_ROUTES:
             raise ValueError(f"prefill route must be one of {PREFILL_ROUTES}; got {prefill!r}")
         if sequences < 1:
@@ -333,6 +341,10 @@ class Session:
         the sites of a step with what the entries state about their launches, read before the first traced step; the log
         of every block call of every traced step; and the launch records of the pass, cut into steps -- or why there are
         none."""
+        if self.on_demand is not None:  # the reference of a run's checks: its calls carry the copies it makes, which no step of a run does
+            raise ValueError(
+                "a session that makes bf16 copies of its weights per call (on_demand) is the reference of a run's checks; its steps are not traced"
+            )
         records = self.check_kernels if records is None else bool(records)
         sites = census.expected(self.plan, self.model) if records else []
         claim = self.claim() if records else None
