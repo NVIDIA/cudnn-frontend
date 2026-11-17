@@ -1584,7 +1584,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
 
 
 def _sm100_d128_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    from cudnn.sdpa.bwd.kernels.sm100._geometry_d128_mxfp8 import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.geometry import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
 
     if cutedsl_too_old(version, floor=CUTEDSL_FLOOR):
         want = ".".join(str(v) for v in CUTEDSL_FLOOR)
@@ -1613,9 +1613,13 @@ def _sm100_d128_mxfp8_spec() -> EngineSpec:
     Dense and causal graphs share the three-kernel chain. Deterministic mode
     chooses the dK/dV walk split per batch element to preserve batch invariance.
     """
+    from .kernels.sm100.d128_mxfp8 import contract
+    from .kernels.sm100.d128_mxfp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_sm100_d128_mxfp8",
+        name=contract.NAME,
         capabilities=Capabilities(
+            implementation=contract.NAME,
             sm_lo=100,
             sm_hi=103,  # measured on cc 10.0 (B200) and cc 10.3 (B300)
             d=frozenset({128}),
@@ -1632,7 +1636,7 @@ def _sm100_d128_mxfp8_spec() -> EngineSpec:
             declaration_check=_sm100_d128_mxfp8_declaration_mismatch,
             band=band.BandSupport.from_legacy_flags(causal=True, bottom_right=True),
         ),
-        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_D128_MXFP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_D128_MXFP8)),
     )
 
 

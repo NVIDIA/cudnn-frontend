@@ -34,7 +34,7 @@ requires_sm100_family = pytest.mark.skipif(
 
 def _dsl_below_floor() -> bool:
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    from cudnn.sdpa.bwd.kernels.sm100._geometry_d128_mxfp8 import CUTEDSL_FLOOR
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.geometry import CUTEDSL_FLOOR
 
     installed, version = cutedsl_state()
     return not installed or cutedsl_too_old(version, floor=CUTEDSL_FLOOR)
@@ -339,7 +339,7 @@ def test_large_batch_plans():
     """B = 8: the throughput plan (no deterministic request) keeps the dK/dV walk unsplit, the batch-invariant plan
     splits it per batch element; both are correct."""
     from cudnn.frost.occupancy import max_active_clusters
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
     for det in (False, True):
         _run(b=8, hq=4, hkv=2, s=1024, use_deterministic_algorithm=det)
@@ -513,7 +513,7 @@ def test_batch_invariance_where_the_default_plan_differs(s, causal):
     over the whole batch), while B = 1 splits it. Under use_deterministic_algorithm the split is decided per batch
     element, so every element of the B = 8 problem is bitwise the B = 1 problem on its data (aligned, tail, causal)."""
     from cudnn.frost.occupancy import max_active_clusters
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
     b, hq, hkv = 8, 4, 2
     g = G.geometry(s, b, hq, hkv, 1 / math.sqrt(_D), False, causal)
@@ -740,7 +740,7 @@ def test_first_build_inside_graph_capture(monkeypatch, tmp_path):
     b, hq, hkv, s = 1, 8, 2, 768
     inp = _inputs(b, hq, hkv, s, seed=17, causal=True)
     g, t, outs = _planned_graph(b, hq, hkv, s, inp, use_causal_mask=True)
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
     ws = torch.empty(G.workspace_bytes(G.geometry(s, b, hq, hkv, inp["scale"], False, True)) + 16, device="cuda", dtype=torch.uint8)
     dq = torch.full((b, hq, s, _D), float("nan"), device="cuda", dtype=torch.bfloat16)
@@ -802,7 +802,7 @@ def test_dq_shared_memory_releases_warm_stress():
     B = 1, 88 / 8 heads, S = 2048: 704 unit pairs on at most 74 two-CTA clusters, so every cluster refills both stages
     about nine times per launch."""
     from cudnn.frost.occupancy import max_active_clusters
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
     from warm_stress import StressCase, assert_warm_stress, stress_validation
 
     b, hq, hkv, s = 1, 88, 8, 2048

@@ -14,9 +14,9 @@ import math
 import torch
 
 from .api_dsl_mxfp8_sm100 import _ATTRIBUTES, _ROLES, SdpaBwdDslSm100Mxfp8
-from .kernels.sm100._geometry_d128_mxfp8 import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
+from .kernels.sm100.d128_mxfp8.contract import NAME as ROW
+from .kernels.sm100.d128_mxfp8.geometry import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
 
-ROW = "sdpa_bwd_sm100_d128_mxfp8"
 _AMAX_ROLES = ("amax_dq", "amax_dk", "amax_dv")
 _AMAX_ATTRIBUTES = ("amax_dQ", "amax_dK", "amax_dV")
 
@@ -90,7 +90,7 @@ class SdpaBwdDslSm100D128Mxfp8(SdpaBwdDslSm100Mxfp8):
         return True
 
     def _geometry(self):
-        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+        from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
         return G.geometry(
             int(self.s_q_max),
@@ -105,7 +105,7 @@ class SdpaBwdDslSm100D128Mxfp8(SdpaBwdDslSm100Mxfp8):
     def scratch_workspace_bytes(self) -> int:
         """Per-row delta / -LSE / -delta / LSE-copy rows, the dQ unit counter, and 16 bytes for amax outputs the graph
         leaves virtual (the kernels write all three when any is requested)."""
-        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+        from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
         return G.workspace_bytes(self._geometry()) + 16
 
@@ -135,8 +135,8 @@ class SdpaBwdDslSm100D128Mxfp8(SdpaBwdDslSm100Mxfp8):
 
         from cudnn.frost.compiled_cache import dsl_compile_lock, positional_entry
         from cudnn.frost.device import compute_capability
-        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
-        from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_mxfp8 as kernels
+        from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
+        from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import chain as kernels
 
         from .prepared import BwdLaunchSpec
 

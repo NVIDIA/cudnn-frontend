@@ -157,7 +157,7 @@ def test_declines_below_the_dsl_floor(monkeypatch, version):
 
 
 def _plan(s, b, hq, hkv, causal=False, batch_invariant=True, **kw):
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
     g = G.geometry(s, b, hq, hkv, 1 / math.sqrt(128), False, causal)
     return G.plan(g, _SM100_CLUSTERS.__getitem__, batch_invariant=batch_invariant, **kw)
@@ -194,7 +194,7 @@ def test_deterministic_plan_is_per_batch_element():
 
 
 def test_forced_split_must_be_built():
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as G
 
     g = G.geometry(1152, 1, 8, 8, 1 / math.sqrt(128), False, True)  # causal MHA, 9 query blocks (odd): no walk split
     assert not g.has_split
