@@ -196,7 +196,8 @@ def norm_bracket(branch: torch.Tensor, residual, weight: torch.Tensor, eps: floa
         v, new_residual = residual.double() + branch.double(), (residual.float() + branch.float()).to(BF16)
     eps32 = struct.unpack("<f", struct.pack("<f", eps))[0]
     t = v * (1.0 + weight.double()) / torch.sqrt(v.square().mean(-1, keepdim=True) + eps32)
-    return (new_residual, *bf16_bracket(t))
+    nearest, other, margin = bf16_bracket(t)
+    return new_residual, nearest, other, margin
 
 
 def nvfp4_global_scale(scale: float, device) -> torch.Tensor:

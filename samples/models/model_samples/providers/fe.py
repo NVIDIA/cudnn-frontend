@@ -146,7 +146,7 @@ class EntryBlock(BlockBase):
 
         return cudnn
 
-    def _build(self, device):
+    def _build(self, device, site: str = ""):  # ``site``: the call site, for an entry that has one form per site
         raise NotImplementedError
 
     def _check_package(self) -> None:
