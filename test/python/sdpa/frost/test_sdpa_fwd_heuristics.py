@@ -2797,17 +2797,41 @@ def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv, total_q",
+    [
+        (16, 64, 8, 128, 65536, 16 * 128),
+        (4, 64, 8, 128, 131072, 4 * 128),
+        (8, 64, 8, 64, 32768, 8 * 48),
+        (4, 32, 8, 512, 32768, 3 * 512),
+        (1, 64, 4, 2048, 4096, 2048),
+    ],
+    ids=["b16_q128", "b4_q128_kv128k", "b8_q64_ragged", "g4_q512", "g16_q2048"],
+)
+def test_b200_paged_d128_prefix_leads_with_a_declared_total_q(b, h_q, h_kv, s_q, s_kv, total_q):
+    """Study sm100_paged_d128_prefix_declq_20261117: a declared total-Q (exact or below b * S_q) leads the same prefixes on cc 10.0 /
+    10.3; the backend's engine 8 ran 3.6-5.1x FROST's first plan at b 4-16, S_q 64-128."""
+    from cudnn.sdpa.fwd import placement
+
+    for cc, sms in (((10, 0), 148), ((10, 3), 160)):
+        facts = _sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=total_q, device_cc=cc, device_sm_count=sms)
+        assert placement._sm100_paged_d128_prefix(facts)
+        first = _f16_plans(facts)[0]
+        assert placement.place(_spec_for_plan(first), facts, first.knobs) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
     "over",
     [
         dict(s_q=64, s_kv=64),  # a square: tiny squares trail 1.3-2.0x
-        dict(max_total_seq_len_q=8 * 128),  # an exact total-Q declaration was not measured
+        dict(s_q=2049),  # past the measured S_q
         dict(device_cc=(10, 7), device_sm_count=208),
         dict(b=65),
         dict(s_kv=131073),
         dict(page_size=32),
         dict(h_q=32, h_kv=32),
     ],
-    ids=["square", "total_q", "rubin", "b65", "kv_past_128k", "page32", "mha"],
+    ids=["square", "q2049", "rubin", "b65", "kv_past_128k", "page32", "mha"],
 )
 def test_b200_paged_d128_prefix_rule_stays_inside_its_study(over):
     from cudnn.sdpa.fwd import placement

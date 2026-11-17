@@ -410,7 +410,8 @@ there is consistent with the backend working against the declared capacity while
 mechanism is not verified. Bounded paged holdouts run through FlashInfer's wrapper on a B200 found an offered packed
 unsplit plan ahead of engine 10 on every bounded GQA 4 / 8 / 16 group; a separately frozen bounded holdout then saw
 every changed default faster in both orders but one, which was neutral. Exact G4 / G8 with an exact total-Q
-declaration and bounded MHA / group 2 showed no material gap and still trail. FlashInfer's exact declarations leave
+declaration and bounded MHA / group 2 showed no material gap and still trail; exact G4 / G8 prefixes up to S_q 2048 have
+since been measured to lead (2026-11-17, below). FlashInfer's exact declarations leave
 ``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0, then
 transferred to cc 10.3 with the full squares below.
 
@@ -424,6 +425,12 @@ scored once per version, came to 0.68 / 0.62 on its 39 changed cells, worst 1.04
 at both versions (223 changed cells, worst 1.09).
 S_kv 65537-131072 (study sm100_paged_d128_prefix_kv131k_20261112, 120 train + 40 holdout cells on B200 and B300 at both
 versions): the changed cells came to 0.66-0.83 of the measured default, worst 1.03.
+A declared total-Q (2026-11-17; FlashInfer's CUDA-graph ``max_total_num_rows``, the inference harness's default) leads too.
+Study sm100_paged_d128_prefix_declq_20261117 timed the harness's exact declaration (the sum of the chunk lengths) through its
+cuDNN legs at cuDNN 9.24.0.43, where the backend's engine 8 ran 3.6-5.1x FROST's first plan at b 4-16, S_q 64-128. A fit of
+"lead when S_q <= T" on 200 frozen B200 cells chose the whole range (121 changed cells at 0.616 of the measured default, worst
+1.009). A 64-cell holdout at fresh heads, scored once, came to 0.619 over its 36 changed cells (worst 1.017; each group 4 /
+8 / 16 exercised), and a B300 transfer over all 264 cells to 0.580 over 157 (worst 1.057).
 
 SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
 b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
@@ -1448,13 +1455,12 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
 
 
 def _sm100_paged_d128_prefix(facts) -> bool:
-    """cc 10.0 / 10.3 paged bf16 d128 GQA prefix, S_q < S_kv, FlashInfer's exact declaration (module docstring)."""
+    """cc 10.0 / 10.3 paged bf16 d128 GQA prefix, S_q < S_kv, exact declaration with or without a total-Q (module docstring)."""
     group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
     return (
         facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
         and not facts.shape_overrides
-        and facts.max_total_seq_len_q is None
         and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and group in (4, 8, 16)

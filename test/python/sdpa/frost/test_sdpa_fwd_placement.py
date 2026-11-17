@@ -1317,8 +1317,8 @@ def test_sm100_paged_full_square_leads_inside_its_box():
 
 @pytest.mark.L0
 def test_sm100_paged_gqa_prefill_leads_inside_its_box():
-    """cc 10.0 and cc 10.3 paged bf16 d128 GQA prefill leads for GQA16 (exact or bounded) and bounded GQA 4 / 8; exact G8,
-    MHA, G2 and out-of-box shapes keep the backend."""
+    """cc 10.0 and cc 10.3 paged bf16 d128 GQA prefill leads for GQA16 (exact or bounded) and bounded GQA 4 / 8; exact G8 leads
+    as a prefix up to S_q 2048 (the prefix rule); MHA, G2 and out-of-box shapes keep the backend."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
@@ -1327,7 +1327,8 @@ def test_sm100_paged_gqa_prefill_leads_inside_its_box():
     assert place() == placement.LEAD
     assert place(b=1, s_q=4096, s_kv=4096, bottom_right=False, max_total_seq_len_q=4096) == placement.LEAD
     assert place(bottom_right=False) == placement.TRAIL  # top-left non-square chunk: outside the measured scope
-    assert place(h_q=32, h_kv=4) == placement.TRAIL  # exact G8 with an exact total-Q declaration
+    assert place(h_q=32, h_kv=4) == placement.LEAD  # exact G8 prefix with a total-Q: study sm100_paged_d128_prefix_declq_20261117
+    assert place(h_q=32, h_kv=4, s_q=3000, max_total_seq_len_q=3 * 3000) == placement.TRAIL  # exact G8 past the prefix rule's S_q
     assert place(h_q=32, h_kv=4, max_total_seq_len_q=None) == placement.LEAD  # exact G8, no total-Q declaration
     assert place(h_q=32, h_kv=32, max_total_seq_len_q=None) == placement.TRAIL
     assert place(h_q=32, h_kv=4, shape_overrides=True) == placement.LEAD  # bounded G8
@@ -1338,8 +1339,10 @@ def test_sm100_paged_gqa_prefill_leads_inside_its_box():
     assert place(h_q=32, h_kv=16, shape_overrides=True) == placement.TRAIL
     assert place(device_cc=(10, 3), device_sm_count=160) == placement.LEAD  # study sm103_paged_d128_prefill_transfer_20261031
     assert place(h_q=32, h_kv=4, max_total_seq_len_q=None, device_cc=(10, 3), device_sm_count=160) == placement.LEAD
-    assert place(h_q=32, h_kv=4, device_cc=(10, 3), device_sm_count=160) == placement.TRAIL  # exact G8 on cc 10.3 too
-    assert place(b=placement.SM100_PAGED_GQA16_MAX_B + 1, max_total_seq_len_q=5 * 864) == placement.TRAIL
+    assert place(h_q=32, h_kv=4, device_cc=(10, 3), device_sm_count=160) == placement.LEAD  # the B300 transfer qualified it
+    past_box = dict(b=placement.SM100_PAGED_GQA16_MAX_B + 1, max_total_seq_len_q=5 * 864)
+    assert not placement._sm100_paged_gqa_prefill(_sm107_paged_facts(**{**base, **past_box}))
+    assert place(**past_box) == placement.LEAD  # the prefix rule answers past the box
 
 
 @pytest.mark.L0
