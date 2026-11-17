@@ -1680,7 +1680,7 @@ length fallback test checks the cuDNN operator and forwarded length tensor.
 
 For a native SDPA candidate-compilation regression, test each offered backend
 candidate before testing the first-success and ALL build policies. A valid
-fallback can otherwise hide a broken first candidate. Preserve compilation
+fallback can otherwise hide a first candidate that fails compilation. Preserve compilation
 errors, and check that retained alternatives execute against an independent
 reference. Include neighboring dense/prefill and backward controls rather than
 asserting a fixed engine order. Detector:

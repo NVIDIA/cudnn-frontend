@@ -169,7 +169,7 @@ def _exercise(cudnn_handle, dtype, sq=1, skv=300, stats=True, thd=True, offset64
             graph.execute(bindings, workspace, handle=cudnn_handle)
             check()
         # Check legal alternatives before reporting a bad candidate. A backend
-        # fallback must not make a broken first candidate invisible to this test.
+        # fallback must not make a first candidate that fails compilation invisible to this test.
         assert not compilation_failures, "native candidates failed compilation (#1084):\n" + "\n".join(compilation_failures)
 
 
