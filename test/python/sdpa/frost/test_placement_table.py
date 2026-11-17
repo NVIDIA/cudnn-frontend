@@ -546,8 +546,9 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_prefill_gaps_follow_their_study(s_kv):
-    """Study sm80_prefill_gaps_20261117 (A100): paged THD-Q prefill (gpt-oss d64 with a sink, causal and windowed; qwen d256; MiMo
-    d192 x 128; dsv4 d512) and dense dsv4 d512 lead past a floor; small chunks keep the backend; paged d128 has no entry."""
+    """Study sm80_prefill_gaps_20261117 (A100): paged THD-Q prefill (gpt-oss d64 with a sink, causal and windowed; dsv4 d512) and dense
+    dsv4 d512 lead past a floor; small chunks keep the backend. Paged d128 has no entry; paged d192 x 128 and d256 were retired after
+    their edge supplement (few query tokens over a long cache lost 1.30-1.47x)."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_prefill_gaps_20261117"
 
@@ -560,8 +561,6 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
     leads = (
         dict(has_sink=True),
         dict(has_sink=True, window_left=127),
-        dict(d_qk=256, d_v=256, h_q=32, h_kv=2),
-        dict(d_qk=192, d_v=128, h_q=64, h_kv=4),
         dict(d_qk=512, d_v=512, h_q=64, h_kv=1, page_size=64),
         dict(d_qk=512, d_v=512, h_q=64, h_kv=1, has_paged_kv=False, thd=False, max_total_seq_len_q=None, page_size=0, padded=False),
     )
@@ -570,8 +569,8 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
         assert pt.lookup(row, f(**over)) is True, over
     small = dict(s_q=32, s_kv=1024 + s_kv % 2, max_total_seq_len_q=32)
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
-    assert pt.lookup(row, f(**small, d_qk=256, d_v=256, h_q=4, h_kv=1)) is False
-    assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
+    for over in (dict(d_qk=128, d_v=128), dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
+        assert pt.matched_entry(row, f(**over)) is None, over
 
 
 @pytest.mark.L0

@@ -969,17 +969,9 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_prefill_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE b085f3499; causal prefill S_q >= 17 over the whole range:
     # chunks S_q 17-4096 over KV 256-128k and squares 128-8192, on and off the tile, b 1-8; paged THD Q (the context path) d64, d64 + sink,
     # d64 + sink + 128-key window, d192 x 128, d256, d512 MQA, and dense d512 MQA; 640 train cells). Holdout at fresh heads, scored once:
-    # 0.38-0.74 geomean of changed cells (worst 1.049). Paged d128 changed no holdout cell: no entry.
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 35.614, "sm80_prefill_gaps_20261117"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
-        "ge", 8.006, "sm80_prefill_gaps_20261117", "q"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 35.5, "sm80_prefill_gaps_20261117"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry("ge", 36.5, "sm80_prefill_gaps_20261117"),
+    # 0.38-0.74 geomean of changed cells (worst 1.049). Paged d128 changed no holdout cell: no entry. The paged d192 x 128 and d256 twins
+    # are retired: an edge supplement at few query tokens over a long cache with many heads (sm80_prefill_gaps_edge_20261117) lost
+    # 1.30-1.47x on their cost floors (THD Q cannot split KV); the d64, d64 + sink and d512 twins passed it (worst 1.015).
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
         "ge", 23.544, "sm80_prefill_gaps_20261117"
     ),
