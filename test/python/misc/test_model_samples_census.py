@@ -7215,6 +7215,17 @@ def test_the_loader_keeps_the_out_projection_weights_by_call_site(monkeypatch):
         "mlp.gate_up",
     )
 
+    # a plan that serves the block with ONE row answers for every call site of it: with a decode plan whose multiplies read the
+    # stored format at both call sites (a test's own stand-ins) and a verify plan that is two rows on it, every plan multiplies
+    # every out-projection on its codes -- the block is named whole, and no copy of any of its weights is made
+    verify, decode, checks = checked(on_stored=True)
+    assert decode.plan.at("projection.fp8.out", "linear_attention.out") == decode.plan.at(
+        "projection.fp8.out", "full_attention.out"
+    ), "one row in the decode plan"
+    assert [label for label, name, _, _, _ in verify.plan.parts() if name == "projection.fp8.out"] == [LA_OUT, FA_OUT], "two in the verify plan"
+    assert "projection.fp8.out" in verify.weights.stored and "projection.fp8.out" in verify.weights.uncopied and one not in verify.weights.uncopied
+    assert all(layer.out_proj.data is None and layer.out_proj.stored is not None for layer in verify.weights.layers) and checks.ok, checks.text()
+
     # the loader itself: the names it takes, and what it refuses
     model, stages = _tiny_model(), Stages()
     from model_samples.weights import Checkpoint

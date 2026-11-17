@@ -1170,8 +1170,13 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     )
     assert "with 13 launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries" in section
     assert "Today three kinds of row do that" in " ".join(family.split()) and "its forms are kept per call site" in " ".join(family.split())
-    assert "by-provider" not in section, "the by-provider line of a verify plan on the recorded class is the decode plan's: nothing to restate"
-    assert _plan(1, 6, model=QwenDense())[0].by_provider() == _plan(1, 1, model=QwenDense())[0].by_provider()
+    # ... and the by-provider sentence of a verify plan: the plan's own line on compute capability 10.0 and on another 10.x class
+    counted = "cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2)"
+    for cc, sms, tokens, frontend in (((10, 0), 148, 6, 5), ((10, 0), 148, 1, 5), ((10, 3), 152, 6, 5), ((10, 3), 152, 1, 4), ((10, 7), 212, 6, 5)):
+        line = _plan(1, tokens, cc=cc, sms=sms, model=QwenDense())[0].by_provider()
+        assert line == f"by provider: cuDNN FE {frontend} | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2", (cc, tokens)
+    assert f"counts what the decode plan counts on compute capability 10.0 -- {counted} --" in section
+    assert "makes the verify plan cuDNN Frontend 5 where the decode plan is cuDNN Frontend 4, with the same fallbacks" in section
     assert "Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(family.split())
     decline = "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
     assert decline in section, "the decline the README quotes is the plan's own sentence"
@@ -1693,6 +1698,48 @@ def test_a_row_that_hands_a_call_site_on_and_the_parts_of_its_block():
     assert (lost.site, lost.form, lost.facts) == ("c", (), None) and lost.wrong == "block mix: no provider row for the call site 'c'; its rows name a, b"
     said = census.check_forms([lost])
     assert said[0] == f"mix at c: an entry | a multiply over a copy states no launch for this run ({lost.wrong}): the provider table is wrong", said
+
+    # against a census of a target: a part on a fallback row is a fallback row of the plan -- also where it is the only one, and
+    # the section says claimed -- and the identity of the block is that of each of its call sites
+    target = census.Target(
+        {
+            "schema": 2,
+            "kernels": {
+                "fp8_projection": {"origin": "cuDNN Frontend", "relation": "target", "kind": "port", "form": {"SPLIT_K": 2}},
+                "library_multiply": {"origin": "a library", "relation": "target", "kind": "code", "selection": "the library's tuner"},
+            },
+            "layers": {"x": "x_layer", "y": "y_layer"},
+            "configurations": {
+                "verify": {
+                    "cc10.0/sm148": {
+                        "claimed": True,
+                        "basis": "recorded",
+                        "tokens": 2,
+                        "geometry": {"hidden": 8},
+                        "rows": {
+                            "2": {
+                                "prologue": [],
+                                "x_layer": [["mix", "fp8_projection", {"form": {"OUT_FEATURES": 8}, "launch": [[80, 2, 1], [256, 1, 1], 103808]}]],
+                                "y_layer": [["mix", "library_multiply", {}]],
+                                "epilogue": [],
+                                "after_step": [],
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    )
+    held = SimpleNamespace(geometry=SimpleNamespace(layer_kinds=("x", "y", "x"), hidden=8), wiring=model.wiring, sites=model.sites)
+    claim = target.claim(plan, held, "verify", installed={})
+    assert claim.reasons == ["fallback rows present"], "the one fallback row of this plan is a part: the class is not claimed"
+    assert [identity.relation for identity in claim.identities] == ["target", "not yet", "target", "host"] and claim.sites == ["a", "b", "a", ""]
+    assert (claim.of("mix"), claim.of("mix", "a"), claim.of("mix", "b")) == ("target; not yet (a copy)", "target", "not yet (a copy)")
+    assert claim.recorded == {0: ((80, 2, 1), (256, 1, 1), 103808), 2: ((80, 2, 1), (256, 1, 1), 103808)}
+    numbers = claim.numbers()
+    assert (numbers["launches"], numbers["code"], numbers["port"], numbers["target_port"], numbers["not_yet"]) == (3, 1, 2, 2, {"mix": 1})
+    identity = [" ".join(line.split()) for line in census.table(plan, claim).splitlines()[2:4]]
+    assert identity[0].endswith("name and launch shape, as the entry states them target") and identity[1].endswith("by family not yet (a copy)")
 
     # a step the entry's row does not serve: one row, one part, the block as every block is
     plain = plan_of(1)

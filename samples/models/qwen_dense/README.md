@@ -844,7 +844,11 @@ and of a step of 9 are not the same bytes, by the target's own choice of split. 
 row's bytes alone as among the others, and the batch-invariance check gates it there on compute capability 10.0 (one
 sequence alone runs on the entry instance of its step's range). The rows of compute capability 10.3 and 10.7 claim
 what the entry admits; the entry's page lists this weight shape as unverified on those classes, and no run of this
-sample has been made there.
+sample has been made there. By provider, a verify plan with such a row counts what the decode plan counts on compute
+capability 10.0 -- cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) -- because the two 8-bit
+projections count as one kind of block per provider and both providers have one there already. On the other 10.x
+classes the in-projection is a multiply over a copy, so the out-projection's row makes the verify plan cuDNN
+Frontend 5 where the decode plan is cuDNN Frontend 4, with the same fallbacks.
 
 The kernel multiplies on the stored 8-bit weight, and the load keeps the forms of this block per call site: the
 codes of the linear-attention layers' out-projections for a plan with such a row, the bf16 copies of the attention
@@ -899,8 +903,9 @@ Up to 16 rows the verify session runs the out-projection of the linear-attention
 session on a multiply over a copy, which rounds its unscaled sum and the scaled result where the kernel rounds once:
 there the logits of the two runs were one bf16 unit apart at most, inside the family's band of 4, and the keys and
 values an attention layer cached were not the same bytes -- printed, not gated, because the layer was fed other rows.
-From 17 rows both sessions multiply over a copy, and the logits and the caches were the same bytes at 18, 24 and 28
-rows. The entry was inside the band of the reference multiply at the first and the last row count of both ranges --
+From 17 rows both sessions multiply over a copy: at three sequences of six tokens and at four of six, seven and eight
+the logits and the caches were the same bytes again, and at nine and 16 sequences of two tokens the logits were within
+half a unit (a multiply over a copy is another library kernel at another row count). The entry was inside the band of the reference multiply at the first and the last row count of both ranges --
 one sequence of two tokens and of eight, three of three, two of eight -- with one bf16 unit on fewer than 0.05 % of
 the elements, and each sequence alone wrote the bytes it wrote among the others. At two and three sequences, on a
 part of this SM count, the verify entry takes another form than at one sequence and at four: one thread block per
@@ -912,7 +917,7 @@ eight, the largest step that form holds. These are the runs of one GPU class.
 reduced models. Up to 32 rows of a step PyTorch reserved within 0.1 GiB of it: one sequence of six tokens, with the
 decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; the verify
 session alone, which keeps the out-projection of the linear-attention layer on its codes without a copy, asked for
-about 3.5 GiB and reserved and grew the same. Beyond that the sentence is short, as it is
+about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB. Beyond that the sentence is short, as it is
 for a decode plan beyond 33 sequences (the section "Support per GPU class"): 16 sequences of three, four and five
 tokens -- 48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB and grew the
 device by 4.5, 5.8 and 7.1 GiB. A GPU whose free memory is what the sentence says passes the plan of such a run and
