@@ -313,7 +313,8 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
     assert placement.place(spec, _facts(s_q=1, dtype=cudnn.data_type.HALF, **lead, **mla)) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, window_left=128, **lead, **mla)) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, has_sink=True, **lead, **mla)) == placement.TRAIL
-    assert placement.place(spec, _facts(s_q=1, h_q=16, b=1, s_kv=32768, **mla)) == placement.TRAIL  # 2**19: a measured loss
+    # 2**19: v2 timed it as a loss (backend 37.4 us, its split-KV reduction uncounted); re-timed 51.0 us vs FROST 41.6 us
+    assert placement.place(spec, _facts(s_q=1, h_q=16, b=1, s_kv=32768, **mla)) == placement.LEAD
     assert placement.place(spec, _facts(s_q=4, h_q=16, b=1, s_kv=2048, **mla)) == placement.LEAD
     # Outside the table (another SM100-row part, a bounded declaration) the #1933 hand floor still decides.
     assert placement.place(spec, _facts(s_q=1, device_cc=(10, 1), **lead, **mla)) == placement.LEAD

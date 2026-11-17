@@ -268,6 +268,9 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # sm100_d256_decode_v4_924_20261116 replaces v3 after its own check (B300 SXM6 AC 1100 W, cuDNN 9.24.0.43; 80 cost-stratified
     # train cells): regret 1.002, worst 1.038; the 15 verdicts that differ from v3 run 0.861 of v3's choice, worst 1.032.
     # sm100_d576_dense_decode_rt924_20261030 replaces its parent study after the same check (20 train cells): regret 1.000.
+    # sm100_d576_decode_v3_924_20261116 (D576 paged s_q 1 on the tile): a 20-cell check missed the regret bound (1.040, worst 1.339;
+    # every changed verdict still beat v2, 0.751), so the class was studied on cc 10.3 itself (B300, 103 train cells): its own fit is
+    # the same threshold, cost 25.503, and a fresh 20-cell cc 10.3 holdout scores 1.000 vs v2's 1.058, no cell slower.
     (10, 3): (
         (10, 0),
         frozenset(
@@ -278,6 +281,7 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
                 "sm100_d512_paged_context_20261030",
                 "sm100_d256_paged_context_20261030",
                 "sm100_d576_dense_decode_rt924_20261030",
+                "sm100_d576_decode_v3_924_20261116",
             }
         ),
     ),
@@ -369,7 +373,12 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm100_d576_decode_v2_20261028"
     ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.588, "sm100_d576_decode_v2_20261028"),
+    # study sm100_d576_decode_v3_924_20261116 (on the tile only): v2's grid with the backend re-timed on a full-power B200 at cuDNN
+    # 9.24.0.43 (its split-KV reduction counted) plus a 40-cell supplement at cost 24.5-27 timed at develop 5304d19df; fresh 20-cell
+    # boundary holdout: regret 1.059 vs v2's 1.293, no cell slower, 9 faster. Off the tile and MTP keep v2 (no holdout cell moved).
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry(
+        "ge", 25.503, "sm100_d576_decode_v3_924_20261116"
+    ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.131, "sm100_d576_decode_v2_20261028"),
     # study sm100_d512_paged_decode_b100_20261030 (cc 10.0 B100 850 W, cuDNN 9.29.0.17; 120 on-tile + 27 off-tile cells, one KV head,
     # h_q 8-128, b 1-128, S_kv 4k-128k, page 16/64, fill 0.25/1; the same threshold on the B200 grid: regret 1.002)
