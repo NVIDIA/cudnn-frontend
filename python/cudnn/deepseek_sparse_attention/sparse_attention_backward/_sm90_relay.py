@@ -11,6 +11,7 @@ SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8, 16, 32, 64)
 SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 16
 SM90_PHYSICAL_RELAY_CLUSTER_SIZES = (4, 8, 16)
 SM90_CONFLICT_RANK_PLANES = 4
+SM90_CONFLICT_RANK_WAVE_CTAS = 128
 SM90_SIGNED_INT32_ELEMENT_LIMIT = 1 << 31
 
 
@@ -117,3 +118,20 @@ def sm90_physical_relay_cluster_size(relay_cluster_size, device=None) -> int:
     raise NotImplementedError(
         "deterministic SM90 DSA backward requires a launchable C4, C8, or C16 " f"physical cluster for logical relay C{relay_cluster_size}"
     )
+
+
+def sm90_conflict_rank_relay_phases(sm_count) -> int:
+    """Choose one 128-CTA wave or two ordered 64-CTA phases.
+
+    Conflict-rank overflow writers wait for lower query ordinals, so every CTA
+    in a launch must be resident together.  A device with at least 128 SMs can
+    launch the complete wave; smaller devices split it into two same-stream
+    phases.  The prepared plan caches this plan-time decision.
+    """
+    try:
+        sm_count = operator.index(sm_count)
+    except TypeError as error:
+        raise ValueError(f"SM90 conflict-rank scheduling requires an integer SM count, got {sm_count!r}") from error
+    if sm_count <= 0:
+        raise ValueError(f"SM90 conflict-rank scheduling requires a positive SM count, got {sm_count}")
+    return 1 if sm_count >= SM90_CONFLICT_RANK_WAVE_CTAS else 2

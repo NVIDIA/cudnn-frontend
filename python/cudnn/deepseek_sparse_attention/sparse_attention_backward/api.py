@@ -26,6 +26,7 @@ from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
 from ._sm90_relay import (
     SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    sm90_conflict_rank_relay_phases,
     sm90_deterministic_relay_accumulator_elements,
     sm90_deterministic_relay_indexing_error,
     sm90_deterministic_relay_requirement_error,
@@ -90,7 +91,10 @@ class SparseAttentionBackward(APIBase):
 
         - ``'records'`` (default): conflict-rank storage. SM90 uses four dense
           planes: ranks zero to three use separate planes and larger ranks
-          deterministically chain through plane zero. SM100 records plans put
+          deterministically chain through plane zero. A prepared SM90 plan
+          launches a complete 128-query wave on devices with at least 128 SMs
+          and otherwise uses two ordered 64-query phases; this device choice is
+          fixed before execution and CUDA Graph capture. SM100 records plans put
           rank ``k`` in dense plane ``k`` while it fits and use slot-private
           overflow records otherwise; records and planes are combined in a
           fixed order. Shapes whose conflict-rank workspace would exceed the
@@ -133,6 +137,7 @@ class SparseAttentionBackward(APIBase):
         self.deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
         self._sm90_deterministic_relay_cluster_size = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE
         self._sm90_physical_relay_cluster_size = 1
+        self._sm90_conflict_rank_phases = None
         self.deterministic_dkv_mode = deterministic_dkv_mode
         self._dkv_mode = deterministic_dkv_mode
         self._backend = None
@@ -414,14 +419,18 @@ class SparseAttentionBackward(APIBase):
         elif self.cli_target_head_count is not None:
             self._value_error_if(True, "cli_target_head_count requires return_cli_target=True")
 
-        # Defer the one-time driver occupancy query until every inexpensive
-        # support check has passed.  The result is part of the prepared plan
-        # and is never recomputed by execute() or CUDA Graph replay.
+        # Defer device scheduling queries until every inexpensive support check
+        # has passed.  Shards query cluster occupancy; records only read the SM
+        # count.  Both results belong to the prepared plan and are never
+        # recomputed by execute() or CUDA Graph replay.
         if major == 9 and self.deterministic and self._dkv_mode == "shards":
             self._sm90_physical_relay_cluster_size = sm90_physical_relay_cluster_size(
                 self._sm90_deterministic_relay_cluster_size,
                 self.q_desc.device,
             )
+        elif major == 9 and self.deterministic and self._dkv_mode == "records" and self._sm90_conflict_rank_phases is None:
+            sm_count = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
+            self._sm90_conflict_rank_phases = sm90_conflict_rank_relay_phases(sm_count)
         self._is_supported = True
         return True
 
@@ -752,6 +761,7 @@ class SparseAttentionBackward(APIBase):
                     cli_target=cli_target,
                     cli_target_head_count=(self.cli_target_head_count if self.return_cli_target else 0),
                     physical_relay_cluster_size=self._sm90_physical_relay_cluster_size,
+                    conflict_rank_phases=self._sm90_conflict_rank_phases,
                 )
             return _iface_sm100.flash_attn_bwd_sm100(
                 q,
@@ -829,9 +839,11 @@ def sparse_attention_backward_wrapper(
     SM90 or SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or
     64-CTA logical relay. SM90 uses the widest launchable C16/C8/C4 physical
     cluster and ordered phases when necessary. ``None`` selects conflict-rank
-    records on SM90 and the automatic policy on SM100. This plan-time choice
-    changes the required workspace and remains fixed across every execution
-    and CUDA Graph replay of the cached plan.
+    records on SM90 and the automatic policy on SM100. An SM90 records plan
+    uses one 128-query wave on devices with at least 128 SMs and two ordered
+    64-query phases otherwise. These plan-time choices change the required
+    workspace or launch schedule and remain fixed across every execution and
+    CUDA Graph replay of the cached plan.
     """
     if return_cli_target and cli_target_head_count is None:
         cli_target_head_count = q.shape[1]

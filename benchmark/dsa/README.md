@@ -418,6 +418,30 @@ the default `--deterministic-dkv-mode records`.
 | C16 logical / C8 physical relay | 484.915 | 22.67 | 4.508 | 1.00x |
 | Four-plane conflict rank | **120.687** | **91.10** | **3.008** | **4.02x** |
 
+##### SM90 conflict-rank H200 wave scheduling (2026-11-17)
+
+Measured on the AIStudio H200 allocation (runtime name `NVIDIA L20X`) with
+BF16 H64, Q=16384, KV=262144, top-k 2048, full runtime lengths, synthetic
+forward statistics, five warmups, and 20 allocation-free calls. The environment
+used PyTorch 2.12.1+cu130, CuTe DSL 4.8.1 with its CUDA 13 extra (CUDA 13.4
+lowering), cuDNN 9.19.0, and `cuda-bindings` 13.0.3. The records plan selected
+one 128-CTA wave because the allocation has at least 128 SMs. Each records/C32
+endpoint was repeated after reversing the measurement order.
+
+| Dqk / Dv | dKV layout | BWD ms | BWD TFLOPS | Workspace GiB | Speedup vs C16 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 512 / 512 | C16 relay | 84.643 | 129.90 | 4.508 | 1.00x |
+| 512 / 512 | C32 relay | 75.936--75.970 | 144.73--144.79 | **2.508** | 1.11x |
+| 512 / 512 | Four-plane conflict rank | **75.056--75.151** | **146.31--146.49** | 3.008 | **1.13x** |
+| 576 / 512 | C16 relay | 100.126 | 118.05 | 5.008 | 1.00x |
+| 576 / 512 | C32 relay | 94.546 | 125.02 | **2.758** | 1.06x |
+| 576 / 512 | Four-plane conflict rank | **85.201--85.257** | **138.64--138.73** | 3.258 | **1.17x** |
+
+For D512, records cut time by 1.1% versus the manually tuned C32 relay while
+using 0.5 GiB more workspace. For D576, records cut time by 9.8% versus C32
+with the same 0.5 GiB tradeoff. C16 remains the upstream default shard-relay
+comparison.
+
 ##### SM90 deterministic relay scheduling (2026-11-02)
 
 Measured on NVIDIA H200 (SM90) with BF16 H64/Dqk576/Dv512, KV=65536,

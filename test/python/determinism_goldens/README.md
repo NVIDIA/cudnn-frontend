@@ -3380,7 +3380,7 @@ Known gaps, stated rather than tolerated:
 - These layouts have no golden records; their bits depend on the plan, and
   for D576 on the SM count.
 
-### SM90 DSA conflict-rank backward: H20 validation, 2026-11-17
+### SM90 DSA conflict-rank backward: H20 and H200 validation, 2026-11-17
 
 The SM90 default deterministic backward now uses four-plane conflict-rank
 storage; an explicit logical relay keeps the shard layout. Validation used an
@@ -3409,6 +3409,23 @@ Top-K 2048. Five warmups and twenty allocation-free calls measure 120.687 ms,
 91.10 TFLOPS and 3.008 GiB workspace. The upstream + physical-cluster-fix C16
 logical/C8 physical baseline measures 484.915 ms and 4.508 GiB: 4.02x speedup
 and 33.3% less workspace.
+
+The AIStudio H200 allocation (runtime name `NVIDIA L20X`) used PyTorch
+2.12.1+cu130, CUDA 13.0, cuDNN 9.19.0, CuTe DSL 4.8.1 with the CUDA 13 extra
+(CUDA 13.4 lowering), and `cuda-bindings` 13.0.3. The prepared plan selected
+one 128-CTA wave instead of two 64-CTA phases. The same high-conflict reference
+case and all three CUDA Graph variants passed, including poisoned workspace and
+changed sparse inputs. The two new SM-count/plan-cache controls add six passing
+L0 cases; the complete SM90 L0 selection passed 64 cases, including records
+and shard-relay compile-cache reuse across changing runtime extents.
+Long-context performance with five warmups and 20 calls was
+75.056--75.151 ms for D512 and 85.201--85.257 ms for D576. C16 baselines were
+84.643 and 100.126 ms; H200-tuned C32 relays were 75.936--75.970 and 94.546 ms.
+
+H20-3e retained the two ordered 64-CTA phases. Its phase-policy, prepared-plan
+cache, records/shards compile-cache, high-conflict reference, and all three
+changed-input CUDA Graph cases passed after the H200 scheduling change; the
+complete SM90 L0 selection also passed 64 cases.
 
 No support status is upgraded: multi-wave dKV is still not batch invariant,
 so SM90 BF16 remains **Replay only**. Duplicate active indices within one

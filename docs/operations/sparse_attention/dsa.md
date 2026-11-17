@@ -327,9 +327,12 @@ rank by popcounting lower query ordinals. Ranks zero through three accumulate
 into four separate dense FP32 planes. Higher ranks reuse plane zero after all
 lower plane-zero writers for that row publish and clear their mutable bits;
 ranks one through three retire their bits before computing because their planes
-are disjoint. Two ordered 64-query, single-CTA-cluster launches process each
-128-query wave, so every writer that a CTA can wait for is resident on the
-supported SM90 targets. Head tiles and later waves remain stream ordered, and
+are disjoint. A prepared plan reads the device SM count once: devices with at
+least 128 SMs process the complete wave in one 128-CTA, single-CTA-cluster
+launch, while smaller devices use two ordered 64-CTA launches. In both cases,
+every writer that a CTA can wait for is resident. The selected phase count is
+compiled into the plan and is not queried during execution or CUDA Graph replay.
+Head tiles and later waves remain stream ordered, and
 the postprocess kernel combines the four planes in fixed order. One warp per
 head computes `d_sink` with a fixed strided-lane/tree reduction order.
 Duplicate valid top-k indices within one query row remain outside this
@@ -366,6 +369,14 @@ records measured 120.687 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
 the C16 logical relay baseline split into physical C8 launches: 4.02x faster
 with 33.3% less workspace. Historical explicit-relay H200 measurements and the
 full environments are recorded in `benchmark/dsa/README.md`.
+
+On the AIStudio H200 allocation (runtime name `NVIDIA L20X`) with BF16 H64,
+Q=16384, KV=262144, and top-k 2048, the single-wave records schedule measured
+75.056--75.151 ms for D512 and 85.201--85.257 ms for D576. The existing C16
+relay measured 84.643 and 100.126 ms respectively; the H200-tuned C32 relay
+measured 75.936--75.970 and 94.546 ms. Each result uses five warmups and 20
+allocation-free calls. Records are 1.13x faster than C16 and 1.01x faster than
+C32 for D512, and 1.17x faster than C16 and 1.11x faster than C32 for D576.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in

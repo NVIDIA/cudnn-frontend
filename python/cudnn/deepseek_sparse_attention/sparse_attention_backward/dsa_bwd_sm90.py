@@ -639,6 +639,7 @@ class FlashAttentionDSABackwardSm90:
         padded_head_dim: int = 0,
         emit_cli_target: bool = False,
         physical_relay_cluster_size: Optional[int] = None,
+        conflict_rank_phases: int = 2,
     ):
         """Specialize the Hopper backward kernel and optional deterministic relay."""
         self.dtype = dtype
@@ -672,9 +673,11 @@ class FlashAttentionDSABackwardSm90:
         self.relay_cluster_size = relay_cluster_size
         if conflict_rank:
             self.physical_relay_cluster_size = 1
-            # Two ordered 64-query rounds keep every waiting overflow writer
-            # resident with the lower ordinal it depends on on the H20 target.
-            self.relay_phases = 2
+            assert conflict_rank_phases in (1, 2)
+            # Every overflow writer waits only for lower ordinals in this
+            # launch.  The prepared host selects one 128-CTA wave when all of
+            # it fits concurrently, otherwise two ordered 64-CTA phases.
+            self.relay_phases = conflict_rank_phases
         else:
             self.physical_relay_cluster_size = min(relay_cluster_size, 16) if physical_relay_cluster_size is None else physical_relay_cluster_size
             assert self.physical_relay_cluster_size in (1, 4, 8, 16)
@@ -1027,9 +1030,10 @@ class FlashAttentionDSABackwardSm90:
 
         # One CTA per query/head tile; TMA predicates the final partial head tile.
         # Deterministic execution bounds the logical grid to one query wave and
-        # serializes head tiles. A logical relay wider than the device's widest
-        # launchable C16/C8/C4 cluster is split into ordered physical launches
-        # that reuse the same FP32 plane.
+        # serializes head tiles. A logical shard relay wider than the device's
+        # widest launchable C16/C8/C4 cluster is split into ordered physical
+        # launches that reuse the same FP32 plane. Conflict-rank records use
+        # either one full 128-CTA wave or two ordered 64-CTA phases.
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
         total_q = cute.size(mQ.shape[3])

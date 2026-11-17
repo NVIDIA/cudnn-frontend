@@ -7124,6 +7124,30 @@ def test_DSA_sparse_attention_backward_sm90_physical_relay_rejects_unlaunchable_
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("sm_count,expected", [(1, 2), (78, 2), (127, 2), (128, 1), (132, 1)])
+def test_DSA_sparse_attention_backward_sm90_conflict_rank_phases_follow_residency(sm_count, expected):
+    """A complete 128-CTA wave is used only where every CTA can be resident."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+
+    assert _sm90_relay.sm90_conflict_rank_relay_phases(sm_count) == expected
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_conflict_rank_plan_caches_phases(monkeypatch):
+    """The prepared plan resolves the SM-count policy before execute or capture."""
+    _require_sm90_deterministic_relay()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api as dsa_bwd_api
+
+    plan, *_ = _plan_case(64, 512, 64, s_q=65, s_kv=256, deterministic=True, compile_plan=False)
+    sm_count = torch.cuda.get_device_properties(plan.q_desc.device).multi_processor_count
+    assert plan._sm90_conflict_rank_phases == _sm90_relay.sm90_conflict_rank_relay_phases(sm_count)
+    monkeypatch.setattr(dsa_bwd_api, "sm90_conflict_rank_relay_phases", lambda sm_count: pytest.fail("recomputed cached SM90 scheduling"))
+    assert plan.check_support()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("relay_cluster_size", [4, 8, 16, 32, 64])
 def test_DSA_sparse_attention_backward_sm90_relay_host_span_matches_workspace_layout(relay_cluster_size):
     """The support-check span calculation matches the execution workspace."""
@@ -7342,8 +7366,9 @@ def test_DSA_sparse_attention_backward_sm90_conflict_rank_high_overlap():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=94)
-def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_runtime_extents(monkeypatch):
-    """Packed Q/KV extents stay runtime values for all deterministic artifacts."""
+@pytest.mark.parametrize("relay_cluster_size", [None, 16], ids=["records", "shards"])
+def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_runtime_extents(monkeypatch, relay_cluster_size):
+    """Packed Q/KV extents stay runtime values for records and shard relays."""
     _require_sm90_deterministic_relay()
     cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
     _interface_sm90 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90")
@@ -7363,7 +7388,7 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_r
             s_kv=s_kv,
             has_topk_length=True,
             deterministic=True,
-            deterministic_relay_cluster_size=16,
+            deterministic_relay_cluster_size=relay_cluster_size,
         )
         dq, dkv, d_sink = outputs
         result = plan.execute(
@@ -7451,10 +7476,10 @@ def test_DSA_sparse_attention_backward_sm90_multiphase_relay_repeat100(relay_clu
 @pytest.mark.parametrize(
     "relay_cluster_size",
     [None, 32, 64],
-    ids=["default-cluster16", "cluster32", "cluster64"],
+    ids=["records", "cluster32", "cluster64"],
 )
 def test_DSA_sparse_attention_backward_sm90_relay_cuda_graph(relay_cluster_size):
-    """C16/C32/C64 relays replay with poisoned storage and changed sparse inputs."""
+    """Records and explicit C32/C64 relays replay with poisoned storage and changed sparse inputs."""
     cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
 
     _require_sm90_deterministic_relay()

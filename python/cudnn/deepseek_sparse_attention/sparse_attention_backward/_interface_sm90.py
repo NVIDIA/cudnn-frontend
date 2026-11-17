@@ -27,6 +27,7 @@ from .dsa_bwd_sm90 import (
 from ._sm90_relay import (
     SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
     normalize_sm90_relay_cluster_size,
+    sm90_conflict_rank_relay_phases,
     sm90_deterministic_relay_layout,
     sm90_deterministic_relay_indexing_error,
     sm90_physical_relay_cluster_size,
@@ -116,6 +117,7 @@ def flash_attn_bwd_sm90(
     cli_target: Optional[torch.Tensor] = None,
     cli_target_head_count: int = 0,
     physical_relay_cluster_size: Optional[int] = None,
+    conflict_rank_phases: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -153,6 +155,9 @@ def flash_attn_bwd_sm90(
         physical_relay_cluster_size: Preselected physical C4/C8/C16 launch
             width. ``None`` queries the current device before compilation.
             Prepared plans pass their cached support-check result here.
+        conflict_rank_phases: Preselected one-wave or two-phase conflict-rank
+            schedule. ``None`` selects from the current device's SM count.
+            Prepared plans cache the result before execution.
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -217,7 +222,13 @@ def flash_attn_bwd_sm90(
         conflict_rank = deterministic_dkv_mode == "records"
         if conflict_rank:
             physical_relay_cluster_size = 1
+            if conflict_rank_phases is None:
+                sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+                conflict_rank_phases = sm90_conflict_rank_relay_phases(sm_count)
+            if conflict_rank_phases not in (1, 2):
+                raise ValueError(f"conflict_rank_phases must be 1 or 2, got {conflict_rank_phases!r}")
         else:
+            conflict_rank_phases = 1
             if physical_relay_cluster_size is None:
                 physical_relay_cluster_size = sm90_physical_relay_cluster_size(relay_cluster_size, q.device)
             if (
@@ -241,6 +252,7 @@ def flash_attn_bwd_sm90(
         conflict_rank = False
         relay_cluster_size = 1
         physical_relay_cluster_size = 1
+        conflict_rank_phases = 1
         physical_plane_elems = seqlen_k_rounded * head_dim_rounded
         num_relay_waves = 1
         num_head_tiles = 1
@@ -439,6 +451,7 @@ def flash_attn_bwd_sm90(
         relay_cluster_size,
         physical_relay_cluster_size,
         _DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
+        conflict_rank_phases,
         head_dim_rounded if deterministic else 0,
     )
     if compile_key not in flash_attn_bwd_sm90.compile_cache:
@@ -475,6 +488,7 @@ def flash_attn_bwd_sm90(
             padded_head_dim=head_dim_rounded if deterministic else 0,
             emit_cli_target=cli_target is not None,
             physical_relay_cluster_size=physical_relay_cluster_size,
+            conflict_rank_phases=conflict_rank_phases,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,
