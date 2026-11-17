@@ -268,11 +268,15 @@ def test_a_draft_vocabulary_is_read_once_each_in_order_and_inside_the_vocabulary
             DraftVocab.seeded(272, rows=rows)
 
 
+def _readme_section() -> str:
+    """The family README's section on the drafter, as it is written there."""
+    return README.read_text().split("\n## The checkpoint's drafter\n", 1)[1].split("\n## ", 1)[0]
+
+
 def _readme_blocks() -> tuple:
     """The two fenced ``python`` blocks of the README's section on the drafter, as they are written there: the call of the
     loader, then the recipe for a draft vocabulary."""
-    section = README.read_text().split("\n## The checkpoint's drafter\n", 1)[1].split("\n## ", 1)[0]
-    blocks = re.findall(r"```python\n(.*?)```", section, flags=re.S)
+    blocks = re.findall(r"```python\n(.*?)```", _readme_section(), flags=re.S)
     assert len(blocks) == 2 and "QwenDenseDrafter.describe(" in blocks[0] and "--dump-tokens" in blocks[1], "the call, then the recipe"
     return tuple(blocks)
 
@@ -284,6 +288,11 @@ def test_the_readmes_recipe_makes_a_draft_vocabulary_the_loader_reads(tmp_path, 
     from model_samples.qwen_dense.drafter import RECIPE, DraftVocab
 
     assert RECIPE == 'samples/models/qwen_dense/README.md, "The checkpoint\'s drafter"' and "--dump-tokens FILE" in README.read_text()
+    # a flag the section names is a flag a script of this folder has: the list is the loader's argument until a script takes it
+    flags = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*[a-z]", _readme_section()))
+    scripts = "".join(path.read_text() for path in sorted((MODELS / "qwen_dense").glob("[0-9][0-9]_*.py")))
+    assert {"--model", "--dump-tokens"} <= flags and [flag for flag in sorted(flags) if f'"{flag}"' not in scripts] == []
+    assert "`draft_vocab=`" in _readme_section()
     monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
     monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_for_the_recipe", MODELS / "qwen_dense" / "00_decode.py")
@@ -600,10 +609,15 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
     call = call.replace('"/data/Qwen3.8-27B-NVFP4"', repr(str(directory))).replace('"draft_vocab.json"', repr(str(tmp_path / "ids.json")))
     monkeypatch.setattr(sys, "path", list(sys.path))  # the lines put samples/models on the path
     capsys.readouterr()
+    read.clear()
     scope = {}
     exec(compile(call, "the README's call of the loader", "exec"), scope)
     assert capsys.readouterr().out == drafter.manifest_text() + "\n" and scope["drafter"] == drafter
     assert torch.equal(scope["weights"].gate_up.codes, weights.gate_up.codes) and torch.equal(scope["weights"].head.codes, weights.head.codes)
+    # called as it is written there, with no table handed over, the load reads the model's table too: the section says so
+    its_key = MODEL + "embed_tokens.weight"
+    assert its_key in read and sorted(set(read)) == sorted(wanted) and _bytes(scope["weights"].embedding) == _raw(directory, its_key)[2]
+    scope["checkpoint"].close()
 
 
 def test_a_drafter_this_sample_does_not_read_is_declined_by_name(tmp_path):
@@ -809,6 +823,12 @@ def test_the_seeded_drafter_draws_its_tensors_and_its_list_from_a_seed():
     keys = {row.name: of_model.get(row.name, "mtp." + row.name[len("drafter.") :]) for row in full.manifest()}
     listed = DraftVocab(tuple(range(65536)), 248320, "draft_vocab.json", 65536)
     published = dataclasses.replace(full, label="checkpoint Qwen3.8-27B-NVFP4 (local)", prefix="mtp.", keys=keys, vocabulary=listed)
-    section = README.read_text().split("\n## The checkpoint's drafter\n", 1)[1].split("\n## ", 1)[0]
+    section = _readme_section()
     printed = re.findall(r"```text\n(.*?)```", section, flags=re.S)
     assert len(printed) == 1 and printed[0].rstrip("\n") == published.manifest_text()
+    # the last line of that manifest leaves the model's embedding table out, and the README's own call of the loader reads
+    # it: the section states the table's size at these widths, and the argument that hands the model's table over instead
+    geometry = full.geometry
+    table = f"{geometry.vocab:,} x {geometry.hidden:,} elements in bf16, {2 * geometry.vocab * geometry.hidden / 2.0**30:.2f} GiB"
+    assert table == "248,320 x 5,120 elements in bf16, 2.37 GiB" and table in " ".join(section.split())
+    assert "drafter.load(checkpoint, device, embedding=table)" in section

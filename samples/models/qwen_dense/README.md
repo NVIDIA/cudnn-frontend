@@ -341,8 +341,14 @@ weights = drafter.load(checkpoint, "cpu")  # or a CUDA device
 ```
 
 It needs the packages of `samples/models/requirements.txt` and the checkpoint on local disk, as `--model` does, and a
-list of token ids, `draft_vocab.json`, which the recipe below makes. It does three things, each from the checkpoint
-itself.
+list of token ids, `draft_vocab.json`, which the recipe below makes.
+
+Called as above, `load` also reads the model's embedding table, which the last line of the manifest below leaves out:
+248,320 x 5,120 elements in bf16, 2.37 GiB for the published checkpoint. A caller that has loaded the model passes the
+table it holds, `drafter.load(checkpoint, device, embedding=table)`: the drafter then reads none and keeps no second
+copy.
+
+The loader does three things, each from the checkpoint itself.
 
 **It finds the drafter's tensors and says what a load makes of each.** They sit under one prefix of the checkpoint
 (`mtp.` in the published one), all stored in bf16: two norm weights in front of a multiply twice the hidden width wide,
@@ -442,7 +448,8 @@ hash `95049016a247`). On the CPU, without a GPU:
   2026-11-12, compute capability 10.0): they hold 2,341 tokens and 342 distinct ids; the list is those 342 and the
   65,194 lowest ids not among them, and the loader read it without dropping an entry;
 - the manifest above: the checkpoint holds 15 tensors under `mtp.`, all in bf16, and the list names exactly those;
-  nothing was read before the load;
+  nothing was read before the load. The call as it is written above read the model's embedding table too, 2,542,796,800
+  bytes equal to the shard file's; a load that was handed a table read none;
 - the head: all 65,536 rows of the loaded head equal the rows of the output head in the shard file at the listed ids,
   read there by the offsets of the shard's header -- 167,772,160 bytes of packed codes and 20,971,520 bytes of block
   scales -- and the two scalars are the file's;
@@ -456,11 +463,10 @@ And the same load on a GPU of compute capability 10.0 (a 148-SM part): every byt
 norm weights and of the head rows equals the byte the CPU made, and every scale is the same bit for bit.
 
 **What is not here.** No draft step and no speculative decoding: nothing runs the loaded drafter, so nothing compares
-its output with anything, and no kernel has read these 8-bit weights. No script takes the list; `--draft-vocab FILE`
-will be a flag of the speculative-decoding script, not of `00_decode.py`. The loader has run on the CPU and on one GPU
-class, compute capability 10.0; a class it has not run on is uncovered, not passing. And the 8-bit weights are held to
-the rule above, not to the weights another implementation makes of the same checkpoint: no such comparison is part of
-this repository.
+its output with anything, and no kernel has read these 8-bit weights. No script takes the list yet; the loader takes
+it as `draft_vocab=`. The loader has run on the CPU and on one GPU class, compute capability 10.0; a class it has not
+run on is uncovered, not passing. And the 8-bit weights are held to the rule above, not to the weights another
+implementation makes of the same checkpoint: no such comparison is part of this repository.
 
 ## Who serves each block (stack `fe-cublas`)
 
