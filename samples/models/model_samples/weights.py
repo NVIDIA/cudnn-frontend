@@ -24,6 +24,10 @@ the block that consumes the operand, never by the one that produced it.
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
 
+A weight that a checkpoint stores in bf16 can be brought to 8 bits when it is loaded, with one scale per row -- per output
+channel of the multiply (:func:`quantize_fp8_per_channel`).  That rule is fixed down to its division, because the codes are
+what a kernel on them reads: a host test pins it against the format definition.
+
 ``Checkpoint.synthetic`` draws every tensor on the CPU generator from a seed and the tensor's name, so a tensor's values depend
 on neither the device nor the load order.
 
@@ -67,7 +71,8 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 @dataclass
 class ScaledTensor:
     """8-bit E4M3 codes with a scale: ``value = code * scale``.  ``codes`` holds the code bytes (``uint8``; view them as
-    ``torch.float8_e4m3fn`` for a kernel); ``scale`` is a float, or a 1-D tensor with one scale per row of a merged weight."""
+    ``torch.float8_e4m3fn`` for a kernel); ``scale`` is a float, or a 1-D fp32 tensor with one scale per row: of a merged
+    weight whose parts kept their scales, or of a weight quantised per channel."""
 
     codes: torch.Tensor
     scale: Union[float, torch.Tensor]
@@ -249,6 +254,40 @@ def quantize_fp8(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) -> S
     return ScaledTensor(codes, float(scale))
 
 
+#: a row of a weight quantised per channel never gets a smaller scale than ``1 / (448 * PER_CHANNEL_FLOOR)``: a row whose
+#: largest magnitude is below ``1 / PER_CHANNEL_FLOOR``, an all-zero row among them, keeps that scale
+PER_CHANNEL_FLOOR = 512
+
+
+def quantize_fp8_per_channel(x: torch.Tensor, rows_per_chunk: int = 2048) -> ScaledTensor:
+    """8-bit quantisation of a weight ``[out, in]`` with one scale per row, that is per output channel of its multiply:
+
+    * ``scale = max|row| / 448``, a division in fp32, and never below ``1 / (448 * 512)`` formed in fp32: a row whose
+      largest magnitude is below 1/512 keeps that scale, so an all-zero row has a scale and the codes 0;
+    * ``code = e4m3(row / scale)``: a division in fp32 again -- not a multiplication by the reciprocal of the scale, which
+      puts a quotient that sits on the midpoint of two codes on the other side on some elements --, saturating at +-448,
+      round to nearest even.
+
+    A row is quantised by itself, so the weights that feed one multiply can be concatenated before or after.  Returns a
+    :class:`ScaledTensor` whose ``scale`` is the fp32 tensor ``[out]``.  ``ValueError`` for a tensor that is not ``[out,
+    in]`` and for a row that holds a value that is not finite: nothing is quantised then."""
+    if x.dim() != 2:
+        raise ValueError(f"the per-channel 8-bit quantisation takes a weight [out, in]; got {list(x.shape)}")
+    top = torch.tensor(E4M3_MAX, dtype=torch.float32, device=x.device)
+    floor = torch.tensor(1.0, dtype=torch.float32, device=x.device) / (top * PER_CHANNEL_FLOOR)
+    codes = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
+    scale = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
+    for where, part in _row_chunks(x, rows_per_chunk):
+        rows = part.float()
+        largest = rows.abs().amax(dim=1)
+        if not bool(torch.isfinite(largest).all()):
+            row = (where.start or 0) + int((~torch.isfinite(largest)).nonzero()[0])
+            raise ValueError(f"row {row} of the weight holds a value that is not finite: nothing is quantised")
+        scale[where] = torch.maximum(largest / top, floor)
+        codes[where] = _e4m3(rows / scale[where].unsqueeze(1))
+    return ScaledTensor(codes, scale)
+
+
 def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) -> BlockScaledTensor:
     """4-bit quantisation with a static global scale: per block of 16, ``block_scale = e4m3(max|x| / 6 / scale)`` and
     ``code = e2m1(x / (block_scale * scale))``; an all-zero block has block scale 0 and codes 0."""
@@ -363,6 +402,8 @@ class DiskTensor:
 #: what a described checkpoint may hold for each format of a family's tensor list: header dtype of the tensor itself
 _DISK_DTYPE = {"bf16": "BF16", "fp32": "F32", "fp8": "F8_E4M3", "nvfp4": "U8", "scalar": "F32"}
 REQUIREMENTS = "samples/models/requirements.txt"
+#: what ``Checkpoint.bind`` says a family reads, unless the family says it in its own words
+MODEL_BUILD = "it reads the build with 8-bit projections and a 4-bit MLP and output head"
 
 
 def read_header(path: str) -> tuple:
@@ -500,10 +541,13 @@ class Checkpoint:
         total = sum(self.files.values())
         return f"{self.label}: {len(self.files)} shards, {len(self.tensors):,} tensors, {total / 1e9:.1f} GB, manifest hash {self.manifest_hash}"
 
-    def bind(self, specs: Iterable[TensorSpec], keys: Mapping[str, str]) -> None:
+    def bind(self, specs: Iterable[TensorSpec], keys: Mapping[str, str], reads: str = MODEL_BUILD) -> None:
         """Attach a family's tensor list to a described checkpoint.  ``keys`` maps each spec's name to the checkpoint's own
         tensor name.  Every tensor must be there in the storage format and shape of its spec; the first that is not raises
-        ``NotImplementedError`` naming it: the checkpoint is not one this family reads."""
+        ``NotImplementedError`` naming it: the checkpoint is not one this family reads (``reads``: the sentence that says
+        what it does read).  A second list of the same checkpoint -- its drafter's -- is bound beside the first; a name
+        both lists hold must stand for the same tensor in the same format and shape, or the lists are wrong: a
+        ``ValueError``.  Nothing is bound unless the whole list fits."""
 
         def need(key, dtype, shape, what):
             found = self.tensors.get(key)
@@ -512,8 +556,7 @@ class Checkpoint:
             if found.dtype != dtype or (shape is not None and tuple(found.shape) != tuple(shape)):
                 wanted = f"{dtype} {list(shape)}" if shape is not None else dtype
                 raise NotImplementedError(
-                    f"{self.label}: tensor {key!r} is {found.dtype} {list(found.shape)} where this sample reads {wanted} ({what}): "
-                    "it reads the build with 8-bit projections and a 4-bit MLP and output head"
+                    f"{self.label}: tensor {key!r} is {found.dtype} {list(found.shape)} where this sample reads {wanted} ({what}): {reads}"
                 )
 
         bound, names = {}, {}
@@ -531,7 +574,13 @@ class Checkpoint:
             else:
                 need(key, _DISK_DTYPE[spec.fmt], spec.shape, "a plain tensor")
             bound[spec.name], names[spec.name] = spec, key
-        self.specs, self._keys = bound, names
+        for name, spec in bound.items():
+            if name in self.specs and (self.specs[name] != spec or self._keys[name] != names[name]):
+                raise ValueError(
+                    f"tensor {name!r} is bound to this checkpoint as another tensor already: "
+                    "two tensor lists of one checkpoint share a name only for the same tensor"
+                )
+        self.specs, self._keys = {**self.specs, **bound}, {**self._keys, **names}
 
     def _read(self, key: str) -> torch.Tensor:
         """One tensor of a described checkpoint on the CPU, through ``safetensors`` (memory-mapped shard, no pickle)."""
