@@ -1085,6 +1085,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "dense", "window", True, "gqa", True): Entry(
         "always", None, "sm107_d64_sink_prefill_20261112"
     ),
+    # study sm107_paged_d64_sink_prefill_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 235172717; benchmark/attention_inference's paged
+    # context graph (THD, exact total-Q, page 16): gpt-oss d64 with a sink, bottom-right causal, groups 3-8, b 1-8, S_q 128-4096, KV
+    # 4k-128k on and off the tile; 100 train cells, measured default regret 1.28 / 1.45). Changed train cells 0.707 / 0.690; a 32-cell
+    # holdout at fresh heads, scored once, 0.660 / 0.618 (worst 0.975); a supplement at S_q 5-96, 0.388 / 0.400 (worst 0.542). The
+    # 128-key window twin has no entry: its on-tile rule led S_q 5 verify graphs at 1.7-2.0x in the supplement.
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", False): Entry(
+        "le", 9.792, "sm107_paged_d64_sink_prefill_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", True): Entry(
+        "always", None, "sm107_paged_d64_sink_prefill_20261117"
+    ),
     # study sm120_decode_20261112 (RTX PRO 6000 Server, cuDNN 9.30.0.4; benchmark/attention_inference's generation graph, s_q 1-4:
     # paged d128 / d256 GQA page 16, d512 / D576xV512 absorbed MLA dense and paged, d64 sink (and window 128) paged MTP; b 1-64, S_kv
     # 8k-131k on and off the tile; 333 train cells + a seeded holdout scored once per class: 0.34-0.67 geomean of the measured default,
