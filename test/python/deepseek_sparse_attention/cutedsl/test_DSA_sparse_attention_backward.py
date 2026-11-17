@@ -7297,14 +7297,15 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=20261117)
-def test_DSA_sparse_attention_backward_sm90_conflict_rank_high_overlap():
-    """SM90 records overflow ranks serialize plane zero and remain bitwise stable."""
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+def test_DSA_sparse_attention_backward_sm90_conflict_rank_high_overlap(head_dim):
+    """SM90 column-phase tickets keep high-conflict overflow ranks bitwise stable."""
     cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
 
     _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         64,
-        512,
+        head_dim,
         64,
         s_q=65,
         s_kv=256,

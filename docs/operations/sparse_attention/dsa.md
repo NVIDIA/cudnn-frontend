@@ -320,14 +320,18 @@ the split count is fixed when the plan is compiled.
 
 On SM90, `deterministic=True` and the default
 `deterministic_dkv_mode='records'` use conflict-rank dKV storage for
-H16/H32/H64/H96/H128. A setup kernel builds immutable and mutable 128-bit
-query-selection bitmaps for every referenced
-`(query wave, M64 head tile, KV row)`. Each query computes its stable conflict
-rank by popcounting lower query ordinals. Ranks zero through three accumulate
-into four separate dense FP32 planes. Higher ranks reuse plane zero after all
-lower plane-zero writers for that row publish and clear their mutable bits;
-ranks one through three retire their bits before computing because their planes
-are disjoint. A prepared plan reads the device SM count once: devices with at
+H16/H32/H64/H96/H128. A setup kernel builds an immutable 128-bit
+query-selection bitmap and four zero-initialized ticket words for every
+referenced `(query wave, M64 head tile, KV row)`. Each query computes its stable
+conflict rank by popcounting lower query ordinals. Ranks zero through three
+accumulate into four separate dense FP32 planes. Higher ranks reuse plane zero after all
+lower plane-zero writers for that row publish monotonically increasing release
+tickets. On a resident 128-CTA wave, D512 uses four independent column groups
+and D576 uses two, so adjacent overflow ranks can pipeline disjoint columns
+instead of serializing the complete row update. The two-launch schedule keeps
+one ticket per row because its waves are already stream ordered. Ranks one
+through three require no ticket because their planes are disjoint. A prepared
+plan reads the device SM count once: devices with at
 least 128 SMs process the complete wave in one 128-CTA, single-CTA-cluster
 launch, while smaller devices use two ordered 64-CTA launches. In both cases,
 every writer that a CTA can wait for is resident. The selected phase count is
@@ -342,8 +346,8 @@ The conflict-rank dKV allocation is
 `4 * (K64 + mask_rows) * D32 * sizeof(float)`, where
 `K64 = round_up(total_S_kv, 64)`, `D32 = round_up(D, 32)`, and
 `mask_rows = ceil(2 * ceil(total_S_q / 128) * ceil(H / 64) * K64 / D32)`.
-The factor two stores the immutable and mutable bitmaps; their four 32-bit
-words are striped across the four planes.
+The factor two stores the immutable bitmap and four 32-bit column-phase ticket
+words; both groups are striped across the four planes.
 
 An explicit `deterministic_relay_cluster_size=C`, for
 `C in {4, 8, 16, 32, 64}`, selects the previous `'shards'` cluster relay even
@@ -365,18 +369,21 @@ the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
 the declared tensor shapes and addresses fixed while allowing tensor contents,
 including `topk_idxs` and `topk_length`, to change.
 On H20-3e with BF16 H64/D512, Q=16384, KV=262144, and top-k 2048, conflict-rank
-records measured 120.687 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
-the C16 logical relay baseline split into physical C8 launches: 4.02x faster
+records measured 119.109 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
+the C16 logical relay baseline split into physical C8 launches: 4.07x faster
 with 33.3% less workspace. Historical explicit-relay H200 measurements and the
 full environments are recorded in `benchmark/dsa/README.md`.
 
 On the AIStudio H200 allocation (runtime name `NVIDIA L20X`) with BF16 H64,
 Q=16384, KV=262144, and top-k 2048, the single-wave records schedule measured
-75.056--75.151 ms for D512 and 85.201--85.257 ms for D576. The existing C16
+69.147--69.217 ms for D512 and 83.164--83.285 ms for D576. The existing C16
 relay measured 84.643 and 100.126 ms respectively; the H200-tuned C32 relay
 measured 75.936--75.970 and 94.546 ms. Each result uses five warmups and 20
-allocation-free calls. Records are 1.13x faster than C16 and 1.01x faster than
-C32 for D512, and 1.17x faster than C16 and 1.11x faster than C32 for D576.
+allocation-free calls. Records are 1.224x faster than C16 and 1.098x faster
+than C32 for D512, and 1.204x faster than C16 and 1.137x faster than C32 for
+D576. When every query shares the same 2048 KV rows, column-phase tickets
+reduce D512 from 151.586 to 87.678 ms (1.73x) and D576 from 195.635 to
+139.779 ms (1.40x) relative to the previous single-ticket records path.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in

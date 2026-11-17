@@ -439,13 +439,15 @@ a row alone and inside a batch under the entry's own picks.
   plans and generic plans for which `deterministic_dkv_mode` selects records
   or the chain relay.
 - On SM90, the default `deterministic_dkv_mode='records'` uses four
-  conflict-rank planes and a fixed-order plane-zero overflow chain. An explicit
-  `deterministic_relay_cluster_size` selects the shard relay instead. H20-3e
-  BF16 H64/D512 high-conflict replay/reference and H96/D576 changed-input CUDA
-  Graph replay are verified. The AIStudio H200 allocation additionally verifies
-  the one-wave 128-CTA schedule with high-conflict and changed-input CUDA Graph
-  replay; smaller SM90 devices retain two ordered 64-CTA phases. Cross-wave dKV
-  remains batch dependent, so the SM90 BF16 status stays **Replay only**.
+  conflict-rank planes and fixed-order plane-zero overflow tickets. A resident
+  128-CTA wave pipelines independent dKV column groups; the two-launch schedule
+  uses one ticket per row. An explicit `deterministic_relay_cluster_size`
+  selects the shard relay instead. H20-3e BF16 H64/D512 and D576 high-conflict
+  replay/reference and H96/D576 changed-input CUDA Graph replay are verified.
+  The AIStudio H200 allocation additionally verifies the one-wave schedule with
+  the same high-conflict and changed-input CUDA Graph cases; smaller SM90
+  devices retain two ordered 64-CTA phases. Cross-wave dKV remains batch
+  dependent, so the SM90 BF16 status stays **Replay only**.
   Duplicate active indices within one query remain outside the SM90
   deterministic contract. FP16 and other SM90 head-count/dimension combinations
   are unverified for this new records path.

@@ -27,9 +27,9 @@ def sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, 
     num_waves = _round_up(total_s_q, 128) // 128
     num_head_tiles = _round_up(num_heads, 64) // 64
     if conflict_rank:
-        # One immutable and one mutable 128-bit query bitmap per KV row,
-        # wave, and 64-head tile.  The four bitmap words are striped over
-        # the four dense dKV planes so every plane has the same extent.
+        # One immutable 128-bit query bitmap plus four 32-bit column-phase
+        # tickets per KV row, wave, and 64-head tile.  The words are striped
+        # over the four dense dKV planes so every plane has the same extent.
         num_dkv_planes = SM90_CONFLICT_RANK_PLANES
         mask_storage_elems = 2 * num_waves * num_head_tiles * seqlen_k_rounded
         mask_rows = _round_up(mask_storage_elems, head_dim_rounded) // head_dim_rounded

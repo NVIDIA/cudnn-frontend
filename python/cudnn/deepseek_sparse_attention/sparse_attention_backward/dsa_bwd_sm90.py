@@ -99,6 +99,21 @@ def _wait_lower_relay_ranks64(mask_ptr, lower_rank_mask: Uint64):
 
 
 @cute.jit
+def _wait_relay_ticket(counter_ptr, ticket: Uint32):
+    """Acquire the preceding overflow writer's column-phase ticket."""
+    current = cute.arch.load(counter_ptr, Uint32, sem="relaxed", scope="gpu")
+    loop = cutlass.while_generate([current], lambda value: value < ticket)
+    with loop as [value]:
+        value = cute.arch.load(counter_ptr, Uint32, sem="relaxed", scope="gpu")
+        cutlass.yield_out([value])
+    acquired = cute.arch.load(counter_ptr, Uint32, sem="acquire", scope="gpu")
+    acquire_loop = cutlass.while_generate([acquired], lambda value: value < ticket)
+    with acquire_loop as [value]:
+        value = cute.arch.load(counter_ptr, Uint32, sem="acquire", scope="gpu")
+        cutlass.yield_out([value])
+
+
+@cute.jit
 def _load_f32_head_to_smem(
     src: cute.Tensor,
     dst: cute.Tensor,
@@ -600,12 +615,10 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
                 for head_tile in cutlass.range_constexpr(self.num_head_tiles):
                     mask_ptr = self._mask_word_ptr(mdKVaccum, query_idx, head_tile, kv_row, batch_idx, num_waves, padded_seqlen_kv)
                     cute.arch.atomic_or(mask_ptr.llvm_ptr, bit, sem="relaxed", scope="gpu")
-                    if cutlass.const_expr(self.conflict_rank):
-                        # The second copy is mutable: low-conflict writers
-                        # retire immediately, while plane-0 and overflow
-                        # writers retire after their dKV reductions.
-                        mutable_ptr = mask_ptr + num_waves * self.num_head_tiles * padded_seqlen_kv
-                        cute.arch.atomic_or(mutable_ptr.llvm_ptr, bit, sem="relaxed", scope="gpu")
+                    # Conflict-rank plane-zero ordering uses four zero-initialized
+                    # column-phase tickets per row.  They live in the auxiliary
+                    # tails reserved by the workspace layout; no mutable bitmap
+                    # needs to be constructed here.
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -678,11 +691,16 @@ class FlashAttentionDSABackwardSm90:
             # launch.  The prepared host selects one 128-CTA wave when all of
             # it fits concurrently, otherwise two ordered 64-CTA phases.
             self.relay_phases = conflict_rank_phases
+            # A full resident wave can pipeline independent dKV column groups.
+            # The split-wave plan keeps one ticket: its second launch cannot
+            # overlap the first, so extra intra-CTA barriers only add cost.
+            self.conflict_ticket_phases = (4 if self.same_hdim_kv else 2) if conflict_rank_phases == 1 else 1
         else:
             self.physical_relay_cluster_size = min(relay_cluster_size, 16) if physical_relay_cluster_size is None else physical_relay_cluster_size
             assert self.physical_relay_cluster_size in (1, 4, 8, 16)
             assert relay_cluster_size % self.physical_relay_cluster_size == 0
             self.relay_phases = relay_cluster_size // self.physical_relay_cluster_size
+            self.conflict_ticket_phases = 1
         self.q_wave_ctas = q_wave_ctas
         self.padded_head_dim = padded_head_dim
         self.mask_dtype = Uint64 if relay_cluster_size == 64 else Uint32
@@ -1352,16 +1370,16 @@ class FlashAttentionDSABackwardSm90:
         kv_row: Int32,
         num_waves: Int32,
         padded_seqlen_kv: Int32,
-        mutable: cutlass.Constexpr[bool],
+        ticket_region: cutlass.Constexpr[bool],
     ):
-        """Address one word of an immutable or mutable 128-query row bitmap."""
+        """Address an immutable rank-bitmap word or column-phase ticket."""
         wave_idx = m_block // self.q_wave_ctas
         phase_idx = head_idx * num_waves + wave_idx
         data_plane_elems = padded_seqlen_kv * self.padded_head_dim
         word_offset = phase_idx * padded_seqlen_kv + kv_row
-        if cutlass.const_expr(mutable):
+        if cutlass.const_expr(ticket_region):
             # Every plane stores all head-tile/wave rows contiguously.  The
-            # mutable copy follows the immutable copy at the same per-plane
+            # ticket region follows the immutable bitmap at the same per-plane
             # offset.  ``head_idx`` is the serialized 64-head tile index.
             word_offset += num_waves * Int32(padded_seqlen_kv) * Int32(self.qhead_tiles)
         plane = mdKVaccum[None, word, batch_idx]
@@ -1403,46 +1421,36 @@ class FlashAttentionDSABackwardSm90:
         sRank: cute.Tensor,
         num_waves: Int32,
         padded_seqlen_kv: Int32,
+        ticket_phase: cutlass.Constexpr[int] = 0,
     ):
-        """Import lower-rank releases before this CTA updates a sparse KV tile."""
+        """Import lower-rank releases before one dKV column phase."""
         if cutlass.const_expr(self.conflict_rank):
             if wg_tidx < self.tile_n:
-                rank = Int32(255)
+                rank = Int32(sRank[wg_tidx]) if cutlass.const_expr(ticket_phase > 0) else Int32(255)
                 slot = n_block * self.tile_n + wg_tidx
                 if slot < topk:
                     kv_row = mTopkIdxs_cur[slot]
                     if kv_row >= 0 and kv_row < max_seqlen_kv:
-                        rank = self._conflict_rank(mdKVaccum, m_block, head_idx, batch_idx, kv_row, num_waves, padded_seqlen_kv)
-                        ordinal = m_block % self.q_wave_ctas
-                        word = ordinal // Int32(32)
-                        bit = Uint32(1) << Uint32(ordinal % Int32(32))
-                        own_ptr = self._rank_mask_word_ptr(mdKVaccum, word, m_block, head_idx, batch_idx, kv_row, num_waves, padded_seqlen_kv, True)
-                        if rank > Int32(0) and rank < Int32(4):
-                            # These ranks write disjoint planes and retire before
-                            # computing, so the bit is scheduling state only.
-                            cute.arch.atomic_and(own_ptr.llvm_ptr, ~bit, sem="relaxed", scope="gpu")
-                        elif rank >= Int32(4):
-                            for lower_word in cutlass.range_constexpr(4):
-                                lower_mask = Uint32(0)
-                                if ordinal >= Int32((lower_word + 1) * 32):
-                                    lower_mask = Uint32(0xFFFFFFFF)
-                                elif ordinal > Int32(lower_word * 32):
-                                    shift = ordinal - Int32(lower_word * 32)
-                                    lower_mask = (Uint32(1) << Uint32(shift)) - Uint32(1)
-                                if lower_mask != Uint32(0):
-                                    wait_ptr = self._rank_mask_word_ptr(
-                                        mdKVaccum,
-                                        Int32(lower_word),
-                                        m_block,
-                                        head_idx,
-                                        batch_idx,
-                                        kv_row,
-                                        num_waves,
-                                        padded_seqlen_kv,
-                                        True,
-                                    )
-                                    _wait_lower_relay_ranks(wait_ptr, lower_mask)
-                sRank[wg_tidx] = cutlass.Uint8(rank)
+                        if cutlass.const_expr(ticket_phase == 0):
+                            rank = self._conflict_rank(mdKVaccum, m_block, head_idx, batch_idx, kv_row, num_waves, padded_seqlen_kv)
+                        if rank >= Int32(4):
+                            # Each auxiliary word is an independent column-phase
+                            # ticket. Overflow CTAs can therefore pipeline disjoint
+                            # dKV column groups instead of serializing the full row.
+                            counter_ptr = self._rank_mask_word_ptr(
+                                mdKVaccum,
+                                Int32(ticket_phase),
+                                m_block,
+                                head_idx,
+                                batch_idx,
+                                kv_row,
+                                num_waves,
+                                padded_seqlen_kv,
+                                True,
+                            )
+                            _wait_relay_ticket(counter_ptr, Uint32(rank - Int32(3)))
+                if cutlass.const_expr(ticket_phase == 0):
+                    sRank[wg_tidx] = cutlass.Uint8(rank)
             _partial_cta_sync(int(NamedBarrierBwd.DKVRelay), self.num_threads_per_warp_group)
             return
         rank = m_block % self.relay_cluster_size
@@ -1478,8 +1486,9 @@ class FlashAttentionDSABackwardSm90:
         sRank: cute.Tensor,
         num_waves: Int32,
         padded_seqlen_kv: Int32,
+        ticket_phase: cutlass.Constexpr[int] = 0,
     ):
-        """Publish this CTA's dKV updates before a later relay rank acquires them."""
+        """Publish one dKV column phase before a later relay rank acquires it."""
         if cutlass.const_expr(self.conflict_rank):
             _partial_cta_sync(int(NamedBarrierBwd.DKVRelay), self.num_threads_per_warp_group)
             if wg_tidx < self.tile_n:
@@ -1489,11 +1498,21 @@ class FlashAttentionDSABackwardSm90:
                     if slot < topk:
                         kv_row = mTopkIdxs_cur[slot]
                         if kv_row >= 0 and kv_row < max_seqlen_kv:
-                            ordinal = m_block % self.q_wave_ctas
-                            word = ordinal // Int32(32)
-                            bit = Uint32(1) << Uint32(ordinal % Int32(32))
-                            own_ptr = self._rank_mask_word_ptr(mdKVaccum, word, m_block, head_idx, batch_idx, kv_row, num_waves, padded_seqlen_kv, True)
-                            cute.arch.atomic_and(own_ptr.llvm_ptr, ~bit, sem="release", scope="gpu")
+                            counter_ptr = self._rank_mask_word_ptr(
+                                mdKVaccum,
+                                Int32(ticket_phase),
+                                m_block,
+                                head_idx,
+                                batch_idx,
+                                kv_row,
+                                num_waves,
+                                padded_seqlen_kv,
+                                True,
+                            )
+                            next_ticket = Uint32(1)
+                            if rank >= Int32(4):
+                                next_ticket = Uint32(rank - Int32(2))
+                            cute.arch.store(counter_ptr, next_ticket, sem="release", scope="gpu")
             return
         rank = m_block % self.relay_cluster_size
         mask_dtype = self.mask_dtype
@@ -1513,6 +1532,55 @@ class FlashAttentionDSABackwardSm90:
                     if (row_mask & ~current_bit) != mask_dtype(0):
                         keep_mask = ~(mask_dtype(1) << bit_shift)
                         cute.arch.atomic_and(mask_ptr.llvm_ptr, keep_mask, sem="release", scope="gpu")
+
+    @cute.jit
+    def advance_dkv_relay_ticket(
+        self,
+        mdKVaccum: cute.Tensor,
+        mTopkIdxs_cur: cute.Tensor,
+        n_block: Int32,
+        topk: Int32,
+        max_seqlen_kv: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        wg_tidx: Int32,
+        sRank: cute.Tensor,
+        num_waves: Int32,
+        padded_seqlen_kv: Int32,
+        completed_phase: cutlass.Constexpr[int],
+    ):
+        """Release one column group and acquire the next group ticket."""
+        self.release_dkv_relay(
+            mdKVaccum,
+            mTopkIdxs_cur,
+            n_block,
+            topk,
+            max_seqlen_kv,
+            m_block,
+            head_idx,
+            batch_idx,
+            wg_tidx,
+            sRank,
+            num_waves,
+            padded_seqlen_kv,
+            ticket_phase=completed_phase,
+        )
+        self.acquire_dkv_relay(
+            mdKVaccum,
+            mTopkIdxs_cur,
+            n_block,
+            topk,
+            max_seqlen_kv,
+            m_block,
+            head_idx,
+            batch_idx,
+            wg_tidx,
+            sRank,
+            num_waves,
+            padded_seqlen_kv,
+            ticket_phase=completed_phase + 1,
+        )
 
     @cute.jit
     def mma_wg0(
@@ -2338,7 +2406,7 @@ class FlashAttentionDSABackwardSm90:
             while n_block >= 0:
                 smem_idx_PdS = 0  # PdS_stage=1
 
-                if cutlass.const_expr(self.deterministic):
+                if cutlass.const_expr(self.deterministic and (not self.conflict_rank or self.conflict_ticket_phases == 1)):
                     self.acquire_dkv_relay(
                         mdKVaccum,
                         mTopkIdxs_cur,
@@ -2405,6 +2473,23 @@ class FlashAttentionDSABackwardSm90:
                     number_of_threads=self.num_mma_threads,
                 )
 
+                if cutlass.const_expr(self.conflict_rank and self.conflict_ticket_phases > 1):
+                    self.acquire_dkv_relay(
+                        mdKVaccum,
+                        mTopkIdxs_cur,
+                        n_block,
+                        topK,
+                        max_seqlen_kv,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        wg_tidx,
+                        sRank,
+                        num_waves,
+                        padded_seqlen_kv,
+                        ticket_phase=0,
+                    )
+
                 # AtomicAdd C0 (s0)
                 self.scatter_dkv_atomic(
                     acc_dKV_s0,
@@ -2456,6 +2541,23 @@ class FlashAttentionDSABackwardSm90:
                     thr_mma_dKV,
                     tidx,
                 )
+
+                if cutlass.const_expr(self.conflict_rank and self.conflict_ticket_phases == 4):
+                    self.advance_dkv_relay_ticket(
+                        mdKVaccum,
+                        mTopkIdxs_cur,
+                        n_block,
+                        topK,
+                        max_seqlen_kv,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        wg_tidx,
+                        sRank,
+                        num_waves,
+                        padded_seqlen_kv,
+                        completed_phase=0,
+                    )
 
                 # --- c3 (stage 1, reuse s1): P^T @ dO[192:256] + dS^T @ Q[192:256] ---
                 sdO_c3 = cute.make_tensor(sdO.iterator + 3 * chunk_elems, sdO_chunk_layout.outer)
@@ -2527,6 +2629,40 @@ class FlashAttentionDSABackwardSm90:
                     tidx,
                 )
 
+                if cutlass.const_expr(self.conflict_rank):
+                    if cutlass.const_expr(self.conflict_ticket_phases == 4):
+                        self.advance_dkv_relay_ticket(
+                            mdKVaccum,
+                            mTopkIdxs_cur,
+                            n_block,
+                            topK,
+                            max_seqlen_kv,
+                            m_block,
+                            head_idx,
+                            batch_idx,
+                            wg_tidx,
+                            sRank,
+                            num_waves,
+                            padded_seqlen_kv,
+                            completed_phase=1,
+                        )
+                    elif cutlass.const_expr(self.conflict_ticket_phases == 2):
+                        self.advance_dkv_relay_ticket(
+                            mdKVaccum,
+                            mTopkIdxs_cur,
+                            n_block,
+                            topK,
+                            max_seqlen_kv,
+                            m_block,
+                            head_idx,
+                            batch_idx,
+                            wg_tidx,
+                            sRank,
+                            num_waves,
+                            padded_seqlen_kv,
+                            completed_phase=0,
+                        )
+
                 # --- c5 (stage 1, reuse s1): P^T @ dO[320:384] + dS^T @ Q[320:384] ---
                 sdO_c5 = cute.make_tensor(sdO.iterator + 5 * chunk_elems, sdO_chunk_layout.outer)
                 sQ_c5 = cute.make_tensor(sQ.iterator + 5 * chunk_elems, sQ_chunk_layout.outer)
@@ -2582,6 +2718,23 @@ class FlashAttentionDSABackwardSm90:
                     thr_mma_dKV,
                     tidx,
                 )
+
+                if cutlass.const_expr(self.conflict_rank and self.conflict_ticket_phases == 4):
+                    self.advance_dkv_relay_ticket(
+                        mdKVaccum,
+                        mTopkIdxs_cur,
+                        n_block,
+                        topK,
+                        max_seqlen_kv,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        wg_tidx,
+                        sRank,
+                        num_waves,
+                        padded_seqlen_kv,
+                        completed_phase=2,
+                    )
 
                 # --- c7 (stage 1, reuse s1): P^T @ dO[448:512] + dS^T @ Q[448:512] ---
                 sdO_c7 = cute.make_tensor(sdO.iterator + 7 * chunk_elems, sdO_chunk_layout.outer)
@@ -2688,20 +2841,37 @@ class FlashAttentionDSABackwardSm90:
                     )
 
                 if cutlass.const_expr(self.deterministic):
-                    self.release_dkv_relay(
-                        mdKVaccum,
-                        mTopkIdxs_cur,
-                        n_block,
-                        topK,
-                        max_seqlen_kv,
-                        m_block,
-                        head_idx,
-                        batch_idx,
-                        wg_tidx,
-                        sRank,
-                        num_waves,
-                        padded_seqlen_kv,
-                    )
+                    if cutlass.const_expr(self.conflict_rank):
+                        self.release_dkv_relay(
+                            mdKVaccum,
+                            mTopkIdxs_cur,
+                            n_block,
+                            topK,
+                            max_seqlen_kv,
+                            m_block,
+                            head_idx,
+                            batch_idx,
+                            wg_tidx,
+                            sRank,
+                            num_waves,
+                            padded_seqlen_kv,
+                            ticket_phase=self.conflict_ticket_phases - 1,
+                        )
+                    else:
+                        self.release_dkv_relay(
+                            mdKVaccum,
+                            mTopkIdxs_cur,
+                            n_block,
+                            topK,
+                            max_seqlen_kv,
+                            m_block,
+                            head_idx,
+                            batch_idx,
+                            wg_tidx,
+                            sRank,
+                            num_waves,
+                            padded_seqlen_kv,
+                        )
 
                 n_block -= 1
                 first_iter = False

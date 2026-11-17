@@ -416,7 +416,7 @@ the default `--deterministic-dkv-mode records`.
 | dKV layout | BWD ms | BWD TFLOPS | Workspace GiB | Speedup |
 | --- | ---: | ---: | ---: | ---: |
 | C16 logical / C8 physical relay | 484.915 | 22.67 | 4.508 | 1.00x |
-| Four-plane conflict rank | **120.687** | **91.10** | **3.008** | **4.02x** |
+| Four-plane conflict rank | **119.109** | **92.31** | **3.008** | **4.07x** |
 
 ##### SM90 conflict-rank H200 wave scheduling (2026-11-17)
 
@@ -432,15 +432,23 @@ endpoint was repeated after reversing the measurement order.
 | --- | --- | ---: | ---: | ---: | ---: |
 | 512 / 512 | C16 relay | 84.643 | 129.90 | 4.508 | 1.00x |
 | 512 / 512 | C32 relay | 75.936--75.970 | 144.73--144.79 | **2.508** | 1.11x |
-| 512 / 512 | Four-plane conflict rank | **75.056--75.151** | **146.31--146.49** | 3.008 | **1.13x** |
+| 512 / 512 | Four-plane conflict rank | **69.147--69.217** | **158.85--159.01** | 3.008 | **1.22x** |
 | 576 / 512 | C16 relay | 100.126 | 118.05 | 5.008 | 1.00x |
 | 576 / 512 | C32 relay | 94.546 | 125.02 | **2.758** | 1.06x |
-| 576 / 512 | Four-plane conflict rank | **85.201--85.257** | **138.64--138.73** | 3.258 | **1.17x** |
+| 576 / 512 | Four-plane conflict rank | **83.164--83.285** | **141.93--142.13** | 3.258 | **1.20x** |
 
-For D512, records cut time by 1.1% versus the manually tuned C32 relay while
-using 0.5 GiB more workspace. For D576, records cut time by 9.8% versus C32
+For D512, records cut time by 9.0% versus the manually tuned C32 relay while
+using 0.5 GiB more workspace. For D576, records cut time by 12.0% versus C32
 with the same 0.5 GiB tradeoff. C16 remains the upstream default shard-relay
-comparison.
+comparison. This version follows the conflict-record design direction of
+PR #2313: four rank planes handle the first four writers, while overflow
+writers reuse plane zero in stable rank order. The SM90 specialization adds
+four independent column-phase tickets for D512 and two for D576, allowing
+adjacent overflow ranks to pipeline disjoint columns. In an all-queries-share-
+the-same-2048-rows stress, this reduced D512 from 151.586 to 87.678 ms (1.73x)
+and D576 from 195.635 to 139.779 ms (1.40x) versus the previous single-ticket
+records path. The two-launch H20 schedule retains one ticket per row because
+additional intra-launch barriers regress that already stream-ordered plan.
 
 ##### SM90 deterministic relay scheduling (2026-11-02)
 

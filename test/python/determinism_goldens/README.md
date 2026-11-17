@@ -3390,24 +3390,26 @@ CuTe DSL 4.8.1 and `cuda-bindings` 12.9.10. Imports resolved to the isolated
 
 New BF16 evidence:
 
-- H64/D512, 65 queries, KV 256 and Top-K 64 with every query selecting the
-  same rows: conflict ranks 0 through 64 exercise all four planes and the
-  plane-zero overflow chain. Four fresh poisoned-workspace executions are
-  raw-byte equal for dQ, dKV and dSink and pass the independent FP32 reference.
+- H64/D512 and D576, 65 queries, KV 256 and Top-K 64 with every query selecting
+  the same rows: conflict ranks 0 through 64 exercise all four planes and the
+  column-phase overflow tickets. Four fresh poisoned-workspace executions per
+  shape are raw-byte equal for dQ, dKV and dSink and pass the independent FP32
+  reference.
 - H96/D576, 129 queries, KV 256 and Top-K 128: eager execution and three CUDA
   Graph replays are raw-byte equal after poisoning outputs/workspace; replay
   also matches eager execution after changing `topk_idxs` and `topk_length`.
 - The complete SM90 L0 selection in
-  `test_DSA_sparse_attention_backward.py` has 57 passing expanded cases after
-  the changed helper signature is included. It covers ordinary execution,
+  `test_DSA_sparse_attention_backward.py` has 65 passing expanded cases. It
+  covers ordinary execution,
   both `topk_length` variants, invalid/padded rows, workspace boundaries,
   compile-cache reuse, the default records route and every explicit shard
   relay size. The H20 C16 logical relay selects physical C8.
 
-The long-context performance case is BF16 H64/D512, Q=16384, KV=262144 and
-Top-K 2048. Five warmups and twenty allocation-free calls measure 120.687 ms,
-91.10 TFLOPS and 3.008 GiB workspace. The upstream + physical-cluster-fix C16
-logical/C8 physical baseline measures 484.915 ms and 4.508 GiB: 4.02x speedup
+The long-context performance case is BF16 H64, Q=16384, KV=262144 and Top-K
+2048. Five warmups and twenty allocation-free calls measure 119.109 ms for
+D512 (92.31 TFLOPS, 3.008 GiB workspace) and 117.653 ms for D576 (100.46
+TFLOPS, 3.258 GiB). The upstream + physical-cluster-fix D512 C16
+logical/C8 physical baseline measures 484.915 ms and 4.508 GiB: 4.07x speedup
 and 33.3% less workspace.
 
 The AIStudio H200 allocation (runtime name `NVIDIA L20X`) used PyTorch
@@ -3415,17 +3417,28 @@ The AIStudio H200 allocation (runtime name `NVIDIA L20X`) used PyTorch
 (CUDA 13.4 lowering), and `cuda-bindings` 13.0.3. The prepared plan selected
 one 128-CTA wave instead of two 64-CTA phases. The same high-conflict reference
 case and all three CUDA Graph variants passed, including poisoned workspace and
-changed sparse inputs. The two new SM-count/plan-cache controls add six passing
-L0 cases; the complete SM90 L0 selection passed 64 cases, including records
-and shard-relay compile-cache reuse across changing runtime extents.
-Long-context performance with five warmups and 20 calls was
-75.056--75.151 ms for D512 and 85.201--85.257 ms for D576. C16 baselines were
-84.643 and 100.126 ms; H200-tuned C32 relays were 75.936--75.970 and 94.546 ms.
+changed sparse inputs. The SM-count/plan-cache controls are included in the
+complete 65-case SM90 L0 selection, including records and shard-relay
+compile-cache reuse across changing runtime extents.
+One-wave overflow writers use four independent column-phase tickets for D512
+and two for D576; the tickets preserve rank order within every disjoint column
+group while allowing adjacent ranks to pipeline. Long-context performance with
+five warmups and 20 calls is 69.147--69.217 ms for D512 and 83.164--83.285 ms
+for D576. The previous single-chain records implementation measured
+75.056--75.151 and 85.201--85.257 ms; upstream C16 baselines were 84.643 and
+100.126 ms. Thus the final records path is 1.224x and 1.204x faster than
+upstream, respectively. In a high-conflict stress where every query shares the
+same 2048 KV rows, two warmups and five calls reduced D512 from 151.586 to
+87.678 ms (1.73x) and D576 from 195.635 to 139.779 ms (1.40x) relative to the
+previous records implementation.
 
-H20-3e retained the two ordered 64-CTA phases. Its phase-policy, prepared-plan
-cache, records/shards compile-cache, high-conflict reference, and all three
-changed-input CUDA Graph cases passed after the H200 scheduling change; the
-complete SM90 L0 selection also passed 64 cases.
+H20-3e retained the two ordered 64-CTA phases and a single overflow ticket per
+row; extra intra-launch column barriers regress this split-wave schedule and
+are deliberately disabled. Its phase-policy, prepared-plan cache,
+records/shards compile-cache, D512/D576 high-conflict references, and all three
+changed-input CUDA Graph cases passed after the H200 scheduling change. The
+complete SM90 L0 selection passed 65 cases on both H20-3e (CUDA 12.9 lowering)
+and the AIStudio H200 allocation (CUDA 13.4 lowering).
 
 No support status is upgraded: multi-wave dKV is still not batch invariant,
 so SM90 BF16 remains **Replay only**. Duplicate active indices within one
