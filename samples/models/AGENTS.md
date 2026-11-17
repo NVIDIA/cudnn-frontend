@@ -607,6 +607,11 @@ Each of these passed every test and every GPU run of the first version.
   the weights stayed (6.9 GiB), and the sentence held by 0.2 GiB of 37.1. On the one-layer model the same sentence
   is 0.5 GiB above what the run reserved: the flat allowance of the reduced models is an estimate in both
   directions, as the section before says.
+- A rule that only fails together with another is not held. The band has two rules, and a block scale outside its
+  interval also puts every code of its block outside its bound: the test of the scale rule passed with that rule
+  switched off. Under zero codes every scale gives the value zero, and a wrong scale byte there fails by its own rule
+  alone. One-line defects applied to the code found it, and found that the test of "half a code step" stepped two
+  codes, and that the chunks of a copy made from an interleaved weight were only read at one chunk length.
 - A count pinned in a test moves with the table. The split rule of the READMEs carried the old numbers in its own
   pattern (`= 49 + 209`), so the rule would have passed a README that kept them. A test that names numbers of the
   table is derived from the plan where it can be, and where it cannot, it is on the list of what a new row changes.

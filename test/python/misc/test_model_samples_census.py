@@ -6076,6 +6076,7 @@ def test_the_gate_up_entrys_adapter_over_a_stand_in_entry(monkeypatch):
         quantize_nvfp4,
         stored_checksum,
         tile_scale_index,
+        tile_scales,
         untile_scales,
     )
 
@@ -6130,6 +6131,24 @@ def test_the_gate_up_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     # ... also where the weight is longer than one chunk of the copy, and at the tile of a test's own layout
     long = quantize_nvfp4(torch.randn(2048 + 256, 64), 0.01)
     assert torch.equal(dequantize(block.stored_layout(long), rows_per_chunk=1024).data.view(torch.int16), dequantize(long).data.view(torch.int16))
+
+    # ... and at every chunk length: a chunk of the copy is whole weight tiles AND whole bands of the scale layout, whatever the
+    # tile (at 32 gate rows a weight tile is half a band), and a weight that does not fill its last band is read through the index
+    def interleaved(merged, tile):
+        n = merged.codes.shape[0]
+
+        def rows(tensor):  # [gate rows, up rows] -> tiles of [gate, up]
+            return tensor.reshape(2, n // (2 * tile), tile, -1).permute(1, 0, 2, 3).reshape(n, -1).contiguous()
+
+        return InterleavedBlockScaledTensor(rows(merged.codes), tile_scales(rows(merged.block_scales)), float(merged.scale), tile)
+
+    short = quantize_nvfp4(torch.randn(192, 64), 0.01)  # one band and a half
+    for whole, tiles in ((long, (32, 64)), (short, (32,))):
+        expected = dequantize(whole).data.view(torch.int16)
+        for tile in tiles:
+            for chunk in (1, 64, 100, 128, 200, 2048):
+                made = dequantize(interleaved(whole, tile), rows_per_chunk=chunk)
+                assert torch.equal(made.data.view(torch.int16), expected), (tuple(whole.shape), tile, chunk)
 
     # a call: the stored weight and the operand as they are, two scalars, outputs of the call's own
     weight = Dequantized(None, laid.scale, laid)
@@ -6359,6 +6378,20 @@ def test_the_gate_ups_twin_and_its_band_on_stated_tensors():
     stepped = codes.clone()
     stepped[0, at] = (stepped[0, at] & 0x8) | ((stepped[0, at] & 0x7) - 2)  # two codes toward zero: a whole code step and more
     assert not judged((stepped[..., 0::2] | (stepped[..., 1::2] << 4), scales)).ok, "a code more than half a step and the bound from the fp64 value"
+    # ... and HALF a code step is the rule: the neighbouring code on the value's side is nearer than a whole step, and outside
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
+    unit = (_e4m3_values(scales, torch.float64) / torch_ref.nvfp4_global_scale(quant.scale, "cpu").double()).repeat_interleave(BLOCK, dim=-1)
+    magnitude = (codes & 0x7).long()
+    toward = torch.where(value.abs() > grid[magnitude] * unit, magnitude + 1, magnitude - 1)  # the neighbour on the value's side
+    fine = (magnitude >= 1) & (magnitude <= 2) & (((codes & 0x8) != 0) == (value < 0))  # both codes below 2: half a step is 0.25
+    away = (grid[toward.clamp(0, 7)] * unit - value.abs()).abs()
+    between = fine & (away > 0.25 * unit + error) & (away <= 0.5 * unit + error)
+    assert bool(between.any()), "the operands have an element whose neighbouring code is between half a step and a whole step away"
+    row, column = (int(i) for i in between.nonzero()[0])
+    near = codes.clone()
+    near[row, column] = (near[row, column] & 0x8) | int(toward[row, column])
+    stats = judged((near[..., 0::2] | (near[..., 1::2] << 4), scales))
+    assert not stats.ok and stats.outside == 1 and 1.0 < stats.worst_share < 2.5, "half a code step, not a whole one"
     not_a_number = scales.clone()
     not_a_number[2, 1] = 0x7F
     stats = judged((packed, not_a_number))
@@ -6372,6 +6405,13 @@ def test_the_gate_ups_twin_and_its_band_on_stated_tensors():
     zero = quantize_nvfp4(torch.zeros(1, width), 8.0 / (448 * 6))
     twin(zero, weight, quant)
     assert judged((torch.zeros((1, half // 2), dtype=torch.uint8), torch.zeros((1, half // BLOCK), dtype=torch.uint8)), ref=twin(zero, weight, quant)).ok
+    # ... which isolates the rule of the block scales: under zero codes every scale gives the value zero, so a scale byte that is
+    # not the byte of a zero block is outside its interval while every code is inside its bound
+    lone = torch.zeros((1, half // BLOCK), dtype=torch.uint8)
+    lone[0, 1] = 0x38  # the byte of 1.0
+    stats = judged((torch.zeros((1, half // 2), dtype=torch.uint8), lone), ref=twin(zero, weight, quant))
+    assert not stats.ok and stats.outside == 1 and stats.worst_share == 0.0 and stats.blocks_equal == stats.blocks - 1, "the scale rule alone"
+    assert stats.line().endswith("; 1 outside their bounds")
 
 
 def test_the_gate_up_row_through_a_session_and_what_fails_it(monkeypatch):
