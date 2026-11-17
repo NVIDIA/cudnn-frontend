@@ -1045,7 +1045,10 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     decode_entries, verify_entries = on_target(1), on_target(6)
     assert len(decode_entries) == len(verify_entries) == 5 and len(decode_entries & verify_entries) == 4
     assert (decode_entries - verify_entries, verify_entries - decode_entries) == ({"cudnn.GdnDecodeFused"}, {"cudnn.GdnVerifyFused"})
-    assert "five entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other four the same -- serve 321 of the 484" in " ".join(area.split())
+    assert (
+        "five entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other four the same -- serve 321 of the 484 launches of a verify "
+        "step, 48 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results" in " ".join(area.split())
+    ), "the entries are named beside the count they serve, and the count carries its split"
     assert "the same five entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
     # the form the entry takes between the step shapes at the ends of a row's range -- one thread block per SM, which a host
     # entry keeps at every step shape (it has no SM count to pick another by): its shared memory at six and at eight
