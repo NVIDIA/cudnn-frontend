@@ -469,32 +469,61 @@ REFUSED = {
     "top_k": 20,
     "min_p": 0.05,
     "n": 2,
+    "best_of": 4,
     "use_beam_search": True,
+    "length_penalty": 2.0,
     "frequency_penalty": 0.5,
     "presence_penalty": -1,
     "repetition_penalty": 1.1,
     "logit_bias": {"17": -100},
+    "logits_processors": [{"qualname": "my.Processor"}],
+    "bad_words": ["sky"],
+    "allowed_token_ids": [1, 2, 3],
+    "watermarking": True,
     "stop": ["\n\n"],
+    "include_stop_str_in_output": True,
     "stop_token_ids": [7],
     "ignore_eos": True,
     "min_tokens": 8,
+    "repetition_detection": {"max_pattern_size": 4},
+    "thinking_token_budget": 128,
+    "include_reasoning": False,
     "logprobs": True,
     "top_logprobs": 5,
+    "prompt_logprobs": 3,
+    "logprob_token_ids": [5, 9],
     "echo": True,
     "skip_special_tokens": False,
+    "spaces_between_special_tokens": False,
     "response_format": {"type": "json_object"},
     "structured_outputs": {"regex": "a+"},
+    "structural_tag": '{"type": "structural_tag"}',
     "guided_json": {"type": "object"},
     "guided_regex": "a+",
     "guided_choice": ["yes", "no"],
     "guided_grammar": "root ::= answer",
     "tool_choice": "required",
+    "function_call": {"name": "weather"},
+    "functions": [{"name": "weather"}],
     "add_generation_prompt": False,
     "continue_final_message": True,
+    "add_special_tokens": True,
     "chat_template": "{{ messages[0].content }}",
     "documents": [{"text": "a page"}],
     "truncate_prompt_tokens": 128,
     "reasoning_effort": "low",
+    "extra_body": {"top_k": 20, "temperature": 0.7},
+}
+#: What the area guide lists as left out of a model sample, and the fields of a request that ask for it: the names of the
+#: public chat request and of the sampling parameters serving engines add to it.  Each is a row of the table.
+LEFT_OUT = {
+    "sampling": ("temperature", "top_p", "top_k", "min_p", "n", "best_of", "use_beam_search", "length_penalty", "watermarking"),
+    "stop strings": ("stop", "include_stop_str_in_output", "stop_token_ids", "repetition_detection"),
+    "constrained output": ("response_format", "structured_outputs", "structural_tag", "guided_json", "guided_regex", "guided_choice", "guided_grammar"),
+    "logit processors": ("logits_processors", "logit_bias", "bad_words", "allowed_token_ids", "thinking_token_budget"),
+    "parsing of the output": ("tool_choice", "function_call", "functions", "include_reasoning"),
+    "another prompt than the template's": ("add_generation_prompt", "continue_final_message", "add_special_tokens", "chat_template", "documents"),
+    "fields a client library did not put into the body": ("extra_body",),
 }
 
 
@@ -511,7 +540,7 @@ def test_a_request_body_as_a_client_sends_it_is_answered_field_by_field():
     assert (request.max_tokens, request.limit_field, request.shown) == (6, "max_completion_tokens", "--messages body.json")
     assert request.line() == (
         "--messages body.json: a chat request body. Read: messages (1), max_completion_tokens 6. "
-        'model "some-org/tiny-checkpoint": names the checkpoint directory. '
+        'model ".../tiny-checkpoint": names the checkpoint directory. '
         "Not used: stream true (the text goes where the command line says, as it is generated unless --no-stream); "
         "seed 7 (token choice is greedy, nothing is drawn). "
         "At the value that changes nothing: n 1, top_p 1."
@@ -527,6 +556,7 @@ def test_a_request_body_as_a_client_sends_it_is_answered_field_by_field():
         "max_completion_tokens": 5,
         "user": "u-1",
         "service_tier": "auto",
+        "parallel_tool_calls": False,
         "frobnicate": [1, 2],
         "audio": None,
         "seed": None,
@@ -535,7 +565,11 @@ def test_a_request_body_as_a_client_sends_it_is_answered_field_by_field():
     assert (request.tools, request.options, request.max_tokens, request.limit_field) == ([WEATHER], {"enable_thinking": False}, 5, "max_tokens")
     line = request.line()
     assert "Read: messages (1), tools (1), chat_template_kwargs (enable_thinking), max_tokens 5, max_completion_tokens 5." in line
-    assert 'Not used: user "u-1" (one process: there is no account); service_tier "auto" (one process: there is no queue).' in line
+    assert (
+        "Not used: user (one process: there is no account); service_tier (one process: there is no queue); "
+        "parallel_tool_calls (the output is text: tool calls in it are not parsed)."
+    ) in line
+    assert "u-1" not in line and '"auto"' not in line, "a field that is not used is named; what somebody wrote into it is not printed back"
     assert line.endswith("Not known to this sample and ignored: frobnicate."), "a field no sample knows is printed, not refused and not swallowed"
     assert "audio" not in line and "seed" not in line and "model" not in line, "null is the field left out"
     for messages_only in (CHAT, {"messages": CHAT}):
@@ -612,6 +646,93 @@ def test_a_neutral_value_is_held_by_its_kind():
     assert '"logit_bias": {"0": -100, ' in str(refusal.value) and "... would change the output" in str(refusal.value), "a long value is cut where it is shown"
 
 
+def test_a_field_that_asks_for_what_a_sample_leaves_out_is_a_row_of_the_table_and_the_guide_says_what_holds():
+    """Stop strings, constrained output, logit processors, parsing of the output: the area guide lists what a model
+    sample leaves out.  A request field that asks for one of them is a row of the table, under every name a client
+    sends it, and is refused by name; a field no row names is printed and ignored, and the guide says both halves."""
+    import serving_options
+
+    for feature, names in LEFT_OUT.items():
+        for name in names:
+            assert name in serving_options.NEUTRAL, f"{name} asks for {feature}: a row of the table, not a field the sample does not know"
+            with pytest.raises(ValueError, match=re.escape(f'--messages body.json: "{name}": ')):
+                serving_options.parse_request({"messages": CHAT, name: REFUSED[name]}, "--messages body.json")
+    # a client library's keyword for the fields it adds: what stands in it would be decoded without, so it is refused whole
+    with pytest.raises(ValueError) as refusal:
+        serving_options.parse_request({"messages": CHAT, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}, "--messages body.json")
+    assert str(refusal.value).endswith(
+        "would change the output and is not served: it is how a client library is handed the fields it adds to a request, "
+        "not a field of the body it sends: its fields go to the top level of the body. Accepted: {}, null, or the field left out"
+    )
+    assert serving_options.parse_request({"messages": CHAT, "extra_body": {}}, "--messages body.json").line().endswith("extra_body {}.")
+    # outside the table: printed, by its name, and ignored -- the sample cannot say what such a field would change
+    line = serving_options.parse_request({"messages": CHAT, "frobnicate": 1, "cache_salt": "x"}, "--messages body.json").line()
+    assert line.endswith("Not known to this sample and ignored: frobnicate, cache_salt.")
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    out = guide.split("Also out: ", 1)[1].split(" ## Rules", 1)[0]
+    assert all(word in out for word in ("stop strings", "constrained output", "logit processors", "tool-call parsing"))
+    assert "is refused there by name" in out and "is printed as not known and ignored" in out, "the guide says what the code does, both halves"
+    assert "never ignored" not in out, "a field outside the table is ignored: the tripwire does not say otherwise"
+
+
+def test_the_line_of_a_request_body_prints_names_and_the_values_the_table_knows_and_no_path(tmp_path):
+    """What a run prints of a body: of ``model`` the last part (an engine that serves a directory is asked for it by its
+    path); of a field that is not used its name, and its value only where that is a number or a boolean; a name that is
+    not a plain word as a JSON string, so that a line break in it cannot put a line of its own into the run."""
+    import serving_options
+
+    def said(body, checkpoint="tiny-checkpoint"):
+        return serving_options.parse_request({"messages": CHAT, **body}, "--messages body.json", checkpoint=checkpoint).line()
+
+    for model in (
+        "/data/models/secret-project/tiny-checkpoint",
+        "/data/models/secret-project/tiny-checkpoint/",
+        "  /data/models/secret-project/tiny-checkpoint  ",
+        "C:\\models\\secret-project\\tiny-checkpoint",
+        "some-org/tiny-checkpoint",
+    ):
+        line = said({"model": model})
+        assert line.endswith('model ".../tiny-checkpoint": names the checkpoint directory.'), model
+        assert "secret-project" not in line and "some-org" not in line, "what stands in front of the last part is not printed"
+    for whole in ("tiny-checkpoint", "tiny-checkpoint/", " tiny-checkpoint "):
+        assert said({"model": whole}).endswith('model "tiny-checkpoint": names the checkpoint directory.'), whole
+    other = said({"model": "/srv/weights/other-model"})
+    assert other.endswith('model ".../other-model": not the name of the checkpoint directory; the run decodes the one it was given, tiny-checkpoint.')
+    assert "/srv" not in other
+    assert said({"model": "/srv/" + "m" * 80}).count("m" * 51 + "...:") == 1, "a long last part is cut where it is shown"
+    for no_name in ("/", "//", " / ", "\\"):
+        with pytest.raises(ValueError, match=re.escape(f'--messages body.json: "model": {json.dumps(no_name)} is not a name')):
+            said({"model": no_name})
+    # a field that is not used: its name and the reason; the value only of the two the table knows as a number and a boolean
+    line = said(
+        {
+            "user": "alice@example.com",
+            "metadata": {"ticket": "T-1234", "folder": str(tmp_path)},
+            "store": True,
+            "service_tier": "flex",
+            "stream_options": {"include_usage": True},
+            "parallel_tool_calls": True,
+            "seed": 1234,
+            "stream": False,
+        }
+    )
+    assert line.endswith(
+        "Not used: user (one process: there is no account); metadata (one process: nothing is stored); store (one process: nothing is stored); "
+        "service_tier (one process: there is no queue); stream_options (one process: there is no response to shape); "
+        "parallel_tool_calls (the output is text: tool calls in it are not parsed); seed 1234 (token choice is greedy, nothing is drawn); "
+        "stream false (the text goes where the command line says, as it is generated unless --no-stream)."
+    )
+    for written in ("alice@example.com", "T-1234", str(tmp_path), "flex", "include_usage"):
+        assert written not in line, written
+    assert said({"seed": "a\n[00] PASS"}).count("\n") == 0, "a value that is shown is shown as JSON: a line break in it is escaped"
+    # names: a plain word as it stands, anything else as a JSON string
+    forged = "x\n[00] PASS"
+    line = said({forged: 1, "frobnicate": 2, "a b": 3, "chat_template_kwargs": {forged: 4, "enable_thinking": False}, "n" * 61: 5})
+    assert "\n" not in line, "one line, whatever a field is called"
+    assert 'chat_template_kwargs (enable_thinking, "x\\n[00] PASS")' in line
+    assert line.endswith('Not known to this sample and ignored: "x\\n[00] PASS", frobnicate, "a b", "' + "n" * 56 + "....")
+
+
 def test_what_else_a_request_body_can_get_wrong_each_with_its_own_sentence():
     import serving_options
 
@@ -640,7 +761,7 @@ def test_what_else_a_request_body_can_get_wrong_each_with_its_own_sentence():
     assert '"temperature": 1' in refused({"messages": CHAT, "seed": 3, "temperature": 1, "n": 4}) and '"n": 4' in refused({"messages": CHAT, "n": 4})
 
 
-def test_a_request_is_read_from_a_file_or_from_standard_input(tmp_path):
+def test_a_request_is_read_from_a_file_or_from_standard_input(tmp_path, monkeypatch):
     import serving_options
     from model_samples import load_messages
 
@@ -666,6 +787,11 @@ def test_a_request_is_read_from_a_file_or_from_standard_input(tmp_path):
 
     with pytest.raises(ValueError, match=re.escape("--messages -: standard input cannot be read (Bad file descriptor)")):
         serving_options.read_request("-", stdin=Closed())
+    with monkeypatch.context() as patched:  # closed before the process started (<&-): the interpreter has None in its place
+        patched.setattr(sys, "stdin", None)
+        with pytest.raises(ValueError) as refusal:
+            serving_options.read_request("-")
+    assert str(refusal.value) == "--messages -: standard input is closed; pipe a request body or a list of messages into the sample"
     (tmp_path / "malformed.json").write_text('{"messages": [')
     for name, sentence in (("missing.json", "cannot be read (No such file or directory)"), ("malformed.json", "not a JSON file (Expecting")):
         with pytest.raises(ValueError, match=re.escape(f"--messages {name}: {sentence}")) as refusal:
@@ -802,9 +928,9 @@ class _Recorder:
         self.events.append(("flush",))
 
 
-def test_where_the_generated_text_goes(tmp_path):
+def test_where_the_generated_text_goes(tmp_path, monkeypatch):
     """Standard output or a file, piece by piece or once; a destination that stops taking text is remembered and not
-    written to again."""
+    written to again; a later sequence count of a run writes nothing and says whether its text is the first count's."""
     import serving_options
 
     out = _Recorder()
@@ -858,6 +984,42 @@ def test_where_the_generated_text_goes(tmp_path):
     gone.write("text")
     gone.close()
     assert gone.error == "No such file or directory" and gone.reported() == "could not be written to answer.txt (No such file or directory)"
+    unnamed = serving_options.TextSink("")  # a file flag that was given an empty name is a file all the same, never standard output
+    unnamed.write("text")
+    assert unnamed.error == "No such file or directory" and unnamed.name != "stdout" and "stdout" not in unnamed.reported()
+    # a standard output that was closed before the process started (>&-): the interpreter has None in its place
+    with monkeypatch.context() as patched:
+        patched.setattr(sys, "stdout", None)
+        closed = serving_options.TextSink()
+        for piece in ("a", "b"):
+            closed.write(piece)
+    assert closed.error == "standard output is closed" and closed.reported() == "could not be written to stdout (standard output is closed)"
+    shut = io.StringIO()
+    shut.close()  # and a stream object that was closed under the run
+    closed = serving_options.TextSink(stream=shut)
+    closed.write("a")
+    assert closed.error.startswith("I/O operation on closed file")
+
+    # a request gets one text: the sink of a later sequence count takes nothing, and says whose text the destination holds
+    out = _Recorder()
+    first = serving_options.TextSink(stream=out)
+    first.write("The sky")
+    first.write("\n")
+    assert first.reported("The sky") == "written to stdout as it was generated"
+    first.write("Rayleigh\n")
+    assert first.reported("Rayleigh") == "written to stdout as it was generated"
+    written = list(out.events)
+    later = first.later()
+    assert (later.name, later.streamed, later.path) == ("stdout", True, None)
+    assert later.announced() == "the report follows; the text of this prompt went to stdout with the first sequence count and is not written again"
+    for piece in ("The sky", "\n"):
+        later.write(piece)
+    assert later.reported("The sky") == "not written again: the same text as with the first sequence count, whose text is the one that went to stdout"
+    assert later.reported("Scattering") == "not written again: ANOTHER text than with the first sequence count, whose text is the one that went to stdout"
+    assert later.reported("") == "not written again: ANOTHER text than with the first sequence count, whose text is the one that went to stdout"
+    assert out.events == written and later.error == "", "a later sequence count writes nothing"
+    filed = serving_options.TextSink(str(target), streamed=False).later()
+    assert "went to answer.txt with the first sequence count" in filed.announced() and "that went to answer.txt" in filed.reported("x")
 
 
 def test_a_reader_of_standard_output_that_goes_away_ends_in_no_traceback():
@@ -880,6 +1042,45 @@ sys.stderr.write("SINK ERROR=" + sink.error + "\\n")
     finally:
         os.close(write_end)
     assert done.returncode == 0 and done.stderr == f"SINK ERROR={PIPE}\n", done.stderr
+
+
+def test_a_standard_stream_that_was_closed_before_the_process_started_ends_in_no_traceback():
+    """``sample >&-``, ``<&-``, ``2>&-``: the interpreter then starts with ``None`` where the stream would be.  Three child
+    processes, each with one descriptor closed before it starts: the sink remembers a standard output that is not there,
+    a read of standard input is a ``ValueError`` in the sample's words, and a line of a run goes nowhere -- not to
+    standard output, which is where ``print`` sends what it is handed no stream for."""
+    head = f"import sys\nsys.path.insert(0, {str(FAMILY)!r})\nimport serving_options\n"
+    children = {
+        1: head + "sink = serving_options.TextSink()\nsink.write('a')\nsink.write('b')\n"
+        "sys.stderr.write(f'stdout={sys.stdout!r} error={sink.error} reported={sink.reported()}\\n')\n",
+        0: head + "try:\n    serving_options.read_request('-')\nexcept ValueError as error:\n    sys.stderr.write(f'stdin={sys.stdin!r} {error}\\n')\n",
+        2: "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('sample_with_standard_error_closed', {str(FAMILY / '00_decode.py')!r})\n"
+        "sample = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(sample)\n"
+        "sample._say('[00] a line of the run', 'and a table', flush=True)\nprint(f'stderr={sys.stderr!r}: the text')\n",
+    }
+    done = {}
+    for descriptor, code in children.items():
+        done[descriptor] = subprocess.run(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            preexec_fn=lambda descriptor=descriptor: os.close(descriptor),  # in the child, before the interpreter starts
+        )
+    assert (done[1].returncode, done[1].stdout, done[1].stderr) == (
+        0,
+        "",
+        "stdout=None error=standard output is closed reported=could not be written to stdout (standard output is closed)\n",
+    )
+    assert (done[0].returncode, done[0].stdout, done[0].stderr) == (
+        0,
+        "",
+        "stdin=None --messages -: standard input is closed; pipe a request body or a list of messages into the sample\n",
+    )
+    assert (done[2].returncode, done[2].stdout, done[2].stderr) == (0, "stderr=None: the text\n", ""), "no line of the run in the text"
 
 
 def _sample_script(monkeypatch):
@@ -924,6 +1125,7 @@ def test_the_serving_style_flags_of_the_sample(monkeypatch, capsys):
         (["--temperature", "1"], "--temperature 1: token choice is greedy"),
         (["--model", "d", "--messages", "-", "--messages", "-"], "--messages - reads one request from standard input; it was given 2 times"),
         (["--text-out", "answer.txt"], "--text-out and --no-stream need --model: the seeded model's output is not language and is written nowhere"),
+        (["--text-out", ""], "--text-out and --no-stream need --model: the seeded model's output is not language and is written nowhere"),
         (["--no-stream"], "--text-out and --no-stream need --model: the seeded model's output is not language and is written nowhere"),
         (["--messages", "-"], "--prompt and --messages need --model"),
         (["--model", "d", "--port", "8000"], "unrecognized arguments: --port 8000"),
@@ -950,6 +1152,10 @@ def test_the_serving_style_flags_of_the_sample(monkeypatch, capsys):
         assert part in shown, part
     with pytest.raises(ValueError, match=r"^--text-out answer.txt: cannot be written there$"):
         sample._writable("--text-out", "/nowhere/at/all/answer.txt")
+    for flag in ("--text-out", "--dump-tokens", "--dump-census"):  # --text-out "$OUT" with the variable unset
+        for empty in ("", "  "):
+            with pytest.raises(ValueError, match=rf"^{flag}: needs a file name; it was given an empty one$"):
+                sample._writable(flag, empty)
 
 
 # --------------------------------------------------------------------------- the sample on the CPU, on a checkpoint generated here
@@ -1189,6 +1395,29 @@ def test_the_text_is_written_between_the_steps_of_the_loop_and_every_other_line_
     monkeypatch.setattr(text, "decoder", real_decoder)
     capsys.readouterr()
 
+    # a later sequence count of a run: the loop writes nothing, and its line says whether the text is the first count's
+    kept = _Recorder()
+    first = serving_options.TextSink(stream=kept)
+    session.reset(fresh=True)
+    session.new_report()
+    sample._decode(session, text, forced, prompts, tie_out, check=False, checked_steps=16, sink=first)
+    written = list(kept.events)
+    capsys.readouterr()
+    for again, said in ((prompts, "the same text as"), ([text.encode("w9 w9 w9")] * 2, "ANOTHER text than")):
+        session.reset(fresh=True)
+        session.new_report()
+        other = sample._decode(session, text, forced, again, tie_out, check=False, checked_steps=16, sink=first.later())
+        assert (other[2] == produced) == (again is prompts), "another prompt, other tokens"
+        err = capsys.readouterr().err
+        assert err.splitlines()[0].endswith(
+            "; the report follows; the text of this prompt went to stdout with the first sequence count and is not written again"
+        )
+        assert _lines(err, "text out ") == [
+            f"text out              sequence 0, 6 tokens, stopped after 6 tokens: not written again: {said} with the first sequence count, "
+            "whose text is the one that went to stdout"
+        ]
+    assert kept.events == written, "nothing more reached the destination"
+
     # seeded weights: not language; the same loop writes it nowhere, whatever sink it is handed
     seeded_text = TextIO.synthetic(model.geometry.vocab)
     seeded = Session(model, seeded_text, sequences=1, stack="reference", device="cpu", capacity=32)
@@ -1228,7 +1457,7 @@ def test_a_client_body_runs_to_the_last_line_with_the_text_on_standard_output(tm
     rule += "(do_sample true, temperature 0.6, top_p 0.95 in generation_config.json) are not applied"
     said = (
         "[00] --messages body.json: a chat request body. Read: messages (1), max_completion_tokens 6. "
-        'model "some-org/tiny-checkpoint": names the checkpoint directory. '
+        'model ".../tiny-checkpoint": names the checkpoint directory. '
         "Not used: stream true (the text goes where the command line says, as it is generated unless --no-stream); "
         "seed 7 (token choice is greedy, nothing is drawn). At the value that changes nothing: n 1, top_p 1."
     )
@@ -1296,6 +1525,67 @@ def test_a_client_body_runs_to_the_last_line_with_the_text_on_standard_output(tm
     )
 
 
+def test_a_request_gets_one_text_whatever_the_sequence_counts_and_no_line_of_a_run_reaches_standard_output(tmp_path, monkeypatch, capsys):
+    """``main()`` on the CPU.  A list of sequence counts decodes every prompt once per count: the text of a prompt is
+    written once, with the first count, and the report of a later count says whether it produced the same text.  The
+    lines of a run never reach standard output, also where standard error was closed before the process started.  And
+    the line of a request body names no path and prints back nothing somebody wrote into the body."""
+    directory = _checkpoint_directory(tmp_path / "tiny-checkpoint")
+    sample = _sample_on_the_cpu(monkeypatch)
+    model = ["--model", str(directory), "--stack", "reference"]
+    body = {"messages": [{"role": "user", "content": "w3 w1 w4 w1 w5"}], "max_tokens": 4}
+    (tmp_path / "body.json").write_text(json.dumps(body))
+    capsys.readouterr()
+    assert sample.main([*model, "--messages", str(tmp_path / "body.json")]) == 0
+    text = capsys.readouterr().out
+    assert text.count("\n") == 1 and text.strip()
+
+    # two sequence counts: one text on standard output, and the later count says whose it is
+    assert sample.main([*model, "--messages", str(tmp_path / "body.json"), "--sequences", "1,2"]) == 0
+    out, err = capsys.readouterr()
+    assert out == text, "one request, one text: not one per sequence count"
+    assert [line.split(": ", 1)[1] for line in _lines(err, "text out ")] == [
+        "written to stdout as it was generated",
+        "not written again: the same text as with the first sequence count, whose text is the one that went to stdout",
+    ]
+    decoding = _lines(err, "[00] decoding: ")
+    assert decoding[0].endswith("; the text of sequence 0 goes to stdout as it is generated, the report follows")
+    assert decoding[1].endswith("; the report follows; the text of this prompt went to stdout with the first sequence count and is not written again")
+    # two prompts at two counts into a file, not streamed: the file holds each prompt's text once, in order
+    target = tmp_path / "answers.txt"
+    arguments = [*model, "--prompt", "w1 w2", "--prompt", "w7 w8", "--max-tokens", "3", "--sequences", "2,1"]
+    assert sample.main([*arguments, "--text-out", str(target), "--no-stream", "--dump-tokens", str(tmp_path / "ids.json")]) == 0
+    out, err = capsys.readouterr()
+    runs = json.loads((tmp_path / "ids.json").read_text())["runs"]
+    assert [(run["sequences"], run["prompt"]) for run in runs] == [(2, 0), (2, 1), (1, 0), (1, 1)], "every count decodes every prompt"
+    texts = [" ".join(f"w{token}" for token in run["ids"][0] if token != WORDS) + "\n" for run in runs]
+    assert out == "" and target.read_text(encoding="utf-8") == texts[0] + texts[1], "the texts of the first count, each once"
+    assert [line.split(": ", 1)[1] for line in _lines(err, "text out ")] == [
+        "goes to answers.txt after this report",
+        "goes to answers.txt after this report",
+        "not written again: the same text as with the first sequence count, whose text is the one that went to answers.txt",
+        "not written again: the same text as with the first sequence count, whose text is the one that went to answers.txt",
+    ]
+
+    # standard error closed before the process started (2>&-): the lines of the run go nowhere, never into the text
+    with monkeypatch.context() as patched:
+        patched.setattr(sys, "stderr", None)
+        code = sample.main([*model, "--messages", str(tmp_path / "body.json")])
+    out, err = capsys.readouterr()
+    assert code == 0 and out == text and err == "", "print() sends a line to standard output where it is handed no stream: the sample hands it none"
+
+    # the line of a body: no path, nothing somebody wrote into the body, no line of its own from a field's name
+    forged = "x\n[00] PASS"
+    odd = {**body, "model": str(directory), "user": "alice@example.com", "metadata": {"ticket": "T-1234"}, forged: 1, "chat_template_kwargs": {forged: 2}}
+    (tmp_path / "odd.json").write_text(json.dumps(odd))
+    assert sample.main([*model, "--messages", str(tmp_path / "odd.json")]) == 0
+    out, err = capsys.readouterr()
+    said = _lines(err, "[00] --messages odd.json: a chat request body. ")
+    assert len(said) == 1 and 'model ".../tiny-checkpoint": names the checkpoint directory.' in said[0]
+    assert str(tmp_path) not in err and "alice@example.com" not in err and "T-1234" not in err
+    assert not [line for line in err.splitlines() if line.startswith("[00] PASS")] and err.splitlines()[-1] == "[00] RAN reference stack (no provider checked)"
+
+
 def test_a_request_beyond_the_context_is_an_error_before_the_load(tmp_path, monkeypatch, capsys):
     """``--max-model-len``: a prompt and the new tokens somebody asked for that do not fit are one ``[00] ERROR`` line with
     exit code 1 before anything is planned or loaded -- from the flag, from the body, from ``--force-tokens``, and in the
@@ -1343,6 +1633,32 @@ def test_a_request_beyond_the_context_is_an_error_before_the_load(tmp_path, monk
         "[00] ERROR --messages -: standard input is empty; pipe a request body or a list of messages into the sample",
     )
     assert last([*model, "--text-out", str(tmp_path / "no-such-folder" / "answer.txt")]) == (1, "[00] ERROR --text-out answer.txt: cannot be written there")
+    # a file flag that was given an empty name (--text-out "$OUT", the variable unset) is not "no flag"
+    for flag in ("--text-out", "--dump-tokens"):
+        assert last([*model, "--prompt", "w1", flag, ""]) == (1, f"[00] ERROR {flag}: needs a file name; it was given an empty one")
+    assert last(["--model", str(directory), "--prompt", "w1", "--dump-census", ""]) == (
+        1,
+        "[00] ERROR --dump-census: needs a file name; it was given an empty one",
+    )
+    # a standard stream that was closed before the process started: the interpreter has None in its place
+    (tmp_path / "chat.json").write_text(json.dumps([{"role": "user", "content": "w1"}]))
+    with monkeypatch.context() as patched:
+        patched.setattr(sys, "stdin", None)
+        closed_input = sample.main([*model, "--messages", "-"])
+    assert (closed_input, capsys.readouterr().err.splitlines()[-1]) == (
+        1,
+        "[00] ERROR --messages -: standard input is closed; pipe a request body or a list of messages into the sample",
+    )
+    with monkeypatch.context() as patched:
+        patched.setattr(sys, "stdout", None)
+        closed_output = sample.main([*model, "--messages", str(tmp_path / "chat.json")])
+        with pytest.raises(AssertionError, match="reached a load"):  # with a file for the text, or without language, nothing is missing
+            sample.main([*model, "--messages", str(tmp_path / "chat.json"), "--text-out", str(tmp_path / "answer.txt")])
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main(["--stack", "reference"])
+    err = capsys.readouterr().err
+    assert closed_output == 1 and err.count("[00] ERROR ") == 1 and "served by" not in err.split("[00] ERROR ", 1)[0], "said before anything is planned"
+    assert "[00] ERROR standard output is closed and the generated text has nowhere to go; redirect it, or name a file with --text-out" in err.splitlines()
 
     # what fits reaches the load: the context holds the prompt and the limit exactly; the default is cut to the room, and says so
     for arguments in (

@@ -15,8 +15,14 @@ answers every field of it:
 * **neutral** (``NEUTRAL``): a field that would change the output is accepted at the value at which it changes nothing --
   ``temperature`` 0, ``n`` 1, ``top_p`` 1, no stop strings -- and at ``null``;
 * **refused**: the same field at another value is a ``ValueError`` that names the field, its value and why this sample
-  does not serve it.  Nothing is decoded differently from what the request asks for without an error;
-* a field this sample does not know is printed and ignored: it cannot say whether that field would change the output.
+  does not serve it.  Nothing is decoded differently from what a field of the table asks for without an error;
+* a field this sample does not know is printed by its name and ignored: it cannot say whether that field would change
+  the output.  So the table is where a field goes that asks for something a sample leaves out -- sampling, stop strings,
+  constrained output, a processor of the logits, parsing of the output -- under whatever name a client sends it.
+
+What a run prints of a body is the names of its fields and the values this module knows: a number, a boolean, a value of
+the table.  It never prints back what somebody else wrote into the body -- a user, metadata -- and of ``model`` it prints
+the last part, which is what it compares: a serving engine that serves a directory is asked for it by its path.
 
 It also holds what a run says to that user before anything is loaded -- the decoding rule beside the checkpoint's own
 generation settings (``greedy_line``), how many decode steps a prompt takes before the first new token
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
@@ -55,10 +62,20 @@ UNUSED = {
     "metadata": "one process: nothing is stored",
     "store": "one process: nothing is stored",
     "service_tier": "one process: there is no queue",
+    "parallel_tool_calls": "the output is text: tool calls in it are not parsed",
 }
+#: the fields of ``UNUSED`` whose value a run prints back: a number and a boolean.  The others are named, never quoted
+_VALUE_SHOWN = ("seed", "stream")
 _SAMPLING = "it shapes the distribution a token is drawn from, and nothing is drawn here: token choice is greedy"
+_BEAM = "there is no beam search: one sequence per prompt, greedy"
 _PENALTY = "no penalty is applied to the logits"
+_LOGITS = "nothing processes the logits: the token of the largest one is taken, over the whole vocabulary"
+_STOP = "stop strings are not served: a sequence ends at an end token of the checkpoint or at its limit of new tokens"
+_LOGPROBS = "a run writes text and, with --dump-tokens, token ids; no log-probabilities"
+_REASONING = "reasoning a model writes before its answer is part of the text"
+_SPECIAL = "special tokens are left out of the text"
 _CONSTRAINED = "constrained output is not served: the text is what the greedy tokens decode to"
+_TOOLS = "tool schemas are rendered into the prompt by the checkpoint's chat template; the output is neither constrained nor parsed"
 _TEMPLATE = "the prompt ends where the checkpoint's chat template opens the reply"
 #: Fields that would change the output, each with the values at which it changes nothing and the reason this sample does
 #: not serve another value.  ``null`` is accepted for every field: it is the field left out.
@@ -68,32 +85,53 @@ NEUTRAL = {
     "top_k": ((0, -1), _SAMPLING),
     "min_p": ((0,), _SAMPLING),
     "n": ((1,), "a request gets one text; --sequences N decodes the same prompt in N sequences"),
-    "use_beam_search": ((False,), "there is no beam search: one sequence per prompt, greedy"),
+    "best_of": ((1,), "a request gets one text: nothing more is generated to choose among"),
+    "use_beam_search": ((False,), _BEAM),
+    "length_penalty": ((1,), _BEAM),
     "frequency_penalty": ((0,), _PENALTY),
     "presence_penalty": ((0,), _PENALTY),
     "repetition_penalty": ((1,), _PENALTY),
     "logit_bias": (({},), "no bias is applied to the logits"),
-    "stop": (([],), "stop strings are not served: a sequence ends at an end token of the checkpoint or at its limit of new tokens"),
+    "logits_processors": (([],), _LOGITS),
+    "bad_words": (([],), _LOGITS),
+    "allowed_token_ids": ((), _LOGITS),
+    "watermarking": ((False,), _LOGITS),
+    "stop": (([],), _STOP),
+    "include_stop_str_in_output": ((False,), _STOP),
     "stop_token_ids": (([],), "a sequence ends at the end tokens of the checkpoint and at no other"),
     "ignore_eos": ((False,), "an end token ends a sequence; --force-tokens N decodes exactly N tokens instead"),
     "min_tokens": ((0,), "an end token ends a sequence whenever it comes"),
-    "logprobs": ((False,), "a run writes text and, with --dump-tokens, token ids; no log-probabilities"),
-    "top_logprobs": ((0,), "a run writes text and, with --dump-tokens, token ids; no log-probabilities"),
+    "repetition_detection": ((), "a sequence ends at an end token of the checkpoint or at its limit of new tokens, whatever it repeats"),
+    "thinking_token_budget": ((), f"{_REASONING}, and no budget is put on it"),
+    "include_reasoning": ((True,), f"{_REASONING}: the output is not parsed"),
+    "logprobs": ((False,), _LOGPROBS),
+    "top_logprobs": ((0,), _LOGPROBS),
+    "prompt_logprobs": ((), _LOGPROBS),
+    "logprob_token_ids": ((), _LOGPROBS),
     "echo": ((False,), "the prompt is not written back with the text"),
-    "skip_special_tokens": ((True,), "special tokens are left out of the text"),
+    "skip_special_tokens": ((True,), _SPECIAL),
+    "spaces_between_special_tokens": ((True,), _SPECIAL),
     "response_format": (({"type": "text"},), _CONSTRAINED),
     "structured_outputs": ((), _CONSTRAINED),
+    "structural_tag": ((), _CONSTRAINED),
     "guided_json": ((), _CONSTRAINED),
     "guided_regex": ((), _CONSTRAINED),
     "guided_choice": ((), _CONSTRAINED),
     "guided_grammar": ((), _CONSTRAINED),
-    "tool_choice": (("auto",), "tool schemas are rendered into the prompt by the checkpoint's chat template; the output is neither constrained nor parsed"),
+    "tool_choice": (("auto",), _TOOLS),
+    "function_call": ((), "it is the older name of tool_choice, and the output is neither constrained nor parsed"),
+    "functions": ((), "it is the older name of tools, the field tool schemas are read from"),
     "add_generation_prompt": ((True,), _TEMPLATE),
     "continue_final_message": ((False,), _TEMPLATE),
+    "add_special_tokens": ((False,), "the prompt is what the checkpoint's chat template renders, encoded as it is: no special token is added"),
     "chat_template": ((), "the messages are rendered by the checkpoint's own chat template"),
     "documents": (([],), "the checkpoint's chat template is given messages and tool schemas, nothing else"),
     "truncate_prompt_tokens": ((), "a prompt is encoded whole"),
     "reasoning_effort": ((), "an option of the checkpoint's chat template goes into chat_template_kwargs"),
+    "extra_body": (
+        ({},),
+        "it is how a client library is handed the fields it adds to a request, not a field of the body it sends: its fields go to the top level of the body",
+    ),
 }
 
 
@@ -109,6 +147,21 @@ def _show(value, width: int = 60) -> str:
     """A JSON value as a request writes it, cut where it is long."""
     text = json.dumps(value)
     return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def _name(name: str) -> str:
+    """The name of a field as a run prints it: as it stands where it is a plain word, as a JSON string where it is not.  A
+    name is whatever the body's author wrote: one with a line break in it would put a line of its own into the run."""
+    return name if re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", name) else _show(name)
+
+
+def _last_part(model: str) -> tuple:
+    """The last part of a model name -- what is compared with the checkpoint directory, and all a run prints of it -- and
+    how a run shows it: with ``.../`` in front where the name had more parts.  A serving engine that serves a directory
+    is asked for it by its path, and a path is never printed."""
+    name = model.strip().rstrip("/\\")
+    last = re.split(r"[/\\]", name)[-1]
+    return last, _show(last if last == name else ".../" + last)
 
 
 def _same(value, neutral) -> bool:
@@ -167,7 +220,7 @@ def parse_request(body, shown: str, checkpoint: str = "") -> Request:
     if tools:
         read.append(f"tools ({len(tools)})")
     if options:
-        read.append("chat_template_kwargs (" + ", ".join(sorted(options)) + ")")
+        read.append("chat_template_kwargs (" + ", ".join(_name(option) for option in sorted(options)) + ")")
     for name, value in limits.items():
         request.max_tokens, request.limit_field = value, request.limit_field or name
         read.append(f"{name} {value}")
@@ -176,19 +229,20 @@ def parse_request(body, shown: str, checkpoint: str = "") -> Request:
         if name in READ or value is None:  # null is the field left out
             continue
         if name == "model":
-            if not isinstance(value, str) or not value.strip():
+            last, said = _last_part(value) if isinstance(value, str) else ("", "")
+            if not last:
                 raise ValueError(f'{shown}: "model": {_show(value)} is not a name')
-            last = value.rstrip("/").rsplit("/", 1)[-1]
             same = (
                 "names the checkpoint directory"
                 if last == checkpoint
                 else f"not the name of the checkpoint directory; the run decodes the one it was given, {checkpoint}"
             )
-            model = f"model {_show(value)}: {same}."
+            model = f"model {said}: {same}."  # what stands in front of the last part -- an organisation, a path -- is not printed
         elif name in UNUSED:
             if name == "stream" and not isinstance(value, bool):
                 raise ValueError(f'{shown}: "stream": {_show(value)} is neither true nor false')
-            unused.append(f"{name} {_show(value, 24)} ({UNUSED[name]})")
+            named = f"{name} {_show(value, 24)}" if name in _VALUE_SHOWN else name  # a value somebody else wrote is not printed back
+            unused.append(f"{named} ({UNUSED[name]})")
         elif name in NEUTRAL:
             values, reason = NEUTRAL[name]
             if not any(_same(value, known) for known in values):
@@ -198,7 +252,7 @@ def parse_request(body, shown: str, checkpoint: str = "") -> Request:
                 )
             neutral.append(f"{name} {_show(value, 24)}")
         else:
-            unknown.append(name)
+            unknown.append(_name(name))
     request.stated.append("Read: " + ", ".join(read) + ".")
     if model:
         request.stated.append(model)
@@ -218,9 +272,12 @@ def read_request(source: str, checkpoint: str = "", stdin=None) -> Request:
         shown = f"--messages {os.path.basename(source)}"
         return parse_request(_text_io().read_json(source, shown), shown, checkpoint)
     shown = "--messages -"
+    stream = sys.stdin if stdin is None else stdin
+    if stream is None:  # closed before the process started (<&-): the interpreter then has no stream in its place
+        raise ValueError(f"{shown}: standard input is closed; pipe a request body or a list of messages into the sample")
     try:
-        text = (sys.stdin if stdin is None else stdin).read()
-    except (OSError, ValueError) as error:  # a closed descriptor, bytes that are not text
+        text = stream.read()
+    except (OSError, ValueError) as error:  # a descriptor that went away, bytes that are not text
         raise ValueError(f"{shown}: standard input cannot be read ({getattr(error, 'strerror', None) or type(error).__name__})") from None
     if not text.strip():
         raise ValueError(f"{shown}: standard input is empty; pipe a request body or a list of messages into the sample")
@@ -314,42 +371,69 @@ class TextSink:
     """Where the generated text of sequence 0 goes: standard output, or the file of ``--text-out``; piece by piece as it
     is generated (``streamed``), or once per prompt.  Every text ends in a line break, and nothing else is written there.
 
-    A destination that stops taking text -- a reader that went away, a full disk, a character the stream cannot encode --
-    is remembered (``error``) and not written to again: the run goes on, and its last line says what is missing."""
+    A destination that stops taking text -- a reader that went away, a full disk, a character the stream cannot encode,
+    a standard output that was closed before the process started -- is remembered (``error``) and not written to again:
+    the run goes on, and its last line says what is missing.
+
+    A request gets one text.  A run with a list of sequence counts decodes every prompt once per count; the text of a
+    prompt is written with the first count, and the sink of a later count (``later()``) takes nothing and says whether
+    its sequence 0 produced the same text."""
 
     def __init__(self, path: Optional[str] = None, streamed: bool = True, stream=None):
         self.path, self.streamed = path, streamed
         self._stream = stream  # a stand-in for standard output (tests)
         self._file = None
         self.error = ""
+        self._texts: list = []  # the text of every prompt so far, as the first sequence count produced it
+        self._first: Optional[TextSink] = None  # of a later sequence count: the sink of the first one
+        self._prompt = 0  # of a later sequence count: the prompt its next text belongs to
 
     @property
     def name(self) -> str:
         """``stdout``, or the file's own name: never a path."""
-        return os.path.basename(os.path.normpath(self.path)) if self.path else "stdout"
+        return os.path.basename(os.path.normpath(self.path)) if self.path is not None else "stdout"
+
+    def later(self) -> "TextSink":
+        """The sink of a later sequence count of the same run: it writes nothing, and holds what it is told of each
+        prompt's text against the text the first count produced."""
+        sink = TextSink(self.path, self.streamed, self._stream)
+        sink._first = self
+        return sink
 
     def announced(self) -> str:
         """For the line before the decode loop: where the text will go."""
+        if self._first is not None:
+            return f"the report follows; the text of this prompt went to {self.name} with the first sequence count and is not written again"
         if self.streamed:
             return f"the text of sequence 0 goes to {self.name} as it is generated, the report follows"
         return f"the report follows, then the text of sequence 0 goes to {self.name}; the text is not streamed"
 
-    def reported(self) -> str:
-        """For the report's ``text out`` line: where the text went, or why it is not there."""
+    def reported(self, text: str = "") -> str:
+        """For the report's ``text out`` line, once per prompt: where the text of sequence 0 (``text``) went, or why it
+        is not there."""
+        if self._first is not None:
+            first = self._first._texts[self._prompt] if self._prompt < len(self._first._texts) else None
+            self._prompt += 1
+            same = "the same text as" if text == first else "ANOTHER text than"
+            return f"not written again: {same} with the first sequence count, whose text is the one that went to {self.name}"
+        self._texts.append(text)
         if self.error:
             return f"could not be written to {self.name} ({self.error})"
         return f"written to {self.name} as it was generated" if self.streamed else f"goes to {self.name} after this report"
 
     def write(self, text: str) -> None:
-        if self.error or not text:
+        if self.error or self._first is not None or not text:
             return
         try:
             if self.path is not None and self._file is None:
                 self._file = open(self.path, "w", encoding="utf-8")
             target = self._file or self._stream or sys.stdout
+            if target is None:  # closed before the process started (>&-): the interpreter then has no stream in its place
+                self.error = "standard output is closed"
+                return
             target.write(text)
             target.flush()
-        except (OSError, UnicodeError) as error:
+        except (OSError, ValueError) as error:  # ValueError: a character the stream cannot encode, a stream that was closed
             self.error = getattr(error, "strerror", None) or str(error) or type(error).__name__
             if self.path is None and self._stream is None:
                 _silence_stdout()

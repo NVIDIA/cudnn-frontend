@@ -30,7 +30,9 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 Where the output goes: the generated text of sequence 0 goes to standard output, as it is generated, and nothing else goes
 there; every other line of a run -- the `[00]` lines, the tables, the report, the checks -- goes to standard error. So
 `> answer.txt` keeps the text and `2> run.log` keeps the run. The seeded default run has no language and writes nothing to
-standard output.
+standard output. A request gets one text: with a list of sequence counts (`--sequences 1,4`) every prompt is decoded once
+per count, its text is written with the first count, and the `text out` line of a later count says whether sequence 0
+produced the same text there.
 
 | flag | default | meaning |
 |---|---|---|
@@ -41,9 +43,9 @@ standard output.
 | `--max-model-len N` | `2051` | the positions a prompt and its new tokens share. A limit of new tokens somebody asked for that does not fit beside the prompt, or a prompt that leaves no room, is an `ERROR` before anything is planned or loaded; the default limit of 256 is cut to the room that is left, and the run says so. The default is the context length the kernel census of this family was recorded with. The flag bounds a request; the state of a run is sized for the run itself |
 | `--temperature 0` | -- | accepted at 0 and nothing else: token choice is greedy |
 | `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-tokens`; it rules over the limit a request body names, and a run says so |
-| `--text-out FILE` | -- | with `--model`: the generated text of sequence 0 goes to FILE instead of standard output; the file then holds what standard output would have held |
+| `--text-out FILE` | -- | with `--model`: the generated text of sequence 0 goes to FILE instead of standard output; the file then holds what standard output would have held: one text per prompt, in order, each ending in a line break. An empty name (`--text-out "$OUT"` with the variable unset) is an `ERROR` before anything is planned, as it is for `--dump-tokens` and `--dump-census` |
 | `--no-stream` | off | with `--model`: the text is written once, after the report of its prompt, instead of piece by piece as it is generated |
-| `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt |
+| `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt, and the text of a prompt is written once, with the first count of the list (a later count reports whether its sequence 0 produced the same text; `--dump-tokens` has the ids of every count) |
 | `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
 | `--stack fe-cublas\|native\|fe-entries\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `native`: the target kernel set of the decode step ("The stack `native`" below); the kernel check is always on. `fe-entries`: the cuDNN Frontend rows of `native`, everything else on fallback rows. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
@@ -99,7 +101,7 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 A run prints one line for the body, which answers every field of it:
 
 ```text
-[00] --messages -: a chat request body. Read: messages (2), chat_template_kwargs (enable_thinking), max_completion_tokens 96. model "nvidia/Qwen3.8-27B-NVFP4": names the checkpoint directory. Not used: stream true (the text goes where the command line says, as it is generated unless --no-stream); seed 7 (token choice is greedy, nothing is drawn). At the value that changes nothing: n 1, top_p 1.
+[00] --messages -: a chat request body. Read: messages (2), chat_template_kwargs (enable_thinking), max_completion_tokens 96. model ".../Qwen3.8-27B-NVFP4": names the checkpoint directory. Not used: stream true (the text goes where the command line says, as it is generated unless --no-stream); seed 7 (token choice is greedy, nothing is drawn). At the value that changes nothing: n 1, top_p 1.
 ```
 
 Every field of a body falls into one of these classes (`serving_options.py`, beside the script, holds them as data):
@@ -107,10 +109,10 @@ Every field of a body falls into one of these classes (`serving_options.py`, bes
 | class | fields | what the sample does |
 |---|---|---|
 | read | `messages`, `tools`, `chat_template_kwargs`, `max_tokens`, `max_completion_tokens` | the messages, tool schemas and template options go to the checkpoint's chat template; the limit is the request's own limit of new tokens. Two limits that differ are an `ERROR` |
-| stated | `model` | printed, and compared with the name of the checkpoint directory. Another name is not an error: the run decodes the directory it was given, and says so |
-| not used | `seed`, `stream`, `stream_options`, `user`, `metadata`, `store`, `service_tier` | printed with the reason: nothing is drawn under greedy decoding, the text goes where the command line says, and one process has no account, no queue and nothing to store |
+| stated | `model` | its last part is printed and compared with the name of the checkpoint directory; what stands in front of it -- an organisation, or a path where a serving engine served a directory -- is not printed (`".../Qwen3.8-27B-NVFP4"`). Another name is not an error: the run decodes the directory it was given, and says so |
+| not used | `seed`, `stream`, `stream_options`, `user`, `metadata`, `store`, `service_tier`, `parallel_tool_calls` | named with the reason: nothing is drawn under greedy decoding, the text goes where the command line says, one process has no account, no queue and nothing to store, and tool calls in the output are not parsed. The value is printed for `seed` and `stream` only: what somebody wrote into the other fields is not printed back |
 | accepted at the value that changes nothing | the table below | accepted at that value and at `null`; at any other value the run ends in one `ERROR` line before anything is loaded, which names the field, its value, the reason and what is accepted |
-| not known to this sample | any other field | printed and ignored: the sample cannot say whether such a field would change the output |
+| not known to this sample | any other field | printed by its name and ignored: the sample cannot say whether such a field would change the output. A name that is not a plain word is printed as a JSON string |
 
 The fields that would change the output, and the values they are accepted at:
 
@@ -121,32 +123,57 @@ The fields that would change the output, and the values they are accepted at:
 | `top_k` | `0`, `-1`, `null` | it shapes the distribution a token is drawn from, and nothing is drawn here: token choice is greedy |
 | `min_p` | `0`, `null` | it shapes the distribution a token is drawn from, and nothing is drawn here: token choice is greedy |
 | `n` | `1`, `null` | a request gets one text; --sequences N decodes the same prompt in N sequences |
+| `best_of` | `1`, `null` | a request gets one text: nothing more is generated to choose among |
 | `use_beam_search` | `false`, `null` | there is no beam search: one sequence per prompt, greedy |
+| `length_penalty` | `1`, `null` | there is no beam search: one sequence per prompt, greedy |
 | `frequency_penalty` | `0`, `null` | no penalty is applied to the logits |
 | `presence_penalty` | `0`, `null` | no penalty is applied to the logits |
 | `repetition_penalty` | `1`, `null` | no penalty is applied to the logits |
 | `logit_bias` | `{}`, `null` | no bias is applied to the logits |
+| `logits_processors` | `[]`, `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `bad_words` | `[]`, `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `allowed_token_ids` | `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `watermarking` | `false`, `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
 | `stop` | `[]`, `null` | stop strings are not served: a sequence ends at an end token of the checkpoint or at its limit of new tokens |
+| `include_stop_str_in_output` | `false`, `null` | stop strings are not served: a sequence ends at an end token of the checkpoint or at its limit of new tokens |
 | `stop_token_ids` | `[]`, `null` | a sequence ends at the end tokens of the checkpoint and at no other |
 | `ignore_eos` | `false`, `null` | an end token ends a sequence; --force-tokens N decodes exactly N tokens instead |
 | `min_tokens` | `0`, `null` | an end token ends a sequence whenever it comes |
+| `repetition_detection` | `null` | a sequence ends at an end token of the checkpoint or at its limit of new tokens, whatever it repeats |
+| `thinking_token_budget` | `null` | reasoning a model writes before its answer is part of the text, and no budget is put on it |
+| `include_reasoning` | `true`, `null` | reasoning a model writes before its answer is part of the text: the output is not parsed |
 | `logprobs` | `false`, `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
 | `top_logprobs` | `0`, `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
+| `prompt_logprobs` | `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
+| `logprob_token_ids` | `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
 | `echo` | `false`, `null` | the prompt is not written back with the text |
 | `skip_special_tokens` | `true`, `null` | special tokens are left out of the text |
+| `spaces_between_special_tokens` | `true`, `null` | special tokens are left out of the text |
 | `response_format` | `{"type": "text"}`, `null` | constrained output is not served: the text is what the greedy tokens decode to |
 | `structured_outputs` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `structural_tag` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
 | `guided_json` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
 | `guided_regex` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
 | `guided_choice` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
 | `guided_grammar` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
 | `tool_choice` | `"auto"`, `null` | tool schemas are rendered into the prompt by the checkpoint's chat template; the output is neither constrained nor parsed |
+| `function_call` | `null` | it is the older name of tool_choice, and the output is neither constrained nor parsed |
+| `functions` | `null` | it is the older name of tools, the field tool schemas are read from |
 | `add_generation_prompt` | `true`, `null` | the prompt ends where the checkpoint's chat template opens the reply |
 | `continue_final_message` | `false`, `null` | the prompt ends where the checkpoint's chat template opens the reply |
+| `add_special_tokens` | `false`, `null` | the prompt is what the checkpoint's chat template renders, encoded as it is: no special token is added |
 | `chat_template` | `null` | the messages are rendered by the checkpoint's own chat template |
 | `documents` | `[]`, `null` | the checkpoint's chat template is given messages and tool schemas, nothing else |
 | `truncate_prompt_tokens` | `null` | a prompt is encoded whole |
 | `reasoning_effort` | `null` | an option of the checkpoint's chat template goes into chat_template_kwargs |
+| `extra_body` | `{}`, `null` | it is how a client library is handed the fields it adds to a request, not a field of the body it sends: its fields go to the top level of the body |
+
+The table holds the fields of the public chat request and of the sampling parameters serving engines add to it that ask
+for something this sample leaves out: sampling, stop strings, constrained output, a processor of the logits, parsing of
+the output, another prompt than the checkpoint's chat template renders. A field under a name the table does not hold
+is in the last class above: printed and ignored. `extra_body` is in the table because client code is often copied
+into a request file with it: a client library merges what it is handed under that name into the top level of the body
+it sends, so a body that still holds the name would be decoded without the fields inside it.
 
 So a body that asks for sampling ends like this, before the plan:
 

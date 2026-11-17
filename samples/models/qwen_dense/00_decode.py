@@ -23,8 +23,10 @@ name because it would change the output (``serving_options.py`` beside this scri
 ``--max-model-len`` mean what they mean there: the limit of new tokens of a request, and the positions a prompt and its new
 tokens share.  The generated text of sequence 0 goes to standard output as it is generated (``--no-stream``: once, after the
 report; ``--text-out FILE``: into a file); every other line of a run -- the ``[00]`` lines, the tables, the report, the
-checks -- goes to standard error, so the text can be piped.  Token choice is always greedy, and a run says so beside the
-checkpoint's own generation settings.  There is no socket and no queue: one process, one fixed set of sequences.
+checks -- goes to standard error, so the text can be piped.  A request gets one text: with a list of sequence counts it
+is the text of the first count, and the report of a later count says whether its sequence 0 produced the same one.
+Token choice is always greedy, and a run says so beside the checkpoint's own generation settings.  There is no socket
+and no queue: one process, one fixed set of sequences.
 
     python samples/models/qwen_dense/00_decode.py
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
@@ -90,8 +92,11 @@ TRACED_STEPS = 32
 
 def _say(*lines, flush: bool = False) -> None:
     """A line of the run.  Every ``[00]`` line, table, report and check goes to standard error: standard output carries
-    the generated text and nothing else, so that it can be piped."""
-    print(*lines, file=sys.stderr, flush=flush)
+    the generated text and nothing else, so that it can be piped.  Where standard error was closed before the process
+    started (``2>&-``) the interpreter has no stream in its place and the lines go nowhere -- never to standard output,
+    which is where ``print`` would send them."""
+    if sys.stderr is not None:
+        print(*lines, file=sys.stderr, flush=flush)
 
 
 def _reason(error) -> str:
@@ -115,7 +120,9 @@ def _dump(path: str, stack: str, runs: list, flag: str = "--dump-tokens", **fact
 
 def _writable(flag: str, path: str) -> None:
     """A file a flag asks for that cannot be written is an error before the run, not after it: a ``ValueError`` that names the
-    file by its own name."""
+    file by its own name.  So is a flag that was given no name at all (``--text-out "$OUT"`` with the variable unset)."""
+    if not path.strip():
+        raise ValueError(f"{flag}: needs a file name; it was given an empty one")
     target = os.path.abspath(path)
     there = os.path.exists(target)
     if os.path.isdir(target) or not os.access(target if there else os.path.dirname(target), os.W_OK):
@@ -240,7 +247,7 @@ def _arguments(argv):
         parser.error("--check-kernels and --dump-census are for a provider stack; --stack reference checks nothing")
     if args.model is None and (args.prompt or args.messages):
         parser.error("--prompt and --messages need --model: the seeded model has no language")
-    if args.model is None and (args.text_out or args.no_stream):
+    if args.model is None and (args.text_out is not None or args.no_stream):
         parser.error("--text-out and --no-stream need --model: the seeded model's output is not language and is written nowhere")
     if args.model is not None and args.layers is not None:
         parser.error("--layers is for the reduced model; a checkpoint has the depth it has")
@@ -295,8 +302,9 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps, sink=No
 
     The text of sequence 0 of a checkpoint goes to ``sink`` (``serving_options.TextSink``; default: standard output, as
     it is generated): piece by piece inside the loop, between the host read of a step and the next launch, or once after
-    the report.  Seeded weights give no language, and their text is written nowhere.  Every other line goes to standard
-    error.
+    the report.  The sink of a later sequence count of a run (``TextSink.later()``) takes nothing: a request gets one
+    text, and the ``text out`` line then says whether this count produced the same one.  Seeded weights give no
+    language, and their text is written nowhere.  Every other line goes to standard error.
 
     Two lines say what comes next before the phases that print nothing for a while (the prompt and the decode loop; the
     checks).  They are printed outside every timed interval, and flushed, so a run through a pipe shows them too."""
@@ -339,7 +347,7 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps, sink=No
         _say(f"text out              sequence 0, {len(produced[0])} tokens (seeded weights: not language): {pieces[0][:48]!r}")
     else:
         ended = "ended at the end token" if rule.ends(produced[0][-1]) else f"stopped after {len(produced[0])} tokens"
-        _say(f"text out              sequence 0, {len(produced[0])} tokens, {ended}: {sink.reported()}", flush=True)
+        _say(f"text out              sequence 0, {len(produced[0])} tokens, {ended}: {sink.reported(pieces[0] + rest)}", flush=True)
         if not streamed:
             sink.write(pieces[0] + rest + "\n")
     if not check:
@@ -377,8 +385,10 @@ def main(argv=None) -> int:
     try:
         overrides = parse_overrides(args.provider)
         for flag, path in (("--dump-tokens", args.dump_tokens), ("--dump-census", args.dump_census), ("--text-out", args.text_out)):
-            if path:  # a file that cannot be written is an error before the run, not after it
+            if path is not None:  # a file that cannot be written, or a flag without a name, is an error before the run, not after it
                 _writable(flag, path)
+        if real and args.text_out is None and sys.stdout is None:  # closed before the process started (>&-): known now, said now
+            raise ValueError("standard output is closed and the generated text has nowhere to go; redirect it, or name a file with --text-out")
         if real:  # the text side and the description of the checkpoint: config and shard headers, no weights
             describing = time.perf_counter()
             text = model_samples.TextIO.from_checkpoint(args.model)
@@ -518,7 +528,8 @@ def main(argv=None) -> int:
     passed, judged, digest, dumped = True, 0, hashlib.sha256(), []
     unobserved, censuses = "", []  # of the kernel check: why the kernels were not observed; the launch records per prompt set
     sink = serving_options.TextSink(args.text_out, streamed=not args.no_stream)  # where the text of sequence 0 goes
-    for (session, prompt_sets), table, claim in zip(runs, tables, claims):
+    for number, ((session, prompt_sets), table, claim) in enumerate(zip(runs, tables, claims)):
+        text_to = sink.later() if number else sink  # a request gets one text: a later sequence count writes none
         _say()
         _say(table)
         if session.check_kernels:  # the kernel table, first part: from the plan alone, before the load
@@ -544,7 +555,7 @@ def main(argv=None) -> int:
                 tie_out,
                 check=args.stack != "reference",
                 checked_steps=CHECKED_STEPS if real else None,
-                sink=sink,
+                sink=text_to,
             )
             passed, judged = passed and ok, judged + blocks_judged
             if session.check_kernels:
@@ -577,13 +588,13 @@ def main(argv=None) -> int:
     unwritten = []  # what a flag asked for and is not there
     if sink.error:  # the reader of standard output went away, or the file of --text-out stopped taking text
         unwritten.append(f"the generated text could not be written to {sink.name}: {sink.error}")
-    if args.dump_tokens:
+    if args.dump_tokens is not None:
         error = _dump(args.dump_tokens, args.stack, dumped)
         if error:
             unwritten.append(error)
         else:
             _say(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
-    if args.dump_census:
+    if args.dump_census is not None:
         if not any(run["steps"] for run in censuses):  # no launch record was kept: there is nothing to write
             why = f"kernels not observed: {unobserved}" if unobserved else "the kernels line of the checks says why"
             error = f"--dump-census {os.path.basename(os.path.normpath(args.dump_census))}: no launch records to write ({why})"
