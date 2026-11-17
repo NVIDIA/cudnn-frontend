@@ -2623,10 +2623,12 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         rows = _D64_DECODE_TILE_ROWS
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
-    if _sm100_f16(caps, facts):
+    sm120_f16 = 120 <= caps.sm_lo and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+    if _sm100_f16(caps, facts) or sm120_f16:
+        # SM120 kernels clip the KV loop to the window too: the whole cache split 4 ways ran 2x (study sm120_swa_split_20261117).
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
-        if physical:
-            ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
+    if _sm100_f16(caps, facts) and physical:
+        ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
     # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
     # the tile, and the true one when it does not (SM120: tile_q % G != 0).
     return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)

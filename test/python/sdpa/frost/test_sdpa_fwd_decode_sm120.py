@@ -500,6 +500,20 @@ def test_sm120_decode_split_model_anchors():
     assert (lead_set.tile_m, lead_set.pack_gqa, lead_set.split_kv) == (16, True, split), lead_set
 
 
+@pytest.mark.L0
+def test_sm120_prefill_split_counts_the_windowed_kv_range():
+    """Study sm120_swa_split_20261117: the SM120 prefill kernels clip the KV loop to the window, so the split model counts the
+    window's tiles, not the whole cache (a 128-key window over 128K keys split 4 ways and ran 2x)."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = _spec()
+    chunk = dict(h_q=32, h_kv=4, s_q=1024, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True)
+    full = heuristics._split_launch(spec.capabilities, _facts(**chunk), 64, 128, 1, 1)
+    windowed = heuristics._split_launch(spec.capabilities, _facts(window_left=128, **chunk), 64, 128, 1, 1)
+    assert full.kv_tiles == 1024
+    assert windowed.kv_tiles <= 3, windowed
+
+
 # --- the kernel through the adapter -----------------------------------------
 
 _L0_CASES = [
