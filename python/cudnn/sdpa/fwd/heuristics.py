@@ -1257,10 +1257,11 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     units keep the prefill rule (MQA at 64 heads: the 128-row packed tile reads
     the shared KV head once per 128 rows).
 
-    Paged d256 MTP past 32 rows (``s_q <= 4``, ``G <= 32``) takes the 32-row tile
-    over several Q tiles: the prefill body has no paged d256 plan, and there the
-    decode tile ran 0.04-0.30 of the backend (study
-    sm120_paged_d256_multiq_probe_20261117).
+    Paged d256 MTP and verify rows past 32 rows (``s_q <= 8``, ``G <= 32``) take
+    the 32-row tile over several Q tiles: the prefill body has no paged d256
+    plan, and there the decode tile ran 0.04-0.87 of the backend (studies
+    sm120_paged_d256_multiq_probe / _verify_v2_20261117). Past ``s_q`` 8 a group
+    that does not divide 32 lost up to 1.19x (_verify_20261117).
     """
     if facts.is_fp8 or facts.is_mxfp8 or facts.thd:
         return 0
@@ -1269,7 +1270,7 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     group = facts.h_q // facts.h_kv
     rows = facts.s_q * group
     tile_m = next((tile_m for tile_m in _SM120_DECODE_Q_TILES if tile_m in caps.tile_ms and rows <= tile_m), 0)
-    multi_q = facts.has_paged_kv and facts.s_q <= 4 and max(facts.d_qk, facts.d_v) == 256 and group <= 32 and 32 in caps.tile_ms
+    multi_q = facts.has_paged_kv and facts.s_q <= 8 and max(facts.d_qk, facts.d_v) == 256 and group <= 32 and 32 in caps.tile_ms
     return tile_m or (32 if multi_q else 0)
 
 
