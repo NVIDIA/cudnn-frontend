@@ -629,6 +629,7 @@ init_properties(py::module_& m) {
         .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
         .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE)
         .value("TILE_CGA", cudnn_frontend::KnobType_t::TILE_CGA)
+        .value("FULL_PRECISION_MATH", cudnn_frontend::KnobType_t::FULL_PRECISION_MATH)
         // frontend-only band (knobs.h): never handed to the backend
         .value("SCHED_POLICY", cudnn_frontend::KnobType_t::SCHED_POLICY)
         .value("PACK_GQA", cudnn_frontend::KnobType_t::PACK_GQA)

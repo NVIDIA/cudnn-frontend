@@ -826,6 +826,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
                                  {KnobType_t::INPUT_TMA_ENABLE, "INPUT_TMA_ENABLE"},
                                  {KnobType_t::OUTPUT_TMA_ENABLE, "OUTPUT_TMA_ENABLE"},
                                  {KnobType_t::TILE_CGA, "TILE_CGA"},
+                                 {KnobType_t::FULL_PRECISION_MATH, "FULL_PRECISION_MATH"},
                                  // frontend-only band (knobs.h)
                                  {KnobType_t::SCHED_POLICY, "SCHED_POLICY"},
                                  {KnobType_t::PACK_GQA, "PACK_GQA"},

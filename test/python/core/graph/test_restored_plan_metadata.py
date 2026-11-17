@@ -80,13 +80,26 @@ def _graph_case(handle, api, kind, dtype):
 @pytest.mark.parametrize("as_bytes", [False, True], ids=["byte_list", "bytes"])
 @pytest.mark.parametrize(
     "api,kind,provider",
-    [(api, kind, "backend") for api in ("raw", "python") for kind in ("matmul", "forward", "backward")] + [("python", "forward", "frost")],
-    ids=["raw_matmul", "raw_forward", "raw_backward", "python_matmul", "python_forward", "python_backward", "frost_forward"],
+    [(api, kind, "backend") for api in ("raw", "python") for kind in ("matmul", "forward", "backward")]
+    + [("python", "forward", "frost"), ("raw", "matmul", "backend_defaults"), ("python", "matmul", "backend_defaults")],
+    ids=[
+        "raw_matmul",
+        "raw_forward",
+        "raw_backward",
+        "python_matmul",
+        "python_forward",
+        "python_backward",
+        "frost_forward",
+        "raw_matmul_defaults",
+        "python_matmul_defaults",
+    ],
 )
 def test_restored_plan_metadata(cudnn_handle, monkeypatch, dtype, as_bytes, api, kind, provider):
     cc = torch.cuda.get_device_capability()
     if cudnn.backend_version() < 92400 or cc[0] < 8:
         pytest.skip("representative graphs require cuDNN 9.24+ and Ampere+")
+    if provider == "backend_defaults" and cudnn.backend_version() < 93000:
+        pytest.skip("compiled FULL_PRECISION_MATH defaults require cuDNN 9.30+")
     if provider == "frost":
         from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
@@ -99,8 +112,13 @@ def test_restored_plan_metadata(cudnn_handle, monkeypatch, dtype, as_bytes, api,
         graph, cls, native_handle, bindings, outputs, refs = _graph_case(cudnn_handle, api, kind, dtype)
         for index in range(graph.get_execution_plan_count()):
             record = graph.get_engine_and_knobs_at_index(index)
-            if is_backend_engine(record[0]) != (provider == "backend"):
+            if is_backend_engine(record[0]) != (provider != "frost"):
                 continue
+            if provider == "backend_defaults":
+                domains = graph.get_knobs_for_engine(record[0])
+                assert all(knob.type != cudnn.knob_type.NOT_SET for knob in domains)
+                if not any(int(knob.type) == 33 for knob in domains):
+                    continue
             try:
                 graph.build_plan_at_index(index)
             except (cudnn.cudnnGraphNotSupportedError, NotImplementedError):
@@ -139,6 +157,9 @@ def test_restored_plan_metadata(cudnn_handle, monkeypatch, dtype, as_bytes, api,
         if not errors:
             actual_engine, actual_knobs = queried["engine_and_knobs"]
             assert actual_engine == expected_record[0]
+            assert cudnn.knob_type.NOT_SET not in actual_knobs
+            if provider == "backend_defaults":
+                assert any(int(knob) == 33 for knob in actual_knobs)
             if (actual_engine, actual_knobs) == expected_record:
                 assert queried["name"] == expected_name
             assert all(actual_knobs.get(key) == value for key, value in expected_record[1].items())

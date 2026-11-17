@@ -53,6 +53,7 @@ enum class KnobType_t : int64_t {
     INPUT_TMA_ENABLE      = 30,
     OUTPUT_TMA_ENABLE     = 31,
     TILE_CGA              = 32,
+    FULL_PRECISION_MATH   = 33,
 
     // ---- frontend-only band -------------------------------------------------
     // Tile-scheduler policy (an engine-declared enumeration, e.g. natural /
@@ -98,6 +99,8 @@ is_frontend_knob_type(KnobType_t const knob_type) {
 // The persisted values: a renumbering here silently re-targets every stored
 // (engine_id, knobs) record downstream.
 static_assert(static_cast<int64_t>(KnobType_t::TILE_CGA) == 32, "backend-mirror knob values are append-only");
+static_assert(static_cast<int64_t>(KnobType_t::FULL_PRECISION_MATH) == 33,
+              "backend-mirror knob values are append-only");
 static_assert(static_cast<int64_t>(KnobType_t::SCHED_POLICY) == FRONTEND_KNOB_TYPE_BASE,
               "frontend-only knobs start at FRONTEND_KNOB_TYPE_BASE");
 
@@ -233,6 +236,11 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
             // knob queries; the numeric value avoids the deprecation warning.
             cudnn_knob_type = (cudnnBackendKnobType_t)26;  // CUDNN_KNOB_TYPE_TILE_CGA
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::FULL_PRECISION_MATH:
+            // A newer runtime can materialize this default in a restored plan
+            // even when FE was built against headers predating the knob.
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(46);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -243,6 +251,12 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
 
 inline KnobType_t
 convert_from_backend_knob_type(cudnnBackendKnobType_t cudnn_knob_type) {
+    // Use the stable backend value so older-header builds preserve the record.
+    // Checking before the switch also avoids an out-of-enum case warning when
+    // that header's CUDNN_KNOB_TYPE_COUNTS precedes this value.
+    if (static_cast<int64_t>(cudnn_knob_type) == 46) {
+        return KnobType_t::FULL_PRECISION_MATH;
+    }
     switch (cudnn_knob_type) {
         case CUDNN_KNOB_TYPE_SWIZZLE:
             return KnobType_t::SWIZZLE;

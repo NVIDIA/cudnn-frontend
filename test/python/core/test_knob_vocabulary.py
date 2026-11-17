@@ -58,6 +58,7 @@ def test_backend_mirror_values_are_frozen():
         "INPUT_TMA_ENABLE": 30,
         "OUTPUT_TMA_ENABLE": 31,
         "TILE_CGA": 32,
+        "FULL_PRECISION_MATH": 33,
     }
     backend_band = {name: int(member) for name, member in kt.__members__.items() if not cudnn.is_frontend_knob_type(member)}
     # Every member the backend band has today, with the value it shipped with;

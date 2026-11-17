@@ -1711,4 +1711,11 @@ and a FROST control; the shared regression is
 A backend may materialize implicit default knobs when restoring a compiled
 plan. Preserve every originally offered knob value, then rebuild from the
 complete restored record and check its name, record, workspace and output bytes.
+
+Compiled plans can expose default knobs absent from the heuristic record, including
+knobs introduced by a newer runtime than the build headers. Preserve their numeric
+identity through C++, JSON and Python; an unknown backend type must report an error
+instead of collapsing to `NOT_SET`. Run the C++ `[knob-vocabulary]` detector with
+both older and current headers, and run restored-record replay with the backend
+version used by CI. Keep the engine, knob values and returned error in failures.
 An extra default knob alone does not prove that a different algorithm ran.

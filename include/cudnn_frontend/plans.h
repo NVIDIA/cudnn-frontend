@@ -621,7 +621,13 @@ class Execution_plan_list {
             "Failed to query engine id / knob choices for plan at index " + std::to_string(index));
         knobs.clear();
         for (auto const& backend_knob : backend_knobs) {
-            knobs[convert_from_backend_knob_type(backend_knob.first)] = backend_knob.second;
+            auto const type = convert_from_backend_knob_type(backend_knob.first);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(type == KnobType_t::NOT_SET,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Cannot represent backend knob type " +
+                                               std::to_string(static_cast<int64_t>(backend_knob.first)) +
+                                               " in the public knob vocabulary.");
+            knobs[type] = backend_knob.second;
         }
         return {error_code_t::OK, ""};
     }

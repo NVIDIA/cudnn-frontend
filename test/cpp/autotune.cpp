@@ -257,7 +257,12 @@ TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[gr
     bindings.check_output();
 
     auto restored_replay = make_matmul(handle.value);
-    REQUIRE(restored_replay->create_execution_plan(restored_metadata.engine, restored_metadata.knobs).is_good());
+    INFO("Restored engine: " << restored_metadata.engine << ", plan: " << restored_metadata.name);
+    INFO("Restored knobs: " << nlohmann::json(restored_metadata.knobs).dump());
+    auto const replay_status =
+        restored_replay->create_execution_plan(restored_metadata.engine, restored_metadata.knobs);
+    INFO("Restored replay status: " << replay_status.code << ": " << replay_status.err_msg);
+    REQUIRE(replay_status.is_good());
     CHECK(restored_replay->metadata(0).name == restored_metadata.name);
     CHECK(restored_replay->metadata(0).knobs == restored_metadata.knobs);
     REQUIRE(restored_replay->build_plan_at_index(0).is_good());
