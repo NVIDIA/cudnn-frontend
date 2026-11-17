@@ -461,8 +461,10 @@ def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
         base.update(over)
         return _facts(**base)
 
-    for over in (dict(), dict(h_q=128), dict(d_qk=512, d_v=512, h_q=16, h_kv=2, s_q=5)):
-        assert getattr(pt.matched_entry(row, spec(**over)), "study", None) != "sm80_paged_wide_verify_20261117", over
+    for over in (dict(), dict(h_q=128), dict(d_qk=512, d_v=512, h_q=16, h_kv=2, s_q=5)):  # re-studied over KV 128-128k
+        assert pt.matched_entry(row, spec(**over)).study == "sm80_paged_wide_verify_v2_20261117", over
+        assert pt.lookup(row, spec(**over)) is True, over
+    assert pt.lookup(row, spec(d_qk=512, d_v=512, h_q=8, h_kv=1, s_q=5, b=1, s_kv=128 + (s_kv % 2))) is False  # below the cost floor
     for over in (
         dict(d_qk=192, d_v=128, h_q=64, h_kv=4, s_q=2),
         dict(d_qk=192, d_v=128, h_q=64, h_kv=4, s_q=16, b=64),

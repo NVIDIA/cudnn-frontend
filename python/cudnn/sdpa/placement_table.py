@@ -894,6 +894,7 @@ TABLE: Dict[Tuple, Entry] = {
     # holdout over other head pairs scored once). FROST runs 0.13-0.20 of the backend; the a100 nightly (run-557) ran these on the
     # backend at 10-53x (kimi_k2 / deepseek_v3 verify, gemma4 global, MiMo-V2). Its d512 and D576 verify twins are retired: a KV-edge
     # supplement at KV 128-4096 (edge_supp_20261117/kvdecode) lost 1.10-1.16x on small-head, short-cache cells; the d192 twins passed.
+    # They are re-studied over KV 128-128k as sm80_paged_wide_verify_v2_20261117 (below).
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm80_paged_wide_verify_20261117"
     ),
@@ -905,6 +906,21 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    # study sm80_paged_wide_verify_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE decaa0520; paged d512 and D576 x V512 verify at s_q
+    # 5-16 over KV 128-128k, on and off the tile, b 1-64; 200 train cells). d512 leads from cost 2^23.9 / 2^23.3, D576 from 2^25.2 on
+    # the tile and always off it (changed train 0.15-0.21); holdout at fresh heads, scored once, 0.128-0.212 (worst 0.842).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 23.877, "sm80_paged_wide_verify_v2_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 23.304, "sm80_paged_wide_verify_v2_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 25.248, "sm80_paged_wide_verify_v2_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_paged_wide_verify_v2_20261117"
     ),
     # study sm80_paged_mtp_sink_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 9bdf9a8ab; the same generation graph, paged page 16,
     # d64 with a sink, full and 128-key window, s_q 2-4, b 1-128, KV 4k-128k; 280 train cells, a 60-cell seeded holdout scored once:
