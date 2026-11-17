@@ -504,10 +504,12 @@ def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [8192, 65537], ids=["on_tile", "off_tile"])
 def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
-    """A100 THD Q cannot pack or split on the k_prefetch / d256 engines: paged THD-Q verify keys ``gqa_unpacked``, which no study
-    answers, so it keeps the backend (llama3.1 / qwen3.5 context re-time: FROST 1.25-3.3x behind). Padded Q keeps its packed
-    class's entry; the wide engine's THD-Q verify keeps its entries (sm80_d576_prefill_20261117 measured FROST at 0.34-0.55)."""
+    """A100 THD Q cannot pack or split on the k_prefetch / d256 engines: paged THD-Q verify keys ``gqa_unpacked`` (llama3.1 /
+    qwen3.5 context re-time: FROST 1.25-3.3x behind). Study sm80_thd_verify_unpacked_20261117: d128 / d256 keep the backend (no
+    entry), d192 x 128 leads on few rows, d64 past a floor. Padded Q keeps its packed class's entry; the wide engine's THD-Q verify
+    keeps its entries (sm80_d576_prefill_20261117 measured FROST at 0.34-0.55)."""
     row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_thd_verify_unpacked_20261117"
 
     def f(**over):
         base = dict(b=16, h_q=64, h_kv=8, s_q=16, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
@@ -515,12 +517,24 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
         base.update(over)
         return _facts(**base)
 
-    for over in (dict(), dict(h_q=32, h_kv=2, d_qk=256, d_v=256), dict(d_qk=192, d_v=128, s_q=5)):
-        thd = dict(over, thd=True, max_total_seq_len_q=16 * over.get("s_q", 16))
-        assert pt.class_key(row, f(**thd))[4:9:4] == ("verify", "gqa_unpacked"), over
-        assert pt.matched_entry(row, f(**thd)) is None, over
+    def thd(**over):
+        return f(**dict(over, thd=True, max_total_seq_len_q=over.get("b", 16) * over.get("s_q", 16)))
+
+    for over in (dict(), dict(h_q=32, h_kv=2, d_qk=256, d_v=256), dict(d_qk=192, d_v=128, s_q=5), dict(d_qk=64, d_v=64)):
+        assert pt.class_key(row, thd(**over))[4:9:4] == ("verify", "gqa_unpacked"), over
         assert pt.class_key(row, f(**over))[8] == "gqa", over
+    for over in (dict(), dict(h_q=32, h_kv=2, d_qk=256, d_v=256), dict(d_qk=192, d_v=128, s_q=5)):
         assert pt.lookup(row, f(**over)) is True, over
+    for over in (dict(), dict(h_q=32, h_kv=2, d_qk=256, d_v=256)):
+        assert pt.matched_entry(row, thd(**over)) is None, over
+    d192 = dict(d_qk=192, d_v=128, s_q=5)
+    assert pt.matched_entry(row, thd(**d192)).study == study
+    assert pt.lookup(row, thd(**d192, b=1, h_q=12, h_kv=2)) is True  # few rows
+    assert pt.lookup(row, thd(**d192)) is False
+    d64 = dict(d_qk=64, d_v=64)
+    assert pt.lookup(row, thd(**d64)) is True
+    assert pt.lookup(row, thd(**d64, b=1, h_q=8, h_kv=1)) is False  # below the floor
+    assert pt.lookup(row, thd(**d64, has_sink=True)) is None  # the sink twins did not ship
     wide = dict(h_q=64, h_kv=1, d_qk=576, d_v=512, page_size=64, thd=True, max_total_seq_len_q=256)
     assert pt.class_key(row, f(**wide))[8] == "gqa"
     assert pt.matched_entry(row, f(**wide)).study == "sm80_paged_wide_verify_v2_20261117"
