@@ -655,6 +655,12 @@ production kernels gain no debug knob or timing-dependent assertion.
   qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
+- Deterministic graphs are unmeasured (the hand rules decide) except on `placement_table.DETERMINISTIC_KEYED_ROWS`, where they
+  key phase `<phase>_det`. Add a row there only with a study that times its deterministic body against the backend's
+  deterministic engine; a row's deterministic body can be a different kernel, so it never inherits the default classes' verdicts.
+- The key does not carry the GQA group, so the train grid must vary it (at least three groups, one of them 5 / 6 / 7);
+  64/8, 32/4, 16/2 and 8/1 are all group 8. Two group-8-only fits failed group-5/2 holdouts (`sm120_paged_d128_mtp_v3_20261117`,
+  `sm90_dense_d256_chunk_20261117`).
 - A refinement can be local to the affected row and part. Keep existing keys for unrelated studies; an unqualified
   new class gets no entry and retains its prior default route. Check both sides of the first placement-tile boundary
   and retain long off-tile controls (`test_sm120_short_square_class_keeps_default_and_long_square_leads`).

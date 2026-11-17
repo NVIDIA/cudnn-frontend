@@ -89,6 +89,7 @@ def _facts_training(c, s):
         has_bias=False,
         has_dropout=False,
         right_band_widening=False,
+        deterministic=bool(c.get("det", False)),
     )
 
 

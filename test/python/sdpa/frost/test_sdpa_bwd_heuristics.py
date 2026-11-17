@@ -397,7 +397,13 @@ def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
             for s_q, s_kv in ((512, 1024), (1024, 512)):  # the key does not see squareness, the guard does
                 assert pt.lookup("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv)) is True
                 assert order(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv) == trails
-            assert order(dtype=dtype, d_qk=d, d_v=d, deterministic=True) == trails  # no study timed deterministic reductions
+            # Deterministic graphs are classes of their own (sm120_det_bwd_20261117, bf16 only; no holdout cell exercised d128 causal MHA).
+            det = order(dtype=dtype, d_qk=d, d_v=d, deterministic=True)
+            if (dtype, d) == (cudnn.data_type.BFLOAT16, 64):
+                assert det[0] == "frost", det
+            else:
+                assert det == trails, (dtype, d, det)
+            assert order(dtype=dtype, d_qk=d, d_v=d, deterministic=True, s_q=512, s_kv=1024) == trails  # square-only study
     assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
     assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout

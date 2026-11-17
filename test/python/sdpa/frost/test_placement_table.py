@@ -55,7 +55,8 @@ def test_entries_are_well_formed_and_name_known_rows():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
-        assert phase in ("q1", "mtp", "verify", "prefill", "prefill_short_square", "prefill_short_q")
+        assert phase.removesuffix("_det") in ("q1", "mtp", "verify", "prefill", "prefill_short_square", "prefill_short_q")
+        assert not phase.endswith("_det") or row in pt.DETERMINISTIC_KEYED_ROWS, key
         assert layout.removesuffix("_bounded") in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
         assert isinstance(kv_off_tile, bool)
@@ -517,6 +518,31 @@ def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
     assert pt.lookup(row, win(h_q=64, h_kv=8, d_qk=64, d_v=64, has_sink=True)) is None
     assert pt.lookup(row, win(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, win(device_cc=(12, 1))) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s", [8192, 3000], ids=["on_tile", "off_tile"])
+def test_sm120_deterministic_backward_follows_its_study(s):
+    """Study sm120_det_bwd_20261117: deterministic SM120 backward graphs are classes of their own (phase prefill_det) and lead where
+    the holdout exercised them (gpt-oss d64 SWA ran engine 7 at 9.8x); non-deterministic graphs keep their study, the unexercised
+    pairs keep the hand rule, and on other rows a deterministic graph stays unmeasured."""
+    row = "sdpa_bwd_sm120"
+
+    def bwd(**over):
+        base = dict(b=2, h_q=64, h_kv=64, s_q=s, s_kv=s, d_qk=64, d_v=64, causal=True, bottom_right=False, window_left=128)
+        base.update(has_paged_kv=False, device_cc=(12, 0), deterministic=True)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.class_key(row, bwd())[4] == "prefill_det"
+    assert pt.lookup(row, bwd()) is True
+    assert pt.matched_entry(row, bwd()).study == "sm120_det_bwd_20261117"
+    assert pt.matched_entry(row, bwd(deterministic=False)).study == "sm120_bwd_bf16_20261107"
+    d128 = dict(d_qk=128, d_v=128, h_q=32, h_kv=8)
+    assert pt.lookup(row, bwd(s_q=1024, s_kv=1024, **d128)) is False  # the d128 window classes lead from S 2048
+    assert pt.lookup(row, bwd(s_q=2048, s_kv=2048, **d128)) is True
+    assert pt.lookup(row, bwd(d_qk=128, d_v=128, window_left=None)) is None  # d128 causal MHA: no holdout cell
+    assert pt.class_key("sdpa_bwd_sm80", bwd(device_cc=(8, 0))) is None
 
 
 @pytest.mark.L0
