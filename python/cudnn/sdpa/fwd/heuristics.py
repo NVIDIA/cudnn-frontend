@@ -1210,18 +1210,22 @@ def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int
     past it only adds combine work. The rates are an RTX PRO 6000 Blackwell
     Workstation's; gathering paged KV, one CTA streams about 6x slower and the
     whole board about 0.6x (studies sm120_decode_split_20261117 and _v2, RTX PRO
-    6000 Server). Candidates are :func:`split_kv_candidates`; ties keep the
-    smaller split.
+    6000 Server). Unsplit, the paged tile streams slower again: at 512-2048
+    units split 1 ran 1.34-1.49x the best split at the same bytes, so split 1
+    prices paged bytes at its own rate (study _v5; raising the shared rates
+    instead over-split small launches, _v3 / _v4). Candidates are
+    :func:`split_kv_candidates`; ties keep the smaller split.
     """
     if min(units, kv_stages, stage_bytes, d_v, sm_count) <= 0:
         return 1
     cta_rate, dram_rate = (7.0e3, 9.0e5) if paged else (4.0e4, 1.55e6)  # bytes / us: one CTA streaming alone; all CTAs together
-    dram_us = units * kv_stages * stage_bytes / dram_rate
+    unsplit_rate = 8.75e5 if paged else dram_rate
+    nbytes = units * kv_stages * stage_bytes
 
     def cost_us(split: int) -> float:
         chain_us = _ceil_div(units * split, sm_count) * _ceil_div(kv_stages, split) * stage_bytes / cta_rate
         combine_us = 2.0 + split * 0.055 * d_v / 128 if split > 1 else 0.0
-        return max(chain_us, dram_us) + combine_us
+        return max(chain_us, nbytes / (dram_rate if split > 1 else unsplit_rate)) + combine_us
 
     return min(split_kv_candidates(sm_count=sm_count, kv_tiles=kv_stages, min_tiles=1), key=cost_us)
 

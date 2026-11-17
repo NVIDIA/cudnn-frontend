@@ -665,6 +665,14 @@ production kernels gain no debug knob or timing-dependent assertion.
 - The off-tile twin needs its own train lattice (the on-tile lattice shifted off the 128-key tile), not a handful of cells or a
   mirrored on-tile rule: `sm90_mha_mtp_20261117` (10 off-tile cells) and `sm80_det_bwd_d64mha_supp_20261117` (mirrored) each passed on
   the tile and lost 1.17-1.35x off it.
+- Fit under the criterion, not under geomean regret alone. A regret fit trades the worst changed cell for the geomean, and the
+  holdout's worst <= 1.10 then fails: `sm120_paged_d128_mtp_v5_20261117` raised T for every group (train worst already 1.18) and
+  `sm120_decode_split_v4_20261117` raised both rates (train worst 1.28). Before reading the holdout, print the fit's own changed-train
+  worst. Prefer a constrained fit (changed train cells at worst <= 1.05) and a one-parameter change that can only move the cells
+  the evidence covers.
+- A split-chooser fit times every split the chooser can return (`split_kv_candidates`), or it scores a case only when all of its
+  candidates were timed. `sm120_decode_split_v3_20261117` swept 1-64 while the chooser offers up to 256 on 188 SMs: it passed its
+  holdout, then failed the real-path check (new vs committed chooser on fresh cases) at 1.108. Run that check before committing a chooser change.
 - A refinement can be local to the affected row and part. Keep existing keys for unrelated studies; an unqualified
   new class gets no entry and retains its prior default route. Check both sides of the first placement-tile boundary
   and retain long off-tile controls (`test_sm120_short_square_class_keeps_default_and_long_square_leads`).

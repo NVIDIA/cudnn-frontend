@@ -493,8 +493,10 @@ def test_sm120_decode_split_model_anchors():
     assert choose(units=64, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188) == 1
     paged_split = choose(units=64, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True)
     assert paged_split > 1 and paged_split & (paged_split - 1) == 0, paged_split
-    # 512 paged units already fill the board's paged DRAM rate: splitting them lost 1.11-1.17x (_v2 verification).
-    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True) == 1
+    # 512 paged units split in two: unsplit, the paged tile ran 1.34-1.49x the best split (sm120_decode_split_v5_20261117), while many
+    # chunks lost 1.11-1.17x (_v2 verification). Dense keeps them whole.
+    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True) == 2
+    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188) == 1
     # Through the heuristics: b = 1, GQA 4 over 128K keys leads with that split on the packed decode tile.
     lead_set = heuristics._knob_sets(_spec(), _facts(s_kv=131072))[0]
     assert (lead_set.tile_m, lead_set.pack_gqa, lead_set.split_kv) == (16, True, split), lead_set
