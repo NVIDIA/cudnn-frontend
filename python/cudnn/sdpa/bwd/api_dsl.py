@@ -35,7 +35,8 @@ from cudnn.sdpa.bwd.config_sm120 import (
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
-_SM120_KERNEL_FILE = "sm120/bprop_f16.py"
+from .kernels.sm120.f16_fused.contract import KERNEL_FILE as _SM120_KERNEL_FILE
+
 _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
@@ -245,6 +246,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         b, h_q, s_q, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         d_v = int(self.v_desc.shape[3])
+        from .launch_grid import yz_grid_mismatch
+
+        grid_reason = yz_grid_mismatch(b, h_q)
+        self._not_implemented_error_if(grid_reason is not None, grid_reason)
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
         self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
@@ -773,12 +778,12 @@ def _sm80_bwd_kernel_mod(key: str = "d64"):
     silently swallows every feature kwarg, so callers must never rely on the
     signature filter and only select it through
     :func:`_sm80_d64_fast_path_eligible`.  The GENERIC kernel
-    (``sm80/bprop_f16``) is a TemplateParams module loaded per-specialization
+    (``sm80/f16_two_subgroup/kernel.py``) is a TemplateParams module loaded per-specialization
     via :func:`_load_sm80_bwd_module` instead.
     """
     assert key == "d64", f"generic SM80 bwd kernels load via _load_sm80_bwd_module; got {key!r}"
     if key not in _SM80_BWD_KERNEL_MOD:
-        from .kernels.sm80 import bprop_d64_f16 as _mod
+        from .kernels.sm80.f16_d64 import kernel as _mod
 
         _SM80_BWD_KERNEL_MOD[key] = _mod
     return _SM80_BWD_KERNEL_MOD[key]
@@ -790,19 +795,21 @@ def _sm80_d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token,
     The perf variant computes a plain dense MHA backward and nothing else;
     every condition here guards a feature it would silently ignore.
     """
-    d64 = _sm80_bwd_kernel_mod("d64")
-    if (d_qk, d_v) != (64, 64) or h_q != h_kv:
-        return False
-    if s_q % d64.M_BLOCK != 0 or s_kv % d64.N_BLOCK != 0:
-        return False
-    if mask_token != "none" or right_bound != 0 or causal_bottom_right:
-        return False
-    for feature in ("seq_kv_lens", "seq_len_q", "bias", "sinks", "rope_freqs"):
-        if bw_kwargs.get(feature) is not None:
-            return False
-    if bw_kwargs.get("deterministic"):
-        return False
-    return True
+    from .kernels.sm80.half_contract import d64_fast_path_eligible
+
+    # One rule for the adapter and for graph ownership (sdpa_bwd_sm80_f16_d64).
+    return d64_fast_path_eligible(
+        d_qk=d_qk,
+        d_v=d_v,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        mask_token=mask_token,
+        right_bound=right_bound,
+        causal_bottom_right=causal_bottom_right,
+        bw_kwargs=bw_kwargs,
+    )
 
 
 def _sm80_bwd_pick_flavor(d_qk: int, d_v: int, flavor_dims=None) -> str:
@@ -1028,7 +1035,8 @@ def _sm80_thd_backward(
 _cache_of_objects: dict = {}
 
 
-_SM80_BWD_KERNEL_FILE = "sm80/bprop_f16.py"
+from .kernels.sm80.f16_two_subgroup.contract import KERNEL_FILE as _SM80_BWD_KERNEL_FILE  # noqa: E402
+
 # The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
 # decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
 from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _BWD_SCHED_LPT_L2  # noqa: E402
@@ -1051,9 +1059,9 @@ def _sm80_bwd_sched_policy(*, is_causal: bool, deterministic: bool, thd: bool = 
     work is uniform per kv-tile, so the plain 3-D grid stays; the deterministic
     relay REQUIRES the plain decode (kv_tile == blockIdx.x).
     """
-    if thd:
-        return _BWD_SCHED_NATURAL
-    return _BWD_SCHED_LPT_L2 if (is_causal and not deterministic) else _BWD_SCHED_NATURAL
+    from .kernels.sm80.half_contract import uses_flat_grid
+
+    return _BWD_SCHED_LPT_L2 if uses_flat_grid(is_causal=is_causal, deterministic=deterministic, thd=thd) else _BWD_SCHED_NATURAL
 
 
 def _load_sm80_bwd_module(params):
@@ -1254,6 +1262,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         _, _, _, d_v = self.v_desc.shape
+        from .kernels.sm80.half_contract import launch_grid_mismatch
+
+        grid_reason = launch_grid_mismatch(b, h_qo, is_causal=self.is_causal, deterministic=self.deterministic, thd=self.thd)
+        self._not_implemented_error_if(grid_reason is not None, grid_reason)
 
         self._check_tensor_shape(self.q_desc, (b, h_qo, s_qo, d_qk), name="Q")
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
@@ -1836,12 +1848,12 @@ def sdpa_bwd_wrapper_sm80(
 _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 # Stage 2's descriptor scratch: Q / dO / K / V, clamped on device.
 _THD_STAGE2_DESC_SLOTS = 4
-_SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
+_SM100_STAGE2_FILE = "sm100/d512_f16_role_split/kernel.py"
 # The 2x2-datapath twin of stage 2: one fused cta_group::2 pipeline per pair (64 q rows per CTA, both BMMs on every
 # SM, S never leaves the lane's registers) inside the same (4,1,1) cluster, K / V shared across the two pairs by TMA
 # multicast.  Same host ABI, workspace format and LSE / do_dot contract as the role-split file; a SIBLING file so the
 # 4x1 rendering stays byte-identical (its own FROST_SOURCE_DIGEST, its own config record).
-_SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
+_SM100_STAGE2_FILE_2X2 = "sm100/d512_f16_2x2/kernel.py"
 # Which stage-2 datapath the SM100 d512 chain renders.  False = the cga4x1 role split (what ships).  True = the 2x2 twin
 # (the Rubin d512 bring-up vehicle; on SM100 the A/B gate for a default flip is >= +3 % stage-2 median on BOTH dense and
 # causal at B=1 H=128 S=8192 d=512 bf16, see the twin's docstring).  A module constant read at CALL time (``compile``),

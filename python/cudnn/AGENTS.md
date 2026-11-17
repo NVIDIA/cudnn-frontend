@@ -121,6 +121,9 @@ unsupported input runnable.
   bind aligned covering B/H/S permutations directly. Graph and standalone
   admission share `config_sm100.dense_bind_strides`; each port uses its own
   storage element width. Unaligned outer strides decline before compilation.
+  The SM90 row does the same through `config_sm90.dense_bind_strides`
+  (`dense_flex` strides, a unit axis pinned to D), the layouts its adapter's
+  `check_support()` accepts.
   The prior compact-BSHD normalization exception has been removed; split
   partials and quantization scalars remain legitimate algorithmic scratch.
 - The flip side of declining: whatever `check_support()` ACCEPTS, the kernel
@@ -359,6 +362,13 @@ the kernel that reads it).
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
 
+- **Restore caller device state after native context binding, including errors.**
+  Scope `ensure_current_context` and the native call with the shared
+  `device_context(x.device)`, and select `current_stream(x.device)` explicitly.
+  A two-GPU regression test should put operands on one GPU and make the other
+  current, check the binding stream before launch, and verify device/stream
+  restoration after both successful calls and injected native exceptions.
+
 SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
 `python/cudnn/sdpa/`.
@@ -447,7 +457,7 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
-  `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
+  `cudnn._jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
   the JAX dependency group and runtime guard enforce this higher floor.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
@@ -480,7 +490,17 @@ DSL satisfies your kernel.**
   the entry's probe names it) and
   `test_trace_raises_no_deprecation_warning_from_the_kernel_package` (device: a real trace) in
   `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py`; the pytest warnings
-  summary of a kernel suite shows the same reads by file and line.
+  summary of a kernel suite shows the same reads by file and line. The first detector sees a
+  name that warns when it is READ. An object the DSL deprecates in place warns only when it is
+  USED: on 4.8.0 `cutlass.utils.StaticPersistentTileScheduler` and
+  `PersistentTileSchedulerParams` resolve silently, and a trace that deals its tiles with them
+  raises 63 `DeprecationWarning`s per compiled form (one attributed to the kernel's line, the
+  rest inside the wheel) -- an exception from inside the trace under
+  `-W error::DeprecationWarning`. Only a trace shows it: take the tree's vendored copy
+  (`cudnn._cutlass_helpers.static_persistent_tile_scheduler`) and pin the trace on a host as
+  well as on a device (`test_rendering_pins_the_convention` and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` in
+  `test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py`).
 - **A kernel on the `cutlass.cute.experimental` layer reads TWO environment namespaces.** The
   target check of `cutlass.utils.blackwell_helpers` reads `CUTE_DSL_ARCH`; the layer's own
   lowering, dump and cache settings read `CUTE_EXPERIMENTAL_DSL_*`. A cross-target render
@@ -784,6 +804,10 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+  The common graph execution boundary must restore the caller's original
+  context on success and failure, including an empty worker context. The
+  backend and FROST cases in `core/graph/test_execute_device_context.py`
+  check mapping/ordered/indexed execution, default streams and captured replay.
 - **A guard that keeps the backend's planner away from a graph covers EVERY
   path that creates a backend plan, not only the heuristics query.** The cc 10.7
   single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
@@ -803,6 +827,18 @@ treatment at the caller boundary.**
   (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
   the first guard. A version-bounded guard also needs the detector that
   re-measures its bound (test/AGENTS.md).
+  The first version where a defect was measured is not its introduction
+  boundary. A lower bound needs evidence of an unaffected earlier release;
+  otherwise exclude the known-bad engine until the verified fixed version.
+  Exercise earlier supported versions in both default-planning and explicit
+  replay tests, and do not version-skip their numerical detector. The SM90
+  ragged-backward cases in `test_sdpa_bwd_backend_guard.py` cover this boundary.
+- **Provider support is not graph invalidity.** A layout a FROST engine cannot
+  run may still be valid for the backend. Preserve its graph facts and let the
+  provider's matcher decline it; returning an empty `invalid` fact record can
+  bypass backend correctness guards. Detector: the mixed dense/ragged Q/K/V
+  checks and native old/fixed-backend gradient controls in
+  `test_sdpa_bwd_backend_guard.py`.
 - **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
   `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
   `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
@@ -979,7 +1015,8 @@ python/cudnn/gemm/
 │   ├── epilogue_codegen.py          # facade for the active family's codegen
 │   ├── kernel_templates/           # template code shared by architecture families
 │   ├── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
-│   └── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
+│   ├── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
+│   └── swiglu_decode/              # direct-call FP4 gate / up product with SwiGLU for decode rows: host entry + kernel/ (same)
 └── ops/                            # backend-independent torch custom-op contracts
 ```
 
@@ -989,6 +1026,16 @@ Keep helpers in the narrowest package shared by their users. For example,
 Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Array slices need wide coordinates for wide global strides. In CuTe DSL 4.8,
+`cutlass.Array` slicing (for example `a[batch, row, head, :]`) multiplies each
+coordinate by a stride cast to that coordinate's integer width. An Int64
+tensor layout alone does not prevent overflow: widen each dynamic sliced
+coordinate before forming its stride product. Full scalar indexing is a
+different path; do not infer a slicing guarantee from it. Detector:
+`TestNativeHalfStrides::test_physical_wide_stride` in the SM100/SM107 forward
+suites physically allocates a wide batch stride and checks output and replay,
+including D256 SwapAB decode at one query row.
 
 Widen operands before triangular workspace products, in both producer and
 consumer. Widening an already-overflowed offset cannot recover it. Derive tile
@@ -1000,6 +1047,20 @@ the allocation when a later operand aliases that storage; remove only the
 binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
 for its P operand. Its public forward/backward reference and byte-golden
 tests in `simplified_sparse_attention/cutedsl/` cover this layout.
+
+Exact workspace reuse requires both an ownership proof and compiler-visible
+load-before-store ordering. If one lane consumes a vector before replacing it,
+keep the aliased load/store in one inline PTX block. Retain loaded values in
+named PTX temporaries until every input operand is consumed: write-only output
+registers may overlap registers holding a later store's inputs. This does not
+make partial overlaps or cross-lane readers safe. KDA's
+`test_state_chain_summary_alias_capture` compares disjoint and exactly aliased
+FP32 H/X for square/rectangular states, both walk directions and changed-input
+capture replay; the unmodified separate-storage implementation is a negative
+control for that alias contract.
+Run that control from a parent source/test tree and verify the nested kernel
+module path: the linear-attention test conftest overlays its sibling source
+tree, so checking only `cudnn.__file__` does not identify the tested kernel.
 
 When sharing a kernel with JAX, match scratch flag storage to its native ABI.
 A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
@@ -1066,6 +1127,50 @@ The same rule applies to inline PTX: `bar.sync` is an alias for
 replay and synccheck runs do not establish that the aligned-CTA promise is
 valid. D192 dense and THD backward share this Stats-publication barrier.
 
+A kernel taken over from another source carries this defect silently. With the
+aligned form at its five warp-role sites the SwiGLU FP4 decode kernel
+(`gemm/frost/swiglu_decode`) wrote the bytes the unaligned form writes in every
+byte comparison run on cc 10.0, while `synccheck` reported `Barrier error
+detected. Divergent thread(s) in block` in its first launch and aborted it.
+Spell a subset barrier through `tile_dsl.barrier.named_barrier_sync_unaligned`
+and pin the statement counts in the rendering:
+`test_rendering_pins_the_convention` in
+`test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py` requires five
+`barrier.sync` and three `bar.sync`.
+
+**The assembler folds an approximate reciprocal of a constant.**
+`rcp.approx.ftz.f32` of an immediate -- 6.0 in an NVFP4 block scale -- never
+reaches the kernel: the compiled code multiplies by the fp32 value the
+assembler computed. State such a factor as its bits
+(`tile_dsl.pointwise.opaque_fp4_max_rcp()` is fp32(1/6), `0x3E2AAAAB`), so the
+value is the source's and not one assembler's. Detector: the rendering pins
+count the bits once and exactly two `rcp.approx.ftz.f32` per block-scale chain
+(`test_rendering_of_every_helper` in
+`test/python/sdpa/frost/test_tile_dsl_quant_helpers.py`;
+`test_rendering_pins_the_convention` of the SwiGLU FP4 decode suite).
+
+**An approximate reciprocal spelled as a DSL intrinsic can be speculated across
+a branch.** `cute.arch.rcp_approx` is the same PTX instruction as
+`tile_dsl.pointwise.rcp_approx_ftz`, but as an intrinsic call the optimizer may
+hoist it above a zero test and turn the branch into a select: the bytes are
+equal, the instruction stream is not (both reciprocals then run for every
+block). Where a kernel must keep a reference instruction stream, use the opaque
+inline form. Detector: with a disassembler, the SwiGLU FP4 decode rendering pin
+requires the two reciprocals of each block-scale chain to be predicated.
+
+**`griddepcontrol.launch_dependents` behind warp-role branches fires at the
+FIRST role that reaches it.** One statement behind the role dispatch of a
+warp-specialised kernel is executed by each role as it finishes, and a thread
+block has signalled once its first role has -- in a persistent GEMM the loader
+warp, when its operand ring has drained and BEFORE the block's last output tile
+is written. "Released at the end" must name the role, and the entry's
+documentation must state the consumer's obligation: a kernel launched behind it
+with the programmatic-stream-serialization attribute issues its own wait before
+it reads the outputs. Detector: `test_dependent_that_waits_reads_the_eager_bytes`
+(SwiGLU FP4 decode suite: a waiting dependent behind the entry copies the
+outputs, eager and captured); the rendering pin counts one
+`launch_dependents`.
+
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
@@ -1086,6 +1191,23 @@ accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`)
 **Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
 `TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
 (the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
+
+**A wgmma accumulator read that no `wgmma.wait_group` dominates serializes
+every wgmma of the kernel.** ptxas keeps `wgmma.mma_async` groups pipelined
+only when every read of their accumulator registers sits behind a wait on
+every path. One path without it is enough: ptxas injects the wait itself
+(remark C7517), reports C7514 (`wgmma.mma_async instructions are serialized`)
+and puts a `WARPGROUP.DEPBAR` behind every HGMMA of the function, not only in
+front of that read. The SM90 blk128 BSA forward issued its last
+`wait_group(0)` under `if has_blocks:` and rescaled O behind the branch; its
+variable-count and split kernels then ran 16 DEPBARs per list step where the
+source has 2 waits. Results are bit-identical either way, so numerics tests
+cannot see it; issuing the wait unconditionally (a wait with nothing pending
+is a no-op) removed both remarks and 26 % of the SM cycles. **Detector:**
+compile with `CUTE_DSL_COMPILER_OPT="remarks{ptx}"` and search the log for
+`C7514` / `C7517` (a pipelined kernel has neither), or compare the
+`WARPGROUP.DEPBAR` count of the SASS with the kernel's own `wait_group` calls.
+No test pins this yet.
 
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged

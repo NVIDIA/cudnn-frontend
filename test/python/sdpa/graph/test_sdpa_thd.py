@@ -1119,7 +1119,7 @@ def test_sdpa_thd_large_batch(cudnn_handle):
 
 
 @pytest.mark.L0
-def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle):
+def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle, request):
     """Ragged-offset Stats must be written for every q head at s_q=1 with GQA.
 
     Regression guard for the report that only the first head of each kv group
@@ -1193,6 +1193,8 @@ def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle):
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
     graph.build_plans()
+    if cudnn_version < "9.27.0" and graph.selected_engine is None:
+        request.applymarker(pytest.mark.xfail(strict=True, reason="#1083: the backend writes only the first q head of each kv group before cuDNN 9.27.0"))
 
     workspace = torch.empty(max(int(graph.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
     stream = torch.cuda.current_stream().cuda_stream

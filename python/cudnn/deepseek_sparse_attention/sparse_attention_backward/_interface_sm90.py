@@ -106,6 +106,9 @@ def flash_attn_bwd_sm90(
     current_stream=None,
     deterministic: bool = False,
     deterministic_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    *,
+    cli_target: Optional[torch.Tensor] = None,
+    cli_target_head_count: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -187,6 +190,13 @@ def flash_attn_bwd_sm90(
     qhead_per_kvhead = num_head // num_head_kv
 
     current_stream = resolve_stream(current_stream)
+    if cli_target is not None:
+        if num_head != 64 or not 0 < cli_target_head_count <= num_head:
+            raise ValueError("CLI target output requires one 64-head block and 1..64 real heads")
+        if cli_target.shape != topk_idxs.shape or cli_target.dtype != torch.float32 or cli_target.device != q.device or not cli_target.is_contiguous():
+            raise ValueError("cli_target must be contiguous FP32 on Q's device with Top-K shape")
+    elif cli_target_head_count:
+        raise ValueError("cli_target_head_count requires a preallocated cli_target")
 
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     if deterministic:
@@ -224,6 +234,10 @@ def flash_attn_bwd_sm90(
     dpsum = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     lse_log2 = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     dkv_accum = carver.take(num_dkv_shards * physical_plane_elems, torch.float32).view(1, num_dkv_shards, physical_plane_elems)
+    # Validate workspace/indexing and carve every scratch view before modifying
+    # caller outputs. Empty rows and unused target slots are not written below.
+    if cli_target is not None:
+        memset_zero_async(cli_target.data_ptr(), cli_target.numel() * cli_target.element_size(), int(current_stream))
     # Deterministic planes include trailing packed relay masks. The mask
     # builder and main kernel share them only through the caller workspace.
     memset_zero_async(dkv_accum.data_ptr(), dkv_accum.numel() * dkv_accum.element_size(), int(current_stream))
@@ -384,6 +398,7 @@ def flash_attn_bwd_sm90(
         dQ_swapAB,
         have_topk_length,
         max_topk,
+        cli_target is not None,
         deterministic,
         num_dkv_shards,
         relay_cluster_size,
@@ -399,6 +414,7 @@ def flash_attn_bwd_sm90(
         dkv_accum_tensor = to_cute_tensor(dkv_accum, fully_dynamic=True)
         topk_idxs_tensor = to_cute_tensor(topk4)
         topk_length_tensor = to_cute_tensor(tlen4) if have_topk_length else None
+        cli_target_tensor = to_cute_tensor(cli_target.unsqueeze(0)) if cli_target is not None else None
 
         fa_bwd_obj = FlashAttentionDSABackwardSm90(
             dtype,
@@ -420,6 +436,7 @@ def flash_attn_bwd_sm90(
             relay_cluster_size=relay_cluster_size,
             q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
             padded_head_dim=head_dim_rounded if deterministic else 0,
+            emit_cli_target=cli_target is not None,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,
@@ -432,6 +449,8 @@ def flash_attn_bwd_sm90(
             dkv_accum_tensor,
             topk_idxs_tensor,
             topk_length_tensor,
+            cli_target_tensor,
+            cutlass.Int32(cli_target_head_count),
             cutlass.Int32(0),
             cutlass.Int32(0),
             softmax_scale,
@@ -449,6 +468,8 @@ def flash_attn_bwd_sm90(
             dkv_accum,
             topk4,
             tlen4,
+            cli_target.unsqueeze(0) if cli_target is not None else None,
+            cli_target_head_count,
             num_relay_waves if deterministic else 0,
             seqlen_k_rounded if deterministic else 0,
             softmax_scale,

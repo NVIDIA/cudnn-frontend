@@ -21,7 +21,7 @@ import hashlib, json, math, os, sys, torch, cudnn
 from cudnn.frost import compiled_cache as cc
 sys.path.insert(0, %(tests)r)
 from frost_test_utils import select_engine, _SM
-from cudnn.sdpa.fwd.engines import engine_name
+from frost_test_utils import half_engine_names
 b, h, s, d = 2, 8, 256, 128
 torch.manual_seed(0)
 # Both layouts bind in place; a split plan carries attention and combine artifacts.
@@ -44,7 +44,7 @@ q, k, v = (g.tensor_like(t).set_uid(UIDS[n]) for n, t in (("q", q_gpu), ("k", k_
 o, _ = g.sdpa(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=1.0 / math.sqrt(d), use_causal_mask=True)
 o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride()).set_uid(UIDS["o"])
 g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])
-select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100"))
+select_engine(g, half_engine_names(arch="sm107" if _SM == 107 else "sm100"))
 if BHSD:
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     knobs[cudnn.knob_type.SPLIT_KV] = 2

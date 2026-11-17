@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.L0]
 
 def _fused_fixture(stats):
     spec, facts, frames, combined = _split_fixture(d=256, splits=8, lengths=False, lse=stats)
-    path = Path(prep.__file__).parent / "kernels/sm107/decode_d256_f16.py"
+    path = Path(prep.__file__).parent / "kernels/sm107/d256_f16_swap_ab/kernel.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     values = dict(zip(spec.order, spec.template))
     spec.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]

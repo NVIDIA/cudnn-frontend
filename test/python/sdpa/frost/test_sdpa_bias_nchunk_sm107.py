@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The (n, n+1) PAIR work item of the resident-bias arm on the Rubin (SM107) f16/bf16 small head-dim tiles --
-``TemplateParams.n_chunk >= 1`` on ``sm107/prefill_d128_f16.py``.
+``TemplateParams.n_chunk >= 1`` on ``sm107/d128_f16_multi_q/kernel.py``.
 
 A work item is (a 128-row q tile, a head, a CHUNK of up to ``n_chunk`` consecutive entries of the flattened batch axis); the two
 softmax sub-tiles are rows nb / nb + 1 of the SAME q tile, so the bias row-block shrinks to the q tile's 128 rows (twice the kv
@@ -132,9 +132,9 @@ def test_row_serves_the_pair_budget_and_keeps_the_one_batch_entry_cells(name, fk
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-    caps = _s13._caps()
     f = _s13._facts(**_s13._resolve_dtypes(fkw))
     knobs = SdpaFwdKnobs(**kkw) if kkw else None
+    caps = _s13._caps(f, knobs)
     why = engines.mismatch(caps, f, knobs)
     assert (why is None) == accept, (name, why)
     if not accept and "budget" in name:
@@ -148,9 +148,9 @@ def test_heuristics_pick_cga1_for_a_pair_eligible_d64_bias_at_s_kv_256():
 
     offered = {s.name: i for i, s in enumerate(heuristics.ENGINE_SPECS)}
     plans = heuristics.recommend("A", _s13._facts(**_s13._resolve_dtypes(dict(d_qk=64, d_v=64, **_s13._bias_kw()))), offered)
-    assert {p.knobs.cga for p in plans if offered[_ROW] == p.engine_id} == {1}
+    assert {p.knobs.cga for p in plans if p.engine_id in {offered[row] for row in _s13._ROWS}} == {1}
     plans = heuristics.recommend("A", _s13._facts(**_s13._resolve_dtypes(dict(d_qk=64, d_v=64, **_s13._bias_kw(b=2)))), offered)
-    assert {p.knobs.cga for p in plans if offered[_ROW] == p.engine_id} == {2}
+    assert {p.knobs.cga for p in plans if p.engine_id in {offered[row] for row in _s13._ROWS}} == {2}
 
 
 def test_config_factory_derives_the_pair_block_and_raises_on_each_coupling():

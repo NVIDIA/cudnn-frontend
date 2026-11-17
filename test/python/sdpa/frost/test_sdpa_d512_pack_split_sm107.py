@@ -123,8 +123,8 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
             graph.validate()
             graph.build_operation_graph()
             graph.create_execution_plan(
-                family_for(graph).offered_ids()["sdpa_fwd_prefill_sm107"],
-                {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(packed), cudnn.knob_type.SCHED_POLICY: 0},
+                family_for(graph).offered_ids()["sdpa_fwd_sm107_d512_2x2"],
+                {cudnn.knob_type.TILE_CGA_M: 4, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(packed), cudnn.knob_type.SCHED_POLICY: 0},
             )
             graph.select_plan(0)
             graph.check_support()
@@ -135,7 +135,7 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
         else:
             api.compile()
             workspace_bytes = api.scratch_workspace_bytes()
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if graph_api else "sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.SPLIT_KV == splits
         assert api._k_mod.CFG.PACK_G == (math.gcd(group, 64) if packed else 1)
         assert api._partial_torch_dtype() == (torch.float32 if splits > 1 else getattr(torch, dtype_name))

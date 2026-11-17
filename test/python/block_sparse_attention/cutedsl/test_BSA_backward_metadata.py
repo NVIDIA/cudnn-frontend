@@ -101,7 +101,26 @@ def test_csr_parallel_offsets_warp_tails_and_cache(monkeypatch, metadata):
     for parallel in (False, True, False, True):
         for kv_blocks in (31, 32, 33, 65):
             _check_csr(partial(builder, parallel_offsets=parallel), metadata, kv_blocks=kv_blocks)
-    assert len(compile_calls) == 2
+    # ``parallel_offsets`` no longer changes generated code: the offsets are always built by one block-wide scan CTA
+    # per (q_group, head, batch), so both settings share one compilation (the KV tails 31/32/33/65 still exercise
+    # the scan).
+    assert len(compile_calls) == 1
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("metadata", ["fixed", "variable"])
+def test_csr_scan_tile_tails(monkeypatch, metadata):
+    """KV rows longer than one scan tile exercise the offsets kernel's running carry across tiles.
+
+    One tile is ``num_scan_threads * scan_items_per_thread`` entries (4096); ``tile`` and ``tile + 1`` put the
+    per-group end entry at index ``num_kv_blocks`` into the second tile, ``tile + 4`` puts counted KV blocks there.
+    """
+    module = _csr_module()
+    builder, compile_calls = _track_compiles(monkeypatch, module)
+    tile = module.BucketedK2QCsrUniversal.num_scan_threads * module.BucketedK2QCsrUniversal.scan_items_per_thread
+    for kv_blocks in (tile - 1, tile, tile + 1, tile + 4):
+        _check_csr(builder, metadata, kv_blocks=kv_blocks)
+    assert len(compile_calls) == 1
 
 
 # ---- paired-KV pair refinement

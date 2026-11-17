@@ -157,7 +157,7 @@ def test_discrete_grouped_gemm_dswiglu_jax_fp8_matches_torch():
 
 @pytest.mark.L0
 def test_discrete_grouped_gemm_dswiglu_jax_jit_matches_eager():
-    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper.
+    """XLA custom-call entry point (cudnn._jax.call): bit-identical to the eager JAX wrapper.
 
     d_row/d_col are deterministic per-tile kernel outputs and are compared bitwise;
     dprob accumulates through floating-point atomics whose ordering is not

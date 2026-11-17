@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""Fixed architecture contract; kernel/config remain owned by SM100."""
+
+from ..shared_half_contract import LOOKAHEAD as NAME, explicit_geometry, mismatch as _mismatch
+
+__all__ = ["NAME", "explicit_geometry", "mismatch"]
+
+
+def mismatch(facts, knobs):
+    return _mismatch(NAME, facts, knobs)

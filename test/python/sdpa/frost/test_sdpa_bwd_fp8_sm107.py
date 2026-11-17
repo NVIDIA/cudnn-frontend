@@ -66,7 +66,7 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
 
 
 _ENGINE = "sdpa_bwd_sm107_fp8"
-_HALF_ENGINE = "sdpa_bwd_sm107"
+_HALF_ENGINE = "sdpa_bwd_sm107_d256_f16_4x1"
 _FAMILY_NAME = "frost_sdpa_bwd"
 _SLOT = 5  # engines/manifest.py: EngineSlot(5, opt_in=True) -> FROST_SDPA_BWD_ID_BASE + 5
 _ENGINE_ID = 20_605
@@ -209,10 +209,13 @@ def _build_graph(*args, **kw):
 
 @requires_rubin
 def test_graph_admits_d256_fp8_backward_on_rubin(monkeypatch):
-    """Classic eager C++ validation (FROST off, the real device query -> cc 10.7):
+    """Classic eager C++ validation (no Python candidate, real device query -> cc 10.7):
     the node no longer raises the ``hidden_dim`` not-supported at d=256."""
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     g = _build_graph()
+    # Disabling opt-in does not remove default Python engines. Pin the classic
+    # validation path, as in the host-side C++ admission matrix.
+    monkeypatch.setattr(g, "_candidate_engines", lambda: [])
     g.validate()
     assert g._lowered_graph is not None, "classic path: the C++ graph validated the node"
 
@@ -260,7 +263,8 @@ def test_engine_name_grammar():
 
     if "fp8" in inspect.signature(engine_name).parameters:
         assert engine_name("sm107", fp8=True) == _ENGINE
-        assert engine_name("sm107") == _HALF_ENGINE
+        assert engine_name("sm107") == "sdpa_bwd_sm107"  # legacy delegated row
+        assert _HALF_ENGINE == "sdpa_bwd_sm107_d256_f16_4x1"
     assert _spec().name == _ENGINE
 
 
@@ -705,6 +709,7 @@ def _run_fp8(
     ws_poison=None,
     attn_scale=None,
     d_v=None,
+    record=None,
 ):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
@@ -827,8 +832,12 @@ def _run_fp8(
     )
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, _ENGINE)
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(g, _ENGINE)
+    else:
+        g.create_execution_plan(*record)
+        g.select_plan(0)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

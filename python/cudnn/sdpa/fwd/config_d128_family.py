@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 """The arch-NEUTRAL half of the f16/bf16 d128-FILE prefill configuration: the small-tile seams the Rubin and Blackwell
-d128-file kernels share (``sm107/prefill_d128_f16.py``, ``sm100/prefill_d128_f16.py``) -- the additive bias / kv_mask arms,
+d128-file kernels share (``sm107/d128_f16_multi_q/kernel.py``, ``sm107/small_f16_batch_pair/kernel.py``,
+``sm100/d128_f16_multi_q/kernel.py``) -- the additive bias / kv_mask arms,
 the (n, n+1) pair item, the streamed ring, the row-max forms, the padded tail and dead-sub-tile forms, the double-buffered S,
 Q in TMEM, the third softmax warp group -- as ONE field block, ONE TMEM map formula, ONE set of budgets and ONE set of
 validators, each taking the arch's BUDGET (:class:`D128FamilyArch`) as a parameter.

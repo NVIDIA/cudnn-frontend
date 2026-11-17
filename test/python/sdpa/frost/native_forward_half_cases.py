@@ -183,22 +183,33 @@ def test_half_native_rejects_invalid_bindings_before_launch(bad, monkeypatch):
 
 
 @pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("d", [128, 256, 512])
-@pytest.mark.parametrize("role,product", [("q", False), ("o", True)])
-def test_half_native_physical_wide_stride(d, role, product):
-    api, tensors, _ = _case(d, d, b=4 if product else 2)
+@pytest.mark.parametrize(
+    "d,q_seq,role,product",
+    [(d, 17, role, product) for role, product in (("q", False), ("o", True)) for d in (128, 256, 512)]
+    + [(256, 1, "q", False), (256, 1, "o", True), (256, 1, "lse", True)],
+)
+def test_half_native_physical_wide_stride(d, q_seq, role, product):
+    api, tensors, _ = _case(d, d, b=4 if product else 2, q_seq=q_seq)
     api.compile()
+    if q_seq == 1:
+        assert api.kernel_template == "decode_d256_f16"
     original = tensors[role]
     batch_stride = 2**31 - 65536 if product else 2**32 + 65536
     required = ((original.shape[0] - 1) * batch_stride + original[0].numel() * 2) * original.element_size()
     if torch.cuda.mem_get_info()[0] < required + 2**30:
         pytest.skip("wide physical stride storage unavailable")
     try:
-        widened = torch.empty_strided(original.shape, (batch_stride, original.stride(1), original.stride(2), 1), device="cuda", dtype=original.dtype)
+        widened = torch.empty_strided(original.shape, (batch_stride, *original.stride()[1:]), device="cuda", dtype=original.dtype)
     except torch.OutOfMemoryError:
         pytest.skip("wide physical stride allocation unavailable")
     widened.copy_(original)
     tensors[role] = widened
+    if role == "lse":
+        # Stats strides are a plan declaration; Q/O strides may be rebound.
+        api = SdpaFwdDslSm100(**{"sample_" + n: t for n, t in tensors.items()})
+        assert api.check_support()
+        api.compile()
+        assert api.kernel_template == "decode_d256_f16"
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     _execute(api, tensors, workspace)
     _check(tensors)
@@ -241,7 +252,8 @@ api, tensors, storage = _case(int(d), int(dv), q_seq=int(q_seq))
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 api.compile()
 if int(q_seq) > 32 and int(d) == 256:
-    assert Path(api._k_mod.__file__).name == "prefill_d256_f16.py", api._k_mod.__file__
+    expected = "sm100/d256_f16_lookahead/kernel.py" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "sm107/d256_f16_lookahead/kernel.py"
+    assert Path(api._k_mod.__file__).as_posix().endswith(expected), api._k_mod.__file__
 owner = api._dense_spec.owner
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")

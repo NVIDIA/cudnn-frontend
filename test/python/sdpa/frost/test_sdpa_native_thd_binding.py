@@ -26,6 +26,7 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.paged, s.has_sink, s.lse_padded = False, False, False
     s.has_lse, s.lse_head_major = layout is not None, layout == "HN"
     s.lse_head_stride, s.lse_stride = (16 if layout == "HN" else 0), None
+    s.lse_stride_override = False
     s.device_index, s.lens_form = 0, 3
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
@@ -890,8 +891,9 @@ def test_native_d64_thd_split_frames(paged, layout, splits):
 
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("splits", [2, 5])
-def test_native_d256_paged_split_frames(layout, splits):
-    _wide_thd_split_frames(True, layout, splits, 256, 256, cga_tile_m=256)
+@pytest.mark.parametrize("paged", [False, True])
+def test_native_d256_paged_split_frames(layout, splits, paged):
+    _wide_thd_split_frames(paged, layout, splits, 256, 256, cga_tile_m=256)
 
 
 def _wide_thd_split_frames(paged, layout, splits, d_qk, d_v, cga_tile_m=128):

@@ -3,7 +3,7 @@
 # Usage:
 #   run_all.sh <arch_label> [gpu] [config ...]
 #     gpu    = CUDA_VISIBLE_DEVICES value (index or GPU-<uuid>), "" to skip
-#     config = subset of configs (default: all six)
+#     config = subset of configs (default: every config the runner lists)
 # e.g. run_all.sh rtx_pro_6000 GPU-41233e81-...   |   run_all.sh b300 "" llama
 set -uo pipefail
 
@@ -13,9 +13,10 @@ if [ -n "${2:-}" ]; then
 fi
 shift; [ $# -gt 0 ] && shift
 CONFIGS=("$@")
-[ ${#CONFIGS[@]} -eq 0 ] && CONFIGS=(llama qwen35 gpt_oss deepseek_v4 kimi_k3 auto_regressive_dit)
 cd "$(dirname "$0")/../.." || exit 1
+[ ${#CONFIGS[@]} -eq 0 ] && mapfile -t CONFIGS < <(python -m benchmark.attention_inference.runner --list-configs | sed -n 's/^  //p')
 
+# Result directory per config; a config not listed lands under its own name.
 declare -A NAMES=(
     [llama]=llama3.1
     [qwen35]=qwen35
@@ -26,12 +27,9 @@ declare -A NAMES=(
 )
 mkdir -p benchmark/attention_inference/results
 for cfg in "${CONFIGS[@]}"; do
-    if [ -z "${NAMES[$cfg]:-}" ]; then
-        echo "!! unknown config '$cfg' (known: ${!NAMES[*]})"
-        continue
-    fi
-    echo "=== $cfg -> results/${NAMES[$cfg]}/$ARCH ==="
+    name=${NAMES[$cfg]:-$cfg}
+    echo "=== $cfg -> results/$name/$ARCH ==="
     python -m benchmark.attention_inference.runner --config "$cfg" \
-        --output-dir "benchmark/attention_inference/results/${NAMES[$cfg]}/$ARCH" \
-        2>&1 | tee "benchmark/attention_inference/results/${NAMES[$cfg]}_${ARCH}.log" || echo "!! $cfg failed"
+        --output-dir "benchmark/attention_inference/results/$name/$ARCH" \
+        2>&1 | tee "benchmark/attention_inference/results/${name}_${ARCH}.log" || echo "!! $cfg failed"
 done

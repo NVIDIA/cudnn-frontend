@@ -75,12 +75,36 @@ def paged_origins(qdtype, kvdtype, cga):
 
 @_native
 @pytest.mark.parametrize("qdtype,kvdtype,splits", itertools.product(("bfloat16", "float16"), ("float8_e4m3fn", "float8_e5m2"), (1, 5)))
-def thd_origins(qdtype, kvdtype, splits):
+def thd_origins(qdtype, kvdtype, splits, monkeypatch):
     import test_sdpa_fwd_thd_origins as thd_checks
+    from test_sdpa_fwd_sm107_half_explicit_engines import _fixed_loader
+
+    name = "sdpa_fwd_sm107_shared_single_q" if splits > 1 else "sdpa_fwd_sm107_d128_multi_q"
+    folder = "sm100/d128_f16_single_q" if splits > 1 else "sm107/d128_f16_multi_q"
+    seen = _fixed_loader(monkeypatch, folder + "/kernel.py")
+
+    def check(graph, *args):
+        from cudnn.sdpa.fwd import engines
+
+        assert graph.selected_engine.name == name
+        assert seen and seen[-1].CFG.SPLIT_KV == splits
+        if splits > 1:
+            native = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d128_multi_q")
+            _, reason = engines.analyze_for(native, graph, engines.SdpaFwdKnobs(cga=1, split_kv=splits))
+            assert reason and "shared SM100 single-Q body" in reason
 
     thd_checks.test_independent_thd_origins_rebind_and_capture(
-        128, qdtype, "head" if kvdtype == "float8_e5m2" else "token", True, splits == 1, splits, kv_dtype_name=kvdtype, engine_name=_ENGINE
+        128,
+        qdtype,
+        "head" if kvdtype == "float8_e5m2" else "token",
+        True,
+        splits == 1,
+        splits,
+        kv_dtype_name=kvdtype,
+        engine_name=name,
+        extra_checks=check,
     )
+    assert seen and seen[-1].CFG.SPLIT_KV == splits
 
 
 @_native
@@ -139,7 +163,9 @@ def uniform_control(dtype_name, geometry):
 def thd_uniform_control(dtype_name, pack_gqa):
     import test_sdpa_fwd_thd_origins as thd_checks
 
-    thd_checks.test_independent_thd_origins_rebind_and_capture(128, dtype_name, "token", True, pack_gqa, 1, kv_dtype_name=dtype_name, engine_name=_ENGINE)
+    thd_checks.test_independent_thd_origins_rebind_and_capture(
+        128, dtype_name, "token", True, pack_gqa, 1, kv_dtype_name=dtype_name, engine_name="sdpa_fwd_sm107_d128_multi_q"
+    )
 
 
 @_native
@@ -153,7 +179,7 @@ def thd_cga1_origins(qdtype, kvdtype, pack_gqa):
     import test_sdpa_fwd_thd_origins as thd_checks
 
     thd_checks.test_independent_thd_origins_rebind_and_capture(
-        128, qdtype, "head" if qdtype == "float16" else "token", True, pack_gqa, 1, kv_dtype_name=kvdtype, engine_name=_ENGINE, cga=1
+        128, qdtype, "head" if qdtype == "float16" else "token", True, pack_gqa, 1, kv_dtype_name=kvdtype, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=1
     )
 
 
@@ -191,7 +217,7 @@ def d64_thd_origins(qdtype, kvdtype, cga, paged):
         )
     else:
         thd_checks.test_independent_thd_origins_rebind_and_capture(
-            64, qdtype, "head" if cga == 1 else "token", True, cga == 2, 1, kv_dtype_name=kvdtype, engine_name=_ENGINE, cga=cga
+            64, qdtype, "head" if cga == 1 else "token", True, cga == 2, 1, kv_dtype_name=kvdtype, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=cga
         )
 
 
@@ -327,7 +353,18 @@ def d256_admission(qdtype, kvdtype, monkeypatch):
 @torch_fork_set_rng(seed=40144)
 def d512_dense_paged(qdtype, kvdtype, layout, splits, monkeypatch, cudnn_handle):
     checks.check_dense_paged_rebind_capture(
-        qdtype, kvdtype, 2, layout, splits, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=True, cpu_reference=True, head_dim=512
+        qdtype,
+        kvdtype,
+        2,
+        layout,
+        splits,
+        "graph",
+        monkeypatch,
+        cudnn_handle,
+        engine_name="sdpa_fwd_sm107_d512_2x2",
+        pack=True,
+        cpu_reference=True,
+        head_dim=512,
     )
 
 
@@ -341,7 +378,18 @@ def d512_standalone(qdtype, kvdtype, splits, monkeypatch, cudnn_handle):
     # The uniform-half A/B seam must not route mixed KV into a half-only body.
     monkeypatch.setattr(api_dsl, "D512_2X2", False)
     checks.check_dense_paged_rebind_capture(
-        qdtype, kvdtype, 2, "dense", splits, "standalone", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=False, cpu_reference=True, head_dim=512
+        qdtype,
+        kvdtype,
+        2,
+        "dense",
+        splits,
+        "standalone",
+        monkeypatch,
+        cudnn_handle,
+        engine_name="sdpa_fwd_sm107_d512_2x2",
+        pack=False,
+        cpu_reference=True,
+        head_dim=512,
     )
 
 
@@ -359,7 +407,7 @@ def d512_mqa(qdtype, kvdtype, layout, q_tokens, monkeypatch, cudnn_handle):
         "graph",
         monkeypatch,
         cudnn_handle,
-        engine_name=_ENGINE,
+        engine_name="sdpa_fwd_sm107_d512_2x2",
         pack=True,
         cpu_reference=True,
         head_dim=512,
@@ -389,7 +437,9 @@ def d512_admission(qdtype, kvdtype, monkeypatch):
     from cudnn.sdpa.fwd import engines, config_sm107
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams, d512_2x2_smem_bytes
 
-    spec, facts = checks.check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 7), head_dim=512, cga=2)
+    spec, facts = checks.check_graph_dtype_facts_and_admission(
+        qdtype, kvdtype, monkeypatch, cc=(10, 7), head_dim=512, cga=2, engine_name="sdpa_fwd_sm107_d512_2x2"
+    )
     for changed, knobs in [
         (facts, engines.SdpaFwdKnobs(cga=1)),
         (replace(facts, thd=True, stats_t=None), engines.SdpaFwdKnobs(cga=2)),

@@ -50,7 +50,8 @@ _COMPACT_SHAPES = {
 
 def _forward_graph(q, k, v, scale):
     """o and Stats from the FROST d512 prefill engine (an fp32 torch forward over 2^32 elements would not fit)."""
-    from test_sdpa_bwd_dsl_sm100 import _bshd, _plan_index
+    from test_sdpa_bwd_dsl_sm100 import _bshd
+    from frost_test_utils import select_engine
 
     import cudnn
 
@@ -65,9 +66,7 @@ def _forward_graph(q, k, v, scale):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    idx = _plan_index(g, "sdpa_fwd_prefill_sm100")
-    assert idx is not None, "the SM100 d512 prefill engine is not offered for the forward"
-    g.select_plan(idx)
+    select_engine(g, ("sdpa_fwd_sm100_d512_role_split", "sdpa_fwd_sm100_d512_2x2"))
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)

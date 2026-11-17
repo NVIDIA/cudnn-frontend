@@ -55,7 +55,7 @@ def test_runtime_kv_padding_nan_rebind_replay(d, dv, dtype, sq, sk, causal, cudn
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_fwd_prefill_sm90")
+    select_engine(graph, "sdpa_fwd_sm90_f16_three_wg")
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")

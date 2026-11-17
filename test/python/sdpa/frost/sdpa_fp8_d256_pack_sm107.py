@@ -9,7 +9,7 @@ import torch
 
 import cudnn
 import test_sdpa_prepared_fp8 as dense
-from sdpa_fp8_d256_padding import _check, _clone_with_slack, _record_route
+from sdpa_fp8_d256_padding import _check, _clone_with_slack
 
 _CASES = [
     (256, 256, 2, 17, 257, False, False, None, False, 0),
@@ -51,7 +51,6 @@ def _check_half_unpacked_control(g, bufs, tensors, check):
 def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False, split=1, pack=True):
     d, dv, group, sq, skv, causal, bottom_right, window, sink, sched = case
     heads = 2 * group
-    seen = _record_route(monkeypatch)
     kwargs = dict(softmax_precision=cudnn.data_type.HALF) if half else {}
     if causal:
         kwargs.update(right_bound=0, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT)
@@ -81,7 +80,12 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False, spl
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    assert seen and set(seen) == {"sm107/prefill_d256_fp8.py"}, seen
+    compiled = g._compiled_plans[g._plan_index]._compiled
+    assert compiled.kernel_module.__file__.endswith("sm107/d256_fp8_single_q/kernel.py")
+    from cudnn.sdpa.fwd.kernels.sm107.d256_fp8_single_q.contract import NAME
+
+    # The explicit implementation also owns its narrower D256 envelopes.
+    assert g.selected_engine.name == NAME, g.selected_engine.name
     assert g.plans[g._plan_index].knobs.pack_gqa == pack
     for name in ("q", "k", "v"):
         value = bufs[name]

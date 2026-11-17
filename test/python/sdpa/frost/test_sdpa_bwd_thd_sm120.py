@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM not in (120, 
 
 
 def _graph_case(case):
-    graph, refs = make_graph(case, engine_name="sdpa_bwd_sm120", engine_id=20600)
+    graph, refs = make_graph(case, engine_name="sdpa_bwd_sm120_f16_two_subgroup", engine_id=20621)
     spec = graph._compiled_plans[graph._plan_index]._prepared.spec
     assert spec.name == "sdpa_bwd_sm80"  # The shared native ABI retains its output-alias guards.
     assert len(spec.roles) == 24 and spec.native is not None

@@ -78,6 +78,7 @@ _REF_SOURCES = (  # CLOSED under its own relative / `sdpa.` imports (pinned by t
     "sdpa/block_scale_o_ref.py",
     "sdpa/random_config.py",
     "sdpa/softmax_knobs.py",
+    "sdpa/frost/frost_test_utils.py",
     "gated_attention_block/cutedsl/gated_block_reference.py",
 )
 _stats = {"hit": 0, "miss": 0, "verified": 0, "refused": 0, "bytes_loaded": 0, "bytes_stored": 0}
