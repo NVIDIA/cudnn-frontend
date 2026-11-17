@@ -31,9 +31,6 @@ _SUPPORTED_VARIANTS = {
 _SM90_SUPPORTED_HEADS = (16, 32, 64, 96, 128)
 _SM90_SUPPORTED_HEAD_DIMS = (512, 576)
 
-# execute() operands that pair with an optional declaration: each is given exactly when its sample_ counterpart was.
-_POOL_OPERANDS = ("extra_kv", "extra_topk_idxs", "extra_topk_length", "descale_kv", "descale_extra_kv")
-
 
 class SparseAttentionForward(APIBase):
     """Sparse prefill forward for the supported Hopper and Blackwell shapes.
@@ -85,11 +82,6 @@ class SparseAttentionForward(APIBase):
         self.descale_extra_kv_desc = self._make_tensor_desc(sample_descale_extra_kv, name="sample_descale_extra_kv")
         self.kv_format = kv_format
         self.extra_kv_format = extra_kv_format
-        # Which of _POOL_OPERANDS this plan declares, in that order.
-        self._declared_pool_operands = tuple(
-            desc is not None
-            for desc in (self.extra_kv_desc, self.extra_topk_idxs_desc, self.extra_topk_length_desc, self.descale_kv_desc, self.descale_extra_kv_desc)
-        )
         self.topk_idxs_desc = self._make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs")
         self.attn_sink_desc = self._make_tensor_desc(sample_attn_sink, name="sample_attn_sink")
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
@@ -346,10 +338,15 @@ class SparseAttentionForward(APIBase):
         """
         if self._compiled_kernel is None:
             raise ValueError("SparseAttentionForward kernel not compiled")
-        given = (extra_kv is not None, extra_topk_idxs is not None, extra_topk_length is not None, descale_kv is not None, descale_extra_kv is not None)
-        if given != self._declared_pool_operands:
-            name = next(name for name, g, d in zip(_POOL_OPERANDS, given, self._declared_pool_operands) if g != d)
-            raise ValueError(f"{name} must be given exactly when the plan was declared with sample_{name}")
+        for name, given, declared in (
+            ("extra_kv", extra_kv, self.extra_kv_desc),
+            ("extra_topk_idxs", extra_topk_idxs, self.extra_topk_idxs_desc),
+            ("extra_topk_length", extra_topk_length, self.extra_topk_length_desc),
+            ("descale_kv", descale_kv, self.descale_kv_desc),
+            ("descale_extra_kv", descale_extra_kv, self.descale_extra_kv_desc),
+        ):
+            if (given is not None) != (declared is not None):
+                raise ValueError(f"{name} must be given exactly when the plan was declared with sample_{name}")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         if self._device_major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -401,11 +398,6 @@ class SparseAttentionForward(APIBase):
 
 
 _cache_of_sparse_attention_forward_objects: dict = {}
-
-
-def _key_dtype(value) -> object:
-    """An optional operand's part of the wrapper's object-cache key: ``None``, its dtype, or the type of a non-tensor."""
-    return None if value is None else getattr(value, "dtype", type(value))
 
 
 def sparse_attention_forward_wrapper(
@@ -469,14 +461,14 @@ def sparse_attention_forward_wrapper(
         topk_length is not None,
         int(indexer_topk),
         None if capability is None else tuple(capability),
-        # repr() and _key_dtype() keep a malformed argument hashable, so check_support() reports it.
+        # repr() and getattr() keep a malformed argument hashable, so check_support() reports it.
         repr(kv_format),
-        _key_dtype(extra_kv),
+        getattr(extra_kv, "dtype", type(extra_kv)),
         repr(extra_kv_format),
-        _key_dtype(extra_topk_idxs),
+        getattr(extra_topk_idxs, "dtype", type(extra_topk_idxs)),
         extra_topk_length is not None,
-        _key_dtype(descale_kv),
-        _key_dtype(descale_extra_kv),
+        getattr(descale_kv, "dtype", type(descale_kv)),
+        getattr(descale_extra_kv, "dtype", type(descale_extra_kv)),
     )
     obj = _cache_of_sparse_attention_forward_objects.get(key)
     if obj is None:
