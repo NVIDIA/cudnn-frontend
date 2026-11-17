@@ -3415,6 +3415,42 @@ def test_determinism_cutile_autotune_configs(backend, variant, tune_cache):
 
 
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", ["kda"])
+def test_determinism_cutile_kda_bv_candidates_agree(backend, variant, tune_cache):
+    """Every BV candidate of the KDA state kernel writes the same bytes, so its sweep needs no host pin.
+
+    ``kda.autotuned_launch_bv`` times the V-tile width BV of ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` outside
+    the host hooks, so two processes can settle on different widths. BV only partitions the V axis across CTAs (the K
+    axis is always reduced in fixed 64-wide blocks), so unlike the worker-warp count it must not change a single
+    summation: force each BV in turn, with every hooked launch held at its first candidate, and compare the bytes
+    against BV candidate 0, not only against a repeat of the same width."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+
+    def run_bv(index):
+        tune_cache()
+        pick = Picking(index)
+        with patch.object(common, "exhaustive_search", Picking(0)), patch.object(kda, "exhaustive_search", pick):
+            return pick, stress_round(backend, variant, shape)
+
+    with waive_unsupported(backend, variant):
+        first_pick, first = run_bv(0)
+    assert first_pick.domain, f"{variant}: no launch took the BV sweep"
+    index, forced = 1, set()
+    while True:
+        pick, outputs = run_bv(index)
+        if not pick.covered:
+            break
+        for name, a, b in zip(stress_names(variant), first, outputs):
+            assert_bitwise(f"{variant} BV candidate {index} against candidate 0: {name}", a, b)
+        forced.update(i for indices in pick.forced.values() for i in indices)
+        index += 1
+    assert forced - {0}, f"{variant}: no BV candidate beyond the default ran; excluded {sorted(pick.excluded)}"
+    print(f"{variant}: BV candidates {sorted(forced)} of {first_pick.domain} agree byte for byte")
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
 @pytest.mark.parametrize("variant", CUTILE_VARIANTS)
 def test_determinism_cutile_autotune_host_hooks(backend, variant, tune_cache):
     """A host pins the pick: ``record_hint`` sees every timed winner, and under ``select_hints`` the search never runs

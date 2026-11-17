@@ -7020,7 +7020,20 @@ the caller. It then pins every launch to the second candidate through
 `select_hints` with the timed search replaced by a mock that fails if called,
 and compares the pinned bytes with a repeat and with the second candidate
 forced directly. Both tests run for GDN and KDA on a ragged batch of six
-sequences. From `test/python`:
+sequences.
+
+One cuTile sweep stays outside the hooks: `kda.autotuned_launch_bv` times the
+V-tile width `BV` (16, 8, 32, 64) of the KDA state kernel
+`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`. `BV` is a compile-time
+constant that partitions the V axis across CTAs; the K axis is reduced in
+fixed 64-wide blocks whatever `BV` is, so a different width must not move a
+bit, and then two processes that time it differently still agree.
+`test_determinism_cutile_kda_bv_candidates_agree` checks that claim: with
+every hooked launch held at its first candidate it forces each `BV` in turn
+and compares output, final state and every gradient bitwise against `BV`
+candidate 0 (not only against a repeat). On GB300 (job 1995834, source as
+below plus this test) the four widths agree byte for byte, so the sweep
+needs no host pin. From `test/python`:
 
 ```bash
 python -m pytest linear_attention/test_la.py -k "autotune or determinism" -rA
@@ -7050,7 +7063,9 @@ and driver API 13040, Torch 2.14.0a0 (NGC 26.09), selecting
 (11), `test_determinism_two_streams` (7: five FROST variants, cuTile GDN and
 KDA), `test_bwd_same_graph_two_streams` (14: the five FROST variants and cuTile
 GDN and KDA, two dtypes each), `test_beta_guard_bwd_determinism` (1), plus the two
-autotune tests for GDN and KDA (2 each). The skips are the `hopper` and
+autotune tests for GDN and KDA (2 each); `test_determinism_cutile_kda_bv_candidates_agree`
+(1) was added after that run and passed in job 1995834 (5 passed with the
+four autotune cases, 1:49). The skips are the `hopper` and
 `hopper_cuda` rows and cuTile's gdn2, gdp and mamba2 rows, which have no
 plan on this GPU; `test_multi_graph_stress` is not selected. After the cast
 fix the launch log of the two-stream backward shows every cuTile launch and
