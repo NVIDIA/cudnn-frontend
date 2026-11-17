@@ -80,7 +80,11 @@ entry needs of the installation is then a ``SKIP`` that names the fix, in the en
 load finds its kernel built.  A decline at that point is the installation's only where this adapter can name a
 requirement the installation does not meet (``_unmet``: the part's target by cuDNN Frontend's public probe, and what the
 entry's page states beyond it); any other decline is of the operands this adapter built -- a ``ValueError``, an ``ERROR``
-before the load, because a faulty adapter must not read as an unsupported GPU.
+before the load, because a faulty adapter must not read as an unsupported GPU.  The fused gate / up entry is built from
+the row count alone, and its row count is held in front of the build (the entry states a launch for it, or the table
+is wrong): there the adapter has built nothing a decline could be about, and one of that entry's requirements -- the
+names its kernel is written on -- has no public probe this adapter could ask.  Every typed decline of that build is
+therefore the entry's answer about the installation, and the ``SKIP``.
 
 **The memory sentence comes first.**  The scratch operands of a first use are as large as the run's own (rows + 1 slots of
 recurrent state for the fused step), so the first use is not made where a block is asked whether it serves
@@ -943,12 +947,17 @@ class SwigluFp4DecodeBlock(EntryBlock):
 
     def _unmet(self) -> bool:
         """Beyond the part's target: the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4 or later, on every
-        class it serves (its bytes were qualified with that compiler)."""
+        class it serves (its bytes were qualified with that compiler).  A CuTe DSL that does not say which compiler it
+        bound is not unmet by that: the entry declines nothing on a value it could not read, and neither does this."""
         if super()._unmet():
             return True
-        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound; the entry has imported the DSL by now
+        try:
+            from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound; the entry has imported the DSL by now
 
-        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+            compiler = (int(CUDA_VERSION.major), int(CUDA_VERSION.minor))
+        except Exception:  # noqa: BLE001 -- whatever keeps the value from being read: no statement about the compiler
+            return False
+        return compiler < (13, 4)
 
     def _build(self, device):
         import torch
@@ -1018,20 +1027,22 @@ class SwigluFp4DecodeBlock(EntryBlock):
         return out, scales
 
     def first_use(self, sequences: int, tokens: int) -> None:
-        """While the run is planned, on a real CUDA device: build the kernel of the run's row count (the entry's build takes
-        no operand).  Declines as ``EntryBlock.first_use``."""
+        """While the run is planned, on a real CUDA device: build the kernel of the run's row count.  The entry's build is
+        handed that row count and nothing else, and the row count is held in front of it (``_check_claim``: an entry that
+        states no launch for it is a wrong table).  Nothing of this adapter's is then left for the build to decline, so
+        every typed decline of it is the entry's answer about the installation -- its compiler, the part's target, the
+        names the kernel is written on -- and passes through as it is: a ``NotImplementedError``, the SKIP in the entry's
+        own words.  (``EntryBlock.first_use`` turns a decline no requirement explains into an ERROR about the operands
+        the adapter built; this adapter builds none here, and one of this entry's requirements has no public probe.)"""
         import torch
 
         if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
             return
         if torch.device(self.options["device"]).type not in self.first_use_devices:
             return
-        try:
-            self._build(self.options["device"]).compile(sequences * tokens)
-        except NotImplementedError as error:
-            if self._unmet():
-                raise
-            raise ValueError(self._declined(error, "its first use")) from None
+        entry, rows = self._build(self.options["device"]), sequences * tokens
+        self._check_claim(entry, rows)
+        entry.compile(rows)
 
     def compile(self, sequences: int, tokens: int) -> None:
         import torch

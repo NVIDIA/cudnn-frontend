@@ -351,8 +351,10 @@ That layout is the provider's, not the loader's: the adapter says how the merged
 (`stored_layout`, which calls the entry's own helper `interleave_gate_up`: a permutation of bytes, nothing is
 requantised), a session collects the layouts of its plans, and the load keeps the weight once, in that order, and no
 bf16 copy of it: 6.0 GiB on the published model where the copies are 21.2 GiB. Two plans of one run that multiply on
-two layouts of one weight are a wrong table, an error before the load. The reference blocks of the checks read copies
-in the checkpoint's row order, made for one call from the interleaved bytes ("What a run holds of a weight" below).
+one weight in two row orders -- the layouts of two providers, or a provider's layout in one plan and the checkpoint's
+row order in another -- are a wrong table, an error with the plans of the run, before anything is built or read. The
+reference blocks of the checks read copies in the checkpoint's row order, made for one call from the interleaved
+bytes ("What a run holds of a weight" below).
 
 The operand comes from the norm kernel as packed codes with their block scales in the 128 x 4 layout, and the entry
 reads both as they are. The scalar it multiplies each sum by is the fp32 product of the operand's global scale and the

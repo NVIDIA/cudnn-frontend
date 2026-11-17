@@ -27,7 +27,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
    time, on the real device, for the launch of the run's row count, and builds the entry's kernel for that row count on
    scratch operands: an entry asks what it needs of the installed toolchain where it builds, not where it is
    constructed, and that answer is a `SKIP` in the entry's own words before the load. A decline at that point which no
-   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`.
+   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`. An entry that is built
+   from the row count alone, once the entry has stated a launch for that row count, is handed nothing a decline
+   could be about: every typed decline of such a build is the entry's answer about the installation, and the `SKIP`.
 2. **State the environment before the first load.** `check_environment()` compares the installed distribution of cuDNN
    Frontend with `cudnn.__version__`, says whether `cudnn` is an editable checkout and prints a source hash (never a path). A
    mismatch is an error that names both. It runs after the plan, so a GPU the sample does not serve still skips.
@@ -574,9 +576,9 @@ Each of these passed every test and every GPU run of the first version.
   reads gate and up rows interleaved in tiles of 64, and its helper returns new tensors. Kept beside the merged
   tensor that would be the weight twice (12 GiB on the published model), made per call a permutation of 100 MB in
   front of every launch. The layout is asked of the provider while the run is planned and applied once per weight
-  at load; the merged tensor is dropped. Two plans of one run on two layouts of one weight are a wrong table, and a
-  session on weights that another plan loaded in another row order is named before its first step, like a missing
-  form.
+  at load; the merged tensor is dropped. Two plans of one run that multiply on one weight in two row orders are a
+  wrong table, named with the plans; a session on weights that another plan loaded in another row order is named
+  before its first step, like a missing form.
 - The reference's copy is made from the bytes the kernel multiplies on, whatever their order. With the weight kept
   interleaved, a copy made by un-permuting it into a second packed tensor would have put a stored tensor the
   checksum does not cover between the kernel's bytes and the reference's. `weights.dequantize` reads the layout a

@@ -3487,10 +3487,12 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     adapter makes that first use while the run is planned, on scratch operands of the run's row count: a decline is then a
     ``NotImplementedError`` -- a SKIP before the load, in the entry's own words -- where the installation does not meet a
     requirement the adapter can name (the part's target by cuDNN Frontend's public probe; on compute capability 10.7 the
-    CUDA 13 flavour of the CuTe DSL for the gate entry and for the norm entry; the compiler the fused gate / up entry is
-    qualified with, on every class), and a ``ValueError`` -- an ERROR -- for any other decline: those are the adapter's
-    own operands, and a faulty adapter must not read as an unsupported GPU.  The norm entry is built once per form the
-    run calls; its build takes no operand, and neither does the projection entry's or the fused gate / up entry's."""
+    CUDA 13 flavour of the CuTe DSL for the gate entry and for the norm entry), and a ``ValueError`` -- an ERROR -- for
+    any other decline: those are the adapter's own operands, and a faulty adapter must not read as an unsupported GPU.
+    The norm entry is built once per form the run calls; its build takes no operand, and neither does the projection
+    entry's.  The fused gate / up entry is built from the row count alone, which is held in front of the build: every
+    typed decline of that build is the entry's own sentence and a SKIP, whatever this adapter can name -- and at its
+    first launch, where the operands are the adapter's, the sentence says whose the decline is."""
     from types import SimpleNamespace
 
     import cudnn
@@ -3656,18 +3658,61 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
         (4, 8704),
         (128, 1088),
     ], "and for the fused gate / up entry: scratch operands in the entry's own layout, the outputs the call's own"
-    # (0a) the fused gate / up entry asks for a CuTe DSL whose compiler is CUDA 13.4 or later, on every class it serves: with an older
-    # one the entry's own sentence is the SKIP; with that compiler the same decline is the adapter's -- an ERROR
+    # (0a) the build of the fused gate / up entry is handed the row count and nothing else, and the entry has stated a launch
+    # for that row count before it is built: nothing of the adapter's is left for the build to decline.  So every typed decline
+    # of it is the entry's answer about the installation and a SKIP in the entry's own words -- the compiler it is qualified
+    # with, on every class it serves, and the names its kernel is written on, which no public probe of the package answers:
+    # with every requirement met that this adapter can ask about, the entry's sentence is still the SKIP, and never an ERROR
+    # about operands this adapter did not build
     qualified = "the SwiGLU FP4 decode kernel is qualified with the CuTe DSL compiling with CUDA 13.4 or later; the DSL in this process compiles with CUDA 12.9"
-    swiglu_decline[0] = qualified
-    for compiler, cc, outcome in (((12, 9), (10, 0), NotImplementedError), ((13, 0), (10, 3), NotImplementedError), ((13, 4), (10, 0), ValueError)):
+    written_on = (
+        "the SwiGLU FP4 decode kernel is written on cutlass.utils.blackwell_helpers; the installed CuTe DSL (nvidia-cutlass-dsl 4.9.0) does not export "
+        "make_smem_layout_epi"
+    )
+    for decline, compiler, cc in (
+        (qualified, (12, 9), (10, 0)),
+        (qualified, (13, 0), (10, 3)),
+        (qualified, (13, 4), (10, 0)),
+        (written_on, (13, 4), (10, 0)),
+        (written_on, (13, 4), (10, 7)),
+    ):
+        swiglu_decline[0] = decline
         with monkeypatch.context() as installed:  # an installation with that compiler and the part's target
             installed.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
             installed.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=compiler[0], minor=compiler[1]))
-            with pytest.raises(outcome) as declined:
+            with pytest.raises(NotImplementedError) as declined:
                 planned(cc=cc)
-        own = qualified if outcome is NotImplementedError else f"cudnn.SwigluFp4Decode declined the operands this adapter built for its first use: {qualified}"
-        assert str(declined.value) == own, (compiler, cc)
+        assert str(declined.value) == decline, (compiler, cc)
+    # ... and a CuTe DSL that does not say which compiler it bound declines nothing by that: the entry's sentence, not an
+    # import error of this adapter's own question
+    with monkeypatch.context() as installed:
+        installed.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
+        installed.delattr(dsl_version, "CUDA_VERSION")
+        with pytest.raises(NotImplementedError) as declined:
+            planned()
+    assert str(declined.value) == written_on
+    swiglu_decline[0] = ""
+    # ... the row count is the one thing this adapter hands the build, and it is held in front of it: an entry that states no
+    # launch for it is a wrong table (an ERROR), whatever its build would have said
+    block = resolved()["mlp.gate_up"]
+    stated = cudnn.SwigluFp4Decode.launch_shape_for
+
+    def past_the_ceiling(self, rows):
+        if rows > 64:
+            raise NotImplementedError("the SwiGLU FP4 decode kernel serves 1 .. 64 rows per call; got 65")
+        return stated(self, rows)
+
+    monkeypatch.setattr(cudnn.SwigluFp4Decode, "launch_shape_for", past_the_ceiling)
+    swiglu_decline[0] = written_on
+    del calls[:]
+    with pytest.raises(ValueError) as wrong:
+        block.first_use(65, 1)
+    assert str(wrong.value) == (
+        "the provider table is wrong: the row of fe.swiglu_fp4_decode claims this run (65 rows on compute capability 10.0), and cudnn.SwigluFp4Decode "
+        "declines it: the SwiGLU FP4 decode kernel serves 1 .. 64 rows per call; got 65"
+    )
+    assert calls == [], "before anything is built"
+    monkeypatch.setattr(cudnn.SwigluFp4Decode, "launch_shape_for", stated)
     swiglu_decline[0] = ""
     # (0) the FP8 projection entry asks for a CuTe DSL with the layer its kernel is written on: without it the entry's own sentence
     # is the SKIP; with it the same decline is the adapter's -- an ERROR
@@ -3748,6 +3793,26 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     monkeypatch.setattr(Norm, "decline", "the add + RMSNorm + quantize decode step serves at most 1024 rows per call; got 4")
     with pytest.raises(RuntimeError, match=r"^cudnn.AddNormQuantDecode declined the operands this adapter built for its first launch: the add \+ RMSNorm"):
         table["add_norm_quantize"].compile(4, 1)
+    # ... the fused gate / up entry's first launch does take operands of this adapter's, so there the sentence says whose the
+    # decline is: the installation's with an older compiler than the entry is qualified with, the adapter's operands with that
+    # compiler -- and with a CuTe DSL that does not say which compiler it bound, which is no unmet requirement (the entry
+    # declines nothing on a value it could not read, and neither does the adapter's question raise)
+    monkeypatch.setattr(Norm, "decline", "")
+    swiglu_decline[0] = qualified
+    for compiler, whose in (
+        ((12, 9), "declines this installation at"),
+        ((13, 4), "declined the operands this adapter built for"),
+        (None, "declined the operands this adapter built for"),
+    ):
+        with monkeypatch.context() as installed:
+            if compiler is None:
+                installed.delattr(dsl_version, "CUDA_VERSION")
+            else:
+                installed.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=compiler[0], minor=compiler[1]))
+            with pytest.raises(RuntimeError) as declined:
+                table["mlp.gate_up"].compile(4, 1)
+        assert str(declined.value) == f"cudnn.SwigluFp4Decode {whose} its first launch: {qualified}", compiler
+    swiglu_decline[0] = ""
     for block in ("attention.gate_quantize", "add_norm_quantize", "mlp.gate_up"):
         row = configs.PROVIDERS[block][0]
         assert row.classes == (
@@ -5190,7 +5255,9 @@ def test_a_run_keeps_no_copy_of_a_weight_that_every_plan_multiplies_on_its_store
     """Which forms a load keeps is decided from the plans of the run, before the first load: the stored format of a weight
     for a block that multiplies on it in SOME plan (this session's or a follower's), and no bf16 copy of it where EVERY plan
     has such a block for it.  One follower that reads the copy -- a stack without the row, a row selected away -- keeps the
-    copy.  The report's bytes of a step follow the session's own plan."""
+    copy.  The report's bytes of a step follow the session's own plan.  A stored weight is kept in ONE row order: plans
+    that multiply on it in two -- two providers' layouts, or a layout beside the checkpoint's order -- are refused with
+    the plans, in either order."""
     from model_samples import Session, TextIO
     from model_samples.blocks import DeviceFacts, plan
 
@@ -5289,6 +5356,29 @@ def test_a_run_keeps_no_copy_of_a_weight_that_every_plan_multiplies_on_its_store
         match=r"^the provider table is wrong: two plans of this run multiply on two layouts of the stored weight of mlp.gate_up \(Swiglu, OtherLayout\); a load keeps one$",
     ):
         first.stored_layouts()
+    # ... and so are a provider's own layout in one plan and the checkpoint's row order in another (a block that multiplies on
+    # the merged tensor as the checkpoint has it): one weight in two row orders, refused where the plans are -- whichever
+    # plan comes first, with the table of the run and again at the load, before anything is read
+    for own_first, orders in ((True, "Swiglu, the checkpoint's row order"), (False, "the checkpoint's row order, Swiglu")):
+        first, later = sessions("native", "native")
+        plain = later if own_first else first
+        merged = type("OnTheMergedTensor", (type(plain.plan["mlp.gate_up"]),), {"stored_layout": None})
+        plain.plan["mlp.gate_up"] = merged(plain.plan.rows["mlp.gate_up"], tiny, facts, {})
+        said = f"the provider table is wrong: two plans of this run multiply on two layouts of the stored weight of mlp.gate_up ({orders}); a load keeps one"
+        with pytest.raises(ValueError) as refused:
+            first.plan_table([later])
+        assert str(refused.value) == said, "with the table of the run: before the memory sentence, before an entry builds anything"
+        first._followers = (later,)
+        with pytest.raises(ValueError) as refused:
+            first.stored_layouts()
+        assert str(refused.value) == said
+        with pytest.raises(ValueError) as refused:
+            first.load()
+        assert str(refused.value) == said and first.weights is None and first.stages.seconds == {}, "at the load: nothing was read for it"
+    # ... while a plan whose block reads the bf16 copy is no reader of the stored form: beside a layout it asks for nothing
+    first, later = sessions("native", "native", overrides={"mlp.gate_up": "cublas.bf16_dequantized+torch_ref.silu_mul_quantize"})
+    first.plan_table([later])
+    assert list(first.stored_layouts()) == ["mlp.gate_up"]
     first, later = sessions("fe-cublas", "fe-cublas")
     first.plan_table([later])
     assert first._kept() == {}, "a run whose every multiply reads a copy asks its family's loader for nothing"
