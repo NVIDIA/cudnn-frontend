@@ -6,7 +6,9 @@
 fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the
 same sequence in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a
 free-memory budget the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with
-that sentence -- unless a check failed before it: a skip never covers a failure.  Each sequence count also reports its
+that sentence -- unless a check failed before it: a skip never covers a failure.  Every line of the run is read from
+standard error, and standard output must stay empty: it is kept for generated text, which a seeded run does not have.
+Each sequence count also reports its
 traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
 bytes of a step.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
@@ -76,8 +78,9 @@ CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles 
 
 def _fresh_interpreter(arguments):
     """The sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
-    Returns ``(exit code, stdout)``.  The child arms its own stack dump before the parent's deadline; where the deadline
-    passes, the failure carries what the child had printed."""
+    Returns ``(exit code, the run's lines, what the run wrote to standard output)``: a sample writes every line of a run
+    to standard error and keeps standard output for generated text.  The child arms its own stack dump before the
+    parent's deadline; where the deadline passes, the failure carries what the child had printed."""
     import cudnn
 
     package_root = str(Path(cudnn.__file__).resolve().parent.parent)
@@ -95,11 +98,11 @@ def _fresh_interpreter(arguments):
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
         pytest.fail(f"the sample did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
-    if "[00] " not in done.stdout:  # the child never reached the sample's own lines: an import or an environment failure
+    if "[00] " not in done.stderr:  # the child never reached the sample's own lines: an import or an environment failure
         pytest.fail(
             f"the sample printed no verdict in a fresh interpreter (exit code {done.returncode})\n--- stdout\n{done.stdout[-3000:]}\n--- stderr\n{done.stderr[-6000:]}"
         )
-    return done.returncode, done.stdout
+    return done.returncode, done.stderr, done.stdout
 
 
 def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
@@ -109,11 +112,16 @@ def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, un
     shows as such in its log."""
     start = time.perf_counter()
     if sample is None:
-        code, out = _fresh_interpreter(arguments)
+        code, out, written = _fresh_interpreter(arguments)
     else:
         code = sample.main(arguments)
-        out = capsys.readouterr().out
+        captured = capsys.readouterr()
+        out, written = captured.err, captured.out  # the run's lines; and standard output, which is for generated text
     seconds = time.perf_counter() - start
+    # A seeded run has no language: whatever its verdict, standard output stays empty.  A line there -- of the sample, or of
+    # a library the stack calls (a kernel build, a log switched to standard output) -- would stand in front of a text that
+    # a user pipes into a file.
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
     tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
     versions = next((line[5:] for line in tagged if line.startswith("[00] cuDNN Frontend ")), "no environment line")
     device = next((line[5:].split(" | ")[0] for line in tagged if " SMs)" in line), "no device line")

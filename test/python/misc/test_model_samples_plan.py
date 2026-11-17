@@ -267,7 +267,7 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().out
+        return module.main(arguments), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -299,7 +299,7 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
     assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
@@ -824,7 +824,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     capsys.readouterr()
     forced = StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
     ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
-    out = capsys.readouterr().out.splitlines()
+    out = capsys.readouterr().err.splitlines()
     assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
     first = (
         "[00] decoding: 3 prompt tokens through the decode step, then 5 new tokens and a traced pass; the report and the text follow, the text is not streamed"
@@ -837,7 +837,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     session.new_report()
     open_end = StopRule(text.eos_ids, max_new_tokens=4)
     ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
     assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 

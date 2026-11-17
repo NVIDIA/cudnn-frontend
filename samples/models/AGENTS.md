@@ -12,7 +12,9 @@ nothing at run time: every provider and route is a row of the printed table. The
 only together with a kernel. A change that needs any of these belongs in a serving engine, not here.
 
 Also out: a `generate()` method on the helper layer (the loop is in the script), stop strings, constrained output, logit
-processors, tool-call parsing of the output, automatic choice of a stack or a route.
+processors, tool-call parsing of the output, automatic choice of a stack or a route. A field of a request body that asks
+for one of them is a row of the table of rule 18 and is refused there by name, never served in part. A field that table
+does not hold is printed as not known and ignored, so a new name for one of them goes into the table.
 
 ## Rules
 
@@ -99,9 +101,15 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
-    for, a request file that is not JSON, messages a template cannot render or renders to no token,
-    an output file that cannot be written: each is raised as a `ValueError` whose text names the file by its own name, and
-    the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
+    for, a request file that is not JSON, a field of a request body that would change the output, a request whose
+    prompt and new tokens do not fit the context length, messages a template cannot render or renders to no token,
+    an output file that cannot be written or a file flag that was given an empty name (`--text-out "$OUT"` with the
+    variable unset: a flag is tested with `is not None`, never by its truth), a standard input or output that was
+    closed before the process started (the interpreter then holds `None` where the stream would be): each is raised as
+    a `ValueError` whose text names the file by its own name, and
+    the sample prints it before the plan. A reader of standard output that goes away while the text is written is the
+    user's too (`sample | head`): the write stops, the run goes on, and its last line is an `ERROR` that keeps the
+    verdict. Whatever a checkpoint's chat template raises is its refusal. That template is
     untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
 
 15. **A kernel is declared, then observed; a name proves no form.** Every adapter declares its census entries (`kernels`,
@@ -145,6 +153,34 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     reader of the file does not know is refused, never read as "nothing recorded". A pull request
     that changes a form the kernel census names updates the census in the same commit. Public text of this area calls
     it "the target kernel set" and names no product, repository or person for it.
+17. **Standard output is the generated text; every line of a run is standard error.** A sample prints its `[NN]` lines,
+    tables, report and checks through one function, to standard error, in every run: the text can then be piped, and
+    a test reads a run's lines from standard error. The text of sequence 0 of a checkpoint goes to standard output (or to
+    the file of `--text-out`) and nothing else does; it is written piece by piece inside the loop, each piece flushed,
+    between the host read of a step and the next launch, so its write is counted in that step's turnaround and never
+    inside a block. Seeded weights give no language, and their text is written nowhere. A request gets one text: a run
+    with a list of sequence counts writes the text of a prompt with the first count, and a later count reports whether
+    its sequence 0 produced the same text. A line of a run never goes to standard output, also where standard error
+    is closed (`print` writes to standard output when it is handed no stream). The GPU test of a default run holds
+    both streams: the run's lines on standard error and an empty standard output, in this process and in a fresh
+    interpreter.
+18. **A request body is answered field by field, beside the script.** A sample that takes the body a serving engine's
+    client sends parses it in one module beside the scripts of its family (`serving_options.py`), as data: the fields
+    it reads, the ones it states or does not use, and for every field that would change the output the values at which
+    it changes nothing. Such a field at another value is an `ERROR` that names the field, its value, the reason and
+    what is accepted; a field the sample does not know is printed and ignored; no field is dropped in silence, and
+    nothing is decoded differently from what a field of the table asks for without an error. The table holds every
+    name under which a client asks for something a sample leaves out (the tripwire's list); the host test names them
+    by feature. The line a run prints for a body holds the names of its fields and the values the table knows; it
+    never prints back what somebody else wrote into the body: of `model` the last part (a serving engine that serves
+    a directory is asked for it by its path), of a field that is not used its name, and a name that is not a plain
+    word as a JSON string. The helper layer is handed
+    messages, tool schemas and template options and never a request body. An option that exists in a serving engine
+    keeps that engine's name and meaning here (`--max-tokens`, `--max-model-len`); a new field of the table comes with
+    its case in `test/python/misc/test_model_samples_text.py`, which fails for a field without one. What a run says
+    before the load to somebody who comes from a serving engine -- the decoding rule beside the checkpoint's own
+    generation settings, the decode steps a prompt takes before the first new token -- states what is exact at that
+    point, a rule and a count, never a time: the report measures the time.
 
 ## What the first GPU run of this area taught
 
@@ -425,3 +461,49 @@ Each of these passed every test and every GPU run of the first version; a host t
   read, and holds the size in the sentence to the tensor list.
 - A section names a flag when a script has it. The first version named the flag that a script which does not exist
   is to take for the list. A host test refuses, in that section, a flag that no script of the folder has.
+
+## What building the serving-style options taught
+
+- A line that warns of a cost before the load has no measurement of its own to give. The first plan for the
+  first-token line was "about X s before the first token", with X taken from an earlier run. The same stack took a
+  quarter of a second per step in one checkpoint run and 0.15 s in another, on another host, because the launch
+  path is the host's: a recorded X would have stood above a report that says otherwise. The line gives the count of
+  decode steps, which is exact, and says where the time is.
+- `true == 1` in the language this is written in. A table of neutral values compared with `==` accepts `"n": true`
+  and `"logprobs": 0`. Compare a boolean only with a boolean, and hold it with a case of each kind.
+- A stand-in that fails forever cannot show a second attempt. The first test of "after a failed write nothing more is
+  written" used a stream that raised at every later write, so a sink that kept trying looked the same. Fail once.
+- A remainder nobody produces is a remainder nobody tests. What a stream still owes at its close (a sequence that
+  stopped inside a character) was dropped by a one-line defect in two places with every test green: no test stream
+  owed anything. Hand the loop a stream that does.
+- A reader of a pipe that goes away fails twice: at the write, and again when the interpreter flushes at exit, with a
+  message of its own and exit code 120 whatever the run returned. Catching the first is not enough; point the
+  descriptor at the null device. A host test runs a child process whose standard output is a closed pipe.
+- Moving a run's lines to another stream moves every test that reads them. Four test modules read the report from
+  standard output; each read was one line, and a run that prints nothing where a test looks fails by an empty list,
+  not by a wrong value. Print through one function, so that the stream is decided in one place.
+
+## What the review of the serving-style options taught
+
+Each of these passed every test and every GPU run of the first version.
+
+- "Not known and ignored" is where a feature hides under another name. The first table refused `stop` and
+  `response_format` and ignored `include_stop_str_in_output`, `structural_tag`, `logits_processors`, `bad_words` and
+  the older `functions`: fields that ask for exactly what this guide lists as out, while the guide said such a request
+  is never ignored. List the names by feature, not by what came to mind, and let a test hold the list.
+- A body copied from client code carries the client library's keyword (`extra_body`), whose content the library
+  would have merged into the top level. Ignored as an unknown field, the sampling settings and template options
+  inside it were dropped and the run decoded another prompt than the client sends.
+- A line that echoes a body echoes what is in it. `model` is a local path where an engine served a directory; `user`
+  and `metadata` hold what somebody else wrote; a field's name can hold a line break, and a line `[00] PASS` then
+  stands in the middle of a run. Print names and the values the table knows, and everything else as a JSON string.
+- A standard stream that was closed before the process started is `None` in the interpreter, not a stream that
+  fails. A write to it is an `AttributeError`, after the whole load; and `print(..., file=None)` writes to standard
+  output, so a run with standard error closed put every line of its report into the text.
+- An empty string is not "no flag". `if path:` let `--text-out ""` (an unset shell variable) through the check before
+  the run; the whole run happened, the text was written nowhere, and the last line blamed standard output.
+- One sink for every sequence count wrote the text of a request once per count, with nothing between the copies.
+  A request is one; the counts are a loop. What the loop writes once and what it writes per count is decided where
+  the loop is, and held by a run with two counts.
+- A sentence about a stream is held on a device only by a test that reads that stream there. "The seeded run writes
+  nothing to standard output" stood in three READMEs while the GPU test dropped standard output.

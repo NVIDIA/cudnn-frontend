@@ -9,7 +9,7 @@ global scale). Area rules, the helper layer and the words a run uses: [../README
 
 | script | what it runs | status |
 |---|---|---|
-| `00_decode.py` | plain greedy decode in one process: on the reduced seeded model, token ids in and out, self-checking; with `--model`, text in and text out on a checkpoint from local disk | this page |
+| `00_decode.py` | plain greedy decode in one process: on the reduced seeded model, token ids in and out, self-checking; with `--model`, text in and text out on a checkpoint from local disk, from a prompt, chat messages or the request body a chat client sends, with the generated text on standard output | this page |
 
 ```bash
 python samples/models/qwen_dense/00_decode.py                          # 2 layers, 1 and 4 sequences, 32 tokens each
@@ -22,18 +22,30 @@ python samples/models/qwen_dense/00_decode.py --stack native           # the tar
 # with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
 pip install -r samples/models/requirements.txt                         # tokenizers, jinja2, safetensors; brings the hf command
 hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
-python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-tokens 256
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages chat.json --dump-tokens ids.json
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt   # a client's request body
 ```
+
+Where the output goes: the generated text of sequence 0 goes to standard output, as it is generated, and nothing else goes
+there; every other line of a run -- the `[00]` lines, the tables, the report, the checks -- goes to standard error. So
+`> answer.txt` keeps the text and `2> run.log` keeps the run. The seeded default run has no language and writes nothing to
+standard output. A request gets one text: with a list of sequence counts (`--sequences 1,4`) every prompt is decoded once
+per count, its text is written with the first count, and the `text out` line of a later count says whether sequence 0
+produced the same text there.
 
 | flag | default | meaning |
 |---|---|---|
 | `--model DIR` | -- | a checkpoint directory on local disk; never a hub name; nothing is downloaded |
 | `--prompt TEXT` | `Why is the sky blue?` with `--model` | one user message, rendered by the checkpoint's chat template; repeat the flag for several prompts, run one after the other in one process |
-| `--messages FILE` | -- | chat messages as JSON: a list of messages, or an object with `messages` and optionally `tools` (JSON tool schemas) and `chat_template_kwargs` (options the checkpoint's template understands); repeatable |
-| `--max-new-tokens N` | `256` | with `--model`: stop after N new tokens unless an end token comes first. Without `--model` the flag is an error: the seeded run decodes `--force-tokens` |
-| `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-new-tokens` |
-| `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt |
+| `--messages FILE` | -- | a chat request as JSON, from a file or, with `-`, from standard input (once per run): a list of messages; an object with `messages` and optionally `tools` (JSON tool schemas) and `chat_template_kwargs` (options the checkpoint's template understands); or the whole request body a chat client sends, every field of which is answered ("Coming from a serving engine" below). Repeatable |
+| `--max-tokens N` | `256` | with `--model`: the limit of new tokens of a request that names none of its own: stop after N new tokens unless an end token comes first. `--max-new-tokens N` is the same flag. The limit a request body names rules over it, and a run says so. Without `--model` the flag is an error: the seeded run decodes `--force-tokens` |
+| `--max-model-len N` | `2051` | the positions a prompt and its new tokens share. A limit of new tokens somebody asked for that does not fit beside the prompt, or a prompt that leaves no room, is an `ERROR` before anything is planned or loaded; the default limit of 256 is cut to the room that is left, and the run says so. The default is the context length the kernel census of this family was recorded with. The flag bounds a request; the state of a run is sized for the run itself |
+| `--temperature 0` | -- | accepted at 0 and nothing else: token choice is greedy |
+| `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-tokens`; it rules over the limit a request body names, and a run says so |
+| `--text-out FILE` | -- | with `--model`: the generated text of sequence 0 goes to FILE instead of standard output; the file then holds what standard output would have held: one text per prompt, in order, each ending in a line break. An empty name (`--text-out "$OUT"` with the variable unset) is an `ERROR` before anything is planned, as it is for `--dump-tokens` and `--dump-census` |
+| `--no-stream` | off | with `--model`: the text is written once, after the report of its prompt, instead of piece by piece as it is generated |
+| `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt, and the text of a prompt is written once, with the first count of the list (a later count reports whether its sequence 0 produced the same text; `--dump-tokens` has the ids of every count) |
 | `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
 | `--stack fe-cublas\|native\|fe-entries\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `native`: the target kernel set of the decode step ("The stack `native`" below); the kernel check is always on. `fe-entries`: the cuDNN Frontend rows of `native`, everything else on fallback rows. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
@@ -53,6 +65,148 @@ A `--messages` file (the `chat.json` of the last command above), here with a sys
 A list of messages alone is also a valid file, and `tools` takes JSON tool schemas. The options are those of the
 checkpoint's chat template: for `nvidia/Qwen3.8-27B-NVFP4`, `enable_thinking: false` leaves out the reasoning the model
 otherwise writes before its answer.
+
+## Coming from a serving engine
+
+This sample is one process with greedy token choice, not a serving engine: no socket, no queue, no sampling. But the
+inputs of a request are the same, and the sample takes them as they are.
+
+| what you have | what the sample takes | note |
+|---|---|---|
+| the model | `--model DIR`, a directory on local disk | a hub name is not fetched |
+| the request body your chat client sends | `--messages request.json`, or `--messages -` to read it from standard input | every field of the body is answered: the table below |
+| `max_tokens` or `max_completion_tokens` in the request | read from the body; `--max-tokens N` is the limit of a request that names none | default 256. A serving engine that is given no limit generates until the context is full; this sample stops at 256 |
+| the context length (`--max-model-len`) | `--max-model-len N`, default 2051 | a prompt and its new tokens share it; a request beyond it is an `ERROR` before anything is loaded |
+| `temperature`, `top_p`, the checkpoint's generation settings | nothing: token choice is always greedy. `"temperature": 0` and `--temperature 0` are accepted | a serving engine may apply the checkpoint's own generation settings to a request that names no temperature. This sample never does, and every run with a checkpoint says so in one line (below) |
+| `"stream": true` | the text of sequence 0 goes to standard output as it is generated; `--no-stream` writes it once; `--text-out FILE` writes it to a file | every other line of the run goes to standard error |
+| concurrent requests | `--sequences N` | a fixed set of sequences that start together, each with the same prompt; nothing is admitted while a step runs |
+| which kernels serve the model | `--stack`, and `--provider BLOCK=KEY` for one block | a kernel choice is a row of the table a run prints before it loads anything |
+| a host, a port, an API key, a served model name, several GPUs, a memory budget | not here | one process on one GPU; the plan prints the memory a run needs before it loads anything |
+
+A request body, with a system turn, the reasoning switched off and what a client adds on its own:
+
+```json
+{"model": "nvidia/Qwen3.8-27B-NVFP4",
+ "messages": [{"role": "system", "content": "Answer in two short sentences."},
+              {"role": "user", "content": "Why is the sky blue?"}],
+ "stream": true, "max_completion_tokens": 96, "seed": 7, "n": 1, "top_p": 1,
+ "chat_template_kwargs": {"enable_thinking": false}}
+```
+
+```bash
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages - < request.json 2> run.log
+```
+
+A run prints one line for the body, which answers every field of it:
+
+```text
+[00] --messages -: a chat request body. Read: messages (2), chat_template_kwargs (enable_thinking), max_completion_tokens 96. model ".../Qwen3.8-27B-NVFP4": names the checkpoint directory. Not used: stream true (the text goes where the command line says, as it is generated unless --no-stream); seed 7 (token choice is greedy, nothing is drawn). At the value that changes nothing: n 1, top_p 1.
+```
+
+Every field of a body falls into one of these classes (`serving_options.py`, beside the script, holds them as data):
+
+| class | fields | what the sample does |
+|---|---|---|
+| read | `messages`, `tools`, `chat_template_kwargs`, `max_tokens`, `max_completion_tokens` | the messages, tool schemas and template options go to the checkpoint's chat template; the limit is the request's own limit of new tokens. Two limits that differ are an `ERROR` |
+| stated | `model` | its last part is printed and compared with the name of the checkpoint directory; what stands in front of it -- an organisation, or a path where a serving engine served a directory -- is not printed (`".../Qwen3.8-27B-NVFP4"`). Another name is not an error: the run decodes the directory it was given, and says so |
+| not used | `seed`, `stream`, `stream_options`, `user`, `metadata`, `store`, `service_tier`, `parallel_tool_calls` | named with the reason: nothing is drawn under greedy decoding, the text goes where the command line says, one process has no account, no queue and nothing to store, and tool calls in the output are not parsed. The value is printed for `seed` and `stream` only: what somebody wrote into the other fields is not printed back |
+| accepted at the value that changes nothing | the table below | accepted at that value and at `null`; at any other value the run ends in one `ERROR` line before anything is loaded, which names the field, its value, the reason and what is accepted |
+| not known to this sample | any other field | printed by its name and ignored: the sample cannot say whether such a field would change the output. A name that is not a plain word is printed as a JSON string |
+
+The fields that would change the output, and the values they are accepted at:
+
+| field | accepted | another value is refused because |
+|---|---|---|
+| `temperature` | `0`, `null` | token choice is greedy: the token of the largest logit at every step |
+| `top_p` | `1`, `null` | it shapes the distribution a token is drawn from, and nothing is drawn here: token choice is greedy |
+| `top_k` | `0`, `-1`, `null` | it shapes the distribution a token is drawn from, and nothing is drawn here: token choice is greedy |
+| `min_p` | `0`, `null` | it shapes the distribution a token is drawn from, and nothing is drawn here: token choice is greedy |
+| `n` | `1`, `null` | a request gets one text; --sequences N decodes the same prompt in N sequences |
+| `best_of` | `1`, `null` | a request gets one text: nothing more is generated to choose among |
+| `use_beam_search` | `false`, `null` | there is no beam search: one sequence per prompt, greedy |
+| `length_penalty` | `1`, `null` | there is no beam search: one sequence per prompt, greedy |
+| `frequency_penalty` | `0`, `null` | no penalty is applied to the logits |
+| `presence_penalty` | `0`, `null` | no penalty is applied to the logits |
+| `repetition_penalty` | `1`, `null` | no penalty is applied to the logits |
+| `logit_bias` | `{}`, `null` | no bias is applied to the logits |
+| `logits_processors` | `[]`, `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `bad_words` | `[]`, `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `allowed_token_ids` | `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `watermarking` | `false`, `null` | nothing processes the logits: the token of the largest one is taken, over the whole vocabulary |
+| `stop` | `[]`, `null` | stop strings are not served: a sequence ends at an end token of the checkpoint or at its limit of new tokens |
+| `include_stop_str_in_output` | `false`, `null` | stop strings are not served: a sequence ends at an end token of the checkpoint or at its limit of new tokens |
+| `stop_token_ids` | `[]`, `null` | a sequence ends at the end tokens of the checkpoint and at no other |
+| `ignore_eos` | `false`, `null` | an end token ends a sequence; --force-tokens N decodes exactly N tokens instead |
+| `min_tokens` | `0`, `null` | an end token ends a sequence whenever it comes |
+| `repetition_detection` | `null` | a sequence ends at an end token of the checkpoint or at its limit of new tokens, whatever it repeats |
+| `thinking_token_budget` | `null` | reasoning a model writes before its answer is part of the text, and no budget is put on it |
+| `include_reasoning` | `true`, `null` | reasoning a model writes before its answer is part of the text: the output is not parsed |
+| `logprobs` | `false`, `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
+| `top_logprobs` | `0`, `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
+| `prompt_logprobs` | `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
+| `logprob_token_ids` | `null` | a run writes text and, with --dump-tokens, token ids; no log-probabilities |
+| `echo` | `false`, `null` | the prompt is not written back with the text |
+| `skip_special_tokens` | `true`, `null` | special tokens are left out of the text |
+| `spaces_between_special_tokens` | `true`, `null` | special tokens are left out of the text |
+| `response_format` | `{"type": "text"}`, `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `structured_outputs` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `structural_tag` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `guided_json` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `guided_regex` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `guided_choice` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `guided_grammar` | `null` | constrained output is not served: the text is what the greedy tokens decode to |
+| `tool_choice` | `"auto"`, `null` | tool schemas are rendered into the prompt by the checkpoint's chat template; the output is neither constrained nor parsed |
+| `function_call` | `null` | it is the older name of tool_choice, and the output is neither constrained nor parsed |
+| `functions` | `null` | it is the older name of tools, the field tool schemas are read from |
+| `add_generation_prompt` | `true`, `null` | the prompt ends where the checkpoint's chat template opens the reply |
+| `continue_final_message` | `false`, `null` | the prompt ends where the checkpoint's chat template opens the reply |
+| `add_special_tokens` | `false`, `null` | the prompt is what the checkpoint's chat template renders, encoded as it is: no special token is added |
+| `chat_template` | `null` | the messages are rendered by the checkpoint's own chat template |
+| `documents` | `[]`, `null` | the checkpoint's chat template is given messages and tool schemas, nothing else |
+| `truncate_prompt_tokens` | `null` | a prompt is encoded whole |
+| `reasoning_effort` | `null` | an option of the checkpoint's chat template goes into chat_template_kwargs |
+| `extra_body` | `{}`, `null` | it is how a client library is handed the fields it adds to a request, not a field of the body it sends: its fields go to the top level of the body |
+
+The table holds the fields of the public chat request and of the sampling parameters serving engines add to it that ask
+for something this sample leaves out: sampling, stop strings, constrained output, a processor of the logits, parsing of
+the output, another prompt than the checkpoint's chat template renders. A field under a name the table does not hold
+is in the last class above: printed and ignored. `extra_body` is in the table because a request file written from
+client code can carry it: a client library merges what it is handed under that name into the top level of the body
+it sends, so a body that still holds the name would be decoded without the fields inside it.
+
+So a body that asks for sampling ends like this, before the plan:
+
+```text
+[00] ERROR --messages request.json: "temperature": 0.6 would change the output and is not served: token choice is greedy: the token of the largest logit at every step. Accepted: 0, null, or the field left out
+```
+
+Which limit of new tokens applies to a request: `--force-tokens N` where it is given; else the limit the request body
+names; else `--max-tokens N`; else 256. Each request of a run has its own. A limit that was given and does not apply is
+said in a line (`its own "max_tokens": 64 applies, not --max-tokens 32: the flag is the limit of a request that names
+none`).
+
+Two lines of a run with a checkpoint are there for a reader who comes from a serving engine. Both are printed before
+anything is loaded:
+
+```text
+[00] greedy decoding: the token of the largest logit at every step; the checkpoint's own generation settings (do_sample true, temperature 1.0, top_k 20, top_p 0.95 in generation_config.json) are not applied
+[00] first token: a prompt goes through the decode step, one step per prompt token (no stack of this sample has a prefill kernel): 58 decode steps before the first new token of the default prompt, as long as 58 new tokens take. No text is written until then; the first token line of the report has the time
+```
+
+The first states the decoding rule beside what the checkpoint's `generation_config.json` names, so the difference
+from an engine that applies those settings is never silent. The second states what a prompt costs here: no stack of
+this sample prefills a prompt with a kernel of its own, so a prompt of N tokens is N decode steps and takes as long as
+N new tokens before the first new token appears. It gives a count and no time, because before the load a run has no
+time of its own to give; the `first token` line of the report has the measured one. In the runs of 2026-11-17 on
+compute capability 10.0, a prompt of 29 tokens took 4.3 s before the first new token on the stack `fe-cublas` (0.15 s
+per step) and the 58 tokens of the default prompt took 7.8 s on the stack `native` (0.13 s per step): orientation
+values of single runs on a shared GPU, as every timing on this page.
+
+What is not here, and is not planned for a sample: a network interface of any kind; a request queue, or admission of
+work while a step runs; different prompts in one step; sampling; stop strings, constrained output, logit processors;
+parsing of tool calls in the output (tool schemas are rendered into the prompt, the output is text); a download from a
+hub; an automatic choice of the stack.
 
 ## What the default run is
 
@@ -288,6 +442,7 @@ The sample was last run with:
 | packages | tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0; the lower bounds of `samples/models/requirements.txt` (0.21.1, 3.1.6, 0.4.3) pass the host tests of the text and weight readers |
 | run | 2026-11-12, compute capability 10.0 (aarch64), in two environments: PyTorch 2.14.0 with CuTe DSL 4.8.0, and a fresh environment built by the lines of this file with PyTorch 2.15.0 and CuTe DSL 4.8.1. Three prompts at one sequence (two plain user turns, one with a tool schema and the reasoning switched off) and one prompt at two sequences; text out, `[00] PASS` in every run, the token line reported. The run before it was on compute capability 10.3 (2026-11-11) |
 | provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0 and 2.15.0, the PyTorch chains |
+| a request body, the text on standard output | 2026-11-17, compute capability 10.0 (x86, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0). On the stack `fe-cublas`, the request body of the section "Coming from a serving engine" on standard input, with standard output and standard error on two pipes: `[00] PASS`; the answer arrived on standard output in 39 pieces, one per decode step, the first after the 29 steps of the prompt, and its line break after the last, before the first line of the report; standard output held the text and that line break, standard error every line of the run. On the stack `native`, the default prompt as a request body with its own limit of 32 new tokens, written with `--text-out` and `--no-stream`: `[00] PASS` with the ids hash and the kernel lines of the same prompt given with `--prompt`, the text in the file. On the stack `fe-cublas` again, the same request body at two sequence counts (`--sequences 1,2`): `[00] PASS`; standard output held the one text, written with the first count, and the second count reported the same text for its sequence 0 |
 
 The sample downloads nothing. Fetching the checkpoint is your own step, for example
 `hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4` (the command comes with the packages of the
@@ -307,15 +462,17 @@ for the run's sequence counts on scratch operands: an entry asks what it needs o
 builds, so a CuTe DSL that cannot build for the GPU is a `SKIP` in the entry's own words here, not an error after the
 weights are read. Then the weights are read, merged (query, key and value; `qkv` and `z`; the
 beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, each entry's kernel is launched once, and each prompt
-is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
-printed; reasoning the model writes before its answer is part of that text.
+is fed through the decode step and decoded greedily to an end token or to its limit of new tokens. The text of sequence 0
+goes to standard output as it is generated; reasoning the model writes before its answer is part of that text.
 
 How long it takes, as orientation values of one run (compute capability 10.3, the default prompt, 256 new tokens, the
 checkpoint in the page cache): about two and a half minutes. About 6 s until the first step (import, read, merge,
 dequantise, compile, warm-up); 14 s for the 58 prompt tokens; 54 s for 225 new tokens, a quarter of a second per token on
-this stack; 12 s for the traced pass; and about a minute for the checks. The text is not streamed: it is printed after
-the report, so that printing is not part of a timed step. A run prints one line before the prompt and the decode loop
-(`[00] decoding: ...`) and one before the checks (`[00] checks on ...`), and nothing while either of the two runs.
+this stack; 12 s for the traced pass; and about a minute for the checks. The text of sequence 0 is written while the
+loop runs: each piece between the host read of one step and the launch of the next, flushed, so its write is part of
+that step's turnaround (`--no-stream` writes the text once, after the report, and keeps the write out of every timed
+step). On standard error a run prints one line before the prompt and the decode loop (`[00] decoding: ...`) and one
+before the checks (`[00] checks on ...`), and nothing while either of the two runs.
 
 Memory, in GiB (2^30 bytes), as the memory lines of a run print it: the stack `fe-cublas`
 holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 56.7 GiB free with one
@@ -365,7 +522,8 @@ three distinct windows (the preamble, a system turn, a tool schema), not one per
 decode step.
 
 Comparing the produced ids with a serving engine is not part of this sample; `--dump-tokens` writes them for a
-comparison made elsewhere, and greedy decoding is not the checkpoint's own default (its generation settings sample).
+comparison made elsewhere, and greedy decoding is not the checkpoint's own default (its generation settings sample,
+which every run with a checkpoint says in its `greedy decoding` line).
 
 ## The checkpoint's drafter
 
