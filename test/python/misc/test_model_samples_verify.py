@@ -1148,6 +1148,31 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "The two sessions share the load and nothing else." in section and "a prompt prefilled through `decode` is no context of `verify`" in section
     assert "says of three lines that they are not stated -- the first-token line" in section, "the report of a verify session"
     assert "48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB" in section, "where the memory sentence is short"
+    # ... and up to 32 rows the sentence is no band of a tenth of a GiB in both directions: one step shape reserved half a GiB
+    # less than its sentence asked for, and the text states that run beside the others
+    assert "PyTorch reserved within 0.1 GiB of it" not in section, "three sequences of three tokens reserved 0.5 GiB less than the sentence said"
+    assert "Up to 32 rows of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said" in section
+    assert (
+        "three sequences of three tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.1 GiB and grew the device by 3.3 GiB"
+        in section
+    )
+    # what the comparison with the decode steps gates is stated for the step shapes where it gated: up to 32 rows.  Beyond
+    # them the in-projection in front of the linear-attention layer is a multiply over a copy in the verify plan and its entry
+    # in the decode plan of the same sequences, so that layer is fed other rows and its state is printed, not gated
+    assert "at every step shape that ran up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows --" in section
+    assert "at every step shape that ran --" not in section, "16 sequences of three, four and five tokens ran too, and their kept state was not gated"
+    in_projection = "projection.fp8.in"
+    for sequences, tokens in ((16, 3), (16, 4), (16, 5)):  # 48, 64 and 80 rows
+        verify_row, decode_row = _plan(sequences, tokens)[0].rows[in_projection], _plan(sequences)[0].rows[in_projection]
+        assert (verify_row.fallback, decode_row.key) == ("bf16 copy of 8-bit weights", "fe.fp8_projection_decode"), (sequences, tokens)
+    for sequences, tokens in ((1, 2), (1, 6), (1, 8), (3, 3), (2, 6), (2, 8), (3, 6), (9, 2), (4, 6), (3, 8), (4, 7), (4, 8), (16, 2)):
+        verify_row, decode_row = _plan(sequences, tokens)[0].rows[in_projection], _plan(sequences)[0].rows[in_projection]
+        assert verify_row.key == decode_row.key == "fe.fp8_projection_decode", "up to 32 rows both plans have the in-projection on its entry"
+    assert (
+        "At 16 sequences of three, four and five tokens -- 48, 64 and 80 rows -- every greedy token was the decode steps' as well, and the kept state "
+        "was printed, not gated: from 33 rows of a step the in-projection is a multiply over a copy in the verify session and its entry in the decode "
+        "session of 16 sequences, so the linear-attention layer was fed other rows" in section
+    )
     # the out-projection of a verify step, as the family README states it: the two-line table of a plan, the row ranges with the
     # launch the entry states for each, the form of the first range, and what a load keeps -- each computed elsewhere in this
     # module or in the census module's loader test, and held here to the text

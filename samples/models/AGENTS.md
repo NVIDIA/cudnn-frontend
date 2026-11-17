@@ -734,5 +734,9 @@ per sequence alone). What building it showed:
 - Two sessions of one load that serve a block with two kernels are not byte-equal behind it. Up to the last row
   count of the entry's rows the verify session rounds the out-projection once and the decode session twice: their
   logits differ by a bf16 unit and an attention layer behind caches other bytes, printed and not gated. From the
-  first row count on the fallback row both multiply over a copy and the bytes meet again. Run both sides of that
-  boundary, and say which lines of the comparison are reported there.
+  first row count on the fallback row both multiply over a copy: the bytes met again at three and four sequences
+  and stayed within half a bf16 unit at nine and 16 sequences of two tokens (a library multiply is another kernel at
+  another row count). Run both sides of that boundary, and say which lines of the comparison are reported there.
+  And state a comparison for the step shapes where it gated: a sentence that begins "at every step shape that ran"
+  is read as a gate on all of them, also on those whose line was `REPORTED`. The memory sentence likewise: "within a
+  tenth of a GiB" is a statement about every run, and one step shape reserved half a GiB less than it asked for.

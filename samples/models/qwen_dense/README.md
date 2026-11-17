@@ -895,17 +895,22 @@ rows -- a block in front of it is another kernel at another row count -- is prin
 the line is `REPORTED`.
 
 On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded model: at every step shape that ran
--- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was the decode steps', and the
-recurrent state of the kept tokens was within the band (at one sequence the same bytes); the kernel check passed with
-the verify kernel in the shape its entry states and, at one sequence of six tokens, with 13 launches of a step in the
-shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results).
+up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was the decode
+steps', and the recurrent state of the kept tokens was within the band (at one sequence the same bytes); the kernel
+check passed with the verify kernel in the shape its entry states and, at one sequence of six tokens, with 13
+launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries
+with byte-equal results).
 Up to 16 rows the verify session runs the out-projection of the linear-attention layer on its kernel and the decode
 session on a multiply over a copy, which rounds its unscaled sum and the scaled result where the kernel rounds once:
 there the logits of the two runs were one bf16 unit apart at most, inside the family's band of 4, and the keys and
 values an attention layer cached were not the same bytes -- printed, not gated, because the layer was fed other rows.
 From 17 rows both sessions multiply over a copy: at three sequences of six tokens and at four of six, seven and eight
 the logits and the caches were the same bytes again, and at nine and 16 sequences of two tokens the logits were within
-half a unit (a multiply over a copy is another library kernel at another row count). The entry was inside the band of the reference multiply at the first and the last row count of both ranges --
+half a unit (a multiply over a copy is another library kernel at another row count). At 16 sequences of three, four
+and five tokens -- 48, 64 and 80 rows -- every greedy token was the decode steps' as well, and the kept state was
+printed, not gated: from 33 rows of a step the in-projection is a multiply over a copy in the verify session and its
+entry in the decode session of 16 sequences, so the linear-attention layer was fed other rows. The entry was inside
+the band of the reference multiply at the first and the last row count of both ranges --
 one sequence of two tokens and of eight, three of three, two of eight -- with one bf16 unit on fewer than 0.05 % of
 the elements, and each sequence alone wrote the bytes it wrote among the others. At two and three sequences, on a
 part of this SM count, the verify entry takes another form than at one sequence and at four: one thread block per
@@ -914,10 +919,13 @@ eight, the largest step that form holds. These are the runs of one GPU class.
 
 **Memory.** The memory sentence of a verify plan counts the state of its step shape -- a recurrent state per
 (sequence, token), `T + 2` history columns per sequence -- beside the flat working memory of every plan of the
-reduced models. Up to 32 rows of a step PyTorch reserved within 0.1 GiB of it: one sequence of six tokens, with the
-decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; the verify
-session alone, which keeps the out-projection of the linear-attention layer on its codes without a copy, asked for
-about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB. Beyond that the sentence is short, as it is
+reduced models. Up to 32 rows of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence
+said: one sequence of six tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB
+and grew the device by 3.8 GiB; the verify session alone, which keeps the out-projection of the linear-attention
+layer on its codes without a copy, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; three
+sequences of three tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.1 GiB and
+grew the device by 3.3 GiB -- half a GiB below its sentence, in each of its runs; every other step shape up to 32
+rows reserved 3.6 GiB. Beyond 32 rows the sentence is short, as it is
 for a decode plan beyond 33 sequences (the section "Support per GPU class"): 16 sequences of three, four and five
 tokens -- 48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB and grew the
 device by 4.5, 5.8 and 7.1 GiB. A GPU whose free memory is what the sentence says passes the plan of such a run and

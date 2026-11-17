@@ -1276,7 +1276,7 @@ def _stand_ins(
         def _symbol(self):
             return TARGET_SYMBOL if dict(self.row.form).get("PDL") else SYMBOL
 
-        def launch_facts(self, rows):
+        def launch_facts(self, rows, site=""):
             return Facts((self._symbol(),), dict(self.row.form), ((96, rows, 1), (256, 1, 1), 42112))
 
         def serving(self):  # what the stand-in's own entry instance states
@@ -1294,7 +1294,7 @@ def _stand_ins(
         provider = "cuDNN FE"
         kernels = (Kernel("gdn_verify_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)
 
-        def launch_facts(self, rows):
+        def launch_facts(self, rows, site=""):
             return Facts((VERIFY_SYMBOL,), dict(self.row.form), VERIFY_SHAPE)
 
         def serving(self):
@@ -1315,7 +1315,7 @@ def _stand_ins(
         def _shape(self, rows):  # one shape, or -- for a run of several row counts -- the shape of a row count
             return gate_shape(rows) if callable(gate_shape) else gate_shape
 
-        def launch_facts(self, rows):
+        def launch_facts(self, rows, site=""):
             return Facts((GATE_SYMBOL,), dict(self.row.form), self._shape(rows))
 
         def serving(self):
@@ -1499,7 +1499,7 @@ def _stand_ins(
         def _shape(self):
             return swiglu_shape or SWIGLU_SHAPE
 
-        def launch_facts(self, rows):
+        def launch_facts(self, rows, site=""):
             return Facts((_swiglu_symbol(dict(self.row.form)),), dict(self.row.form), self._shape())
 
         def serving(self):  # what the stand-in's own entry instance states
