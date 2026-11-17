@@ -816,9 +816,10 @@ def _copy_unit(sm, k, cq, r, trow, is_l0, rz):
     _tc_fence_before()
     cute.arch.sync_warp()
     _mbar_arrive_if(is_l0, _a(sm, "q_ready"))
-    # Rule 11: the staging buffer is refilled (TMA / bulk) after st_empty; the arrive's address is computed from every word
-    # this lane loaded from it
-    consume_then_arrive(_mbar_ptr(_a(sm, "st_empty")), (w, st_v, dl_v), rz, pred=(is_l0 != Uint32(0)))
+    # Rule 11: the staging buffer is refilled (TMA / bulk) after st_empty. Every lane arrives with an address computed from
+    # every word it loaded from the stage, so each lane's own reads are released before the refill (an elected arrive
+    # after sync_warp leaves lanes 1-31 without a release of their own: a Compute Sanitizer racecheck WAR hazard).
+    consume_then_arrive(_mbar_ptr(_a(sm, "st_empty")), (w, st_v, dl_v), rz)
     return st_v, dl_v
 
 
@@ -870,7 +871,8 @@ def dq_kernel(
         prims.mbarrier_init(_mbar_ptr(_a(sm, "done")), 1)
         prims.mbarrier_init(_mbar_ptr(_a(sm, "dq_free")), _G.NSMX_B)
         prims.mbarrier_init(_mbar_ptr(_a(sm, "st_full")), 1)
-        prims.mbarrier_init(_mbar_ptr(_a(sm, "st_empty")), _G.NSMX_B + 1)  # softmax warps (Q / dO / rows read) + the MMA warp's sf copy commit
+        # every lane of the softmax warps (Q / dO / rows read) + the MMA warp's sf copy commit
+        prims.mbarrier_init(_mbar_ptr(_a(sm, "st_empty")), _G.NSMX_B * 32 + 1)
         prims.mbarrier_init(_mbar_ptr(_a(sm, "q_ready")), _G.NSMX_B)
         prims.mbarrier_init(_mbar_ptr(_a(sm, "dq_staged")), _G.NSMX_B)  # softmax warps: unit's bf16 dQ tile written into the staging buffer
         for i in cutlass.range_constexpr(2):

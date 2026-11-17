@@ -6,7 +6,7 @@
     CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 python benchmark/attention_training/benchmark_mxfp8_bwd_sm100_d128.py \\
         --s 2048 4096 8192 16384 --b 1 --hq 88 --hkv 8 --check --check-tol 0.01
 
-Engines are pinned by plan name. The SM100 engine uses a BSHD copy; other
+Engines are pinned by plan name. The ``sdpa_bwd_sm100_mxfp8_pair`` engine uses a BSHD copy; other
 engines use BHSD. Timing reports the median of interleaved single-call CUDA
 graph replays, each after a 512 MiB L2 flush and a 0.2 s idle gap. CUDA events
 measure the entire chain, including PDL overlap.
@@ -204,7 +204,7 @@ def main():
     ap.add_argument("--hq", type=int, default=88)
     ap.add_argument("--hkv", type=int, default=8)
     ap.add_argument("--scale", type=float, default=None, help="attn_scale (default 1/sqrt(128))")
-    ap.add_argument("--engines", nargs="+", default=["backend", "sdpa_bwd_sm100_d128_mxfp8", "sdpa_bwd_sm100_mxfp8"])
+    ap.add_argument("--engines", nargs="+", default=["backend", "sdpa_bwd_sm100_d128_mxfp8", "sdpa_bwd_sm100_mxfp8_pair"])
     ap.add_argument("--reps", type=int, default=7, help="timed cold calls per engine (median)")
     ap.add_argument("--amax", action="store_true", help="request amax_dQ / dK / dV (engines that cannot are reported as skipped)")
     ap.add_argument("--deterministic", action="store_true", help="request use_deterministic_algorithm (batch-invariant plans)")
@@ -227,7 +227,7 @@ def main():
         inputs = make_inputs(args.b, args.hq, args.hkv, s, scale, causal=args.causal)
         runs, skipped = [], {}
         for e in args.engines:
-            layout = "bshd" if e == "sdpa_bwd_sm100_mxfp8" else "bhsd"
+            layout = "bshd" if e == "sdpa_bwd_sm100_mxfp8_pair" else "bhsd"
             try:
                 runs.append(build(e, args.b, args.hq, args.hkv, s, scale, inputs, layout, amax=args.amax, deterministic=args.deterministic, causal=args.causal))
             except Exception as ex:  # noqa: BLE001 -- report and keep benchmarking the rest
