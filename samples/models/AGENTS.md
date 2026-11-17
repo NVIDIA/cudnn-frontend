@@ -72,7 +72,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
    every sequence count before the first load, never at run time, and a block that finds its form missing is an
    error that names it. The reference blocks of the checks read copies: where the load kept none the checks make
    theirs for one call at a time (`weights.OnDemand`), the memory sentence states that part, and the checks print
-   what the copies cost. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   what the copies cost. Such a copy is made from the bytes the weight's own block multiplies on, so it is a
+   reference only while those are the bytes of the load: the loader takes a checksum of every weight it keeps on its
+   stored format alone and the checks compare it before their first pass and after their last (`stored weights`: a
+   weight that was written to fails the run by block and layer). An adapter never writes into its weight. Only the
+   reference session of the checks makes copies per call; any other session is refused the maker. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -521,8 +525,29 @@ Each of these passed every test and every GPU run of the first version.
   sequence count on a fallback row, or a row selected away, keeps the copy; nothing is decided at run time.
 - The reference of the checks is a reader too, and the one reader that may come without its form. It gets a bf16
   copy for one call, made by the session of the reference and by the tap of the checked pass -- never inside a
-  block, whose call neither reads the device nor synchronises. Such a copy is bit for bit the copy a load keeps, and
-  a host test loads the same plan both ways and compares every check line.
+  block, whose call neither reads the device nor synchronises. Such a copy is bit for bit the copy a load keeps as
+  long as no block has written into its weight, and a host test loads the same plan both ways and compares every
+  check line.
+- A reference made from the provider's own operand is no reference until that operand is held still. With the copy
+  gone, the reference's copy of a weight is made from the bytes its block multiplies on: a stand-in that zeroed half
+  of its weight from its first call on passed replay, every block line (distance 0.00), the tokens and the kernel
+  check, where the same stand-in in a run that kept its copies was 255 units off on half of its elements. The loader
+  now takes a checksum of every weight it keeps on its stored format alone, the checks take it again before their
+  first pass and after their last, and a changed weight fails the run by name. When a change takes an independent
+  operand away from a check, give the check a way to see that the shared one has not moved -- and test the defect in
+  both forms of the run.
+- What a memory sentence rests on is tested on the thing itself. "One copy at a time" was held by one run's peak; a
+  defect that kept every copy alive passed every host module, and a two-layer run would have held 34 GiB more
+  without a failure. A host test now holds weak references to the copies' tensors (none of an earlier call alive
+  when the next is made, none when the checks return), and the GPU cell holds PyTorch's peak below the sentence.
+- An option that exists for one caller is refused for every other. The maker of copies was a public parameter of
+  every session; on a checked session it put a cast and two synchronisations in front of blocks of its timed and
+  traced steps, and the run passed. It is refused when the session is built, and such a session is not traced.
+- On the reduced models the memory sentence is an estimate that runs miss by a few tenths of a GiB in either
+  direction (a flat 2 GiB of working memory), with and without their copies; leaving copies out neither widened nor
+  narrowed that in a way the runs agree on (2.3 GiB of room with the in-projections of four layers on their codes
+  alone, 1.7 GiB with every multiplied weight of two layers). State such a sentence with the runs beside it, and do
+  not fit a term to one run.
 - The memory a run takes beyond its weights does not shrink with the copies it leaves out. Without the 9.7 GiB of
   in-projection copies the device grew by 10 GiB less, but the room beyond the weights held stayed where the stored
   tensors had put it: 6.6 GiB, against 6.9 GiB with the codes beside every copy and 5.3 GiB with copies alone. The
