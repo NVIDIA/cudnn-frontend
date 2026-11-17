@@ -7628,3 +7628,46 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+
+### Shared backward delta: native SM120 memory qualification — 2026-11-17
+
+The unchanged shared-helper source at `54b464d2bd233db1535caec4628fae6decf9456f`
+was run on an actual RTX 5080 (SM120, 84 SMs, 16-GB device), with Torch
+2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 and its CUDA 13.4 compiler.
+The frozen checkout and every runtime dependency were hash-checked; imports
+resolved to that checkout. No unrelated memory reservation simulated a smaller
+GPU. Each pytest worker had a 2-GiB Torch allocator limit.
+
+- Four workers: **49 passed, 1 skipped**, including all **30 native** delta
+  cases, five stride controls and the host/compiler suite. The only skip is
+  the existing SM80-FP8 compiler case; no native SM120 case skipped.
+- Four synchronized replicas of the largest THD rebind case: **4 passed**.
+  All four workers reached the live-storage barrier while retaining their
+  old and fresh inputs.
+- A separate process with recording disabled and strict golden checking:
+  **6 passed, 0 skipped**. Five small golden records cover dense FP16/BF16/FP8
+  and THD FP16/BF16; the sixth case is the small accumulator control.
+
+The sampled device-memory increments were 8.54 GiB for the four-worker
+suite and 9.26 GiB for synchronized replicas. Maximum measured per-worker
+Torch allocation/reservation was 1.880/1.916 GiB. These samples do not establish
+an instantaneous device peak. The run completed normally. An earlier runner
+attempt stopped before pytest because two helper plugins were not staged;
+that failure is retained separately and contributes no qualification.
+
+The five records under `45e8f430a9d818a2/` were recorded only after reference,
+replay and batch checks, then compared strictly in the separate process.
+Their input/output records also match the existing runtime-specific records
+where present. Only the runtime fingerprint differs. Re-run the strict small
+selection on the matching environment with:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest sdpa/frost/test_sdpa_bwd_dot_grid_determinism.py -m L0 -k small -q
+```
+
+This closes the native SM120 qualification gap for these direct-helper cases.
+It does not qualify full attention chains at the launch boundary, native
+SM103/SM107 boundary cases, or a new public API support row. Current-head
+review and integration CI remain separate from this bounded packet.
