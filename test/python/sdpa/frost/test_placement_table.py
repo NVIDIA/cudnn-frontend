@@ -181,6 +181,8 @@ def test_cc103_borrows_only_the_studies_its_transfer_check_named(monkeypatch):
         dict(d_qk=512, d_v=512, b=8, s_kv=65536, page_size=64, padded=True),  # paged d512 decode
         dict(d_qk=576, d_v=512, has_paged_kv=False, b=1, h_q=96, s_kv=131072),  # dense D576 decode
         dict(d_qk=256, d_v=256, h_q=32, h_kv=2, s_q=2048, s_kv=65536, causal=True, bottom_right=True),  # paged d256 context
+        # FlashInfer's paged d64 short-Q prefill (llama3.2-1b, unsplit), study b300_d64_transfer_20261117
+        dict(d_qk=64, d_v=64, h_q=32, h_kv=8, b=4, s_q=128, s_kv=8192, causal=True, bottom_right=True, thd=True, page_size=16, padded=True),
     )
     for kw in cases:
         on_100, on_103 = pt.lookup(row, _facts(**kw)), pt.lookup(row, _facts(device_cc=(10, 3), **kw))
@@ -722,9 +724,8 @@ def _sm100_paged(d, h_q, h_kv, b, s_q, s_kv, **over):
 def test_sm100_paged_packed_split_classes_follow_their_study():
     """The SM100 row's packed split is its own group (``gqa_split``) and, at D64, one Q tile per request its own phase
     (``prefill_short_q``): study sm100_paged_d64_d256_prefill_20261111 leads the split and short-Q D64 graphs, keeps the backend
-    for a long-Q D64 graph over a long cache, and leaves D256 unsplit graphs to sm100_d256_paged_context_20261030. cc 10.3 does
-    not borrow the new study (its B300 holdout did not qualify the transfer): the split still leads there through the row's
-    hand rule, and the unsplit D64 graphs keep the backend."""
+    for a long-Q D64 graph over a long cache, and leaves D256 unsplit graphs to sm100_d256_paged_context_20261030. cc 10.3 borrows
+    the study after its own B300 transfer check (b300_d64_transfer_20261117), so the unsplit short-Q D64 graphs lead there too."""
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -748,8 +749,9 @@ def test_sm100_paged_packed_split_classes_follow_their_study():
     b300 = dict(device_cc=(10, 3))
     for d, h_q, s_q in ((64, 32, 64), (256, 16, 128)):
         facts = _sm100_paged(d, h_q, 8, 1, s_q, 32768, **b300)
-        assert pt.lookup(row, facts) is None and placement.place(spec, facts) == placement.LEAD
-    assert pt.lookup(row, _sm100_paged(64, 16, 8, 16, 64, 16384, **b300)) is None
+        assert pt.lookup(row, facts) is True and placement.place(spec, facts) == placement.LEAD
+    assert pt.lookup(row, _sm100_paged(64, 16, 8, 16, 64, 16384, **b300)) is True
+    assert pt.matched_entry(row, _sm100_paged(64, 16, 8, 16, 64, 16384, **b300)).study == study
     assert pt.matched_entry(row, _sm100_paged(256, 32, 8, 16, 512, 8192, **b300)).study == "sm100_d256_paged_context_20261030"
 
 

@@ -271,6 +271,11 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # sm100_d576_decode_v3_924_20261116 (D576 paged s_q 1 on the tile): a 20-cell check missed the regret bound (1.040, worst 1.339;
     # every changed verdict still beat v2, 0.751), so the class was studied on cc 10.3 itself (B300, 103 train cells): its own fit is
     # the same threshold, cost 25.503, and a fresh 20-cell cc 10.3 holdout scores 1.000 vs v2's 1.058, no cell slower.
+    # sm100_paged_d64_d256_prefill_20261111 after its own check (study b300_d64_transfer_20261117: B300 SXM6 AC 1100 W, cuDNN
+    # 9.24.0.43, FE 9bdf9a8ab; 76 of its d64 train cells + its 45 off-lattice d64 holdout cells through FlashInfer's paged path):
+    # regret 1.020 vs today's cc 10.3 default 1.155; the 31 changed verdicts run 0.614 (worst 0.928). Unsplit short-Q d64 (the
+    # GB300 nightly's 3-4x serving-prefill loss) goes 3.39 -> 1.00 on the tile. Its d256 entries are the split classes, which
+    # cc 10.3 already led through the split rule.
     (10, 3): (
         (10, 0),
         frozenset(
@@ -282,6 +287,7 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
                 "sm100_d256_paged_context_20261030",
                 "sm100_d576_dense_decode_rt924_20261030",
                 "sm100_d576_decode_v3_924_20261116",
+                "sm100_paged_d64_d256_prefill_20261111",
             }
         ),
     ),
