@@ -419,6 +419,35 @@ def test_sm80_sm90_decode_shaped_gqa_follows_the_decode_studies(row, cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
+def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
+    """Study sm80_paged_wide_verify_20261117 (A100): paged speculative decode with wide heads leads -- D576 x V512 and d512 at
+    s_q 5-16, d192 x V128 at s_q 2-16 (FROST 0.13-0.20 of the backend). d512 at s_q <= 4, windowed graphs and f16 are other
+    studies' or the hand rules'."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def spec(**over):
+        base = dict(b=1, h_q=16, h_kv=1, s_q=8, s_kv=s_kv, d_qk=576, d_v=512, causal=True, bottom_right=True)
+        base.update(device_cc=(8, 0), page_size=64, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for over in (
+        dict(),
+        dict(h_q=128),
+        dict(d_qk=512, d_v=512, h_q=16, h_kv=2, s_q=5),
+        dict(d_qk=192, d_v=128, h_q=64, h_kv=4, s_q=2),
+        dict(d_qk=192, d_v=128, h_q=64, h_kv=4, s_q=16, b=64),
+    ):
+        assert pt.class_key(row, spec(**over))[4] in ("mtp", "verify"), over
+        assert pt.lookup(row, spec(**over)) is True, over
+        assert pt.matched_entry(row, spec(**over)).study == "sm80_paged_wide_verify_20261117", over
+    other = pt.matched_entry(row, spec(d_qk=512, d_v=512, s_q=4))  # d512 MTP: not this study's class
+    assert other is None or other.study != "sm80_paged_wide_verify_20261117"
+    assert pt.lookup(row, spec(dtype=cudnn.data_type.HALF)) is None
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("window_left", [None, 128], ids=["causal", "window"])
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):

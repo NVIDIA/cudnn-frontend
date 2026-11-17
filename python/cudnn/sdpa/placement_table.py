@@ -839,6 +839,34 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "dense", "causal_br", True, "gqa", True): Entry("ge", 3.5, "sm80_decode_20261112", "tiles"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", False): Entry("always", None, "sm80_decode_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", True): Entry("always", None, "sm80_decode_20261112"),
+    # study sm80_paged_wide_verify_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 688f00136; paged speculative decode with wide heads: D576 x V512 and
+    # d512 at s_q 5-16, d192 x V128 at s_q 2-16; groups 1-128, b 1-64, KV 8k / 128k on and off the tile; 960 train cells, a 100-cell
+    # holdout over other head pairs scored once). FROST runs 0.13-0.20 of the backend; the a100 nightly (run-557) ran these on the
+    # backend at 10-53x (kimi_k2 / deepseek_v3 verify, gemma4 global, MiMo-V2).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_paged_wide_verify_20261117"
+    ),
     # study sm80_paged_mtp_sink_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 9bdf9a8ab; the same generation graph, paged page 16,
     # d64 with a sink, full and 128-key window, s_q 2-4, b 1-128, KV 4k-128k; 280 train cells, a 60-cell seeded holdout scored once:
     # the four classes moved 47 cells at 0.29-0.41 geomean, worst 1.07). The a100 nightly (run-547) had gpt-oss paged MTP at 3.9-8.4x.
