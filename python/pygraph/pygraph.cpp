@@ -808,6 +808,22 @@ PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
     return;
 }
 
+py::dict
+PyGraph::get_variant_pack_scalar_defaults() {
+    py::dict result;
+    for (auto const& [uid, scalar] : graph->get_variant_pack_scalar_defaults()) {
+        std::visit(
+            [&](auto const& value) {
+                using T            = std::decay_t<decltype(value)>;
+                constexpr int code = std::is_integral_v<T> ? 0 : (std::is_same_v<T, nv_bfloat16> ? 4 : 2);
+                result[py::int_(uid)] =
+                    py::make_tuple(code, sizeof(T) * 8, py::bytes(reinterpret_cast<char const*>(&value), sizeof(T)));
+            },
+            scalar);
+    }
+    return result;
+}
+
 void
 PyGraph::prepare_variant_pack_template() {
     auto status = graph->prepare_variant_pack_template();
@@ -1557,6 +1573,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("workspace_bytes")  = std::nullopt)
         .def("_prepare_variant_pack_template", &PyGraph::prepare_variant_pack_template)
         .def("_get_variant_pack_uids_sorted", &PyGraph::get_variant_pack_uids_sorted)
+        .def("_get_variant_pack_scalar_defaults", &PyGraph::get_variant_pack_scalar_defaults)
         .def("_execute_with_raw_ptrs",
              &PyGraph::execute_with_raw_ptrs,
              py::arg("user_ptrs_array"),

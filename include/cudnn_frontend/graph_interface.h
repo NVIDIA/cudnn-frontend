@@ -1802,12 +1802,13 @@ class Graph : public ICudnn, public INode {
         std::vector<void *> heap_ptrs;
         void **user_ptrs = (n_user <= STACK_MAX) ? stack_ptrs : (heap_ptrs.resize(n_user), heap_ptrs.data());
         for (int i = 0; i < n_user; i++) {
-            int64_t uid = varpack_template.all_uids[varpack_template.user_slots[i]];
-            auto it     = tensor_uid_to_pointer_map.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(it == tensor_uid_to_pointer_map.end(),
+            int64_t uid       = varpack_template.all_uids[varpack_template.user_slots[i]];
+            auto it           = tensor_uid_to_pointer_map.find(uid);
+            void *default_ptr = varpack_template.template_ptrs[varpack_template.user_slots[i]];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(it == tensor_uid_to_pointer_map.end() && default_ptr == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " not found in variant pack.");
-            user_ptrs[i] = it->second;
+            user_ptrs[i] = it == tensor_uid_to_pointer_map.end() ? default_ptr : it->second;
         }
         return execute_ordered_impl(handle,
                                     user_ptrs,
@@ -2931,7 +2932,8 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        // 5. Identify user-fillable slots: nullptr entries that are NOT workspace/replacement targets
+        // 5. Runtime PBV defaults remain user-fillable: an explicit binding takes
+        // precedence over the graph's value. Workspace/replacement targets are internal.
         std::unordered_set<int64_t> workspace_uids;
         for (auto const &[uid, data] : cached_workspace_modifications) {
             workspace_uids.insert(uid);
@@ -2943,11 +2945,16 @@ class Graph : public ICudnn, public INode {
         }
         for (int i = 0; i < (int)t.template_ptrs.size(); i++) {
             int64_t uid = t.all_uids[i];
-            if (t.template_ptrs[i] == nullptr && workspace_uids.find(uid) == workspace_uids.end() &&
+            if (workspace_uids.find(uid) == workspace_uids.end() &&
                 replacement_dst_uids.find(uid) == replacement_dst_uids.end()) {
                 t.user_slots.push_back(i);
             }
         }
+
+        // Known PBV values may have appended slots outside the original sorted
+        // variant-pack UIDs. Every caller-facing binding order must stay sorted.
+        std::sort(
+            t.user_slots.begin(), t.user_slots.end(), [&](int a, int b) { return t.all_uids[a] < t.all_uids[b]; });
 
         // A legacy Slice destination is checked too: its pointer is the source pointer plus the slice offset.
         for (int slot = 0; slot < (int)t.all_uids.size(); slot++) {
@@ -3012,6 +3019,11 @@ class Graph : public ICudnn, public INode {
             }
             return -1;
         });
+    }
+
+    std::unordered_map<uid_t, pass_by_values_t> const &
+    get_variant_pack_scalar_defaults() const {
+        return cached_pass_by_value;
     }
 
     std::vector<int64_t>
