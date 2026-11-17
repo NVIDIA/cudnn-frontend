@@ -160,6 +160,14 @@ Selected helper routines in the block-sparse attention CuTe DSL utilities
 quack-kernels 0.4.1 and maintained locally. Those files retain the
 'QuACK team' copyright notice in their headers.
 
+Selected helper routines of the MoE dispatch, MLP and combine CuTe DSL
+kernels (python/cudnn/moe_ep/_cutemok/cutedsl/_compat/) are adapted
+from quack-kernels 0.5.0 and maintained locally. Those files retain their
+original copyright notices in their headers (Tri Dao; Wentao Guo, Tri Dao;
+Wentao Guo, Ted Zadouri, Tri Dao; Vijay Thakkar, Tri Dao; QuACK team).
+gemm_sm100.py there notes in its header, as QuACK's GEMM module does, that it
+is based on the CUTLASS CuTe DSL examples (entry 3).
+
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 
 -------------------------------------------------------------------------------
@@ -394,5 +402,26 @@ FlashInfer's NOTICE:
     FlashInfer
     Copyright 2025-2026 NVIDIA
     Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+13. Mixture-of-Kittens (cursor/mixture-of-kittens)
+    https://github.com/cursor/mixture-of-kittens
+
+The MoE dispatch, expert MLP and combine operator under
+python/cudnn/moe_ep/cutemok.py and
+python/cudnn/moe_ep/_cutemok/ is derived from Mixture-of-Kittens at
+commit 22fc95ae (22fc95ae6e331a738c4a58a227a8b03cac586e12). The CuTe DSL
+kernels and hosts under python/cudnn/moe_ep/_cutemok/cutedsl/ are
+ports of its CUDA megakernels and scheduler; the layer interface
+(cutemok.py, functional.py, ops.py) and parts of the tests under
+test/python/moe_ep/cutemok/ derive from its Python package and
+tests. Those files retain the 'Copyright 2026 Cursor Research' notice in their
+headers, followed by NVIDIA's copyright where NVIDIA modified them; files
+added by NVIDIA carry NVIDIA's copyright only.
+The port contains no code from Mixture-of-Kittens' ThunderKittens dependency.
+
+Copyright 2026 Cursor Research
 
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
