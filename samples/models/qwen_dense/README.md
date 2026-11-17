@@ -435,8 +435,8 @@ with open("draft_vocab.json", "w") as f:
     json.dump(sorted(listed), f)
 ```
 
-**The run behind this section** (2026-11-17, on the CPU, no GPU; PyTorch 2.13.0, safetensors 0.8.0; the published
-checkpoint, manifest hash `95049016a247`):
+**The runs behind this section** (2026-11-17; PyTorch 2.13.0, safetensors 0.8.0; the published checkpoint, manifest
+hash `95049016a247`). On the CPU, without a GPU:
 
 - the recipe, on six `--dump-tokens` files that runs of this sample with the checkpoint wrote (three prompts,
   2026-11-12, compute capability 10.0): they hold 2,341 tokens and 342 distinct ids; the list is those 342 and the
@@ -452,11 +452,15 @@ checkpoint, manifest hash `95049016a247`):
   midpoint of two codes, and each has the even code; a multiplication by the reciprocal of the scale would have given
   another code on 207,130 elements.
 
+And the same load on a GPU of compute capability 10.0 (a 148-SM part): every byte of the five 8-bit weights, of the
+norm weights and of the head rows equals the byte the CPU made, and every scale is the same bit for bit.
+
 **What is not here.** No draft step and no speculative decoding: nothing runs the loaded drafter, so nothing compares
 its output with anything, and no kernel has read these 8-bit weights. No script takes the list; `--draft-vocab FILE`
-will be a flag of the speculative-decoding script, not of `00_decode.py`. No statement about a GPU: the loader has run
-on the CPU only. And the 8-bit weights are held to the rule above, not to the weights another implementation makes of
-the same checkpoint: no such comparison is part of this repository.
+will be a flag of the speculative-decoding script, not of `00_decode.py`. The loader has run on the CPU and on one GPU
+class, compute capability 10.0; a class it has not run on is uncovered, not passing. And the 8-bit weights are held to
+the rule above, not to the weights another implementation makes of the same checkpoint: no such comparison is part of
+this repository.
 
 ## Who serves each block (stack `fe-cublas`)
 
