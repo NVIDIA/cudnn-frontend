@@ -617,3 +617,30 @@ Each of these passed every test and every GPU run of the first version.
 - A count pinned in a test moves with the table. The split rule of the READMEs carried the old numbers in its own
   pattern (`= 49 + 209`), so the rule would have passed a README that kept them. A test that names numbers of the
   table is derived from the plan where it can be, and where it cannot, it is on the list of what a new row changes.
+
+## What the review of the gate / up row taught
+
+Each of these passed every host test, every one-line defect and every GPU run of the first version; a host test now
+holds each.
+
+- An interval has two ends, and a test of one of them holds one. The block-scale rule of the band was tested one
+  binade up, one binade down and at a lone byte above a zero block; the case one binade down failed through the code
+  rule, so with the lower end taken out every test stayed green -- and the lower end is the one rule of the band that
+  fails buffers nobody wrote: under a zero scale every code reads as zero, and a code's bound admits the whole value
+  below a scale that is too small. Buffers of zeros are a test of their own, and so is the byte just below the lower
+  end with the codes of its block written under it. Ask of every rule which wrong output it alone would catch, and
+  write that output.
+- "The operands this adapter built" is a sentence about operands. The first use of this entry hands its build a
+  row count and nothing else, and the page of the entry names a requirement no public probe answers (the names its
+  kernel is written on). A decline by that requirement ended in an `ERROR` that blamed the adapter for operands it
+  had not built, where rule 1 asks for the entry's own sentence as a `SKIP`. Where an adapter hands a build nothing
+  of its own, it has nothing to be blamed for there: hold what it does hand over (the row count) in front of the
+  build, and let the entry speak.
+- A question asked inside an error path must not raise. The adapter read the compiler of the installed CuTe DSL to
+  word a decline; a DSL that does not report one turned the entry's decline into an import error from inside the
+  handler. The entry itself declines nothing on a value it could not read, and neither does its adapter.
+- "Two of X are refused" is tested with X and with what stands beside X. Two providers' layouts of one weight were
+  refused before the load; a provider's layout beside the checkpoint's row order -- a block that multiplies on the
+  stored tensor as it is -- was not, and ended after the read in the sentence of a session that was not planned
+  with the run, although it was. What a load keeps is one row order per weight, whoever asks for it: every reader of
+  the stored form has an owner in that comparison, and both orders of the two plans are a case each.

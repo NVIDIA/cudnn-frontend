@@ -6346,9 +6346,11 @@ def test_the_gate_ups_twin_and_its_band_on_stated_tensors():
     documented contract, an interval.  The terms of the bound are those of the entry's own suite.  The kernel's chain in
     fp32 -- both products accumulated in fp32 and rounded once to bf16, SiLU x up rounded once more, the block scale of
     that value, the codes under it -- is inside the band, and so are the bytes of the block's reference pair.  Each rule
-    is held on its own: a block scale outside the interval its block's bound admits (above and below), a code farther from
-    the fp64 value than half a code step plus the bound, a scale byte that is no number, other outputs than codes with
-    their scales: each fails the block.  And what the band cannot see is pinned as that: one bf16 unit of the product."""
+    is held on its own: a block scale outside the interval its block's bound admits (above; and below, by buffers that
+    were never written and by the byte just under the lower end, each with every code inside its bound), a code farther
+    from the fp64 value than half a code step plus the bound, a scale byte that is no number, other outputs than codes
+    with their scales: each fails the block.  And what the band cannot see is pinned as that: one bf16 unit of the
+    product."""
     from types import SimpleNamespace
 
     from model_samples import tie_out
@@ -6459,6 +6461,34 @@ def test_the_gate_ups_twin_and_its_band_on_stated_tensors():
     block = scales.clone()
     block[0, 0] ^= 1  # the neighbouring byte: 6 % of the scale, where the bound admits a few tenths of a percent of the block's largest value
     assert not judged((packed, block)).ok, "a block scale of another largest magnitude than the bound admits"
+    # ... the LOWER end of the interval is a rule of its own, and the one rule of the band that fails an output nobody wrote.
+    # Under a zero block scale every code reads as zero, and what a code's bound admits below a scale that is too small is
+    # the whole value (the clip term): buffers of zeros are inside the code rule on every element, and outside by the lower
+    # end alone, in every block
+    stats = judged((torch.zeros_like(packed), torch.zeros_like(scales)))
+    assert not stats.ok and stats.finite and stats.outside == stats.blocks == rows * half // BLOCK, "an output that was never written"
+    assert 0.0 < stats.worst_share < 1.0 and stats.blocks_equal == 0 and stats.line().endswith("; 12 outside their bounds"), "no code is outside its bound"
+    # ... and the place of each end is the byte the bound admits, written out once more from the value and its bound: the
+    # byte below the lower end fails and so does the byte above the upper one, each with the codes of its block those of
+    # the fp64 value under THAT scale (below, the largest of them clipped), so that every code is inside its bound and the
+    # scale rule alone decides
+    global_scale = torch_ref.nvfp4_global_scale(quant.scale, "cpu").double()
+    largest, spread = (t.unflatten(-1, (-1, BLOCK)).amax(-1) for t in (value.abs(), error))
+    low = torch_ref.e4m3_nearest(global_scale * (largest - spread).clamp(min=0) / 6.0 * (1 - 2.0**-21))
+    high = torch_ref.e4m3_nearest(global_scale * (largest + spread) / 6.0 * (1 + 2.0**-21))
+    assert bool(((scales >= low) & (scales <= high)).all()) and bool((low > 0).all()), "the fp32 chain's bytes are inside; every interval has a byte below it"
+    for end, beyond, why in ((low, -1, "one byte below the lower end"), (high, 1, "one byte above the upper end")):
+        at_end = (scales == end).nonzero()
+        assert len(at_end), "the operands have a block whose byte is this end of its interval: that byte is admitted (the chain above passed)"
+        row, col = (int(i) for i in at_end[0])
+        moved = scales.clone()
+        moved[row, col] = int(end[row, col]) + beyond
+        step_there = _e4m3_values(moved, torch.float64)[row, col] / global_scale
+        recoded = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
+        span = slice(col * BLOCK, (col + 1) * BLOCK)
+        recoded[row, span] = _e2m1((value[row, span] / step_there).float(), signed_zero=True)
+        stats = judged((recoded[..., 0::2] | (recoded[..., 1::2] << 4), moved))
+        assert not stats.ok and stats.outside == 1 and stats.worst_share <= 1.0, f"{why}: the scale rule alone, every code inside its bound"
     codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
     at = int((codes[0, :BLOCK] & 0x7).argmax())  # the largest code of the first block
     flipped = codes.clone()
