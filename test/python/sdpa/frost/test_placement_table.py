@@ -928,8 +928,8 @@ def test_sm107_dense_d256_prefill_follows_its_v2_study(s_kv):
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_d576_mla_prefill_follows_its_study(s_kv):
-    """Study sm100_d576_prefill_20261117: absorbed-MLA (576, 512) prefill chunks lead on B200 (dense and paged), B300 (its transfer
-    check) and Rubin (dense); FROST ran 0.09-0.20 of the default backend. Rubin paged has no FROST plan and no entry."""
+    """Study sm100_d576_prefill_20261117: absorbed-MLA (576, 512) dense prefill leads on B200, B300 (its transfer check) and Rubin;
+    FROST ran 0.09-0.20 of the default backend. The paged twin is retired after an edge supplement (a small square at 1.157)."""
     study = "sm100_d576_prefill_20261117"
 
     def chunk(cc, paged, **over):
@@ -938,16 +938,17 @@ def test_d576_mla_prefill_follows_its_study(s_kv):
         base.update(over)
         return _facts(**base)
 
-    for row, cc, layouts in (("sdpa_fwd_prefill_sm100", (10, 0), (False, True)), ("sdpa_fwd_prefill_sm107", (10, 7), (False,))):
+    for row, cc, layouts in (("sdpa_fwd_prefill_sm100", (10, 0), (False,)), ("sdpa_fwd_prefill_sm107", (10, 7), (False,))):
         for paged in layouts:
             for over in (dict(), dict(b=16, h_q=24, s_q=8)):
                 assert pt.class_key(row, chunk(cc, paged, **over))[4] == "prefill"
                 assert pt.lookup(row, chunk(cc, paged, **over)) is True, (row, paged, over)
                 assert pt.matched_entry(row, chunk(cc, paged, **over)).study == study
     assert getattr(pt.matched_entry("sdpa_fwd_prefill_sm107", chunk((10, 7), True)), "study", None) != study
-    for paged in (False, True):
-        assert pt.lookup("sdpa_fwd_prefill_sm100", chunk((10, 3), paged)) is True
-        assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 3), paged)).study == study
+    assert pt.lookup("sdpa_fwd_prefill_sm100", chunk((10, 3), False)) is True
+    assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 3), False)).study == study
+    for cc in ((10, 0), (10, 3)):  # the paged twin is retired (edge_supp_20261117: 1.157 on a small square)
+        assert getattr(pt.matched_entry("sdpa_fwd_prefill_sm100", chunk(cc, True)), "study", None) != study
 
 
 @pytest.mark.L0

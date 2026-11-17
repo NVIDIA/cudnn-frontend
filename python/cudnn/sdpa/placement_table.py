@@ -408,17 +408,12 @@ TABLE: Dict[Tuple, Entry] = {
     # absorbed-MLA (576, 512) MQA prefill chunks, h_q 8-128, b 1-16, S_q 8-2048, KV 4k-128k on and off the tile; dense BSHD and paged
     # THD with an exact total-Q; 320 train cells). FROST's prefill_d512_f16_2x2 leads everywhere: changed train cells 0.137-0.149
     # (worst 0.452); holdout at fresh h_q, scored once, 0.110-0.196 (worst 0.431). Only h_kv 1 was measured. cc 10.3 borrows these
-    # entries (PART_TRANSFERS).
+    # entries (PART_TRANSFERS). Edge supplements at S_q 5-7 and over squares / short caches (edge_supp_20261117) passed the dense twin
+    # (0.29-0.33); the paged twin is retired (1.157 on a b 1 square of 32 off the tile).
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm100_d576_prefill_20261117"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "always", None, "sm100_d576_prefill_20261117"
-    ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "always", None, "sm100_d576_prefill_20261117"
-    ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm100_d576_prefill_20261117"
     ),
     # study sm100_d576_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid on the tile + the same grid off it)
