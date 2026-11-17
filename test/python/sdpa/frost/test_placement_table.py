@@ -693,23 +693,25 @@ def test_sm107_dense_d128_noncausal_mha_follows_its_study():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
-def test_two_condition_entry_leads_only_where_both_hold(s_kv):
-    """``Entry.also``: sm80_dense_d128_gqa_v2_20261117 leads A100 dense d128 GQA causal prefill only with few query rows AND a long
-    cache (few rows over a short cache lost 1.06-1.24x, many rows up to 1.9x)."""
+def test_two_condition_entry_leads_only_where_both_hold():
+    """``Entry.also``: on the KV tile sm80_dense_d128_gqa_v4_split_20261117 leads A100 dense d128 GQA causal prefill only with few
+    launch tiles AND a long cache; off the tile one condition on query rows answers."""
     row = "sdpa_fwd_prefill_sm80"
 
     def f(**over):
-        base = dict(b=1, h_q=8, h_kv=1, s_q=256, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base = dict(b=1, h_q=8, h_kv=1, s_q=256, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True)
         base.update(device_cc=(8, 0), has_paged_kv=False)
         base.update(over)
         return _facts(**base)
 
     entry = pt.matched_entry(row, f())
-    assert entry.study == "sm80_dense_d128_gqa_v2_20261117" and entry.feature == "rows" and entry.also == ("ge", 10.501, "kv")
+    assert entry.study == "sm80_dense_d128_gqa_v4_split_20261117" and entry.feature == "tiles" and entry.also == ("ge", 10.5, "kv")
     assert pt.lookup(row, f()) is True
-    assert pt.lookup(row, f(s_kv=1024 + s_kv % 2)) is False  # few rows, short cache
-    assert pt.lookup(row, f(b=8, h_q=64, h_kv=8, s_q=2048)) is False  # many rows, long cache
+    assert pt.lookup(row, f(s_kv=1024)) is False  # few tiles, short cache
+    assert pt.lookup(row, f(b=8, h_q=64, h_kv=8, s_q=2048)) is False  # many tiles, long cache
+    off = pt.matched_entry(row, f(s_kv=131073))
+    assert off.feature == "rows" and off.also is None
+    assert pt.lookup(row, f(s_kv=1025)) is True  # few rows lead off the tile whatever the cache
 
 
 @pytest.mark.L0
@@ -733,7 +735,7 @@ def test_sm80_dense_chunk_follows_its_study(s_kv):
     mha64 = dict(d_qk=64, d_v=64, h_q=16, h_kv=16)
     assert pt.matched_entry(row, f(**mha64)).study == study
     assert pt.lookup(row, f(**mha64)) is True
-    assert pt.matched_entry(row, f(d_qk=128, d_v=128, h_q=8, h_kv=1)).study == "sm80_dense_d128_gqa_v2_20261117"  # its own re-study
+    assert pt.matched_entry(row, f(d_qk=128, d_v=128, h_q=8, h_kv=1)).study == "sm80_dense_d128_gqa_v4_split_20261117"  # its own re-study
 
 
 @pytest.mark.L0

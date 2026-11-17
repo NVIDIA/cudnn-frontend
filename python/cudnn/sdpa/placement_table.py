@@ -960,15 +960,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm80_d576_prefill_20261117"
     ),
-    # study sm80_dense_d128_gqa_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 22789d800; dense BSHD d128 GQA causal prefill over the
-    # whole range, stratified by query rows in flight; 120 train cells). No single feature orders the class (few rows win over a long
-    # cache, lose over a short one), so one two-condition rule, fit on train after a pre-recorded amendment: lead iff
-    # b * h_q * S_q <= 2^12.79 and KV >= 2^10.5. Holdout at fresh heads, scored once: 0.349 / 0.413 (worst 0.667).
+    # study sm80_dense_d128_gqa_v4_split_20261117 (A100 80GB PCIe 300 W, cuDNN 9.24.0.43, FE 0f8b0426d; dense BSHD d128 GQA causal
+    # prefill, refit on the 252 v3 cells at the SM80 split fix (FROST timed at the split the fixed planner picks)). On the tile: lead
+    # iff launch tiles <= 2^6.453 and KV >= 2^10.5; off it: iff b * h_q * S_q <= 2^13.497. Holdout at 8 fresh head pairs, measured at
+    # 0f8b0426d and scored once: 4 changed at 0.974 (worst 1.041) / 8 changed at 0.916 (worst 1.098). Supersedes v2's
+    # rows <= 2^12.79 and KV >= 2^10.5 (fit on a 275 W board).
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
-        "le", 12.7925, "sm80_dense_d128_gqa_v2_20261117", "rows", ("ge", 10.501, "kv")
+        "le", 6.453, "sm80_dense_d128_gqa_v4_split_20261117", "tiles", ("ge", 10.5, "kv")
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "le", 12.7925, "sm80_dense_d128_gqa_v2_20261117", "rows", ("ge", 10.501, "kv")
+        "le", 13.497, "sm80_dense_d128_gqa_v4_split_20261117", "rows"
     ),
     # study sm80_d576_paged_v3_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE b085f3499; paged THD-Q D576 x 512 MQA causal prefill over the
     # whole range, stratified by launch tiles and cache; 120 train cells). On the tile it replaces sm80_d576_prefill_20261117's floor of
