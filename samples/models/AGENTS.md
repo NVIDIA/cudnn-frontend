@@ -370,3 +370,10 @@ Each of these passed every test and every GPU run of the first version; a host t
 - A block of a README that shows what a run printed is held like a table. The manifest of the published checkpoint is
   rendered in a host test from the code that prints it, at the published widths; the run on the checkpoint then only
   has to show that the checkpoint's own headers give that list.
+- A call that a README shows is a run, and it reads what it reads. The section's own call of the loader read the
+  model's embedding table as well, 2.37 GiB at the published widths, under a manifest whose last line counts 0.57 GiB
+  "besides" that table; nothing said that an argument hands the model's table over. Say under a shown call what it
+  reads beyond the lines it prints. A host test runs the call as it is written and finds the table among what was
+  read, and holds the size in the sentence to the tensor list.
+- A section names a flag when a script has it. The first version named the flag that a script which does not exist
+  is to take for the list. A host test refuses, in that section, a flag that no script of the folder has.
