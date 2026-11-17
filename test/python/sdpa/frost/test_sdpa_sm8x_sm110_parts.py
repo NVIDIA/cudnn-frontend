@@ -202,3 +202,34 @@ def test_d192_thd_backward_requires_the_dsl_target(monkeypatch):
         api.check_support()
     monkeypatch.setattr(buffers, "_cutedsl_has_sm110", lambda: True)
     assert api.check_support() is True
+
+
+def _dense_bwd_api(api_type, *, d_qk, d_v, b=2, h=4, s=512):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    from cudnn.api_base import TensorDesc
+
+    def desc(name, width, dtype=torch.bfloat16):
+        shape = (b, h, s, width)
+        stride = (s * h * width, width, h * width, 1)
+        return TensorDesc(dtype=dtype, shape=shape, stride=stride, stride_order=(3, 1, 2, 0), device=torch.device("cuda"), name=name)
+
+    samples = {f"sample_{role}": desc(role, d_v if role in ("v", "o", "do", "dv") else d_qk) for role in ("q", "k", "v", "o", "do", "dq", "dk", "dv")}
+    samples["sample_stats"] = TensorDesc(
+        dtype=torch.float32, shape=(b, h, s, 1), stride=(h * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=torch.device("cuda"), name="stats"
+    )
+    return api_type(**samples, is_causal=True, scale_softmax=d_qk**-0.5)
+
+
+def test_dense_d192_backward_admits_thor(monkeypatch):
+    from cudnn.frost import device as frost_device
+    from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
+
+    api = _dense_bwd_api(SdpaBwdDslSm100D192, d_qk=192, d_v=128)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm110", lambda: True)
+    monkeypatch.setattr(frost_device, "compute_capability", lambda device: (11, 0))
+    assert api.check_support() is True
+    monkeypatch.setattr(frost_device, "compute_capability", lambda device: (10, 7))
+    with pytest.raises(NotImplementedError, match="SM100-106 or SM110"):
+        api.check_support()
