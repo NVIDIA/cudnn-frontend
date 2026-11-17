@@ -949,6 +949,29 @@ def test_d576_mla_prefill_follows_its_study(s_kv):
         assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 3), paged)).study == study
 
 
+@pytest.mark.L0
+def test_sm120_window_sink_d192_prefill_follows_its_study():
+    """Study sm120_window_sink_prefill_20261117: dense window-128 sink prefill at d192 x 128 (MiMo SWA) leads on few KV-head tiles
+    on the KV tile and from KV 2^15.5 off it; the served MiMo chunks (2^7-2^9 tiles) keep the backend. d64 + sink has no entry."""
+    row = "sdpa_fwd_prefill_sm120"
+    study = "sm120_window_sink_prefill_20261117"
+
+    def chunk(**over):
+        base = dict(b=1, h_q=16, h_kv=1, s_q=1024, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(12, 0))
+        base.update(has_paged_kv=False, padded=False, page_size=0, window_left=127, has_sink=True)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, chunk()).study == study
+    assert pt.lookup(row, chunk()) is False  # MiMo SWA tp8: 2^7 tiles
+    assert pt.lookup(row, chunk(h_q=128, h_kv=8, s_q=512)) is False  # MiMo SWA: 2^9 tiles
+    assert pt.lookup(row, chunk(h_q=16, h_kv=2, s_q=256)) is True  # 2^5 tiles
+    assert pt.lookup(row, chunk(s_kv=16385)) is False  # off the tile, below KV 2^15.5
+    assert pt.lookup(row, chunk(s_kv=131073)) is True
+    assert pt.matched_entry(row, chunk(s_kv=131073)).study == study
+    assert getattr(pt.matched_entry(row, chunk(d_qk=64, d_v=64, h_q=64, h_kv=8)), "study", None) != study
+
+
 def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):
     """FlashInfer's ragged cudnn declaration on cc 10.7: the broad envelope (b 4096, S_q 128 or 65536) or a power-of-two
     bounded class (b <= 4, with its packed-Q capacity), always with execute-time shape overrides."""

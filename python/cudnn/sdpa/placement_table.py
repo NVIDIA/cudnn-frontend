@@ -1207,6 +1207,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm100_d576_prefill_20261117"
     ),
+    # study sm120_window_sink_prefill_20261117 (RTX PRO 6000 Server 600 W, cuDNN 9.24.0.43, FE 6f17f2973; benchmark/attention_inference's
+    # context graph: dense bottom-right window 128 with a sink, d192 x 128 (MiMo SWA) at groups 6-16, b 1-8, S_q 256-4096, squares
+    # and chunks to KV 128k, on and off the tile; 100 train cells). Lead on few KV-head tiles on the tile, and from KV 2^15.5 off it:
+    # changed train cells 0.918 / 0.923; holdout at fresh heads, scored once, 0.934 / 0.961 (worst 1.043). d64 + sink has no
+    # entry (its on-tile rule changed no cell, a vacuous pass).
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
+        "le", 5.5, "sm120_window_sink_prefill_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
+        "ge", 15.5, "sm120_window_sink_prefill_20261117", "kv"
+    ),
     # study sm100_swa_prefill_20261031 (cuDNN 9.29.0.18; B100 850 W, cc 10.0; the sm103 study's grid and seeds: 320 train + 64 random
     # holdout cells; 90 training cells timed while another process held the GPU were re-timed, 32 of them moved > 5%)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry(
