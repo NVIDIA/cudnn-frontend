@@ -157,6 +157,9 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     compute capability 10.0 the FP8 projection entry for the in-projections (one instance per weight shape) inside the
     band of the reference multiply, and on every other class that block on its multiply over a copy; the
     kernel check on every launch of the traced steps; the census line, which claims nothing while a row is a fallback.
+    Where the projection entry serves both sequence counts the run holds the in-projections on their stored codes alone,
+    so the reference of the checks makes its own bf16 copies and the run prints what they cost (``on demand``); on every
+    other class every weight has its copy and no such line is printed.
     In a fresh interpreter: the kernel check reads kernel names from the profiler, which names them wrongly in a process
     that has unloaded a kernel module (the module docstring)."""
     if not torch.cuda.is_available():  # decided here, before a child is started
@@ -190,7 +193,15 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert len(served) == 2 and all(line.count(" x cudnn.Fp8ProjectionDecode #") == 2 for line in served), "one instance per weight shape"
         stated = [line for line in out.splitlines() if line.strip().startswith("projection.fp8.in at ") and "; the entry states " in line]
         assert len(stated) == 4 and all("block (256, 1, 1), shared memory" in line for line in stated), "both shapes, at both sequence counts"
+        made = [line for line in out.splitlines() if line.startswith("  on demand ")]
+        assert len(made) == 2 and all(
+            "weights this run keeps on their stored format alone (projection.fp8.in)" in line for line in made
+        ), "no bf16 copy of the in-projections is held: the reference of the checks made its own, at both sequence counts"
+        assert (
+            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)" in out
+        ), "and the memory sentence says so"
     else:
+        assert "\n  on demand " not in out and " for the checks (" not in out, "every weight has its bf16 copy: nothing is made on demand"
         assert "cudnn.Fp8ProjectionDecode" not in out, "the row claims compute capability 10.0 only"
         assert any(line.split()[:1] == ["projection.fp8.in"] and line.endswith("fallback: bf16 copy of 8-bit weights") for line in out.splitlines())
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]

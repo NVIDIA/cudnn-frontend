@@ -39,11 +39,12 @@ the stored codes of both (``docs/operations/gemm_fusions/fp8_projection_decode.m
 weight shape at one split, and the in-projection of a layer has another shape in each kind of layer: the row names the
 shape per call site, and the adapter holds one entry instance per site.  The row's form is the whole kernel -- the split,
 the weight tile, the ring depth, the tensor-memory columns and their release, the launch knobs -- and the adapter passes
-it as given, so the entry never runs on its own pick.  The weight is the merged codes the loader kept beside the bf16
-copy (``weights.Dequantized.stored``; ``stored_weights`` asks the loader for them), the scale the fp32 product of the
-two static scales as one element on the device, formed on the host once per pair of values, and the output a buffer of
-the call's own.  The kernel accumulates in fp32 in a fixed order and rounds once, as the reference multiply does in its
-own precision: the reference block of the same name is its twin.
+it as given, so the entry never runs on its own pick.  The weight is the merged codes the loader kept for this block
+(``weights.Dequantized.stored``; ``stored_weights`` asks the loader for them, and where no other block of the run reads
+the weight's bf16 copy the loader makes none), the scale the fp32 product of the two static scales as one element on the
+device, formed on the host once per pair of values, and the output a buffer of the call's own.  The kernel accumulates
+in fp32 in a fixed order and rounds once, as the reference multiply does in its own precision: the reference block of
+the same name is its twin.
 
 A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
 An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
@@ -720,7 +721,7 @@ class Fp8ProjectionDecodeBlock(EntryBlock):
     name = "Fp8ProjectionDecode"
     what = "the FP8 projection decode step at these weight shapes"
     kernels = (Kernel("fp8_projection", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
-    stored_weights = True  # the weight is multiplied on its stored 8-bit codes: the loader keeps them beside the bf16 copy
+    stored_weights = True  # the weight is multiplied on its stored 8-bit codes: the loader keeps them for this block
     _scales = None  # (activation scale, weight scale, device) -> the one-element fp32 tensor the kernel reads: built once per pair
     _site = ""  # of the last call
 

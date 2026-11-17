@@ -34,6 +34,15 @@ blocks (``model_samples.census``: the form on the objects, attribution, count, o
 the traced pass kept (``Session.traced``).  Where the profiler's records cannot be had it is neither PASS nor FAIL: the line
 says ``NOT OBSERVED`` with the reason, ``Checks.unobserved`` carries it, and a sample then ends in ``RAN``, never in ``PASS``.
 
+**Where the reference's weights come from.**  The reference blocks multiply bf16 copies of the weights' code values.  A
+run keeps such a copy of every weight that a block of its plans reads as one; a weight that every plan multiplies on its
+stored format has none (``Session.uncopied_weights``).  For those the checks make the copy themselves, for one call
+at a time, and drop it after the call (``weights.OnDemand``): in the teacher-forced pass for the twin's call, and in
+the reference stack's own passes for every call (``Session(on_demand=...)``).  Such a copy is bit for bit the one a
+load would have kept, so no check line depends on which of the two a run has.  What it costs is printed under the
+checks (``on demand``: how many copies, the largest, their bytes in all, the seconds), and the largest one is part of
+the run's memory sentence.  A run that made none prints no such line.
+
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
@@ -107,8 +116,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from . import census
+from .blocks import GIB
 from .loop import Session
 from .sampling import margin
+from .weights import OnDemand
 
 LOGITS_FACTOR = 2.0
 GDN_EQUAL_BYTES = 0.999
@@ -282,10 +293,12 @@ def _smallest(counts: torch.Tensor, total: int, layer: int) -> Tuple[float, str]
 class BlockTap:
     """The hook of a checked pass: runs the provider block, then the reference block and -- with more than one sequence -- the
     provider block on one sequence alone (sequence ``step`` modulo the count), each from the same state, and restores the
-    provider's results before it returns them."""
+    provider's results before it returns them.  The reference block reads a bf16 copy of its weight: where the run keeps
+    none, ``on_demand`` (``weights.OnDemand``) makes it for that one call; the provider block is always handed the run's
+    own weight."""
 
-    def __init__(self, plan, reference):
-        self.plan, self.reference = plan, reference
+    def __init__(self, plan, reference, on_demand=None):
+        self.plan, self.reference, self.on_demand = plan, reference, on_demand
         self.stats: Dict[str, BlockStats] = {}
         self.step = 0  # set by the checked pass before every step
 
@@ -318,7 +331,7 @@ class BlockTap:
         after = self._save(holders)
         if independent:
             self._load(holders, before)
-            ref_out = ref(*operands)
+            ref_out = ref(*(operands if self.on_demand is None else self.on_demand.operands(operands)))  # a copy made now is dropped here
             self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer, ref)
         if alone:
             s = self.step % self.plan.sequences
@@ -514,6 +527,7 @@ class Checks:
     judged: int = 0  # provider blocks compared with the reference; 0: every block of the run was the reference chain itself
     kernels: str = ""  # the kernel check, when it was asked for: PASS | FAIL | NOT OBSERVED
     unobserved: str = ""  # why the kernels were not observed
+    on_demand: Optional[OnDemand] = None  # what the reference's copies of the weights the run keeps no copy of cost
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -521,6 +535,18 @@ class Checks:
 
 def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
+
+
+def on_demand_line(cost: OnDemand, blocks=()) -> str:
+    """The line of the checks that says what the reference's own copies cost (``weights.OnDemand``): how many were made of
+    the weights of ``blocks`` -- those the run keeps on their stored format alone -- the largest one, which is what is held
+    at a time, their bytes in all and the seconds they took.  It carries no verdict: it is a cost, in GiB (2^30 bytes)."""
+    kept = ", ".join(blocks) or "some weights"
+    return (
+        f"  on demand         the reference read {cost.copies:,} bf16 copies of weights this run keeps on their stored format alone ({kept}): "
+        f"each made for one call and dropped after it; the largest {cost.largest / GIB:.2f} GiB, {cost.bytes / GIB:.1f} GiB in all, "
+        f"{cost.seconds:.1f} s of the checks (orientation only)"
+    )
 
 
 def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
@@ -561,6 +587,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
     facts = session.plan.facts
+    cost = OnDemand()  # the reference's bf16 copies of the weights this run keeps on their stored format alone: one per call
     reference = Session(
         session.model,
         session.text,
@@ -571,10 +598,11 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         capacity=session.capacity,
         share=session,
         record_steps=steps,
+        on_demand=cost,
     )
     reference.load()
 
-    tap = BlockTap(session.plan, reference.plan)
+    tap = BlockTap(session.plan, reference.plan, cost)
     session.reset(fresh=True)
     session.tap = tap
     try:
@@ -605,6 +633,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
             capacity=session.capacity,
             share=session,
             record_steps=steps,
+            on_demand=cost,
         )
         matmul = torch.backends.cuda.matmul
         kept = getattr(matmul, "fp32_precision", None)  # a session with IEEE fp32 accumulation sets it for the process
@@ -661,9 +690,11 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
+    if cost.copies:  # what the checks cost beyond the run: said only where the run keeps a weight without its bf16 copy
+        lines.append(on_demand_line(cost, getattr(session.weights, "uncopied", ())))
     status, unobserved = "", ""
     if kernels:
         status, unobserved, kernel_lines = kernel_check(session)
         lines += kernel_lines
     session.reset(fresh=True)
-    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok and status != census.FAIL, len(judged), status, unobserved)
+    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok and status != census.FAIL, len(judged), status, unobserved, cost)

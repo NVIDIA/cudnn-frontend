@@ -132,8 +132,9 @@ def _writable(flag: str, path: str) -> None:
 EPILOG = """\
 The default run needs no checkpoint and no extra package; it needs a GPU of compute capability 10.x or 12.x.
 With --model: pip install -r samples/models/requirements.txt first.  The checkpoint is your own download (nothing is
-fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stacks fe-cublas, native and
-fe-entries, each of which holds a bf16 copy of every weight.
+fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas, which holds a
+bf16 copy of every weight.  The stacks native and fe-entries keep a weight their kernels multiply on its stored format
+without that copy: about 53 GiB on compute capability 10.0, about 57 GiB elsewhere.
 The generated text goes to standard output; every other line of a run goes to standard error.
 The checkpoint, the memory, the checks, a request body field by field and every flag: samples/models/qwen_dense/README.md
 """

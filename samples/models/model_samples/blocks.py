@@ -271,12 +271,17 @@ class Plan(dict):
     def reserve_bytes(self) -> int:
         return sum(block.reserve_bytes() for block in self.values())
 
-    def memory(self, need_bytes: int, what: str = "") -> str:
+    def memory(self, need_bytes: int, what: str = "", checks_bytes: int = 0) -> str:
         """The memory sentence, in GiB (2^30 bytes); ``what`` names what the need covers when that is more than this plan's
-        run.  Raises ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free, and says so when
-        the need exceeds what the GPU has in total: freeing memory cannot help there."""
+        run.  ``checks_bytes`` is the part of ``need_bytes`` that is the checks' own -- the bf16 copy their reference
+        makes, one at a time, of a weight the run keeps on its stored format alone: the sentence then states it, in GiB
+        to two places (a copy of one weight is a fraction of one).  Raises ``NotImplementedError`` (a SKIP that names
+        what to do) when the GPU has too little free, and says so when the need exceeds what the GPU has in total:
+        freeing memory cannot help there."""
         need = need_bytes + self.reserve_bytes()
         free, total = self.facts.free_bytes, self.facts.total_bytes
+        if checks_bytes:
+            what += f", {checks_bytes / GIB:.2f} GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
         if total and need > total:
             raise NotImplementedError(
                 f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; this GPU has {total / GIB:.1f} GiB in total: "

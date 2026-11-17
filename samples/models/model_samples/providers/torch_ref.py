@@ -57,12 +57,14 @@ def add_norm_quantize(branch, residual, weight, quant, eps: float, acc):
 
 def linear(qx, weight: Dequantized, acc, columns_per_chunk: int = 8192) -> torch.Tensor:
     """A multiply on quantised operands: the code values of both sides multiplied and accumulated in ``acc``, the scales applied
-    to the result, one rounding to bf16.  Chunked over the weight's rows so the wide copy is never held twice in ``acc``."""
-    x = dequantize(qx)
+    to the result, one rounding to bf16.  Chunked over the weight's rows so the wide copy is never held twice in ``acc``.
+    It reads the weight's bf16 copy: the one a load kept, or -- in the checks of a run that keeps the weight on its stored
+    format alone -- the one the checks made for this call (``weights.OnDemand``)."""
+    x, copy = dequantize(qx), weight.bf16()
     xa = x.data.to(acc)
-    out = torch.empty((xa.shape[0], weight.data.shape[0]), dtype=acc, device=xa.device)
-    for a in range(0, weight.data.shape[0], columns_per_chunk):
-        out[:, a : a + columns_per_chunk] = xa @ weight.data[a : a + columns_per_chunk].to(acc).T
+    out = torch.empty((xa.shape[0], copy.shape[0]), dtype=acc, device=xa.device)
+    for a in range(0, copy.shape[0], columns_per_chunk):
+        out[:, a : a + columns_per_chunk] = xa @ copy[a : a + columns_per_chunk].to(acc).T
     scale = weight.scale.to(acc) * x.scale if isinstance(weight.scale, torch.Tensor) else float(weight.scale) * float(x.scale)
     return (out * scale).to(BF16)
 
