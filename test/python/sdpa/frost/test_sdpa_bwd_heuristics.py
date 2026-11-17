@@ -56,6 +56,8 @@ _OFFERED = {
     "sdpa_bwd_sm100_d128_fp8_accumulation": 20623,
     "sdpa_bwd_sm100_mxfp8_pair": 20624,
     "sdpa_bwd_sm100_d256_mxfp8": 20625,
+    "sdpa_bwd_sm89": 20635,
+    "sdpa_bwd_sm89_f16_d64": 20636,
 }
 
 

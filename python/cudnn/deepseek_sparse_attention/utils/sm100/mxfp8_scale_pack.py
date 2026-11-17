@@ -374,7 +374,7 @@ def _launch_pack(
         return
     if layout in (_Q_THD, _K_THD):
         if cu_seqlens is None or cu_seqlens_scale_padded is None:
-            raise ValueError("THD MXFP8/MXFP4 scale packing requires logical and padded cu_seqlens")
+            raise ValueError("THD MXFP8/MXFP4/NVFP4 scale packing requires logical and padded cu_seqlens")
         num_sequences = cu_seqlens.numel() - 1
     else:
         # Non-THD specializations compile the dead pointers out.

@@ -67,6 +67,17 @@ def graph_mismatch(facts, _version=None):
         if reason is not None:
             return reason
     if facts.is_backward:
+        from cudnn.sdpa.bwd.kernels.sm80.half_contract import launch_grid_mismatch
+
+        reason = launch_grid_mismatch(
+            facts.b,
+            facts.h_q,
+            is_causal=facts.causal or facts.right_band_widening,
+            deterministic=facts.deterministic,
+            thd=facts.thd,
+        )
+        if reason is not None:
+            return reason
         if facts.has_bias != facts.has_dbias:
             return "SM80 bias and dbias must both be declared for native backward"
         if facts.has_sink != facts.has_dsink:

@@ -64,6 +64,8 @@ arbitrary user callbacks.
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
+| `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified |
+| `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -92,6 +94,7 @@ arbitrary user callbacks.
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
+| `DSA.indexer_forward_wrapper` | fprop | NVFP4 packed E2M1 Q/K; E4M3 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
@@ -129,6 +132,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa` / standalone FROST D256 paged THD (CGA2, fixed PackGQA and split count, independent physical origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unsupported for this combined path |
+| `pygraph.sdpa`, FROST D256 nonpaged THD split with independent physical origins (CGA2, unpacked, fixed splits 2/5, B=1/4) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported for this lowering | Supported (tested configurations on both SM100 and SM103) | Supported (tested configurations) |
 | `pygraph.sdpa`, FROST single-sequence THD setup (dense D128 or paged D64/D128, unsplit) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | See native single-sequence limits below |
 | `pygraph.sdpa`, FROST D64/D128 split THD setup (CGA1, fixed packing and split count) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | Unverified by this suite |
 | `pygraph.sdpa` / standalone FROST D64 packed THD prefill (CGA1/2, N128, unsplit, independent origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (tested configurations) | Unverified by this suite |
@@ -186,6 +190,10 @@ checks cover empty actual Q/KV lengths; split partial Stats use natural logs
 regardless of the final Stats base. `SWAP_AB=0` and an unset knob keep the
 prefill body, whose output bytes need not equal this body's. This is forward
 only and adds no backward implementation.
+The SM100/SM103 dense body also preserves O, Stats and Amax bytes under
+retained replay with output batch strides or address products beyond 32 bits.
+These wide-address checks cover both FP8 input types and all four scalar
+output types; batch invariance retains the fixed-plan scope described above.
 
 SM100 D64 per-tensor FP8 paging also offers an explicit `SWAP_AB=1`
 implementation. Each token unit computes eight packed query columns using a
@@ -477,6 +485,9 @@ a row alone and inside a batch under the entry's own picks.
   ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
 - `sdpa_mxfp8(causal_exclude_own_block=32)`: no determinism switch. Every plan is repeatable. PackGQA does not change a row's bytes. A split-KV plan adds its per-split partials in a fixed order, so its bytes follow the split count; the heuristics choose that count from the launch grid (on B200 only a single sequence at one or two KV heads splits), so a row keeps its bytes across batches while the plan keeps its split count. The option is forward-only: `sdpa_mxfp8_backward` refuses it, so there is no bprop row. It is served by the SM100/SM103 MXFP8 D128 kernel only; SM90 and SM107 decline it. Rows 0-31 keep no key and return O = 0 and Stats = -inf, which the tests accept as the declared sentinel.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
+  NVFP4 indexer forward reads packed E2M1 Q/K with non-negative E4M3 block
+  scales, one per 16 values; the per-tensor global decode scales are folded
+  into `sm_scale`, a launch argument, so they do not change the plan.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
 - SM90 combined Indexer Forward + Top-K requires packed THD, ratio 4, head
@@ -731,6 +742,19 @@ checks. SM120 RTX PRO 6000 execution passed functional, memcheck, racecheck
 and synccheck coverage, including separate multi-tile THD cases. This evidence
 does not establish SM121 or cross-runtime bit identity, independent physical
 THD origins for quantized inputs, or backward behavior.
+
+## SM89 half backward
+
+On SM89 (Ada), `sdpa_bwd_sm89` runs the SM80 FP16/BF16 backward chain and
+accepts `use_deterministic_algorithm=True` with the same scope as the SM80 row:
+eight-aligned `D_V <= D_QK <= 256`, dense and THD layouts, MHA/GQA,
+causal/bottom-right/window masks, padding, sinks and bias/dBias (a bias
+broadcast over B > 1 is declined, since its dBias reduces through unordered
+atomics). On an L40S,
+repeat execution preserves dQ/dK/dV raw bytes for dense and THD-with-origins
+graphs, and CUDA Graph replay after changing the input payload in place matches
+the reference. Batch reordering/duplication and cross-GPU identity are not
+covered by these checks.
 
 ## SM120 packed backward
 

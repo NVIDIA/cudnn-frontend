@@ -246,6 +246,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         b, h_q, s_q, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         d_v = int(self.v_desc.shape[3])
+        from .launch_grid import yz_grid_mismatch
+
+        grid_reason = yz_grid_mismatch(b, h_q)
+        self._not_implemented_error_if(grid_reason is not None, grid_reason)
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
         self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
@@ -1055,9 +1059,9 @@ def _sm80_bwd_sched_policy(*, is_causal: bool, deterministic: bool, thd: bool = 
     work is uniform per kv-tile, so the plain 3-D grid stays; the deterministic
     relay REQUIRES the plain decode (kv_tile == blockIdx.x).
     """
-    if thd:
-        return _BWD_SCHED_NATURAL
-    return _BWD_SCHED_LPT_L2 if (is_causal and not deterministic) else _BWD_SCHED_NATURAL
+    from .kernels.sm80.half_contract import uses_flat_grid
+
+    return _BWD_SCHED_LPT_L2 if uses_flat_grid(is_causal=is_causal, deterministic=deterministic, thd=thd) else _BWD_SCHED_NATURAL
 
 
 def _load_sm80_bwd_module(params):
@@ -1258,6 +1262,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         _, _, _, d_v = self.v_desc.shape
+        from .kernels.sm80.half_contract import launch_grid_mismatch
+
+        grid_reason = launch_grid_mismatch(b, h_qo, is_causal=self.is_causal, deterministic=self.deterministic, thd=self.thd)
+        self._not_implemented_error_if(grid_reason is not None, grid_reason)
 
         self._check_tensor_shape(self.q_desc, (b, h_qo, s_qo, d_qk), name="Q")
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")

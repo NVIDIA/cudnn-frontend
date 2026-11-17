@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Indexer FP8/MXFP8 replay with fixed quantized data and scale bytes."""
+"""Indexer FP8/MXFP8/NVFP4 replay with fixed quantized data and scale bytes.
+
+NVFP4 Q/K travel as their packed E2M1 bytes (``uint8``), viewed as ``float4_e2m1fn_x2`` only for the launch, and the
+reference decodes those bytes."""
 
 import pytest
 import torch
@@ -11,9 +14,12 @@ from determinism_utils import assert_bitwise, assert_golden, assert_replays, sna
 from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference
 from deepseek_sparse_attention.cutedsl.dsa_reference import ref_indexer_forward
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
+    dequantize_e2m1,
     expand_mxfp8_scale,
     make_random_mxfp8_scale,
+    make_random_nvfp4_scale,
     pack_mxfp8_scales_thd,
+    quantize_e2m1,
     quantize_fp8_1x128,
     quantize_mxfp8,
 )
@@ -21,16 +27,20 @@ from deepseek_sparse_attention.cutedsl.test_DSA_indexer_determinism import forwa
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 ALLOWED_INF = {"scores": -torch.inf, "lse": -torch.inf}
+# SM100-family block-scaled precisions: E4M3 MXFP8 and packed-E2M1 NVFP4.
+BLOCK_SCALED = ("mxfp8", "nvfp4")
 
 
-@pytest.fixture(params=["mxfp8", "fp8"], ids=["sm100-sm103-sm107-mxfp8", "sm90-fp8"])
+@pytest.fixture(params=["mxfp8", "nvfp4", "fp8"], ids=["sm100-sm103-sm107-mxfp8", "sm100-sm103-sm107-nvfp4", "sm90-fp8"])
 def precision(request):
     if not torch.cuda.is_available():
         pytest.skip("Indexer FP8 requires CUDA")
     capability = torch.cuda.get_device_capability()
-    admitted = ((10, 0), (10, 3), (10, 7)) if request.param == "mxfp8" else ((9, 0),)
+    admitted = ((10, 0), (10, 3), (10, 7)) if request.param in BLOCK_SCALED else ((9, 0),)
     if capability not in admitted:
         pytest.skip(f"{request.param} requires {admitted}; found {capability}")
+    if request.param == "nvfp4" and getattr(torch, "float4_e2m1fn_x2", None) is None:
+        pytest.skip("nvfp4 requires torch.float4_e2m1fn_x2")
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 
     if not cutedsl_state()[0]:
@@ -53,6 +63,10 @@ def sample(precision, **options):
                 exponent_max=2,
             )
             source[name] = quantize_mxfp8(source[name], scales)
+        elif precision == "nvfp4":
+            scales = make_random_nvfp4_scale((*source[name].shape[:-1], 8), device="cpu", seed=options.get("seed", 20261104) + 100 + index)
+            packed, _ = quantize_e2m1(source[name].float() * expand_mxfp8_scale(scales, 128, 16), scales, 16)
+            source[name] = packed.view(torch.uint8)
         else:
             source[name], scales = quantize_fp8_1x128(source[name])
         source[f"{name}_scale"] = scales
@@ -69,7 +83,7 @@ def pack(samples, precision, ragged=False):
     else:
         result = {name: torch.cat([item[name] for item in samples]) for name in ("q", "k", "w", "q_scale", "k_scale")}
     result["q_causal_offsets"] = torch.cat([item["q_causal_offsets"] for item in samples])
-    if precision == "mxfp8":
+    if precision in BLOCK_SCALED:
         heads = samples[0]["q"].shape[2]
         if ragged:
             result["q_scale"], result["k_scale"], result["cu_seqlens_q_scale_padded"], result["cu_seqlens_k_scale_padded"] = pack_mxfp8_scales_thd(
@@ -90,7 +104,10 @@ def run(inputs, precision, ratio=1):
     before = {name: value.clone() for name, value in local.items() if isinstance(value, torch.Tensor)}
     for name, value in before.items():
         assert torch.isfinite(value.float()).all(), f"{name}: non-finite input"
-    output = DSA.indexer_forward_wrapper(**local, precision=precision, ratio=ratio, return_lse=precision == "fp8")
+    launch = dict(local)
+    if precision == "nvfp4":
+        launch.update({name: local[name].view(torch.float4_e2m1fn_x2) for name in ("q", "k")})
+    output = DSA.indexer_forward_wrapper(**launch, precision=precision, ratio=ratio, return_lse=precision == "fp8")
     expected_keys = ("scores", "lse") if precision == "fp8" else ("scores",)
     assert tuple(output.keys()) == expected_keys
     assert_bitwise({name: local[name] for name in before}, before, "quantized inputs/scales changed")
@@ -100,6 +117,9 @@ def run(inputs, precision, ratio=1):
 def reference(item, actual, precision, ratio=1):
     values = {}
     for name in ("q", "k"):
+        if precision == "nvfp4":
+            values[name] = dequantize_e2m1(item[name], item[f"{name}_scale"], 16)
+            continue
         scale = expand_mxfp8_scale(item[f"{name}_scale"], 128) if precision == "mxfp8" else item[f"{name}_scale"].unsqueeze(-1)
         values[name] = item[name].float() * scale
     expected = {
@@ -116,7 +136,7 @@ def reference(item, actual, precision, ratio=1):
         expected["lse"] = torch.logsumexp(expected["scores"], -1)
     for name, want in expected.items():
         assert torch.equal(torch.isneginf(actual[name]), torch.isneginf(want)), f"{name}: incorrect mask"
-        tolerance = 5e-3 if precision == "mxfp8" or name == "lse" else 2e-3
+        tolerance = 5e-3 if precision in BLOCK_SCALED or name == "lse" else 2e-3
         torch.testing.assert_close(actual[name], want, atol=tolerance, rtol=tolerance)
 
 

@@ -432,6 +432,23 @@ def test_dsl_sm90_wrapper_matches_the_reference(sm100):
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=2e-2, rtol=2e-2)
 
 
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm90_wrapper_serves_a_d128_claim_counter_plan(sm100, monkeypatch):
+    """Without sinks the wrapper reaches the D128 kernel; a causal persistent plan past the claim gate needs the
+    counter's workspace, which the wrapper must allocate (the gate is lowered so a small shape crosses it)."""
+    from cudnn.sdpa.fwd import api_dsl, sdpa_fwd_wrapper_dsl_sm90
+
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 0)
+    claims, execute = [], api_dsl.SdpaFwdDslSm90.execute
+    monkeypatch.setattr(api_dsl.SdpaFwdDslSm90, "execute", lambda self, *a, **kw: claims.append(self.params.causal_claim) or execute(self, *a, **kw))
+    q, k, v = (sm100._bhsd(2, h, 1280, 128, torch.bfloat16) for h in (8, 2, 2))
+    o, lse = sdpa_fwd_wrapper_dsl_sm90(q, k, v, is_causal=True)
+    assert claims == [1], claims
+    o_ref, lse_ref = sm100._ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(128), is_causal=True, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=2e-2, rtol=2e-2)
+
+
 # --- The adapter's kernel flavor (issue #378) -------
 #
 # check_support picks its template once, first (config_sm90.pick_flavor over the flavors that have a

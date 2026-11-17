@@ -804,6 +804,10 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+  The common graph execution boundary must restore the caller's original
+  context on success and failure, including an empty worker context. The
+  backend and FROST cases in `core/graph/test_execute_device_context.py`
+  check mapping/ordered/indexed execution, default streams and captured replay.
 - **A guard that keeps the backend's planner away from a graph covers EVERY
   path that creates a backend plan, not only the heuristics query.** The cc 10.7
   single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
@@ -823,6 +827,18 @@ treatment at the caller boundary.**
   (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
   the first guard. A version-bounded guard also needs the detector that
   re-measures its bound (test/AGENTS.md).
+  The first version where a defect was measured is not its introduction
+  boundary. A lower bound needs evidence of an unaffected earlier release;
+  otherwise exclude the known-bad engine until the verified fixed version.
+  Exercise earlier supported versions in both default-planning and explicit
+  replay tests, and do not version-skip their numerical detector. The SM90
+  ragged-backward cases in `test_sdpa_bwd_backend_guard.py` cover this boundary.
+- **Provider support is not graph invalidity.** A layout a FROST engine cannot
+  run may still be valid for the backend. Preserve its graph facts and let the
+  provider's matcher decline it; returning an empty `invalid` fact record can
+  bypass backend correctness guards. Detector: the mixed dense/ragged Q/K/V
+  checks and native old/fixed-backend gradient controls in
+  `test_sdpa_bwd_backend_guard.py`.
 - **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
   `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
   `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
@@ -1010,6 +1026,16 @@ Keep helpers in the narrowest package shared by their users. For example,
 Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Array slices need wide coordinates for wide global strides. In CuTe DSL 4.8,
+`cutlass.Array` slicing (for example `a[batch, row, head, :]`) multiplies each
+coordinate by a stride cast to that coordinate's integer width. An Int64
+tensor layout alone does not prevent overflow: widen each dynamic sliced
+coordinate before forming its stride product. Full scalar indexing is a
+different path; do not infer a slicing guarantee from it. Detector:
+`TestNativeHalfStrides::test_physical_wide_stride` in the SM100/SM107 forward
+suites physically allocates a wide batch stride and checks output and replay,
+including D256 SwapAB decode at one query row.
 
 Widen operands before triangular workspace products, in both producer and
 consumer. Widening an already-overflowed offset cannot recover it. Derive tile
