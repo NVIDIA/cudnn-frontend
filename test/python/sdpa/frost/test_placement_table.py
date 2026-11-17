@@ -892,6 +892,30 @@ def test_sm90_mha_mtp_follows_its_study(s_kv):
     assert pt.matched_entry(row, mtp(h_q=32, h_kv=8)).study == "sm90_d128_h100_refit_20261114"  # GQA keeps its study
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [32768, 32767], ids=["on_tile", "off_tile"])
+def test_sm90_dense_d256_chunks_follow_their_study(s_kv):
+    """Study sm90_dense_d256_chunk_v2_20261117 (H100): dense bottom-right d256 chunks lead while few query tiles are in flight
+    (qwen3.5 TP4 / TP8 ran the backend at 1.8-4.1x) and keep the backend past about 2^6 tiles. A causal square reads as bottom-right,
+    so it shares the class (sm90_dense_d256_square_xfer_20261117 checked it)."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def chunk(**over):
+        base = dict(b=1, h_q=8, h_kv=1, s_q=512, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True)
+        base.update(has_paged_kv=False, device_cc=(9, 0))
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(h_q=4), dict(h_q=4, h_kv=2, s_q=1024)):
+        assert pt.lookup(row, chunk(**over)) is True, over
+        assert pt.matched_entry(row, chunk(**over)).study == "sm90_dense_d256_chunk_v2_20261117"
+    assert pt.lookup(row, chunk(b=4, h_q=32, h_kv=2, s_q=2048)) is False  # 32 / 2 at q 2048: 1.8-1.9x on FROST
+    square = chunk(s_q=s_kv)
+    assert pt.matched_entry(row, square).study == "sm90_dense_d256_chunk_v2_20261117"
+    assert pt.lookup(row, square) is False  # 2048 query tiles at 32k
+    assert pt.lookup(row, chunk(s_q=512, s_kv=512)) is True  # 32 tiles
+
+
 _SM90_D128_STUDY = "sm90_d128_h100_refit_20261114"
 _SM90_D128_ENTRIES = [
     pytest.param(

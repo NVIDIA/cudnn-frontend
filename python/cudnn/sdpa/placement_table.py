@@ -868,6 +868,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm90_d128_h100_refit_20261114"
     ),
+    # study sm90_dense_d256_chunk_v2_20261117 (H100 80GB, cuDNN 9.24.0.43, FE 7c63bf4ff; dense bottom-right d256 chunks, groups 2-16,
+    # b 1-4, q 128-2048, KV 4k-131k with an off-tile lattice of its own; 726 train cells fitted under the criterion, a 72-cell holdout
+    # of new head pairs scored once: 7 changed at 0.70 / 0.57, worst 1.06). FROST leads while few query tiles are in flight (the h200
+    # nightly's qwen3.5 TP4 / TP8 chunks ran the backend at 1.8-4.1x); v1 failed at group 2, outside its train grid.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "le", 6.085, "sm90_dense_d256_chunk_v2_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "le", 5.407, "sm90_dense_d256_chunk_v2_20261117", "tiles"
+    ),
     # study sm90_mha_mtp_v2_20261117 re-fits the MHA twins (H100 80GB, cuDNN 9.24.0.43, FE ba0b35370; heads 4-64 MHA, b 1-64, s_q 2/4,
     # KV 8k-128k with a full off-tile lattice; 240 train cells, a 60-cell holdout scored once: 34 changed at 0.54-0.59, worst 0.98).
     # FROST splits the cache where the backend does not, so few head-batch units over a long KV lead (h200 ar_dit 9/9 ran 6.4x).
