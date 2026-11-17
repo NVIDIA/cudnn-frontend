@@ -1344,8 +1344,9 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
 
     key = placement_table.class_key("sdpa_fwd_prefill_sm120", facts)
     if key is not None and key[:-1] == _SM120_PAGED_MTP_D128_CLASS:
-        # The group decides (the class key cannot carry it). Ahead of the prefill-body guard: group 16 at s_q 4 runs that body
-        # at 0.35 of the backend. Holdouts: groups 5-16, 49 changed at 0.42-0.44, worst 1.06; groups 4-5, 32 at 0.78-0.82, worst 1.03.
+        # The group decides (the class key cannot carry it). Decode-tile graphs only: past 32 packed rows the prefill body runs and
+        # the `gqa_body` entries answer (sm120_paged_d128_body_20261117). Holdouts: groups 5-16, 49 changed at 0.42-0.44, worst 1.06;
+        # groups 4-5, 32 at 0.78-0.82, worst 1.03.
         group = facts.h_q // facts.h_kv
         lead = group >= SM120_PAGED_MTP_D128_MIN_GROUP or placement_table.log2_tiles(facts) <= SM120_PAGED_MTP_D128_MAX_LOG2_TILES
         return LEAD if lead else TRAIL

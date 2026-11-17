@@ -273,7 +273,9 @@ def test_sm120_paged_d128_mtp_follows_the_group(s_kv):
         assert placement.place(spec, _facts(b=b, h_q=h_q, **mtp)) == placement.LEAD, (b, h_q)
     for b, h_q in ((128, 24), (16, 16)):  # groups 3 / 2 past 2^5.5 units
         assert placement.place(spec, _facts(b=b, h_q=h_q, **mtp)) == placement.TRAIL, (b, h_q)
-    assert placement.place(spec, _facts(b=128, h_q=64, **dict(mtp, h_kv=4, s_q=4))) == placement.LEAD  # group 16, FROST's prefill body
+    body = dict(mtp, h_kv=4, s_q=4)  # group 16: 64 rows run FROST's prefill body, whose `gqa_body` entries decide
+    assert placement.place(spec, _facts(b=128, h_q=64, **body)) == placement.LEAD
+    assert placement.place(spec, _facts(b=1, h_q=64, **body)) == placement.TRAIL
     assert placement.place(spec, _facts(b=128, h_q=32, dtype=cudnn.data_type.HALF, **mtp)) == placement.LEAD  # f16: no class, hand rule
 
 

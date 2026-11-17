@@ -44,6 +44,7 @@ def _dtype_name(dtype) -> Optional[str]:
 
 DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80"})
 SM80_DET_NARROW_WINDOW_MAX_LEFT = 383  # window_left at or below keys `window_narrow` on sdpa_bwd_sm80 prefill_det (256 measured, 512 not)
+SM120_PAGED_BODY_MAX_S_Q = 16  # sdpa_fwd_prefill_sm120 paged d128 up to this s_q, off the decode tile, keys `gqa_body`
 """Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
 (SM120: the two-kernel dS / dQ split), so those graphs neither share the default classes' entries nor count as unmeasured."""
 
@@ -133,6 +134,21 @@ def _unpacked_decode(row: str, facts) -> bool:
     return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
 
 
+def _sm120_paged_body(row: str, facts) -> bool:
+    """SM120 paged d128 MTP / short prefill that the decode tile declines (packed rows past 32) runs the prefill body, which leads
+    only once enough query rows are in flight; the decode tile's group rule does not transfer (sm120_paged_d128_body_20261117).
+    The row's own tile choice decides, so the class follows the kernel. Padded Q only: no study timed THD Q here."""
+    if row != "sdpa_fwd_prefill_sm120" or not facts.has_paged_kv or facts.thd or not 1 < facts.s_q <= SM120_PAGED_BODY_MAX_S_Q:
+        return False
+    if (facts.d_qk, facts.d_v) != (128, 128):
+        return False
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next((s for s in ENGINE_SPECS if s.name == row), None)
+    return spec is not None and heuristics._sm120_decode_tile_m(spec.capabilities, facts) == 0
+
+
 def _packed_split(row: str, facts) -> bool:
     """A paged GQA prefix the SM100 row packs and splits (``heuristics.sm100_paged_packed_split_choice``): a different kernel
     regime from the unsplit graphs beside it (B200 D64: 0.02-0.61 of the backend split, 0.24-1.08 unsplit), so it is a class
@@ -215,6 +231,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "gqa_unpacked"
     else:
         group = "gqa_split" if _packed_split(row, facts) else "gqa"
+    if group == "gqa" and _sm120_paged_body(row, facts):
+        group = "gqa_body"
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
     # an on-tile study never answers.
     kv_off_tile = facts.s_kv % 128 != 0
@@ -969,6 +987,35 @@ TABLE: Dict[Tuple, Entry] = {
     # (sm120_paged_d512_q1_v2_20261117 and the D576 transfer check sm120_paged_d576_q1_xfer_20261117; fwd/placement._place_sm120_f16))
     # Its d128 paged MTP entries (sm120_paged_d128_mtp_20261117, `le 5.5 tiles`) are retired the same way: FROST's time is flat in
     # the GQA group and the backend's grows with it, so the group decides (sm120_paged_d128_mtp_v6_20261117; fwd/placement._place_sm120_f16).
+    # study sm120_paged_d128_body_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE a09a291e7; paged d128 at s_q 2-16 past 32
+    # packed rows, which the decode tile declines (`gqa_body`), causal and windowed; groups 2-16, b 1-64, KV 4k-131k on and off the
+    # tile; 480 train cells fitted under the criterion, a 70-cell holdout scored once: 37 changed at 0.39-0.81, worst 0.985). The
+    # prefill body runs 0.32-0.67 of the backend from about 2^9-2^11 query rows in flight and 1.5x behind it at b 1, so ripple /
+    # laguna / step37 MTP and verify leave the backend (rtxpro6000 run-553, 1.9-2.7x) while one-request MTP keeps it.
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_body", False): Entry(
+        "ge", 8.792, "sm120_paged_d128_body_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_body", True): Entry(
+        "ge", 10.161, "sm120_paged_d128_body_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa_body", False): Entry(
+        "ge", 8.792, "sm120_paged_d128_body_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa_body", True): Entry(
+        "ge", 10.161, "sm120_paged_d128_body_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "prefill", "paged", "causal_br", False, "gqa_body", False): Entry(
+        "ge", 10.792, "sm120_paged_d128_body_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "prefill", "paged", "causal_br", False, "gqa_body", True): Entry(
+        "ge", 4.5, "sm120_paged_d128_body_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_body", False): Entry(
+        "ge", 4.5, "sm120_paged_d128_body_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_body", True): Entry(
+        "ge", 4.5, "sm120_paged_d128_body_20261117", "tiles"
+    ),
     # study sm120_paged_window_decode_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE b9eb6fead; paged sliding-window decode at s_q 1,
     # d64 / d128 / d256, groups 2-16, windows 256-4096, KV 4k-131k on and off the tile; 256 train cells fitted under the criterion, a
     # 60-cell holdout scored once: 25 changed at 0.20-0.63, worst 1.00). The decode split clips KV to the window (c59994a55), so FROST

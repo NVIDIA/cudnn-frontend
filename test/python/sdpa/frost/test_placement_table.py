@@ -61,9 +61,10 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert (
             mask in ("none", "window", "window_narrow", "causal_br", "causal_tl")
             and isinstance(sink, bool)
-            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
+            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split", "gqa_body")
         )
         assert mask != "window_narrow" or (row, phase) == ("sdpa_bwd_sm80", "prefill_det"), key  # a row-local key
+        assert group != "gqa_body" or (row, layout, phase in ("mtp", "prefill")) == ("sdpa_fwd_prefill_sm120", "paged", True), key
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -480,6 +481,34 @@ def test_sm120_decode_entries_follow_their_study():
     sink = dict(h_q=64, h_kv=8, d_qk=64, d_v=64, s_q=2, has_sink=True, causal=True, bottom_right=True)
     assert pt.lookup(row, f(**sink)) is None
     assert pt.matched_entry(row, f(window_left=127, **sink)).study == "sm120_decode_20261112"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [32768, 32769], ids=["on_tile", "off_tile"])
+def test_sm120_paged_d128_body_follows_its_study(s_kv):
+    """Paged d128 at s_q 2-16 past 32 packed rows runs the prefill body, not the decode tile: its own group (`gqa_body`) and study
+    (sm120_paged_d128_body_20261117). It leads from enough query rows in flight and trails one request; decode-tile graphs, THD Q,
+    s_q past 16 and other rows keep `gqa`."""
+    row = "sdpa_fwd_prefill_sm120"
+
+    def paged(**over):
+        base = dict(b=16, h_q=64, h_kv=4, s_q=4, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(device_cc=(12, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    off = s_kv % 128 != 0
+    for s_q, phase in ((4, "mtp"), (8, "prefill"), (16, "prefill")):
+        assert pt.class_key(row, paged(s_q=s_q)) == (row, (12, 0), "bf16", (128, 128), phase, "paged", "causal_br", False, "gqa_body", off)
+        assert pt.class_key(row, paged(s_q=s_q, window_left=1023))[6:9] == ("window", False, "gqa_body")
+        assert pt.matched_entry(row, paged(s_q=s_q)).study == "sm120_paged_d128_body_20261117"
+        assert pt.lookup(row, paged(s_q=s_q)) is True  # 16 requests x 64 heads
+        assert pt.lookup(row, paged(b=1, h_q=16, h_kv=1, s_q=s_q)) is False  # one request, 16 heads
+    assert pt.class_key(row, paged(h_q=32, h_kv=4, s_q=4))[8] == "gqa"  # 4 x group 8 = 32 rows: the decode tile
+    assert pt.class_key(row, paged(s_q=32))[8] == "gqa"
+    for other in (paged(thd=True, max_total_seq_len_q=64), paged(d_qk=64, d_v=64, h_q=128), paged(has_paged_kv=False, page_size=0)):
+        assert pt.class_key(row, other)[8] != "gqa_body"
+    assert pt.class_key("sdpa_fwd_prefill_sm100", paged(device_cc=(10, 0)))[8] != "gqa_body"
 
 
 @pytest.mark.L0
