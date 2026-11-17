@@ -241,8 +241,12 @@ Rubin row has its own arm ("SM107 per-tensor FP8 row" below).
   fewer than 4 units lost up to 1.79x below the 128k endpoint on that tree, where 1-2 units led 0.75-0.83 in one column. Re-measured
   on FE 9bdf9a8ab (study rubin_paged_d256_small_units_20261117: computelab Rubin, cuDNN 9.30.0.4, the nightly harness legs timed
   as back-to-back GPU time; groups 4 / 6 / 8 / 12 / 16, pages 16 / 32 / 64), 1-3 units lead on all 88 train cells from 4k declared KV
-  (0.35-0.88) and on a fresh seeded 32-cell holdout scored once (0.37-0.69, geomean 0.55), so they lead from
-  ``SM107_PAGED_D256_SMALL_UNITS_MIN_KV``; above 512
+  (0.35-0.88) and on a fresh seeded 32-cell holdout scored once (0.37-0.69, geomean 0.55). The same tree re-measured the 2**15 step
+  (study rubin_paged_d256_band_floor_20261117, 75 train cells at 4-48 units x 1k-16k declared KV): it separates on declared KV and
+  units, not tokens in flight. Any unit count leads from 4k declared KV (4-16 units 0.61-0.89), 32+ units lead at 1k-2k
+  (0.83-0.96), and 4-16 units at <= 2k lose 1.15-1.69. A fresh seeded 32-cell holdout scored once moved 11 cells, 0.62-0.89
+  (geomean 0.75), none slower. So the tile leads from ``SM107_PAGED_D256_DECODE_MIN_KV`` declared KV or from
+  ``SM107_PAGED_D256_DECODE_WIDE_UNITS`` units, and the 2**16 band stays in between; above 512
   units and past 128k declared KV: unmeasured. A further band of the SAME measurement (2026-10-13, the same board, method and
   arms) LEADs by default too, where the tile is strictly faster than the backend's default plan with margin in BOTH regimes;
   FE's placement is a verdict against the backend's plan, and what the consumer's other kernels do is the consumer's routing:
@@ -589,8 +593,11 @@ SM107_SINK_DECODE_KV_TOKENS = (1024, 16384)  # measured cache band (the backend 
 # band is in the module docstring ("PAGED dense-Q d256 half decode": 212-SM cc 10.7 perf class, cuDNN 9.27.0, cudnn-frontend 1.32.0,
 # CUDA-graph replay and eager, 2026-10-13).  Units are b * h_kv (one packed unit of the tile each) and the KV tokens the graph DECLARES.
 SM107_PAGED_D256_DECODE_GROUPS = (4, 6, 8, 12, 16)  # the GQA groups measured (16/4, 24/4, 8/1, 24/2 + 12/1, 32/2 + 16/1); 32 (64/2) has its own band below
-SM107_PAGED_D256_DECODE_MIN_UNITS = 4  # fewer units lost up to 1.79x below the 128k endpoint (1-2 units led 0.75-0.83 there: one column, not admitted)
-SM107_PAGED_D256_SMALL_UNITS_MIN_KV = 4096  # 1-3 units, re-measured 2026-11-17: 0.35-0.88 from this declared KV (shorter unmeasured)
+SM107_PAGED_D256_DECODE_MIN_UNITS = 4  # below the KV / wide-units arms, the 10-13 tokens-in-flight band applies from 4 units
+# Re-measured 2026-11-17 (FE 9bdf9a8ab, module docstring): any unit count leads from this declared KV (1-3 units 0.35-0.88,
+# 4-16 units 0.61-0.89), and 32+ units lead at any declared KV in the band (0.83-0.96 at 1k-2k); 4-16 units at <= 2k KV lose 1.15-1.69.
+SM107_PAGED_D256_DECODE_MIN_KV = 4096
+SM107_PAGED_D256_DECODE_WIDE_UNITS = 32
 SM107_PAGED_D256_DECODE_MAX_UNITS = 512  # the band's largest column (b 128 x 4 KV heads); the tile still led 0.53-0.63 there
 SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT = (
     2**16
@@ -933,12 +940,11 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     if not kv_lo <= facts.s_kv <= kv_hi:
         return False
     if group in SM107_PAGED_D256_DECODE_GROUPS:
-        if units < SM107_PAGED_D256_DECODE_MIN_UNITS:
-            return facts.s_kv >= SM107_PAGED_D256_SMALL_UNITS_MIN_KV
-        return (
-            SM107_PAGED_D256_DECODE_MIN_UNITS <= units <= SM107_PAGED_D256_DECODE_MAX_UNITS
-            and units * facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT
-        )
+        if units > SM107_PAGED_D256_DECODE_MAX_UNITS:
+            return False
+        if facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV or units >= SM107_PAGED_D256_DECODE_WIDE_UNITS:
+            return True
+        return units >= SM107_PAGED_D256_DECODE_MIN_UNITS and units * facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT
     if (facts.h_q, facts.h_kv) in SM107_PAGED_D256_G32_GEOMETRIES and facts.page_size in SM107_PAGED_D256_G32_PAGE_SIZES:
         return SM107_PAGED_D256_G32_MIN_UNITS <= units <= SM107_PAGED_D256_G32_MAX_UNITS and units * facts.s_kv >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT
     return False

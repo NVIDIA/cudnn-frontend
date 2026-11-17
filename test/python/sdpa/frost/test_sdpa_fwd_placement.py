@@ -871,40 +871,43 @@ def _sm107_paged_d256_decode_facts(**over):
 
 _SM107_PAGED_D256_DECODE_CORNERS = [
     # (heads, b, declared KV, verdict): the measured frontier of the Rubin paged d256 decode-tile band -- units = b * h_kv,
-    # LEAD from 4 units and 2**16 KV tokens in flight (64 x 1k, 32 x 2k, 16 x 4k, 8 x 8k, 4 x 32k), TRAIL one step below
-    # (2**15 tokens in flight), past the measured 512 units / 128k declared KV, below 1k. 1-3 units LEAD from 4k declared KV
-    # (re-measured 2026-11-17) and TRAIL below it.
+    # LEAD from 4k declared KV at any unit count, from 32 units at any declared KV, and from 4 units at 2**16 KV tokens in flight
+    # (re-measured 2026-11-17); TRAIL at 4-31 units below 2**16 with <= 2k declared KV, at 1-3 units below 4k, past the measured
+    # 512 units / 128k declared KV, below 1k.
     ("24/2", 4, 8192, placement.LEAD),
-    ("24/2", 4, 4096, placement.TRAIL),
+    ("24/2", 4, 4096, placement.LEAD),
     ("24/2", 32, 1024, placement.LEAD),
-    ("24/2", 16, 1024, placement.TRAIL),
+    ("24/2", 16, 1024, placement.LEAD),
     ("24/2", 16, 2048, placement.LEAD),
     ("24/2", 8, 2048, placement.TRAIL),
     ("24/2", 8, 4096, placement.LEAD),
     ("24/2", 2, 32768, placement.LEAD),
-    ("24/2", 2, 8192, placement.TRAIL),
+    ("24/2", 2, 8192, placement.LEAD),
     ("24/2", 1, 131072, placement.LEAD),
     ("8/1", 1, 4096, placement.LEAD),
     ("8/1", 3, 4096, placement.LEAD),
     ("8/1", 3, 2048, placement.TRAIL),
+    ("8/1", 16, 2048, placement.TRAIL),
+    ("8/1", 8, 1024, placement.TRAIL),
+    ("8/1", 31, 1024, placement.TRAIL),
     ("24/2", 128, 131072, placement.LEAD),
     ("24/2", 32, 262144, placement.TRAIL),
     ("24/2", 64, 512, placement.TRAIL),
     ("32/2", 2, 32768, placement.LEAD),
-    ("32/2", 2, 8192, placement.TRAIL),
+    ("32/2", 2, 8192, placement.LEAD),
     ("16/4", 128, 131072, placement.LEAD),
     ("16/4", 256, 131072, placement.TRAIL),
     ("16/4", 1, 32768, placement.LEAD),
-    ("16/4", 1, 8192, placement.TRAIL),
+    ("16/4", 1, 8192, placement.LEAD),
     ("24/4", 2, 8192, placement.LEAD),
-    ("24/4", 2, 4096, placement.TRAIL),
+    ("24/4", 2, 4096, placement.LEAD),
     ("8/1", 8, 8192, placement.LEAD),
-    ("8/1", 8, 4096, placement.TRAIL),
-    ("8/1", 4, 8192, placement.TRAIL),
+    ("8/1", 8, 4096, placement.LEAD),
+    ("8/1", 4, 8192, placement.LEAD),
     ("12/1", 16, 4096, placement.LEAD),
     ("12/1", 16, 2048, placement.TRAIL),
     ("16/1", 64, 1024, placement.LEAD),
-    ("16/1", 32, 1024, placement.TRAIL),
+    ("16/1", 32, 1024, placement.LEAD),
     # group 32 (64/2, the 32-column tile in one unit): LEAD from 4 units and 2**17 KV tokens in flight (the 2**16 step holds the 8 x 8k eager
     # parity cell), the measured 256-unit / 128k edges, 2 units only at the 128k endpoint (not admitted)
     ("64/2", 32, 8192, placement.LEAD),
