@@ -229,7 +229,7 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
 
     return graph_fwd
 
-def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=False, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False):
+def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=False, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, with_ragged_offset_multiplier=False, max_total_seq_len_q=None, max_total_seq_len_kv=None):
     graph_bwd = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     stride_q = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1)
@@ -298,6 +298,8 @@ def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         right_bound=right_bound,
         use_deterministic_algorithm=deterministic,
         seq_len_q=seq_len_q, seq_len_kv=seq_len_kv,
+        max_total_seq_len_q=max_total_seq_len_q,
+        max_total_seq_len_kv=max_total_seq_len_kv,
         sink_token=sink_token,
         dSink_token=dSink_token,
     )
@@ -310,6 +312,11 @@ def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         dQ.set_ragged_offset(q_ragged_offset)
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
+        if with_ragged_offset_multiplier:
+            for tensor in (q, k, dQ, dK):
+                tensor.set_ragged_offset_multiplier(d_qk)
+            for tensor in (v, o, dO, dV):
+                tensor.set_ragged_offset_multiplier(d_vo)
 
     amax_dQ.set_uid(GraphBwdUid.dQ_amax).set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     amax_dK.set_uid(GraphBwdUid.dK_amax).set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
@@ -1271,7 +1278,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         dP_scale_gpu = torch.tensor([get_fp8_scale_factor(dP_amax, torch_otype)], dtype=torch.float, device="cuda")
 
         try:
-            graph_bwd = generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token)
+            graph_bwd = generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, with_ragged_offset_multiplier=with_ragged_offset_multiplier,
+                                                 max_total_seq_len_q=max_t_q if (is_ragged and cfg.declare_total_seq_len) else None,
+                                                 max_total_seq_len_kv=max_t_kv if (is_ragged and cfg.declare_total_seq_len) else None)
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
