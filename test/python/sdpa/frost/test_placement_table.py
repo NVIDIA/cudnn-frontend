@@ -850,6 +850,26 @@ def test_sm100_paged_packed_split_classes_follow_their_study():
     assert pt.matched_entry(row, _sm100_paged(256, 32, 8, 16, 512, 8192, **b300)).study == "sm100_d256_paged_context_20261030"
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [62208, 62209], ids=["on_tile", "off_tile"])
+def test_sm90_mha_mtp_follows_its_study(s_kv):
+    """Study sm90_mha_mtp_v2_20261117 (H100): dense d128 MHA MTP leads while few head-batch units cover a long cache (FROST splits
+    KV; the h200 auto-regressive DiT 9/9 ran 6.4x on the backend) and keeps the backend from about 2^6 tiles."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def mtp(**over):
+        base = dict(b=1, h_q=9, h_kv=9, s_q=2, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(has_paged_kv=False, device_cc=(9, 0))
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(s_q=4), dict(b=4, h_q=12, h_kv=12)):
+        assert pt.lookup(row, mtp(**over)) is True, over
+        assert pt.matched_entry(row, mtp(**over)).study == "sm90_mha_mtp_v2_20261117"
+    assert pt.lookup(row, mtp(b=16, h_q=32, h_kv=32)) is False
+    assert pt.matched_entry(row, mtp(h_q=32, h_kv=8)).study == "sm90_d128_h100_refit_20261114"  # GQA keeps its study
+
+
 _SM90_D128_STUDY = "sm90_d128_h100_refit_20261114"
 _SM90_D128_ENTRIES = [
     pytest.param(
@@ -865,12 +885,6 @@ _SM90_D128_ENTRIES = [
         None,
         "cost",
         id="mtp-gqa-causal_br-off",
-    ),
-    pytest.param(
-        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", False), "le", 26.006, "cost", id="mtp-mha-causal_br-on"
-    ),
-    pytest.param(
-        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", True), "le", 27.97, "cost", id="mtp-mha-causal_br-off"
     ),
     pytest.param(
         ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", False), "always", None, "cost", id="mtp-gqa-none-on"

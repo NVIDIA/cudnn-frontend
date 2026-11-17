@@ -868,10 +868,15 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm90_d128_h100_refit_20261114"
     ),
+    # study sm90_mha_mtp_v2_20261117 re-fits the MHA twins (H100 80GB, cuDNN 9.24.0.43, FE ba0b35370; heads 4-64 MHA, b 1-64, s_q 2/4,
+    # KV 8k-128k with a full off-tile lattice; 240 train cells, a 60-cell holdout scored once: 34 changed at 0.54-0.59, worst 0.98).
+    # FROST splits the cache where the backend does not, so few head-batch units over a long KV lead (h200 ar_dit 9/9 ran 6.4x).
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", False): Entry(
-        "le", 26.006, "sm90_d128_h100_refit_20261114"
+        "le", 6.08, "sm90_mha_mtp_v2_20261117", "tiles"
     ),
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", True): Entry("le", 27.97, "sm90_d128_h100_refit_20261114"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", True): Entry(
+        "le", 6.29, "sm90_mha_mtp_v2_20261117", "tiles"
+    ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", False): Entry("always", None, "sm90_d128_h100_refit_20261114"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", True): Entry("always", None, "sm90_d128_h100_refit_20261114"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa_unpacked", False): Entry(
