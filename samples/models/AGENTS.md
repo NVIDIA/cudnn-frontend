@@ -419,9 +419,10 @@ Each of these passed every test and every GPU run of the first version; a host t
   have built a form no call of a two-layer model is made in. A host test that pins the forms a run builds holds it.
 - A kernel on the stored format needs the stored format. The loader had the merged 8-bit codes in hand and freed them
   after the copy; it now keeps them for the blocks that say they multiply on them, asked by the plan of the session
-  and of the sessions that follow on its weights. The copy stays for the reference, so the memory sentence grows, and
-  the allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the
-  stored bytes alone. Measure the sentence against a run whenever what a stack holds changes.
+  and of the sessions that follow on its weights. At that point the copy stayed for the reference (it no longer
+  does: the last section of this guide), so the memory sentence grew, and the allocator's slack with it: the first
+  checkpoint run took 0.4 GiB more than a sentence that had added the stored bytes alone. Measure the sentence
+  against a run whenever what a stack holds changes.
 - With a second exactly judged row behind it, a launch behind a layer's input norm fails the check: it now sits
   between two rows that are judged one by one. The same launch behind the in-projection fails in a linear-attention
   layer (the fused step follows) and is counted as the reference chain's in an attention layer. What the check

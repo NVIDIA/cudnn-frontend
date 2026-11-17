@@ -5005,7 +5005,7 @@ def test_a_form_of_a_weight_the_load_did_not_keep_fails_by_name_before_the_first
     assert cost.copies == 2 and reference.read(reference.prefill([text.encode("ab0")])), "the warm-up step: one copy per in-projection call"
     assert cost.copies == 2 + 2 * 3 and all(layer.in_proj.data is None for layer in first.weights.layers), "one per call; the weights are as they were"
     # (4) planned together, nothing is missing in either direction
-    first, later = session("fe-cublas"), None
+    first = session("fe-cublas")
     later = session("native", share=first)
     first.plan_table([later])
     first.load()
