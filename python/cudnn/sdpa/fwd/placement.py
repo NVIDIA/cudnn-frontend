@@ -499,8 +499,14 @@ SM120 MXFP8 row (``sdpa_fwd_prefill_sm120_mxfp8``, offered by default): the back
 SDPA on cc 12.x ("MXFP8 SDPA is only supported on Blackwell Data Center architectures"), so the row is the only
 provider there and leads every graph it admits.
 
-Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
+Rows with no measurement (SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
+
+SM80 (``TRAIL_ONLY_ROWS``) trails the backend outside its table entries, except bf16 dense d128 GQA causal prefill with few
+query rows over a long cache (``SM80_D128_GQA_LEAD_*``): FROST leads at b * h_q * S_q <= 2^12.79 over KV >= 2^10.5
+(study sm80_dense_d128_gqa_v2_20261117, A100, cuDNN 9.24.0.43: train 0.374 / 0.400 on / off the tile, holdout scored once
+0.349 / 0.413, worst 0.667; llama3.1-tp8 b 1 long-KV chunks ran the backend at 3.7-3.8x). No single table feature orders the
+class: many query rows or a short cache lose 1.06-1.9x.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
 pack, so the lead is the unpacked FROST plan; it leads the backend when the declaration admits no chunk over a longer
 cache (equal Q and KV extents and, with packed totals declared, equal totals), the declared cache holds at least 4096
@@ -548,6 +554,8 @@ CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d
 SM107_D128_CHUNKED_MAX_Q_TILES = 256  # Rubin bf16 d128 chunks: study sm107_dense_d128_chunk_tiles_20261117 (module docstring)
 SM107_D128_CHUNKED_MIN_S_Q = 256  # ... from the study's smallest S_q; below it the edge supplement lost 1.37x (module docstring)
 CHUNKED_MIN_KV_TOKENS = 4096
+SM80_D128_GQA_LEAD_MAX_LOG2_ROWS = 12.7925  # A100 bf16 dense d128 GQA causal prefill: module docstring
+SM80_D128_GQA_LEAD_MIN_LOG2_KV = 10.501
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
 NONPAGED_D256_THD_MIN_Q = 256  # nonpaged d256 THD lead: query tokens per request
 PAGED_D128_FULL_PREFILL_CCS = ((10, 0), (10, 3))  # packed paged D128 full-prefill lead (#1809)
@@ -707,6 +715,16 @@ TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefe
 """Default-offered rows with no hand-written lead shard: offered after the backend's block, so they serve a graph only when
 the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph. An SM80
 implementation engine inherits its row's policy."""
+
+
+def _sm80_d128_gqa_long_kv(facts) -> bool:
+    """A100 bf16 dense d128 GQA causal prefill with few query rows over a long cache (module docstring)."""
+    from cudnn.sdpa import placement_table
+
+    key = placement_table.class_key("sdpa_fwd_prefill_sm80", facts)
+    if key is None or key[1:9] != ((8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa"):
+        return False
+    return placement_table.log2_q_rows(facts) <= SM80_D128_GQA_LEAD_MAX_LOG2_ROWS and placement_table.log2_kv(facts) >= SM80_D128_GQA_LEAD_MIN_LOG2_KV
 
 
 def place(spec, facts, knobs=None) -> str:
@@ -925,6 +943,8 @@ def place(spec, facts, knobs=None) -> str:
         return _place_sm120_fp8(facts)
     if spec.name == "sdpa_fwd_prefill_sm120_mxfp8":
         return LEAD  # the backend declines MXFP8 SDPA on cc 12.x ("only supported on Blackwell Data Center")
+    if spec.name == "sdpa_fwd_prefill_sm80" and _sm80_d128_gqa_long_kv(facts):
+        return LEAD
     if spec.name in TRAIL_ONLY_ROWS:
         return TRAIL
     return LEAD

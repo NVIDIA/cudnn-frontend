@@ -130,6 +130,26 @@ def test_a_trail_only_row_leads_where_a_generated_entry_says_so(monkeypatch, ent
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_d128_gqa_long_kv_chunks_lead(s_kv):
+    """Study sm80_dense_d128_gqa_v2_20261117 (A100): bf16 dense d128 GQA causal prefill leads with few query rows over a long cache
+    (llama3.1-tp8 b 1 long-KV chunks ran the backend at 3.7-3.8x); many rows, a short cache, f16 or another part trail."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row, impl = (next(s for s in ENGINE_SPECS if s.name == n) for n in ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch"))
+
+    def f(**over):
+        return _facts(**{**dict(s_q=256, s_kv=s_kv, has_paged_kv=False, device_cc=(8, 0), device_sm_count=108), **over})
+
+    assert placement.place(row, f()) == placement.LEAD
+    assert placement.place(impl, f()) == placement.LEAD
+    assert placement.place(row, f(b=8, h_q=64, h_kv=8, s_q=2048)) == placement.TRAIL  # many query rows
+    assert placement.place(row, f(s_kv=1024 + s_kv % 2)) == placement.TRAIL  # a short cache
+    assert placement.place(row, f(dtype=cudnn.data_type.HALF)) == placement.TRAIL
+    assert placement.place(row, f(device_cc=(8, 6))) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 @pytest.mark.parametrize("verdict", [placement.LEAD, placement.TRAIL])
 def test_propose_preserves_recommendations_and_places_one_marker(monkeypatch, recommendations, kind, verdict):
