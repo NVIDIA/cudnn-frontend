@@ -541,6 +541,30 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_dense_chunk_follows_its_study(s_kv):
+    """Study sm80_dense_chunk_20261117 (A100): dense d256 GQA causal prefill leads past a cost floor, so qwen3.5's b 1 long-KV chunks
+    (FROST 2.3-3.0x faster) lead and small squares keep the backend; d64 MHA causal leads past a floor off the tile. d128 GQA keeps
+    the hand rule."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_dense_chunk_20261117"
+
+    def f(**over):
+        base = dict(b=1, h_q=4, h_kv=1, s_q=512, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True)
+        base.update(device_cc=(8, 0), has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == study
+    assert pt.lookup(row, f()) is True
+    assert pt.lookup(row, f(s_q=128, s_kv=128)) is False  # a small square
+    mha64 = dict(d_qk=64, d_v=64, h_q=16, h_kv=16)
+    assert pt.matched_entry(row, f(**mha64)).study == study
+    assert pt.lookup(row, f(**mha64)) is True
+    assert pt.lookup(row, f(d_qk=128, d_v=128, h_q=8, h_kv=1)) is None  # d128 GQA: no entry
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
     """A verify class no study answers (here SM80 d64) keeps the prefill entry it had before the verify phase existed."""
@@ -806,7 +830,7 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     assert pt.lookup(row, prefill(1024, 1024, 64, causal=False, bottom_right=False)) is None  # a class the hand rules keep
     assert pt.lookup(row, prefill(16, 128, 128, causal=False, bottom_right=False)) is True  # small mask-free d128 MHA: FROST leads
     bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
-    assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
+    assert pt.TABLE[pt.class_key(row, bf16)].study == "sm80_dense_chunk_20261117"  # a bf16 study keeps the bf16 class
     assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
 
 

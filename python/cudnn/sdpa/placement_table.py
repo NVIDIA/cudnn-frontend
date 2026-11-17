@@ -738,12 +738,6 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "ge", 5.782, "sm80_dense_prefill_20261031", "tiles"
     ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", False, "mha", False): Entry(
-        "ge", 6.293, "sm80_dense_prefill_20261031", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", False, "mha", True): Entry(
-        "ge", 6.293, "sm80_dense_prefill_20261031", "tiles"
-    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", True, "gqa", False): Entry(
         "ge", 6.793, "sm80_dense_prefill_20261031", "q"
     ),
@@ -782,12 +776,6 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "mha", True): Entry(
         "always", None, "sm80_dense_prefill_r4_20261101"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
-        "ge", 6.793, "sm80_dense_prefill_r4_20261101", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "ge", 6.793, "sm80_dense_prefill_r4_20261101", "tiles"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", False): Entry(
         "ge", 6.793, "sm80_dense_prefill_r4_20261101", "tiles"
@@ -974,6 +962,21 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
         "ge", 27.161, "sm80_thd_verify_unpacked_20261117"
     ),
+    # study sm80_dense_chunk_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE fa4f913c2; dense BSHD causal prefill over the whole range:
+    # chunks S_q 5-4096 over KV 256-128k and squares 128-8192, on and off the tile, b 1-8; 480 train cells). Replaces the d256 GQA causal
+    # (sm80_dense_prefill_r4_20261101) and d64 MHA causal (sm80_dense_prefill_20261031) entries, which trailed long-KV chunks FROST ran
+    # 2-3x faster. Holdout at fresh heads, scored once: d256 GQA 0.332 / 0.612, d64 MHA 0.712 / 0.730 (worst 1.052). d128 (MHA failed,
+    # GQA's off-tile side changed no holdout cell), d256 MHA and d64 GQA failed: they keep their entries / hand rules.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 23.904, "sm80_dense_chunk_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 28.406, "sm80_dense_chunk_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm80_dense_chunk_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", False, "mha", True): Entry("ge", 20.329, "sm80_dense_chunk_20261117"),
     # study sm80_paged_mtp_sink_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 9bdf9a8ab; the same generation graph, paged page 16,
     # d64 with a sink, full and 128-key window, s_q 2-4, b 1-128, KV 4k-128k; 280 train cells, a 60-cell seeded holdout scored once:
     # the four classes moved 47 cells at 0.29-0.41 geomean, worst 1.07). The a100 nightly (run-547) had gpt-oss paged MTP at 3.9-8.4x.
