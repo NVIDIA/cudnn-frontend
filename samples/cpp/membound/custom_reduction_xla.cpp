@@ -5,6 +5,10 @@
 
 // XLA's variadic argmax over (value, s32 index) with only the index read, as a custom reduction. Every shape below
 // is an argmax operand shape taken from XLA HLO. Each case is checked element for element against a host reference.
+//
+// XLA's argmax reduces against an iota along the reduced axis. Here that iota is made in the graph with a GEN_INDEX
+// pointwise operation, so the kernel reads no index tensor from memory. Only the split second stage binds an index
+// tensor: its indices are the global positions that stage 1 found, not an iota.
 
 #include <catch2/catch_test_macros.hpp>
 #include "../utils/helpers.h"
@@ -237,8 +241,16 @@ accepted_argmax(std::vector<float> const& values,
     return {reference_argmax(values, indices, layout, row)};
 }
 
-// Builds and runs one argmax. values/indices are host copies of what the device reads (values already rounded to
-// the stream type). Returns the index output.
+// Where the index stream of run_argmax comes from.
+//   In_graph: a GEN_INDEX pointwise operation along the reduced axis, the iota of XLA's argmax. The kernel computes
+//     the index; no index tensor is bound.
+//   Caller_tensor: an INT32 input tensor that the caller fills. Use it only when the indices are not an iota, as in
+//     the split second stage.
+enum class Index_source { In_graph, Caller_tensor };
+
+// Builds and runs one argmax. values/indices are host copies of what the device sees (values already rounded to
+// the stream type). With Index_source::In_graph, indices must be iota_along_axis: the host reference reads them, the
+// device makes them. Returns the index output.
 Case_result
 run_argmax(cudnnHandle_t handle,
            std::vector<int64_t> const& dims,
@@ -246,6 +258,7 @@ run_argmax(cudnnHandle_t handle,
            fe::DataType_t value_type,
            std::vector<float> const& values,
            std::vector<int32_t> const& indices,
+           Index_source index_source,
            Arg_nan_rule rule = Arg_nan_rule::XLA) {
     Case_result result;
     Layout const layout(dims, axis);
@@ -255,9 +268,20 @@ run_argmax(cudnnHandle_t handle,
     auto const stride = packed_stride(dims);
     auto X_value      = graph.tensor(
         fe::graph::Tensor_attributes().set_name("value").set_dim(dims).set_stride(stride).set_data_type(value_type));
-    auto X_index =
-        graph.tensor(fe::graph::Tensor_attributes().set_name("index").set_dim(dims).set_stride(stride).set_data_type(
-            fe::DataType_t::INT32));
+    std::shared_ptr<fe::graph::Tensor_attributes> X_index;
+    if (index_source == Index_source::In_graph) {
+        X_index = graph.pointwise(X_value,
+                                  fe::graph::Pointwise_attributes()
+                                      .set_name("index")
+                                      .set_mode(fe::PointwiseMode_t::GEN_INDEX)
+                                      .set_axis(axis)
+                                      .set_compute_data_type(fe::DataType_t::INT32));
+        X_index->set_data_type(fe::DataType_t::INT32);
+    } else {
+        X_index = graph.tensor(
+            fe::graph::Tensor_attributes().set_name("index").set_dim(dims).set_stride(stride).set_data_type(
+                fe::DataType_t::INT32));
+    }
     auto outputs        = graph.custom_reduction({X_value, X_index}, xla_argmax("xla_argmax", axis, value_type, rule));
     auto const out_dims = keep_dims(dims, axis);
     // Only the index is read, as in XLA; the value result stays virtual.
@@ -276,7 +300,9 @@ run_argmax(cudnnHandle_t handle,
 
     size_t const value_bytes = value_type == fe::DataType_t::BFLOAT16 ? sizeof(nv_bfloat16) : sizeof(float);
     Device_buffer d_value(static_cast<size_t>(layout.elements()) * value_bytes);
-    Device_buffer d_index(static_cast<size_t>(layout.elements()) * sizeof(int32_t));
+    Device_buffer d_index(index_source == Index_source::Caller_tensor
+                              ? static_cast<size_t>(layout.elements()) * sizeof(int32_t)
+                              : size_t{0});
     Device_buffer d_out(static_cast<size_t>(layout.rows()) * sizeof(int32_t));
     if (value_type == fe::DataType_t::BFLOAT16) {
         std::vector<nv_bfloat16> staged(values.size());
@@ -287,14 +313,17 @@ run_argmax(cudnnHandle_t handle,
     } else {
         CUDA_CHECK(cudaMemcpy(d_value.get(), values.data(), values.size() * value_bytes, cudaMemcpyHostToDevice));
     }
-    CUDA_CHECK(cudaMemcpy(d_index.get(), indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_out.get(), 0xFF, static_cast<size_t>(layout.rows()) * sizeof(int32_t)));
 
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Device_buffer workspace(static_cast<size_t>(workspace_size));
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> pack = {
-        {X_value, d_value.get()}, {X_index, d_index.get()}, {outputs.at(1), d_out.get()}};
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> pack = {{X_value, d_value.get()},
+                                                                                     {outputs.at(1), d_out.get()}};
+    if (index_source == Index_source::Caller_tensor) {
+        CUDA_CHECK(cudaMemcpy(d_index.get(), indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        pack[X_index] = d_index.get();
+    }
     auto exec = graph.execute(handle, pack, workspace.get());
     if (!exec.is_good()) {
         result.built   = false;
@@ -403,8 +432,9 @@ run_argmax_family(char const* family,
         for (auto const fill : {Fill::Ties, Fill::OneNaN, Fill::TwoNaN, Fill::SignedZeroTies, Fill::AllNegInf}) {
             std::vector<float> values;
             fill_argmax_values(values, layout, value_type, fill, seed++);
-            check_case(std::string(family) + " " + shape_string(shape.dims, shape.axis) + "/" + fill_name(fill),
-                       run_argmax(handle, shape.dims, shape.axis, value_type, values, indices, rule));
+            check_case(
+                std::string(family) + " " + shape_string(shape.dims, shape.axis) + "/" + fill_name(fill),
+                run_argmax(handle, shape.dims, shape.axis, value_type, values, indices, Index_source::In_graph, rule));
         }
     }
 }
@@ -462,7 +492,8 @@ TEST_CASE("Custom reduction XLA argmax shapes with the torch rule, bf16 value, s
 
 // XLA splits an argmax in two. The second stage reduces the (value, index) partials to the index alone, which
 // executes: its indices are global positions, not an iota, so the tie-break compares index values. Its result is
-// checked against the argmax of the whole unsplit row.
+// checked against the argmax of the whole unsplit row. This is the one case that binds a caller-supplied index
+// tensor (Index_source::Caller_tensor): the indices are data from stage 1, so GEN_INDEX cannot make them.
 TEST_CASE("Custom reduction XLA split argmax second stage", "[custom_reduction][xla][argmax][split]") {
     if (auto const* reason = custom_reduction_runtime_skip_reason(); reason != nullptr) {
         SKIP(reason);
@@ -508,7 +539,13 @@ TEST_CASE("Custom reduction XLA split argmax second stage", "[custom_reduction][
                     indices[at]       = winner;
                 }
             }
-            auto result = run_argmax(handle, {split.batch, split.parts}, 1, fe::DataType_t::FLOAT, values, indices);
+            auto result = run_argmax(handle,
+                                     {split.batch, split.parts},
+                                     1,
+                                     fe::DataType_t::FLOAT,
+                                     values,
+                                     indices,
+                                     Index_source::Caller_tensor);
             if (result.built) {
                 // run_argmax compared against the argmax of the partials; also hold it to the unsplit row.
                 Layout const partial({split.batch, split.parts}, 1);

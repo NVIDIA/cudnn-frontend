@@ -5,7 +5,8 @@
 
 // Token selection of LLM decoding with reduction_modifiers::argmax over [B, V] logits: greedy argmax, the target
 // argmax of speculative-decoding verify, a masked argmax and Gumbel-max sampling. The last two compute the argmax
-// input with pointwise operations in the same graph. Each result is checked against a host reference.
+// input with pointwise operations in the same graph. Each result is checked against a host reference. The token
+// index is made in the graph with GEN_INDEX, so no index tensor is read from memory.
 
 #include <catch2/catch_test_macros.hpp>
 #include "../utils/helpers.h"
@@ -110,9 +111,17 @@ logits_tensor(fe::graph::Graph& graph, char const* name, int64_t rows, fe::DataT
                             .set_data_type(type));
 }
 
-// The argmax of y along the vocabulary, with the index tensor 0 ... V-1 of every row; returns the index output.
+// The argmax of y along the vocabulary; returns the index output. The index stream 0 ... V-1 of every row is a
+// GEN_INDEX along the vocabulary axis, made in the graph.
 Tensor_t
-argmax_over_vocabulary(fe::graph::Graph& graph, Tensor_t const& y, Tensor_t const& index, fe::DataType_t value_type) {
+argmax_over_vocabulary(fe::graph::Graph& graph, Tensor_t const& y, fe::DataType_t value_type) {
+    auto index = graph.pointwise(y,
+                                 fe::graph::Pointwise_attributes()
+                                     .set_name("token_index")
+                                     .set_mode(fe::PointwiseMode_t::GEN_INDEX)
+                                     .set_axis(1)
+                                     .set_compute_data_type(fe::DataType_t::INT32));
+    index->set_data_type(fe::DataType_t::INT32);
     auto outputs = graph.custom_reduction({y, index},
                                           fe::graph::reduction_modifiers::argmax(
                                               Attributes().set_name("next_token").set_reduction_dims({1}), value_type));
@@ -139,15 +148,6 @@ run(fe::graph::Graph& graph, std::unordered_map<Tensor_t, void*> pack, Tensor_t 
     return out.copy_to_host();
 }
 
-std::vector<int32_t>
-vocabulary_iota(int64_t rows) {
-    std::vector<int32_t> iota(static_cast<size_t>(rows * vocabulary));
-    for (size_t i = 0; i < iota.size(); ++i) {
-        iota[i] = static_cast<int32_t>(static_cast<int64_t>(i) % vocabulary);
-    }
-    return iota;
-}
-
 // BF16 logits, N(0, 3^2), with exact float copies of the stored values.
 void
 make_logits(int64_t rows, uint32_t seed, std::vector<uint16_t>& bits, std::vector<float>& values) {
@@ -171,17 +171,14 @@ TEST_CASE("Custom reduction greedy decoding: next token by argmax of BF16 logits
     std::vector<uint16_t> bits;
     std::vector<float> values;
     make_logits(batch, 1, bits, values);
-    auto const iota = vocabulary_iota(batch);
 
     fe::graph::Graph graph;
     graph.set_intermediate_data_type(fe::DataType_t::FLOAT);
     auto logits = logits_tensor(graph, "logits", batch, fe::DataType_t::BFLOAT16);
-    auto index  = logits_tensor(graph, "index", batch, fe::DataType_t::INT32);
-    auto token  = argmax_over_vocabulary(graph, logits, index, fe::DataType_t::BFLOAT16);
+    auto token  = argmax_over_vocabulary(graph, logits, fe::DataType_t::BFLOAT16);
 
     Device_array<uint16_t> d_logits(bits);
-    Device_array<int32_t> d_index(iota);
-    auto const got = run(graph, {{logits, d_logits.ptr}, {index, d_index.ptr}}, token, batch);
+    auto const got = run(graph, {{logits, d_logits.ptr}}, token, batch);
     REQUIRE(got == host_argmax(values, batch));
 }
 
@@ -211,12 +208,10 @@ TEST_CASE("Custom reduction speculative decoding: verify draft tokens against th
     fe::graph::Graph graph;
     graph.set_intermediate_data_type(fe::DataType_t::FLOAT);
     auto logits = logits_tensor(graph, "target_logits", rows, fe::DataType_t::BFLOAT16);
-    auto index  = logits_tensor(graph, "index", rows, fe::DataType_t::INT32);
-    auto token  = argmax_over_vocabulary(graph, logits, index, fe::DataType_t::BFLOAT16);
+    auto token  = argmax_over_vocabulary(graph, logits, fe::DataType_t::BFLOAT16);
 
     Device_array<uint16_t> d_logits(bits);
-    Device_array<int32_t> d_index(vocabulary_iota(rows));
-    auto const got = run(graph, {{logits, d_logits.ptr}, {index, d_index.ptr}}, token, rows);
+    auto const got = run(graph, {{logits, d_logits.ptr}}, token, rows);
     REQUIRE(got == want);
     for (int64_t b = 0; b < batch; ++b) {
         int64_t accepted = 0;
@@ -248,7 +243,6 @@ TEST_CASE("Custom reduction masked argmax: excluded tokens take -inf", "[custom_
     graph.set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
     auto logits  = logits_tensor(graph, "logits", batch, fe::DataType_t::BFLOAT16);
     auto allowed = logits_tensor(graph, "allowed", batch, fe::DataType_t::BYTE_BOOLEAN);
-    auto index   = logits_tensor(graph, "index", batch, fe::DataType_t::INT32);
     auto minus_infinity =
         graph.tensor(-std::numeric_limits<float>::infinity(), fe::graph::ScalarType::COMPILE_TIME_CONST);
     minus_infinity->set_name("minus_infinity").set_dim({1, 1}).set_stride({1, 1});
@@ -260,12 +254,11 @@ TEST_CASE("Custom reduction masked argmax: excluded tokens take -inf", "[custom_
                                  .set_mode(fe::PointwiseMode_t::BINARY_SELECT)
                                  .set_compute_data_type(fe::DataType_t::FLOAT));
     y->set_data_type(fe::DataType_t::FLOAT);
-    auto token = argmax_over_vocabulary(graph, y, index, fe::DataType_t::FLOAT);
+    auto token = argmax_over_vocabulary(graph, y, fe::DataType_t::FLOAT);
 
     Device_array<uint16_t> d_logits(bits);
     Device_array<uint8_t> d_mask(mask);
-    Device_array<int32_t> d_index(vocabulary_iota(batch));
-    auto const got = run(graph, {{logits, d_logits.ptr}, {allowed, d_mask.ptr}, {index, d_index.ptr}}, token, batch);
+    auto const got = run(graph, {{logits, d_logits.ptr}, {allowed, d_mask.ptr}}, token, batch);
     REQUIRE(got == host_argmax(masked, batch));
 }
 
@@ -295,7 +288,6 @@ TEST_CASE("Custom reduction Gumbel-max sampling: argmax of logits / T + noise", 
     graph.set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
     auto logits = logits_tensor(graph, "logits", batch, fe::DataType_t::BFLOAT16);
     auto g      = logits_tensor(graph, "noise", batch, fe::DataType_t::FLOAT);
-    auto index  = logits_tensor(graph, "index", batch, fe::DataType_t::INT32);
     auto t      = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("temperature")
                               .set_dim({batch, 1})
@@ -315,13 +307,11 @@ TEST_CASE("Custom reduction Gumbel-max sampling: argmax of logits / T + noise", 
                                  .set_mode(fe::PointwiseMode_t::ADD)
                                  .set_compute_data_type(fe::DataType_t::FLOAT));
     y->set_data_type(fe::DataType_t::FLOAT);
-    auto token = argmax_over_vocabulary(graph, y, index, fe::DataType_t::FLOAT);
+    auto token = argmax_over_vocabulary(graph, y, fe::DataType_t::FLOAT);
 
     Device_array<uint16_t> d_logits(bits);
     Device_array<float> d_noise(noise);
     Device_array<float> d_temperature(temperature);
-    Device_array<int32_t> d_index(vocabulary_iota(batch));
-    auto const got = run(
-        graph, {{logits, d_logits.ptr}, {g, d_noise.ptr}, {t, d_temperature.ptr}, {index, d_index.ptr}}, token, batch);
+    auto const got = run(graph, {{logits, d_logits.ptr}, {g, d_noise.ptr}, {t, d_temperature.ptr}}, token, batch);
     REQUIRE(got == host_argmax(perturbed, batch));
 }
