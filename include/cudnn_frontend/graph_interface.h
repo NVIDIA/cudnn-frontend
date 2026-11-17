@@ -4052,6 +4052,12 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
 #endif
             int64_t const plan_count_before = get_execution_plan_count();
             auto preferred_status           = create_execution_plan(engine_id, user_knobs);
+            if (sub_node->is_heuristics_override_exclusive()) {
+                // The request rests on this config (the unified SDPA backward selects its deterministic and d = 256
+                // kernels through it), so no heuristics config may stand in for it.
+                CHECK_CUDNN_FRONTEND_ERROR(preferred_status);
+                return {error_code_t::OK, ""};
+            }
             if (preferred_status.is_good()) {
                 preferred_enqueued = true;
             } else {

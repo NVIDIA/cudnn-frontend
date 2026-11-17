@@ -2367,6 +2367,13 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
         return Type::SDPA_BWD;
     }
 
+    // The deterministic algorithm (and d = 256 on SM10x) is a property of the config override_heuristics_query() pins,
+    // not of the graph: the heuristics' configs for the same graph run the non-deterministic kernels.
+    bool
+    is_heuristics_override_exclusive() const override final {
+        return true;
+    }
+
     // Deterministic dQ on the unified backward engine is selected through the engine's STAGES knob (the
     // heuristics never emit it): 2 kernels (dK/dV, then dQ) on SM10x; on SM8x / SM9x / SM12x the dS workspace with a
     // post-kernel dQ matmul (STAGES = 2), like the composite node's dP-workspace path. On SM90 the kv-ordered dQ

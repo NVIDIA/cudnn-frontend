@@ -490,6 +490,14 @@ class INode {
         return {-1, {}};
     }
 
+    // Whether the config override_heuristics_query() returns is the only one that serves this node as requested. An
+    // exclusive config is not followed by the heuristics' configs, and a backend that declines it leaves the graph
+    // unsupported instead of falling back to the heuristics query.
+    virtual bool
+    is_heuristics_override_exclusive() const {
+        return false;
+    }
+
     std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,
                                               std::shared_ptr<Tensor_attributes>,
                                               Matmul_attributes);
