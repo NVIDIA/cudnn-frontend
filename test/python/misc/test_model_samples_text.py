@@ -785,14 +785,16 @@ def test_the_first_token_line_counts_decode_steps_and_states_no_time():
 
 
 class _Recorder:
-    """A stand-in for standard output that records what it is handed and when it is flushed."""
+    """A stand-in for standard output that records what it is handed and when it is flushed.  Its ``fail_at``-th write
+    fails with ``error``, once: a write after it would be recorded again."""
 
     def __init__(self, events=None, fail_at=None, error=None):
         self.events = [] if events is None else events
-        self.fail_at, self.error = fail_at, error
+        self.fail_at, self.error, self.writes = fail_at, error, 0
 
     def write(self, text):
-        if self.fail_at is not None and len([e for e in self.events if e[0] == "text"]) >= self.fail_at:
+        self.writes += 1
+        if self.writes == self.fail_at:
             raise self.error
         self.events.append(("text", text))
 
@@ -828,6 +830,7 @@ def test_where_the_generated_text_goes(tmp_path):
     file = serving_options.TextSink(str(target))
     assert file.name == "answer.txt" and "answer.txt as it is generated" in file.announced() and str(tmp_path) not in file.announced() + file.reported()
     assert not target.exists(), "nothing is created before there is text"
+    target.write_text("the answer of an earlier run\n")  # what the file held is replaced, not added to
     file.write("naïve ")
     assert target.read_text(encoding="utf-8") == "naïve ", "a piece is on disk when write() returns"
     file.write("café 🙂\n")
@@ -842,11 +845,14 @@ def test_where_the_generated_text_goes(tmp_path):
             "'ascii' codec can't encode character '\\xe9' in position 0: ordinal not in range(128)",
         ),
     ):
-        out = _Recorder(fail_at=1, error=error)
+        out = _Recorder(fail_at=2, error=error)
         sink = serving_options.TextSink(stream=out)
         for piece in ("a", "b", "c"):
             sink.write(piece)
-        assert sink.error == said and out.events == [("text", "a"), ("flush",)], "after the first failure nothing more is written"
+        assert sink.error == said and out.events == [
+            ("text", "a"),
+            ("flush",),
+        ], "after a failed write nothing more is written, although the stream would take it"
         assert sink.reported() == f"could not be written to stdout ({said})"
     gone = serving_options.TextSink(str(tmp_path / "no-such-folder" / "answer.txt"))
     gone.write("text")
@@ -1155,12 +1161,34 @@ def test_the_text_is_written_between_the_steps_of_the_loop_and_every_other_line_
     # a destination that stopped taking text: the loop goes on, and the report says what is missing
     session.reset(fresh=True)
     session.new_report()
-    closed = serving_options.TextSink(stream=_Recorder(fail_at=2, error=OSError(errno.EPIPE, PIPE)))
+    closed = serving_options.TextSink(stream=_Recorder(fail_at=3, error=OSError(errno.EPIPE, PIPE)))
     still = sample._decode(session, text, forced, prompts, tie_out, check=False, checked_steps=16, sink=closed)
     assert still[2] == produced and closed.error == PIPE
     assert _lines(capsys.readouterr().err, "text out ") == [
         f"text out              sequence 0, 6 tokens, stopped after 6 tokens: could not be written to stdout ({PIPE})"
     ]
+
+    # what a sequence that stopped inside a character still owes: written before the line break, streamed or not
+    class Owing:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def push(self, token):
+            return self._stream.push(token)
+
+        def close(self):
+            return "<owed>"
+
+    real_decoder = text.decoder
+    monkeypatch.setattr(text, "decoder", lambda prompt_ids=None: Owing(real_decoder(prompt_ids)))
+    for streamed in (True, False):
+        session.reset(fresh=True)
+        session.new_report()
+        owed = _Recorder()
+        sample._decode(session, text, forced, prompts, tie_out, check=False, checked_steps=16, sink=serving_options.TextSink(streamed=streamed, stream=owed))
+        assert "".join(event[1] for event in owed.events if event[0] == "text") == text.decode(produced[0]) + "<owed>\n", streamed
+    monkeypatch.setattr(text, "decoder", real_decoder)
+    capsys.readouterr()
 
     # seeded weights: not language; the same loop writes it nowhere, whatever sink it is handed
     seeded_text = model_samples.TextIO.synthetic(model.geometry.vocab)
