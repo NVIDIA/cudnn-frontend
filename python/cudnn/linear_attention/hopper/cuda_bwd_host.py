@@ -70,6 +70,11 @@ _NAME_EXPRESSIONS = (
     "k_scan_t<32, 256, true, true>",
     "k_scan_t<32, 256, true, false>",
     "k_scan_t<32, 256, false, false>",
+    "k_scan_t<16, 128, true, true, true>",
+    "k_scan_t<16, 128, true, false, true>",
+    "k_scan_t<32, 256, true, true, true>",
+    "k_scan_t<32, 256, true, false, true>",
+    "k_scan_t<32, 256, false, false, true>",
     "k_bwd<true>",
     "k_bwd<false>",
 )
@@ -341,11 +346,14 @@ def launch(
     n_heads: int,
     n_seqs: int,
     scale: float,
+    gradient_outputs: bool = True,
 ) -> None:
-    """One backward pass: k_meta (varlen only), k_prep, k_scan_t, k_bwd.
+    """One backward pass: k_meta (varlen only), k_prep, k_scan_t, and optionally k_bwd.
 
     All tensor arguments are device addresses; ``scale`` is the query scale the
-    forward applied. Restated from the artifact's ``kda_bwd_launch``.
+    forward applied. Restated from the artifact's ``kda_bwd_launch``. Setting
+    ``gradient_outputs=False`` is an internal qualification hook: it stops once
+    ``d_initial_state`` is complete and does not touch dq/dk/dv/dg/dbeta.
     """
     lib = library(device)
     ws, ncs, _ = _layout(workspace, total_tokens, n_heads, n_seqs)
@@ -400,6 +408,10 @@ def launch(
             scan_name = "k_scan_t<32, 256, false, false>"
             grid, block = (2 * (DH // 32), N * H, 1), (256, 1, 1)
 
+        if not gradient_outputs:
+            scan_name = scan_name[:-1] + ", true>"
+            grid = (grid[0] // 2, grid[1], grid[2])
+
         scan = _Params()
         for address in (
             ws["wneg"],
@@ -432,6 +444,9 @@ def launch(
             params=scan,
             what=f"{scan_name} (T={T}, H={H}, N={N})",
         )
+
+        if not gradient_outputs:
+            return
 
         bwd = _Params()
         for address in (q, k, v, g, beta, dO, ws["amat"], ws["vnew"], ws["dv2"], ws["hst"], ws["dhst"], ws["cs_t0"], ws["cs_len"], dq, dk, dv, dg, dbeta):

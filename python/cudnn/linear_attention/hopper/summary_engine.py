@@ -21,6 +21,7 @@ from cudnn.frost import buffers
 from cudnn.frost.device import build_device, current_device, device_context
 
 from ..graph_analyzer import analyze, to_buffer_dtype
+from . import marshal
 
 _LOCK = threading.Lock()
 _LIBRARIES = {}
@@ -183,6 +184,7 @@ class KdaSummaryHopperCudaEngine(BaseEngine):
     """SM90 forward/reverse summary provider for the existing KDA graph nodes."""
 
     name = "kda_summary_hopper_cuda"
+    plan_class = KdaSummaryHopperPlan
     behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph):
@@ -201,4 +203,108 @@ class KdaSummaryHopperCudaEngine(BaseEngine):
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         with build_device(device):
-            return KdaSummaryHopperPlan(graph, graph._facts_for(analyze))
+            return self.plan_class(graph, graph._facts_for(analyze))
+
+
+class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
+    """G-only reverse summary from the ordinary chunk-parallel backward scan.
+
+    Packed-forward CP already owns the span transition, so this explicit plan
+    emits only ``d_initial_state``. It reuses the ordinary backward's prep and
+    reverse scan, stops before token gradients, and launches no forward scan
+    CTAs. The absent final-state gradient is a caller-workspace zero row.
+    """
+
+    plan_name = "kda_summary_hopper_scan"
+
+    def __init__(self, graph, facts):
+        from cudnn.frost.workspace import WorkspaceLayout
+        from . import cuda_bwd_host
+
+        node = next(iter(graph.nodes))
+        self.device = current_device()
+        self.is_bwd = True
+        self.total = facts.total_t
+        self.heads = facts.h_o
+        self.seqs = facts.n_seq
+        self.scale = float(facts.scale) if facts.scale is not None else 128**-0.5
+        self.cu64 = facts.cu_dtype == cudnn.data_type.INT64
+        self.geometry = {name: (tuple(t.dim), to_buffer_dtype(t.get_data_type())) for name, t in {**node.inputs, **node.outputs}.items()}
+        self.outputs = set(node.outputs)
+        self.ports = None
+        layout = WorkspaceLayout(align=256)
+        self.scratch_offset = layout.add(cuda_bwd_host.workspace_bytes(self.total, self.heads, self.seqs), align=256)
+        self.zero_offset = layout.add(self.seqs * self.heads * 128 * 128 * 4, align=256)
+        self.workspace_bytes = layout.size
+        # Compile at plan build, never on the first execute/capture.
+        self.library = cuda_bwd_host.library(self.device)
+
+    def get_workspace_size(self):
+        return self.workspace_bytes
+
+    def _launch(self, params, x, spans, variant_pack, ctx):
+        del params
+        from cudnn.frost.workspace import Workspace
+        from . import cuda_bwd_host
+
+        if not self.seqs:
+            return
+        Workspace.over(variant_pack, self.workspace_bytes, self.plan_name, align=256)
+        if type(ctx.workspace) is not int:
+            Workspace(ctx.workspace, self.workspace_bytes, self.plan_name, align=256, device=self.device)
+        workspace = int(variant_pack.workspace)
+        for name, start, end in spans:
+            if start < end and workspace < end and start < workspace + self.workspace_bytes:
+                raise ValueError(f"{self.plan_name}: workspace overlaps {name}")
+        stream = int(ctx.stream or 0)
+        zero = workspace + self.zero_offset
+        buffers.memset_zero_async(zero, self.seqs * self.heads * 128 * 128 * 4, stream)
+        addr = {name: value[0] for name, value in x.items()}
+        cuda_bwd_host.launch(
+            device=self.device,
+            stream=stream,
+            workspace=workspace + self.scratch_offset,
+            dO=addr["dO"],
+            q=addr["q"],
+            k=addr["k"],
+            v=addr["dO"],
+            g=addr["g"],
+            beta=addr["beta"],
+            cu_seqlens=addr["cu_seqlens"],
+            initial_state=0,
+            d_final_state=zero,
+            dq=0,
+            dk=0,
+            dv=0,
+            dg=0,
+            dbeta=0,
+            d_initial_state=addr["d_initial_state"],
+            total_tokens=self.total,
+            n_heads=self.heads,
+            n_seqs=self.seqs,
+            scale=self.scale,
+            gradient_outputs=False,
+        )
+
+
+class KdaSummaryHopperScanEngine(KdaSummaryHopperCudaEngine):
+    """Explicit state-only SM90 reverse summary using the ordinary scan."""
+
+    name = "kda_summary_hopper_scan"
+    plan_class = KdaSummaryHopperScanPlan
+
+    def check_support(self, graph):
+        super().check_support(graph)
+        facts = graph._facts_for(analyze)
+        node = next(iter(graph.nodes))
+        if not facts.is_bwd:
+            raise NotImplementedError(f"{self.name}: reverse summary only")
+        if set(node.inputs) != {"q", "k", "g", "beta", "dO", "cu_seqlens"} or set(node.outputs) != {"d_initial_state"}:
+            raise NotImplementedError(f"{self.name}: requires an unseeded G-only summary without transition or context")
+        if not facts.batch_invariant:
+            raise NotImplementedError(f"{self.name}: requires batch_invariant=True")
+        if facts.cu_dtype != cudnn.data_type.INT32:
+            raise NotImplementedError(f"{self.name}: requires int32 cu_seqlens")
+        for tensor_name, tensor in {**node.inputs, **node.outputs}.items():
+            if not marshal.packed(tensor.dim, tensor.stride):
+                raise NotImplementedError(f"{self.name}: {tensor_name} must be packed row-major")

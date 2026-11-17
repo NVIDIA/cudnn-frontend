@@ -71,6 +71,7 @@ arbitrary user callbacks.
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `kimi_delta_attention_summary` | state / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
 | `kimi_delta_attention_summary_bwd` | state-gradient / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
+| KDA reverse summary, explicit `kda_summary_hopper_scan` | reverse state G only | BF16 ordinary-backward scan, FP32 output | Supported | Unsupported | Unsupported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -309,6 +310,17 @@ a row alone and inside a batch under the entry's own picks.
   do not provide dQ/dK/dV/dG/dBeta or a backward context; this qualification
   does not establish determinism of the ordinary SM90 KDA apply kernels.
 
+- The explicit `kda_summary_hopper_scan` SM90 plan is qualified only for the
+  unseeded reverse G output with packed K=V=128 BF16 inputs, equal head counts,
+  int32 offsets, `batch_invariant=True`, and no transition/context output. Its
+  output bytes match the ordinary Hopper KDA backward's `d_initial_state`; this
+  is intentionally the ordinary mixed-precision scan rather than the direct
+  FP32 summary recurrence. Four fixed-input replays, changed-neighbor packing,
+  duplicated/empty sequences, poisoned caller workspace, changed-input CUDA
+  Graph replay, and fresh-address rebinding retain identical bytes. The plan
+  does not provide a forward summary, a transition, a seeded state gradient,
+  cu64 offsets, or token gradients. Those forms are unsupported by this plan,
+  not silently interpreted.
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
   rows move. The fused CuTe path also changes scalar loss and saved gradient

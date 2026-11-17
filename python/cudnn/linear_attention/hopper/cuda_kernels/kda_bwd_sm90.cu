@@ -1059,7 +1059,7 @@ static constexpr uint32_t O_GN = O_A + 64 * PCV * 2;
 // accumulator is staged through shared memory as bf16x2 pairs, halving the
 // conversion and store counts.
 // ---------------------------------------------------------------------------
-template <int BV, int NT, bool SINGLE, bool FULL>
+template <int BV, int NT, bool SINGLE, bool FULL, bool REVERSE_ONLY = false>
 __global__
 __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
                                        const bf16* __restrict__ uu,
@@ -1085,7 +1085,7 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
     constexpr int NW  = NT / 32;
     constexpr int C8V = BV / 8;
 
-    const int dir = blockIdx.x / NVB, vb = blockIdx.x % NVB;
+    const int dir = REVERSE_ONLY ? 1 : blockIdx.x / NVB, vb = blockIdx.x % NVB;
     const int nh = blockIdx.y, n = nh / H, h = nh % H;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t gs = (size_t)H * DH;

@@ -85,6 +85,18 @@ The five families support chunkwise context parallelism. We leave the all-gather
 
 Each rank summarizes one boundary sequence. `<op>_summary` for the last local sequence from a zero state for the forward, and `<op>_summary_bwd` on the first local sequence from a zero outgoing-state gradient for the backward. Each returns a state row and the span's transition operator. After the all-gather, the forward on rank `rank` takes `gathered[preceding_rank_start:rank]` and the backward `gathered[rank + 1:following_rank_stop]`, in ascending rank order. The fold is inside the ops. The forward takes the preceding ranks' slices as `preceding_state_update` and `preceding_transition`. The raw backward op `torch.ops.cudnn.<op>_bwd` takes the following ranks' slices as `following_state_grad` and `following_transition` and folds them into the gradient state the last local sequence starts from.
 
+On SM90, a KDA caller that already retains the packed-forward transition can
+request `plan_name="kda_summary_hopper_scan"` for the reverse G term alone. The
+plan requires BF16 packed K=V=128 tensors, equal head counts, int32 offsets,
+`batch_invariant=True`, no final-state gradient, and
+`output_transition=False`. It reuses the ordinary Hopper backward's reverse
+scan byte-for-byte, omits the forward scan CTAs, and exits before token
+gradients. It is an explicit opt-in plan
+(`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`) and uses caller-owned workspace;
+query `graph.get_workspace_size()` rather than hard-coding its size. It is most
+useful for CP implementations that can transpose/reuse the forward transition
+instead of recomputing the reverse transition.
+
 ## Context Parallelism Example
 
 Below, we show an example of using context parallelism in practice.

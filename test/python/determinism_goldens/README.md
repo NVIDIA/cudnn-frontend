@@ -8492,3 +8492,58 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+### SM90 KDA state-only reverse scan — 2026-11-18
+
+`linear_attention/hopper/test_kda_summary_scan_sm90.py` adds 14 L0 cases for
+the explicit `kda_summary_hopper_scan` plan. The served contract is reverse
+G only: packed BF16 K=V=128 inputs, equal heads, FP32 log gate/beta/output,
+int32 offsets, `batch_invariant=True`, no seed, transition, context, or token
+gradients. The suite rejects each incompatible form explicitly, including
+cu64 offsets. The numerical oracle is independent FP64 with an ordinary-
+backward accuracy bound; the stronger implementation contract compares every
+G byte with the complete Hopper KDA backward's `d_initial_state` before its
+token-gradient kernel runs.
+
+Determinism covers four fixed-input executions under concurrent GPU work,
+moving and duplicating a 33-token sequence among empty and changed neighbors,
+and a 23-sequence packed batch. CUDA Graph coverage poisons the full caller
+workspace with `0xff`, changes Q/dO/g and packed boundaries, replays, then
+rebinds fresh operand/output/workspace addresses. A short observed workspace
+is rejected before the output sentinel changes. Host launch tests pin all
+three scheduler variants: only the reverse half-grid is launched and `k_bwd`
+is absent. The new H20 runtime golden is
+`32cb2f58db95235f/kda_summary_scan_sm90_bwd_bf16.json`; no existing golden was
+replaced.
+
+On H20-3e (SM90, 78 SMs), Torch 2.9.1+cu128, CUDA toolkit/runtime 12.8,
+driver API 12080, cuDNN 91002, CuTe DSL 4.8.1 and TVM FFI 0.1.15.post2, imports
+resolved to the candidate checkout based on
+`e89ebcfaaf54b118257ae109a5afaa7dcff22565`. The recording run passed **1 test,
+no skips**; the strict full suite passed **14 tests, no skips** in 1.20 s. The
+existing Hopper KDA and FP32-summary suites passed **78 tests with 2 resource
+skips** in 3.30 s. SM100/103/107 are unsupported by this plan. CUDA 13
+execution is unverified; the kernel has no new CuTeDSL dependency.
+
+The direct benchmark at T=65,536/H=32 measured the complete ordinary backward
+host at 21.9227 ms and the prep plus reverse-only scan at 9.6383 ms, a 2.2745x
+speedup with bitwise-equal G. In the H20 CP16 1M-token KDA run, packed-apply
+backward fell 44.9961→32.7748 ms and KDA E2E 79.4098→67.4154 ms (1.178x).
+A contemporaneous full KDA+CSA run fell 2866.8384→2857.3909 ms; CSA remained
+dominant at about 2.79 s. Peak allocated memory fell by 2.5117 GiB in that
+same-environment A/B because the state-only plan avoids the five token-gradient
+outputs even though its caller workspace is large. These timings are benchmark
+evidence, not CI thresholds.
+
+From `test/python`, with a complete CUDA toolkit selected because the pip
+runtime headers omit `crt/mma.h`:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_scan_sm90.py -m L0 -q -s
+CUDA_HOME=/usr/local/cuda-12.8 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_sm90.py \
+  linear_attention/hopper/test_kda_sm90_cuda.py -m L0 -q -s
+```
