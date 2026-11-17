@@ -957,23 +957,13 @@ def test_d576_mla_prefill_follows_its_study(s_kv):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
-def test_sm107_paged_d64_sink_prefill_follows_its_study(s_kv):
-    """Study sm107_paged_d64_sink_prefill_20261117: Rubin paged gpt-oss d64 + sink prefill (full causal) leads off the KV tile and up
-    to 2^9.79 KV-head tiles on it, S_q 5-96 included (a supplement); the 128-key window twin has no entry."""
+def test_sm107_paged_d64_sink_prefill_entries_are_retired(s_kv):
+    """Study sm107_paged_d64_sink_prefill_20261117 trained on chunks over KV >= 4k; its KV-edge supplement lost up to 1.65x on small
+    squares, so its entries are retired."""
     row = "sdpa_fwd_prefill_sm107"
-    study = "sm107_paged_d64_sink_prefill_20261117"
-
-    def f(**over):
-        base = dict(b=1, h_q=64, h_kv=8, s_q=1024, s_kv=s_kv, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(10, 7))
-        base.update(has_paged_kv=True, padded=True, page_size=16, thd=True, has_sink=True, max_total_seq_len_q=1024)
-        base.update(over)
-        return _facts(**base)
-
-    assert pt.matched_entry(row, f()).study == study
-    assert pt.lookup(row, f()) is True  # gpt-oss b 1 q 1024: 2^9 tiles
-    assert pt.lookup(row, f(s_q=8, b=64, max_total_seq_len_q=512)) is True  # verify
-    assert pt.lookup(row, f(b=8, s_q=4096, max_total_seq_len_q=8 * 4096)) is (s_kv % 128 != 0)  # 2^14 tiles: on the tile, the backend
-    assert getattr(pt.matched_entry(row, f(window_left=127)), "study", None) != study
+    base = dict(b=1, h_q=64, h_kv=8, s_q=1024, s_kv=s_kv, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(10, 7))
+    base.update(has_paged_kv=True, padded=True, page_size=16, thd=True, has_sink=True, max_total_seq_len_q=1024)
+    assert getattr(pt.matched_entry(row, _facts(**base)), "study", None) != "sm107_paged_d64_sink_prefill_20261117"
 
 
 @pytest.mark.L0
