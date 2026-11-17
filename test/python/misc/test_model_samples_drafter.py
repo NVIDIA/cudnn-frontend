@@ -226,7 +226,8 @@ def test_a_draft_vocabulary_is_read_once_each_in_order_and_inside_the_vocabulary
     assert twice.ids == (4,) and twice.text().endswith("(2 entries listed; dropped: 1 listed before)")
     beyond = DraftVocab.read(written("beyond.json", [4, 300]), 272)
     assert beyond.ids == (4,) and beyond.text().endswith("(2 entries listed; dropped: 1 outside the vocabulary)")
-    assert DraftVocab.read(written("ids.json", [271]), 271 + 1).ids == (271,) and DraftVocab.read(written("ids.json", [0]), 1).ids == (0,)
+    last, alone = DraftVocab.read(written("last.json", [271]), 271 + 1), DraftVocab.read(written("alone.json", [0]), 1)
+    assert last.ids == (271,) and alone.ids == (0,), "the last id of a model, and the one id of a model that has one"
 
     (tmp_path / "folder.json").mkdir()
     (tmp_path / "bytes.json").write_bytes(b"[1, 2\xff]")
@@ -294,7 +295,8 @@ def test_the_readmes_recipe_makes_a_draft_vocabulary_the_loader_reads(tmp_path, 
         {"sequences": 2, "prompt": 0, "prompt_ids": [[248045, 846], [248045, 9]], "ids": [[70000, 3], [200000, 12]]},
         {"sequences": 1, "prompt": 1, "prompt_ids": [[248045, 846, 5]], "ids": [[70000]]},
     ]
-    assert sample._dump("ids_1.json", "fe-cublas", one) == "" and sample._dump("ids_2.json", "native", two) == ""
+    refused = (sample._dump("ids_1.json", "fe-cublas", one), sample._dump("ids_2.json", "native", two))  # written before anything is asserted
+    assert refused == ("", ""), "the writer returns what went wrong: nothing, twice"
     seen = {248045, 846, 198, 70000, 12, 90000, 248046, 9, 3, 200000, 5}
 
     recipe = _readme_blocks()[1]
@@ -650,9 +652,12 @@ def test_a_drafter_this_sample_does_not_read_is_declined_by_name(tmp_path):
     label = r"checkpoint other \(local\)"
     reads = "it reads a drafter stored in bf16, whose multiplies it quantises to 8 bits when it loads"
     fc, k_proj = DRAFTER + "fc.weight", DRAFTER + "layers.0.self_attn.k_proj.weight"
-    assert described().vocabulary.ids == (1, 2, 3), "the checkpoint as generated is read"
+    # every checkpoint is written and described in a statement of its own: an assert states what came back, it does no work
+    as_generated = described()
+    assert as_generated.vocabulary.ids == (1, 2, 3), "the checkpoint as generated is read"
     for key in ("mtp_num_hidden_layers", "mtp_use_dedicated_embeddings"):  # a config without the two keys: one layer, no table of its own
-        assert described(config_change=lambda c, key=key: c.pop(key)).prefix == DRAFTER
+        without = described(config_change=lambda c, key=key: c.pop(key))
+        assert without.prefix == DRAFTER, key
     declined = (
         (dict(change=drop_the_drafter), rf"^{label} holds no drafter \(no tensor ends in '.pre_fc_norm_hidden.weight' with 'fc.weight' beside it\)$"),
         (dict(change=lambda t: t.pop(fc)), rf"^{label} holds no drafter \("),
