@@ -184,3 +184,38 @@ def _wide_v_engine_guard(graph, facts) -> Dict[int, str]:
         f"(NVIDIA/cudnn-frontend#2401); the backend's other engines serve this graph"
         for engine in WIDE_V_WRONG_O_ENGINES
     }
+
+
+# Actual 9.24.0.43 and 9.25.1.1 native SM100 FP8 prefill STREAM_K=1
+# omit S/V/O compensation from their split partials. On an exact constant-V
+# 8K row with reciprocal S scales256/448, O is16/28 instead of1. 9.24 also
+# writes FP16 bits into BF16 O. Raw C++ and Python graph execution agree;
+# the same engine's STREAM_K=0 is correct. Released9.26.0.51 and9.27.0.42
+# and9.28 preview pass both configurations. Keep this guard plan-granular.
+# 9.23.2.1 offers only STREAM_K=0 and rejects an explicit STREAM_K=1
+# before launch; 9.24/9.25 also fail E4M3/E5M2 outputs, not just 16-bit O.
+FP8_PREFILL_SPLIT_WRONG_O_FIXED_IN = 92600
+
+
+def backend_plan_guard(graph, facts, engine_id, knobs) -> Optional[str]:
+    """Reject an affected native FP8 split configuration while retaining its unsplit sibling."""
+    import cudnn
+    from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
+
+    if facts is None or facts.invalid is not None or facts.is_backward or not facts.is_fp8:
+        return None
+    if facts.device_cc not in ((10, 0), (10, 3)) or facts.s_q <= 1:
+        return None
+    if facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2):
+        return None
+    version = cudnn.backend_version()
+    if not 92400 <= version < FP8_PREFILL_SPLIT_WRONG_O_FIXED_IN:
+        return None
+    opaque = engine_id == BACKEND_HEURISTIC_ENGINE_ID
+    if not opaque and (engine_id not in (3, 10) or not knobs or knobs.get(cudnn.knob_type.STREAM_K) != 1):
+        return None
+    return (
+        f"cuDNN {cudnn.backend_version_string()} native FP8 prefill STREAM_K=1 returns incorrectly scaled O "
+        f"on SM100/SM103 (reproduced in 9.24.0.43 and 9.25.1.1, fixed in 9.26.0.51); "
+        + ("an opaque backend fallback cannot exclude that configuration" if opaque else "STREAM_K=0 and other engines remain available")
+    )
