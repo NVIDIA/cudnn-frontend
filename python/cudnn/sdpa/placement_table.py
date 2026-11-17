@@ -43,6 +43,7 @@ def _dtype_name(dtype) -> Optional[str]:
 
 
 DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80"})
+SM80_DET_NARROW_WINDOW_MAX_LEFT = 383  # window_left at or below keys `window_narrow` on sdpa_bwd_sm80 prefill_det (256 measured, 512 not)
 """Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
 (SM120: the two-kernel dS / dQ split), so those graphs neither share the default classes' entries nor count as unmeasured."""
 
@@ -200,7 +201,10 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         layout += "_bounded"
     bottom_right = facts.bottom_right or facts.s_q == facts.s_kv  # a square reads the same from either corner
     if facts.window_left is not None:
-        mask = "window"
+        # A100 deterministic backward: a window of up to ~384 keys wins from S ~900, a 1024-key one only from S ~3k; neither S nor
+        # S / window orders both (sm80_det_bwd_d64mha_v4_20261117), so narrow windows key apart on this row only.
+        narrow = row == "sdpa_bwd_sm80" and phase == "prefill_det" and facts.window_left <= SM80_DET_NARROW_WINDOW_MAX_LEFT
+        mask = "window_narrow" if narrow else "window"
     elif facts.causal and not (facts.s_q == 1 and bottom_right):  # one bottom-right row sees every key: no mask
         mask = "causal_br" if bottom_right else "causal_tl"
     else:
@@ -1288,6 +1292,31 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "mha", True): Entry(
         "ge", 11.92, "sm80_det_bwd_d64mha_v3_20261117", "kv"
     ),
+    # study sm80_det_bwd_narrow_window_20261117 (A100, cuDNN 9.24.0.43, FE 7c63bf4ff; deterministic backward at windows of up to ~384
+    # keys, d64 / d128, MHA and GQA; the earlier A100 studies' narrow-window cells plus 128 short-S cells (S 256-1024) as train, fitted
+    # under the criterion; a 56-cell holdout scored once). Narrow windows lead from S ~900 (the `window` class from S ~3k), so
+    # gpt-oss's d64 SWA backward at S 2048 leaves engine 7 (2.61x on the a100 nightly).
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window_narrow", False, "gqa", False): Entry(
+        "ge", 9.792, "sm80_det_bwd_narrow_window_20261117", "kv"
+    ),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window_narrow", False, "gqa", True): Entry(
+        "ge", 10.682, "sm80_det_bwd_narrow_window_20261117", "kv"
+    ),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window_narrow", False, "gqa", False): Entry(
+        "ge", 9.792, "sm80_det_bwd_narrow_window_20261117", "kv"
+    ),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window_narrow", False, "gqa", True): Entry(
+        "ge", 32.449, "sm80_det_bwd_narrow_window_20261117", "cost"
+    ),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window_narrow", False, "mha", False): Entry(
+        "ge", 9.792, "sm80_det_bwd_narrow_window_20261117", "kv"
+    ),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill_det", "dense", "window_narrow", False, "mha", True): Entry(
+        "ge", 9.521, "sm80_det_bwd_narrow_window_20261117", "kv"
+    ),
+    # d128 MHA narrow windows failed the narrow study's holdout (1.38x off the tile), so they keep sm80_det_bwd_20261117's `window` rule.
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window_narrow", False, "mha", False): Entry("ge", 34.5, "sm80_det_bwd_20261117"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill_det", "dense", "window_narrow", False, "mha", True): Entry("ge", 34.5, "sm80_det_bwd_20261117"),
     # study sm120_det_bwd_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 9bdf9a8ab; deterministic backward, dense BSHD squares,
     # d64 / d128, MHA and GQA 4 / 8, no mask, causal and 128 / 1024-key windows, S 1k-8k; 128 train cells and a 40-cell holdout
     # scored once: 36 changed cells in 16 classes at 0.14-0.92 geomean, worst 0.93; the two class pairs no holdout cell exercised (d128 causal MHA, d64 no-mask GQA) have no entry). FROST's deterministic body (two kernels) runs 0.1-0.9 of the backend's deterministic engine;

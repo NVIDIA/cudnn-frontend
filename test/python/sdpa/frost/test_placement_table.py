@@ -58,7 +58,12 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert phase.removesuffix("_det") in ("q1", "mtp", "verify", "prefill", "prefill_short_square", "prefill_short_q")
         assert not phase.endswith("_det") or row in pt.DETERMINISTIC_KEYED_ROWS, key
         assert layout.removesuffix("_bounded") in ("dense", "paged", "thd", "thd_ragged")
-        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
+        assert (
+            mask in ("none", "window", "window_narrow", "causal_br", "causal_tl")
+            and isinstance(sink, bool)
+            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
+        )
+        assert mask != "window_narrow" or (row, phase) == ("sdpa_bwd_sm80", "prefill_det"), key  # a row-local key
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -547,11 +552,12 @@ def test_sm120_deterministic_backward_follows_its_study(s):
 def test_sm80_deterministic_backward_follows_its_study(s):
     """Study sm80_det_bwd_20261117: on A100 deterministic backward is keyed like SM120's; windowed d128 and windowed d64 GQA lead from
     S 4096, unwindowed classes keep the hand rule (measured `never`). d64 windowed MHA (gpt-oss) answers from its own study
-    (sm80_det_bwd_d64mha_v3_20261117) from S ~3.5k on the tile, ~3.9k off it."""
+    (sm80_det_bwd_d64mha_v3_20261117) from S ~3.5k on the tile, ~3.9k off it. Windows of up to ~384 keys key apart on this row
+    (sm80_det_bwd_narrow_window_20261117) and lead from S ~900, except d128 MHA, which keeps its `window` rule."""
     row = "sdpa_bwd_sm80"
 
     def bwd(**over):
-        base = dict(b=2, h_q=32, h_kv=8, s_q=s, s_kv=s, d_qk=128, d_v=128, causal=True, bottom_right=False, window_left=128)
+        base = dict(b=2, h_q=32, h_kv=8, s_q=s, s_kv=s, d_qk=128, d_v=128, causal=True, bottom_right=False, window_left=1023)
         base.update(has_paged_kv=False, device_cc=(8, 0), deterministic=True)
         base.update(over)
         return _facts(**base)
@@ -566,6 +572,13 @@ def test_sm80_deterministic_backward_follows_its_study(s):
     assert pt.lookup(row, bwd(**d64_mha)) is True
     assert pt.matched_entry(row, bwd(**d64_mha)).study == "sm80_det_bwd_d64mha_v3_20261117"
     assert pt.lookup(row, bwd(s_q=3000, s_kv=3000, **d64_mha)) is False
+    narrow = bwd(s_q=2048, s_kv=2048, window_left=127, **d64_mha)  # gpt-oss: engine 7 at 2.61x before the narrow class
+    assert pt.class_key(row, narrow)[6] == "window_narrow"
+    assert pt.lookup(row, narrow) is True
+    assert pt.matched_entry(row, narrow).study == "sm80_det_bwd_narrow_window_20261117"
+    assert pt.lookup(row, bwd(s_q=512, s_kv=512, window_left=127, **d64_mha)) is False
+    assert pt.matched_entry(row, bwd(window_left=127, h_q=64, h_kv=64)).study == "sm80_det_bwd_20261117"  # d128 MHA keeps its rule
+    assert pt.class_key("sdpa_bwd_sm120", bwd(window_left=127, device_cc=(12, 0)))[6] == "window"  # row-local
 
 
 @pytest.mark.L0
