@@ -662,6 +662,9 @@ production kernels gain no debug knob or timing-dependent assertion.
   group (2 / 3), a non-power of two (5 / 6 / 7) and the served ones; 64/8, 32/4, 16/2 and 8/1 are all group 8. Three narrow fits
   failed holdouts on a group outside their train range (`sm90_dense_d256_chunk_20261117`: group 2; `sm120_paged_d128_mtp_v3_20261117`:
   group 5; `sm120_paged_d128_mtp_v4_20261117`, trained on groups 4-8: group 3).
+- The off-tile twin needs its own train lattice (the on-tile lattice shifted off the 128-key tile), not a handful of cells or a
+  mirrored on-tile rule: `sm90_mha_mtp_20261117` (10 off-tile cells) and `sm80_det_bwd_d64mha_supp_20261117` (mirrored) each passed on
+  the tile and lost 1.17-1.35x off it.
 - A refinement can be local to the affected row and part. Keep existing keys for unrelated studies; an unqualified
   new class gets no entry and retains its prior default route. Check both sides of the first placement-tile boundary
   and retain long off-tile controls (`test_sm120_short_square_class_keeps_default_and_long_square_leads`).
