@@ -24,6 +24,12 @@ Either way, ``F.scaled_dot_product_attention`` under
 hybrid fallback to the existing implementations for configurations the
 python path does not serve yet.
 
+On versions with varlen backend selection, Torch's public selector determines
+which calls can reach this provider. Installing it does not widen Torch's
+architecture, GQA or window rules. Some versions select a backend for varlen
+forward/backward but still expose a Flash-only ``varlen_attn_out``; that out
+entry point remains with Torch until its own schema supports backend selection.
+
 On torch < 2.13 (no registry, no varlen ops), ``cudnn.torch.install()``
 applies the ``F.scaled_dot_product_attention`` overrides directly.
 """
