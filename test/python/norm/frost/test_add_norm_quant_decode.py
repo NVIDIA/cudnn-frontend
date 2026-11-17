@@ -839,7 +839,6 @@ def test_kernel_takes_its_quantization_helpers_from_the_tile_library():
     thread-block barrier of its own, and every ``order="..."`` its text names is an order the tile library defines.  Read from
     the source: no DSL import."""
     import ast
-    import re
 
     source = (REPO / "python" / "cudnn" / "norm" / "frost" / "kernel" / "add_norm_quant_decode_f16.py").read_text()
     tree = ast.parse(source)

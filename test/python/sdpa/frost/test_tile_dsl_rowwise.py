@@ -709,7 +709,6 @@ def test_one_instruction_helpers():
     gen = torch.Generator(device="cpu").manual_seed(36)
     bf16 = _all_bf16()
     not_nan = ~torch.isnan(bf16)
-    finite = torch.isfinite(bf16)
 
     # min.xorsign.abs against its definition
     for bound in (E4M3_MAX, -E4M3_MAX):
