@@ -924,6 +924,31 @@ def test_sm107_dense_d256_chunk_prefill_follows_its_study():
     assert getattr(pt.matched_entry(row, chunk(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_dense_chunk_20261117"
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_d576_mla_prefill_follows_its_study(s_kv):
+    """Study sm100_d576_prefill_20261117: absorbed-MLA (576, 512) prefill chunks lead on B200 (dense and paged), B300 (its transfer
+    check) and Rubin (dense); FROST ran 0.09-0.20 of the default backend. Rubin paged has no FROST plan and no entry."""
+    study = "sm100_d576_prefill_20261117"
+
+    def chunk(cc, paged, **over):
+        base = dict(b=1, h_q=96, h_kv=1, s_q=1024, s_kv=s_kv, d_qk=576, d_v=512, causal=True, bottom_right=True, device_cc=cc)
+        base.update(has_paged_kv=paged, padded=paged, page_size=32 if paged else 0, thd=paged, max_total_seq_len_q=1024 if paged else None)
+        base.update(over)
+        return _facts(**base)
+
+    for row, cc, layouts in (("sdpa_fwd_prefill_sm100", (10, 0), (False, True)), ("sdpa_fwd_prefill_sm107", (10, 7), (False,))):
+        for paged in layouts:
+            for over in (dict(), dict(b=16, h_q=24, s_q=8)):
+                assert pt.class_key(row, chunk(cc, paged, **over))[4] == "prefill"
+                assert pt.lookup(row, chunk(cc, paged, **over)) is True, (row, paged, over)
+                assert pt.matched_entry(row, chunk(cc, paged, **over)).study == study
+    assert getattr(pt.matched_entry("sdpa_fwd_prefill_sm107", chunk((10, 7), True)), "study", None) != study
+    for paged in (False, True):
+        assert pt.lookup("sdpa_fwd_prefill_sm100", chunk((10, 3), paged)) is True
+        assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 3), paged)).study == study
+
+
 def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):
     """FlashInfer's ragged cudnn declaration on cc 10.7: the broad envelope (b 4096, S_q 128 or 65536) or a power-of-two
     bounded class (b <= 4, with its packed-Q capacity), always with execute-time shape overrides."""

@@ -305,6 +305,8 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # regret 1.020 vs today's cc 10.3 default 1.155; the 31 changed verdicts run 0.614 (worst 0.928). Unsplit short-Q d64 (the
     # GB300 nightly's 3-4x serving-prefill loss) goes 3.39 -> 1.00 on the tile. Its d256 entries are the split classes, which
     # cc 10.3 already led through the split rule.
+    # sm100_d576_prefill_20261117 after its own check (B300 SXM6 AC 1100 W, cuDNN 9.24.0.43, FE 6f17f2973; all 384 of its B200 cells):
+    # every twin passes, 278 changed verdicts at 0.130-0.153 of cc 10.3's default, worst 0.456.
     (10, 3): (
         (10, 0),
         frozenset(
@@ -317,6 +319,7 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
                 "sm100_d576_dense_decode_rt924_20261030",
                 "sm100_d576_decode_v3_924_20261116",
                 "sm100_paged_d64_d256_prefill_20261111",
+                "sm100_d576_prefill_20261117",
             }
         ),
     ),
@@ -400,6 +403,23 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry(
         "always", None, "sm100_d256_decode_v4_924_20261116"
+    ),
+    # study sm100_d576_prefill_20261117 (B200 1000 W, cuDNN 9.24.0.43, FE 8014a2c75; benchmark/attention_inference's context graph:
+    # absorbed-MLA (576, 512) MQA prefill chunks, h_q 8-128, b 1-16, S_q 8-2048, KV 4k-128k on and off the tile; dense BSHD and paged
+    # THD with an exact total-Q; 320 train cells). FROST's prefill_d512_f16_2x2 leads everywhere: changed train cells 0.137-0.149
+    # (worst 0.452); holdout at fresh h_q, scored once, 0.110-0.196 (worst 0.431). Only h_kv 1 was measured. cc 10.3 borrows these
+    # entries (PART_TRANSFERS).
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_d576_prefill_20261117"
     ),
     # study sm100_d576_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid on the tile + the same grid off it)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
@@ -1177,6 +1197,15 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm107_dense_chunk_20261117"
+    ),
+    # study sm100_d576_prefill_20261117, Rubin part (208-SM Rubin, cuDNN 9.30.0.4, FE 8014a2c75): the B200 study's dense cells
+    # (160 train). FROST leads everywhere: changed train cells 0.115 (worst 0.310); holdout 0.091-0.104 (worst 0.251). Paged
+    # D576 prefill has no FROST plan on Rubin and no entry. Only h_kv 1 was measured.
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_d576_prefill_20261117"
     ),
     # study sm100_swa_prefill_20261031 (cuDNN 9.29.0.18; B100 850 W, cc 10.0; the sm103 study's grid and seeds: 320 train + 64 random
     # holdout cells; 90 training cells timed while another process held the GPU were re-timed, 32 of them moved > 5%)
