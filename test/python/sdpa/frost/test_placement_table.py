@@ -973,10 +973,10 @@ def test_d576_mla_prefill_follows_its_study(s_kv):
     assert getattr(pt.matched_entry("sdpa_fwd_prefill_sm107", chunk((10, 7), True)), "study", None) != study
     assert pt.lookup("sdpa_fwd_prefill_sm100", chunk((10, 3), False)) is True
     assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 3), False)).study == study
-    # the paged twin was retired (edge_supp_20261117: 1.157 on a small square); its re-study answers cc 10.0 only
-    assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 0), True)).study == "sm100_d576_paged_v2_20261117"
-    assert pt.lookup("sdpa_fwd_prefill_sm100", chunk((10, 0), True)) is True
-    assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk((10, 3), True)) is None
+    # the paged twin was retired (edge_supp_20261117: 1.157 on a small square); its re-study answers cc 10.0 and, by transfer, cc 10.3
+    for cc in ((10, 0), (10, 3)):
+        assert pt.matched_entry("sdpa_fwd_prefill_sm100", chunk(cc, True)).study == "sm100_d576_paged_v2_20261117"
+        assert pt.lookup("sdpa_fwd_prefill_sm100", chunk(cc, True)) is True
     if s_kv % 128:  # off the tile: a tiny square sits below the cost floor
         assert pt.lookup("sdpa_fwd_prefill_sm100", chunk((10, 0), True, b=1, h_q=8, s_q=33, s_kv=33, max_total_seq_len_q=33)) is False
 

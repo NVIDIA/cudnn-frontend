@@ -307,6 +307,8 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # cc 10.3 already led through the split rule.
     # sm100_d576_prefill_20261117 after its own check (B300 SXM6 AC 1100 W, cuDNN 9.24.0.43, FE 6f17f2973; all 384 of its B200 cells):
     # every twin passes, 278 changed verdicts at 0.130-0.153 of cc 10.3's default, worst 0.456.
+    # sm100_d576_paged_v2_20261117 after its own check (B300 SXM6 AC 1100 W, cuDNN 9.24.0.43, FE 680f1ace7; all 264 of its B200 cells):
+    # every twin passes, 261 changed verdicts at 0.225-0.230 of cc 10.3's default, worst 1.088.
     (10, 3): (
         (10, 0),
         frozenset(
@@ -320,6 +322,7 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
                 "sm100_d576_decode_v3_924_20261116",
                 "sm100_paged_d64_d256_prefill_20261111",
                 "sm100_d576_prefill_20261117",
+                "sm100_d576_paged_v2_20261117",
             }
         ),
     ),
@@ -419,7 +422,7 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm100_d576_paged_v2_20261117 (B200 1000 W, cuDNN 9.24.0.43, FE 5841acc2e; paged THD exact total-Q absorbed-MLA (576, 512)
     # MQA causal prefill over the class's whole range: chunks S_q 5-2048 over KV 256-128k and squares 8-4096, on and off the tile;
     # 200 train cells). On the tile `always` (changed train 0.240), off it from cost 2^20.47 (0.224); holdout at fresh h_q, scored once,
-    # 0.209 / 0.231 (worst 1.034). cc 10.0 only: no transfer check names this study.
+    # 0.209 / 0.231 (worst 1.034). cc 10.3 borrows it (PART_TRANSFERS).
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm100_d576_paged_v2_20261117"
     ),
