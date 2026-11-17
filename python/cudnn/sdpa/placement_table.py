@@ -69,8 +69,19 @@ def _unmeasured(facts, row: Optional[str] = None) -> bool:
 def _unpacked_decode(row: str, facts) -> bool:
     """A decode-shaped GQA graph the FROST forward row cannot pack (every query head re-reads K/V): a different kernel regime
     from the packed graphs the studies measured (paged d512 at G = 12-96 ran 5-21x slower than its packed neighbours). The
-    row's own heuristics decide it, so the class follows the kernel rather than a shape proxy."""
-    if not row.startswith("sdpa_fwd") or facts.s_q > 4 or facts.h_q == facts.h_kv:
+    row's own heuristics decide it, so the class follows the kernel rather than a shape proxy.
+
+    The SM80 k_prefetch / d256 engines reach the verify depth: THD Q cannot pack or split there (``config_sm80.validate_params``),
+    and paged THD-Q verify ran 1.25-3.3x behind the backend, where the padded-Q graphs sm80_decode_20261112 measured ran packed at
+    0.2-0.5. The SM80 wide engine's THD-Q verify won unpacked (sm80_d576_prefill_20261117: 0.34-0.55); SM90's is unmeasured."""
+    depth = 4
+    if row == "sdpa_fwd_prefill_sm80":
+        from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as sm80_half
+        from cudnn.sdpa.fwd.kernels.sm80.wide_cooperative.contract import NAME as SM80_WIDE
+
+        if sm80_half.owner(facts) not in (None, SM80_WIDE):
+            depth = _VERIFY_MAX_S_Q
+    if not row.startswith("sdpa_fwd") or facts.s_q > depth or facts.h_q == facts.h_kv:
         return False
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, sm100_legacy_policy_spec

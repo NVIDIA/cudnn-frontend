@@ -502,6 +502,31 @@ def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [8192, 65537], ids=["on_tile", "off_tile"])
+def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
+    """A100 THD Q cannot pack or split on the k_prefetch / d256 engines: paged THD-Q verify keys ``gqa_unpacked``, which no study
+    answers, so it keeps the backend (llama3.1 / qwen3.5 context re-time: FROST 1.25-3.3x behind). Padded Q keeps its packed
+    class's entry; the wide engine's THD-Q verify keeps its entries (sm80_d576_prefill_20261117 measured FROST at 0.34-0.55)."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=16, h_q=64, h_kv=8, s_q=16, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(device_cc=(8, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(h_q=32, h_kv=2, d_qk=256, d_v=256), dict(d_qk=192, d_v=128, s_q=5)):
+        thd = dict(over, thd=True, max_total_seq_len_q=16 * over.get("s_q", 16))
+        assert pt.class_key(row, f(**thd))[4:9:4] == ("verify", "gqa_unpacked"), over
+        assert pt.matched_entry(row, f(**thd)) is None, over
+        assert pt.class_key(row, f(**over))[8] == "gqa", over
+        assert pt.lookup(row, f(**over)) is True, over
+    wide = dict(h_q=64, h_kv=1, d_qk=576, d_v=512, page_size=64, thd=True, max_total_seq_len_q=256)
+    assert pt.class_key(row, f(**wide))[8] == "gqa"
+    assert pt.matched_entry(row, f(**wide)).study == "sm80_paged_wide_verify_v2_20261117"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
     """A verify class no study answers (here SM80 d64) keeps the prefill entry it had before the verify phase existed."""
