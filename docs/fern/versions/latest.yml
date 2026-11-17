@@ -30,7 +30,7 @@ navigation:
         path: ../../operations/Attention.md
         slug: operations/Attention
         contents:
-          - page: JAX SDPA Python frontend
+          - page: JAX SDPA Python frontend (experimental)
             path: ../../operations/sdpa_jax.md
             slug: jax_sdpa
           - page: Ahead-of-time Attention (SM120 C/C++)

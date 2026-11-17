@@ -1,4 +1,7 @@
-# JAX SDPA Python frontend route
+# JAX SDPA Python frontend route (experimental)
+
+**Experimental API:** `cudnn.sdpa_jax` and its opt-in JAX integration are subject
+to changes in API and feature support.
 
 `cudnn.sdpa_jax` builds attention graphs with the Python frontend and executes
 serialized cuDNN backend plans through XLA FFI. It does not call Torch or execute
