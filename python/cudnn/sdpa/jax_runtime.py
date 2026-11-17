@@ -51,9 +51,13 @@ def _library():
     with (directory / "build.lock").open("a") as lock:
         loader._lock_exclusive(lock, directory / "build.lock", "SDPA JAX FFI")
         if not path.exists():
+            xla_include = Path(jax.ffi.include_dir())
+            ffi_header = xla_include / "xla/ffi/api/ffi.h"
+            if not ffi_header.is_file():
+                raise ImportError(f"Missing XLA FFI header: {ffi_header}. Install compatible JAX and jaxlib packages with the bundled FFI headers.")
             temporary = path.with_name(f"bridge.{os.getpid()}.tmp.so")
             command = ["c++", "-shared", "-fPIC", "-std=c++17", "-O2", str(source), "-o", str(temporary)]
-            command += ["-I" + str(p) for p in (headers, toolkit / "include", cudnn_root / "include", jax.ffi.include_dir())]
+            command += ["-I" + str(p) for p in (headers, toolkit / "include", cudnn_root / "include", xla_include)]
             command += [
                 str(cudnn_lib / "libcudnn.so.9"),
                 "-L" + str(toolkit / "lib64"),

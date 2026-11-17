@@ -3,12 +3,34 @@
 
 """Compare identical inputs and cotangents through both JAX SDPA routes."""
 
+from types import SimpleNamespace
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 pytestmark = pytest.mark.L0
+
+
+def test_missing_ffi_header(monkeypatch, tmp_path):
+    from cudnn._cake import loader
+    from cudnn.sdpa import jax_runtime
+
+    library = tmp_path / "lib" / "libcudnn.so.9"
+    library.parent.mkdir()
+    library.touch()
+    monkeypatch.setenv("CUDNN_PATH", str(tmp_path))
+    monkeypatch.setattr(loader, "_toolkit", lambda: ("/cuda/bin/nvcc", SimpleNamespace(full="test")))
+    monkeypatch.setattr(loader, "cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(jax.ffi, "include_dir", lambda: str(tmp_path / "jax_include"))
+    with mock.patch.object(jax_runtime.subprocess, "run") as compile_bridge:
+        with pytest.raises(ImportError, match="Missing XLA FFI header") as error:
+            jax_runtime._library.__wrapped__()
+        compile_bridge.assert_not_called()
+    assert str(tmp_path / "jax_include" / "xla/ffi/api/ffi.h") in str(error.value)
+    assert "Install compatible JAX and jaxlib" in str(error.value)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
