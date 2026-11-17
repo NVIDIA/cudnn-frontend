@@ -367,6 +367,158 @@ decode step.
 Comparing the produced ids with a serving engine is not part of this sample; `--dump-tokens` writes them for a
 comparison made elsewhere, and greedy decoding is not the checkpoint's own default (its generation settings sample).
 
+## The checkpoint's drafter
+
+A checkpoint of this family can carry a second, small network beside the model: a drafter. In speculative decoding the
+drafter proposes the next few tokens from the model's last hidden row, and the model then checks all of them in one step
+instead of producing them one by one. `nvidia/Qwen3.8-27B-NVFP4` carries one.
+
+**What is here today is its loader, and nothing else** (`QwenDenseDrafter`, `model_samples/qwen_dense/drafter.py`). No
+script of this folder drafts yet: there is no draft step, no block and no provider row for the drafter, and
+`00_decode.py` neither reads it nor has a flag for it. The loader is called from Python, from the root of this checkout:
+
+```python
+import sys
+
+sys.path.insert(0, "samples/models")
+from model_samples import Checkpoint
+from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+
+checkpoint = Checkpoint.describe("/data/Qwen3.8-27B-NVFP4")  # config.json and the shard headers: no tensor is read
+model = QwenDense.describe(checkpoint)
+drafter = QwenDenseDrafter.describe(checkpoint, model, draft_vocab="draft_vocab.json")
+print(drafter.manifest_text())  # which tensors, and what a load makes of each
+weights = drafter.load(checkpoint, "cpu")  # or a CUDA device
+```
+
+It needs the packages of `samples/models/requirements.txt` and the checkpoint on local disk, as `--model` does, and a
+list of token ids, `draft_vocab.json`, which the recipe below makes.
+
+Called as above, `load` also reads the model's embedding table, which the last line of the manifest below leaves out:
+248,320 x 5,120 elements in bf16, 2.37 GiB for the published checkpoint. A caller that has loaded the model passes the
+table it holds, `drafter.load(checkpoint, device, embedding=table)`: the drafter then reads none and keeps no second
+copy.
+
+The loader does three things, each from the checkpoint itself.
+
+**It finds the drafter's tensors and says what a load makes of each.** They sit under one prefix of the checkpoint
+(`mtp.` in the published one), all stored in bf16: two norm weights in front of a multiply twice the hidden width wide,
+one attention layer with its MLP at the model's widths, and a final norm. The drafter has no embedding table and no
+output head of its own; it reads the model's. The list is bound from `config.json` and the shard headers, beside the
+model's list and before a tensor is read. A checkpoint without a drafter, or with one that is another network -- more
+than one layer, an embedding table of its own, a tensor that is missing, stored in another format or of another shape,
+a tensor under the prefix that is not on the list -- is declined there with a sentence that names what does not fit
+(a `NotImplementedError`, which a script of this area prints as `SKIP`). For the published checkpoint the loader prints:
+
+```text
+drafter of checkpoint Qwen3.8-27B-NVFP4 (local): 15 tensors of its own under 'mtp.', 3 of the model's
+  tensor                                        stored                at load
+  mtp.pre_fc_norm_embedding.weight              bf16 [5120]           pre_fc_norm_embedding: as stored
+  mtp.pre_fc_norm_hidden.weight                 bf16 [5120]           pre_fc_norm_hidden: as stored
+  mtp.layers.0.input_layernorm.weight           bf16 [5120]           input_norm: as stored
+  mtp.layers.0.self_attn.q_norm.weight          bf16 [256]            q_norm: as stored
+  mtp.layers.0.self_attn.k_norm.weight          bf16 [256]            k_norm: as stored
+  mtp.layers.0.post_attention_layernorm.weight  bf16 [5120]           post_norm: as stored
+  mtp.norm.weight                               bf16 [5120]           final_norm: as stored
+  mtp.fc.weight                                 bf16 [5120, 10240]    fc: 8-bit codes, one scale per row
+  mtp.layers.0.self_attn.q_proj.weight          bf16 [12288, 5120]    rows 0 to 12,287 of qkv: 8-bit codes, one scale per row
+  mtp.layers.0.self_attn.k_proj.weight          bf16 [1024, 5120]     rows 12,288 to 13,311 of qkv: 8-bit codes, one scale per row
+  mtp.layers.0.self_attn.v_proj.weight          bf16 [1024, 5120]     rows 13,312 to 14,335 of qkv: 8-bit codes, one scale per row
+  mtp.layers.0.self_attn.o_proj.weight          bf16 [5120, 6144]     o: 8-bit codes, one scale per row
+  mtp.layers.0.mlp.gate_proj.weight             bf16 [17408, 5120]    rows 0 to 17,407 of gate_up: 8-bit codes, one scale per row
+  mtp.layers.0.mlp.up_proj.weight               bf16 [17408, 5120]    rows 17,408 to 34,815 of gate_up: 8-bit codes, one scale per row
+  mtp.layers.0.mlp.down_proj.weight             bf16 [5120, 17408]    down: 8-bit codes, one scale per row
+  model.language_model.embed_tokens.weight      bf16 [248320, 5120]   embedding: the model's table
+  lm_head.weight                                4-bit [248320, 5120]  head: its rows at the 65,536 ids of the draft vocabulary, as stored
+  lm_head.input_scale                           fp32 scalar           head_quant: the static scale of the head's 4-bit operand
+  draft vocabulary draft_vocab.json: 65,536 ids of the model's 248,320, in ascending order (65,536 entries listed, none dropped)
+  loaded, besides the model's embedding table: 0.57 GiB (8-bit weights 0.40, norm weights 0.00, head rows 0.18)
+```
+
+**It quantises the weights of the drafter's five multiplies to 8 bits when it loads them**
+(`weights.quantize_fp8_per_channel`): the checkpoint stores them in bf16, two bytes per element, and a loaded drafter
+holds one byte per element and one scale per row. A row of a weight is one output channel of its multiply, and the
+rule is per row:
+
+- the scale is the row's largest magnitude divided by 448, the largest value of the 8-bit format (E4M3), formed in
+  fp32. It is never below 1 / (448 x 512), so a row of zeros has a scale too;
+- a code is the element divided by that scale, rounded to the nearest value of the format, to the even code on a tie,
+  and saturating at +-448. The division is a division in fp32, not a multiplication by the reciprocal of the scale:
+  where a quotient sits exactly between two codes the two give different codes.
+
+A row is quantised by itself, so the weights that feed one multiply are concatenated first: query (with its gate half),
+key and value; gate and up. A multiply over these codes applies the scale of each row to its result. The rule is fixed
+this closely because the codes are an operand: a kernel that reads them computes with exactly these bytes. A host test
+pins it, bytes and scales, against a quantiser written from the format's definition
+(`test/python/misc/test_model_samples_drafter.py`).
+
+**It cuts the drafter's output head out of the model's.** A drafter proposes from a part of the vocabulary, the *draft
+vocabulary*: a JSON list of token ids. The loader takes each listed id once, in ascending order, and only ids the model
+has, and says how many entries it dropped. The drafter's head is then the rows of the model's 4-bit output head at
+those ids -- packed codes and block scales byte for byte as the checkpoint stores them, with the head's own global
+scale and the static scale of its operand -- and `head_ids` gives the token id of every row. A file that is not a JSON
+list of whole numbers, or that lists no id of the model, is refused with a sentence that names the file by its own
+name (a `ValueError`, which a script of this area prints as `ERROR`); so is a checkpoint's drafter that is given no
+list, and that sentence points to this section.
+
+**A recipe for the list.** Any ids of the model can be listed. One way to choose them needs nothing but this sample:
+let the model answer prompts of the kind you will give it, write the ids of every run with `--dump-tokens`, and list
+what the model read and wrote in those runs, then the lowest ids that are not among them until the list is as long as
+you want it.
+
+```bash
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --dump-tokens ids_1.json
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages chat.json --dump-tokens ids_2.json
+```
+
+```python
+import collections
+import itertools
+import json
+
+dumps = ["ids_1.json", "ids_2.json"]  # the files --dump-tokens wrote, one or more
+rows = 65536  # how many ids to list
+
+seen = collections.Counter()
+for path in dumps:
+    with open(path) as f:
+        for run in json.load(f)["runs"]:
+            for sequence in run["prompt_ids"] + run["ids"]:
+                seen.update(sequence)
+listed = [token for token, _ in seen.most_common(rows)]  # what the model read and wrote, most frequent first
+unseen = (token for token in itertools.count() if token not in seen)
+listed += itertools.islice(unseen, rows - len(listed))  # then the lowest ids not among them
+with open("draft_vocab.json", "w") as f:
+    json.dump(sorted(listed), f)
+```
+
+**The runs behind this section** (2026-11-17; PyTorch 2.13.0, safetensors 0.8.0; the published checkpoint, manifest
+hash `95049016a247`). On the CPU, without a GPU:
+
+- the recipe, on six `--dump-tokens` files that runs of this sample with the checkpoint wrote (three prompts,
+  2026-11-12, compute capability 10.0): they hold 2,341 tokens and 342 distinct ids; the list is those 342 and the
+  65,194 lowest ids not among them, and the loader read it without dropping an entry;
+- the manifest above: the checkpoint holds 15 tensors under `mtp.`, all in bf16, and the list names exactly those;
+  nothing was read before the load. The call as it is written above read the model's embedding table too, 2,542,796,800
+  bytes equal to the shard file's; a load that was handed a table read none;
+- the head: all 65,536 rows of the loaded head equal the rows of the output head in the shard file at the listed ids,
+  read there by the offsets of the shard's header -- 167,772,160 bytes of packed codes and 20,971,520 bytes of block
+  scales -- and the two scalars are the file's;
+- the 8-bit weights: every one of the 64,512 scales and of the 424,673,280 codes, checked a second way: the scale and
+  the quotient formed in fp64 and rounded once to fp32, the code against the two midpoints around its value in a
+  table written from the format's definition. No row is at the smallest scale. 2,021,676 quotients are exactly the
+  midpoint of two codes, and each has the even code; a multiplication by the reciprocal of the scale would have given
+  another code on 207,130 elements.
+
+And the same load on a GPU of compute capability 10.0 (a 148-SM part): every byte of the five 8-bit weights, of the
+norm weights and of the head rows equals the byte the CPU made, and every scale is the same bit for bit.
+
+**What is not here.** No draft step and no speculative decoding: nothing runs the loaded drafter, so nothing compares
+its output with anything, and no kernel has read these 8-bit weights. No script takes the list yet; the loader takes
+it as `draft_vocab=`. The loader has run on the CPU and on one GPU class, compute capability 10.0; a class it has not
+run on is uncovered, not passing. And the 8-bit weights are held to the rule above, not to the weights another
+implementation makes of the same checkpoint: no such comparison is part of this repository.
+
 ## Who serves each block (stack `fe-cublas`)
 
 | block | calls per step (64 layers) | provider key | entry [form] |
