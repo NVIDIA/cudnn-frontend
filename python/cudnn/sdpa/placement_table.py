@@ -937,17 +937,8 @@ TABLE: Dict[Tuple, Entry] = {
     # worst 0.65. The sink-only d64 MTP class lost 1.21x on the holdout and dense d512 s_q 1 stays with the #2497 rule: no entry.
     # Its paged d512 and D576 s_q 1 entries are retired: the group, which the key cannot carry, decides there
     # (sm120_paged_d512_q1_v2_20261117 and the D576 transfer check sm120_paged_d576_q1_xfer_20261117; fwd/placement._place_sm120_f16))
-    # study sm120_paged_d128_mtp_20261117 re-fits the d128 paged MTP twins (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 9bdf9a8ab; llama
-    # heads 8/1-64/8, b 1-128, s_q 2-4, KV 8k-128k; 129 train cells, a 60-cell seeded holdout scored once: 10 changed at 0.43 / 0.77
-    # geomean, worst 0.92). The study's FROST split kept 64 CTAs at 64 KV units; under the paged split rates FROST leads every unit
-    # count on its grid (all group 8), but an `always` re-fit lost 1.25x to group 5 on a fresh holdout (sm120_paged_d128_mtp_v3), so
-    # the lead stays below 2^5.5 tiles.
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
-        "le", 5.5, "sm120_paged_d128_mtp_20261117", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
-        "le", 5.5, "sm120_paged_d128_mtp_20261117", "tiles"
-    ),
+    # Its d128 paged MTP entries (sm120_paged_d128_mtp_20261117, `le 5.5 tiles`) are retired the same way: FROST's time is flat in
+    # the GQA group and the backend's grows with it, so the group decides (sm120_paged_d128_mtp_v6_20261117; fwd/placement._place_sm120_f16).
     # study sm120_window_prefill_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE c59994a55; dense bottom-right chunks and squares,
     # d256 window 1024 and d512 MQA window 128; 221 train cells, a served-pair and an other-group holdout, each scored once: 0.34-0.58
     # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend.

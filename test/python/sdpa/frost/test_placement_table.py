@@ -480,8 +480,8 @@ def test_sm120_decode_entries_follow_their_study():
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm120_paged_d128_mtp_follows_its_study(s_kv):
-    """Study sm120_paged_d128_mtp_20261117 (RTX PRO 6000, llama's paged generation graph): d128 MTP leads up to 32 KV units at any
-    cache length and trails from 64 (a group-8-only `always` re-fit did not hold on group 5); f16 and another part keep the hand rules."""
+    """Study sm120_paged_d128_mtp_v6_20261117 retired the d128 paged MTP entries: the GQA group decides there, which the class key
+    cannot carry (fwd/placement._place_sm120_f16; test_sdpa_fwd_placement.test_sm120_paged_d128_mtp_follows_the_group)."""
     row = "sdpa_fwd_prefill_sm120"
 
     def mtp(**over):
@@ -490,13 +490,9 @@ def test_sm120_paged_d128_mtp_follows_its_study(s_kv):
         base.update(over)
         return _facts(**base)
 
-    for b, h_q, h_kv in ((1, 32, 4), (1, 64, 8), (4, 64, 8), (32, 8, 1)):
-        assert pt.lookup(row, mtp(b=b, h_q=h_q, h_kv=h_kv)) is True, (b, h_q, h_kv)
-        assert pt.matched_entry(row, mtp(b=b, h_q=h_q, h_kv=h_kv)).study == "sm120_paged_d128_mtp_20261117"
-    assert pt.lookup(row, mtp(b=16, h_q=32, h_kv=4)) is False
-    assert pt.lookup(row, mtp(b=128, h_q=64, h_kv=8, s_q=4)) is False
-    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
-    assert pt.lookup(row, mtp(device_cc=(12, 1))) is None
+    for b, h_q, h_kv in ((1, 32, 4), (1, 64, 8), (16, 32, 4), (128, 64, 8), (32, 8, 1)):
+        assert pt.class_key(row, mtp(b=b, h_q=h_q, h_kv=h_kv))[4:9] == ("mtp", "paged", "causal_br", False, "gqa")
+        assert pt.lookup(row, mtp(b=b, h_q=h_q, h_kv=h_kv)) is None, (b, h_q, h_kv)
 
 
 @pytest.mark.L0
