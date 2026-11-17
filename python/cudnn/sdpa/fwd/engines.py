@@ -439,7 +439,6 @@ class Capabilities:
     # INT32 (B+1,) prefixes, read on device. THD and dense storage have
     # independent lowerings; a THD claim alone does not enable dense readers.
     cu_seq_len: bool = False
-    dense_cu_seq_len: bool = False
     # Dense padded + stats: the per-batch seq_len_q LSE trim (padded q-rows
     # write LSE=-inf / O=0, cuDNN >= 9.14). Every kernel carries the dense
     # padded-Q trim itself (a graph with per-batch Q lengths compiles the
@@ -746,6 +745,8 @@ class Capabilities:
 
     # Delegate by the native shape a padded graph selects, so an owner also serves the row's envelope onto its tile.
     delegated_envelope: bool = False
+    # Dense device-prefix lengths are independent of THD; preserve all older positional fields.
+    dense_cu_seq_len: bool = False
 
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V

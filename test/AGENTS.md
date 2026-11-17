@@ -43,6 +43,11 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+For an explicitly isolated CPU metadata probe, verify that
+`graph_analyzer._device_props()` returns `None` and use that same value in the
+fixture: repeatedly retrying unavailable CUDA discovery for every engine and
+every envelope pair can dominate the run. Keep device-dependent C++ validation
+failures separate; this fixture establishes no native qualification.
 For Torch varlen providers, test each op's schema independently: forward and
 backward can select a backend while the out op is still Flash-only. The host
 `test_torch_provider_dispatch.py` matrix checks legacy, mixed and selected
