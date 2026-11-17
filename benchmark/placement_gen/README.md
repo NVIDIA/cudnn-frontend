@@ -40,6 +40,8 @@ gen.py study.json --constrained [--two-feature] --rules-out RULES.json [--emit] 
 gen.py study.json --score RULES.json holdout.jsonl ...                            # score the holdout once
 ```
 
-`--score` prints, per class, the changed holdout cells' geomean and worst against the default, and each twin's verdict. A twin is the class on and off the 128-key KV tile. It passes when both sides pass (geomean <= 1.0, worst <= 1.10) with at least one changed cell each. A study whose existing entry already matches one side's fit on every train cell may pre-register that side to keep its entry.
+`--score` prints, per class, the changed holdout cells' geomean and worst against the default, and each twin's verdict. A twin is the class on and off the 128-key KV tile. It passes when both sides pass (geomean <= 1.0, worst <= 1.10) with at least one changed cell each. A second verdict tolerates a vacuous side: a side with no changed holdout cell keeps its existing entry, and the twin ships its passing sides if no side fails. Pre-register which verdict the study uses.
+
+When a study fails on a few cells, pool its train and holdout (`train` takes a list of paths) as the next study's train, and score once on a fresh holdout at new head pairs. Where the pooled data's default leg was timed under entries that have since changed, take the backend-only leg as the default (see `sm80_paged_d256_d192_v3_20261117/pool.py`). Time on a full-power board: record `power.limit` per shard.
 
 Entries carry the study id. Re-run the study when a kernel change touches the row's capabilities.

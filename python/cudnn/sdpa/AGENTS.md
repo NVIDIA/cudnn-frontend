@@ -658,6 +658,14 @@ production kernels gain no debug knob or timing-dependent assertion.
   second condition (`Entry.also`, both must hold to lead) instead of a hand rule. Pre-register the two-feature candidate set, fit
   it under the same constraint, and score it once on the holdout (`sm80_dense_d128_gqa_v2_20261117`). `benchmark/placement_gen/gen.py
   --constrained [--two-feature]` and `--score` run both fits and the holdout score from the repo.
+- A twin side with no changed holdout cell is untested, not refuted. It keeps its existing entry and does not block its twin, so
+  pre-register "a twin ships its passing sides when neither side fails" (`gen.py --score` prints both verdicts). The strict both-sides
+  rule failed `sm80_paged_d64_v2_20261117`, whose off-tile refits moved v1's thresholds by 1-2 train cells that no holdout cell fell
+  between.
+- When a study fails on a few cells, pool its train and holdout as the next study's train and score once on a fresh holdout at new
+  head pairs. The failing cells then shape the second condition (`sm80_paged_d192x192_v2_20261117`, `sm80_paged_d256_d192_v3_20261117`).
+- Time on a full-power board and record `power.limit` per shard. A 275 W A100-SXM4-80GB let legs on the identical plan read up to
+  1.5-1.7x apart (`a100_ctx_retime_4d65_fp_20261117` re-checks the 2026-11-17 A100 entries at 400 W).
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
 - Deterministic graphs are unmeasured (the hand rules decide) except on `placement_table.DETERMINISTIC_KEYED_ROWS`, where they
   key phase `<phase>_det`. Add a row there only with a study that times its deterministic body against the backend's

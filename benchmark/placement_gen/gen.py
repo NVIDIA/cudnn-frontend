@@ -25,7 +25,8 @@ worst <= 1.05 against that leg. The feasible rule with the lowest training regre
 ``cost``). With ``--two-feature``, a single-feature rule may also carry a second condition, ``ge`` on KV or query tokens
 (``Entry.also``); a single-feature rule wins a tie. No feasible rule means no entry. ``--score`` scores frozen rules on a
 holdout once: per class, changed cells at geomean <= 1.0 and worst <= 1.10; a twin (on / off the KV tile) passes when both
-sides pass with at least one changed cell.
+sides pass with at least one changed cell, and is printed with a second verdict that tolerates a vacuous side (no changed cell:
+the side keeps its existing entry) as long as no side fails (AGENTS.md S12).
 """
 
 from __future__ import annotations
@@ -234,20 +235,23 @@ def _entry(key, rule, study):
 def constrained_main(args, s):
     if args.score:
         rules = {tuple(tuple(v) if isinstance(v, list) else v for v in json.loads(k)): tuple(r) for k, r in json.load(open(args.score)).items()}
-        ok = {}
+        verdicts = {}
         for key, xs in sorted(_cells(args.paths, s).items(), key=lambda kv: str(kv[0])):
             rule = rules.get(key[3:])
             if rule is None:
                 continue
             _, ch = _changed(xs, rule)
-            ok[key[3:]] = bool(ch) and _geo(ch) <= 1.0 and max(ch) <= 1.10
-            verdict = "PASS" if ok[key[3:]] else ("VACUOUS" if not ch else "FAIL")
-            print(f"  {key[3:]}  n={len(xs)}  {rule}  changed {len(ch)} geo {_geo(ch):.3f} worst {max(ch, default=1.0):.3f}  {verdict}")
+            passed = bool(ch) and _geo(ch) <= 1.0 and max(ch) <= 1.10
+            verdicts[key[3:]] = "PASS" if passed else ("VACUOUS" if not ch else "FAIL")
+            print(f"  {key[3:]}  n={len(xs)}  {rule}  changed {len(ch)} geo {_geo(ch):.3f} worst {max(ch, default=1.0):.3f}  {verdicts[key[3:]]}")
         twins = collections.defaultdict(list)
-        for tail, v in ok.items():
+        for tail, v in verdicts.items():
             twins[tail[:-1]].append(v)
         for tail, v in sorted(twins.items(), key=str):
-            print(f"  twin {tail}  {'PASS' if all(v) and len(v) == 2 else 'FAIL'}")
+            strict = "PASS" if v == ["PASS", "PASS"] else "FAIL"
+            # A vacuous side's change is untested, not refuted: it keeps its existing entry and does not block its twin.
+            tolerant = "PASS" if "FAIL" not in v and "PASS" in v else "FAIL"
+            print(f"  twin {tail}  {strict}  (vacuous side tolerated: {tolerant})")
         return 0
     rules = {}
     for key, xs in sorted(_cells(s["train"], s).items(), key=lambda kv: str(kv[0])):
