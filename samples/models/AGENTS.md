@@ -39,7 +39,7 @@ does not hold is printed as not known and ignored, so a new name for one of them
 5. **No downloads.** Weights and tokenizer files come from a local path and are read without pickle. Every reduction (depth,
    vocabulary, seeded weights) is printed; a seeded run prints a hash of the produced ids and "the output is not language".
    A checkpoint is described from its `config.json` and shard headers first (`Checkpoint.describe`, the family's
-   `describe`): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
+   `describe`, its drafter's): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
    a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
    the tests generate what they read.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
@@ -439,6 +439,28 @@ Each of these passed every test and every GPU run of the first version; a host t
 - An option an adapter declines on is tested through the session that hands it over. The adapter's decline for a
   weight merged at one scale per row was tested on a block built by hand; without the option in the session's plan
   the decline would have come after the load, as an error about another plan.
+
+## What building the drafter's loader taught
+
+- A loader that no step runs yet has no tie-out behind it, and when a step does run, both stacks will read the same
+  loaded bytes. So what a load makes is pinned where it is made: the 8-bit quantisation against a quantiser written
+  from the format's definition, bytes and scales; the rows cut from the output head against the bytes of the shard
+  file, read by the offsets of its header and not through the reader under test.
+- A rule for codes is fixed down to its operation. Dividing by a scale and multiplying by its reciprocal agree on
+  almost every element and differ where a quotient is exactly the midpoint of two codes. On the weights of the
+  published checkpoint's drafter 2,021,676 of 424,673,280 quotients are such a midpoint, and the reciprocal would have
+  given another code on 207,130 elements. Say the operation in the docstring, and hold it with an element that tells
+  the two apart.
+- A block of a README that shows what a run printed is held like a table. The manifest of the published checkpoint is
+  rendered in a host test from the code that prints it, at the published widths; the run on the checkpoint then only
+  has to show that the checkpoint's own headers give that list.
+- A call that a README shows is a run, and it reads what it reads. The section's own call of the loader read the
+  model's embedding table as well, 2.37 GiB at the published widths, under a manifest whose last line counts 0.57 GiB
+  "besides" that table; nothing said that an argument hands the model's table over. Say under a shown call what it
+  reads beyond the lines it prints. A host test runs the call as it is written and finds the table among what was
+  read, and holds the size in the sentence to the tensor list.
+- A section names a flag when a script has it. The first version named the flag that a script which does not exist
+  is to take for the list. A host test refuses, in that section, a flag that no script of the folder has.
 
 ## What building the serving-style options taught
 
