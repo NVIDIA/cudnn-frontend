@@ -1206,17 +1206,9 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_decode_q1_20261112"),
     # study sm107_dense_chunk_20261117 (Rubin dense d256 chunks, trained at S_q >= 256): its two `always` entries are retired. The
     # class starts at S_q 5, and an edge supplement there (edge_supp_20261117) lost 1.58x off the tile on a b 8 square of 64. The
-    # class is re-studied over its whole S_q range (sm107_dense_d256_v2_20261117, below).
-    # study sm107_dense_d256_v2_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 65ce81615; benchmark/attention_inference's context graph:
-    # dense d256 bottom-right chunks S_q 5-2048 to KV 128k and squares 32-2048, on and off the tile, groups 5-16, b 1-16; 200 train
-    # cells). Lead from KV 2^11.5 (changed train 0.546 / 0.408, worst 1.050); holdout at fresh heads, scored once, 0.583 / 0.529
-    # (worst 1.099).
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
-        "ge", 11.5, "sm107_dense_d256_v2_20261117", "kv"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "ge", 11.501, "sm107_dense_d256_v2_20261117", "kv"
-    ),
+    # class was re-studied as sm107_dense_d256_v2_20261117 (also retired, below).
+    # study sm107_dense_d256_v2_20261117 (its `ge kv 11.5` floor): retired. A short-cache chunk supplement (edge_supp_20261117/
+    # shortkv) found it trailing decode-shaped chunks (S_q 8 over KV 0.5-2k) that the hand rule leads, at 5.9-7.8x.
     # study sm100_d576_prefill_20261117, Rubin part (208-SM Rubin, cuDNN 9.30.0.4, FE 8014a2c75): the B200 study's dense cells
     # (160 train). FROST leads everywhere: changed train cells 0.115 (worst 0.310); holdout 0.091-0.104 (worst 0.251). Paged
     # D576 prefill has no FROST plan on Rubin and no entry. Only h_kv 1 was measured.

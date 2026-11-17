@@ -913,17 +913,18 @@ def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
-def test_sm107_dense_d256_prefill_follows_its_v2_study(s_kv):
-    """Study sm107_dense_d256_v2_20261117 replaced sm107_dense_chunk_20261117, whose `always` entries lost 1.58x on small squares
-    below its train grid: dense d256 prefill leads from KV 2^11.5 over the class's whole S_q range."""
+def test_sm107_dense_d256_prefill_entries_are_retired(s_kv):
+    """Rubin dense d256 prefill: sm107_dense_chunk_20261117 (small squares, 1.58x) and its v2 (decode-shaped short-cache chunks,
+    5.9-7.8x) are both retired; the hand rule decides (it leads decode-shaped chunks and chunks within 128 launch tiles)."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
     row = "sdpa_fwd_prefill_sm107"
-    base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
-    base.update(has_paged_kv=False, padded=False, page_size=0)
-    f = lambda **over: _facts(**{**base, **over})
-    assert pt.matched_entry(row, f()).study == "sm107_dense_d256_v2_20261117"
-    assert pt.lookup(row, f()) is True
-    assert pt.lookup(row, f(b=8, h_q=16, h_kv=1, s_q=64 + (s_kv % 2), s_kv=64 + (s_kv % 2))) is False  # a small square
-    assert pt.lookup(row, f(s_q=8)) is True  # a short chunk over a long cache
+    base = dict(b=16, h_q=40, h_kv=8, s_q=8, s_kv=2048 + (s_kv % 2), d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
+    base.update(has_paged_kv=False, padded=False, page_size=0, device_sm_count=208)
+    assert pt.matched_entry(row, _facts(**base)) is None
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    assert placement.place(spec, _facts(**base)) == placement.LEAD  # decode-shaped: the hand rule leads (backend 5.9-7.8x)
 
 
 @pytest.mark.L0
