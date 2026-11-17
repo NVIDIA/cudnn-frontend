@@ -238,7 +238,11 @@ Rubin row has its own arm ("SM107 per-tensor FP8 row" below).
   0.43-0.85, the f16 twins 0.46-0.57, 0.53-0.63 at the 512-unit edge. One step below (2**15 tokens in flight: 32 x 1k, 16 x 2k, 8 x
   4k, 4 x 8k, 1 x 32k) the cells are MIXED, 0.78-1.79, and 12 of them are launch-bound and unverifiable, so the band starts
   at 2**16 (replay alone also led at 16 x 2k, 0.82-0.85 with three geometries unverifiable, and at 8 x 4k, 0.89-0.95: not admitted);
-  fewer than 4 units lose up to 1.79x below the 128k endpoint, where 1-2 units led 0.75-0.83 in one column (not admitted); above 512
+  fewer than 4 units lost up to 1.79x below the 128k endpoint on that tree, where 1-2 units led 0.75-0.83 in one column. Re-measured
+  on FE 9bdf9a8ab (study rubin_paged_d256_small_units_20261117: computelab Rubin, cuDNN 9.30.0.4, the nightly harness legs timed
+  as back-to-back GPU time; groups 4 / 6 / 8 / 12 / 16, pages 16 / 32 / 64), 1-3 units lead on all 88 train cells from 4k declared KV
+  (0.35-0.88) and on a fresh seeded 32-cell holdout scored once (0.37-0.69, geomean 0.55), so they lead from
+  ``SM107_PAGED_D256_SMALL_UNITS_MIN_KV``; above 512
   units and past 128k declared KV: unmeasured. A further band of the SAME measurement (2026-10-13, the same board, method and
   arms) LEADs by default too, where the tile is strictly faster than the backend's default plan with margin in BOTH regimes;
   FE's placement is a verdict against the backend's plan, and what the consumer's other kernels do is the consumer's routing:
@@ -586,6 +590,7 @@ SM107_SINK_DECODE_KV_TOKENS = (1024, 16384)  # measured cache band (the backend 
 # CUDA-graph replay and eager, 2026-10-13).  Units are b * h_kv (one packed unit of the tile each) and the KV tokens the graph DECLARES.
 SM107_PAGED_D256_DECODE_GROUPS = (4, 6, 8, 12, 16)  # the GQA groups measured (16/4, 24/4, 8/1, 24/2 + 12/1, 32/2 + 16/1); 32 (64/2) has its own band below
 SM107_PAGED_D256_DECODE_MIN_UNITS = 4  # fewer units lost up to 1.79x below the 128k endpoint (1-2 units led 0.75-0.83 there: one column, not admitted)
+SM107_PAGED_D256_SMALL_UNITS_MIN_KV = 4096  # 1-3 units, re-measured 2026-11-17: 0.35-0.88 from this declared KV (shorter unmeasured)
 SM107_PAGED_D256_DECODE_MAX_UNITS = 512  # the band's largest column (b 128 x 4 KV heads); the tile still led 0.53-0.63 there
 SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT = (
     2**16
@@ -928,6 +933,8 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     if not kv_lo <= facts.s_kv <= kv_hi:
         return False
     if group in SM107_PAGED_D256_DECODE_GROUPS:
+        if units < SM107_PAGED_D256_DECODE_MIN_UNITS:
+            return facts.s_kv >= SM107_PAGED_D256_SMALL_UNITS_MIN_KV
         return (
             SM107_PAGED_D256_DECODE_MIN_UNITS <= units <= SM107_PAGED_D256_DECODE_MAX_UNITS
             and units * facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT

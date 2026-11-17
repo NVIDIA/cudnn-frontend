@@ -872,7 +872,8 @@ def _sm107_paged_d256_decode_facts(**over):
 _SM107_PAGED_D256_DECODE_CORNERS = [
     # (heads, b, declared KV, verdict): the measured frontier of the Rubin paged d256 decode-tile band -- units = b * h_kv,
     # LEAD from 4 units and 2**16 KV tokens in flight (64 x 1k, 32 x 2k, 16 x 4k, 8 x 8k, 4 x 32k), TRAIL one step below
-    # (2**15 tokens in flight), below 4 units even at the 128k endpoint, past the measured 512 units / 128k declared KV, below 1k.
+    # (2**15 tokens in flight), past the measured 512 units / 128k declared KV, below 1k. 1-3 units LEAD from 4k declared KV
+    # (re-measured 2026-11-17) and TRAIL below it.
     ("24/2", 4, 8192, placement.LEAD),
     ("24/2", 4, 4096, placement.TRAIL),
     ("24/2", 32, 1024, placement.LEAD),
@@ -882,7 +883,10 @@ _SM107_PAGED_D256_DECODE_CORNERS = [
     ("24/2", 8, 4096, placement.LEAD),
     ("24/2", 2, 32768, placement.LEAD),
     ("24/2", 2, 8192, placement.TRAIL),
-    ("24/2", 1, 131072, placement.TRAIL),
+    ("24/2", 1, 131072, placement.LEAD),
+    ("8/1", 1, 4096, placement.LEAD),
+    ("8/1", 3, 4096, placement.LEAD),
+    ("8/1", 3, 2048, placement.TRAIL),
     ("24/2", 128, 131072, placement.LEAD),
     ("24/2", 32, 262144, placement.TRAIL),
     ("24/2", 64, 512, placement.TRAIL),
