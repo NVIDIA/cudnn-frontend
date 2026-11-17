@@ -412,6 +412,30 @@ def test_sm80_sm90_decode_shaped_gqa_follows_the_decode_studies(row, cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("window_left", [None, 128], ids=["causal", "window"])
+@pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
+def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
+    """Study sm80_paged_mtp_sink_20261117 (A100, gpt-oss's paged generation graph): d64 sink MTP rows lead once enough tiles are in
+    flight and keep the backend at b 1; no sink, f16 and another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def mtp(**over):
+        base = dict(b=128, h_q=64, h_kv=8, s_q=2, s_kv=s_kv, d_qk=64, d_v=64, causal=True, bottom_right=True, has_sink=True)
+        base.update(window_left=window_left, device_cc=(8, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for b in (8, 128):
+        assert pt.lookup(row, mtp(b=b)) is True, b
+        assert pt.matched_entry(row, mtp(b=b)).study == "sm80_paged_mtp_sink_20261117"
+    assert pt.lookup(row, mtp(b=1, h_q=8, h_kv=1)) is False
+    assert pt.matched_entry(row, mtp(b=1, h_q=8, h_kv=1)).study == "sm80_paged_mtp_sink_20261117"
+    assert pt.lookup(row, mtp(has_sink=False)) is None
+    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, mtp(device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
     """A verify class no study answers (here SM80 d64) keeps the prefill entry it had before the verify phase existed."""
