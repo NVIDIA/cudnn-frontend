@@ -89,6 +89,7 @@ argmin(Custom_reduction_attributes attributes,
 ```
 
 - `argmax` and `argmin` reduce two streams: stream 0 holds the values and stream 1 holds the index of each element along the reduced dimensions (for example 0 to N−1), in a tensor of the full input shape. Among equal values, the lowest index value wins.
+- Make the index stream in the graph: a `GEN_INDEX` pointwise operation along the reduced dimension gives 0 to N−1 (see the example below). The kernel then computes each index, and it reads no index tensor from memory. An index tensor that the caller fills is also accepted. Use it only when the index values are not 0 to N−1 along one dimension, for example the global positions in the second stage of a split argmax. That tensor has the full input shape, so the kernel reads it in addition to the values.
 - `value_type` and `index_type` are the data types of the two streams; the identities have exactly these types. A value stream that is not `FLOAT`, `HALF`, `BFLOAT16` or `DOUBLE`, or an index stream that is not `INT32` or `INT64`, gives `INVALID_VALUE` from `validate`.
 - The identities are `(-inf, largest index)` for argmax and `(+inf, largest index)` for argmin, and `(NaN, largest index)` for `IGNORE_NAN`, where the largest index is the maximum of the index type. Each is a two-sided identity of its body for any index values smaller than the largest index.
 - The frontend builds the graph for each stream type; the cuDNN library decides which stream types and body forms it runs, and this can change with the library version. If the library does not support the graph, the build returns its status unchanged (`GRAPH_NOT_SUPPORTED` for a not-supported status).
@@ -103,9 +104,16 @@ The rule sets the result for NaN values. Each rule gives the lowest index among 
 
 The backend contract requires a commutative combination. The `XLA` body is not commutative for two NaN values, so for those rows its result depends on the reduction order.
 
-Example, an argmax over dimension 1 of BF16 values:
+Example, an argmax over dimension 1 of BF16 values. `GEN_INDEX` makes the index stream in the graph, so the only input tensor is `values`:
 
 ```cpp
+auto indices = graph.pointwise(values,
+                               Pointwise_attributes()
+                                   .set_name("index")
+                                   .set_mode(PointwiseMode_t::GEN_INDEX)
+                                   .set_axis(1)  // the reduced dimension
+                                   .set_compute_data_type(DataType_t::INT32));
+indices->set_data_type(DataType_t::INT32);
 auto outputs = graph.custom_reduction(
     {values, indices},
     reduction_modifiers::argmax(Custom_reduction_attributes().set_name("argmax").set_reduction_dims({1}),
@@ -157,9 +165,11 @@ auto Y = graph.custom_reduction({X},
 - `cudnn.reduction_modifiers.sum()`, `max()` and `min()` return a dictionary with the `reducer` and `reducer_semantic_key` arguments. These are the C++ `reduction_modifiers` reducers and keys.
 - `cudnn.reduction_modifiers.argmax(value_type, index_type=cudnn.data_type.INT32, rule=cudnn.reduction_modifiers.ArgNanRule.TORCH)` and `argmin(...)` return a dictionary with the `reducer`, `reducer_semantic_key` and `identity_values` arguments. `rule` is an `ArgNanRule` (`TORCH`, `XLA`, `IGNORE_NAN`) or its value (`"torch"`, `"xla"`, `"ignore_nan"`). These are the C++ helpers: the same bodies, keys and identities, and the same rules and limits (see the C++ API).
 
-Example, an argmax over dimension 1. `x` holds the values and `idx` holds the index of each element along dimension 1, from 0 to N−1 for a dimension of extent N.
+Example, an argmax over dimension 1. `x` holds the values. `graph.gen_index` makes the index of each element along dimension 1, from 0 to N−1 for a dimension of extent N, in the graph. The kernel reads no index tensor from memory.
 
 ```python
+idx = graph.gen_index(x, axis=1, compute_data_type=cudnn.data_type.INT32)
+idx.set_data_type(cudnn.data_type.INT32)
 value, index = graph.custom_reduction(
     [x, idx],
     reduction_dims=[1],
@@ -168,7 +178,7 @@ value, index = graph.custom_reduction(
 index.set_output(True)
 ```
 
-A pointwise operation of the graph can produce an input stream. Examples, with `B` rows, a graph with the intermediate data type `FLOAT`, and `idx` the index tensor:
+A pointwise operation of the graph can produce an input stream. Examples, with `B` rows, a graph with the intermediate data type `FLOAT`, and `idx` the index from `graph.gen_index`:
 
 ```python
 argmax = cudnn.reduction_modifiers.argmax(cudnn.data_type.FLOAT)
@@ -182,6 +192,8 @@ y = graph.binary_select(x, graph.tensor_scalar(float("-inf"), cudnn.scalar_type.
 # Recovered token of speculative decoding: max(p_t - p_d, 0) * inv_q.
 y = graph.mul(graph.max(graph.sub(p_t, p_d), graph.tensor_scalar(0.0, cudnn.scalar_type.COMPILE_TIME_CONST)), inv_q)
 
+idx = graph.gen_index(y, axis=1, compute_data_type=cudnn.data_type.INT32)
+idx.set_data_type(cudnn.data_type.INT32)
 _, index = graph.custom_reduction([y, idx], reduction_dims=[1], **argmax)
 index.set_output(True)
 ```
@@ -199,7 +211,7 @@ y = graph.custom_reduction(
 
 ## XLA HLO examples
 
-`samples/cpp/membound/custom_reduction_xla.cpp` runs the variadic argmax that XLA emits (value and `s32` index, only the index read) at every distinct argmax operand shape of a corpus of XLA HLO dumps of LLM and vision models: 31 shapes. Each shape runs with `Arg_nan_rule::XLA` (the XLA comparator) and with `Arg_nan_rule::TORCH`, on rows with ties, one NaN, two NaN, signed zeros and only `-inf`, against a host reference. The sample also runs the second stage of an XLA split argmax.
+`samples/cpp/membound/custom_reduction_xla.cpp` runs the variadic argmax that XLA emits (value and `s32` index, only the index read) at every distinct argmax operand shape of a corpus of XLA HLO dumps of LLM and vision models: 31 shapes. Each shape runs with `Arg_nan_rule::XLA` (the XLA comparator) and with `Arg_nan_rule::TORCH`, on rows with ties, one NaN, two NaN, signed zeros and only `-inf`, against a host reference. The XLA iota of the index stream is a `GEN_INDEX` operation in the graph. The sample also runs the second stage of an XLA split argmax. Its indices are the global positions from the first stage, not an iota, so that one case binds an index tensor that the caller fills.
 
 | Types (value, index) | Operand shape | Reduced dimension | Source models |
 |---|---|---|---|
