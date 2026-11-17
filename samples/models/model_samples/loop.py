@@ -183,21 +183,46 @@ class Session:
             )
         return self.plan
 
-    def stored_weights(self, own: bool = False) -> tuple:
-        """The blocks whose weights this session's load keeps on their stored format: every block that a provider
-        multiplying on the stored format serves (``Block.stored_weights``) in this session's plan or in the plan of a
-        session that will run on its weights (``plan_table(later)``).  ``own``: the blocks of this session's plan alone
-        -- the weights its own steps read on the stored format."""
+    def _on_stored(self, every: bool, own: bool = False) -> tuple:
+        """The weights that a plan of the run -- ``every``: that every plan of the run -- multiplies on the stored format,
+        named as a family's loader is asked for them: a block (all of its calls), or ``<block> at <call site>``
+        (``blocks.scoped``) for the calls at one site of a block whose calls several rows serve in some plan.  A plan
+        that serves the block with one row answers for every site of it.  ``own``: this session's plan alone."""
         plans = [self.resolve(), *(session.resolve() for session in (() if own else self._followers))]
-        return tuple(dict.fromkeys(name for plan in plans for name, block in plan.items() if getattr(block, "stored_weights", False)))
+        readers = {}  # block -> per plan: call site -> whether the block's part there multiplies on the stored format ("": every call)
+        for plan in plans:
+            reads = {}
+            for _, name, site, _, block in plan.parts():
+                reads.setdefault(name, {})[site] = bool(getattr(block, "stored_weights", False))
+            for name, sites in reads.items():
+                readers.setdefault(name, []).append(sites)
+        held = all if every else any
+        named = []
+        # in the order the plans name them: the first plan's blocks on a stored format, then what a later plan adds
+        order = dict.fromkeys(name for plan in plans for _, name, _, _, block in plan.parts() if getattr(block, "stored_weights", False))
+        for name in order:
+            by_plan = readers[name]
+            if every and len(by_plan) < len(plans):  # a plan without the block: no statement about every plan
+                continue
+            sites = tuple(dict.fromkeys(site for sites in by_plan for site in sites if site))  # the call sites some plan tells apart
+            at = [site for site in sites or ("",) if held(reads[""] if "" in reads else reads.get(site, False) for reads in by_plan)]
+            named += [name] if len(at) == len(sites or ("",)) else [blocks.scoped(name, site) for site in at]
+        return tuple(named)
+
+    def stored_weights(self, own: bool = False) -> tuple:
+        """The weights this session's load keeps on their stored format: those of every block that a provider multiplying
+        on the stored format serves (``Block.stored_weights``) in this session's plan or in the plan of a session that
+        will run on its weights (``plan_table(later)``) -- named by block, or, where such a provider serves the calls at
+        some call sites of a block only, as ``<block> at <call site>``.  ``own``: the blocks of this session's plan
+        alone -- the weights its own steps read on the stored format."""
+        return self._on_stored(every=False, own=own)
 
     def uncopied_weights(self) -> tuple:
-        """The blocks whose weights this session's load keeps on their stored format ALONE, without a bf16 copy: a provider
-        multiplying on the stored format serves them in this session's plan and in the plan of every session that will
-        run on its weights (``plan_table(later)``), so no block of the run reads a copy.  The reference blocks of the
-        checks do, and get theirs per call (``on_demand``)."""
-        plans = [self.resolve(), *(session.resolve() for session in self._followers)]
-        return tuple(name for name in self.stored_weights() if all(getattr(plan.get(name), "stored_weights", False) for plan in plans))
+        """The weights this session's load keeps on their stored format ALONE, without a bf16 copy (named as
+        ``stored_weights`` names them): a provider multiplying on the stored format serves their calls in this session's
+        plan and in the plan of every session that will run on its weights (``plan_table(later)``), so no block of the
+        run reads a copy.  The reference blocks of the checks do, and get theirs per call (``on_demand``)."""
+        return self._on_stored(every=True)
 
     def stored_layouts(self) -> dict:
         """Block -> the layout its provider multiplies the stored weight on (``Block.stored_layout``), for the blocks of
@@ -208,7 +233,7 @@ class Session:
         block reads the bf16 copy is no reader of the stored form and asks for nothing here."""
         layouts, owners = {}, {}
         for plan in (self.resolve(), *(session.resolve() for session in self._followers)):
-            for name, block in plan.items():
+            for _, name, _, _, block in plan.parts():  # of every call site, for a block whose calls several rows serve
                 if not getattr(block, "stored_weights", False):
                     continue
                 layout = getattr(block, "stored_layout", None)
@@ -242,15 +267,23 @@ class Session:
             return
         laid_out = getattr(self.weights, "laid_out", ())
         other = "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
-        for name, block in self.plan.items():
+
+        def names(among, name, site) -> bool:
+            """Whether a load names the weights of these calls among those it keeps in one form: the block, or this call
+            site of it.  For a block this plan serves with one row a load that names some call sites of it alone has
+            the form for some of the block's weights and not for others, which is the load of another plan as well."""
+            return name in among or (bool(site) and blocks.scoped(name, site) in among)
+
+        for label, name, site, _, block in self.plan.parts():  # per call site, for a block whose calls several rows serve
             on_stored = getattr(block, "stored_weights", False)
-            if on_stored and name not in kept:
-                raise ValueError(f"{block.entry} multiplies on the stored format of the weight of {name}, and the load kept none: {other}")
+            if on_stored and not names(kept, name, site):
+                raise ValueError(f"{block.entry} multiplies on the stored format of the weight of {label}, and the load kept none: {other}")
             if on_stored and (getattr(block, "stored_layout", None) is not None) != (name in laid_out):
                 wants, has = ("the checkpoint's row order", "a provider's own") if name in laid_out else ("its own row order", "the checkpoint's")
                 raise ValueError(f"{block.entry} multiplies on the stored weight of {name} in {wants}, and the load kept it in {has}: {other}")
-            if not on_stored and name in uncopied and self.on_demand is None:
-                raise ValueError(f"{block.entry} reads a bf16 copy of the weight of {name}, and the load kept its stored format alone: {other}")
+            partly = not site and any(kept_alone.startswith(name + " at ") for kept_alone in uncopied)  # some call sites of this block
+            if not on_stored and (names(uncopied, name, site) or partly) and self.on_demand is None:
+                raise ValueError(f"{block.entry} reads a bf16 copy of the weight of {label}, and the load kept its stored format alone: {other}")
 
     def claim(self) -> Optional[census.Claim]:
         """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the

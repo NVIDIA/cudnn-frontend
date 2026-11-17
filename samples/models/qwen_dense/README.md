@@ -333,7 +333,8 @@ kernel for the in-projections; it has run at 1, 4, 9, 16, 17 and 32 rows (the ru
 (`not yet (bf16 copy of 8-bit weights)`), as it does for a checkpoint of the family whose layer widths give other
 weight shapes, and with a weight merged at one scale per row (`merge_rule="own_scale"` of a session) the plan declines
 the row by name: the entry reads one scale per weight. The 8-bit out-projection is not this row's: the target runs a
-library multiply for it in a plain step.
+library multiply for it in a plain step. In a step of several tokens per sequence the out-projection of a
+linear-attention layer is this entry's as well, on rows of its own (the section "The verify step").
 
 The MLP's first multiply is one launch in the target and one call of `cudnn.SwigluFp4Decode` here: the kernel
 multiplies the 4-bit operand the MLP's norm wrote by the merged gate / up weight (34816 x 5120) on its stored 4-bit
@@ -799,22 +800,73 @@ Every other block is the row its own ranges give at `sequences x T` rows, as at 
 of six tokens the norm entry, the in-projection entry (compute capability 10.0), the fused gate / up entry (the
 8-token tile) and the attention gate entry keep their rows; at 16 sequences of five tokens -- 80 rows -- the
 in-projection (rows 1-32) and the gate / up step (rows 1-64) are on their fallback rows, printed with their reasons.
-The attention preparation and the attention core are reference chains, called once per token. The out-projection of
-a linear-attention layer is still the multiply over a copy: the target runs a kernel of cuDNN Frontend there in a
-verify step (the 8-bit projection in a split of its own), which this stack does not serve yet -- it is counted as
-`not yet`.
+The attention preparation and the attention core are reference chains, called once per token.
+
+**The out-projection.** In a decode step the target runs a library multiply for the out-projection of every layer. In
+a verify step it runs the 8-bit projection kernel for the out-projection of a linear-attention layer -- the kernel of
+the in-projections, at the weight shape 5120 x 6144 -- and keeps the library multiply for an attention layer's. So the
+block has rows of `fe.fp8_projection_decode`, `cudnn.Fp8ProjectionDecode`, for a step of several tokens per sequence
+alone, in the stacks `native` and `fe-entries`, and such a row serves one of the block's two call sites: the
+linear-attention layers' call (`linear_attention.out`). The attention layers' call (`full_attention.out`) it hands on
+to the next row, the multiply over a copy. A plan of a verify step then prints the block once per call site (the
+64-layer model):
+
+```text
+projection.fp8.out at linear_attention.out  48  cuDNN FE  cudnn.Fp8ProjectionDecode      rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144  none
+projection.fp8.out at full_attention.out    16  cuBLAS    torch.matmul over a bf16 copy  any                                                                                                           fallback: bf16 copy of 8-bit weights
+```
+
+The target chooses the split of this kernel by the rows of the step (sequences x tokens per sequence), and a split is
+fixed per entry instance, so every range is a row of its own (`VERIFY_OUT_ROWS` in `configs.py`):
+
+| GPU class | rows of a step | K slices, weight tile, ring stages, token tile | launch: grid, block, shared memory of a thread block |
+|---|---|---|---|
+| compute capability 10.0 | 2 to 8 | 2, 64, 11, 8 | (80, 2, 1), (256, 1, 1), 103,808 B |
+| compute capability 10.0 | 9 to 16 | 4, 64, 7, 16 | (80, 4, 1), (256, 1, 1), 84,352 B |
+| compute capability 10.0 | 17 and more | -- | the multiply over a copy at both call sites: the target runs its library multiply there |
+| compute capability 10.3 and 10.7 | 2 to 8, 9 to 16, 17 to 32 | 4, 64, 7, and 8, 16, 32 | (80, 4, 1), (256, 1, 1), and 71,040 B, 84,352 B, 110,976 B |
+
+A row states the kernel whole, so the entry never runs on its own pick: `[SPLIT_K 2, MMA_M 64, STAGES 11, TOKEN_TILE
+8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True]` for 2 to 8 rows, with the weight's
+shape at its call site (`OUT_FEATURES 5120, IN_FEATURES 6144`). The token tile follows the row count in the target
+kernel and in the entry -- the smallest of 8, 16 and 32 that holds the rows -- and the entry takes it as a floor of its
+form. A row names the tile of its range, so that the call log of a step shows the row count a call was made with: an
+instance that is handed twelve rows states the 16-row tile, and the kernel check names it against the row. The
+tensor-memory columns and their release (`TMEM_COLS 32`, `HOLD_TMEM True`) are the entry's own two fields, at the
+values its byte comparison with the target kernel ran with for this weight shape; the target kernel allocates 256
+columns and releases them early, and the census lists both under `differences`. The kernel is launched as a dependent
+of the fused verify step, which releases the launch after it at entry: it starts under that kernel, streams its weight
+and waits for it right before it reads the 8-bit codes; it releases its own successor after its last weight issue, and
+the norm in front of the MLP waits before it reads the rows.
+
+The two ranges of compute capability 10.0 are two byte classes of the entry: the out-projection of a step of 8 rows
+and of a step of 9 are not the same bytes, by the target's own choice of split. Inside a range the entry writes a
+row's bytes alone as among the others, and the batch-invariance check gates it there on compute capability 10.0 (one
+sequence alone runs on the entry instance of its step's range). The rows of compute capability 10.3 and 10.7 claim
+what the entry admits; the entry's page lists this weight shape as unverified on those classes, and no run of this
+sample has been made there.
+
+The kernel multiplies on the stored 8-bit weight, and the load keeps the forms of this block per call site: the
+codes of the linear-attention layers' out-projections for a plan with such a row, the bf16 copies of the attention
+layers'. A run whose every plan is such a verify plan holds no copy of the linear-attention layers' out-projections
+(2.8 GiB on the published model; their codes are 1.4 GiB), and the reference of its checks reads copies made from the
+stored bytes, one call at a time. A run in which a decode session shares the load -- the snippet above -- keeps what
+both plans read: the codes for the verify plan and the copies for the decode plan. The codes kept beside the copies
+add about 1.9 GiB to the memory sentence of the published model: their 1.4 GiB and their share of the working memory.
 
 **What a verify plan says about the target** (stack `native`, the 64-layer model, compute capability 10.0 with 148
 SMs, one sequence of six tokens: the one step shape the census has a recorded section for):
 
 ```text
 the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 162 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
-kernel identity, as planned: 322 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results); not yet: projection.fp8.out 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
+kernel identity, as planned: 370 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results); not yet: mlp.down 64, attention.prepare 16, attention.core 16, projection.fp8.out 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
 ```
 
 The target's verify step has other kernels than its decode step in two places -- the fused step is the verify
 kernel, and the out-projection of a linear-attention layer is a kernel of cuDNN Frontend where the decode step has a
-library multiply -- so the whole is 162 + 321 + 1 where the decode step's is 210 + 273 + 1. The census section holds
+library multiply -- so the whole is 162 + 321 + 1 where the decode step's is 210 + 273 + 1. With the out-projection
+row this stack launches all 321 at this step shape: the 16 out-projections still counted as `not yet` are the
+attention layers', a library multiply in the target. The census section holds
 for the tokens per sequence, the row count, the layer widths and the GPU class it was recorded with; any other verify
 step prints `kernel identity: not stated for this run (no recorded section for ...)`. The drafter's own launches are
 not part of it.
@@ -838,19 +890,29 @@ the same rows by both: there the recurrent state is gated by the state rule of t
 rows -- a block in front of it is another kernel at another row count -- is printed, not gated; with no layer gated
 the line is `REPORTED`.
 
-On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded model: at one sequence of six
-tokens and at four, every greedy token of the verify steps was the decode steps' and the logits were the same bytes;
-the recurrent state of the kept tokens was within the band everywhere (at one sequence the same bytes), the history
-and the attention caches byte-equal; the kernel check passed with the verify kernel in the shape its entry states
-and, at one sequence of six tokens, in the shape the census records. The same held at two sequences of six tokens
-and at two and three of eight. There, on a part of this SM count, the entry takes another form than at one sequence
-and at four: one thread block per value head and sequence, each on an SM of its own, with 224,672 B of shared memory
-at six tokens and 231,744 B at eight, the largest step that form holds. These are the runs of one GPU class.
+On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded model: at every step shape that ran
+-- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was the decode steps', and the
+recurrent state of the kept tokens was within the band (at one sequence the same bytes); the kernel check passed with
+the verify kernel in the shape its entry states and, at one sequence of six tokens, with 13 launches of a step in the
+shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results).
+Up to 16 rows the verify session runs the out-projection of the linear-attention layer on its kernel and the decode
+session on a multiply over a copy, which rounds its unscaled sum and the scaled result where the kernel rounds once:
+there the logits of the two runs were one bf16 unit apart at most, inside the family's band of 4, and the keys and
+values an attention layer cached were not the same bytes -- printed, not gated, because the layer was fed other rows.
+From 17 rows both sessions multiply over a copy, and the logits and the caches were the same bytes at 18, 24 and 28
+rows. The entry was inside the band of the reference multiply at the first and the last row count of both ranges --
+one sequence of two tokens and of eight, three of three, two of eight -- with one bf16 unit on fewer than 0.05 % of
+the elements, and each sequence alone wrote the bytes it wrote among the others. At two and three sequences, on a
+part of this SM count, the verify entry takes another form than at one sequence and at four: one thread block per
+value head and sequence, each on an SM of its own, with 224,672 B of shared memory at six tokens and 231,744 B at
+eight, the largest step that form holds. These are the runs of one GPU class.
 
 **Memory.** The memory sentence of a verify plan counts the state of its step shape -- a recurrent state per
 (sequence, token), `T + 2` history columns per sequence -- beside the flat working memory of every plan of the
-reduced models. Up to 32 rows of a step PyTorch reserved within 0.1 GiB of it: one sequence of six tokens asked for
-about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB. Beyond that the sentence is short, as it is
+reduced models. Up to 32 rows of a step PyTorch reserved within 0.1 GiB of it: one sequence of six tokens, with the
+decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; the verify
+session alone, which keeps the out-projection of the linear-attention layer on its codes without a copy, asked for
+about 3.5 GiB and reserved and grew the same. Beyond that the sentence is short, as it is
 for a decode plan beyond 33 sequences (the section "Support per GPU class"): 16 sequences of three, four and five
 tokens -- 48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB and grew the
 device by 4.5, 5.8 and 7.1 GiB. A GPU whose free memory is what the sentence says passes the plan of such a run and
@@ -870,11 +932,11 @@ step, and two sessions on one load keep two states, so no run here prefills a pr
 tokens behind it. The report of a verify session (`Session.report()`) states its step timings and its traced pass
 and says of three lines that they are not stated -- the first-token line (nothing is prefilled through verify
 steps), the rate (a step is not one token), and the bytes of a step (the family's arithmetic is the decode step's:
-one embedding row, one recurrent state and three history columns per sequence). The verify out-projection on its
-target kernel, the attention blocks
-and the MLP's down multiply on theirs. A captured verify step. A verify step of more than eight tokens per
+one embedding row, one recurrent state and three history columns per sequence). The attention layers'
+out-projection, the attention blocks and the MLP's down multiply on their target kernels. A captured verify step. A verify step of more than eight tokens per
 sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
-has run on compute capability 10.0 only; every other class is uncovered, not passing.
+has run on compute capability 10.0 only; every other class is uncovered, not passing -- the rows of the
+out-projection on compute capability 10.3 and 10.7 among them.
 
 ## Who serves each block (stack `fe-cublas`)
 
@@ -1042,11 +1104,14 @@ sequence count before the first load:
 |---|---|
 | reads a bf16 copy (every fallback row; every block of `--stack reference`) | the copy, 2 bytes per element |
 | multiplies on the stored format (an adapter that says so: `stored_weights`) | the merged stored tensor: 1 byte per element of an 8-bit weight, 0.5625 of a 4-bit one; in the row order the adapter names, where it names one (`stored_layout`) |
-| both kinds, at different sequence counts or through `--provider` | both |
+| both kinds, at different sequence counts, in the two kinds of step of one load, or through `--provider` | both |
 
-So a weight that every plan of the run multiplies on its stored format has no copy. Today two rows do that: the FP8
-projection entry for the in-projections on compute capability 10.0, and the fused gate / up entry for the MLP's first
-multiply on compute capability 10.x. The second keeps its weight in the layout its kernel multiplies on, gate and up
+So a weight that every plan of the run multiplies on its stored format has no copy. Today three kinds of row do that:
+the FP8 projection entry for the in-projections on compute capability 10.0, the fused gate / up entry for the MLP's
+first multiply on compute capability 10.x, and -- in a step of several tokens per sequence -- the FP8 projection entry
+for the out-projection of the linear-attention layers. That last block is served by two rows, by call site, so its
+forms are kept per call site: the linear-attention layers' weights as their row reads them, the attention layers' as
+copies (the section "The verify step"). The second keeps its weight in the layout its kernel multiplies on, gate and up
 rows interleaved in tiles of 64, with the block scales of those rows in the kernel's 128 x 4 layout: the same bytes
 in another order, made once per weight when it is loaded. The MLP's down multiply and the output head have no row on
 their stored format yet, and the loader keeps those forms for a host test's own blocks only. A session that runs on
@@ -1156,7 +1221,9 @@ entry inside this sample, the
 fused step in its wait + release form, and the kernel patterns of the check have run on 10.0 only. The norm entry admits every compute
 capability 10.x; its own page lists 10.3 and 10.7 as not run on a device. So does the page of the fused gate / up
 entry, whose rows here claim every 10.x class as the entry does: on 10.3 and 10.7 the rows, the weight in the kernel's
-row order and the memory sentence of that plan are unverified. So has the build of the entries' kernels while a run is
+row order and the memory sentence of that plan are unverified. The rows of the projection entry for the
+out-projection of a verify step claim 10.3 and 10.7 as well, in the split the target runs there, and are as
+unverified: the entry's page lists that weight shape as not run on those classes. So has the build of the entries' kernels while a run is
 planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
 decline, not on such an installation.

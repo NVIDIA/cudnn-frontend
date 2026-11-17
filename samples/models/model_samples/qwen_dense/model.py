@@ -16,7 +16,7 @@ linear_attention.step  x, z, normed hidden, slot ids, params, slots      8-bit `
 attention.prepare      QKV row, cache, position, params                  (q, gate); key and value inserted in the cache
 attention.core         q, cache, position                                ``[rows, 6144]`` bf16
 attention.gate_quantize attention output, gate, ``Quant``                8-bit ``[rows, 6144]``
-projection.fp8.out     8-bit operand, weight copy                        ``[rows, hidden]`` bf16
+projection.fp8.out     8-bit operand, weight copy, site                  ``[rows, hidden]`` bf16
 mlp.gate_up            4-bit operand, merged gate / up weight, ``Quant``  4-bit ``[rows, 17408]``
 mlp.down               4-bit operand, weight copy                        ``[rows, hidden]`` bf16
 output_head            4-bit operand, weight copy                        logits ``[rows, vocabulary]`` bf16
@@ -26,7 +26,10 @@ token_choice           logits                                            ids ``[
 The norm block is called at several sites of a step, and a kernel that serves it is called in another form at each: ``site``
 names the call by what the normed rows feed (``NORM_SITES``; ``sites()`` lists the site of every call of the wiring).  The
 in-projection is called with another weight shape in each kind of layer, and its site says which
-(``IN_PROJECTION_SITES``).  A reference chain and a multiply over a copy ignore the site.
+(``IN_PROJECTION_SITES``).  The out-projection has one weight shape, and its site names the layer's kind too
+(``OUT_PROJECTION_SITES``): the target kernel set serves the two kinds with two kernels in a step of several tokens per
+sequence, so a provider row may serve one of them and hand the other on.  A reference chain and a multiply over a copy
+ignore the site.
 
 A step feeds one token per sequence -- the decode step -- or, on a state built for several (``DecodeState(tokens=T)``),
 ``T`` tokens per sequence at once: the verify step of speculative decoding.  Its rows are sequence by sequence (``rows =
@@ -41,7 +44,8 @@ The loader then keeps each multiplied weight in the forms the plans of the run r
 blocks): a bf16 copy where a block reads one -- every fallback row, the reference stack -- and the merged stored tensor
 where a block multiplies on it (8-bit codes with their one scale; packed 4-bit codes with their block scales and their
 global scale) -- in the layout that block's provider reads, where it has one of its own (the fused gate / up kernel:
-``load(layouts=)``).  A weight that every plan of the run reads on its stored format gets no copy; the reference blocks of the
+``load(layouts=)``).  Where the calls of a block are served by two rows, by call site, the forms are kept per call site:
+the weights of the layers of that site's kind (a name ``<block> at <call site>`` beside the block names).  A weight that every plan of the run reads on its stored format gets no copy; the reference blocks of the
 checks then make theirs for one call at a time (``weights.OnDemand``), and the memory sentence counts the largest.
 
 ``QwenDense.reduced()`` keeps every layer width of the published model and reduces the depth and the vocabulary; every
@@ -57,7 +61,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..blocks import GIB
+from ..blocks import GIB, scoped
 from ..providers import AttentionParams, GdnParams, Quant, split_qkvz
 from ..weights import BLOCK, E2M1_MAX, E4M3_MAX, TensorSpec
 from . import configs
@@ -81,6 +85,32 @@ STORED_WEIGHTS = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp
 #: the call sites of the in-projection, by the layer's kind: what the merged weight holds there (its shape differs).  A
 #: site name belongs to one block: a provider reads the sites of its row out of ``sites()`` by name
 IN_PROJECTION_SITES = {"linear_attention": "linear_attention.qkvz", "full_attention": "full_attention.qkv"}
+#: the call sites of the out-projection, by the layer's kind.  The weight has one shape in both kinds (hidden x the
+#: mixer's output width, which the two kinds share); what differs is the kernel the target kernel set launches for it in
+#: a step of several tokens per sequence, so a provider row serves the calls of one kind and hands the other's on
+OUT_PROJECTION_SITES = {"linear_attention": "linear_attention.out", "full_attention": "full_attention.out"}
+#: block -> its call sites by the layer's kind, for the blocks that multiply a weight and are called at a site per kind:
+#: how a weight of one call site is named where a load keeps the forms of a block per site (``<block> at <call site>``)
+WEIGHT_SITES = {"projection.fp8.in": IN_PROJECTION_SITES, "projection.fp8.out": OUT_PROJECTION_SITES}
+
+
+def weights_of(name: str) -> Tuple[str, Optional[str]]:
+    """``(block, layer kind)`` of a name a load is asked to keep a form for: a block of ``STORED_WEIGHTS`` (every layer:
+    kind ``None``), or ``<block> at <call site>`` for the calls of such a block at one of its sites (the layers of that
+    site's kind).  ``ValueError`` for any other name."""
+    if name in STORED_WEIGHTS:
+        return name, None
+    for block, sites in WEIGHT_SITES.items():
+        for kind, site in sites.items():
+            if name == scoped(block, site):
+                return block, kind
+    raise ValueError(f"{name} names no weight this family's loader keeps; those are the weights of {', '.join(STORED_WEIGHTS)}, by block or by call site")
+
+
+def _names(among: Sequence[str], block: str, kind: Optional[str] = None) -> bool:
+    """Whether ``among`` -- blocks, or ``<block> at <call site>`` -- names the weight of ``block`` in a layer of ``kind``."""
+    site = WEIGHT_SITES.get(block, {}).get(kind)
+    return block in among or (site is not None and scoped(block, site) in among)
 
 
 @dataclass(frozen=True)
@@ -329,14 +359,18 @@ class QwenDense:
         """The call site of every call of ``wiring()``, in its order: for the norm block what its normed rows feed (the layer's
         kind for a layer's input norm, ``"mlp"``, ``"output_head"``), with ``".first"`` behind the first call of a step, which
         has no residual stream to add to; for the in-projection the layer's kind and what its merged weight holds
-        (``IN_PROJECTION_SITES``: the weight has another shape in each kind of layer); ``""`` for a block that is called in
-        one form everywhere.  A site name belongs to one block.  ``step`` hands the same names to the two blocks; a
-        provider row names the form of each (``ProviderRow.sites``)."""
+        (``IN_PROJECTION_SITES``: the weight has another shape in each kind of layer); for the out-projection the layer's
+        kind (``OUT_PROJECTION_SITES``: one weight shape, and two kernels of the target in a step of several tokens per
+        sequence); ``""`` for a block that is called in one form everywhere.  A site name belongs to one block.  ``step``
+        hands the same names to the three blocks; a provider row names the form of each, or hands a site on to the next
+        row (``ProviderRow.sites``)."""
         kinds = self.geometry.layer_kinds
         sites, seen = [], set()
         for block, layer in self.wiring():
             if block == "projection.fp8.in":
                 sites.append(IN_PROJECTION_SITES[kinds[layer]])
+            elif block == "projection.fp8.out":
+                sites.append(OUT_PROJECTION_SITES[kinds[layer]])
             elif block != "add_norm_quantize":
                 sites.append("")
             elif layer == len(kinds):
@@ -406,8 +440,13 @@ class QwenDense:
 
     def weight_shapes(self, block: str) -> Tuple[str, Tuple[Tuple[int, int], ...]]:
         """``(stored format, shapes)`` of the weight a block of ``STORED_WEIGHTS`` multiplies: ``"fp8"`` or ``"nvfp4"``, and
-        ``(out features, in features)`` of the merged weight of every call of a step, in layer order."""
+        ``(out features, in features)`` of the merged weight of every call of a step, in layer order.  ``<block> at <call
+        site>`` (``weights_of``) gives the calls at that site alone: the layers of its kind."""
         g = self.geometry
+        if block not in STORED_WEIGHTS and " at " in block:  # the calls at one call site: the layers of that site's kind
+            block, only = weights_of(block)
+            fmt, shapes = self.weight_shapes(block)
+            return fmt, tuple(shape for shape, kind in zip(shapes, g.layer_kinds) if kind == only)
         if block == "projection.fp8.in":
             return "fp8", tuple(g.in_projection(kind) for kind in g.layer_kinds)
         if block == "projection.fp8.out":
@@ -419,6 +458,13 @@ class QwenDense:
         if block == "output_head":
             return "nvfp4", ((g.vocab, g.hidden),)
         raise ValueError(f"block {block} multiplies no weight this family's loader keeps; those are {', '.join(STORED_WEIGHTS)}")
+
+    def scale_per_row(self, site: str, merge_rule: str) -> bool:
+        """Whether the weight a multiply reads at the call site ``site`` has one scale per row under ``merge_rule``: a weight
+        merged from several stored tensors under a rule that keeps each part's scale (the in-projections under
+        ``"own_scale"``).  The out-projection's weight is one stored tensor: one scale under every rule.  A site this
+        family does not know is answered as a merged weight."""
+        return merge_rule != "largest_scale" and site not in OUT_PROJECTION_SITES.values()
 
     def _elements(self, blocks: Sequence[str]) -> int:
         """The weight elements the blocks ``blocks`` multiply in a step."""
@@ -531,6 +577,18 @@ class QwenDense:
         }
 
     # ------------------------------------------------------------------ load
+    def _kept_by_name(self, name: str) -> List[Tuple[str, Optional[str]]]:
+        """``(block, layer kind)`` of every kind of weight a name of ``load`` stands for: a block of ``STORED_WEIGHTS`` (for a
+        block called at a site per kind: each kind of this model), or ``<block> at <call site>`` (that site's kind).
+        Empty for a name this family's loader keeps no weight for."""
+        try:
+            block, kind = weights_of(name)
+        except ValueError:
+            return []
+        if kind is not None or block not in WEIGHT_SITES:
+            return [(block, kind)]
+        return [(block, each) for each in dict.fromkeys(self.geometry.layer_kinds)]
+
     def load(
         self, checkpoint, device, stages, merge_rule: str = "largest_scale", stored: Sequence[str] = (), uncopied: Sequence[str] = (), layouts=None
     ) -> Weights:
@@ -539,7 +597,9 @@ class QwenDense:
 
         ``stored`` names the blocks (``STORED_WEIGHTS``) a provider of the plans multiplies on the stored format: their
         merged stored tensor is kept (``Dequantized.stored``) -- the 8-bit codes with their one scale, or the packed 4-bit
-        codes with their block scales and their global scale, exactly what a copy is made from.  ``uncopied`` names those
+        codes with their block scales and their global scale, exactly what a copy is made from.  A name ``<block> at <call
+        site>`` (``weights_of``) asks for the weights of that block's calls at one site alone -- the layers of that
+        site's kind -- where the plans serve the block's two call sites with two rows; ``uncopied`` takes the same names.  ``uncopied`` names those
         of them that NO block of the plans reads as a bf16 copy: for them no copy is made, and a checksum of the stored
         bytes is taken in its place (stage ``checksum``; ``Weights.alone``) -- the reference of the checks will be made
         from these bytes, so the checks hold them to what they are now.  Every other multiplied weight is dequantised to
@@ -554,13 +614,15 @@ class QwenDense:
 
         from ..weights import Dequantized, dequantize, merge_block_scaled, merge_scaled, stored_checksum
 
-        unknown = sorted(set(stored) - set(STORED_WEIGHTS))
+        unknown = sorted(name for name in {*stored, *uncopied} if not self._kept_by_name(name))
         if unknown:
             raise ValueError(
                 f"this family's loader keeps the stored weights of {', '.join(STORED_WEIGHTS)}; a provider of this run multiplies on those of {', '.join(unknown)}"
             )
-        bare = sorted(set(uncopied) - set(stored))
-        if bare:  # a weight is held in one form at least: without its copy it needs its stored form
+        # a weight is held in one form at least: without its copy it needs its stored form (asked per layer kind for a block
+        # whose forms are kept per call site)
+        bare = sorted(name for name in set(uncopied) if not all(_names(stored, block, kind) for block, kind in self._kept_by_name(name)))
+        if bare:
             raise ValueError(f"a load that keeps no bf16 copy of the weights of {', '.join(bare)} must keep their stored format, and was not asked to")
         kept, copyless, layouts = tuple(stored), tuple(uncopied), dict(layouts or {})
         unasked = sorted(set(layouts) - set(kept))
@@ -574,15 +636,16 @@ class QwenDense:
             with stages.stage(read):
                 return checkpoint.load(name, device)
 
-        def copy(parts, block, merge=None, layer=None):
-            """The weight of ``block`` (in layer ``layer``) in the forms the plans read: its bf16 copy unless no block reads
-            one, its merged stored tensor where a block multiplies on it."""
+        def copy(parts, block, merge=None, layer=None, kind=None):
+            """The weight of ``block`` (in layer ``layer``, a layer of ``kind``) in the forms the plans read: its bf16 copy
+            unless no block reads one, its merged stored tensor where a block multiplies on it.  ``kind`` is given for a
+            block that is called at a site per layer kind: the plans may read its two kinds of weight in two forms."""
             if merge is not None:
                 with stages.stage("merge"):
                     parts = [merge(parts)]
             whole = parts[0]
             copied = None
-            if block not in copyless:  # a block of the plans reads the copy: made from the merged tensor, as every stack made it
+            if not _names(copyless, block, kind):  # a block of the plans reads the copy: made from the merged tensor, as every stack made it
                 with stages.stage("dequantise"):
                     copied = dequantize(whole)
             if block in layouts:  # the provider multiplies on a layout of its own: the one stored form this load keeps
@@ -593,7 +656,7 @@ class QwenDense:
                     bare = Dequantized(None, whole.scale, whole, stored_checksum(whole))
                 alone.append((block, layer, bare))
                 return bare
-            if block in kept:  # a block of the plans multiplies on the stored format, another reads the copy: both stay
+            if _names(kept, block, kind):  # a block of the plans multiplies on the stored format, another reads the copy: both stay
                 copied.stored = whole
             return copied
 
@@ -631,8 +694,8 @@ class QwenDense:
                 layer = LayerWeights(
                     kind,
                     in_quant=Quant("fp8", scale(a + "in_proj_qkv", a + "in_proj_z")),
-                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule), layer=i),
-                    out_proj=copy([stored(a + "out_proj.weight")], "projection.fp8.out", layer=i),
+                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule), layer=i, kind=kind),
+                    out_proj=copy([stored(a + "out_proj.weight")], "projection.fp8.out", layer=i, kind=kind),
                     gdn=gdn,
                     **common,
                 )
@@ -645,8 +708,8 @@ class QwenDense:
                 layer = LayerWeights(
                     kind,
                     in_quant=Quant("fp8", scale(a + "q_proj", a + "k_proj", a + "v_proj")),
-                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule), layer=i),
-                    out_proj=copy([stored(a + "o_proj.weight")], "projection.fp8.out", layer=i),
+                    in_proj=copy(parts, "projection.fp8.in", lambda ps: merge_scaled(ps, merge_rule), layer=i, kind=kind),
+                    out_proj=copy([stored(a + "o_proj.weight")], "projection.fp8.out", layer=i, kind=kind),
                     attn=attn,
                     out_quant=Quant("fp8", scale(a + "o_proj")),
                     **common,
@@ -690,7 +753,7 @@ class QwenDense:
                 qh, gate = call("attention.prepare", i, row, state.layers[i], position, layer.attn)
                 attended = call("attention.core", i, qh, state.layers[i], position)
                 mixed = call("attention.gate_quantize", i, attended, gate, layer.out_quant)
-            branch = call("projection.fp8.out", i, mixed, layer.out_proj)
+            branch = call("projection.fp8.out", i, mixed, layer.out_proj, OUT_PROJECTION_SITES[layer.kind])
             q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
         q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")

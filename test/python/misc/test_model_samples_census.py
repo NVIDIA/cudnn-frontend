@@ -65,6 +65,17 @@ PROJECTION_SYMBOL = (
     "cudnn_kernel_frost_fp8_projection_decode_n16384k5120s1r1_m128g8t8c32_w1h1p1q1_tensorptri8gmemalign32o21_tensorptri8gmemalign32o21_"
     "tensorptrbf16gmemalign32o21_tensorptrf32gmemo11_0"
 )
+#: of the same entry for the out-projection of a linear-attention layer in a step of several tokens per sequence: at 2 to 8 rows
+#: two K slices per 64 weight rows (a step of six rows: the recorded launch), at 9 to 16 rows four slices and the 16-row tile
+OUT_SHAPE = ((80, 2, 1), (256, 1, 1), 103808)
+OUT_SHAPE_SPLIT_4 = ((80, 4, 1), (256, 1, 1), 84352)
+#: of the fused verify step at one sequence of six tokens, and a symbol of its kernel (cut in front of its launch knobs and tokens)
+VERIFY_SHAPE = ((96, 1, 1), (256, 1, 1), 126512)
+VERIFY_SYMBOL = (
+    "cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrueNBUF3STATE_STREAMFalseMIN_CTAS_PER_SM1CTAS_PER_SM0BA_PREFETCH_CHUNKS3"
+    "NORM_FORMctas2STATE_LOAD_PATHbulkSTATE_STORE_PATHbulkBULK_I_0"
+)
+CENSUS_VERIFY = "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)"
 #: the form of the row of that entry in the target stacks, and the further fields of its two call sites
 PROJECTION_FORM = "[SPLIT_K 1, MMA_M 128, STAGES 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True"
 #: of the fused gate / up entry at 1 to 32 rows on a part with at least 148 SMs: one thread block per 128 weight rows up to the cap
@@ -681,7 +692,7 @@ def test_a_row_serves_the_layer_widths_it_names():
     # the family's table says what the entry serves: the row's width is one the entry builds for, and the entry declines another by name
     row = configs.PROVIDERS["add_norm_quantize"][0]
     assert row.key == "fe.add_norm_quant_decode" and row.widths == (("hidden", 5120),) and row.serves == "rows 1-1,024, hidden 5120"
-    narrow_rows = {r.key: r.widths for rows in configs.PROVIDERS.values() for r in rows if r.widths}
+    narrow_rows = {r.key: r.widths for block, rows in configs.PROVIDERS.items() for r in rows if r.widths and block != "projection.fp8.out"}
     assert set(narrow_rows) == {
         "fe.add_norm_quant_decode",
         "fe.fp8_projection_decode",
@@ -706,6 +717,12 @@ def test_a_row_serves_the_layer_widths_it_names():
     }
     assert shapes == {"linear_attention.qkvz": published.in_projection("linear_attention"), "full_attention.qkv": published.in_projection("full_attention")}
     assert shapes == {"linear_attention.qkvz": (16384, 5120), "full_attention.qkv": (14336, 5120)}
+    # its rows for the out-projection of a verify step serve one weight shape, the linear-attention layers': each names the
+    # widths that shape follows from, and the shape it names for its one served call site is the model's own
+    out_rows = [r for r in configs.PROVIDERS["projection.fp8.out"] if r.widths]
+    assert len(out_rows) == len(configs.VERIFY_OUT_ROWS) == 5 and {r.key for r in out_rows} == {"fe.fp8_projection_decode"}
+    assert all(dict(r.widths) == {name: getattr(published, name) for name in ("hidden", "la_value_heads", "la_head_dim")} for r in out_rows)
+    assert all(tuple(value for _, value in dict(r.sites)["linear_attention.out"]) == (published.hidden, published.la_out) == (5120, 6144) for r in out_rows)
     form = dict(add=True, bf16=False, quant="nvfp4")
     assert cudnn.AddNormQuantDecode("cpu", dict(row.widths)["hidden"], 1e-6, **form).form_for(1)["HIDDEN"] == 5120
     with pytest.raises(NotImplementedError, match=r"serves hidden 5120 \(validated\); got hidden 4096$"):
@@ -1005,16 +1022,17 @@ def _table_of(geometry):
 
 
 def _census_of(model):
-    """The family's census with its one section re-stated for the layer widths of ``model``: the stand-in providers of this
-    module launch the recorded shapes whatever the widths, so a run of the tiny geometry is a run the section holds for."""
+    """The family's census with its sections re-stated for the layer widths of ``model``: the stand-in providers of this
+    module launch the recorded shapes whatever the widths, so a run of the tiny geometry is a run a section holds for."""
     import copy
 
     from model_samples import census
     from model_samples.qwen_dense import QwenDense
 
     data = copy.deepcopy(QwenDense.target().data)
-    for section in data["configurations"]["plain"].values():
-        section["geometry"] = {name: getattr(model.geometry, name) for name in section["geometry"]}
+    for sections in data["configurations"].values():  # the decode step's and the verify step's
+        for section in sections.values():
+            section["geometry"] = {name: getattr(model.geometry, name) for name in section["geometry"]}
     return census.Target(data)
 
 
@@ -1031,8 +1049,12 @@ def _tiny_session(sequences, stack="reference"):
 
 def _projection_symbol(fields, rows=1):
     """The symbol a stand-in instance of the FP8 projection entry states for its weight shape and a row count: the rendering
-    behind the kernel's name, as the entry writes it."""
-    return f"cudnn_kernel_frost_fp8_projection_decode_n{fields['OUT_FEATURES']}k{fields['IN_FEATURES']}s1r{rows}_m128g8t8c32_w1h1p1q1_0"
+    behind the kernel's name, as the entry writes it (a row that names no split, weight tile, ring or token tile: the
+    in-projection's)."""
+    split, tile, stages, token_tile = (fields.get(name, default) for name, default in (("SPLIT_K", 1), ("MMA_M", 128), ("STAGES", 8), ("TOKEN_TILE", 8)))
+    return (
+        f"cudnn_kernel_frost_fp8_projection_decode_n{fields['OUT_FEATURES']}k{fields['IN_FEATURES']}s{split}r{rows}_m{tile}g{stages}t{token_tile}c32_w1h1p1q1_0"
+    )
 
 
 def _projection_entry(calls, decline=None):
@@ -1148,6 +1170,7 @@ def _stand_ins(
     swiglu_shape=None,
     on_stored=False,
     stored_defect="",
+    out_defect="",
 ):
     """The provider factories of a device that exists only as a log: every provider of the provider rows is a stand-in that
     runs the reference's arithmetic and writes the launches a real provider of its row would make into the log; a stand-in
@@ -1157,8 +1180,8 @@ def _stand_ins(
     entry states); ``declares`` replaces the census entries it declares; ``serves`` what it says served a call (default: its
     one entry instance, which states the form of the row).  ``profiler``: ``"records"``, or the reason it cannot run -- or a
     list of these, one per traced pass, the last one for every further pass.  The stand-in of the gate entry runs the
-    kernel's fp32 chain, states and launches ``gate_shape`` and is compared with the gate's real twin; ``gate_defect``
-    makes it write one wrong byte per call.
+    kernel's fp32 chain, states and launches ``gate_shape`` (a shape, or a function of the rows of a call) and is compared
+    with the gate's real twin; ``gate_defect`` makes it write one wrong byte per call.
 
     The stand-in of the norm entry runs that kernel's fp32 chain in the form of the call's site -- one instance per form,
     the residual stream updated in place, the 4-bit block scales as the kernel forms them and in its 128 x 4 layout, the
@@ -1196,7 +1219,18 @@ def _stand_ins(
     launches.  ``stored_defect`` names the stored container (``"ScaledTensor"``, ``"BlockScaledTensor"``) whose
     multiplies write one wrong element per call; or, ``"writes"``, makes each of them write into its stored weight (the
     first row of its last tensor -- the block scales of a 4-bit weight, the codes of an 8-bit one -- is zero from its
-    first call on)."""
+    first call on).
+
+    A plan of several tokens per sequence has two more stand-ins.  The fused verify step runs the reference's verify
+    step and launches the verify kernel's symbol in the recorded shape of one sequence of six tokens.  The FP8
+    projection entry's stand-in serves the out-projection of the linear-attention layers too, on the row of the step's
+    rows: it states and launches one thread block per K slice and 64 weight rows, with the shared memory of that row's
+    kernel.  ``out_defect`` is a defect of that call: ``"split"`` (the kernel of the other row range: four K slices, its
+    symbol, its shape, an instance that states its form), ``"chain"`` (the kernels of a multiply over a copy under the
+    row's name), ``"behind"`` (one more launch behind its kernel), ``"missing"`` (no launch), ``"element"`` (one wrong
+    element per call), ``"weight"`` (another weight of the same shape under the row's name: its rows in reverse),
+    ``"writes"`` (it writes into the stored weight it multiplies on); and ``"attention"`` is a defect of the other call
+    site: the attention layers' call, a multiply over a copy in the plan, launches the entry's kernel."""
     from model_samples import loop
     from model_samples.census import Facts, Kernel, Launch
     from model_samples.providers import factories, torch_ref
@@ -1253,6 +1287,23 @@ def _stand_ins(
                 launch(name, shape)
             return super().__call__(x, z, hidden, slot_ids, params, slots)
 
+    class VerifyStep(torch_ref.GdnDecodeStep):
+        """The stand-in of the fused verify step: the reference's verify step on the step's slot table, one launch per call
+        under the verify kernel's symbol, in the launch shape recorded for one sequence of six tokens."""
+
+        provider = "cuDNN FE"
+        kernels = (Kernel("gdn_verify_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)
+
+        def launch_facts(self, rows):
+            return Facts((VERIFY_SYMBOL,), dict(self.row.form), VERIFY_SHAPE)
+
+        def serving(self):
+            return "cudnn.GdnVerifyFused #1", tuple(self.row.form)
+
+        def __call__(self, x, z, hidden, table, params, slots):
+            launch(VERIFY_SYMBOL, VERIFY_SHAPE)
+            return super().__call__(x, z, hidden, table, params, slots)
+
     class Gate(torch_ref.GateQuantize):
         """The stand-in of the gate entry: the kernel's own chain in fp32 -- the gated value as a quotient, rounded once to
         bf16, then the static 8-bit quantisation -- one launch per call, and the real twin to be compared with."""
@@ -1261,8 +1312,11 @@ def _stand_ins(
         kernels = (Kernel("gate_quant", "cuDNN FE", "exact", launches=1, shape="entry"),)
         _twin = None
 
+        def _shape(self, rows):  # one shape, or -- for a run of several row counts -- the shape of a row count
+            return gate_shape(rows) if callable(gate_shape) else gate_shape
+
         def launch_facts(self, rows):
-            return Facts((GATE_SYMBOL,), dict(self.row.form), gate_shape)
+            return Facts((GATE_SYMBOL,), dict(self.row.form), self._shape(rows))
 
         def serving(self):
             return "cudnn.AttentionGateQuantDecode #1", tuple(self.row.form)
@@ -1273,7 +1327,7 @@ def _stand_ins(
             return self._twin
 
         def __call__(self, o, gate, quant):
-            launch(GATE_SYMBOL, gate_shape)
+            launch(GATE_SYMBOL, self._shape(o.shape[0]))
             codes = quantize_fp8((o.float() / (1.0 + torch.exp(-gate.float()))).to(torch.bfloat16), quant.scale).codes
             if gate_defect:
                 codes[0, 0] = 0x7E  # the largest code: of no bf16 value near a gated value of this model
@@ -1367,15 +1421,28 @@ def _stand_ins(
         writes = projection_defect == "writes"  # into the stored weight it multiplies on
         _site = ""
 
+        #: the shared memory of a thread block by (K slices, ring stages, token tile), for a row that names its token tile
+        SHARED = {(2, 11, 8): 103808, (4, 7, 16): 84352, (4, 7, 8): 71040, (4, 7, 32): 110976}
+
         def _shape(self, site):
             fields = dict(self.row.site_form(site))
-            return projection_shape or ((fields["OUT_FEATURES"] // fields["MMA_M"], fields["SPLIT_K"], 1), (256, 1, 1), 139520)
+            shared = self.SHARED[(fields["SPLIT_K"], fields["STAGES"], fields["TOKEN_TILE"])] if "TOKEN_TILE" in fields else 139520
+            if site == "linear_attention.out":  # the out-projection of a verify step: its own launch, never another call's shape
+                return (fields["OUT_FEATURES"] // fields["MMA_M"], fields["SPLIT_K"], 1), (256, 1, 1), shared
+            return projection_shape or ((fields["OUT_FEATURES"] // fields["MMA_M"], fields["SPLIT_K"], 1), (256, 1, 1), shared)
+
+        def _other_range(self, site):
+            """The form of the row of the other row range of the out-projection: four K slices, a ring of 7, the 16-row tile."""
+            other = {"SPLIT_K": 4, "STAGES": 7, "TOKEN_TILE": 16}
+            return tuple((name, other.get(name, value)) for name, value in self.row.site_form(site))
 
         def launch_facts(self, rows, site=""):
             fields = dict(self.row.site_form(site))
             return Facts((_projection_symbol(fields, rows),), fields, self._shape(site))
 
         def serving(self):  # what the stand-in's own entry instance of the last call's site states
+            if self._site == "linear_attention.out" and out_defect == "split":  # an instance of the other row range served the call
+                return "cudnn.Fp8ProjectionDecode #2", self._other_range(self._site)
             if projection_serves is not None:
                 return projection_serves(self._site)
             place = [site for site, _ in self.row.sites].index(self._site) + 1
@@ -1383,22 +1450,27 @@ def _stand_ins(
 
         def __call__(self, qx, weight, site=""):
             self._site, rows = site, qx.codes.shape[0]
-            if projection_defect == "chain":
+            # the out-projection of a verify step has its own defects; every other call of the entry the in-projection's
+            defect = out_defect if site == "linear_attention.out" else projection_defect
+            if defect == "chain":
                 for name in (ELEMENTWISE, NVJET, SPLIT_K, ELEMENTWISE):
                     launch(name)
             else:
-                if projection_defect == "extra":
+                if defect == "extra":
                     launch(ELEMENTWISE)  # in front of its own kernel: behind the norm's
-                if not (projection_defect == "missing" and site == "full_attention.qkv"):
+                if defect == "split":  # the kernel of the other row range, under its own symbol and in its own shape
+                    launch(_projection_symbol(dict(self._other_range(site)), rows), OUT_SHAPE_SPLIT_4)
+                elif not (defect == "missing" and site in ("full_attention.qkv", "linear_attention.out")):
                     launch(_projection_symbol(dict(self.row.site_form(site)), rows), self._shape(site))
-                if projection_defect == "behind":
+                if defect == "behind":
                     launch(ELEMENTWISE)  # behind its own kernel: in front of its consumer's
             stored = weight.stored  # the merged codes with their one scale, kept by the loader for this block
-            if self.writes:  # the same bytes after every call: the weight the block multiplies on is no longer the loaded one
+            if self.writes or defect == "writes":  # the same bytes after every call: the weight the block multiplies on is no longer the loaded one
                 stored.codes[: stored.codes.shape[0] // 2] = 0
+            codes = stored.codes.flip(0) if defect == "weight" else stored.codes  # another weight of this shape under the row's name
             scale = torch.tensor(float(qx.scale), dtype=torch.float32) * torch.tensor(float(stored.scale), dtype=torch.float32)
-            out = ((_e4m3_values(qx.codes) @ _e4m3_values(stored.codes).T) * scale).to(torch.bfloat16)
-            if projection_defect == "element":
+            out = ((_e4m3_values(qx.codes) @ _e4m3_values(codes).T) * scale).to(torch.bfloat16)
+            if defect == "element":
                 out[0, 0] = out[0, 0].float() * 1.5 + 1.0
             return out
 
@@ -1517,9 +1589,24 @@ def _stand_ins(
             self.product = on_stored_format(qx, weight)
             return torch_ref.silu_mul_quantize(self.product, quant)
 
-    over_copies = logging(torch_ref.Linear, ELEMENTWISE, NVJET, SPLIT_K, ELEMENTWISE)
+    class OverCopies(torch_ref.Linear):
+        """The stand-in of a multiply over a copy: the kernels such a multiply launches, then the reference's arithmetic.
+        ``out_defect == "attention"``: at the attention layers' out-projection it launches the FP8 projection kernel
+        instead -- the entry serving a call its row hands on."""
+
+        def __call__(self, qx, weight, site=""):
+            if out_defect == "attention" and site == "full_attention.out":
+                fields = {"OUT_FEATURES": 5120, "IN_FEATURES": 6144, "SPLIT_K": 2, "MMA_M": 64, "STAGES": 11, "TOKEN_TILE": 8}
+                launch(_projection_symbol(fields, qx.codes.shape[0]), OUT_SHAPE)
+            else:
+                for name in (ELEMENTWISE, NVJET, SPLIT_K, ELEMENTWISE):
+                    launch(name)
+            return super().__call__(qx, weight, site)
+
+    over_copies = OverCopies
     stand_ins = {
         "fe.gdn_decode_fused": Step,
+        "fe.gdn_verify_fused": VerifyStep,
         "fe.attention_gate_quant_decode": Gate,
         "fe.add_norm_quant_decode": Norm,
         "fe.fp8_projection_decode": Projection,
@@ -1579,6 +1666,44 @@ def _recorded_run(monkeypatch, sequences=2, stack="fe-cublas", check_kernels=Tru
         ids = session.step(ids)
         session.read(ids)
     return session, text, prompts
+
+
+def _verify_run(monkeypatch, sequences=1, tokens=6, decode=True, steps=3, stack="native", **stand_in):
+    """Verify steps of the tiny geometry on the CPU through the rows of ``stack``, on the stand-in providers and the stand-in
+    profiler of :func:`_stand_ins` (``stand_in``: its options; the gate's stand-in launches the shape recorded for the
+    rows of each call): ``steps`` steps of ``tokens`` tokens per sequence, each keeping another number of them.  With ``decode`` a
+    session of one token per sequence is planned in front of it and loads, as a run with both kinds of step does; without,
+    the verify session loads for its own plan alone.  Returns ``(verify session, decode session or None)`` with the run
+    recorded and the traced pass not yet made."""
+    from model_samples import Session, TextIO, blocks, census
+
+    from model_samples.qwen_dense import QwenDense
+
+    stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))  # three rows per thread block: (3, 1, 1) at one row
+    build = _stand_ins(monkeypatch, **stand_in)
+    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
+    model = _tiny_model()
+    monkeypatch.setattr(QwenDense, "_target", _census_of(model))
+    text = TextIO.synthetic(model.geometry.vocab)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+
+    def session_of(per_sequence, share=None):
+        session = Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=40, check_kernels=True, tokens=per_sequence, share=share)
+        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True}
+        session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, per_sequence, stack, model=model, options=options, factories=build)
+        return session
+
+    first = session_of(1) if decode else None
+    verify = session_of(tokens, share=first)
+    if first is not None:
+        first._followers = (verify,)  # as ``plan_table([verify])`` leaves it: the load keeps what both plans read
+        first.load()
+    verify.load()
+    generator = torch.Generator().manual_seed(0)
+    for step in range(steps):
+        ids = torch.randint(0, model.geometry.vocab, (sequences, tokens), generator=generator, dtype=torch.int32)
+        verify.read(verify.verify(ids, step % tokens))
+    return verify, first
 
 
 def _line(checks, start):
@@ -2142,7 +2267,7 @@ def test_the_census_file_of_the_target_kernel_set():
                 assert path in meta["tie_out"] and (MODELS.parents[1] / path).exists(), f"{kernel_id}: what the repository holds for the entry"
     assert "on compute capability 10.0 -- no differing byte" in kernels["add_norm_quant"]["tie_out"], "the class the comparison was made on"
     assert len(kernels["add_norm_quant"]["differences"]) == 5, "what differs from the target kernel besides its results, as the entry lists it"
-    assert "on compute capability 10.0 -- no differing bit" in kernels["fp8_projection"]["tie_out"] and len(kernels["fp8_projection"]["differences"]) == 9
+    assert "on compute capability 10.0 -- no differing bit" in kernels["fp8_projection"]["tie_out"] and len(kernels["fp8_projection"]["differences"]) == 11
     swiglu = kernels["swiglu_fp4"]
     assert "on compute capability 10.0 -- no differing byte" in swiglu["tie_out"] and len(swiglu["differences"]) == 10
     assert sum("were not timed against each other" in item for item in swiglu["differences"]) == 1, "its instruction stream is its own: said, with no timing"
@@ -4017,7 +4142,8 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
     exists yet -- ``step`` hands the same name to the block as its last operand, and a provider row names the form of
     each site: six forms, of which the 64-layer model calls five, 1 / 47 / 16 / 64 / 1 times a step.  The in-projection
     is called with another weight shape in each kind of layer: two sites, 48 / 16 times a step, the shape of each in its
-    row.  A site name belongs to one block."""
+    row.  The out-projection is called at a site per kind of layer too, 48 / 16 times a step: one weight shape, and in a
+    step of several tokens per sequence two rows.  A site name belongs to one block."""
     from collections import Counter
     from types import SimpleNamespace
 
@@ -4028,11 +4154,19 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
     wiring, sites = full.wiring(), full.sites()
     assert len(sites) == len(wiring) == 484 and census.call_sites(full) == sites
     every = [(block, layer, site) for (block, layer), site in zip(wiring, sites) if site]
-    assert {block for block, _, _ in every} == {"add_norm_quantize", "projection.fp8.in"}, "the two blocks that are called at named sites"
+    assert {block for block, _, _ in every} == {
+        "add_norm_quantize",
+        "projection.fp8.in",
+        "projection.fp8.out",
+    }, "the three blocks that are called at named sites"
     named = [call for call in every if call[0] == "add_norm_quantize"]
     multiplies = [call for call in every if call[0] == "projection.fp8.in"]
-    assert len(named) == 129 and len(multiplies) == 64
-    assert not {site for _, _, site in named} & {site for _, _, site in multiplies}, "a site name belongs to one block: an adapter finds its sites by name"
+    outs = [call for call in every if call[0] == "projection.fp8.out"]
+    assert len(named) == 129 and len(multiplies) == 64 and len(outs) == 64
+    names = [{site for _, _, site in calls} for calls in (named, multiplies, outs)]
+    assert not (names[0] & names[1] or names[0] & names[2] or names[1] & names[2]), "a site name belongs to one block: an adapter finds its sites by name"
+    assert Counter(site for _, _, site in outs) == {"linear_attention.out": 48, "full_attention.out": 16}
+    assert outs[:4] == [("projection.fp8.out", layer, "linear_attention.out") for layer in (0, 1, 2)] + [("projection.fp8.out", 3, "full_attention.out")]
     assert Counter(site for _, _, site in named) == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}
     assert Counter(site for _, _, site in multiplies) == {"linear_attention.qkvz": 48, "full_attention.qkv": 16}
     assert multiplies[:4] == [("projection.fp8.in", layer, "linear_attention.qkvz") for layer in (0, 1, 2)] + [("projection.fp8.in", 3, "full_attention.qkv")]
@@ -4043,11 +4177,16 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
         return [site for (block, _), site in zip(model.wiring(), model.sites()) if block == "add_norm_quantize"]
 
     assert norm_sites(QwenDense.reduced(1)) == ["full_attention.first", "mlp", "output_head"], "a model that starts with an attention layer"
-    assert [site for site in QwenDense.reduced(1).sites() if site and site not in norm_sites(QwenDense.reduced(1))] == ["full_attention.qkv"]
+    assert [site for site in QwenDense.reduced(1).sites() if site and site not in norm_sites(QwenDense.reduced(1))] == [
+        "full_attention.qkv",
+        "full_attention.out",
+    ]
     from model_samples.qwen_dense import model as family
 
     assert {site.removesuffix(family.FIRST) for _, _, site in named} == set(family.NORM_SITES) and family.FIRST == ".first"
     assert {site for _, _, site in multiplies} == set(family.IN_PROJECTION_SITES.values()) and set(family.IN_PROJECTION_SITES) == set(full.geometry.layer_kinds)
+    assert {site for _, _, site in outs} == set(family.OUT_PROJECTION_SITES.values()) and set(family.OUT_PROJECTION_SITES) == set(full.geometry.layer_kinds)
+    assert family.WEIGHT_SITES == {"projection.fp8.in": family.IN_PROJECTION_SITES, "projection.fp8.out": family.OUT_PROJECTION_SITES}
     assert norm_sites(QwenDense.reduced(2)) == ["linear_attention.first", "mlp", "full_attention", "mlp", "output_head"]
     bare = SimpleNamespace(wiring=lambda: (("embedding", -1), ("token_choice", -1)))
     assert census.call_sites(bare) == ("", ""), "a model that names no call sites: every block in one form"
@@ -4059,7 +4198,7 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
     seen = []
 
     def tap(name, layer, block, operands):
-        seen.append((name, layer, operands[4] if name == "add_norm_quantize" else (operands[2] if name == "projection.fp8.in" else "")))
+        seen.append((name, layer, operands[4] if name == "add_norm_quantize" else (operands[2] if name.startswith("projection.fp8.") else "")))
         return block(*operands)
 
     session.tap = tap
@@ -4067,6 +4206,7 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
     assert seen == [(block, layer, site) for (block, layer), site in zip(session.model.wiring(), session.model.sites())]
     assert [site for block, _, site in seen if block == "add_norm_quantize"] == ["linear_attention.first", "mlp", "full_attention", "mlp", "output_head"]
     assert [site for block, _, site in seen if block == "projection.fp8.in"] == ["linear_attention.qkvz", "full_attention.qkv"]
+    assert [site for block, _, site in seen if block == "projection.fp8.out"] == ["linear_attention.out", "full_attention.out"]
 
     # the row: the launch form every call has, and per call site the residual mode and the outputs
     row = configs.PROVIDERS["add_norm_quantize"][0]
@@ -4122,7 +4262,12 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
     assert (
         configs.PROVIDERS["projection.fp8.in"][1].key == "cublas.bf16_dequantized"
     ), "the multiply over a copy stays the row of every other class and row count"
-    assert configs.PROVIDERS["projection.fp8.out"][0].key == "cublas.bf16_dequantized", "the out-projection is not this slice's"
+    out_rows = configs.PROVIDERS["projection.fp8.out"]
+    at_one_token = next(r for r in out_rows if "native" in r.stacks and r.tokens[0] <= 1)
+    assert (
+        at_one_token.key == "cublas.bf16_dequantized" and at_one_token.sites == ()
+    ), "a step of one token per sequence: the out-projection is a multiply over a copy at both call sites"
+    assert all(r.tokens == (2, None) for r in out_rows if r.key == "fe.fp8_projection_decode"), "the entry's rows of this block are a verify step's"
 
 
 def test_a_call_served_in_the_form_of_another_call_site_fails_the_form_check():
@@ -4146,7 +4291,12 @@ def test_a_call_served_in_the_form_of_another_call_site_fails_the_form_check():
         assert all(site.facts.form[name] == value for name, value in site.form) and site.facts.form["HIDDEN"] == 5120, "the entry instance of that form"
         assert site.row == f"add_norm_quantize at {site.site}" and site.name == f"add_norm_quantize (layer {site.layer})"
     assert len({site.form for _, site in norms}) == 5 and len({tuple(site.facts.shape) for _, site in norms}) == 1, "five forms, one launch shape"
-    assert [site.site for site in sites if site.block not in ("add_norm_quantize", "projection.fp8.in")] == [""] * 291
+    assert [site.site for site in sites if site.block not in ("add_norm_quantize", "projection.fp8.in", "projection.fp8.out")] == [""] * 227
+    outs = [site for site in sites if site.block == "projection.fp8.out"]
+    assert Counter(site.site for site in outs) == {"linear_attention.out": 48, "full_attention.out": 16}
+    assert all(
+        site.form == () and site.facts is None and site.wrong == "" for site in outs
+    ), "a multiply over a copy at both sites of a step of one token per sequence"
     assert sites[2].row == "projection.fp8.in at linear_attention.qkvz" and sites[3].row == "linear_attention.step"
     assert census.check_forms(sites) == []
     clean = [census.Call(site.block, site.layer, 1, "an entry instance", site.form) for site in sites]
@@ -6823,3 +6973,298 @@ def test_the_loader_keeps_a_weight_in_the_layout_its_provider_multiplies_on(monk
     assert fmt == "nvfp4" and all(out % 128 == 0 and (inner // BLOCK) % 4 == 0 and inner % 64 == 0 for out, inner in shapes)
     assert QwenDense().stored_bytes((block,)) == sum(out * inner // 2 + out * inner // BLOCK for out, inner in shapes) == 6_417_285_120
     assert QwenDense().check_bytes((block,)) == 2 * 34816 * 5120, "the reference's copy is made from it chunk by chunk: one copy, no second packed form"
+
+
+# ----------------------------------------------------------------------------------------------- the out-projection of a verify step
+LA_OUT, FA_OUT = "projection.fp8.out at linear_attention.out", "projection.fp8.out at full_attention.out"
+#: the form of the row of the FP8 projection entry for the out-projection of a verify step of 2 to 8 rows, at its one call site
+OUT_FORM = "[SPLIT_K 2, MMA_M 64, STAGES 11, TOKEN_TILE 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True, OUT_FEATURES 5120, IN_FEATURES 6144]"
+OUT_SYMBOL = "cudnn_kernel_frost_fp8_projection_decode_n5120k6144s2r6_m64g11t8c32_w1h1p1q1_0"
+COMPARED_13 = (
+    "13 launches of a step compared by launch shape (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results "
+    "+ 0 declared stand-ins)"
+)
+
+
+def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fails_it(monkeypatch):
+    """The row of the FP8 projection entry for the out-projection of a verify step, through real sessions on the CPU: a
+    decode session and a verify session of one sequence x six tokens on one load, on the stand-ins of the entries (the
+    projection's multiplies on the stored codes the loader kept).  Clean, the verify run holds: the linear-attention
+    layer's call is the entry's, judged against the reference multiply under its own name and served by the instance of
+    its row; the attention layer's call is the multiply over a copy; 13 launches of a step are judged one by one, each
+    in the recorded shape; and the decode session of the same load is the plan it was.  Then the negative controls on
+    the verify plan, each of which must fail with its own sentence: the kernel of the other row range (another split);
+    the entry's kernel at the attention layer's call; the kernels of a multiply over a copy under the row's name; a
+    launch more in front of the kernel and behind it (it stands between two rows that are judged one by one); a launch
+    less; a launch in another shape than the recorded one; and, with the kernel check holding, a wrong element and
+    another weight of the same shape, which fail the block in its band.
+
+    The ids of the steps are those of seed 0.  The token line of the tiny geometry moves with them -- its rows are 64
+    wide, so one 4-bit code of the gate / up stand-in, another chain than the reference's, moves a logit by units -- and
+    is not what a defect of this row is told by: every defect below is asserted by its own line."""
+    from model_samples import census, tie_out
+    from model_samples.qwen_dense import configs
+
+    small = next(r for r in configs.PROVIDERS["projection.fp8.out"] if r.key == "fe.fp8_projection_decode")
+    assert census.form_text(small.site_form("linear_attention.out")).strip() == OUT_FORM
+
+    def run(**stand_in):
+        verify, decode = _verify_run(monkeypatch, **stand_in)
+        verify.trace(4)
+        return verify, decode, tie_out.run_checks(verify, prompt_tokens=0)
+
+    def sentences(checks):
+        return [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
+
+    def judged(checks, label):
+        return next(line for line in checks.lines if line.strip().startswith(label + " ") and " calls " in line)
+
+    every = "kernels: step 0 (and 2 more of the 3 traced steps): "
+    verify, decode, checks = run()
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
+    assert "13 on exact rows, in the wiring order" in _line(checks, "kernels ")
+    assert judged(checks, LA_OUT).endswith("[band: bf16_rounding]  PASS") and judged(checks, FA_OUT).endswith("[band: bf16_rounding]  PASS")
+    assert not any(
+        line.split()[:1] == ["projection.fp8.out"] and line.split()[1].isdigit() for line in checks.lines
+    ), "each call site is judged under its own name"
+    assert "9 of 9 provider blocks inside their bands" in _line(checks, "blocks")
+    log = verify.traced.call_log[0]
+    assert [(call.layer, call.instance, call.form) for call in log if call.block == "projection.fp8.out"] == [
+        (0, "cudnn.Fp8ProjectionDecode #1", small.site_form("linear_attention.out")),
+        (1, "", ()),
+    ], "the linear-attention layer's call from the entry's instance, the attention layer's from no entry"
+    assert _line(checks, "projection.fp8.out, as the call log of a traced step has it (1 calls): ").endswith(f"1 x cudnn.Fp8ProjectionDecode #1 {OUT_FORM}")
+    assert _line(checks, f"{LA_OUT}: cudnn.Fp8ProjectionDecode {OUT_FORM}, 1 launch per step (1 call x 1 per call); ").endswith(
+        f"the entry states grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B and the kernel {OUT_SYMBOL}"
+    )
+    assert _line(checks, "kernel identity, as planned: ").strip() == (
+        "kernel identity, as planned: 13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
+        "with byte-equal results); not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1; 1 declared "
+        "stand-in (not yet: output_head.quantize)"
+    )
+    assert _line(checks, CENSUS_VERIFY).endswith(f"{COMPARED_13}: each in the recorded one")
+    records = [record for record in verify.traced.steps[0] if census.canonical(record) == "fp8_projection"]
+    assert [record.shape for record in records] == [PROJECTION_SHAPE[16384], OUT_SHAPE, PROJECTION_SHAPE[14336]], "in-projection, out-projection, in-projection"
+
+    # the decode session of the same load: one row at both call sites, the plan and the numbers it had
+    text = decode.text
+    ids = decode.prefill([text.encode("ab0")])
+    decode.read(ids)
+    for _ in range(4):
+        ids = decode.step(ids)
+        decode.read(ids)
+    decode.trace(4)
+    plain = tie_out.run_checks(decode, prompt_tokens=3)
+    assert plain.ok and plain.kernels == census.PASS, plain.text()
+    assert judged(plain, "projection.fp8.out").endswith("[band: bf16_rounding]  PASS") and " at linear_attention.out" not in plain.text()
+    assert "12 on exact rows, in the wiring order" in _line(plain, "kernels ") and _line(plain, CENSUS).endswith(f"{COMPARED_12}: each in the recorded one")
+
+    # (1) the split of the other row range: the kernel of 9 to 16 rows -- four K slices, its own symbol and shape -- from an
+    # instance that states that form.  The objects, the census and the entry's own symbol each say it
+    _, _, checks = run(out_defect="split")
+    other = OUT_FORM.replace("SPLIT_K 2", "SPLIT_K 4").replace("STAGES 11", "STAGES 7").replace("TOKEN_TILE 8", "TOKEN_TILE 16")
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"kernels: form: projection.fp8.out (layer 0), the call at linear_attention.out: the adapter served the call with the form {other} "
+            f"(cudnn.Fp8ProjectionDecode #2); the row says {OUT_FORM}",
+            f"{every}projection.fp8.out (layer 0) launched fp8_projection with grid (80, 4, 1), block (256, 1, 1), shared memory 84,352 B; "
+            f"the {CENSUS_VERIFY} has grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
+            f"{every}projection.fp8.out (layer 0) launched 'cudnn_kernel_frost_fp8_projection_decode_n5120k6144s4r6_m64g7t16c32_w1h1p1q1_0'; "
+            f"cudnn.Fp8ProjectionDecode names '{OUT_SYMBOL}' for this run",
+        ]
+    ), checks.text()
+    assert judged(checks, LA_OUT).endswith("PASS"), "another split is another byte class of the kernel; this stand-in's arithmetic has none"
+
+    # (2) the attention layer's call served by the entry: a launch of its kernel where the plan has the multiply over a copy
+    _, _, checks = run(out_defect="attention")
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"{every}launched fp8_projection ('{OUT_SYMBOL}') after attention.gate_quantize (layer 1), where the plan has no such launch: "
+            "the step has 4 launch(es) of fp8_projection, the plan 3 = 3 call(s) x 1 per call"
+        ]
+    ), checks.text()
+
+    # (3) a library multiply under the row's name, and (6) a launch less: the entry's launch is missing
+    missing = (
+        f"{every}projection.fp8.out (layer 0) did not launch fp8_projection: the step has 2 launch(es) of fp8_projection, the plan 3 = 3 call(s) x 1 per call"
+    )
+    for defect in ("chain", "missing"):
+        _, _, checks = run(out_defect=defect)
+        assert not checks.ok and checks.kernels == census.FAIL and sentences(checks) == [missing], checks.text()
+        assert judged(checks, LA_OUT).endswith("PASS"), "its bytes are the kernel's: only the kernel check sees it"
+
+    # (4) (5) one launch more: in front of the kernel it stands behind the fused verify step, behind the kernel in front of the
+    # norm of the MLP -- three rows that are judged one by one, so nothing may sit between them
+    nothing = "a kernel of the fallback family pytorch, which no row there declares; nothing may sit between two exact rows"
+    launched = f"launched {ELEMENTWISE[:93] + '...'!r} between"
+    for defect, where in (
+        ("extra", "linear_attention.step (layer 0) and projection.fp8.out (layer 0)"),
+        ("behind", "projection.fp8.out (layer 0) and add_norm_quantize (layer 0)"),
+    ):
+        _, _, checks = run(out_defect=defect)
+        assert not checks.ok and checks.kernels == census.FAIL and sentences(checks) == [f"{every}{launched} {where}: {nothing}"], checks.text()
+
+    # (7) a launch in another shape than the recorded one -- the shared memory of the 16-row token tile: the census and the entry
+    verify, _ = _verify_run(monkeypatch)
+    verify.trace(4)
+    for step in verify.traced.steps:
+        at = [index for index, record in enumerate(step) if census.canonical(record) == "fp8_projection"][1]
+        step[at] = step[at]._replace(shared_memory=117120)
+    checks = tie_out.run_checks(verify, prompt_tokens=0)
+    found = "projection.fp8.out (layer 0) launched fp8_projection with grid (80, 2, 1), block (256, 1, 1), shared memory 117,120 B; "
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"{every}{found}the {CENSUS_VERIFY} has grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
+            f"{every}{found}cudnn.Fp8ProjectionDecode states grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
+        ]
+    ), checks.text()
+    assert not any(COMPARED_13 in line for line in checks.lines), "nothing is said to have been compared"
+
+    # (8) a wrong element, and (9) another weight of the same shape under the row's name: the block fails in its band against
+    # the reference multiply, the kernel check holds
+    for defect in ("element", "weight"):
+        _, _, checks = run(out_defect=defect)
+        line = judged(checks, LA_OUT)
+        assert not checks.ok and checks.kernels == census.PASS and line.endswith("[band: bf16_rounding]  FAIL"), line
+        assert _line(checks, "blocks").endswith("FAIL") and "8 of 9 provider blocks inside their bands" in _line(checks, "blocks")
+        assert judged(checks, FA_OUT).endswith("PASS"), "the other call site is another row, judged on its own"
+
+
+def test_the_loader_keeps_the_out_projection_weights_by_call_site(monkeypatch):
+    """In a verify plan the out-projection of a linear-attention layer multiplies on the stored 8-bit codes and the
+    out-projection of an attention layer on a bf16 copy: two rows of one block, by call site, so a load keeps the forms
+    of that block per call site.  A verify plan alone keeps the linear-attention layers' weights on their stored codes
+    alone -- no copy; the reference of the checks reads one made from those bytes for the call, and the checks hold the
+    bytes to their load -- and the attention layers' as copies.  A run in which a decode session shares the load keeps
+    what BOTH plans read: the codes for the verify plan, the copy for the decode plan.  The numbers of the memory
+    sentence and of the bytes of a step follow, on the published model."""
+    from model_samples import census, tie_out
+    from model_samples.qwen_dense import QwenDense, model as family
+    from model_samples.timing import Stages
+    from model_samples.weights import ScaledTensor, dequantize
+
+    one = "projection.fp8.out at linear_attention.out"
+
+    def checked(**stand_in):
+        verify, decode = _verify_run(monkeypatch, **stand_in)
+        verify.trace(4)
+        return verify, decode, tie_out.run_checks(verify, prompt_tokens=0)
+
+    # the verify plan alone: the stored codes alone for the linear-attention layer, the copy alone for the attention layer
+    verify, _, checks = checked(decode=False)
+    weights = verify.weights
+    assert weights.stored == weights.uncopied == ("projection.fp8.in", one, "mlp.gate_up") == verify.stored_weights() == verify.uncopied_weights()
+    la, fa = (layer.out_proj for layer in weights.layers)
+    assert (
+        la.data is None and isinstance(la.stored, ScaledTensor) and isinstance(la.stored.scale, float) and la.checksum is not None
+    ), "no copy: every plan multiplies on the codes"
+    assert fa.data is not None and fa.stored is None and fa.checksum is None, "the attention layer's weight is read as a copy and kept as nothing else"
+    assert [(block, layer) for block, layer, _ in weights.alone] == [
+        ("mlp.gate_up", 0),
+        ("projection.fp8.in", 0),
+        ("projection.fp8.out", 0),
+        ("mlp.gate_up", 1),
+        ("projection.fp8.in", 1),
+    ], "the weights kept on their stored format alone, in the order the loader makes them"
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
+    assert (
+        _line(checks, "stored weights")
+        .strip()
+        .startswith("stored weights    5 of 5 weights this run keeps on their stored format alone hold the bytes of their load, ")
+    )
+    assert f"weights this run keeps on their stored format alone (projection.fp8.in, {one}, mlp.gate_up)" in _line(checks, "on demand")
+    assert next(line for line in checks.lines if line.strip().startswith(LA_OUT + " ")).endswith(
+        "[band: bf16_rounding]  PASS"
+    ), "against a copy made from the stored bytes"
+    assert (
+        verify.model.copy_bytes(weights.uncopied)
+        == weights.copy_bytes
+        == verify.model.copy_bytes(("projection.fp8.in", "mlp.gate_up")) - 2 * la.stored.codes.numel()
+    )
+
+    # ... and a block that writes into that weight moves its own reference with it: the checks name the weight, by block and layer
+    _, _, checks = checked(decode=False, out_defect="writes")
+    assert not checks.ok and _line(checks, "stored weights").endswith("FAIL") and "projection.fp8.out of layer 0 (" in _line(checks, "stored weights")
+
+    # a decode session and a verify session on one load: the codes AND the copy of the linear-attention layer's weight
+    verify, decode, checks = checked()
+    weights = verify.weights
+    assert (
+        decode.weights is weights and weights.stored == ("projection.fp8.in", "mlp.gate_up", one) and weights.uncopied == ("projection.fp8.in", "mlp.gate_up")
+    )
+    la, fa = (layer.out_proj for layer in weights.layers)
+    assert (
+        la.data is not None and isinstance(la.stored, ScaledTensor) and la.checksum is None
+    ), "both forms: the copy for the decode plan, the codes for the verify plan"
+    assert torch.equal(dequantize(la.stored).data, la.data), "the copy is what the codes dequantise to"
+    assert fa.data is not None and fa.stored is None
+    assert len(weights.alone) == 4 and checks.ok, checks.text()
+    assert "(projection.fp8.in, mlp.gate_up)" in _line(checks, "on demand"), "the reference of the checks reads the load's copy of the out-projection"
+    assert decode.stored_weights(own=True) == ("projection.fp8.in", "mlp.gate_up") and verify.stored_weights(own=True) == (
+        "projection.fp8.in",
+        one,
+        "mlp.gate_up",
+    )
+
+    # the loader itself: the names it takes, and what it refuses
+    model, stages = _tiny_model(), Stages()
+    from model_samples.weights import Checkpoint
+
+    checkpoint = Checkpoint.synthetic(model, 0)
+    both = model.load(checkpoint, "cpu", stages, stored=("projection.fp8.out",))
+    assert all(layer.out_proj.stored is not None and layer.out_proj.data is not None for layer in both.layers), "the block: both call sites"
+    other = model.load(checkpoint, "cpu", stages, stored=("projection.fp8.out at full_attention.out",), uncopied=("projection.fp8.out at full_attention.out",))
+    assert [(layer.out_proj.data is None, layer.out_proj.stored is None) for layer in other.layers] == [(False, True), (True, False)]
+    assert [(block, layer) for block, layer, _ in other.alone] == [("projection.fp8.out", 1)]
+    for stored, uncopied, sentence in (
+        (("projection.fp8.out at mlp",), (), "a provider of this run multiplies on those of projection.fp8.out at mlp$"),
+        (("mlp.down at linear_attention.out",), (), "a provider of this run multiplies on those of mlp.down at linear_attention.out$"),
+        ((one,), ("projection.fp8.out",), "keeps no bf16 copy of the weights of projection.fp8.out must keep their stored format, and was not asked to$"),
+        ((), (one,), f"keeps no bf16 copy of the weights of {one} must keep their stored format, and was not asked to$"),
+    ):
+        with pytest.raises(ValueError, match=sentence):
+            model.load(checkpoint, "cpu", stages, stored=stored, uncopied=uncopied)
+    whole = model.load(checkpoint, "cpu", stages, stored=("projection.fp8.out",), uncopied=(one,))  # the block's codes cover the call site's
+    assert [layer.out_proj.data is None for layer in whole.layers] == [True, False] and all(layer.out_proj.stored is not None for layer in whole.layers)
+    assert family.weights_of(one) == ("projection.fp8.out", "linear_attention") and family.weights_of("projection.fp8.in at full_attention.qkv") == (
+        "projection.fp8.in",
+        "full_attention",
+    )
+    assert family.weights_of("mlp.down") == ("mlp.down", None)
+    with pytest.raises(ValueError, match=r"^projection.fp8.out at mlp names no weight this family's loader keeps; "):
+        family.weights_of("projection.fp8.out at mlp")
+
+    # the published model: what the row adds to a load, in bytes -- the numbers of the family README
+    full = QwenDense()
+    codes = 48 * 5120 * 6144  # the out-projection weights of the 48 linear-attention layers, one byte per element
+    assert (
+        full.weight_shapes(one) == ("fp8", ((5120, 6144),) * 48) and full.weight_shapes("projection.fp8.out at full_attention.out")[1] == ((5120, 6144),) * 16
+    )
+    assert (
+        full.weight_shapes("projection.fp8.out")[1] == ((5120, 6144),) * 64
+        and full.weight_shapes("projection.fp8.in at full_attention.qkv")[1] == ((14336, 5120),) * 16
+    )
+    assert full.stored_bytes((one,)) == codes == 1_509_949_440 and round(codes / GIB, 2) == 1.41
+    assert full.copy_bytes() - full.copy_bytes((one,)) == 2 * codes and round(2 * codes / GIB, 2) == 2.81, "the copies a verify plan alone does not make"
+    assert full.check_bytes((one,)) == 2 * 5120 * 6144, "the checks' own copy of one such weight at a time"
+    plain_kept = ("projection.fp8.in", "mlp.gate_up")
+    shared = full.memory_bytes(1, 64, stored=(*plain_kept, one), uncopied=plain_kept, tokens=6) - full.memory_bytes(
+        1, 64, stored=plain_kept, uncopied=plain_kept, tokens=6
+    )
+    assert (
+        shared == codes + codes // 8 + codes // 4 and round(shared / GIB, 1) == 1.9
+    ), "a decode and a verify session on one load: the codes beside every copy, and their share of working memory"
+    step = full.bytes_per_step(1, 0, stored=(*plain_kept, one))
+    before = full.bytes_per_step(1, 0, stored=plain_kept)
+    assert (
+        step["stored"] - before["stored"] == codes and before["copies"] - step["copies"] == codes
+    ), "a step reads these weights at one byte per element, not two"

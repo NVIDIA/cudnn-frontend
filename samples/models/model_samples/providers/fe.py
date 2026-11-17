@@ -51,7 +51,13 @@ rounds once, so the adapter names its twin: the norm at the kernel's rounding po
 ``fe.fp8_projection_decode`` calls ``cudnn.Fp8ProjectionDecode``, the multiply of an 8-bit activation by an 8-bit weight on
 the stored codes of both (``docs/operations/gemm_fusions/fp8_projection_decode.md``): one launch per call.  An entry is one
 weight shape at one split, and the in-projection of a layer has another shape in each kind of layer: the row names the
-shape per call site, and the adapter holds one entry instance per site.  The row's form is the whole kernel -- the split,
+shape per call site, and the adapter holds one entry instance per site.  A row of it may serve one call site of its
+block and hand the other on (the out-projection of a step of several tokens per sequence: the linear-attention layers'
+call is this entry's, the attention layers' the next row's): the adapter then builds and serves the sites its row
+serves, and is never called at the other.  The split is fixed per entry instance and the token tile follows the row
+count, so a block whose kernel changes its split with the rows of a step has one row per range, each an adapter and an
+entry of its own; a row that names the token tile passes it as the entry's floor, which is the tile of every row count
+in its range.  The row's form is the whole kernel -- the split,
 the weight tile, the ring depth, the tensor-memory columns and their release, the launch knobs -- and the adapter passes
 it as given, so the entry never runs on its own pick.  The weight is the merged codes the loader kept for this block
 (``weights.Dequantized.stored``; ``stored_weights`` asks the loader for them, and where no other block of the run reads
@@ -290,11 +296,16 @@ class EntryBlock(BlockBase):
         return not cutedsl_runtime_available(tuple(self.facts.cc))
 
     def _sites(self) -> tuple:
-        """The call sites of the row that the model's wiring has (every site of the row for a model that names none): the
+        """The call sites the row serves that the model's wiring has (every such site for a model that names none): the
         forms a run builds.  A row without sites is called in its one form."""
         named = getattr(self.model, "sites", None)
         called = set(named()) if callable(named) else None
-        return tuple(site for site, _ in self.row.sites if called is None or site in called) if self.row.sites else ("",)
+        return tuple(site for site in self.row.served if called is None or site in called) if self.row.sites else ("",)
+
+    def _named(self) -> list:
+        """The call sites the row serves (``ProviderRow.served``: not those it hands on to the next row), or the one
+        unnamed site of a row that names none: every form the table states for this adapter."""
+        return list(self.row.served) or [""]
 
     def _stated(self, entry, rows: int) -> dict:
         """The form an entry instance states for ``rows``, as the row's fields are looked up in it: the entry's own
@@ -784,7 +795,7 @@ class AddNormQuantDecodeBlock(EntryBlock):
 
     def check_support(self, sequences: int, tokens: int) -> None:
         self._check_package()
-        for site in [site for site, _ in self.row.sites] or [""]:
+        for site in self._named():
             self._arguments(site)
         if self.facts.total_bytes and "device" in self.options:
             for site in self._sites():  # the first use, where the entry gates the toolchain, follows the memory sentence
@@ -856,7 +867,7 @@ class AddNormQuantDecodeBlock(EntryBlock):
 
         if self._twin is None:
             self._twin = torch_ref.AddNormQuantizeBracket(reference.row, self.model, self.facts, self.options)
-            self._twin.forms = {site: dict(self.row.site_form(site)) for site in [site for site, _ in self.row.sites] or [""]}
+            self._twin.forms = {site: dict(self.row.site_form(site)) for site in self._named()}
         return self._twin
 
     def first_use(self, sequences: int, tokens: int) -> None:
@@ -981,10 +992,14 @@ class Fp8ProjectionDecodeBlock(EntryBlock):
 
     def check_support(self, sequences: int, tokens: int) -> None:
         self._check_package()
-        for site in [site for site, _ in self.row.sites] or [""]:
+        for site in self._named():
             self._arguments(site)
         rule = self.options.get("merge_rule", "largest_scale")
-        if rule != "largest_scale":  # the entry reads ONE scale element per call: a weight merged with a scale per row is not its operand
+        # the entry reads ONE scale element per call: a weight merged with a scale per row is not its operand.  Which weights
+        # a merge rule gives one scale per row is the family's to say, per call site (``scale_per_row``): a weight that is
+        # one stored tensor has one scale under every rule.  A family that does not say is asked for the default rule
+        per_row = getattr(self.model, "scale_per_row", None)
+        if rule != "largest_scale" and (not callable(per_row) or any(per_row(site, rule) for site in self._named())):
             raise NotImplementedError(
                 f"cudnn.Fp8ProjectionDecode takes one scale per weight; the merge rule {rule!r} keeps one per weight row: load with the merge "
                 f'rule "largest_scale", or select another declared row of the block with --provider'
