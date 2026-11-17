@@ -7068,12 +7068,18 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
         and checks.kernels == census.FAIL
         and sentences(checks)
         == [
-            f"kernels: form: projection.fp8.out (layer 0), the call at linear_attention.out: the adapter served the call with the form {other} "
-            f"(cudnn.Fp8ProjectionDecode #2); the row says {OUT_FORM}",
-            f"{every}projection.fp8.out (layer 0) launched fp8_projection with grid (80, 4, 1), block (256, 1, 1), shared memory 84,352 B; "
-            f"the {CENSUS_VERIFY} has grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
-            f"{every}projection.fp8.out (layer 0) launched 'cudnn_kernel_frost_fp8_projection_decode_n5120k6144s4r6_m64g7t16c32_w1h1p1q1_0'; "
-            f"cudnn.Fp8ProjectionDecode names '{OUT_SYMBOL}' for this run",
+            (
+                f"kernels: form: projection.fp8.out (layer 0), the call at linear_attention.out: the adapter served the call with the form {other} "
+                f"(cudnn.Fp8ProjectionDecode #2); the row says {OUT_FORM}"
+            ),
+            (
+                f"{every}projection.fp8.out (layer 0) launched fp8_projection with grid (80, 4, 1), block (256, 1, 1), shared memory 84,352 B; "
+                f"the {CENSUS_VERIFY} has grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B"
+            ),
+            (
+                f"{every}projection.fp8.out (layer 0) launched 'cudnn_kernel_frost_fp8_projection_decode_n5120k6144s4r6_m64g7t16c32_w1h1p1q1_0'; "
+                f"cudnn.Fp8ProjectionDecode names '{OUT_SYMBOL}' for this run"
+            ),
         ]
     ), checks.text()
     assert judged(checks, LA_OUT).endswith("PASS"), "another split is another byte class of the kernel; this stand-in's arithmetic has none"
