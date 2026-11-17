@@ -2756,3 +2756,15 @@ class TestNativeFp8D192Pair:
     test_causal_empty_kv_tiles = staticmethod(_d192_pair_checks.test_causal_empty_kv_tiles)
     test_negative_scale_declined_at_check = staticmethod(_d192_pair_checks.test_negative_scale_declined_at_check)
     test_explicit_attn_scale = staticmethod(_d192_pair_checks.test_explicit_attn_scale)
+
+
+@requires_rubin
+class TestNativeD256WideDecode:
+    """Run the wide decode epilogue detectors through the SM107 CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_decode_d256_sm107 as _decode
+
+    test_source_twin = staticmethod(_decode.test_sm107_decode_body_matches_the_sm100_body)
+    test_spill_free_renderings = staticmethod(_decode.test_sm107_decode_wide_tile_renderings_carry_no_spill)
+    test_column_groups = staticmethod(_decode.test_decode_kernel_four_column_groups)
+    test_wide_output_replays = staticmethod(_decode.test_decode_64_column_tile_wide_output_replays)

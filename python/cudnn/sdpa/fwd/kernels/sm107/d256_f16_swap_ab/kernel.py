@@ -874,16 +874,17 @@ def _softmax_warp_group(
     # writes the graph's actual d_v columns only (the tile is an envelope).
     oo = cutlass.make_array_view(o_tensor)
     D_V = cutlass.const_expr(o_tensor.shape[3])
-    # The epilogue runs in two 8-column halves: each half derives its columns' inverse sum / dead / live facts, then
-    # reads that half of O^T back (the x8 tcgen05.ld shape) and stores it.  The 16-wide per-column lists and the x16
-    # O^T readback together were what the 18-warp N_Q = 64 tile spilled at ptxas's 96-register cap; the halves keep
-    # the same arithmetic and the same stores (bitwise).  Each thread stores ONE LSE (the column its key lane names, lane == j), kept
-    # as a per-lane scalar with a liveness bit; the column's token / head are two integer ops on a warp-uniform row
-    # index, recomputed at each store site rather than carried in lists.
-    O_HALF = COLS // 2
+    # Bound the epilogue's live inverse/dead/live lists together with its TMEM
+    # readback and wide output addresses. The dense 18-warp N_Q=64 tile needs
+    # four columns at a time to stay within its 96-register cap. Paged records
+    # stay spill-free with eight columns, as do smaller CTAs: keep their wider
+    # readback to avoid extra epilogue waits. Arithmetic and ownership match.
+    # Each lane keeps only its own LSE and recomputes token/head at the store.
+    O_GROUPS = 4 if N_Q == 64 and not PAGED_KV else 2
+    O_HALF = COLS // O_GROUPS
     my_lse = ZERO
     my_lse_live = lane < cutlass.Int32(0)  # False
-    for h in cutlass.range_constexpr(2):
+    for h in cutlass.range_constexpr(O_GROUPS):
         inv_cols = []
         dead_cols = []
         live_cols = []

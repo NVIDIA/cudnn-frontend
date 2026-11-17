@@ -1499,3 +1499,10 @@ The detectors are `QSA/cutedsl/test_qsa_backward_sm100.py::test_sparse_pair_isol
 for the sparse query pairs and `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`
 for the dense kernel's query groups, which changes finite/nonfinite inputs under
 one captured graph for both shared and separate packed sequences.
+
+Wide output-address fixes can increase epilogue register pressure even when
+no launch or arithmetic changes. Check the affected tile's existing SASS
+spill detector as well as wide-stride numerics. For SM107 D256 SwapAB,
+`test_sm107_decode_wide_tile_renderings_carry_no_spill` detects the N_Q=64
+96-register limit, and `test_decode_64_column_tile_wide_output_replays`
+checks that reducing live epilogue columns preserves wide O addressing.
