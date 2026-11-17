@@ -123,7 +123,11 @@ def test_the_slot_table_of_a_step_of_several_tokens():
     assert table.tensors() == (), "a table: no call writes it"
     one = table.rows(4, 8)  # the rows of sequence 1 in a step
     assert one.indices.tolist() == [[2, 5, 8, 11]] and one.cu_seqlens.tolist() == [0, 4] and one.accepted.tolist() == [4] and one.accept == 3
-    assert one.indices.data_ptr() != table.indices.data_ptr(), "tensors of its own: a row of the table need not start aligned"
+    first = table.rows(0, 4)  # the first sequence's row starts where the table starts: only a copy has another address
+    assert (
+        first.indices.tolist() == [[1, 4, 7, 10]] and first.indices.data_ptr() != table.indices.data_ptr()
+    ), "tensors of its own: a row of the table need not start aligned"
+    assert first.cu_seqlens.tolist() == [0, 4] and table.rows(8, 12).cu_seqlens.tolist() == [0, 4], "the first row of a sequence alone is row 0"
 
     shapes = {"state": (2, 8, 8), "conv": (3, 32), "kv": (1, 8)}
     kinds = ("linear_attention", "full_attention")
@@ -400,6 +404,13 @@ def test_the_first_layer_is_not_excused_where_the_table_says_both_runs_feed_it_t
     assert not alike(_plan(1, 6, "fe-cublas")[0], _plan(1, 1, "fe-cublas")[0]), "reference chains and multiplies over copies state no batch invariance"
     assert not alike(_plan(1, 6, cc=(10, 3), sms=152)[0], _plan(1, 1, cc=(10, 3), sms=152)[0]), "a class the rows do not gate"
     assert not alike(_plan(1, 6, "reference")[0], _plan(1, 1, "reference")[0])
+    from dataclasses import replace
+
+    mine, theirs = _plan(1, 6)[0], _plan(1, 1)[0]
+    other = SimpleNamespace(facts=theirs.facts, rows={**theirs.rows, "add_norm_quantize": replace(theirs.rows["add_norm_quantize"], key="fe.another_norm")})
+    assert not alike(mine, other), "another row in front of the mixer is another kernel, though both rows gate batch invariance on the class"
+    chain = SimpleNamespace(facts=theirs.facts, rows={**theirs.rows, "projection.fp8.in": replace(theirs.rows["projection.fp8.in"], fallback="a copy")})
+    assert not alike(mine, chain) and not alike(SimpleNamespace(facts=mine.facts, rows={}), theirs)
     # ... and there a history that differs fails the line, where everywhere else it is printed
     step = torch_ref.gdn_verify_step
 
@@ -419,6 +430,38 @@ def test_the_first_layer_is_not_excused_where_the_table_says_both_runs_feed_it_t
         assert not checks.ok, "the tokens of this stack are byte-equal without the defect: they fail either way"
 
 
+@pytest.mark.parametrize("case", ["one element beyond the cap", "one element in a hundred outside the band"])
+def test_the_kept_state_is_held_to_both_rules_of_the_band(monkeypatch, case):
+    """What the verify run stands on is moved in what the comparison READS, so nothing accumulates and the runs themselves
+    are the clean ones: one element far beyond the cap leaves the share above the band's, and one element in a hundred a
+    little outside the band stays inside the cap -- each rule of the band fails the line on its own."""
+    from model_samples import state, tie_out
+
+    decode, verify = _pair(8, 2)
+    standing = state.DecodeState.standing
+
+    def moved(self):
+        layers = standing(self)
+        if self.tokens > 1:
+            recurrent, taps = layers[0]
+            recurrent = recurrent.clone()
+            unit = max(1.0, float(recurrent.abs().amax()))
+            if case.startswith("one element beyond"):
+                recurrent.view(-1)[0] += 0.5 * unit
+            else:
+                recurrent.view(-1)[::100] += 1e-3 * unit
+            layers[0] = (recurrent, taps)
+        return layers
+
+    monkeypatch.setattr(state.DecodeState, "standing", moved)
+    checks = tie_out.verify_checks(verify, decode)
+    tokens, kept = (next(line for line in checks.lines if line.startswith(start)) for start in ("  tokens  ", "  kept state  "))
+    assert tokens.endswith("    PASS"), "the runs are the clean ones"
+    assert "2 of 2 linear-attention layers were fed the same rows by both runs" in kept and kept.endswith("    FAIL") and not checks.ok, kept
+    share = float(kept.split("recurrent state ", 1)[1].split("% within", 1)[0])
+    assert (share > 99.9) == case.startswith("one element beyond"), f"{case}: {share} % within the band"
+
+
 def test_what_a_verify_session_refuses_and_what_a_stream_needs():
     from model_samples import Session, TextIO, tie_out
 
@@ -432,8 +475,9 @@ def test_what_a_verify_session_refuses_and_what_a_stream_needs():
     with pytest.raises(ValueError, match=r"takes ids \[1, 6\] \(sequences, tokens per sequence\); got \(6,\)"):
         verify.verify(torch.zeros(6, dtype=torch.int32), 0)
     for wrong in (6, -1, True, None):
-        with pytest.raises(ValueError, match="keeps 0 to 5 tokens behind the first"):
+        with pytest.raises(ValueError, match="a verify step of 6 tokens per sequence keeps 0 to 5 tokens behind the first; got accept="):
             verify.verify(torch.zeros((1, 6), dtype=torch.int32), wrong)
+        assert verify.record.count == 0 and verify.state.position == 0, "refused before the step: nothing ran, nothing was recorded"
     with pytest.raises(ValueError, match="needs a stream of 21 decode steps at 6 tokens per sequence; this one has 20"):
         tie_out.verify_checks(verify, decode)
     with pytest.raises(ValueError, match="compares a session of several tokens per sequence"):
@@ -452,6 +496,9 @@ def test_what_a_verify_session_refuses_and_what_a_stream_needs():
         verify.verify(ids, kept)
     with pytest.raises(ValueError, match="was built for 26 positions per sequence"):
         verify.verify(ids, 0)
+    assert verify.record.accepted == [5, 5, 5, 2] and verify.state.accepted == 2
+    verify.reset(fresh=False)  # back to the start in the same allocations: the record and where the state stands go with it
+    assert (verify.record.count, verify.record.accepted, verify.state.position, verify.state.accepted) == (0, [], 0, 0)
 
 
 def test_the_rows_of_the_verify_entry_and_what_every_other_block_does_at_its_row_count():
