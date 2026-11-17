@@ -336,7 +336,7 @@ class AddNormQuantizeBracket(_Reference):
 class Linear(_Reference):
     kernels = PYTORCH_CHAIN_WITH_MULTIPLY
 
-    def __call__(self, qx, weight):
+    def __call__(self, qx, weight, site=""):  # the chain is one function at every call site
         return linear(qx, weight, self.acc)
 
 

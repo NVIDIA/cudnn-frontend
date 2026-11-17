@@ -21,6 +21,10 @@ Two more containers carry what a kernel on the stored formats hands to a block t
 consumer's operand has.  :func:`dequantize` reads both, so the gather out of the layout and the quantisation are launched by
 the block that consumes the operand, never by the one that produced it.
 
+A weight that a block multiplies on its stored format is kept beside its bf16 copy (``Dequantized.stored``): the merged
+8-bit codes with their one scale, as the loader had them before it dequantised them.  The copy stays, because the reference
+block and every fallback row read it; a family's memory sentence counts both.
+
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
 
@@ -198,10 +202,13 @@ class Unquantized:
 
 @dataclass
 class Dequantized:
-    """A bf16 copy of code values (exact) and the scale a multiply applies to its result (a float or one scale per row)."""
+    """A bf16 copy of code values (exact) and the scale a multiply applies to its result (a float or one scale per row).
+    ``stored`` is the stored tensor the copy was made from, kept where a block of the plan multiplies on the stored format
+    (a family's loader decides it from the plan); ``None`` everywhere else."""
 
     data: torch.Tensor
     scale: Union[float, torch.Tensor]
+    stored: Optional[object] = None
 
 
 def _e4m3(x: torch.Tensor) -> torch.Tensor:

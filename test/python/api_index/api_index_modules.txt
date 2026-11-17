@@ -31,6 +31,7 @@ cudnn.moe_ep
 cudnn.native_sparse_attention
 cudnn.ops
 cudnn.ops.dsa
+cudnn.ops.mhc
 cudnn.ops.nsa
 cudnn.reduction_modifiers
 cudnn.rmsnorm_rht_amax
