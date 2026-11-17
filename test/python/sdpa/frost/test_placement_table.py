@@ -604,6 +604,28 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
 
 
 @pytest.mark.L0
+def test_sm80_paged_d64_no_sink_on_tile_floor_follows_v2():
+    """sm80_paged_d64_v2_20261117 (confirmed by v3): A100 paged THD-Q d64 causal prefill without a sink leads on the KV tile from cost
+    2^34.161; llama3.2-1b 32/8 at b 4, S_q 512 over 32k ran the backend at 1.80x under the old 2^37.292 floor. The sink and off-tile
+    classes keep sm80_prefill_gaps_20261117's entries."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=4, h_q=32, h_kv=8, s_q=512, s_kv=32768, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=4 * 512)
+        base.update(over)
+        return _facts(**base)
+
+    moved = f()
+    assert pt.matched_entry(row, moved).study == "sm80_paged_d64_v2_20261117"
+    assert 34.161 <= pt.FEATURES["cost"](moved) < 37.292
+    assert pt.lookup(row, moved) is True
+    assert pt.lookup(row, f(b=1, s_q=128, s_kv=4096, max_total_seq_len_q=128)) is False
+    for over in (dict(has_sink=True), dict(s_kv=32769)):
+        assert pt.matched_entry(row, f(**over)).study == "sm80_prefill_gaps_20261117", over
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_two_condition_entry_leads_only_where_both_hold(s_kv):
     """``Entry.also``: sm80_dense_d128_gqa_v2_20261117 leads A100 dense d128 GQA causal prefill only with few query rows AND a long
