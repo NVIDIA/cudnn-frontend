@@ -34,6 +34,17 @@ stay in the kernel's 128 x 4 layout (``weights.TiledBlockScaledTensor``), and wh
 the consumer's quantised operand is handed over unquantised (``weights.Unquantized``).  The kernel normalises in fp32 and
 rounds once, so the adapter names its twin: the norm at the kernel's rounding points.
 
+``fe.fp8_projection_decode`` calls ``cudnn.Fp8ProjectionDecode``, the multiply of an 8-bit activation by an 8-bit weight on
+the stored codes of both (``docs/operations/gemm_fusions/fp8_projection_decode.md``): one launch per call.  An entry is one
+weight shape at one split, and the in-projection of a layer has another shape in each kind of layer: the row names the
+shape per call site, and the adapter holds one entry instance per site.  The row's form is the whole kernel -- the split,
+the weight tile, the ring depth, the tensor-memory columns and their release, the launch knobs -- and the adapter passes
+it as given, so the entry never runs on its own pick.  The weight is the merged codes the loader kept beside the bf16
+copy (``weights.Dequantized.stored``; ``stored_weights`` asks the loader for them), the scale the fp32 product of the
+two static scales as one element on the device, formed on the host once per pair of values, and the output a buffer of
+the call's own.  The kernel accumulates in fp32 in a fixed order and rounds once, as the reference multiply does in its
+own precision: the reference block of the same name is its twin.
+
 A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
 An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
 ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it compiled, its
@@ -81,6 +92,9 @@ SOURCE_FILES = (
     "norm/frost/add_norm_quant_decode.py",
     "norm/frost/kernel/add_norm_quant_decode_config.py",
     "norm/frost/kernel/add_norm_quant_decode_f16.py",
+    "gemm/frost/projection_decode/fp8_projection_decode.py",
+    "gemm/frost/projection_decode/kernel/fp8_projection_decode_config.py",
+    "gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py",
 )
 #: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
 FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}
@@ -93,6 +107,15 @@ NORM_FORM_ARGUMENTS = {"ADD": "add", "BF16_OUT": "bf16", "QUANT": "quant", "STOR
 NORM_FORM_REQUIRED = ("ADD", "BF16_OUT", "QUANT")
 #: the quantisation of a consumer's operand (``providers.Quant.fmt``) -> the entry's name for the codes that serve it
 NORM_QUANT = {"fp8": "e4m3_static", "nvfp4": "nvfp4"}
+#: the fields of the form of ``cudnn.Fp8ProjectionDecode`` a provider row may name, by how the adapter passes them: the
+#: constructor arguments (``SPLIT_K`` is a numerics attribute of the entry, the other two its launch knobs), the fields of
+#: its performance form (``form=ProjectionForm(...)``, passed as a whole: the entry then never takes its own pick) and the
+#: weight's shape (``geometry=ProjectionGeometry(...)``), which a row names per call site.  A row names at least the split,
+#: the weight tile, the ring depth and the shape: the entry is called on an explicit kernel, never on a default
+PROJECTION_ARGUMENTS = {"SPLIT_K": "split_k", "PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+PROJECTION_FORM_FIELDS = ("MMA_M", "STAGES", "TMEM_COLS", "TOKEN_TILE", "PREWAIT_WEIGHTS", "HOLD_TMEM")
+PROJECTION_GEOMETRY = ("OUT_FEATURES", "IN_FEATURES")
+PROJECTION_REQUIRED = ("SPLIT_K", "MMA_M", "STAGES", *PROJECTION_GEOMETRY)
 #: the entry's three launch facts: what the kernel check reads
 LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
 #: the first cuDNN Frontend version that carries the entries of this module, and the CuTe DSL floor their pages state
@@ -204,6 +227,18 @@ class EntryBlock(BlockBase):
 
         return not cutedsl_runtime_available(tuple(self.facts.cc))
 
+    def _sites(self) -> tuple:
+        """The call sites of the row that the model's wiring has (every site of the row for a model that names none): the
+        forms a run builds.  A row without sites is called in its one form."""
+        named = getattr(self.model, "sites", None)
+        called = set(named()) if callable(named) else None
+        return tuple(site for site, _ in self.row.sites if called is None or site in called) if self.row.sites else ("",)
+
+    def _stated(self, entry, rows: int) -> dict:
+        """The form an entry instance states for ``rows``, as the row's fields are looked up in it: the entry's own
+        ``form_for``.  An adapter whose row names fields the entry states one level down says where."""
+        return entry.form_for(rows)
+
     def _declined(self, error, what: str) -> str:
         """The sentence for a typed decline of the entry at ``what``: the installation's where this adapter can name an unmet
         requirement, else the operands this adapter built."""
@@ -246,7 +281,7 @@ class EntryBlock(BlockBase):
         if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
             place = next((n for n, built in enumerate((e for e in _ENTRIES.values() if type(e) is type(entry)), 1) if built is entry), 0)
             try:
-                stated = entry.form_for(rows)
+                stated = self._stated(entry, rows)
             except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
                 stated = {}
             form = tuple((name, stated[name]) for name, _ in self._served_form() if name in stated)
@@ -263,7 +298,7 @@ class EntryBlock(BlockBase):
         data and its launch shape.  The entry's typed declines pass through: a row that claims a row count the entry does not
         serve is a wrong table."""
         entry = self._build(self.options.get("device", "cuda"))
-        return Facts(tuple(entry.kernel_symbols_for(rows)), entry.form_for(rows), tuple(entry.launch_shape_for(rows)))
+        return Facts(tuple(entry.kernel_symbols_for(rows)), self._stated(entry, rows), tuple(entry.launch_shape_for(rows)))
 
 
 class GdnDecodeFusedBlock(EntryBlock):
@@ -513,13 +548,6 @@ class AddNormQuantDecodeBlock(EntryBlock):
             )
         return {NORM_FORM_ARGUMENTS[name]: value for name, value in form}
 
-    def _sites(self) -> tuple:
-        """The call sites of the row that the model's wiring has (every site of the row for a model that names none): the
-        forms a run builds.  A row without sites is called in its one form."""
-        named = getattr(self.model, "sites", None)
-        called = set(named()) if callable(named) else None
-        return tuple(site for site, _ in self.row.sites if called is None or site in called) if self.row.sites else ("",)
-
     def check_support(self, sequences: int, tokens: int) -> None:
         self._check_package()
         for site in [site for site, _ in self.row.sites] or [""]:
@@ -682,3 +710,162 @@ class AddNormQuantDecodeBlock(EntryBlock):
         else:  # the form ends at the bf16 rows: a consumer that reads a quantised operand quantises them itself
             q = None if quant is None else Unquantized(out, quant.fmt, float(quant.scale))
         return q, out, residual
+
+
+class Fp8ProjectionDecodeBlock(EntryBlock):
+    """``cudnn.Fp8ProjectionDecode``: ``out[t, n] = bf16(scale * sum_k activation[t, k] * weight[n, k])`` on the 8-bit codes
+    of both operands, fp32 accumulation in a fixed order; one launch per call, from the entry instance of the call's site
+    (one per weight shape), in the form the row names."""
+
+    name = "Fp8ProjectionDecode"
+    what = "the FP8 projection decode step at these weight shapes"
+    kernels = (Kernel("fp8_projection", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    stored_weights = True  # the weight is multiplied on its stored 8-bit codes: the loader keeps them beside the bf16 copy
+    _scales = None  # (activation scale, weight scale, device) -> the one-element fp32 tensor the kernel reads: built once per pair
+    _site = ""  # of the last call
+
+    def _arguments(self, site: str) -> dict:
+        """The constructor arguments the form of ``site`` stands for.  A field this adapter cannot pass, or a form that
+        leaves the split, the weight tile, the ring depth or the weight's shape to the entry, is a wrong table."""
+        form = self.row.site_form(site)
+        known = (*PROJECTION_ARGUMENTS, *PROJECTION_FORM_FIELDS, *PROJECTION_GEOMETRY)
+        unknown = [name for name, _ in form if name not in known]
+        missing = [name for name in PROJECTION_REQUIRED if name not in dict(form)]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form at {site or 'its one call site'} {what}; this adapter passes {', '.join(known)} to "
+                f"cudnn.Fp8ProjectionDecode, and never leaves {', '.join(PROJECTION_REQUIRED)} to the entry's own pick"
+            )
+        from cudnn.gemm import ProjectionForm, ProjectionGeometry
+
+        fields = dict(form)
+        arguments = {PROJECTION_ARGUMENTS[name]: value for name, value in form if name in PROJECTION_ARGUMENTS}
+        arguments["geometry"] = ProjectionGeometry(*(fields[name] for name in PROJECTION_GEOMETRY))
+        arguments["form"] = ProjectionForm(**{name: fields[name] for name in PROJECTION_FORM_FIELDS if name in fields})
+        return arguments
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        for site in [site for site, _ in self.row.sites] or [""]:
+            self._arguments(site)
+        rule = self.options.get("merge_rule", "largest_scale")
+        if rule != "largest_scale":  # the entry reads ONE scale element per call: a weight merged with a scale per row is not its operand
+            raise NotImplementedError(
+                f"cudnn.Fp8ProjectionDecode takes one scale per weight; the merge rule {rule!r} keeps one per weight row: load with the merge "
+                f'rule "largest_scale", or select another declared row of the block with --provider'
+            )
+        if self.facts.total_bytes and "device" in self.options:
+            for site in self._sites():  # the first use, where the entry gates the toolchain, follows the memory sentence
+                self._check_claim(self._build(self.options["device"], site), sequences * tokens)
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: the entry's page asks for a CuTe DSL that has the layer its kernel is written on."""
+        if super()._unmet():
+            return True
+        import importlib.util
+
+        try:
+            return importlib.util.find_spec("cutlass.cute.experimental") is None
+        except (ImportError, ValueError):
+            return True
+
+    def _build(self, device, site: str = ""):
+        import torch
+
+        device = torch.device(device)
+        key = ("fp8_projection_decode", str(device), tuple(self.row.site_form(site)))
+        if key not in _ENTRIES:
+            arguments = self._arguments(site)
+            try:
+                _ENTRIES[key] = self._cudnn().Fp8ProjectionDecode(device, **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the shape, the split or the form the table hands it
+                where = f" at {site}" if site else ""
+                raise ValueError(
+                    f"the provider table is wrong: {self.entry} declines the weight shape or the form of the row of {self.row.key}{where}: {error}"
+                ) from None
+        return _ENTRIES[key]
+
+    def _stated(self, entry, rows: int) -> dict:
+        """The entry's form for ``rows`` with the two fields of its geometry beside the others: a row names the weight's
+        shape per call site (``OUT_FEATURES``, ``IN_FEATURES``), and the entry states them one level down (``GEOM``)."""
+        form = entry.form_for(rows)
+        return {**form, **form.get("GEOM", {})}
+
+    def _served_form(self) -> tuple:
+        return tuple(self.row.site_form(self._site))
+
+    def launch_facts(self, rows: int, site: str = "") -> Facts:
+        """The answers of the entry instance of ``site`` for ``rows``: the symbol of the kernel it compiled for that row
+        count, its form and its launch shape (one thread block per weight tile: the grid follows the weight's shape)."""
+        entry = self._build(self.options.get("device", "cuda"), site)
+        return Facts(tuple(entry.kernel_symbols_for(rows)), self._stated(entry, rows), tuple(entry.launch_shape_for(rows)))
+
+    def _scale(self, activation: float, weight: float, device):
+        """The one fp32 element the kernel reads its scale from: the fp32 product of the activation's static scale and the
+        weight's scale, formed on the host once per pair of values and never inside a later step."""
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(activation), float(weight), str(device))
+        if key not in self._scales:
+            product = torch.tensor([float(activation)], dtype=torch.float32) * torch.tensor([float(weight)], dtype=torch.float32)
+            self._scales[key] = product.to(device)
+        return self._scales[key]
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the kernel of the run's row count at every weight shape
+        the run calls (the entry's build takes no operand).  Declines as ``EntryBlock.first_use``."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        for site in self._sites():
+            try:
+                self._build(self.options["device"], site).compile(sequences * tokens)
+            except NotImplementedError as error:
+                if self._unmet():
+                    raise
+                raise ValueError(self._declined(error, "its first use")) from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
+        for site in self._sites():
+            entry, fields = self._build(device, site), dict(self.row.site_form(site))
+            n, k = (fields[name] for name in PROJECTION_GEOMETRY)
+            weight = torch.zeros((n, k), dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
+            activation = torch.zeros((rows, k), dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
+            out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
+            try:
+                entry.compile(rows)  # built while the run was planned (``first_use``): the entry finds its kernel
+                entry(weight, activation, self._scale(1.0, 1.0, device), out)  # the first launch of the compiled kernel, before the first step
+            except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+                raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, qx, weight, site=""):
+        import torch
+
+        stored = getattr(weight, "stored", None)
+        if not isinstance(stored, ScaledTensor) or isinstance(stored.scale, torch.Tensor):
+            has = "one scale per weight row" if isinstance(stored, ScaledTensor) else "no stored 8-bit codes"
+            raise ValueError(
+                f"cudnn.Fp8ProjectionDecode multiplies on the stored 8-bit weight with its one scale; the weight of this call has {has}: "
+                "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+            )
+        if not isinstance(qx, ScaledTensor):
+            raise ValueError(f"cudnn.Fp8ProjectionDecode multiplies static 8-bit codes; this block is handed {type(qx).__name__}")
+        device, rows = qx.codes.device, int(qx.codes.shape[0])
+        entry = self._build(device, site)
+        self._served, self._site = (entry, rows), site  # what the call log of a traced step reads back (``serving``)
+        out = torch.empty((rows, stored.codes.shape[0]), dtype=torch.bfloat16, device=device)  # this call's own
+        scale = self._scale(qx.scale, stored.scale, device)
+        try:
+            entry(stored.codes.view(torch.float8_e4m3fn), qx.codes.view(torch.float8_e4m3fn), scale, out)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.Fp8ProjectionDecode declined the operands of this step: {error}") from error
+        return out

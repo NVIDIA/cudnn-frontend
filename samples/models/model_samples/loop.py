@@ -8,7 +8,8 @@ number of sequences and the stack, and states the memory the run needs -- for th
 follow it on its weights, so that nothing can decline once the first of them has loaded.  Only a run that fits then lets its
 entries build their kernels on scratch operands (their first use, where an entry asks what it needs of the installed
 toolchain): the memory sentence comes before the first allocation on the GPU.  ``load()`` then reads (or draws),
-merges and dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one
+merges and dequantises the weights -- keeping, beside its bf16 copy, the stored form of every weight that a block of
+these plans multiplies on (``Block.stored_weights``) -- compiles what a provider compiles (a compiled form is launched once) and runs one
 warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
 chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
 no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
@@ -118,6 +119,7 @@ class Session:
         self.state: Optional[DecodeState] = None
         self.record: Optional[Record] = None
         self.tap = None  # tie_out's hook: tap(block name, layer, block, operands) -> the block's result
+        self._followers: tuple = ()  # the sessions that will run on this one's weights, as ``plan_table`` was told
         self._report = Report(model.name, reduced=bool(getattr(model, "reductions", ())))
         self._calls = 0
         self._prefill_start = 0.0
@@ -125,7 +127,12 @@ class Session:
     # ------------------------------------------------------------------ plan
     def resolve(self) -> blocks.Plan:
         if self.plan is None:
-            options = {"reference_precision": self.reference_precision, "device": str(self.device), "check_kernels": self.check_kernels}
+            options = {
+                "reference_precision": self.reference_precision,
+                "device": str(self.device),
+                "check_kernels": self.check_kernels,
+                "merge_rule": self.merge_rule,
+            }
             facts = self.device if self.device.type == "cuda" else blocks.DeviceFacts((0, 0), "cpu")
             self.plan = blocks.plan(
                 self.model.provider_table,
@@ -140,6 +147,14 @@ class Session:
                 source=self.model.table_source,
             )
         return self.plan
+
+    def stored_weights(self, own: bool = False) -> tuple:
+        """The blocks whose weights this session's load keeps on their stored format beside the bf16 copy: every block that
+        a provider multiplying on the stored format serves (``Block.stored_weights``) in this session's plan or in the
+        plan of a session that will run on its weights (``plan_table(later)``).  ``own``: the blocks of this session's
+        plan alone -- the weights its own steps read on the stored format."""
+        plans = [self.resolve(), *(session.resolve() for session in (() if own else self._followers))]
+        return tuple(dict.fromkeys(name for plan in plans for name, block in plan.items() if getattr(block, "stored_weights", False)))
 
     def claim(self) -> Optional[census.Claim]:
         """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the
@@ -164,9 +179,14 @@ class Session:
         plan = self.resolve()
         for session in later:
             session.resolve()
+        self._followers = tuple(later)
         sentence = ""
         if self.device.type == "cuda":
-            need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
+            # weights kept on their stored format beside the copies, for the blocks that multiply on it: part of what the load
+            # of the first session holds (asked of a family's model only where a block of the plans reads them)
+            stored = self.stored_weights() if self._share is None else ()
+            held = {"stored": stored} if stored else {}
+            need = self.model.memory_bytes(self.sequences, self.capacity, **held) - (self.model.copy_bytes() if self._share is not None else 0)
             need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
             counts = [self.sequences, *(session.sequences for session in later)]
             what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
@@ -188,7 +208,9 @@ class Session:
                 from .weights import Checkpoint
 
                 self.checkpoint = Checkpoint.synthetic(self.model, self.seed)
-            self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule)
+            stored = self.stored_weights()
+            keep = {"stored": stored} if stored else {}  # asked of a family's loader only where a block of the plans reads them
+            self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule, **keep)
         for name, block in plan.items():
             if getattr(block, "compiles", False):
                 with self.stages.stage(f"compile and first launch {name} ({self.sequences} row{'s' if self.sequences > 1 else ''})"):
@@ -310,5 +332,9 @@ class Session:
 
     def report(self) -> Report:
         if hasattr(self.model, "bytes_per_step") and self.state is not None:
-            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position)
+            # a block of this session's plan that multiplies on the stored format reads its weight there, not as a copy
+            # (asked of a family's model only where the plan has such a block)
+            stored = self.stored_weights(own=True)
+            read = {"stored": stored} if stored else {}
+            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position, **read)
         return self._report
