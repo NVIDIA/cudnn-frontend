@@ -17,7 +17,7 @@ attention.prepare      QKV row, cache, position, params                  (q, gat
 attention.core         q, cache, position                                ``[rows, 6144]`` bf16
 attention.gate_quantize attention output, gate, ``Quant``                8-bit ``[rows, 6144]``
 projection.fp8.out     8-bit operand, weight copy                        ``[rows, hidden]`` bf16
-mlp.gate_up            4-bit operand, merged gate / up copy, ``Quant``   4-bit ``[rows, 17408]``
+mlp.gate_up            4-bit operand, merged gate / up weight, ``Quant``  4-bit ``[rows, 17408]``
 mlp.down               4-bit operand, weight copy                        ``[rows, hidden]`` bf16
 output_head            4-bit operand, weight copy                        logits ``[rows, vocabulary]`` bf16
 token_choice           logits                                            ids ``[rows]`` int32
@@ -33,7 +33,8 @@ attention layer; ``qkv`` and ``z`` of a linear-attention layer; its ``b`` and ``
 The loader then keeps each multiplied weight in the forms the plans of the run read it in (``STORED_WEIGHTS`` names the
 blocks): a bf16 copy where a block reads one -- every fallback row, the reference stack -- and the merged stored tensor
 where a block multiplies on it (8-bit codes with their one scale; packed 4-bit codes with their block scales and their
-global scale).  A weight that every plan of the run reads on its stored format gets no copy; the reference blocks of the
+global scale) -- in the layout that block's provider reads, where it has one of its own (the fused gate / up kernel:
+``load(layouts=)``).  A weight that every plan of the run reads on its stored format gets no copy; the reference blocks of the
 checks then make theirs for one call at a time (``weights.OnDemand``), and the memory sentence counts the largest.
 
 ``QwenDense.reduced()`` keeps every layer width of the published model and reduces the depth and the vocabulary; every
@@ -135,8 +136,9 @@ class LayerWeights:
 class Weights:
     """The weights of one load.  ``stored`` and ``uncopied`` say what that load kept of the multiplied weights, by block
     (``STORED_WEIGHTS``): the blocks whose weights it holds on their stored format, and those of them it holds on that
-    format alone, without a bf16 copy.  A session reads them before its first step: a block must find the form it reads.
-    ``alone`` lists the weights of the blocks ``uncopied`` one by one -- ``(block, layer, weight)``, the layer ``None``
+    format alone, without a bf16 copy; ``laid_out`` those of ``stored`` it holds in the layout a provider multiplies on
+    (``load(layouts=)``) in place of the checkpoint's row order.  A session reads them before its first step: a block
+    must find the form it reads.  ``alone`` lists the weights of the blocks ``uncopied`` one by one -- ``(block, layer, weight)``, the layer ``None``
     for the output head -- each with the checksum of its stored bytes at this load (``weights.Dequantized.checksum``):
     the checks of a run hold these bytes to it, because their reference of such a weight is made from them."""
 
@@ -149,6 +151,7 @@ class Weights:
     stored: Tuple[str, ...] = ()
     uncopied: Tuple[str, ...] = ()
     alone: Tuple[tuple, ...] = ()
+    laid_out: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -518,7 +521,9 @@ class QwenDense:
         }
 
     # ------------------------------------------------------------------ load
-    def load(self, checkpoint, device, stages, merge_rule: str = "largest_scale", stored: Sequence[str] = (), uncopied: Sequence[str] = ()) -> Weights:
+    def load(
+        self, checkpoint, device, stages, merge_rule: str = "largest_scale", stored: Sequence[str] = (), uncopied: Sequence[str] = (), layouts=None
+    ) -> Weights:
         """Read (or draw) and merge every weight, and keep each multiplied weight in the forms the plans of the run read
         (``weights.Dequantized``); each stage's seconds accumulate in ``stages``.
 
@@ -528,7 +533,13 @@ class QwenDense:
         of them that NO block of the plans reads as a bf16 copy: for them no copy is made, and a checksum of the stored
         bytes is taken in its place (stage ``checksum``; ``Weights.alone``) -- the reference of the checks will be made
         from these bytes, so the checks hold them to what they are now.  Every other multiplied weight is dequantised to
-        its bf16 copy, as every stack of this family did.  The returned weights say what was kept."""
+        its bf16 copy, as every stack of this family did.  The returned weights say what was kept.
+
+        ``layouts`` maps a block of ``stored`` to the layout its provider multiplies on: a function of the merged stored
+        tensor that returns it in that layout (``Block.stored_layout``; stage ``lay out``).  The weight is then kept in
+        that layout and in no other stored form -- the same bytes in the kernel's order -- its checksum is taken of
+        what the block multiplies on, and a bf16 copy of it, kept or made later, is in the checkpoint's row order
+        either way (``weights.dequantize``)."""
         import torch
 
         from ..weights import Dequantized, dequantize, merge_block_scaled, merge_scaled, stored_checksum
@@ -541,7 +552,10 @@ class QwenDense:
         bare = sorted(set(uncopied) - set(stored))
         if bare:  # a weight is held in one form at least: without its copy it needs its stored form
             raise ValueError(f"a load that keeps no bf16 copy of the weights of {', '.join(bare)} must keep their stored format, and was not asked to")
-        kept, copyless = tuple(stored), tuple(uncopied)
+        kept, copyless, layouts = tuple(stored), tuple(uncopied), dict(layouts or {})
+        unasked = sorted(set(layouts) - set(kept))
+        if unasked:  # a layout is a form of a stored weight: without the stored weight there is nothing to lay out
+            raise ValueError(f"a load was handed a layout of the stored weights of {', '.join(unasked)}, and was not asked to keep them")
         alone = []  # (block, layer, weight) of every weight kept on its stored format alone
         g = self.geometry
         read = "draw" if getattr(checkpoint, "synthetic_weights", False) else "read"
@@ -557,13 +571,18 @@ class QwenDense:
                 with stages.stage("merge"):
                     parts = [merge(parts)]
             whole = parts[0]
-            if block in copyless:  # every plan of the run multiplies this weight on its stored format: no copy is made
+            copied = None
+            if block not in copyless:  # a block of the plans reads the copy: made from the merged tensor, as every stack made it
+                with stages.stage("dequantise"):
+                    copied = dequantize(whole)
+            if block in layouts:  # the provider multiplies on a layout of its own: the one stored form this load keeps
+                with stages.stage("lay out"):
+                    whole = layouts[block](whole)
+            if copied is None:  # every plan of the run multiplies this weight on its stored format: no copy is made
                 with stages.stage("checksum"):  # of the bytes the block multiplies on and the checks' reference is made from
                     bare = Dequantized(None, whole.scale, whole, stored_checksum(whole))
                 alone.append((block, layer, bare))
                 return bare
-            with stages.stage("dequantise"):
-                copied = dequantize(whole)
             if block in kept:  # a block of the plans multiplies on the stored format, another reads the copy: both stay
                 copied.stored = whole
             return copied
@@ -634,6 +653,7 @@ class QwenDense:
             stored=kept,
             uncopied=copyless,
             alone=tuple(alone),  # read after the head's weight was made, two lines up
+            laid_out=tuple(name for name in kept if name in layouts),
         )
 
     # ------------------------------------------------------------------ one decode step

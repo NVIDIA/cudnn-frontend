@@ -46,6 +46,25 @@ device, formed on the host once per pair of values, and the output a buffer of t
 in fp32 in a fixed order and rounds once, as the reference multiply does in its own precision: the reference block of
 the same name is its twin.
 
+``fe.swiglu_fp4_decode`` calls ``cudnn.SwigluFp4Decode``, the merged gate / up multiply of an MLP on the packed 4-bit codes
+of both operands with ``SiLU(gate) * up`` and the 4-bit quantisation of the result in its epilogue
+(``docs/operations/gemm_fusions/swiglu_fp4_decode.md``): one launch per call, and nothing of the product is stored.  The
+row's form is the whole kernel -- the token tile of its row count, the weight stages issued ahead of the wait, the L2
+policy of the weight stream, the cap of the persistent grid, the launch attribute -- and the adapter passes it as one
+config, so the entry never runs on its own default; the token tile follows the row count, so the table has one row per
+tile and the adapter one entry instance per row.  The kernel reads the weight in a layout of its own, the rows in tiles
+of 64 gate + 64 up channels with the block scales in the 128 x 4 layout: the adapter builds it once per weight at load
+with the entry's own helper (``stored_layout``, which the loader calls for a block that says ``stored_weights``), and
+that tensor is the one form of the stored weight the load keeps.  The operand is the norm's 4-bit output: from the
+norm's kernel it comes in the layout this kernel reads and is handed over as it is; from a block that is not a kernel
+(a reference chain, or one row of a batch in a check) the block scales come row by row, and bringing them into the
+layout is this block's own launch, made when it reads its operand.  The two scalars are one fp32 element each on the
+device, formed on the host once per value: the fp32 product of the two static scales, and the global scale of the
+output (the fp32 reciprocal of the consumer's static scale).  The outputs are buffers of the call's own and stay in the
+kernel's layout (``weights.TiledBlockScaledTensor``): a consumer on a fallback row gathers when it reads them.  The
+kernel accumulates in fp32 over the whole input width and rounds three times, so the adapter names its twin: the
+reference pair of the block evaluated in fp64 with the entry's error bound.
+
 A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
 An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
 ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it compiled, its
@@ -76,7 +95,7 @@ import re
 
 from ..census import Facts, Kernel
 from ..state import RecurrentSlots
-from ..weights import ScaledTensor
+from ..weights import BLOCK, TILE_COLUMNS, TILE_ROWS, BlockScaledTensor, InterleavedBlockScaledTensor, ScaledTensor, TiledBlockScaledTensor, tile_scales
 from . import BlockBase, GdnParams, split_qkvz
 
 #: the files of the package this adapter runs, relative to the ``cudnn`` package: the source hash of ``check_environment``
@@ -96,6 +115,9 @@ SOURCE_FILES = (
     "gemm/frost/projection_decode/fp8_projection_decode.py",
     "gemm/frost/projection_decode/kernel/fp8_projection_decode_config.py",
     "gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py",
+    "gemm/frost/swiglu_decode/swiglu_fp4_decode.py",
+    "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_config.py",
+    "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_nvfp4.py",
 )
 #: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
 FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}
@@ -117,6 +139,13 @@ PROJECTION_ARGUMENTS = {"SPLIT_K": "split_k", "PDL": "pdl", "PDL_RELEASE": "pdl_
 PROJECTION_FORM_FIELDS = ("MMA_M", "STAGES", "TMEM_COLS", "TOKEN_TILE", "PREWAIT_WEIGHTS", "HOLD_TMEM")
 PROJECTION_GEOMETRY = ("OUT_FEATURES", "IN_FEATURES")
 PROJECTION_REQUIRED = ("SPLIT_K", "MMA_M", "STAGES", *PROJECTION_GEOMETRY)
+#: the fields of the form of ``cudnn.SwigluFp4Decode`` a provider row names, by how the adapter passes them: the fields of
+#: its config (``cfg=Cfg(...)``, passed as a whole: the entry then never takes a default of its own) and its launch knob
+#: (``pdl=``).  A row names every one of them: the token tile of its row count, the weight stages ahead of the wait, the
+#: L2 policy of the weight stream, the cap of the persistent grid, the launch attribute
+SWIGLU_CONFIG_FIELDS = ("TOKEN_TILE", "PREWAIT_STAGES", "L2_EVICT_FIRST", "MAX_CLUSTERS")
+SWIGLU_ARGUMENTS = {"PDL": "pdl"}
+SWIGLU_REQUIRED = (*SWIGLU_CONFIG_FIELDS, *SWIGLU_ARGUMENTS)
 #: the entry's three launch facts: what the kernel check reads
 LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
 #: the first cuDNN Frontend version that carries the entries of this module, and the CuTe DSL floor their pages state
@@ -870,3 +899,187 @@ class Fp8ProjectionDecodeBlock(EntryBlock):
         except NotImplementedError as error:
             raise RuntimeError(f"cudnn.Fp8ProjectionDecode declined the operands of this step: {error}") from error
         return out
+
+
+class SwigluFp4DecodeBlock(EntryBlock):
+    """``cudnn.SwigluFp4Decode``: ``gate`` and ``up`` = ``bf16(alpha * sum_k activation[t, k] * weight[row, k])`` on the packed
+    4-bit codes of both operands, ``v = bf16(silu(gate) * up)``, and per block of 16 channels the block scale and the
+    4-bit codes of ``v``; one launch per call, in the form the row names, on the weight in the kernel's own layout."""
+
+    name = "SwigluFp4Decode"
+    what = "the fused 4-bit gate / up decode step"
+    kernels = (Kernel("swiglu_fp4", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    stored_weights = True  # the weight is multiplied on its stored 4-bit codes: the loader keeps them for this block, in ``stored_layout``
+    _twin = None
+    _scalars = None  # (kind, values, device) -> the one-element fp32 tensor the kernel reads: built once per value, never inside a later step
+
+    def _geometry(self):
+        from cudnn.gemm import SwigluGeometry
+
+        return SwigluGeometry(self.model.geometry.hidden, self.model.geometry.mlp)
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for: the config as a whole and the launch knob.  A field this
+        adapter cannot pass, or a form that leaves one of them to the entry's default, is a wrong table."""
+        form = dict(self.row.form)
+        unknown = [name for name in form if name not in SWIGLU_REQUIRED]
+        missing = [name for name in SWIGLU_REQUIRED if name not in form]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(SWIGLU_REQUIRED)} to cudnn.SwigluFp4Decode, "
+                "and never leaves one of them to the entry's own default"
+            )
+        from cudnn.gemm.frost.swiglu_decode import Cfg
+
+        cfg = Cfg(GEOM=self._geometry(), **{name: form[name] for name in SWIGLU_CONFIG_FIELDS})
+        return {"cfg": cfg, **{SWIGLU_ARGUMENTS[name]: form[name] for name in SWIGLU_ARGUMENTS}}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4 or later, on every
+        class it serves (its bytes were qualified with that compiler)."""
+        if super()._unmet():
+            return True
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound; the entry has imported the DSL by now
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+
+    def _build(self, device):
+        import torch
+
+        device = torch.device(device)
+        g = self.model.geometry
+        key = ("swiglu_fp4_decode", str(device), g.hidden, g.mlp, tuple(self.row.form))
+        if key not in _ENTRIES:
+            arguments = self._arguments()
+            try:
+                _ENTRIES[key] = self._cudnn().SwigluFp4Decode(device, self._geometry(), **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the widths or the form the table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the geometry or the form of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def stored_layout(self, merged):
+        """The merged gate / up weight (every gate row, then every up row; block scales row by row) in the layout the
+        kernel multiplies on, built once per weight at load by the entry's own helper: the rows in tiles of 64 gate + 64 up
+        channels, the block scales of those rows in the 128 x 4 layout.  A permutation of bytes: nothing is requantised.
+        The loader keeps what this returns as the stored form of the weight, and nothing else of it."""
+        from cudnn.gemm.frost.swiglu_decode import interleave_gate_up
+
+        if not isinstance(merged, BlockScaledTensor):
+            raise ValueError(f"cudnn.SwigluFp4Decode multiplies on a merged 4-bit gate / up weight; the loader handed its layout {type(merged).__name__}")
+        try:
+            codes, scales = interleave_gate_up(merged.codes, tile_scales(merged.block_scales))
+        except (TypeError, ValueError) as error:  # a weight whose shape the kernel's layout cannot hold
+            raise ValueError(f"the provider table is wrong: {self.entry} cannot lay out the weight of the row of {self.row.key}: {error}") from None
+        return InterleavedBlockScaledTensor(codes, scales.view(merged.block_scales.shape), float(merged.scale))
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the block's reference pair evaluated in fp64 with the error
+        bound of the entry's contract, not the pair's own bf16 product."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.GateUpFp4Bound(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def _scalar(self, device, product=None, reciprocal=None):
+        """One fp32 element the kernel reads, formed on the host once per value: the fp32 product of two static scales
+        (``product``: the pair), or the fp32 reciprocal of one, correctly rounded (``reciprocal``: the global scale of 4-bit
+        codes whose consumer reads ``code * block scale * scale``)."""
+        import torch
+
+        from .torch_ref import fp32_product
+
+        if self._scalars is None:
+            self._scalars = {}
+        key = ("product", *(float(v) for v in product), str(device)) if product is not None else ("reciprocal", float(reciprocal), str(device))
+        if key not in self._scalars:
+            if product is not None:
+                value = fp32_product(*product)
+            else:
+                value = torch.ones(1, dtype=torch.float32) / torch.tensor([float(reciprocal)], dtype=torch.float32)
+            self._scalars[key] = value.to(device)
+        return self._scalars[key]
+
+    def _outputs(self, rows: int, device):
+        """This call's own buffers: the packed codes of the rows, and whole bands and tiles of the 128 x 4 layout for their
+        block scales (the kernel writes the bytes of the live rows; nothing else of that buffer is read)."""
+        import torch
+
+        width = self.model.geometry.mlp
+        out = torch.empty((rows, width // 2), dtype=torch.uint8, device=device)
+        scales = torch.empty((-(-rows // TILE_ROWS) * TILE_ROWS, -(-(width // BLOCK) // TILE_COLUMNS) * TILE_COLUMNS), dtype=torch.uint8, device=device)
+        return out, scales
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the kernel of the run's row count (the entry's build takes
+        no operand).  Declines as ``EntryBlock.first_use``."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        try:
+            self._build(self.options["device"]).compile(sequences * tokens)
+        except NotImplementedError as error:
+            if self._unmet():
+                raise
+            raise ValueError(self._declined(error, "its first use")) from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows, g = torch.device(self.options.get("device", "cuda")), sequences * tokens, self.model.geometry
+        entry = self._build(device)
+        weight = torch.zeros((2 * g.mlp, g.hidden // 2), dtype=torch.uint8, device=device)
+        weight_scale = torch.zeros((2 * g.mlp, g.hidden // BLOCK), dtype=torch.uint8, device=device)
+        activation = torch.zeros((rows, g.hidden // 2), dtype=torch.uint8, device=device)
+        activation_scale = torch.zeros((-(-rows // TILE_ROWS) * TILE_ROWS, g.hidden // BLOCK), dtype=torch.uint8, device=device)
+        one = self._scalar(device, product=(1.0, 1.0))
+        try:
+            entry.compile(rows)  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(weight, weight_scale, activation, activation_scale, one, one, *self._outputs(rows, device))  # the first launch, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    @staticmethod
+    def _operand(qx):
+        """The 4-bit operand as the kernel reads it: ``(packed codes, block scales in the 128 x 4 layout)``.  From a kernel
+        on the stored formats it comes that way and is handed over as it is.  From a block that is not a kernel -- a
+        reference chain, or one row of a batch in a check -- the block scales come row by row, and this block brings
+        them into the layout when it reads them: its own launch, never the producer's."""
+        if isinstance(qx, TiledBlockScaledTensor):
+            return qx.codes, qx.tiled_scales
+        if isinstance(qx, BlockScaledTensor):
+            return qx.codes, tile_scales(qx.block_scales)
+        raise ValueError(f"cudnn.SwigluFp4Decode multiplies packed 4-bit codes with their block scales; this block is handed {type(qx).__name__}")
+
+    def __call__(self, qx, weight, quant):
+        stored = getattr(weight, "stored", None)
+        if not isinstance(stored, InterleavedBlockScaledTensor):
+            has = "it in the checkpoint's row order" if isinstance(stored, BlockScaledTensor) else "no stored 4-bit codes"
+            raise ValueError(
+                f"cudnn.SwigluFp4Decode multiplies on the stored 4-bit gate / up weight in its own row order; the weight of this call has {has}: "
+                "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+            )
+        if quant is None or quant.fmt != "nvfp4":
+            asked = "no quantised operand" if quant is None else repr(quant.fmt)
+            raise ValueError(f"cudnn.SwigluFp4Decode writes 4-bit codes with their block scales; this block is asked for {asked}")
+        codes, scales = self._operand(qx)
+        device, rows = codes.device, int(codes.shape[0])
+        entry = self._build(device)
+        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        out, out_scales = self._outputs(rows, device)
+        alpha, scale = self._scalar(device, product=(qx.scale, stored.scale)), self._scalar(device, reciprocal=quant.scale)
+        try:
+            entry(stored.codes, stored.tiled_scales, codes, scales, alpha, scale, out, out_scales)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.SwigluFp4Decode declined the operands of this step: {error}") from error
+        return TiledBlockScaledTensor(out, out_scales, float(quant.scale))

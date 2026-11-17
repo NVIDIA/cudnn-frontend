@@ -31,6 +31,12 @@ from the bytes the weight's own block multiplies on, so it is a reference only w
 the loader takes a checksum of every weight it keeps that way (:func:`stored_checksum`), and the checks of a run
 compare it before their first pass and after their last (``Dequantized.intact``).
 
+A kernel may read its weight in a layout of its own.  The fused gate / up kernel of an MLP reads the merged weight with
+its rows in tiles of gate rows and up rows and its block scales in the 128 x 4 layout
+(:class:`InterleavedBlockScaledTensor`): the same bytes in another order, built once per weight at load by the
+provider that multiplies on it.  A load then holds that ONE tensor, never the checkpoint's order beside it, and
+:func:`dequantize` gives its bf16 copy back in the checkpoint's row order, which is what every reader of a copy reads.
+
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
 
@@ -62,6 +68,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -181,6 +188,56 @@ class TiledBlockScaledTensor:
         return self.row_major().tensors()
 
 
+def tile_scales(block_scales: torch.Tensor) -> torch.Tensor:
+    """Row-major block scales ``[rows, blocks]`` in the 128 x 4 layout (:func:`tile_scale_index`): a buffer of whole bands
+    of 128 rows and whole tiles of 4 scale columns, ``[ceil(rows / 128) * 128, ceil(blocks / 4) * 4]``, zero where no row
+    lives.  Whole bands of whole tiles are a permutation of dimensions; anything else is one scatter.  Either way the
+    launches are those of the block that needs the layout."""
+    rows, blocks = block_scales.shape
+    if rows % TILE_ROWS == 0 and blocks % TILE_COLUMNS == 0:
+        lines = TILE_ROWS // TILE_LINE_ROWS
+        bands = block_scales.reshape(rows // TILE_ROWS, lines, TILE_LINE_ROWS, blocks // TILE_COLUMNS, TILE_COLUMNS)
+        return bands.permute(0, 3, 2, 1, 4).reshape(rows, blocks).contiguous()
+    shape = (-(-rows // TILE_ROWS) * TILE_ROWS, -(-blocks // TILE_COLUMNS) * TILE_COLUMNS)
+    tiled = torch.zeros(shape, dtype=block_scales.dtype, device=block_scales.device)
+    tiled.view(-1)[tile_scale_index(rows, blocks, block_scales.device)] = block_scales
+    return tiled
+
+
+def untile_scales(tiled: torch.Tensor, rows: int, blocks: int) -> torch.Tensor:
+    """The inverse of :func:`tile_scales` for the first ``rows`` rows: ``[rows, blocks]`` row-major block scales out of a
+    buffer in the 128 x 4 layout."""
+    if rows % TILE_ROWS == 0 and blocks % TILE_COLUMNS == 0 and tiled.numel() == rows * blocks:
+        lines = TILE_ROWS // TILE_LINE_ROWS
+        bands = tiled.reshape(rows // TILE_ROWS, blocks // TILE_COLUMNS, TILE_LINE_ROWS, lines, TILE_COLUMNS)
+        return bands.permute(0, 3, 2, 1, 4).reshape(rows, blocks)
+    return tiled.reshape(-1)[tile_scale_index(rows, blocks, tiled.device)]
+
+
+@dataclass
+class InterleavedBlockScaledTensor:
+    """The merged gate / up weight of an MLP in the layout a fused gate / up kernel multiplies on: packed E2M1 codes
+    ``[2 x intermediate, in / 2]`` whose rows come in tiles of ``tile`` gate rows followed by the ``tile`` up rows of the
+    same channels (the checkpoint has every gate row first, then every up row), the E4M3 block scales of those rows as
+    code bytes in the 128 x 4 layout (:func:`tile_scales`) and the global scale of :class:`BlockScaledTensor`.  The same
+    bytes as the merged weight, in another order: a provider that multiplies on this layout builds it once per weight at
+    load (its entry's own helper), and a load that keeps it keeps no other form of the stored weight.  A reader of a
+    bf16 copy gets one in the CHECKPOINT's row order (:func:`dequantize`)."""
+
+    codes: torch.Tensor
+    tiled_scales: torch.Tensor
+    scale: float
+    tile: int = 64
+
+    @property
+    def shape(self):
+        return (*self.codes.shape[:-1], self.codes.shape[-1] * 2)
+
+    def tensors(self):
+        """What the block multiplies on, as it holds it: the bytes a checksum of this weight reads."""
+        return (self.codes, self.tiled_scales)
+
+
 @dataclass
 class Unquantized:
     """bf16 rows on their way to a block that reads a quantised operand, with the quantisation that operand has (``fmt``:
@@ -217,7 +274,8 @@ class Unquantized:
 class Dequantized:
     """A weight as a multiply is handed it, in the forms the plans of a run read: ``data`` is the bf16 copy of its code
     values (exact), ``scale`` the scale a multiply applies to its result (a float or one scale per row), ``stored`` the
-    stored tensor the copy is made from (a :class:`ScaledTensor` or a :class:`BlockScaledTensor`).  A family's loader
+    stored tensor the copy is made from (a :class:`ScaledTensor`, a :class:`BlockScaledTensor`, or that weight in the
+    layout its provider multiplies on: an :class:`InterleavedBlockScaledTensor`).  A family's loader
     decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies on the stored
     format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
     loader of a weight it keeps on its stored format alone (:func:`stored_checksum`): what its stored bytes were at the
@@ -272,7 +330,8 @@ def _word_sums(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def stored_checksum(stored) -> tuple:
-    """A checksum of a stored weight (a :class:`ScaledTensor` or a :class:`BlockScaledTensor`): three 64-bit sums per
+    """A checksum of a stored weight (a :class:`ScaledTensor`, a :class:`BlockScaledTensor` or an
+    :class:`InterleavedBlockScaledTensor`: the tensors as the weight's block multiplies on them): three 64-bit sums per
     tensor of it -- the codes, the block scales, a scale per row -- over its bytes read as 64-bit words: all of them,
     the row sums weighted by the row and the column sums weighted by the column; and a scale that is one float, as it
     is.  One changed byte moves the first sum; bytes exchanged between two rows, or along a row, move the others.
@@ -427,7 +486,9 @@ def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
     """The code values of a stored tensor as a bf16 copy, without the outer scale (exact: see the module docstring), and that
     scale.  A plain tensor is returned as it is with scale 1.  An operand a kernel on the stored formats handed over is
     brought to the stored form first, here, by the block that reads it: bf16 rows without codes are quantised
-    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`)."""
+    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`).  A merged
+    gate / up weight kept in a fused kernel's layout (:class:`InterleavedBlockScaledTensor`) gives its copy in the
+    checkpoint's row order."""
     if isinstance(t, Unquantized):
         t = t.quantized()
     if isinstance(t, TiledBlockScaledTensor):
@@ -439,12 +500,39 @@ def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
         lead = t.codes.shape[0] if t.codes.dim() > 1 else 1
         codes, blocks, flat = t.codes.reshape(lead, -1), t.block_scales.reshape(lead, -1), out.view(lead, -1)
         for a in range(0, lead, rows_per_chunk):  # chunked: the nibble lookup needs an index tensor
-            c = codes[a : a + rows_per_chunk]
-            values = torch.stack((_e2m1_values(c & 0xF), _e2m1_values(c >> 4)), dim=-1).flatten(-2)
-            scales = _e4m3_values(blocks[a : a + rows_per_chunk]).repeat_interleave(BLOCK, dim=-1)
-            flat[a : a + rows_per_chunk] = (values * scales).to(torch.bfloat16)
+            flat[a : a + rows_per_chunk] = _block_values(codes[a : a + rows_per_chunk], blocks[a : a + rows_per_chunk])
         return Dequantized(out, t.scale)
+    if isinstance(t, InterleavedBlockScaledTensor):
+        return Dequantized(_interleaved_values(t, rows_per_chunk), t.scale)
     return Dequantized(t, 1.0)
+
+
+def _block_values(codes: torch.Tensor, block_scales: torch.Tensor) -> torch.Tensor:
+    """The code values of packed 4-bit rows (two codes per byte, the low nibble first) times the scale of their block of 16,
+    as bf16: exact."""
+    values = torch.stack((_e2m1_values(codes & 0xF), _e2m1_values(codes >> 4)), dim=-1).flatten(-2)
+    return (values * _e4m3_values(block_scales).repeat_interleave(BLOCK, dim=-1)).to(torch.bfloat16)
+
+
+def _interleaved_values(t: InterleavedBlockScaledTensor, rows_per_chunk: int) -> torch.Tensor:
+    """The bf16 copy of a merged gate / up weight kept in a fused kernel's layout, in the CHECKPOINT's row order (every
+    gate row, then every up row): what a block that reads a copy reads, bit for bit the copy of the merged weight.
+    Chunk by chunk over whole tiles -- a tile's gate rows and its up rows go to their two places -- so the weight is
+    never held in a second packed form beside the copy."""
+    n, half, tile = t.codes.shape[0], t.codes.shape[0] // 2, t.tile
+    blocks = t.codes.shape[1] * 2 // BLOCK
+    out = torch.empty((n, t.codes.shape[1] * 2), dtype=torch.bfloat16, device=t.codes.device)
+    whole = n % TILE_ROWS == 0 and blocks % TILE_COLUMNS == 0  # whole bands of whole scale tiles: a chunk's scales are a slice
+    scales = None if whole else untile_scales(t.tiled_scales, n, blocks)
+    unit = math.lcm(2 * tile, TILE_ROWS)  # rows of a chunk: whole weight tiles and whole scale bands
+    step = max(rows_per_chunk // unit, 1) * unit
+    for a in range(0, n, step):
+        b = min(a + step, n)
+        rows = untile_scales(t.tiled_scales[a:b], b - a, blocks) if whole else scales[a:b]
+        values = _block_values(t.codes[a:b], rows).view((b - a) // (2 * tile), 2, tile, -1)
+        out[a // 2 : b // 2] = values[:, 0].reshape((b - a) // 2, -1)
+        out[half + a // 2 : half + b // 2] = values[:, 1].reshape((b - a) // 2, -1)
+    return out
 
 
 def merge_scaled(parts: Sequence[ScaledTensor], rule: str = "largest_scale") -> ScaledTensor:

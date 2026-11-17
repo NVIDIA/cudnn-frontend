@@ -177,6 +177,7 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("gate_quant", re.compile(r"^cudnn_kernel_frost_attention_gate_quant_")),
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
+    ("swiglu_fp4", re.compile(r"^cudnn_kernel_frost_swiglu_fp4_decode_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
     # ``torch.index_select`` launches one of three kernels, by the number of rows it gathers and the size of a table row: the
     # small-index kernel up to 16 rows, and from 17 the large-index kernel or PyTorch's vectorized gather (seen on a bf16

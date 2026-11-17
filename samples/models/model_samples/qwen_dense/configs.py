@@ -64,6 +64,12 @@ PROJECTION_SITES = (
     ("full_attention.qkv", (("OUT_FEATURES", 14336), ("IN_FEATURES", 5120))),
 )
 
+#: the fused gate / up kernel of the MLP by row count: the target runs the narrowest of its four token tiles that holds the
+#: rows of a step, so the token tile is a field of the form and the block has one row per tile: (first row count, last
+#: row count, token tile).  A launch record does not show the tile -- the grid and the block are the same at all four,
+#: the shared memory at three -- so it is held on the objects and in the kernel's symbol
+GATE_UP_TILES = ((1, 8, 8), (9, 16, 16), (17, 32, 32), (33, 64, 64))
+
 PROVIDERS = {
     "embedding": [ProviderRow(*ANY, "torch.index_select", EVERY, serves="any")],
     "add_norm_quantize": [
@@ -173,6 +179,33 @@ PROVIDERS = {
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
     "mlp.gate_up": [
+        *(
+            ProviderRow(
+                ("cc10.x",),
+                (1, last),
+                (1, None),
+                "fe.swiglu_fp4_decode",
+                TARGET_STACKS,
+                serves=f"rows {first}-{last} of 1-64, hidden 5120, intermediate 17408",
+                band="swiglu_fp4",
+                batch_invariant=("cc10.0",),
+                # the target's kernel, stated whole and never left to the entry's default: the token tile of the row count, two
+                # weight stages issued ahead of the wait, the weight stream loaded with the evict-first L2 policy, at most 148
+                # thread blocks, launched as a dependent of its predecessor.  It waits for that launch -- the norm in front of
+                # the MLP, which releases at its own wait -- before it reads the 4-bit operand, its block scales and the two
+                # scalars; only weight tiles are read ahead of the wait.  The launch before it must not write the weight or
+                # its block scales: both are constants of the layer.  It signals the launch after it before its last output
+                # tile is written: a launch behind it that carries the attribute must wait before it reads the codes; the
+                # multiply over a copy behind it in this stack carries none and starts when this kernel has completed
+                form=(("TOKEN_TILE", tile), ("PREWAIT_STAGES", 2), ("L2_EVICT_FIRST", True), ("MAX_CLUSTERS", 148), ("PDL", True)),
+                rows=(first, last),
+                # the widths the entry serves (its page: hidden 5120, intermediate 17408, the published model's).  A checkpoint of
+                # the family with another width keeps the block on the multiply over a copy below, and its run states no
+                # kernel identity
+                widths=(("hidden", 5120), ("mlp", 17408)),
+            )
+            for first, last, tile in GATE_UP_TILES
+        ),
         ProviderRow(
             *ANY,
             "cublas.bf16_dequantized+torch_ref.silu_mul_quantize",
