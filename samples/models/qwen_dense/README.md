@@ -1027,7 +1027,7 @@ held by a host test over a stand-in entry and was seen on a real GPU only with t
 decline, not on such an installation.
 
 Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
-reserved 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
+reserved 3.5 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
 it adds an allowance of 3 GiB and asks for about 6.7 GiB: the first launch of the fused step reserves device memory outside
 PyTorch's pool on that class. The need is stated once, for every sequence count of the run, before anything is loaded: the
 copies, the working memory and the first launch are counted once, the state per count. The run measures that launch and
@@ -1050,7 +1050,7 @@ after the plan with these models; with the published checkpoint the working memo
 and the runs stayed inside the sentence (the section on checkpoints).
 Beyond 33 sequences the sentence is short, on every stack: what a run holds per sequence beyond the state the
 sentence counts is not in its flat allowance. At 64 sequences the default stack asked for about 3.9 GiB, reserved
-6.7 GiB and grew the device by 6.9 GiB; `--stack native` asked for about 3.8 GiB, reserved 6.0 GiB and grew it by
+6.6 GiB and grew the device by 6.8 GiB; `--stack native` asked for about 3.8 GiB, reserved 6.0 GiB and grew it by
 6.2 GiB; and `--stack native --sequences 64,65` asked for about 4.4 GiB, reserved 8.0 GiB and grew it by 8.2 GiB. At
 such a count a GPU needs several GiB more than the sentence says.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
