@@ -33,6 +33,7 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
 _OFFERED = {
     "sdpa_bwd_sm120": 20600,
     "sdpa_bwd_sm80": 20601,
+    "sdpa_bwd_sm90": 20634,
     "sdpa_bwd_sm100": 20602,
     "sdpa_bwd_sm100_d512_role_split": 20626,
     "sdpa_bwd_sm100_d512_2x2": 20627,
