@@ -69,6 +69,9 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
         assert entry.feature in pt.FEATURES
+        assert entry.also is None or (
+            entry.direction in ("ge", "le") and entry.also[0] in ("ge", "le") and isinstance(entry.also[1], float) and entry.also[2] in pt.FEATURES
+        ), key
 
 
 @pytest.mark.L0
@@ -542,10 +545,30 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_two_condition_entry_leads_only_where_both_hold(s_kv):
+    """``Entry.also``: sm80_dense_d128_gqa_v2_20261117 leads A100 dense d128 GQA causal prefill only with few query rows AND a long
+    cache (few rows over a short cache lost 1.06-1.24x, many rows up to 1.9x)."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=8, h_kv=1, s_q=256, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(device_cc=(8, 0), has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    entry = pt.matched_entry(row, f())
+    assert entry.study == "sm80_dense_d128_gqa_v2_20261117" and entry.feature == "rows" and entry.also == ("ge", 10.501, "kv")
+    assert pt.lookup(row, f()) is True
+    assert pt.lookup(row, f(s_kv=1024 + s_kv % 2)) is False  # few rows, short cache
+    assert pt.lookup(row, f(b=8, h_q=64, h_kv=8, s_q=2048)) is False  # many rows, long cache
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_dense_chunk_follows_its_study(s_kv):
     """Study sm80_dense_chunk_20261117 (A100): dense d256 GQA causal prefill leads past a cost floor, so qwen3.5's b 1 long-KV chunks
-    (FROST 2.3-3.0x faster) lead and small squares keep the backend; d64 MHA causal leads past a floor off the tile. d128 GQA keeps
-    the hand rule."""
+    (FROST 2.3-3.0x faster) lead and small squares keep the backend; d64 MHA causal leads past a floor off the tile. d128 GQA answers
+    from its own re-study."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_dense_chunk_20261117"
 
@@ -561,7 +584,7 @@ def test_sm80_dense_chunk_follows_its_study(s_kv):
     mha64 = dict(d_qk=64, d_v=64, h_q=16, h_kv=16)
     assert pt.matched_entry(row, f(**mha64)).study == study
     assert pt.lookup(row, f(**mha64)) is True
-    assert pt.lookup(row, f(d_qk=128, d_v=128, h_q=8, h_kv=1)) is None  # d128 GQA: no entry
+    assert pt.matched_entry(row, f(d_qk=128, d_v=128, h_q=8, h_kv=1)).study == "sm80_dense_d128_gqa_v2_20261117"  # its own re-study
 
 
 @pytest.mark.L0

@@ -32,6 +32,7 @@ class Entry(NamedTuple):
     log2_work: Optional[float]  # the threshold for "ge" / "le", in the entry's feature
     study: str  # the frozen study that produced it (grid + holdout hashes live in its record)
     feature: str = "cost"  # which scalar the threshold reads: a key of FEATURES
+    also: Optional[Tuple[str, float, str]] = None  # (direction, threshold, feature): a second condition a lead must also meet
 
 
 def _dtype_name(dtype) -> Optional[str]:
@@ -345,8 +346,13 @@ study's classes on it."""
 def _answer(entry: Entry, facts) -> bool:
     if entry.direction in ("always", "never"):
         return entry.direction == "always"
-    w = FEATURES[entry.feature](facts)
-    return w >= entry.log2_work if entry.direction == "ge" else w <= entry.log2_work
+    lead = _holds(entry.direction, entry.log2_work, entry.feature, facts)
+    return lead and (entry.also is None or _holds(*entry.also, facts))
+
+
+def _holds(direction: str, threshold: float, feature: str, facts) -> bool:
+    w = FEATURES[feature](facts)
+    return w >= threshold if direction == "ge" else w <= threshold
 
 
 def matched_entry(row: str, facts) -> Optional[Entry]:
@@ -945,6 +951,16 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm80_d576_prefill_20261117"
+    ),
+    # study sm80_dense_d128_gqa_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 22789d800; dense BSHD d128 GQA causal prefill over the
+    # whole range, stratified by query rows in flight; 120 train cells). No single feature orders the class (few rows win over a long
+    # cache, lose over a short one), so one two-condition rule, fit on train after a pre-recorded amendment: lead iff
+    # b * h_q * S_q <= 2^12.79 and KV >= 2^10.5. Holdout at fresh heads, scored once: 0.349 / 0.413 (worst 0.667).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "le", 12.7925, "sm80_dense_d128_gqa_v2_20261117", "rows", ("ge", 10.501, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "le", 12.7925, "sm80_dense_d128_gqa_v2_20261117", "rows", ("ge", 10.501, "kv")
     ),
     # study sm80_thd_verify_unpacked_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE fa4f913c2; paged THD-Q GQA verify, S_q 5-16, b 1-64,
     # KV 256-128k on and off the tile; the k_prefetch / d256 engines run it unpacked and unsplit; 420 train cells). d128, d256 and d256

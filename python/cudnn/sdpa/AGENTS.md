@@ -654,6 +654,9 @@ production kernels gain no debug knob or timing-dependent assertion.
   threshold on whichever `placement_table.FEATURES` scalar (cost proxy, parallel tiles, query rows, KV per request, query tokens per request) fits the training grid best,
   qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
+  When no single feature orders a class (few query rows win over a long cache and lose over a short one), an entry may carry a
+  second condition (`Entry.also`, both must hold to lead) instead of a hand rule. Pre-register the two-feature candidate set, fit
+  it under the same constraint, and score it once on the holdout (`sm80_dense_d128_gqa_v2_20261117`).
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
 - Deterministic graphs are unmeasured (the hand rules decide) except on `placement_table.DETERMINISTIC_KEYED_ROWS`, where they
   key phase `<phase>_det`. Add a row there only with a study that times its deterministic body against the backend's
