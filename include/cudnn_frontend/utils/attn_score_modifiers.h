@@ -177,8 +177,18 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
                     std::shared_ptr<Tensor_attributes> s_q_ptr,
                     std::shared_ptr<Tensor_attributes> s_kv_ptr,
                     std::shared_ptr<Tensor_attributes> cu_s_q_ptr,
-                    std::shared_ptr<Tensor_attributes> cu_s_kv_ptr) {
+                    std::shared_ptr<Tensor_attributes> cu_s_kv_ptr,
+                    bool compile_time_fill) {
     std::shared_ptr<Tensor_attributes> return_mask = attention_score;
+
+    // The masked-score fill value. As a compile-time constant the backend knows it is -inf when it builds the plan
+    // (the unified backward then applies the masks after the softmax stats subtraction, which is only exact for a
+    // -inf fill).
+    auto const make_fill = [compile_time_fill]() {
+        return compile_time_fill
+                   ? std::make_shared<Tensor_attributes>(get_negative_inf_value(), ScalarType::COMPILE_TIME_CONST)
+                   : std::make_shared<Tensor_attributes>(get_negative_inf_value());
+    };
 
     // Note: the right and left bound subtrees can be constructed in different ways as well that yield functionally
     // correct results. However, for performance reasons in the cuDNN backend they are organized as they are. Be
@@ -210,7 +220,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
         }
 
         return_mask = graph->diagonal_band_mask(/*x=*/attention_score,
-                                                /*b=*/std::make_shared<Tensor_attributes>(get_negative_inf_value()),
+                                                /*b=*/make_fill(),
                                                 /*seq_len_q=*/effective_s_q,
                                                 /*seq_len_kv=*/effective_s_kv,
                                                 /*cu_seq_len_q=*/effective_cu_s_q,
@@ -264,7 +274,7 @@ sliding_window_mask(std::shared_ptr<Graph> graph,
         }
 
         return_mask = graph->diagonal_band_mask(/*x=*/return_mask,
-                                                /*b=*/std::make_shared<Tensor_attributes>(get_negative_inf_value()),
+                                                /*b=*/make_fill(),
                                                 /*seq_len_q=*/effective_s_q,
                                                 /*seq_len_kv=*/effective_s_kv,
                                                 /*cu_seq_len_q=*/effective_cu_s_q,
