@@ -477,6 +477,21 @@ def test_sm120_decode_shaped_graphs_lead_on_the_decode_tile(over, lead):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_q, h_kv, s_q", [(16, 1, 3), (32, 2, 4), (64, 4, 3), (24, 1, 2)])
+def test_sm120_paged_d256_mtp_past_32_rows_takes_the_decode_tile(h_q, h_kv, s_q):
+    """Paged d256 MTP past 32 packed rows (Qwen3.5 at s_q 3-4) runs the 32-row decode tile over several Q tiles: the prefill body
+    has no paged d256 plan, and the decode tile ran 0.04-0.30 of the backend (sm120_paged_d256_multiq_probe_20261117). Dense
+    graphs, longer queries and groups past 32 keep the prefill rule."""
+    from cudnn.sdpa.fwd import heuristics
+
+    paged = dict(b=8, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=32768, d_qk=256, d_v=256, has_paged_kv=True, page_size=16, padded=True)
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**paged)) == 32
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, has_paged_kv=False, page_size=0, padded=False))) == 0
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, s_q=8))) == 0
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, h_q=64, h_kv=1, s_q=1))) == 0  # 64 rows: G > 32
+
+
+@pytest.mark.L0
 def test_sm120_decode_split_model_anchors():
     """The decode tile's split model, unmocked: a launch that fills the machine stays unsplit, a lone KV stream over
     128K keys splits until the DRAM bound takes over, and a one-stage unit never splits."""
