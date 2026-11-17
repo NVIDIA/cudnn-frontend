@@ -1088,14 +1088,13 @@ def test_the_text_is_written_between_the_steps_of_the_loop_and_every_other_line_
     """The sample's own loop function on a CPU session with a checkpoint's text side: the pieces of sequence 0 reach the
     sink while the loop still steps, the line break after the last one, and the report after that; not streamed, the
     text is handed over once, after the report; seeded weights are written nowhere."""
-    import model_samples
     import serving_options
-    from model_samples import StopRule, tie_out
+    from model_samples import Session, StopRule, TextIO, tie_out
 
     sample = _sample_script(monkeypatch)
     model = _tiny_model()
-    text = model_samples.TextIO.from_checkpoint(str(_checkpoint_directory(tmp_path / "tiny-checkpoint")))
-    session = model_samples.Session(model, text, sequences=2, stack="reference", device="cpu", capacity=32)
+    text = TextIO.from_checkpoint(str(_checkpoint_directory(tmp_path / "tiny-checkpoint")))
+    session = Session(model, text, sequences=2, stack="reference", device="cpu", capacity=32)
     session.plan_table()
     session.load()
     prompts = [text.encode("w3 w1 w4")] * 2
@@ -1191,8 +1190,8 @@ def test_the_text_is_written_between_the_steps_of_the_loop_and_every_other_line_
     capsys.readouterr()
 
     # seeded weights: not language; the same loop writes it nowhere, whatever sink it is handed
-    seeded_text = model_samples.TextIO.synthetic(model.geometry.vocab)
-    seeded = model_samples.Session(model, seeded_text, sequences=1, stack="reference", device="cpu", capacity=32)
+    seeded_text = TextIO.synthetic(model.geometry.vocab)
+    seeded = Session(model, seeded_text, sequences=1, stack="reference", device="cpu", capacity=32)
     seeded.plan_table()
     seeded.load()
     unused = _Recorder()
