@@ -545,6 +545,37 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_prefill_gaps_follow_their_study(s_kv):
+    """Study sm80_prefill_gaps_20261117 (A100): paged THD-Q prefill (gpt-oss d64 with a sink, causal and windowed; qwen d256; MiMo
+    d192 x 128; dsv4 d512) and dense dsv4 d512 lead past a floor; small chunks keep the backend; paged d128 has no entry."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_prefill_gaps_20261117"
+
+    def f(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=512, s_kv=s_kv, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=512)
+        base.update(over)
+        return _facts(**base)
+
+    leads = (
+        dict(has_sink=True),
+        dict(has_sink=True, window_left=127),
+        dict(d_qk=256, d_v=256, h_q=32, h_kv=2),
+        dict(d_qk=192, d_v=128, h_q=64, h_kv=4),
+        dict(d_qk=512, d_v=512, h_q=64, h_kv=1, page_size=64),
+        dict(d_qk=512, d_v=512, h_q=64, h_kv=1, has_paged_kv=False, thd=False, max_total_seq_len_q=None, page_size=0, padded=False),
+    )
+    for over in leads:
+        assert pt.matched_entry(row, f(**over)).study == study, over
+        assert pt.lookup(row, f(**over)) is True, over
+    small = dict(s_q=32, s_kv=1024 + s_kv % 2, max_total_seq_len_q=32)
+    assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
+    assert pt.lookup(row, f(**small, d_qk=256, d_v=256, h_q=4, h_kv=1)) is False
+    assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_two_condition_entry_leads_only_where_both_hold(s_kv):
     """``Entry.also``: sm80_dense_d128_gqa_v2_20261117 leads A100 dense d128 GQA causal prefill only with few query rows AND a long
     cache (few rows over a short cache lost 1.06-1.24x, many rows up to 1.9x)."""
