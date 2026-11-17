@@ -629,6 +629,22 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill_short_q", "thd_bounded", "none", False, "mha", False): Entry(
         "always", None, "sm107_thd_prefill_20261111"
     ),
+    # study sm80_thd_prefill_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 3227bbcd8; THD d256 GQA causal prefill, squares and
+    # bottom-right chunks, equal and ragged lengths, groups 2-4; 256 train cells fitted under the criterion, a 64-cell holdout scored
+    # once: 31 changed at 0.49-0.59, worst 0.69). FROST leads every measured d256 THD cell (0.38-0.74 of engine 8; the a100 nightly's
+    # context-parallel d256 rows ran engine 8 at 1.85-2.67x). d128 THD failed its holdout (parity to 1.11x) and keeps the trail-only row.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_thd_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_thd_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_thd_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_thd_prefill_20261117"
+    ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
     # holdouts, 96-cell holdout 3; d128 GQA causal is non-monotone and keeps the hand-written order; d256 mask-free MHA,

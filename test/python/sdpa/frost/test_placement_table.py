@@ -582,6 +582,31 @@ def test_sm80_deterministic_backward_follows_its_study(s):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("total_fraction", [1.0, 0.75], ids=["thd", "thd_ragged"])
+@pytest.mark.parametrize("s", [8192, 8100], ids=["on_tile", "off_tile"])
+def test_sm80_thd_d256_prefill_follows_its_study(s, total_fraction):
+    """Study sm80_thd_prefill_20261117 (A100): d256 THD causal prefill leads, squares and chunks, equal and ragged lengths (the
+    nightly's context-parallel d256 rows ran engine 8 at 1.85-2.67x); d128 THD keeps the trail-only SM80 row."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row = "sdpa_fwd_prefill_sm80"
+
+    def thd(**over):
+        base = dict(b=64, h_q=8, h_kv=2, s_q=s, s_kv=s, d_qk=256, d_v=256, causal=True, bottom_right=False, has_paged_kv=False, thd=True)
+        base.update(max_total_seq_len_q=int(64 * s * total_fraction), device_cc=(8, 0), device_sm_count=108)
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(s_q=1024, bottom_right=True), dict(h_q=32, h_kv=8)):
+        assert pt.lookup(row, thd(**over)) is True, over
+        assert pt.matched_entry(row, thd(**over)).study == "sm80_thd_prefill_20261117"
+    assert pt.lookup(row, thd(d_qk=128, d_v=128)) is None
+    d256 = [spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_sm80_d256_kv_prefetch"]
+    assert d256 and placement.place(d256[0], thd()) == placement.LEAD
+
+
+@pytest.mark.L0
 def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     """The A100 f16 dense prefill classes answer from their own study (sm80_f16_dense_prefill_20261106), not the bf16 one, and
     another Ampere part has no entry: the hand rules decide there."""
