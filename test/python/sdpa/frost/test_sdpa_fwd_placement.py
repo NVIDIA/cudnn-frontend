@@ -1561,11 +1561,11 @@ def test_sm90_d128_default_placement_reads_its_study(monkeypatch):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("s_q, paged", [(1, placement.LEAD), (5, placement.TRAIL), (1024, placement.TRAIL)])
+@pytest.mark.parametrize("s_q, paged", [(1, placement.LEAD), (5, placement.LEAD), (1024, placement.TRAIL)])
 def test_sm90_paged_d512_follows_its_measurement(s_q, paged):
-    """The SM90 row's dense d512 lead holds at every s_q. Paged d512 leads where study sm90_decode_20261112 measured it (s_q 1-4,
-    incl. GQA over 2 KV heads at page 16: 0.26-0.94 at s_q 1) and keeps the backend first where nothing measured it (verify
-    rows, prefill)."""
+    """The SM90 row's dense d512 lead holds at every s_q. Paged d512 leads where studies measured it -- s_q 1-4
+    (sm90_decode_20261112, incl. GQA over 2 KV heads at page 16: 0.26-0.94 at s_q 1) and verify rows (sm90_decode_gaps_20261117:
+    0.05 of the backend) -- and keeps the backend first where nothing measured it (prefill)."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")

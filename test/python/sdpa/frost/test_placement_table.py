@@ -1024,6 +1024,33 @@ def test_sm100_paged_packed_split_classes_follow_their_study():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
+def test_sm90_decode_gaps_follow_their_study(s_kv):
+    """Study sm90_decode_gaps_20261117 (H100): paged d512 verify and paged d256 sliding-window decode / MTP / verify lead (FROST
+    0.05 / 0.28-0.46 of the backend)."""
+    row = "sdpa_fwd_prefill_sm90"
+    study = "sm90_decode_gaps_20261117"
+
+    def f(**over):
+        base = dict(b=1, h_q=8, h_kv=1, s_q=8, s_kv=s_kv, d_qk=512, d_v=512, causal=True, bottom_right=True)
+        base.update(device_cc=(9, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(b=64, h_q=32, h_kv=4, s_q=16)):  # paged d512 verify
+        assert pt.class_key(row, f(**over))[4] == "verify"
+        assert pt.lookup(row, f(**over)) is True, over
+        assert pt.matched_entry(row, f(**over)).study == study, over
+    swa = dict(h_q=16, h_kv=8, d_qk=256, d_v=256, window_left=1023)
+    assert pt.lookup(row, f(**dict(swa, s_q=8))) is True  # gemma4 SWA verify
+    assert pt.matched_entry(row, f(**dict(swa, s_q=8))).study == study
+    for s_q in (1, 4):  # single-row / MTP: gemma4 SWA's group 2, and groups the row cannot pack (3 here)
+        assert pt.class_key(row, f(**dict(swa, s_q=s_q, h_q=12, h_kv=4)))[8] == "gqa_unpacked"
+        assert pt.lookup(row, f(**dict(swa, s_q=s_q, h_q=12, h_kv=4))) is True, s_q
+        assert pt.lookup(row, f(**dict(swa, s_q=s_q))) is True, s_q
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [62208, 62209], ids=["on_tile", "off_tile"])
 def test_sm90_mha_mtp_follows_its_study(s_kv):
     """Study sm90_mha_mtp_v2_20261117 (H100): dense d128 MHA MTP leads while few head-batch units cover a long cache (FROST splits

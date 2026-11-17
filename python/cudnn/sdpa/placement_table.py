@@ -918,6 +918,36 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", False): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", True): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
+    # study sm90_decode_gaps_20261117 (H100 80GB HBM3, cuDNN 9.24.0.43, FE dbae6eec5; SM90 decode classes no study answered, found by
+    # re-timing the h200 nightly on the branch: paged d512 verify (gemma4 global) and paged d256 sliding-window decode / MTP / verify
+    # (gemma4 SWA, window 1024); 763 train cells fitted under the criterion, a 48-cell holdout scored once). FROST runs 0.05 of the
+    # backend on paged d512 verify (the nightly ran the backend at 32-84x) and 0.31-0.44 on the windowed d256 classes (2.8-3.8x).
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa_unpacked", False): Entry(
+        "always", None, "sm90_decode_gaps_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa_unpacked", True): Entry(
+        "always", None, "sm90_decode_gaps_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa_unpacked", False): Entry(
+        "le", 6.0, "sm90_decode_gaps_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa_unpacked", True): Entry(
+        "le", 6.0, "sm90_decode_gaps_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "verify", "paged", "window", False, "gqa", False): Entry("always", None, "sm90_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "verify", "paged", "window", False, "gqa", True): Entry("always", None, "sm90_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (512, 512), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm90_decode_gaps_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (512, 512), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm90_decode_gaps_20261117"
+    ),
+    # study sm90_decode_gaps_20261117, supplement (36 fresh cells, scored once): gemma4 SWA's own windowed paged d256 single-row /
+    # MTP twins (groups 2 / 4) lead too: 0.32-0.41 of the backend, worst 0.68.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm90_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm90_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm90_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("le", 32.001, "sm90_decode_gaps_20261117"),
     # study sm90_decode_20261112 (H200 700 W, cuDNN 9.30.0.4; the same graphs and lattice as sm80_decode_20261112 without d64 /
     # D576, which the SM90 row does not serve, plus d512 absorbed MLA dense and paged page 64; 820 train cells + an 88-cell holdout:
     # mtp / verify 0.01-0.20 geomean, d512 q1 0.25-0.33, d256 paged q1 0.94. Dense verify d128 lost 1.08-1.14x at 40/8 b24-96
