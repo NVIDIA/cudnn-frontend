@@ -16,7 +16,9 @@ pytestmark = pytest.mark.L0
 def _graph(raw, constant, record=None):
     cls = cudnn._pybind_module.backend_graph if raw else cudnn.pygraph
     g = cls(io_data_type=cudnn.data_type.FLOAT, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    x = g.tensor(dim=[1, 1, 16, 16], stride=[256, 256, 16, 1], data_type=cudnn.data_type.FLOAT, name="x").set_uid(3)
+    # SM120 FORT pointwise rejects C=1. Keep the binding fixture on a
+    # supported NHWC layout so it reaches scalar execution on every arch.
+    x = g.tensor(dim=[1, 16, 1, 16], stride=[256, 1, 256, 16], data_type=cudnn.data_type.FLOAT, name="x").set_uid(3)
     kind = cudnn.scalar_type.COMPILE_TIME_CONST if constant else cudnn.scalar_type.RUNTIME_PARAM
     alpha = g.tensor_scalar(2.0, kind).set_name("alpha").set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT).set_uid(31)
     y = g.mul(a=x, b=alpha, name="scaled_x").set_output(True).set_data_type(cudnn.data_type.FLOAT).set_uid(19)
@@ -39,7 +41,7 @@ def test_scalar_binding_precedence_and_capture(mode, serialized, constant):
     # One pinned native plan makes fresh and serialized executions comparable.
     g, x_uid, alpha_uid, y_uid = _graph(raw, constant, record)
     g.build_plan_at_index(0)
-    x = torch.arange(256, device="cuda", dtype=torch.float32).reshape(1, 1, 16, 16)
+    x = torch.arange(256, device="cuda", dtype=torch.float32).reshape(1, 16, 1, 16).contiguous(memory_format=torch.channels_last)
     y = torch.empty_like(x)
     workspace = torch.empty(max(1, g.get_workspace_size_plan_at_index(0)), device="cuda", dtype=torch.uint8)
     handle = cudnn.create_handle()
