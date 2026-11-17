@@ -4,6 +4,10 @@
 serialized cuDNN backend plans through XLA FFI. It does not call Torch or execute
 Python callbacks during a compiled invocation.
 
+JAX is optional. Installing the frontend wheel does not install JAX, and
+importing `cudnn` or using the Torch SDPA API does not load the JAX bridge.
+Only access to `cudnn.sdpa_jax` requires JAX.
+
 The companion JAX change selects this function for
 `jax.nn.dot_product_attention(..., implementation="cudnn")` when
 `JAX_CUDNN_SDPA_USE_PYTHON_FRONTEND=1`. Set the variable before tracing.
@@ -40,3 +44,18 @@ python -m pytest sdpa/jax/test_sdpa_jax.py -m L0 -q
 
 Each numerical case reuses its inputs and upstream gradient with the setting
 unset, `0`, and `1`. Numerical parity and deterministic replay are separate tests.
+
+The paired suite is not the full JAX regression suite. From the companion JAX
+checkout, run the upstream SDPA tests with each setting:
+
+```bash
+JAX_NUM_GENERATED_CASES=1000000 JAX_CUDNN_SDPA_USE_PYTHON_FRONTEND=0 \
+  python -m pytest tests/nn_test.py tests/fused_attention_stablehlo_test.py \
+  tests/fused_attention_stablehlo_multigpu_test.py -k DotProductAttention -q -ra
+```
+
+Repeat with `1` and with the route variable unset. The large generated-case
+limit covers the full parameter grid; JAX otherwise samples these cases.
+Public `jax.nn` tests exercise route selection. Tests that call the internal
+cuDNN primitive directly remain legacy regression checks under either setting.
+Report hardware and runtime skips separately from passes.

@@ -26,7 +26,7 @@ import pytest
 
 pytestmark = pytest.mark.L0
 
-_HEAVY = ("torch", "cutlass", "nvidia_cutlass_dsl")
+_HEAVY = ("torch", "jax", "jaxlib", "cutlass", "nvidia_cutlass_dsl")
 
 
 def _modules(code: str) -> set:
@@ -475,3 +475,26 @@ assert "cudnn.ops._nvfp4_block_scale_kernels" not in sys.modules
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="requires torch")
+def test_torch_sdpa_import_without_jax():
+    modules = _modules("""
+import sys
+sys.modules["jax"] = None
+sys.modules["jaxlib"] = None
+import torch
+import cudnn
+import cudnn.ops
+assert callable(cudnn.sdpa_torch)
+assert hasattr(torch.ops.cudnn, "sdpa_fwd")
+assert hasattr(torch.ops.cudnn, "sdpa_bwd")
+try:
+    cudnn.sdpa_jax
+except ImportError as error:
+    assert "jax" in str(error).lower(), str(error)
+else:
+    raise AssertionError("JAX entry point loaded without JAX")
+""")
+    assert "cudnn.sdpa.jax_runtime" not in modules
+    assert "cudnn.sdpa.jax_api" not in modules
