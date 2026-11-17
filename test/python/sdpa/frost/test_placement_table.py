@@ -450,8 +450,8 @@ def test_sm80_decode_gaps_follow_their_study(s_kv):
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
-    """Study sm80_paged_wide_verify_20261117 (A100): paged speculative decode with wide heads leads -- D576 x V512 and d512 at
-    s_q 5-16, d192 x V128 at s_q 2-16 (FROST 0.13-0.20 of the backend). d512 at s_q <= 4, windowed graphs and f16 are other
+    """Study sm80_paged_wide_verify_20261117 (A100): paged d192 x V128 speculative decode at s_q 2-16 leads (FROST 0.13-0.20 of the
+    backend). Its d512 / D576 verify twins are retired (a short-cache supplement lost 1.10-1.16x); windowed graphs and f16 are other
     studies' or the hand rules'."""
     row = "sdpa_fwd_prefill_sm80"
 
@@ -461,10 +461,9 @@ def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
         base.update(over)
         return _facts(**base)
 
+    for over in (dict(), dict(h_q=128), dict(d_qk=512, d_v=512, h_q=16, h_kv=2, s_q=5)):
+        assert getattr(pt.matched_entry(row, spec(**over)), "study", None) != "sm80_paged_wide_verify_20261117", over
     for over in (
-        dict(),
-        dict(h_q=128),
-        dict(d_qk=512, d_v=512, h_q=16, h_kv=2, s_q=5),
         dict(d_qk=192, d_v=128, h_q=64, h_kv=4, s_q=2),
         dict(d_qk=192, d_v=128, h_q=64, h_kv=4, s_q=16, b=64),
     ):
