@@ -550,7 +550,8 @@ def test_sm120_deterministic_backward_follows_its_study(s):
 @pytest.mark.parametrize("s", [8192, 5000], ids=["on_tile", "off_tile"])
 def test_sm80_deterministic_backward_follows_its_study(s):
     """Study sm80_det_bwd_20261117: on A100 deterministic backward is keyed like SM120's; windowed d128 and windowed d64 GQA lead from
-    S 4096, unwindowed classes keep the hand rule (measured `never`), and d64 windowed MHA has no entry yet."""
+    S 4096, unwindowed classes keep the hand rule (measured `never`). d64 windowed MHA (gpt-oss) answers from its own study
+    (sm80_det_bwd_d64mha_v3_20261117) from S ~3.5k on the tile, ~3.9k off it."""
     row = "sdpa_bwd_sm80"
 
     def bwd(**over):
@@ -565,7 +566,10 @@ def test_sm80_deterministic_backward_follows_its_study(s):
         assert pt.matched_entry(row, bwd(**over)).study == "sm80_det_bwd_20261117"
     assert pt.lookup(row, bwd(s_q=2048, s_kv=2048)) is False
     assert pt.lookup(row, bwd(window_left=None)) is None
-    assert pt.lookup(row, bwd(h_q=64, h_kv=64, d_qk=64, d_v=64)) is None
+    d64_mha = dict(h_q=64, h_kv=64, d_qk=64, d_v=64)
+    assert pt.lookup(row, bwd(**d64_mha)) is True
+    assert pt.matched_entry(row, bwd(**d64_mha)).study == "sm80_det_bwd_d64mha_v3_20261117"
+    assert pt.lookup(row, bwd(s_q=3000, s_kv=3000, **d64_mha)) is False
 
 
 @pytest.mark.L0
