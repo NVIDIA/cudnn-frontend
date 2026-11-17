@@ -2,8 +2,9 @@
   "schema": 2,
   "about": [
     "The target kernel set of a plain decode step of the dense Qwen 3.5-architecture model: per block call of a step the kernel a stack that reproduces the set launches, in step order.",
-    "kernels: per kernel id what it is, where it comes from and how it stands to the target -- 'target' of kind 'code' (the target's own compiled kernel: an entry, a library call or a framework operator called as the target calls it) or of kind 'port' (a kernel whose home is cuDNN Frontend: an entry that reproduces the target kernel's results byte for byte), or 'stand-in' (a declared replacement for an operation that lives inside a serving engine). 'entry' is null until a stack of this repository calls an entry for the kernel; with an entry comes 'form', what the target passes to it.",
+    "kernels: per kernel id what it is, where it comes from and how it stands to the target -- 'target' of kind 'code' (the target's own compiled kernel: an entry, a library call or a framework operator called as the target calls it) or of kind 'port' (a kernel whose home is cuDNN Frontend: an entry that reproduces the target kernel's results byte for byte), or 'stand-in' (a declared replacement for an operation that lives inside a serving engine). 'entry' is null until a stack of this repository calls an entry for the kernel; with an entry comes 'form': what the target passes to it and, for a field only the port has, the value the port's byte comparison ran with ('differences' then says what the target kernel does there).",
     "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file: 'tie_out' says where that comparison stands and on which GPU class it was made, 'differences' what differs from the target's kernel besides its results. A port without an entry here has neither yet.",
+    "A kernel the target calls in several forms has, on each entry of a section, 'form': the fields of its form at that call beyond the form it has everywhere (for a multiply the shape of the weight it is called with there; for a kernel whose form follows the row count, the field of the section's row count); 'first_layer' names what differs at a block's first call in the model's first layer.",
     "configurations: per GPU class and SM count one section. 'geometry' is the layer widths of the model the section holds for; a model with other widths has no section. 'launch' is [grid, block, shared memory in bytes] of one launch at the section's row count; 'at' names further fields of the geometry that one launch shape was recorded with. A section is 'recorded' (launch records of the target on that class) or 'planned' (derived, never claimed); 'claimed' is false until a stack launches every kernel of the section.",
     "The numbers of a section are three, never one: of its launches per step, how many are the target's own compiled kernels (code), how many cuDNN Frontend entries with byte-equal results (port), how many declared stand-ins. They count what a complete stack launches: a port is counted whether or not its entry is called by a stack yet.",
     "A change of a form this file names changes this file in the same commit."
@@ -19,8 +20,28 @@
   },
   "kernels": {
     "embedding_gather": {"what": "token embedding lookup", "origin": "PyTorch", "relation": "target", "kind": "code", "entry": "torch.index_select"},
-    "add_norm_quant": {"what": "residual add + RMSNorm + quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
-    "fp8_projection": {"what": "8-bit in-projection of a layer", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
+    "add_norm_quant": {"what": "residual add + RMSNorm + quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.AddNormQuantDecode", "form": {"PDL": true, "PDL_RELEASE": true},
+      "tie_out": "Compared when the entry was written: every output byte against the target kernel's -- the residual, the normed rows, the codes and the whole block-scale buffer -- for all fifteen forms of the entry, 14 row counts from 1 to 1024, eight scales per quantising form, with the dependent-launch arm on and off, on compute capability 10.0 -- no differing byte. No such comparison is recorded for another compute capability. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/normalizations/add_norm_quant_decode.md) and its suites (test/python/norm/frost/).",
+      "differences": [
+        "a kernel of its own: the same count of every floating-point, convert, load, store, shuffle and barrier instruction as the target kernel's, and 8 to 27 fewer integer instructions",
+        "two launch flags where the target kernel has one: the wait for the predecessor and the release of the successor can be chosen apart; the target launches wait + release, the form this file names",
+        "the kernel takes only the operands its form uses (3 to 7 tensors); the target kernel always takes eight",
+        "the form is readable in the kernel's symbol; the target kernel has one symbol for all of its forms",
+        "on the host: typed declines, outputs the caller may own one by one, at most 1024 rows per call, the row width a field of the form (served: 5120)"
+      ]},
+    "fp8_projection": {"what": "8-bit in-projection of a layer", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.Fp8ProjectionDecode", "form": {"SPLIT_K": 1, "MMA_M": 128, "STAGES": 8, "TMEM_COLS": 32, "PREWAIT_WEIGHTS": true, "HOLD_TMEM": true, "PDL": true, "PDL_RELEASE": true},
+      "tie_out": "Compared when the entry was written: both kernels run in one process on the same operand tensors and their bf16 outputs compared bit for bit, at the four byte classes the entry gained with these weight shapes (the two of this file among them): every row count from 1 to 32, with and without the dependent-launch attribute, three operand draws each, the entry in the form this file names and in two forms with the early tensor-memory release -- 256 cells, 2,304 comparisons, on compute capability 10.0 -- no differing bit. No such comparison is recorded for another compute capability. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/gemm_fusions/fp8_projection_decode.md) and its suites (test/python/gemm/frost/projection_decode/).",
+      "differences": [
+        "a kernel of its own: its instruction stream differs from the target kernel's in lines of the kinds this list names; the two were not timed against each other",
+        "32 tensor-memory columns per thread block where the target kernel allocates 256",
+        "the tensor memory is released after the values read from it are consumed; the target kernel releases it right after the accumulator read. Both orders write the same bytes",
+        "one barrier fewer: the target kernel initialises a barrier it never uses",
+        "the multiply warp waits for the first phase of the tensor-memory barrier in front of its arrive for the second; in the target kernel that order rests on when the epilogue threads enter",
+        "two launch flags where the target kernel has one: the wait for the predecessor and the release of the successor can be chosen apart; the target launches attribute, wait and release, the form this file names",
+        "the split is fixed per entry; the target kernel's caller chooses it per row count (one K slice at every row count of these weight shapes)",
+        "the form is readable in the kernel's symbol; the target kernel's symbol is the default text of its compile-time arguments",
+        "on the host: typed declines, an output the caller owns, 1 to 32 rows per call, the weight's shape a field of the form (served here: 16384 x 5120 and 14336 x 5120)"
+      ]},
     "gdn_decode_fused": {"what": "fused linear-attention decode step", "origin": "cuDNN Frontend", "relation": "target", "kind": "code", "entry": "cudnn.GdnDecodeFused", "form": {"PDL": true, "PDL_RELEASE": true}},
     "cublaslt_fp8_gemm": {"what": "8-bit out-projection of a layer", "origin": "cuBLASLt through FlashInfer", "relation": "target", "kind": "code", "entry": null, "selection": "the library's tuner chooses the kernel: a pick is recorded and never gated, so no launch shape is held here"},
     "attention_prepare": {"what": "attention preparation: norm, rotary embedding, cache insert", "origin": "Triton", "relation": "target", "kind": "code", "entry": null},
@@ -28,7 +49,20 @@
     "gate_quant": {"what": "attention output gate + 8-bit quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.AttentionGateQuantDecode", "form": {"THREADS": 256, "PDL_RELEASE": true},
       "tie_out": "Compared when the entry was written: its output bytes against the target kernel's for every pair of bf16 operand values, at 14 scales, on compute capability 10.3 -- no differing byte. No such comparison is recorded for compute capability 10.0. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/attention/gate_quant_decode.md) and its suites (test/python/attention_gate/frost/).",
       "differences": ["a kernel of its own: the same arithmetic at the same rounding points in another instruction stream than the target kernel's"]},
-    "swiglu_fp4": {"what": "MLP gate / up multiply with SiLU x up and the 4-bit quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
+    "swiglu_fp4": {"what": "MLP gate / up multiply with SiLU x up and the 4-bit quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.SwigluFp4Decode", "form": {"PREWAIT_STAGES": 2, "L2_EVICT_FIRST": true, "MAX_CLUSTERS": 148, "PDL": true},
+      "tie_out": "Compared when the entry was written: both kernels run in one process on the same operands -- every row count from 1 to 64 at both geometries the entry serves (the one of this file among them), six operand sets, with the dependent-launch attribute on and off, with and without the weight stages ahead of the wait, and under seven arms of the entry's knobs: 7,808 cells inside the entry's contract and 2,880 outside it, on compute capability 10.0 -- no differing byte in the packed codes and in the whole block-scale band. No such comparison is recorded for another compute capability. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/gemm_fusions/swiglu_fp4_decode.md) and its suites (test/python/gemm/frost/swiglu_decode/).",
+      "differences": [
+        "a kernel of its own: the same count of every floating-point instruction, shared-memory load and store, tensor load and multiply instruction as the target kernel's, and 63 to 86 more instructions in all by token tile (the byte packing of the epilogue, the named barriers below); the two were not timed against each other",
+        "no product buffer: the target kernel is handed a bf16 tensor of the product's shape per row count, which it never writes; the entry takes none",
+        "one compiled kernel per token tile, the row count a run-time value; the target kernel is compiled per row count",
+        "the five named barriers inside warp-role branches are unaligned; the target kernel's are aligned. Both write the same bytes",
+        "the scalar of the product is read below the dependent-launch wait; the target kernel reads it above the wait",
+        "the launch goes to the caller's current stream explicitly; the target kernel's goes to the stream of its launch layer",
+        "the work tiles are dealt by the repository's own copy of the static persistent tile scheduler, in the same static order",
+        "the cluster cap, the weight stages ahead of the wait, the L2 policy and a token-tile floor are fields of the entry's form; the target's caller passes them as arguments and the token tile by row count (the values this file names)",
+        "the form is readable in the kernel's symbol; the target kernel has one symbol text for all of its forms",
+        "on the host: typed declines and binding checks before every launch, outputs the caller owns, 1 to 64 rows per call, the weight's shape a field of the form (served here: hidden 5120, intermediate 17408)"
+      ]},
     "fi_mm_fp4": {"what": "4-bit multiply: MLP down, output head", "origin": "FlashInfer", "relation": "target", "kind": "code", "entry": null},
     "fi_fp4_quantize": {"what": "4-bit quantise of the final hidden rows in front of the output head", "origin": "FlashInfer", "relation": "stand-in", "entry": null}
   },
@@ -53,28 +87,29 @@
             "prologue": [
               ["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]
             ],
+            "first_layer": {"add_norm_quantize": {"form": {"ADD": false, "STORE_RESIDUAL": true}}},
             "linear_attention_layer": [
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
-              ["projection.fp8.in", "fp8_projection", {"launch": [[128, 1, 1], [256, 1, 1], 139520]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": "e4m3_static"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["projection.fp8.in", "fp8_projection", {"form": {"OUT_FEATURES": 16384, "IN_FEATURES": 5120}, "launch": [[128, 1, 1], [256, 1, 1], 139520]}],
               ["linear_attention.step", "gdn_decode_fused", {"launch": [[96, 1, 1], [256, 1, 1], 42112]}],
               ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
-              ["mlp.gate_up", "swiglu_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "nvfp4"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["mlp.gate_up", "swiglu_fp4", {"form": {"TOKEN_TILE": 8}, "launch": [[1, 1, 148], [192, 1, 1], 231424]}],
               ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
             ],
             "attention_layer": [
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
-              ["projection.fp8.in", "fp8_projection", {"launch": [[112, 1, 1], [256, 1, 1], 139520]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "e4m3_static"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["projection.fp8.in", "fp8_projection", {"form": {"OUT_FEATURES": 14336, "IN_FEATURES": 5120}, "launch": [[112, 1, 1], [256, 1, 1], 139520]}],
               ["attention.prepare", "attention_prepare", {"launch": [[1, 28, 1], [128, 1, 1], 16]}],
               ["attention.core", "fi_decode_attention", {"launch": [[5, 4, 1], [512, 1, 1], 178456]}],
               ["attention.gate_quantize", "gate_quant", {"launch": [[3, 1, 1], [256, 1, 1], 0]}],
               ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
-              ["mlp.gate_up", "swiglu_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "nvfp4"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["mlp.gate_up", "swiglu_fp4", {"form": {"TOKEN_TILE": 8}, "launch": [[1, 1, 148], [192, 1, 1], 231424]}],
               ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
             ],
             "epilogue": [
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}]
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": null}, "launch": [[1, 1, 1], [640, 1, 1], 80]}]
             ],
             "after_step": [
               ["output_head.quantize", "fi_fp4_quantize", {}],

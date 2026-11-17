@@ -88,6 +88,7 @@ nanobind_add_module(
     pycudnn.cpp
     gnn.cpp
     properties.cpp
+    cpp_launcher.cpp
 
     pygraph/pygraph.cpp
     pygraph/custom_reduction.cpp

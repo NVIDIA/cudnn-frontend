@@ -576,6 +576,7 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -594,7 +595,7 @@ pytest core/test_determinism_utils.py
 | `norm/frost/test_add_norm_quant_decode_determinism.py` | `AddNormQuantDecode` (the add + RMSNorm + quantize decode step, hidden 5120, rows 1 .. 1024) | the updated BF16 residual, BF16 output `out`, FP8 E4M3 or packed E2M1 `codes`, the NVFP4 E4M3 block `scales` | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
-| `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
+| `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_backward_metadata` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
 | `sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` | the SM90 D128 template (`SdpaFwdDslSm90`, the 128 x 128 tile pinned) | O, Stats | none (forward-only template; no backward) |
 | `sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py` | fixed SM90 dedicated D128 and three-WG D512 bodies, FP16/BF16 | O, Stats; claim counter in stress | none (forward-only qualification) |
 | `sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` | `pygraph.sdpa_mxfp8(causal_exclude_own_block=32)` (SM100/SM103 MXFP8 D128 FROST kernel) | BF16 O, FP32 Stats | — (the option is forward-only) |
@@ -2076,6 +2077,54 @@ failure is a separate integration blocker; these explicit-plan results do
 not claim it is fixed. Existing measurements below are retained, not rerun
 as part of this addition.
 
+### GLU + Hadamard + quant column-scale packing — SM100, 2026-11-11
+
+The shared columnwise scale store now writes standard GEMM 128x4 scale atoms.
+The existing reference decoder independently gathers those physical bytes
+before checking scales and dequantized RHT values. A negative-control run of
+the updated column-scale test against pristine `683f294b` failed: 3626 of 4096
+scale elements mismatched, with maximum absolute error 93. The legacy decoder
+was self-consistent with the old producer; this fixes its GEMM consumer contract.
+
+Qualification used the edited `683f294b` checkout on NVIDIA GB200 (SM100,
+152 SMs), driver 580.126.20, PyTorch 2.13.0a0+8145d630e8.nv26.06 / CUDA 13.3,
+cuDNN backend 92600, and CuTe DSL 4.8.0 compiling with CUDA 13.4. Import-path
+and source-hash checks confirmed the tested checkout. Results:
+
+- Existing Torch quantization suite: **17 passed, 6 Rubin-only skips**, 17.24 s.
+- New determinism suite: **5 passed**, 11.93 s. The default 32-channel interleaved
+  input uses expert M=[256,0,512], N=256/2048, K=512. Separate independent
+  GEMM/SwiGLU/H16/dequantization checks accompany raw-byte comparisons of every
+  output across fresh allocations, concurrent work, changed-weight/scale graph
+  replay, and expert isolation/reordering/duplication/removal/changed neighbors.
+- JAX selection: **16 passed, 196 deselected**, 45.53 s, using isolated JAX 0.11.1
+  and NumPy 2.2.6. Columnwise cases use an independent input dequantization and
+  GEMM/SwiGLU/H16 reference as well as Torch byte parity and compiled replay.
+  The fixture's RHT maximum 25984 exceeds the 10752 range at encode scale 0.25;
+  columnwise RHT therefore uses 1/64 (range 172032), with finite/per-block scale
+  representability assertions. Inputs and numerical tolerances are unchanged.
+
+The warm-stress case uses M=[1024,0,2048], N=2048, K=4096, crossing the staged
+input ring and reusing epilogue buffers. The unsafe control failed 200/200
+launches. The actual kernel had **0 mismatches in 3000 warm and 3000 poisoned
+launches**. These are cold-reference stability checks; the independent numerical
+reference runs separately, not as an exact-byte stress reference. The kernel
+launches 152 blocks (one per SM), below the control's three blocks per SM.
+Each 3000-launch arm bounds the observed per-launch failure rate below 0.0998%
+at 95% confidence for this tested configuration; it does not establish race
+freedom or transfer the control's geometry to this kernel.
+
+SM103, SM107, CUDA 12 compilation and JAX batch invariance remain unverified.
+This is a forward-only fusion; no backward API is claimed. No runtime golden
+or numerical tolerance was changed. From `test/python`, with the edited source
+on the import path:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py -m L0 -q -rs -s
+python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -k glu_hadamard_quant -m L0 -q -rs
+```
+
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 
 `test_DSA_indexer_compressed_sm90_determinism.py` now covers the public
@@ -2379,7 +2428,7 @@ unset.
 On the committed suite B300 skips thirteen cases by contract: the nine FP16
 forward cases (four replay, four batch, the golden; the SM100/SM103 blk64
 forward serves BF16 only) and the four prepared-route cases
-(`block_sparse_attention_prepare_backward` serves SM90 only), each after the
+(`block_sparse_attention_backward_metadata` serves SM90 only), each after the
 API rejected a tiny instance of the configuration (`skip_by_contract`,
 `NotImplementedError` naming BF16 or the SM90-only clause). The earlier
 revisions had three FP16 forward cases and no rejection check, so they
@@ -3438,7 +3487,7 @@ The suite lives in `block_sparse_attention/cutedsl/test_BSA_determinism.py`
 and is collected separately from the 330-case attention set above
 (`pytest -m L0 block_sparse_attention/cutedsl/test_BSA_determinism.py --collect-only -q`
 lists 30 node IDs). It drives the public `block_sparse_attention_forward`,
-`block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
+`block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 entry points with `sparse_block_size=64`: the SM90 blk64 kernels, and the
 SM100/SM103 blk64 path through the same API. Head dimension 128, MHA, BHSD.
 A sequence is one batch element with its own KV block lists and counts;
@@ -3461,7 +3510,7 @@ blocks, ten-block lists, a 47-token KV tail marked by `block_sizes`).
 | `TestBlk64Forward::test_replay` | L0 | The four configurations in BF16 and FP16: eight executions with fresh buffers and side-stream work, input mutation check, FP32 reference | 8 |
 | `TestBlk64Forward::test_batch_invariance` | L0 | The four configurations in BF16 and FP16: a batch element alone against its slice of the packed, reversed, duplicated and neighbor-duplicated batches, with reversed heads, and with changed neighbor data and masks (shared block sizes) | 8 |
 | `TestBlk64Forward::test_golden` | L0 | BF16, FP16: B1 H2, three query blocks (one empty), four KV blocks (sizes 64/40/64/23), two-block lists; three executions, reference, saved hashes | 2 |
-| `TestBlk64Backward::test_replay` | L0 | Routes `regular` (one query group: direct dK/dV stores), `grouped` (`bucket_size_blocks=5`: four query groups, FP32 dK/dV workspace), `paired` (paired-KV kernel, task gate forced to 0, four query groups), `prepared-regular` and `prepared-paired` (SM90: `block_sparse_attention_prepare_backward` + `metadata=`); B3 H2, 16 x 16 blocks, six-block lists with empty rows and partial blocks; eight executions, dispatcher decisions asserted, FP32 reference, empty-row dQ zero; dQ/dK/dV bytes measured, asserted only for the prepared-regular dK/dV | 5 |
+| `TestBlk64Backward::test_replay` | L0 | Routes `regular` (one query group: direct dK/dV stores), `grouped` (`bucket_size_blocks=5`: four query groups, FP32 dK/dV workspace), `paired` (paired-KV kernel, task gate forced to 0, four query groups), `prepared-regular` and `prepared-paired` (SM90: `block_sparse_attention_backward_metadata` + `metadata=`); B3 H2, 16 x 16 blocks, six-block lists with empty rows and partial blocks; eight executions, dispatcher decisions asserted, FP32 reference, empty-row dQ zero; dQ/dK/dV bytes measured, asserted only for the prepared-regular dK/dV | 5 |
 | `TestBlk64Backward::test_batch_invariance` | L0 | `regular` and `paired`: a batch element alone against the packed, reversed, duplicated and changed-neighbor batches; forward results asserted bitwise, gradients measured, route asserted | 2 |
 | `TestBlk64Backward::test_prepared_parity` | L0 | SM90: prepared against default route on the regular and paired kernels, within the FP32 reduce-add noise (atol/rtol 1e-2), reused object, reference | 2 |
 | `TestBlk64Backward::test_zero_upstream_gradient` | L0 | Eight executions with zero dO on the regular route; every gradient exactly zero, bitwise | 1 |
@@ -3469,7 +3518,7 @@ blocks, ten-block lists, a 47-token KV tail marked by `block_sizes`).
 
 On SM100/SM103 the nine FP16 forward cases (four replay, four batch, the
 golden) and the four prepared-route cases skip by contract: the blk64 forward
-there serves BF16 only, and `block_sparse_attention_prepare_backward` serves
+there serves BF16 only, and `block_sparse_attention_backward_metadata` serves
 SM90 only. Each skip is gated on the API itself (`skip_by_contract`): the case
 first makes a tiny FP16 forward call or prepare call and requires the
 documented rejection (`NotImplementedError` naming BF16, or the SM90-only
@@ -5138,7 +5187,7 @@ then completed and were checked again in the42-case strict run.
 
 The new suite is
 `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py`.
-It tests the public `cudnn.ops.simplified_sparse_attention` call. There is no
+It tests the public `cudnn.ops.simplified_sparse_attention_forward` call. There is no
 mode that guarantees determinism. All cases are L0 and use BF16 input,
 BF16 output/gradients, and FP32 loss. Tests check output, indexer loss,
 dQ, dK, dV, dIndexerQ, and dIndexerK. They do not expose or compare saved
@@ -5474,7 +5523,7 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 ## Phase 1 dense indexer KL public exports (2026-11-09)
 
 Revision `b1a9c4a`, based on `55b9180`. The installed wheel exposes
-`dense_indexer_kl` through both `cudnn.ops` and
+`dense_indexer_kl_forward` through both `cudnn.ops` and
 `cudnn.simplified_sparse_attention`. The API retains the scalar loss and
 indexer-only autograd contract. `use_kf=False` selects chunked PyTorch;
 `use_kf=True` selects the supplied-LSE CuTe kernel. Both reject external
@@ -7438,3 +7487,57 @@ comes from the frozen implementation revisions; subsequent parent integration
 preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
+
+
+### SM100/SM103 FP8 swap-AB wide output addressing — 2026-11-16
+
+The D128 body now widens all coordinates before an Array row slice accumulates
+runtime stride products. Original compact output controls pass on B200 and
+B300; an output batch stride of `2**31 - 65536` elements at B4 leaves half the
+original output unwritten. The fix changes addressing only, with no arithmetic,
+barrier, capability or plan-selection change. This forward body adds no backward
+implementation.
+
+Native qualification used cuDNN 9.24.0.43, Torch 2.11.0+cu130, CuTeDSL 4.8.0
+with compiler/NVRTC 13.4, and verified checkout imports. Parent kernel source
+is `f1b7ee075`; final candidate adds the coordinate-width fix and maintained
+prepared-output regression. B200/SM100 and B300/SM103 both have 148 SMs in these
+runs. CUDA 12 compiler compatibility was not measured in this qualification.
+
+- B200: **74 passed, 0 skipped** for the 48 new output-layout cases and existing
+  dense/paged replay, batch, golden and warm-refill cases.
+- B300: **58 passed, 0 skipped** for the same 48 output-layout cases and existing
+  dense replay, batch, golden and warm-refill cases. Paged SwapAB is not claimed
+  on SM103.
+- Separate B200 D64/D128 paged, split, optional-output and route controls:
+  **60 passed, 0 skipped** with the identical kernel patch.
+
+The 48-case regression crosses E4M3/E5M2 input, FP16/BF16/E4M3/E5M2 output,
+packed/unpacked heads, compact storage, wide batch products and wide strides.
+It checks O, Stats and Amax against the independent reference, byte equality
+for unchanged replay, changed V/scales, and restored-input replay. Snapshots
+are cloned before mutation. Existing batch tests preserve quantized payloads
+through reordering, duplication and changed neighbors; whole-batch Amax retains
+its separate comparison rule. Warm-refill controls on both GPUs detect the
+unsafe ring; the candidate has zero mismatches in 256 warm plus 256 poisoned
+launches per stress case.
+
+For the exact old-stack environments, record the **unmodified parent** into a
+new private golden directory, then compare the candidate with recording unset.
+All 10 B200 and 4 B300 parent records pass strict candidate comparison; no
+committed baseline is replaced. The parent recording runs are separate from
+the candidate counts above.
+
+From `test/python`, run the maintained wide-output detector plus the affected
+existing CI entries:
+
+```bash
+pytest sdpa/frost/test_sdpa_prepared_fp8.py::test_decode_fp8_physical_output_strides_replay -m L0 -q
+CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
+  pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py -m L0 -q \
+  -k 'TestDenseFp8SwapAB and (test_replay_batch or test_golden or test_warm_refill)'
+# SM100 additionally:
+CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
+  pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
+pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
+```

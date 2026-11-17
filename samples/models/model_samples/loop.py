@@ -7,11 +7,16 @@ A session decides everything before it loads anything: ``plan_table()`` resolves
 number of sequences and the stack, and states the memory the run needs -- for this session and for the sessions that will
 follow it on its weights, so that nothing can decline once the first of them has loaded.  Only a run that fits then lets its
 entries build their kernels on scratch operands (their first use, where an entry asks what it needs of the installed
-toolchain): the memory sentence comes before the first allocation on the GPU.  ``load()`` then reads (or draws),
-merges and dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one
-warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
-chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
-no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
+toolchain): the memory sentence comes before the first allocation on the GPU.  ``load()`` then reads (or draws) and
+merges the weights and keeps each in the forms the blocks of these plans read: the stored form of a weight that a block
+multiplies on (``Block.stored_weights``; in the layout of that block's provider where it has one of its own:
+``Block.stored_layout``), the bf16 copy of a weight that a block reads as one -- so no copy of a weight
+that every plan of the run multiplies on its stored format.  A block that would read a form the load did not keep fails
+there, by name, before the first step.  ``load()`` then compiles what a provider compiles (a compiled form is launched
+once) and runs one warm-up step, each as a timed stage.  The reference session of a run's checks reads bf16 copies; where
+the load kept none it gets one per call (``on_demand``).  ``prefill`` feeds the prompts and ``step`` advances every
+sequence by one token; the chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the
+sample's own loop -- there is no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
 lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
 what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
 traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
@@ -34,7 +39,10 @@ from .state import DecodeState
 from .timing import Report, Stages, now, trace_steps
 
 STACKS = ("fe-cublas", "native", "fe-entries", "reference")
+REFERENCE = "reference"  # the stack of the plain-PyTorch reference blocks: what the checks of a run compare it with
 PREFILL_ROUTES = ("decode-step",)
+#: how a stored weight is laid out for a block that multiplies on it and names no layout of its provider's own
+CHECKPOINT_ORDER = "the checkpoint's row order"
 
 
 class StopRule:
@@ -91,15 +99,26 @@ class Session:
         share: Optional["Session"] = None,
         record_steps: Optional[int] = None,
         check_kernels: bool = False,
+        on_demand=None,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
         ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step).
         ``check_kernels`` says that the run will check its kernels: what that needs of a provider is then part of the plan
         (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack that declares a target
-        kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them."""
+        kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them.
+        ``on_demand`` (``weights.OnDemand``) is for the reference session of a run's checks, which runs on the weights of the
+        session it checks: where that load kept a weight on its stored format alone, the blocks of this session get a bf16
+        copy of it made for the one call and dropped after it, and the object counts what that cost.  It is refused for
+        any other session (``ValueError``): a copy made per call is a cast and two synchronisations in front of a block,
+        which no step of a run that is timed, traced or checked may carry."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
+        if on_demand is not None and (share is None or stack != REFERENCE):
+            raise ValueError(
+                f"on_demand is for the reference session of a run's checks (stack {REFERENCE}, on the weights of the session it checks: share=); "
+                f"a session of stack {stack}{'' if share is None else ' on shared weights'} reads the forms its load kept and never dequantises a weight per call"
+            )
         if prefill not in PREFILL_ROUTES:
             raise ValueError(f"prefill route must be one of {PREFILL_ROUTES}; got {prefill!r}")
         if sequences < 1:
@@ -110,6 +129,7 @@ class Session:
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
         self.check_kernels = bool(check_kernels) or stack in getattr(model, "target_stacks", ())
+        self.on_demand = on_demand  # the maker of the bf16 copies this session's blocks read and its weights do not hold
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
         self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
@@ -118,6 +138,7 @@ class Session:
         self.state: Optional[DecodeState] = None
         self.record: Optional[Record] = None
         self.tap = None  # tie_out's hook: tap(block name, layer, block, operands) -> the block's result
+        self._followers: tuple = ()  # the sessions that will run on this one's weights, as ``plan_table`` was told
         self._report = Report(model.name, reduced=bool(getattr(model, "reductions", ())))
         self._calls = 0
         self._prefill_start = 0.0
@@ -125,7 +146,12 @@ class Session:
     # ------------------------------------------------------------------ plan
     def resolve(self) -> blocks.Plan:
         if self.plan is None:
-            options = {"reference_precision": self.reference_precision, "device": str(self.device), "check_kernels": self.check_kernels}
+            options = {
+                "reference_precision": self.reference_precision,
+                "device": str(self.device),
+                "check_kernels": self.check_kernels,
+                "merge_rule": self.merge_rule,
+            }
             facts = self.device if self.device.type == "cuda" else blocks.DeviceFacts((0, 0), "cpu")
             self.plan = blocks.plan(
                 self.model.provider_table,
@@ -140,6 +166,70 @@ class Session:
                 source=self.model.table_source,
             )
         return self.plan
+
+    def stored_weights(self, own: bool = False) -> tuple:
+        """The blocks whose weights this session's load keeps on their stored format: every block that a provider
+        multiplying on the stored format serves (``Block.stored_weights``) in this session's plan or in the plan of a
+        session that will run on its weights (``plan_table(later)``).  ``own``: the blocks of this session's plan alone
+        -- the weights its own steps read on the stored format."""
+        plans = [self.resolve(), *(session.resolve() for session in (() if own else self._followers))]
+        return tuple(dict.fromkeys(name for plan in plans for name, block in plan.items() if getattr(block, "stored_weights", False)))
+
+    def uncopied_weights(self) -> tuple:
+        """The blocks whose weights this session's load keeps on their stored format ALONE, without a bf16 copy: a provider
+        multiplying on the stored format serves them in this session's plan and in the plan of every session that will
+        run on its weights (``plan_table(later)``), so no block of the run reads a copy.  The reference blocks of the
+        checks do, and get theirs per call (``on_demand``)."""
+        plans = [self.resolve(), *(session.resolve() for session in self._followers)]
+        return tuple(name for name in self.stored_weights() if all(getattr(plan.get(name), "stored_weights", False) for plan in plans))
+
+    def stored_layouts(self) -> dict:
+        """Block -> the layout its provider multiplies the stored weight on (``Block.stored_layout``), for the blocks of
+        ``stored_weights()`` whose provider has one of its own: what the family's loader is handed beside the block names.
+        A load keeps ONE stored form of a weight, so two plans of a run that multiply on it in two row orders are a
+        ``ValueError``, a wrong table: two providers' own layouts, and as much a provider's own layout in one plan beside
+        the checkpoint's row order in another (a block that says ``stored_weights`` and names no layout).  A plan whose
+        block reads the bf16 copy is no reader of the stored form and asks for nothing here."""
+        layouts, owners = {}, {}
+        for plan in (self.resolve(), *(session.resolve() for session in self._followers)):
+            for name, block in plan.items():
+                if not getattr(block, "stored_weights", False):
+                    continue
+                layout = getattr(block, "stored_layout", None)
+                owner = CHECKPOINT_ORDER if layout is None else type(block)  # whose row order this plan multiplies on
+                if owners.setdefault(name, owner) is not owner:
+                    orders = ", ".join(each if isinstance(each, str) else each.__name__ for each in (owners[name], owner))
+                    raise ValueError(
+                        f"the provider table is wrong: two plans of this run multiply on two layouts of the stored weight of {name} ({orders}); a load keeps one"
+                    )
+                if layout is not None:
+                    layouts.setdefault(name, layout)
+        return layouts
+
+    def _kept(self) -> dict:
+        """What the plans of the run ask the family's loader to keep, as its keyword arguments: nothing for a run whose every
+        multiply reads a bf16 copy (a family without such a block is never asked)."""
+        stored, uncopied = self.stored_weights(), self.uncopied_weights()
+        return {**({"stored": stored} if stored else {}), **({"uncopied": uncopied} if uncopied else {})}
+
+    def _check_forms(self) -> None:
+        """Before the first step: every form of a weight a block of this session's plan reads is one the load of its weights
+        kept, and a stored weight is in the row order its block multiplies on.  A session that runs on another session's
+        weights was not necessarily planned with it; a ``ValueError`` then names the block and the form."""
+        kept, uncopied = getattr(self.weights, "stored", None), getattr(self.weights, "uncopied", ())
+        if kept is None:  # a family whose loader holds one form of every weight
+            return
+        laid_out = getattr(self.weights, "laid_out", ())
+        other = "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+        for name, block in self.plan.items():
+            on_stored = getattr(block, "stored_weights", False)
+            if on_stored and name not in kept:
+                raise ValueError(f"{block.entry} multiplies on the stored format of the weight of {name}, and the load kept none: {other}")
+            if on_stored and (getattr(block, "stored_layout", None) is not None) != (name in laid_out):
+                wants, has = ("the checkpoint's row order", "a provider's own") if name in laid_out else ("its own row order", "the checkpoint's")
+                raise ValueError(f"{block.entry} multiplies on the stored weight of {name} in {wants}, and the load kept it in {has}: {other}")
+            if not on_stored and name in uncopied and self.on_demand is None:
+                raise ValueError(f"{block.entry} reads a bf16 copy of the weight of {name}, and the load kept its stored format alone: {other}")
 
     def claim(self) -> Optional[census.Claim]:
         """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the
@@ -164,13 +254,21 @@ class Session:
         plan = self.resolve()
         for session in later:
             session.resolve()
+        self._followers = tuple(later)
+        if self._share is None:
+            self.stored_layouts()  # one weight in two row orders is a wrong table: named here, with the plans, before anything is built or read
         sentence = ""
         if self.device.type == "cuda":
-            need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
+            # what the load of the first session holds follows the plans: the stored format of the weights a block multiplies
+            # on, and no bf16 copy of those no block reads as one (asked of a family's model only where a plan has such a block)
+            held = self._kept() if self._share is None else {}
+            need = self.model.memory_bytes(self.sequences, self.capacity, **held) - (self.model.copy_bytes() if self._share is not None else 0)
             need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
             counts = [self.sequences, *(session.sequences for session in later)]
             what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
-            sentence = "\n  " + plan.memory(need, what)  # before anything is built on the GPU: this is where a run that does not fit ends
+            # the part of the need that is the checks': the reference's copy of a weight the load keeps no copy of, one at a time
+            checks = self.model.check_bytes(held["uncopied"]) if "uncopied" in held else 0
+            sentence = "\n  " + plan.memory(need, what, checks)  # before anything is built on the GPU: this is where a run that does not fit ends
         for session in (self, *later):
             session.plan.first_use()
         return plan.table() + sentence
@@ -178,6 +276,9 @@ class Session:
     # ------------------------------------------------------------------ load
     def load(self) -> None:
         plan = self.resolve()
+        # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
+        # two row orders of one weight end here -- before an entry builds anything, before a byte is read
+        layouts = self.stored_layouts() if self._share is None else {}
         plan.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
             torch.backends.cuda.matmul.fp32_precision = "ieee"
@@ -188,7 +289,10 @@ class Session:
                 from .weights import Checkpoint
 
                 self.checkpoint = Checkpoint.synthetic(self.model, self.seed)
-            self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule)
+            # the forms the plans of the run read, asked of a family's loader only where a block multiplies on a stored format
+            forms = {**self._kept(), **({"layouts": layouts} if layouts else {})}  # ... and the layouts asked above
+            self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule, **forms)
+        self._check_forms()
         for name, block in plan.items():
             if getattr(block, "compiles", False):
                 with self.stages.stage(f"compile and first launch {name} ({self.sequences} row{'s' if self.sequences > 1 else ''})"):
@@ -218,6 +322,8 @@ class Session:
     def _call(self, name: str, layer: int, *operands):
         self._calls += 1
         block = self.plan[name]
+        if self.on_demand is not None:  # a weight the load kept without a bf16 copy: this session's blocks get one for this call
+            operands = self.on_demand.operands(operands)
         out = self.tap(name, layer, block, operands) if self.tap is not None else block(*operands)
         if self._call_log is not None:  # a traced step: the call site, and what the adapter says served the call it has just made
             self._call_log.append(census.Call(name, layer, self.sequences, *block.serving()))
@@ -271,6 +377,10 @@ class Session:
         the sites of a step with what the entries state about their launches, read before the first traced step; the log
         of every block call of every traced step; and the launch records of the pass, cut into steps -- or why there are
         none."""
+        if self.on_demand is not None:  # the reference of a run's checks: its calls carry the copies it makes, which no step of a run does
+            raise ValueError(
+                "a session that makes bf16 copies of its weights per call (on_demand) is the reference of a run's checks; its steps are not traced"
+            )
         records = self.check_kernels if records is None else bool(records)
         sites = census.expected(self.plan, self.model) if records else []
         claim = self.claim() if records else None
@@ -310,5 +420,9 @@ class Session:
 
     def report(self) -> Report:
         if hasattr(self.model, "bytes_per_step") and self.state is not None:
-            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position)
+            # a block of this session's plan that multiplies on the stored format reads its weight there, not as a copy
+            # (asked of a family's model only where the plan has such a block)
+            stored = self.stored_weights(own=True)
+            read = {"stored": stored} if stored else {}
+            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position, **read)
         return self._report

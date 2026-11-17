@@ -6,7 +6,9 @@
 fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the
 same sequence in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a
 free-memory budget the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with
-that sentence -- unless a check failed before it: a skip never covers a failure.  Each sequence count also reports its
+that sentence -- unless a check failed before it: a skip never covers a failure.  Every line of the run is read from
+standard error, and standard output must stay empty: it is kept for generated text, which a seeded run does not have.
+Each sequence count also reports its
 traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
 bytes of a step.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
@@ -15,7 +17,8 @@ the four-layer one (three + one).
 
 The ``fe-entries`` cell runs the same default run on the stack ``fe-entries``: every cuDNN Frontend row of the stack ``native``
 (the fused linear-attention step in its wait + release form; on compute capability 10.x the attention gate + quantise
-entry, judged against its twin) with every other block on its fallback row -- no package beyond cuDNN Frontend and PyTorch.
+entry, the add + RMSNorm + quantise entry in the form of each call site and the fused 4-bit gate / up entry, each judged
+against its twin) with every other block on its fallback row -- no package beyond cuDNN Frontend and PyTorch.
 That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan,
 the entries' own launch facts and, where the family's kernel census has a section for the GPU, the recorded launch shapes.
 Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entries stack (kernels not observed: <reason>)``:
@@ -64,8 +67,11 @@ def sample(monkeypatch):
 
 
 FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2"
-#: with the gate entry (compute capability 10.x) one more block is cuDNN Frontend's and one reference chain fewer is a fallback
-FE_ENTRIES = "by provider: cuDNN FE 2 | fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3) | PyTorch 2"
+#: with the gate entry, the norm entry and the fused gate / up entry (compute capability 10.x) three more blocks are cuDNN Frontend's:
+#: two reference chains and one multiply over a copy fewer are fallbacks
+FE_ENTRIES = "by provider: cuDNN FE 4 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+#: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
+FE_ENTRIES_CC100 = "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
@@ -73,8 +79,9 @@ CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles 
 
 def _fresh_interpreter(arguments):
     """The sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
-    Returns ``(exit code, stdout)``.  The child arms its own stack dump before the parent's deadline; where the deadline
-    passes, the failure carries what the child had printed."""
+    Returns ``(exit code, the run's lines, what the run wrote to standard output)``: a sample writes every line of a run
+    to standard error and keeps standard output for generated text.  The child arms its own stack dump before the
+    parent's deadline; where the deadline passes, the failure carries what the child had printed."""
     import cudnn
 
     package_root = str(Path(cudnn.__file__).resolve().parent.parent)
@@ -92,11 +99,11 @@ def _fresh_interpreter(arguments):
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
         pytest.fail(f"the sample did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
-    if "[00] " not in done.stdout:  # the child never reached the sample's own lines: an import or an environment failure
+    if "[00] " not in done.stderr:  # the child never reached the sample's own lines: an import or an environment failure
         pytest.fail(
             f"the sample printed no verdict in a fresh interpreter (exit code {done.returncode})\n--- stdout\n{done.stdout[-3000:]}\n--- stderr\n{done.stderr[-6000:]}"
         )
-    return done.returncode, done.stdout
+    return done.returncode, done.stderr, done.stdout
 
 
 def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
@@ -106,11 +113,16 @@ def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, un
     shows as such in its log."""
     start = time.perf_counter()
     if sample is None:
-        code, out = _fresh_interpreter(arguments)
+        code, out, written = _fresh_interpreter(arguments)
     else:
         code = sample.main(arguments)
-        out = capsys.readouterr().out
+        captured = capsys.readouterr()
+        out, written = captured.err, captured.out  # the run's lines; and standard output, which is for generated text
     seconds = time.perf_counter() - start
+    # A seeded run has no language: whatever its verdict, standard output stays empty.  A line there -- of the sample, or of
+    # a library the stack calls (a kernel build, a log switched to standard output) -- would stand in front of a text that
+    # a user pipes into a file.
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
     tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
     versions = next((line[5:] for line in tagged if line.startswith("[00] cuDNN Frontend ")), "no environment line")
     device = next((line[5:].split(" | ")[0] for line in tagged if " SMs)" in line), "no device line")
@@ -141,14 +153,26 @@ def test_default_run_passes_its_own_checks(sample, capsys):
 @pytest.mark.L0
 def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kernel_check(capsys):
     """The cuDNN Frontend rows of the stack ``native``, on real launches: the fused step in its wait + release form and, on
-    compute capability 10.x, the gate + quantise entry inside its band against its twin; the kernel check on every launch
-    of the traced steps; the census line, which claims nothing while a row is a fallback.  In a fresh interpreter: the
-    kernel check reads kernel names from the profiler, which names them wrongly in a process that has unloaded a kernel
-    module (the module docstring)."""
+    compute capability 10.x, the gate + quantise entry, the add + RMSNorm + quantise entry (four of its forms on the
+    two-layer model, each call served by the instance of its call site) and the fused 4-bit gate / up entry (the kernel
+    stated whole, in the token tile of the row count) inside their bands against their twins; on compute capability 10.0
+    the FP8 projection entry for the in-projections (one instance per weight shape) inside the band of the reference
+    multiply, and on every other class that block on its multiply over a copy; the kernel check on every launch of the
+    traced steps; the census line, which claims nothing while a row is a fallback.
+    Where an entry that multiplies on the stored format serves both sequence counts -- the fused gate / up entry on
+    compute capability 10.x, the projection entry on 10.0 -- the run holds those weights on their stored format alone, so
+    the reference of the checks makes its own bf16 copies: the run says that the stored bytes they are made from are those
+    of the load (``stored weights``) and what the copies cost (``on demand``), and PyTorch's peak stays below the memory
+    sentence -- one copy at a time, where all of them together are many times that sentence.  On compute capability 12.x
+    every weight has its copy and neither line is printed.
+    In a fresh interpreter: the kernel check reads kernel names from the profiler, which names them wrongly in a process
+    that has unloaded a kernel module (the module docstring)."""
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
-    gate = torch.cuda.get_device_capability()[0] == 10  # the gate entry serves compute capability 10.x
-    out = _run(None, capsys, ["--stack", "fe-entries"], "fe-entries", FE_ENTRIES if gate else FE_CUBLAS, unobserved=True)
+    gate = torch.cuda.get_device_capability()[0] == 10  # the gate entry and the norm entry serve compute capability 10.x
+    projection = tuple(torch.cuda.get_device_capability()) == (10, 0)  # the class the row of the FP8 projection entry claims
+    by_provider = FE_ENTRIES_CC100 if projection else (FE_ENTRIES if gate else FE_CUBLAS)
+    out = _run(None, capsys, ["--stack", "fe-entries"], "fe-entries", by_provider, unobserved=True)
     assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "stack fe-entries" in out
     assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the target's form"
     assert out.count("\nkernels, planned (decided before the load") == 2 and out.count("\n  kernels  ") == 2, "the kernel check ran at both sequence counts"
@@ -157,6 +181,56 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert "cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True]" in out
         assert out.count("[band: gate_fp8]  PASS") == 2, "the gate entry was judged against its twin at both sequence counts"
         assert "attention.gate_quantize equal (gated)" in out or "REPORTED" in out
+        assert "cudnn.AddNormQuantDecode [PDL True, PDL_RELEASE True] + one of 6 forms, by call site" in out, "the norm entry, a form per call site"
+        assert out.count("[band: add_norm_quant]  PASS") == 2, "the norm entry was judged against its twin at both sequence counts"
+        assert "add_norm_quantize equal (gated)" in out or "REPORTED" in out
+        served = [line for line in out.splitlines() if line.strip().startswith("add_norm_quantize, as the call log of a traced step has it (5 calls): ")]
+        assert len(served) == 2 and all(
+            line.count(" x cudnn.AddNormQuantDecode #") == 4 for line in served
+        ), "five calls of a step on four forms, each from its instance"
+        fused = "cudnn.SwigluFp4Decode [TOKEN_TILE 8, PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True]"
+        assert fused in out, "the fused gate / up entry, the kernel stated whole: 1 and 4 rows run the 8-token tile"
+        assert out.count("[band: swiglu_fp4]  PASS") == 2, "judged against its twin at both sequence counts"
+        assert "mlp.gate_up equal (gated)" in out or "REPORTED" in out
+        stated = [line for line in out.splitlines() if line.strip().startswith(f"mlp.gate_up: {fused}, 2 launches per step") and "; the entry states " in line]
+        assert len(stated) == 2 and all("block (192, 1, 1), shared memory 231,424 B" in line for line in stated), "one launch per MLP, at both sequence counts"
+        # the weights the run keeps on their stored format alone: the gate / up weights, and on 10.0 the in-projections too
+        kept, count = ("projection.fp8.in, mlp.gate_up", 4) if projection else ("mlp.gate_up", 2)
+        made = [line for line in out.splitlines() if line.startswith("  on demand ")]
+        assert len(made) == 2 and all(
+            f"weights this run keeps on their stored format alone ({kept})" in line for line in made
+        ), "no bf16 copy of these weights is held: the reference of the checks made its own, at both sequence counts"
+        assert (
+            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)" in out
+        ), "and the memory sentence says so"
+        held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
+        assert len(held) == 2 and all(
+            line.startswith(f"  stored weights    {count} of {count} weights this run keeps on their stored format alone hold the bytes of their load, ")
+            and line.endswith("    PASS")
+            for line in held
+        ), "the copies were made from the bytes of the load: no block wrote into its weight, at both sequence counts"
+        # one copy at a time: the copies of a count are tens of GiB in all, and what PyTorch held at its peak is below the sentence
+        need = float(out.split("this stack needs about ", 1)[1].split(" GiB", 1)[0])
+        peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
+        assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
+    else:
+        assert "\n  on demand " not in out and " for the checks (" not in out, "every weight has its bf16 copy: nothing is made on demand"
+        assert "\n  stored weights " not in out, "and the reference reads the copies of the load: no stored bytes to hold"
+        assert "cudnn.SwigluFp4Decode" not in out, "the rows claim compute capability 10.x only"
+        assert any(line.split()[:1] == ["mlp.gate_up"] and line.endswith("fallback: bf16 copy of 4-bit weights") for line in out.splitlines())
+    multiply = [line for line in out.splitlines() if line.split()[:1] == ["projection.fp8.in"] and "calls" in line and "[band: " in line]
+    assert len(multiply) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in multiply), "the in-projection was judged at both sequence counts"
+    if projection:
+        form = "[SPLIT_K 1, MMA_M 128, STAGES 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True]"
+        assert f"cudnn.Fp8ProjectionDecode {form} + one of 2 forms, by call site" in out, "the FP8 projection entry, the kernel stated whole"
+        assert "projection.fp8.in equal (gated)" in out or "REPORTED" in out
+        served = [line for line in out.splitlines() if line.strip().startswith("projection.fp8.in, as the call log of a traced step has it (2 calls): ")]
+        assert len(served) == 2 and all(line.count(" x cudnn.Fp8ProjectionDecode #") == 2 for line in served), "one instance per weight shape"
+        stated = [line for line in out.splitlines() if line.strip().startswith("projection.fp8.in at ") and "; the entry states " in line]
+        assert len(stated) == 4 and all("block (256, 1, 1), shared memory" in line for line in stated), "both shapes, at both sequence counts"
+    else:
+        assert "cudnn.Fp8ProjectionDecode" not in out, "the row claims compute capability 10.0 only"
+        assert any(line.split()[:1] == ["projection.fp8.in"] and line.endswith("fallback: bf16 copy of 8-bit weights") for line in out.splitlines())
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
     frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
 

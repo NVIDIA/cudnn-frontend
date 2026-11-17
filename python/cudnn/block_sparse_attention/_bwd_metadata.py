@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prebuilt metadata of the SM90 blk64 backward (``block_sparse_attention_prepare_backward``).
+"""Prebuilt metadata of the SM90 blk64 backward (``block_sparse_attention_backward_metadata``).
 
 The backward's metadata kernels (the bucketed K-to-Q CSR build and, on the paired-KV path, the pair bitsets, matching,
 refinement and partitioned CSR) depend on the sparse pattern and the sequence lengths only, never on Q/K/V/dO. A
@@ -57,7 +57,7 @@ def source_mismatch(built: tuple, current: tuple) -> Optional[str]:
 class BsaBackwardMetadata:
     """Backward metadata of one sparse pattern for ``block_sparse_attention_backward(..., metadata=...)`` (SM90 blk64).
 
-    Built by :func:`block_sparse_attention_prepare_backward` from ``q2k_block_index`` / ``q2k_block_nums`` /
+    Built by :func:`block_sparse_attention_backward_metadata` from ``q2k_block_index`` / ``q2k_block_nums`` /
     ``block_sizes`` and the sequence lengths only, so it serves any number of backward calls over the same metadata
     tensors. The object keeps those tensors alive and remembers their storage, shape, strides and in-place version
     counters; a backward call with other metadata, or after an in-place change of the same tensors, is rejected.

@@ -289,6 +289,82 @@ class _FromMemory:
         return dequantize(stored) if as_format == "dequantized" else stored
 
 
+def test_what_a_kernel_on_the_stored_formats_hands_to_a_block_that_is_not_one_yet():
+    """Two containers carry an operand from a kernel on the stored formats to a consumer on a fallback row, and ``dequantize``
+    reads both -- so what the consumer needs beyond the kernel's bytes is launched by the consumer.  The block scales of a
+    4-bit activation stay in the 128 x 4 layout the kernel writes: the index of that layout is pinned here against the
+    layout rule written out, and against the rule the entry that writes it states; the gather gives the row-major scales
+    whatever the pad bytes hold.  And bf16 rows whose producer wrote no codes are quantised by the reference quantiser when
+    they are read.  A zero keeps its sign in the code a kernel writes; the reference quantiser's own rule is unchanged."""
+    from model_samples import weights
+    from model_samples.weights import BlockScaledTensor, TiledBlockScaledTensor, Unquantized, dequantize, quantize_fp8, quantize_nvfp4, tile_scale_index
+
+    def byte(row, block, blocks):  # the layout rule, written out: bands of 128 rows, tiles of 128 rows x 4 scale columns
+        tiles_per_band = (blocks + 3) // 4
+        local = row % 128
+        return (row // 128) * tiles_per_band * 512 + (block // 4) * 512 + (local % 32) * 16 + (local // 32) * 4 + block % 4
+
+    for rows, blocks in ((1, 320), (4, 320), (129, 320), (300, 8), (2, 4)):
+        index = tile_scale_index(rows, blocks, "cpu")
+        assert index.dtype == torch.int64 and tuple(index.shape) == (rows, blocks)
+        probe = [(0, 0), (rows - 1, blocks - 1), (rows // 2, blocks // 3), (min(33, rows - 1), min(5, blocks - 1)), (rows - 1, 0)]
+        for row, block in probe:
+            assert int(index[row, block]) == byte(row, block, blocks), (rows, blocks, row, block)
+        size = -(-rows // 128) * 128 * blocks
+        assert int(index.max()) < size and len(set(index.flatten().tolist())) == rows * blocks, "inside the buffer, and no byte twice"
+    assert tile_scale_index(4, 320, "cpu") is tile_scale_index(4, 320, "cpu"), "built once per (rows, blocks, device)"
+    assert [byte(row, block, 320) for row, block in ((0, 0), (1, 0), (32, 0), (0, 1), (0, 4), (128, 0))] == [0, 16, 4, 1, 512, 40960]
+    entry = pytest.importorskip("cudnn.norm.frost.kernel.add_norm_quant_decode_config")  # the entry that writes the layout states the same rule
+    cfg = entry.Cfg(HIDDEN=5120, EPS=1e-6, ADD=True, STORE_RESIDUAL=False, BF16_OUT=False, QUANT="nvfp4", PDL=False, PDL_RELEASE=False)
+    stated = [[entry.scale_byte_offset(cfg, row, block) for block in range(320)] for row in (0, 1, 31, 32, 127, 128, 200)]
+    assert tile_scale_index(201, 320, "cpu")[[0, 1, 31, 32, 127, 128, 200]].tolist() == stated
+
+    generator = torch.Generator().manual_seed(3)
+    y = torch.randn((5, 64), generator=generator).to(torch.bfloat16)
+    stored = quantize_nvfp4(y, 0.03125)
+    buffer = torch.full((128, 4), 0xA5, dtype=torch.uint8)  # the pad bytes hold something: a kernel writes the live rows' bytes only
+    buffer.view(-1)[tile_scale_index(5, 4, "cpu")] = stored.block_scales
+    tiled = TiledBlockScaledTensor(stored.codes, buffer, stored.scale)
+    assert tiled.shape == stored.shape == (5, 64)
+    back = tiled.row_major()
+    assert (
+        isinstance(back, BlockScaledTensor)
+        and torch.equal(back.block_scales, stored.block_scales)
+        and back.codes is stored.codes
+        and back.scale == stored.scale
+    )
+    assert not torch.equal(buffer[:5], stored.block_scales), "the layout is not row-major: the gather is what reads it"
+    for a, b in ((tiled.tensors(), stored.tensors()), (tiled.rows(1, 3).tensors(), stored.rows(1, 3).tensors()), (tiled.clone().tensors(), stored.tensors())):
+        assert len(a) == len(b) == 2 and all(torch.equal(x, z) for x, z in zip(a, b))
+    assert torch.equal(dequantize(tiled).data, dequantize(stored).data) and dequantize(tiled).scale == dequantize(stored).scale
+
+    for fmt, quantise in (("nvfp4", quantize_nvfp4), ("fp8", quantize_fp8)):
+        later = Unquantized(y, fmt, 0.03125)
+        want = quantise(y, 0.03125)
+        assert type(later.quantized()) is type(want) and all(torch.equal(x, z) for x, z in zip(later.tensors(), want.tensors())) and later.shape == y.shape
+        assert all(torch.equal(x, z) for x, z in zip(later.rows(2, 4).tensors(), want.rows(2, 4).tensors())), "a row alone is quantised as in the batch"
+        assert later.clone().data is not y and torch.equal(later.clone().data, y)
+        assert torch.equal(dequantize(later).data, dequantize(want).data) and dequantize(later).scale == dequantize(want).scale
+    with pytest.raises(ValueError, match="unknown quantisation format 'int8'"):
+        Unquantized(y, "int8", 1.0).quantized()
+
+    values = torch.tensor([-0.0, 0.0, -0.1, 0.1, -0.25, 0.25, -0.26, -6.5, 1.25, 1.75])
+    assert weights._e2m1(values).tolist() == [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        9,
+        15,
+        2,
+        4,
+    ], "the reference rule: a value that rounds to zero has the code 0; ties to the even code"
+    assert weights._e2m1(values, signed_zero=True).tolist() == [8, 0, 8, 0, 8, 0, 9, 15, 2, 4], "a kernel that carries the sign bit through keeps it on a zero"
+    assert weights._e2m1_values(torch.tensor([8, 0], dtype=torch.uint8)).tolist() == [-0.0, 0.0], "a consumer reads either as zero"
+
+
 def test_a_safetensors_header_is_read_without_its_tensors(tmp_path):
     from model_samples.weights import read_header
 
@@ -510,7 +586,7 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     sample, directory = _sample_on_stated_facts(tmp_path, monkeypatch, free)
     arguments = ["--model", str(directory), "--prompt", "why is the sky blue ?", "--prompt", "why ?", "--sequences", "1,2"]
     code = sample.main(arguments)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert code == 0 and str(tmp_path) not in out, out
     assert out.splitlines()[0].startswith("[00] qwen_dense decode | checkpoint tiny-checkpoint (local): 2 shards, ") and "manifest hash" in out
     skip = (
@@ -520,12 +596,12 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     free[0] = 8 * 1024**3
     with pytest.raises(AssertionError, match="reached a load"):
         sample.main(arguments)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GiB are free" in out and "SKIP" not in out
     assert "stack fe-cublas, 1 sequence, cc 10.0" in out and "[00] tokenizer and chat template of checkpoint tiny-checkpoint" in out
     monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
     code = sample.main(arguments)
-    last = capsys.readouterr().out.splitlines()[-1]
+    last = capsys.readouterr().err.splitlines()[-1]
     assert (
         code == 0
         and last.startswith("[00] SKIP a checkpoint is read through the safetensors package")
@@ -549,7 +625,7 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
 
     def last(arguments):
         code = sample.main(arguments)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert str(tmp_path) not in out and "served by" not in out, out
         return code, out.splitlines()[-1]
 

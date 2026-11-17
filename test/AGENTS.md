@@ -43,6 +43,12 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+For Torch varlen providers, test each op's schema independently: forward and
+backward can select a backend while the out op is still Flash-only. The host
+`test_torch_provider_dispatch.py` matrix checks legacy, mixed and selected
+schemas, including removal. Keep public-selector rejection tests separate
+from direct registered-operator numerics, so upstream architecture/GQA/window
+restrictions do not erase FE forward/backward or synchronization coverage.
 When appending an SDPA adapter constructor argument, update every signature-tail
 pin, including the API-contract, score-stats, SM107 and bias-max suites. Search
 for the previous trailing parameter in `test/python/sdpa/frost`; a new feature's
@@ -103,6 +109,12 @@ body's barrier sites separately, including both ordinary and batch-pair work.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
+When an SDPA harness stores ragged offsets in scaled units, preserve the multiplier
+on backward inputs and gradient outputs too: Q/K/dQ/dK use d_qk, V/O/dO/dV use d_v,
+while Stats keeps its own element units. Check real descriptors before launching
+an old-code negative control; incorrect units can otherwise execute invalid offsets.
+`sdpa/graph/test_ragged_offset_multiplier.py` covers unequal widths, ordinary-offset
+controls, the FP8 execution call site, and declared token-stride gaps.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
 Columnwise F8_128x4 scale atoms span all B*H scale rows along their column
@@ -442,6 +454,7 @@ check that changing either the delta or a shared barrier still fails the test.
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
 - **Check reference GEMM rounding before relaxing a chained-kernel tolerance.** Save the failing inputs and compare the projection in FP64 before its BF16 cast. A small FP32 accumulation error can cross that cast's midpoint, then grow through normalization. The serving pool tests use the existing `acc_dtype=torch.float64` oracle option while retaining all intermediate dtype casts and tolerances; pipeline 74800620 exposed this at token 350, head 0, column 109 on a 212-SM Rubin GPU.
 - **Reference cache (opt-in).** `sdpa/ref_cache.py::cached_reference(name, key, compute)` stores an oracle's outputs on disk, keyed by the reference sources' content (`_REF_SOURCES`, `ref_cache.py` itself included; the list is closed under its own relative / `sdpa.` imports -- `sdpa/test_ref_cache.py::test_the_reference_sources_are_closed_under_their_own_imports` fails when a listed module imports an unlisted one), the WHOLE content of the recipe's files -- the file `compute` is defined in and every file on the call stack at the call that is not the interpreter's own: the recipe module, a shared wrapper that built the oracle closure, the test module (frames of pytest / pluggy / torch / the standard library are skipped, not stopped at); the draw order, the quantization call sites and the oracle wrapper are hashed as files, so an edit anywhere in them is a miss, never a stale hit -- the key names the inputs' recipe literally; a helper the recipe imports and has already returned from when the oracle is called is covered through `_REF_SOURCES` only, so list it there --, the device class (name, compute capability, SM count -- one seed is a different dataset on a different SM count), torch's version and the caller's key -- which names what the files' content does not pin because it arrives as a parameter: shape, seed, scale, mask, dtype; off unless `CUDNN_TEST_REF_CACHE=<node-local dir>` names a directory (never a cross-site network file system). Files are hashed as they are on disk at the call, so an edit made WHILE a cache-enabled run is in progress keys that run's later entries by the new content though the old code computed them: after such an edit run once with VERIFY on, or use a fresh directory. A hit returns a previous run's values bitwise, so tolerances are untouched; the point is `CUDNN_TEST_REF_CACHE_VERIFY=1` (`0` / `false` / `no` / `off` = off), which recomputes on every hit and fails the test if the reference drifted from its own past. Entries are read with torch's weights-only unpickler -- tensors and plain Python containers / scalars, all the cache ever stores -- so a pickle payload or a foreign file at an entry path is refused as a miss, never executed; still, keep the directory writable by the test account / CI job only, since whoever writes it decides what a run compares against. The fp8 d=256 backward suite (`sdpa/frost/test_sdpa_bwd_fp8_sm107.py::_run_fp8`) also memoizes its oracle in-process across the parametrizations of one case (the gradient dtype only casts the fp32 gradients), bounded by bytes; under VERIFY the memo stands aside so every repeat is verified too.
+- **Named-engine rejection has two paths.** If all engines decline, planning raises an aggregate error: assert the target engine's specific decline reason. If another engine supplies plans, a strict selector reports that the named engine has no plan. Test both precise paths instead of inferring backend availability from head size alone; backend version and tensor strides (including Stats layout) also affect eligibility.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
 - Shape-override tests must cover a backend lowering decline as well as a lowered graph. Ragged-offset tensors are backend-only operands and can be absent from the Python-only layout; filter those auxiliary overrides against `_variant_pack_uids()` while requiring every Q/K/V/O, Stats and length operand. `test_thd_cache_shape_grid_tracks_runtime_capacity` exercises both layouts without weakening capture, launch-bound or replay checks.
 - **Plan selection must respect current filters.** When testing build-all after an
@@ -1664,3 +1677,17 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+When a shared SDPA harness offers a declared-total switch, inspect the actual
+backward node before planning as well as checking numerical outputs. Native
+backends may produce identical results without the totals, hiding a dropped
+executor keyword while a FROST THD row needs those values to plan.
+`test_fp8_training_declared_totals` exercises both switch states through the
+real executor and checks its backward metadata before backward planning can
+turn missing coverage into an unsupported skip.
+
+For Torch provider routing checks, record the actual native operator call and
+compare with overrides removed. A selected-backend log on stderr may not
+propagate to pytest's `caplog` under Torch's logging configuration; missing
+captured text does not establish a routing failure. The varlen explicit-KV
+length fallback test checks the cuDNN operator and forwarded length tensor.

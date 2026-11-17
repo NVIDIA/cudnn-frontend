@@ -4,8 +4,9 @@
 """Library kernels as providers of model blocks.
 
 ``cublas.bf16_dequantized`` is a fallback, and the table says so: the multiply of an 8-bit or 4-bit block runs as a bf16
-``torch.matmul`` (cuBLAS) over a bf16 copy of the weight's code values made once at load, on the operand's code values
-dequantised per call; the two scales are applied to the result.  The copies are exact (see ``weights.dequantize``), so the
+``torch.matmul`` (cuBLAS) over a bf16 copy of the weight's code values made once at load (a load keeps it for every block
+of the run's plans that is on this row), on the operand's code values dequantised per call; the two scales are applied to
+the result.  The copies are exact (see ``weights.dequantize``), so the
 result differs from a multiply on the stored formats by its accumulation order and by one extra bf16 rounding of the unscaled
 sum.  It moves 2 bytes per weight element where the stored formats hold 1 or 0.56.
 
@@ -34,12 +35,12 @@ CUBLAS_OVER_COPIES = (Kernel("cublas", "cuBLAS"), Kernel("pytorch", "PyTorch"))
 
 def matmul_bf16(qx, weight: Dequantized) -> torch.Tensor:
     """``[rows, in]`` quantised operand x ``[out, in]`` bf16 code copy -> ``[rows, out]`` bf16, scales applied to the result."""
-    x = dequantize(qx)
+    x, copy = dequantize(qx), weight.bf16()  # the copy the load kept for this block: a load for another plan may hold none
     flags = torch.backends.cuda.matmul
     allowed = flags.allow_bf16_reduced_precision_reduction
     flags.allow_bf16_reduced_precision_reduction = False  # partial sums stay in the fp32 accumulator, whatever kernel cuBLAS picks
     try:
-        y = torch.matmul(x.data, weight.data.T).float()
+        y = torch.matmul(x.data, copy.T).float()
     finally:
         flags.allow_bf16_reduced_precision_reduction = allowed
     if isinstance(weight.scale, torch.Tensor):
@@ -51,7 +52,7 @@ class CublasLinear(BlockBase):
     provider = "cuBLAS"
     kernels = CUBLAS_OVER_COPIES
 
-    def __call__(self, qx, weight):
+    def __call__(self, qx, weight, site=""):  # one multiply at every call site
         return matmul_bf16(qx, weight)
 
 

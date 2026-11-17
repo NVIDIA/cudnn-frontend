@@ -161,6 +161,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
             owned_path = {
                 "sdpa_fwd_sm100_d128_multi_q": "sm100/d128_f16_multi_q/kernel.py",
                 "sdpa_fwd_sm100_d128_single_q": "sm100/d128_f16_single_q/kernel.py",
+                "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",
             }.get(engine_name)
             expected_path = owned_path or (engine_name.rsplit("_", 1)[1] + "/" + body)
             assert mod.__file__.endswith(expected_path)

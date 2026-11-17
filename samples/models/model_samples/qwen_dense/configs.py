@@ -4,11 +4,13 @@
 """The provider table and the regime table of the dense Qwen family, as data.
 
 For every block the rows are ordered; the first row whose GPU classes, sequence range, tokens-per-sequence range and stack
-contain the run serves the block.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
+contain the run serves the block.  A row whose entry serves some layer widths only names them (``widths``): a model of the
+family with another width is not that row's, and the next row is asked.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
 reference chain or a multiply over a dequantised copy; ``band`` is the tie-out band of the row against the reference block
 (``model_samples.tie_out.BANDS``) and is never widened in place.  ``form`` is what the row's adapter passes to its entry: fields
-of the entry's own form, which the kernel check compares with the entry's answer.  A stack adds its rows here; it removes
-none.
+of the entry's own form, which the kernel check compares with the entry's answer.  A row whose entry a step calls in several
+forms names them by call site (``sites``; the call sites of this family's wiring: ``QwenDense.sites``).  A stack adds its
+rows here; it removes none.
 
 The stacks:
 
@@ -38,10 +40,105 @@ TARGET_STACKS = ("native", "fe-entries")
 PROVIDER_STACKS = ("fe-cublas", *TARGET_STACKS)
 EVERY = (*BOTH, *TARGET_STACKS)
 
+#: the forms the target calls the add + RMSNorm + quantise kernel in, by call site of the wiring: the residual mode (the first
+#: call of a step starts the residual stream from its operand, every other call adds to it in place) and the outputs the
+#: next block reads.  A layer's input norm writes the 8-bit operand of the in-projection, and the normed bf16 rows too where
+#: the mixer reads them (the linear-attention step does, the attention layer does not); the norm in front of an MLP writes
+#: 4-bit codes alone; the final norm writes bf16 rows alone, and the output head's 4-bit operand is quantised from them by a
+#: launch of its own.  Six forms; a model of 48 + 16 layers calls five of them, 1 / 47 / 16 / 64 / 1 times a step
+NORM_FORMS = (
+    ("linear_attention.first", (("ADD", False), ("STORE_RESIDUAL", True), ("BF16_OUT", True), ("QUANT", "e4m3_static"))),
+    ("full_attention.first", (("ADD", False), ("STORE_RESIDUAL", True), ("BF16_OUT", False), ("QUANT", "e4m3_static"))),
+    ("linear_attention", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", True), ("QUANT", "e4m3_static"))),
+    ("full_attention", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", False), ("QUANT", "e4m3_static"))),
+    ("mlp", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", False), ("QUANT", "nvfp4"))),
+    ("output_head", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", True), ("QUANT", None))),
+)
+
+#: the in-projection of a layer, by call site of the wiring: the shape of its merged weight (out features x in features) --
+#: ``qkv`` and ``z`` of a linear-attention layer; the query with its gate half, the key and the value projection of an
+#: attention layer.  The FP8 projection entry is one weight shape per instance, so a row of it names both; the form of
+#: the kernel is the row's and the same at both sites.  A model of 48 + 16 layers calls them 48 and 16 times a step
+PROJECTION_SITES = (
+    ("linear_attention.qkvz", (("OUT_FEATURES", 16384), ("IN_FEATURES", 5120))),
+    ("full_attention.qkv", (("OUT_FEATURES", 14336), ("IN_FEATURES", 5120))),
+)
+
+#: the fused gate / up kernel of the MLP by row count: the target runs the narrowest of its four token tiles that holds the
+#: rows of a step, so the token tile is a field of the form and the block has one row per tile: (first row count, last
+#: row count, token tile).  A launch record does not show the tile -- the grid and the block are the same at all four,
+#: the shared memory at three -- so it is held on the objects and in the kernel's symbol
+GATE_UP_TILES = ((1, 8, 8), (9, 16, 16), (17, 32, 32), (33, 64, 64))
+
 PROVIDERS = {
     "embedding": [ProviderRow(*ANY, "torch.index_select", EVERY, serves="any")],
-    "add_norm_quantize": [ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain")],
+    "add_norm_quantize": [
+        ProviderRow(
+            ("cc10.x",),
+            (1, 1024),
+            (1, None),
+            "fe.add_norm_quant_decode",
+            TARGET_STACKS,
+            serves="rows 1-1,024, hidden 5120",
+            band="add_norm_quant",
+            batch_invariant=("cc10.0",),
+            # the target's launch form at every call site: the kernel waits for its predecessor after it has loaded the norm
+            # weight and the scale and before it reads the rows, and releases its successor directly behind that wait.  The
+            # launch after a layer's input norm is the in-projection's: where that row is the FP8 projection entry it carries
+            # the dependent-launch attribute, starts on this release and waits for this kernel before it reads the 8-bit
+            # operand; every other launch after a norm in this stack carries none, and the release changes nothing there.
+            # The launch before it must not write the norm weight or the scale, which are constants of the layer
+            form=(("PDL", True), ("PDL_RELEASE", True)),
+            rows=(1, 1024),
+            sites=NORM_FORMS,
+            # the row width the entry serves (its page: 5120, the published model's).  A checkpoint of the family with another
+            # hidden width keeps the block on the reference chain below, and its run states no kernel identity
+            widths=(("hidden", 5120),),
+        ),
+        ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain"),
+    ],
     "projection.fp8.in": [
+        ProviderRow(
+            ("cc10.0",),  # the class on which the target launches this kernel for the in-projections; elsewhere it runs a library multiply
+            (1, 32),
+            (1, None),
+            "fe.fp8_projection_decode",
+            TARGET_STACKS,
+            serves="rows 1-32, weights 16384 x 5120 and 14336 x 5120",
+            band="bf16_rounding",
+            batch_invariant=("cc10.0",),
+            # the target's kernel, stated whole and never left to the entry's pick: one K slice per weight tile of 128 rows, a
+            # ring of 8 stages, the weight stream issued ahead of the wait; launched as a dependent of its predecessor (it
+            # waits for the norm's kernel right before it reads the 8-bit operand) and releasing its successor after its last
+            # weight issue.  The two fields the entry owns are at the values its byte comparison with the target's kernel
+            # ran: 32 tensor-memory columns, released after the values read from them are consumed.  The launch before it
+            # must not write the weight or the scale: both are constants of the layer.  The launch after it reads its rows:
+            # the fused linear-attention step of this stack carries the attribute and waits first (its row says so), and
+            # the chain behind it in an attention layer carries none
+            form=(
+                ("SPLIT_K", 1),
+                ("MMA_M", 128),
+                ("STAGES", 8),
+                ("TMEM_COLS", 32),
+                ("PREWAIT_WEIGHTS", True),
+                ("HOLD_TMEM", True),
+                ("PDL", True),
+                ("PDL_RELEASE", True),
+            ),
+            rows=(1, 32),
+            sites=PROJECTION_SITES,
+            # the layer widths the two weight shapes follow from (the published model's).  A checkpoint of the family with
+            # another width keeps the block on the multiply over a copy below, and its run states no kernel identity
+            widths=(
+                ("hidden", 5120),
+                ("la_key_heads", 16),
+                ("la_value_heads", 48),
+                ("la_head_dim", 128),
+                ("attn_heads", 24),
+                ("attn_kv_heads", 4),
+                ("attn_head_dim", 256),
+            ),
+        ),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 8-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
@@ -82,6 +179,33 @@ PROVIDERS = {
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
     "mlp.gate_up": [
+        *(
+            ProviderRow(
+                ("cc10.x",),
+                (1, last),
+                (1, None),
+                "fe.swiglu_fp4_decode",
+                TARGET_STACKS,
+                serves=f"rows {first}-{last} of 1-64, hidden 5120, intermediate 17408",
+                band="swiglu_fp4",
+                batch_invariant=("cc10.0",),
+                # the target's kernel, stated whole and never left to the entry's default: the token tile of the row count, two
+                # weight stages issued ahead of the wait, the weight stream loaded with the evict-first L2 policy, at most 148
+                # thread blocks, launched as a dependent of its predecessor.  It waits for that launch -- the norm in front of
+                # the MLP, which releases at its own wait -- before it reads the 4-bit operand, its block scales and the two
+                # scalars; only weight tiles are read ahead of the wait.  The launch before it must not write the weight or
+                # its block scales: both are constants of the layer.  It signals the launch after it before its last output
+                # tile is written: a launch behind it that carries the attribute must wait before it reads the codes; the
+                # multiply over a copy behind it in this stack carries none and starts when this kernel has completed
+                form=(("TOKEN_TILE", tile), ("PREWAIT_STAGES", 2), ("L2_EVICT_FIRST", True), ("MAX_CLUSTERS", 148), ("PDL", True)),
+                rows=(first, last),
+                # the widths the entry serves (its page: hidden 5120, intermediate 17408, the published model's).  A checkpoint of
+                # the family with another width keeps the block on the multiply over a copy below, and its run states no
+                # kernel identity
+                widths=(("hidden", 5120), ("mlp", 17408)),
+            )
+            for first, last, tile in GATE_UP_TILES
+        ),
         ProviderRow(
             *ANY,
             "cublas.bf16_dequantized+torch_ref.silu_mul_quantize",
@@ -184,8 +308,23 @@ def readme_table(calls: dict, stack: str = "fe-cublas", cc=(10, 0)) -> str:
     lines = ["| block | calls per step (64 layers) | provider key | entry [form] |", "|---|---|---|---|"]
     for block, rows in PROVIDERS.items():
         row = next(r for r in rows if stack in r.stacks and r.serves_class(cc))
-        entry = ENTRY_NAMES[row.key] + form_text(row.form) + (f", fallback: {row.fallback}" if row.fallback else "")
+        forms = f" + one of {len(row.sites)} forms, by call site" if row.sites else ""
+        entry = ENTRY_NAMES[row.key] + form_text(row.form) + forms + (f", fallback: {row.fallback}" if row.fallback else "")
         lines.append(f"| {BLOCK_TITLES[block]} | {calls[block]} | `{row.key}` | {entry} |")
+    return "\n".join(lines)
+
+
+def readme_sites(model, stack: str = "native", cc=(10, 0)) -> str:
+    """The call-site table of the family README (markdown): for every row of ``stack`` on ``cc`` that names call sites, the
+    form of each site and how many calls of a step of ``model`` are made there."""
+    from collections import Counter
+
+    calls = Counter(zip((block for block, _ in model.wiring()), model.sites()))
+    lines = ["| block | call site | calls per step (64 layers) | form of the entry there |", "|---|---|---|---|"]
+    for block, rows in PROVIDERS.items():
+        row = next(r for r in rows if stack in r.stacks and r.serves_class(cc))
+        for site, fields in row.sites:
+            lines.append(f"| {BLOCK_TITLES[block]} | `{site}` | {calls[(block, site)]} | {form_text(fields).strip()} |")
     return "\n".join(lines)
 
 

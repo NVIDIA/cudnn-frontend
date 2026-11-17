@@ -305,8 +305,9 @@ python/cudnn/
                                 the launch shape (kernel_symbols_for /
                                 form_for / launch_shape_for on the entry)
     tile_dsl/                   shared CuTe-DSL primitives (barriers, TMA,
-                                MMA, softmax pieces, masks). Import by dotted
-                                path: cudnn.frost.tile_dsl.<module>
+                                MMA, softmax pieces, masks, row reductions).
+                                Import by dotted path:
+                                cudnn.frost.tile_dsl.<module>
 
   sdpa/                         ALL sdpa engines, every arch / pass / phase
     graph_analyzer.py           facts extraction: graph.nodes -> SdpaGraphFacts,
@@ -1064,6 +1065,110 @@ Contract:
   the rendering's PTX, by reading its disassembly (no load of the stage first
   read behind the arrive), and with `warm_stress.assert_warm_stress` on a
   shape that refills the stage (`test/AGENTS.md`).
+
+
+## Reducing a row over one thread block: `tile_dsl.rowwise`
+
+A row kernel launches one thread block per row -- a normalization, a per-row
+quantization, a row argmax. Every thread reduces its own elements in
+registers; `block_reduce` turns the one value per thread into one result in
+every thread of the block: warp shuffles, one shared-memory word per warp, one
+thread-block barrier, a second warp level.
+
+```python
+from cudnn.frost.tile_dsl.rowwise import WARP, block_reduce, slot_words
+
+@cute.kernel
+def kernel(cfg: cutlass.Constexpr, x: cute.Tensor, ...):
+    tid, _, _ = cute.arch.thread_idx()
+    lane = tid % WARP                                  # the kernel's own two statements
+    warp = tid // WARP
+    alloc = cutlass.memory.SmemAllocator()             # ONE allocator; one slot array per reduction
+    sum_slots = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(slot_words("sum", cfg.WARPS)), byte_alignment=16)
+    max_slots = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(slot_words("max", cfg.WARPS)), byte_alignment=16)
+    ...
+    total = block_reduce(partial_sum, lane, warp, sum_slots, cfg.WARPS, kind="sum", order="ascending")
+    amax = block_reduce(largest_magnitude, lane, warp, max_slots, cfg.WARPS, kind="max", order=None)
+```
+
+| `kind` | Value per thread | `order` | Result in every thread | Slot words |
+|---|---|---|---|---|
+| `"sum"` | the thread's partial sum | required, one of `SUM_ORDERS` | the row total | `warps` |
+| `"max"` | the thread's maximum (usually of magnitudes) | `None` | the row maximum | `warps` |
+| `"max_index"` | `(best value, its index)`, with `index_limit=` | `None` | the maximum and the lowest index that holds it | `2 * warps` |
+
+Contract:
+
+- **The order of a sum is part of the bytes.** fp32 addition is not
+  associative: the same partial sums paired in another order give a total that
+  differs in the last bit on some rows. `order` has no default.
+  `"ascending"` pairs the lanes of a warp with the shuffle offsets 1, 2, 4, 8,
+  16, and the warp sums the same way with `+0` in the lanes past the warp
+  count; it is defined for every warp count.
+- **`"descending"`** pairs the lanes with the offsets 16, 8, 4, 2, 1; behind
+  the barrier every lane loads the sum of warp `lane mod warps` and adds over
+  the offsets `warps / 2 .. 1` (`5 + log2(warps)` shuffles, no zero is
+  added). It serves a kernel whose bytes follow a reference that reduces in
+  that order, and exists for a power-of-two warp count only: any other count
+  is refused at trace time.
+- **An entry names its order.** A kernel that documents a byte contract states
+  the order in its module text and at the call; moving a landed kernel to the
+  other order is a numerical change with new goldens, never a refactor.
+- **`lane` and `warp` are the caller's.** The kernel computes
+  `thread index % 32` and `thread index // 32` itself and passes them in.
+  Where those two values are computed is part of the caller's rendering: a
+  helper that computed them would emit its lane mask where it is traced, which
+  can be behind a dependent-launch wait the kernel placed in front of the
+  reduction. Measured on the add + RMSNorm + quantize decode kernel
+  (`norm/frost/kernel/add_norm_quant_decode_f16.py`), which takes its row
+  total from `block_reduce(..., kind="sum", order="ascending")`: with its own
+  two statements every form renders the cubin it rendered with the reduction
+  spelled inline (`sm_100a`, `sm_103a`, `sm_107a`, `sm_120a`); with them at
+  the call site 16 of its 45 `sm_100a` forms render another image, with the
+  same output bytes.
+- **Every thread, full warps, no warp-role branch.** A call emits one aligned
+  thread-block barrier that all `32 * warps` threads issue once, and
+  full-mask shuffles. The call sits under compile-time control flow only.
+- **One slot array per call**, from the kernel's one allocator, at least
+  `slot_words(kind, warps)` fp32 words. It is written once (lane 0 of each
+  warp, before the barrier) and read once (behind it), so nothing releases it
+  and `tile_dsl.consume` has no site. A second reduction on the same array
+  would be a refill behind a barrier: give it its own array. A slot tensor of
+  another type, or statically too small, is refused at trace time.
+- **Maxima.** The fp32 warp maximum is one `redux.sync.max.f32` where the
+  compile target is known to assemble it (compute capability 10.x) and five
+  butterfly steps of `max.f32` on every other target; the two arms are
+  bitwise equal on inputs without a NaN, up to the sign of a zero maximum
+  that zeros of both signs hold. A NaN value is outside the contract. The
+  lanes past the warp count hold `-inf`, the identity of a maximum, so a
+  maximum of signed values is exact at every warp count.
+  `"max_index"` returns the lowest index among the positions that hold the
+  maximum; `index_limit` is a Python int above every index.
+- **Refusals are trace-time `ValueError`s** raised in plain Python before any
+  operation is emitted: an unknown kind or order, an order given to a
+  maximum, a warp count outside 1 .. 32, a missing `index_limit`.
+- **Check a new call site** by its rendering (the shuffle offsets in program
+  order, one barrier, one slot store and load per reduction:
+  `test_rendering_of_every_primitive` in
+  `test/python/sdpa/frost/test_tile_dsl_rowwise.py` is the pattern) and by a
+  bitwise reference of the tree it asked for
+  (`test_block_sum_is_the_documented_tree`: three row classes that tell the
+  two levels of the tree apart). A kernel that adopts the primitive without a
+  numerical change renders every form for every target before and after, with
+  one explicit `PYTHONHASHSEED`, and compares the cubin md5.
+
+The module also holds the row helpers of an eight-element-per-thread kernel,
+each a composition of `tile_dsl.pointwise` and `tile_dsl.tma` helpers with the
+element-to-byte order stated once: `row_load8(addr, dtype=)` (one 128-bit load
+of eight 16-bit values, widened exactly; element `j` is the value at
+`addr + 2 j` bytes; `dtype` is required, `BFloat16` or `Float16`: it decides
+the decoded values), `row_store8_bf16(addr, values)` (nearest-even, one 128-bit
+store), `row_store8_e4m3(addr, values, inv, clamp=)` (the E4M3 codes of
+`values[j] * inv`, the code of `values[j]` in the byte at `addr + j`; `clamp`
+adds one `min.xorsign.abs.f32` against 448 per element and changes no code)
+and `fp8_dynamic_row_scale(amax)` (`scale = max(div.rn(amax, 448),
+fp32(1 / (448 * 512)))` and `inv = div.rn(1, scale)`: the per-row FP8 scale
+and its reciprocal, two IEEE divisions).
 
 
 ## Adding coverage, cheapest first
