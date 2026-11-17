@@ -261,17 +261,17 @@ def test_sm120_paged_d512_decode_follows_the_group(b, d_qk):
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [32768, 32769], ids=["on_tile", "off_tile"])
 def test_sm120_paged_d128_mtp_follows_the_group(s_kv):
-    """Study sm120_paged_d128_mtp_v6_20261117 (llama paged MTP, page 16): FROST's time is flat in the GQA group and the backend's
-    grows with it, so from group 6 FROST leads at any batch; a smaller group leads up to 2^5.5 KV units and trails above; f16 and
-    another part keep the hand rules."""
+    """Studies sm120_paged_d128_mtp_v6 / _v7_20261117 (llama paged MTP, page 16): FROST's time is flat in the GQA group and the
+    backend's grows with it, so from group 4 FROST leads at any batch; groups 2 / 3 lead up to 2^5.5 KV units and trail above; f16
+    and another part keep the hand rules."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
     mtp = dict(h_kv=8, s_q=2, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(12, 0), device_sm_count=188)
     mtp.update(has_paged_kv=True, page_size=16, padded=True)
-    for b, h_q in ((1, 64), (128, 64), (128, 48), (4, 32), (4, 16)):  # groups 8 / 8 / 6 at any batch; 32 units at groups 4 / 2
+    for b, h_q in ((1, 64), (128, 64), (128, 40), (128, 32), (4, 16)):  # groups 8 / 8 / 5 / 4 at any batch; 32 units at group 2
         assert placement.place(spec, _facts(b=b, h_q=h_q, **mtp)) == placement.LEAD, (b, h_q)
-    for b, h_q in ((128, 40), (128, 32), (16, 16)):  # groups 5 / 4 / 2 past 2^5.5 units
+    for b, h_q in ((128, 24), (16, 16)):  # groups 3 / 2 past 2^5.5 units
         assert placement.place(spec, _facts(b=b, h_q=h_q, **mtp)) == placement.TRAIL, (b, h_q)
     assert placement.place(spec, _facts(b=128, h_q=64, **dict(mtp, h_kv=4, s_q=4))) == placement.LEAD  # group 16, FROST's prefill body
     assert placement.place(spec, _facts(b=128, h_q=32, dtype=cudnn.data_type.HALF, **mtp)) == placement.LEAD  # f16: no class, hand rule

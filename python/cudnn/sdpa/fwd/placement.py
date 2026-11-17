@@ -124,11 +124,12 @@ head dims the decode tile can take (d <= 256): wide paged MLA (d512 / D576xV512)
 0.04-0.40 of the backend over 108 nightly cells (deepseek_v4, kimi_k3, s_q 2-4, groups 8-128, run 534 and run 540).
 bf16 paged d128 MTP (``2 <= s_q <= 4`` under the bottom-right diagonal, packed GQA, no sink) is placed by the GQA group, ahead
 of that guard: FROST's time is flat in the group while the backend's grows with it (b 64, KV 8k, 8 KV heads: FROST 2.26-2.33 ms
-at groups 4-8, the backend 1.69 ms at group 4 and 3.17 ms at group 8). From group 6 FROST leads at any size; a smaller group
-leads up to 2^5.5 tiles and trails above, where groups 2-5 lose 1.09-1.54. Study sm120_paged_d128_mtp_v6_20261117 (RTX PRO
-6000 Server, cuDNN 9.24.0.43; groups 2-16, 707 train cells, a 72-cell holdout of groups 5-16 scored once: 49 changed at
-0.42 / 0.44 geomean on / off the 128-key tile, worst 1.06). Group 16 at s_q 4 runs FROST's prefill body there, at 0.35 of the
-backend.
+at groups 4-8, the backend 1.69 ms at group 4 and 3.17 ms at group 8). From group 4 FROST leads at any size; groups 2 / 3 lead
+up to 2^5.5 tiles and trail above (up to 1.13-1.14 there). Study sm120_paged_d128_mtp_v6_20261117 (RTX PRO 6000 Server, cuDNN
+9.24.0.43; groups 2-16, 707 train cells, a 72-cell holdout of groups 5-16 scored once: 49 changed at 0.42 / 0.44 geomean on /
+off the 128-key tile, worst 1.06) set group 6 under the old paged split; once split 1 priced its own rate (groups 4 / 5 had lost
+1.06-1.52 unsplit), v7 re-timed groups 2-5 above 2^5.5 tiles and lowered it to 4 (178 train cells, a 64-cell holdout of new
+head pairs: 32 changed at 0.78 / 0.82, worst 1.03). Group 16 at s_q 4 runs FROST's prefill body there, at 0.35 of the backend.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -580,7 +581,7 @@ SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1
 SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a wider group leads when it is a power of two (fills the packed tile), else trails
 SM120_PAGED_SQ1_D512_MIN_GROUP = 40  # s_q == 1, paged d512: <= 32 heads lose 1.06-1.75 at any batch (sm120_paged_d512_q1_v2_20261117)
-SM120_PAGED_MTP_D128_MIN_GROUP = 6  # bf16 paged d128 MTP: from this group FROST leads at any size (sm120_paged_d128_mtp_v6_20261117) ...
+SM120_PAGED_MTP_D128_MIN_GROUP = 4  # bf16 paged d128 MTP: from this group FROST leads at any size (sm120_paged_d128_mtp_v7_20261117) ...
 SM120_PAGED_MTP_D128_MAX_LOG2_TILES = 5.5  # ... and a smaller group up to 2^5.5 tiles (b * h_kv), as the retired table entries did
 _SM120_PAGED_MTP_D128_CLASS = ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa")
 
@@ -1344,7 +1345,7 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
     key = placement_table.class_key("sdpa_fwd_prefill_sm120", facts)
     if key is not None and key[:-1] == _SM120_PAGED_MTP_D128_CLASS:
         # The group decides (the class key cannot carry it). Ahead of the prefill-body guard: group 16 at s_q 4 runs that body
-        # at 0.35 of the backend. Holdout: 49 changed at 0.42-0.44, worst 1.06.
+        # at 0.35 of the backend. Holdouts: groups 5-16, 49 changed at 0.42-0.44, worst 1.06; groups 4-5, 32 at 0.78-0.82, worst 1.03.
         group = facts.h_q // facts.h_kv
         lead = group >= SM120_PAGED_MTP_D128_MIN_GROUP or placement_table.log2_tiles(facts) <= SM120_PAGED_MTP_D128_MAX_LOG2_TILES
         return LEAD if lead else TRAIL
