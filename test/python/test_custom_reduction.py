@@ -1681,6 +1681,8 @@ def test_reduction_modifiers_forward_the_backend_decision_on_other_stream_types(
     # The frontend builds the body for any stream type, and the backend decides: the build either runs and gives the
     # torch index, or forwards the backend's not-supported status.
     for value_dtype, index_type, index_dtype in (
+        # This row probes an INT64 gen_index as well as an INT64 reduction stream, so a backend that declines either
+        # one gives NOT_SUPPORTED.
         (torch.float32, cudnn.data_type.INT64, torch.int64),
         (torch.float64, cudnn.data_type.INT32, torch.int32),
     ):

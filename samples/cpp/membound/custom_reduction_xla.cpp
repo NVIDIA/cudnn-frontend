@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -300,9 +301,6 @@ run_argmax(cudnnHandle_t handle,
 
     size_t const value_bytes = value_type == fe::DataType_t::BFLOAT16 ? sizeof(nv_bfloat16) : sizeof(float);
     Device_buffer d_value(static_cast<size_t>(layout.elements()) * value_bytes);
-    Device_buffer d_index(index_source == Index_source::Caller_tensor
-                              ? static_cast<size_t>(layout.elements()) * sizeof(int32_t)
-                              : size_t{0});
     Device_buffer d_out(static_cast<size_t>(layout.rows()) * sizeof(int32_t));
     if (value_type == fe::DataType_t::BFLOAT16) {
         std::vector<nv_bfloat16> staged(values.size());
@@ -320,9 +318,12 @@ run_argmax(cudnnHandle_t handle,
     Device_buffer workspace(static_cast<size_t>(workspace_size));
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> pack = {{X_value, d_value.get()},
                                                                                      {outputs.at(1), d_out.get()}};
+    std::optional<Device_buffer> d_index;
     if (index_source == Index_source::Caller_tensor) {
-        CUDA_CHECK(cudaMemcpy(d_index.get(), indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        pack[X_index] = d_index.get();
+        d_index.emplace(static_cast<size_t>(layout.elements()) * sizeof(int32_t));
+        CUDA_CHECK(
+            cudaMemcpy(d_index->get(), indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        pack[X_index] = d_index->get();
     }
     auto exec = graph.execute(handle, pack, workspace.get());
     if (!exec.is_good()) {

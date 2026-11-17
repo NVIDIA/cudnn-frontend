@@ -14,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -139,8 +140,22 @@ run_argmax(std::vector<int64_t> const& dims, fe::DataType_t type, bool partial_i
     fe::graph::Graph graph;
     graph.set_intermediate_data_type(type);
     auto x = graph.tensor(fe::graph::Tensor_attributes().set_dim(dims).set_stride(strides(dims)).set_data_type(type));
-    auto indices = graph.tensor(
-        fe::graph::Tensor_attributes().set_dim(dims).set_stride(strides(dims)).set_data_type(fe::DataType_t::INT32));
+    // The vocabulary HLO reduces against an iota, so the graph makes it with GEN_INDEX and no index tensor is bound.
+    // The split second stage reads global partial indices, which are not an iota, so the caller supplies them.
+    Tensor indices;
+    if (partial_indices) {
+        indices = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_dim(dims)
+                                   .set_stride(strides(dims))
+                                   .set_data_type(fe::DataType_t::INT32));
+    } else {
+        indices = graph.pointwise(x,
+                                  fe::graph::Pointwise_attributes()
+                                      .set_mode(fe::PointwiseMode_t::GEN_INDEX)
+                                      .set_axis(static_cast<int64_t>(dims.size() - 1))
+                                      .set_compute_data_type(fe::DataType_t::INT32));
+        indices->set_data_type(fe::DataType_t::INT32);
+    }
     auto identity = type == fe::DataType_t::BFLOAT16 ? Identity(__float2bfloat16(-INFINITY)) : Identity(-INFINITY);
     auto outputs  = graph.custom_reduction({x, indices},
                                           Attributes()
@@ -152,13 +167,17 @@ run_argmax(std::vector<int64_t> const& dims, fe::DataType_t type, bool partial_i
     REQUIRE(outputs[0]->get_is_virtual());
     REQUIRE(outputs[1]->get_dim() == std::vector<int64_t>(dims.size(), 1));
     size_t value_size = type == fe::DataType_t::BFLOAT16 ? sizeof(nv_bfloat16) : sizeof(float);
-    Buffer device_x(static_cast<size_t>(n) * value_size), device_indices(static_cast<size_t>(n) * sizeof(int32_t));
+    Buffer device_x(static_cast<size_t>(n) * value_size);
     Buffer device_output(sizeof(int32_t));
     int64_t workspace_size = 0;
     REQUIRE(graph.get_workspace_size(workspace_size).is_good());
     Buffer workspace(static_cast<size_t>(workspace_size));
-    std::unordered_map<Tensor, void*> pointers{
-        {x, device_x.value}, {indices, device_indices.value}, {outputs[1], device_output.value}};
+    std::unordered_map<Tensor, void*> pointers{{x, device_x.value}, {outputs[1], device_output.value}};
+    std::optional<Buffer> device_indices;
+    if (partial_indices) {
+        device_indices.emplace(static_cast<size_t>(n) * sizeof(int32_t));
+        pointers[indices] = device_indices->value;
+    }
     for (int pattern = 0; pattern < 5; ++pattern) {
         {
             INFO("pattern " << pattern);
@@ -190,10 +209,12 @@ run_argmax(std::vector<int64_t> const& dims, fe::DataType_t type, bool partial_i
                 REQUIRE(cudaMemcpy(device_x.value, values.data(), values.size() * value_size, cudaMemcpyHostToDevice) ==
                         cudaSuccess);
             }
-            REQUIRE(cudaMemcpy(device_indices.value,
-                               index_values.data(),
-                               index_values.size() * sizeof(int32_t),
-                               cudaMemcpyHostToDevice) == cudaSuccess);
+            if (device_indices) {
+                REQUIRE(cudaMemcpy(device_indices->value,
+                                   index_values.data(),
+                                   index_values.size() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice) == cudaSuccess);
+            }
             REQUIRE(cudaMemset(device_output.value, 0xA5, sizeof(int32_t)) == cudaSuccess);
             auto status = graph.execute(handle.value, pointers, workspace.value);
             INFO(status.get_message());
