@@ -3251,7 +3251,7 @@ def test_moe_block_scale_quant_scale_output_must_be_a_packed_blob_sm120(axis, re
 def test_e2e_auto_config_sm120() -> None:
     """The engine's auto path on an SM 12.x part: preferred_pipeline lands on the
     sm120 MoE block-scale template and select_config hands it a legal geometry."""
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
 
     dev = "cuda"
     torch.manual_seed(0)

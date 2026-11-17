@@ -1057,6 +1057,7 @@ def _kernel(
         sched_full_phase = cutlass.Int32(0)
 
         # AVG uses routed rows in use; clamp empty routing to a finite divisor.
+        # Referenced by the generated AVG epilogue injected below.
         moe_used_rows = group_used_rows(M, num_groups, first_token_arr, group_rows_per_group)
 
         # @@EPILOGUE_SETUP:BEGIN@@

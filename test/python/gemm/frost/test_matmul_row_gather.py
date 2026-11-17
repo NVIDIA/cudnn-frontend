@@ -1400,7 +1400,7 @@ def test_frost_materialized_gather_input_views_native_capture(mode, transpose_in
 @pytest.mark.parametrize("port", ["source", "indices", "output"])
 def test_frost_materialized_gather_alignment_rejects_before_enqueue(port, monkeypatch):
     from cudnn.frost import buffers
-    from cudnn.gemm.frost import compiler
+    from cudnn.gemm.frost import source_loader
     from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
 
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -1410,7 +1410,8 @@ def test_frost_materialized_gather_alignment_rejects_before_enqueue(port, monkey
     for node in graph.nodes:
         node.infer_properties(graph.context)
     calls = []
-    monkeypatch.setattr(compiler, "_import_kernel", lambda _: SimpleNamespace(compile=lambda: lambda *args: calls.append("enqueue")))
+
+    monkeypatch.setattr(source_loader, "_import_kernel", lambda _: SimpleNamespace(compile=lambda: lambda *args: calls.append("enqueue")))
     plan = MaterializedGatherPlan(available_routes(graph)[0])
     pack = {}
     for tensor, name, dt, address in (
@@ -1443,6 +1444,7 @@ def test_frost_fused_gather_preserves_shared_call_convention():
             calls.append((pack, workspace, stream))
 
     backend = SimpleNamespace(
+        _check_block_scale_sign=lambda state: None,
         probe_cutedsl=lambda: None,
         plan_config=lambda *args, **kwargs: object(),
         probe_chain=lambda *args: None,

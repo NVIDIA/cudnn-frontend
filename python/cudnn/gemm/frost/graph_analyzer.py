@@ -602,41 +602,15 @@ def _graph_has_gemm(graph: cudnn.pygraph) -> bool:
     return False
 
 
-def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
-    """Cheap eligibility check for the GEMM engine (analyze + support gates, NO
-    ``cute.compile``). Never raises (a probe must not break the native path)."""
-    if not _graph_has_gemm(graph):
-        return False
-    from .compiler import probe_supported
-
-    try:
-        probe_supported(graph)
-    except (NotImplementedError, ValueError):
-        return False
-    except Exception:  # noqa: BLE001
-        _LOG.debug(
-            "cudnn.gemm.frost: probe_supported raised unexpectedly; ineligible",
-            exc_info=True,
-        )
-        return False
-    return True
+def _graph_dynamic_shapes(graph) -> bool:
+    """Whether the frontend graph declared its shapes dynamic."""
+    return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
-    """Analyze + JIT the graph into a compiled GEMM plan."""
-    if any(node.node_type.name == "GATHER" for node in graph.nodes):
-        from .gather_execution import build_execution_plan
-
-        return build_execution_plan(graph, knobs=knobs)
-    if not _graph_has_gemm(graph):
-        raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed, jit_from_cudnn_graph, plan_config, probe_chain
-
-    chain = analyze(graph)
-    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs, shapes_fixed=_graph_shapes_fixed(graph))
-    if knobs is not None:
-        probe_chain(chain, config)
-    return jit_from_cudnn_graph(graph, config=config)
+def _graph_shapes_fixed(graph) -> bool:
+    """Whether planning may specialize to the declared graph geometry."""
+    options = getattr(graph, "_cpp_graph_kwargs", {})
+    return not any(options.get(key, False) for key in ("is_dynamic_shape_enabled", "is_override_shape_enabled"))
 
 
 # Analyzer
@@ -1423,7 +1397,7 @@ def _build_multi_moe_chain(
 
         for cap in a_caps.values():
             if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None:
-                from .kernel_registry import linear_token_sf_reject
+                from .operand_contracts import linear_token_sf_reject
 
                 sf = meta[cap["sf_id"]]
                 data = meta[cap["data_id"]]
@@ -1701,7 +1675,7 @@ def _legacy_operand_aux_inputs(ops, meta, aux_steps, io_dtype, intermediate_dtyp
     """
     if not aux_steps:
         return set()
-    from .kernel_registry import per_k_scale_reject
+    from .operand_contracts import per_k_scale_reject
 
     producers = {op.output: op for op in ops}
     mm = next(op for op in ops if op.cudnn_name == "matmul")

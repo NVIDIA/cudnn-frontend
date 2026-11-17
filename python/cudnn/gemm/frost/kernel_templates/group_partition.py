@@ -15,7 +15,6 @@ def group_row_bounds(group, capacity, offsets, rows_per_group: cutlass.Constexpr
     are untrusted: malformed ranges become empty or truncated, never OOB.
     """
     begin = cutlass.Int64(0)
-    end = cutlass.Int64(0)
     if cutlass.const_expr(rows_per_group > 0):
         begin = cutlass.Int64(group) * rows_per_group
         end = begin + rows_per_group

@@ -80,6 +80,8 @@ from ..recipe import (
     moe_weight_sf_reject,
 )
 from ..graph_analyzer import (
+    _graph_dynamic_shapes,
+    _graph_shapes_fixed,
     GemmBinding,
     analyze_with_binding,
     resolve_variant_pack,
@@ -2761,17 +2763,6 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
 
 
 _TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
-
-
-def _graph_dynamic_shapes(graph) -> bool:
-    """Whether the frontend graph declared its shapes dynamic."""
-    return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
-
-
-def _graph_shapes_fixed(graph) -> bool:
-    """Whether planning may specialize geometry to the declared token count."""
-    options = getattr(graph, "_cpp_graph_kwargs", {})
-    return not any(options.get(key, False) for key in ("is_dynamic_shape_enabled", "is_override_shape_enabled"))
 
 
 def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:

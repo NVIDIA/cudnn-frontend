@@ -717,7 +717,7 @@ def test_small_m_block_scale_public_plan_and_replay(combo, m, shape_flag, width)
     """Replay a narrow-token public plan numerically and through CUDA Graph capture."""
     from gemm_test_utils import skip_unless_pipeline_active
     from cudnn.engines import is_python_engine
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
     from cudnn.gemm.frost.heuristics import analyze_facts
     from cudnn.gemm.frost.knobs import GemmKnobs
 
@@ -798,7 +798,7 @@ def test_small_m_override_plan_reuses_changed_tokens(monkeypatch):
     """Reuse an override plan without recompiling and reject incompatible chunks before writes."""
     import cutlass.cute as cute
     from cudnn.frost.workspace import Workspace
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
     from cudnn.gemm.frost.knobs import GemmKnobs
 
     g = _build_nvfp4_graph(8, 512, 4096)
@@ -1024,7 +1024,7 @@ def test_narrow_n_multi_gemm_fusion(width):
 @pytest.mark.parametrize("shape_flag", ["is_override_shape_enabled", "is_dynamic_shape_enabled"])
 def test_narrow_n_replay_changed_extents_and_capture(shape_flag, monkeypatch):
     """Rebind N extents and replay changed scales through the same compiled plan."""
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
     from cudnn.gemm.frost.knobs import GemmKnobs
 
     # Exercise runtime widths 1, 2 and 3, including the last partial super-block.

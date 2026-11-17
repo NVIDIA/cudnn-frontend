@@ -1396,7 +1396,7 @@ def test_select_config_lifts_the_n_tile_for_n_major_b() -> None:
 def test_moe_grouped_matmul_fwd_auto_config_n_major_small_n() -> None:
     """The auto path on the N tile the K-major heuristic would have picked too
     small (32) — it must lift to a legal geometry, not fail to build."""
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
 
     E, N, K = 4, 32, 128
     group_sizes = [64, 64, 64, 64]

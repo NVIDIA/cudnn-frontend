@@ -5,15 +5,11 @@
 
 from __future__ import annotations
 
-import functools
-import hashlib
 import importlib
-import importlib.util
 import logging
 import os
 import re
 import sys
-import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +19,7 @@ from cudnn._device import ensure_current_context
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 
+from .source_loader import _fallback_cache_dir, _usable_cache_dir, _cache_dir, _write_atomic, _import_kernel
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
@@ -882,76 +879,6 @@ def _moe_launch_tail(cs, aux=(), *, tma_slots: "frozenset[int]" = frozenset()) -
 
 
 _LOG = logging.getLogger(__name__)
-
-
-def _fallback_cache_dir() -> Path:
-    """A writable per-user cache under the system temp dir."""
-    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
-    return Path(tempfile.gettempdir()) / f"cudnn_gemm_kernel_cache{suffix}"
-
-
-@functools.lru_cache(maxsize=None)
-def _usable_cache_dir(base: str) -> Path:
-    """Resolve a writable kernel cache directory."""
-    try:
-        p = Path(base)
-        p.mkdir(parents=True, exist_ok=True)
-        if not os.access(p, os.W_OK):
-            raise PermissionError(f"{p} is not writable")
-        return p
-    except OSError as exc:
-        fallback = _fallback_cache_dir()
-        fallback.mkdir(parents=True, exist_ok=True)
-        _LOG.warning(
-            "cudnn.gemm.frost: kernel cache %s is unusable (%s); falling back to %s. Set CUDNN_FRONTEND_GEMM_KERNEL_CACHE to choose another location.",
-            base,
-            exc,
-            fallback,
-        )
-        return fallback
-
-
-def _cache_dir() -> Path:
-    """Select the generated-kernel source cache directory."""
-    base = os.environ.get("CUDNN_FRONTEND_GEMM_KERNEL_CACHE")
-    if not base:
-        xdg = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-        base = os.path.join(xdg, "cudnn_gemm", "kernel_cache")
-    return _usable_cache_dir(base)
-
-
-def _write_atomic(path: Path, src: str) -> None:
-    """Publish ``src`` at ``path`` in one rename."""
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(src)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            # Preserve the original write failure.
-            pass
-        raise
-
-
-def _import_kernel(src: str) -> object:
-    """Import a generated kernel from the source cache."""
-    digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
-    out_dir = _cache_dir() / f"gen_{digest}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "generated_kernel.py"
-    _write_atomic(out_file, src)
-
-    mod_name = f"_cudnn_gemm_generated_{digest}"
-    spec = importlib.util.spec_from_file_location(mod_name, out_file)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
-    mod.FROST_SOURCE_DIGEST = digest
-    return mod
 
 
 class _CompiledRuntime:

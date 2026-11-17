@@ -22,6 +22,35 @@ pytestmark = pytest.mark.L0
 
 _GPU = requires_sm100
 
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("first", ["graph_analyzer", "gather_execution", "grouped_lowering", "compiler"])
+def test_frost_gather_import_order_keeps_analysis_independent(family, first):
+    import os
+    import subprocess
+    import sys
+
+    script = f"""
+import importlib
+import sys
+root = 'cudnn.gemm.frost'
+importlib.import_module(root + '.{first}')
+if '{first}' != 'compiler':
+    assert root + '.compiler' not in sys.modules
+    assert root + '.sm100.compiler' not in sys.modules
+    assert root + '.sm120.compiler' not in sys.modules
+backend = importlib.import_module(root + '.compiler')
+assert backend.__name__ == root + '.{family}.compiler'
+from cudnn.gemm.frost import build_gemm_plan, probe_gemm_plan
+from cudnn.gemm.frost.engine import build_gemm_plan as engine_build
+assert build_gemm_plan is engine_build
+assert callable(probe_gemm_plan)
+"""
+    env = dict(os.environ, CUDNN_FRONTEND_GEMM_ARCH_FAMILY=family)
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 M, N, K = 256, 256, 128
 _FROST = "frost_gemm"
 
@@ -568,7 +597,7 @@ def test_probe_and_build_agree(name):
     native cuDNN silently serves the graph -- a rejection with NO test failure.
     This pins them equal, which is the only regression signal the epilogue gates
     have on the public path."""
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan, probe_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan, probe_gemm_plan
 
     g = _AGREEMENT_GRAPHS[name]()
     probed = probe_gemm_plan(g)

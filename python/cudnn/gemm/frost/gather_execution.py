@@ -16,7 +16,15 @@ from cudnn.frost.execution import BufferBinding, ExecutionStep, SequentialPlan, 
 
 from .dtypes import DTYPE_BYTES
 from .fusion_ir import IndexMap, Dtype, FusionChain
-from .graph_analyzer import GemmBinding, _analyze_state, _state_from_graph, _operand_view_path, _reachable_recorded_ops
+from .graph_analyzer import (
+    _graph_shapes_fixed,
+    _graph_dynamic_shapes,
+    GemmBinding,
+    _analyze_state,
+    _state_from_graph,
+    _operand_view_path,
+    _reachable_recorded_ops,
+)
 from .layouts import OperandView, checked_layout
 
 _BUFFER_DTYPES = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32", "int32": "int32", "int64": "int64"}
@@ -57,15 +65,11 @@ def execution_routes(graph):
     other. No device storage is allocated during analysis or compilation.
     """
     from cudnn._gemm_validate import validate_node
-    from .compiler import _graph_shapes_fixed
 
     for node in graph.nodes:
         if node.node_type.name == "GATHER":
             validate_node(node)
     state = _state_from_graph(graph)
-    from .compiler import _check_block_scale_sign
-
-    _check_block_scale_sign(state)
     gathers = [op for op in state["ops"] if op.cudnn_name == "gather"]
     if not gathers:
         chain, binding = _analyze_state(state)
@@ -223,7 +227,7 @@ class MaterializedGatherPlan(SequentialPlan):
 
     def __init__(self, route, gemm=None):
         from functools import partial
-        from .compiler import _import_kernel
+        from .source_loader import _import_kernel
         from .graph_analyzer import _map_dtype
         from cudnn.frost.device import current_device
 
@@ -297,11 +301,9 @@ class MaterializedGatherPlan(SequentialPlan):
         self.binding = GemmBinding(a_operands=list(self.bound))
 
 
-def probe_execution_plan(graph, config=None, *, backend=None):
+def probe_execution_plan(graph, config=None, *, backend):
     """Cheap admission across loader alternatives, without JIT or allocations."""
-    if backend is None:
-        from . import compiler as backend
-    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed
+    backend._check_block_scale_sign(_state_from_graph(graph))
 
     backend.probe_cutedsl()
     reasons = []
@@ -320,11 +322,9 @@ def probe_execution_plan(graph, config=None, *, backend=None):
     raise NotImplementedError("no fused or materialized gather plan: " + "; ".join(reasons))
 
 
-def build_execution_plan(graph, config=None, *, knobs=None, backend=None):
+def build_execution_plan(graph, config=None, *, knobs=None, backend):
     """The graph API and direct compiled-plan API share the same route selection."""
-    if backend is None:
-        from . import compiler as backend
-    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed
+    backend._check_block_scale_sign(_state_from_graph(graph))
 
     backend.probe_cutedsl()
     reasons = []

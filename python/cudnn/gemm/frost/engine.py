@@ -3,6 +3,7 @@
 
 """The FROST GEMM engine: JIT-compiled fused matmul chains for cuDNN graphs."""
 
+import logging
 from typing import TYPE_CHECKING, List
 
 from cudnn import behavior_note
@@ -11,6 +12,49 @@ from cudnn.frost.workspace import Workspace
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
+
+_LOG = logging.getLogger(__name__)
+
+
+def probe_gemm_plan(graph: "pygraph") -> bool:
+    """Cheap eligibility check for the GEMM engine (analyze + support gates, NO
+    ``cute.compile``). Never raises (a probe must not break the native path)."""
+    from .graph_analyzer import _graph_has_gemm
+
+    if not _graph_has_gemm(graph):
+        return False
+    from .compiler import probe_supported
+
+    try:
+        probe_supported(graph)
+    except (NotImplementedError, ValueError):
+        return False
+    except Exception:  # noqa: BLE001
+        _LOG.debug(
+            "cudnn.gemm.frost: probe_supported raised unexpectedly; ineligible",
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def build_gemm_plan(graph: "pygraph", knobs=None):
+    """Analyze + JIT the graph into a compiled GEMM plan."""
+    from .graph_analyzer import _graph_has_gemm, analyze, _graph_dynamic_shapes, _graph_shapes_fixed
+    from .compiler import jit_from_cudnn_graph, plan_config, probe_chain
+
+    if any(node.node_type.name == "GATHER" for node in graph.nodes):
+        from .gather_execution import build_execution_plan
+        from . import compiler
+
+        return build_execution_plan(graph, knobs=knobs, backend=compiler)
+    if not _graph_has_gemm(graph):
+        raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
+    chain = analyze(graph)
+    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs, shapes_fixed=_graph_shapes_fixed(graph))
+    if knobs is not None:
+        probe_chain(chain, config)
+    return jit_from_cudnn_graph(graph, config=config)
 
 
 class _FrostGemmPlan(CompiledPlan):
@@ -97,7 +141,6 @@ class FrostGemmEngine(BaseEngine):
         return GemmKnobs.from_public(public) if public else None
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
-        from .graph_analyzer import build_gemm_plan
         from cudnn.frost.device import build_device
 
         knobs = plan.knobs if plan is not None else None

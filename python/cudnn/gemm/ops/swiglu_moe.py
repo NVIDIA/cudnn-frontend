@@ -33,7 +33,7 @@ def _device_key(tensor: torch.Tensor) -> tuple:
 
 
 def _frost_plan(graph):
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
 
     return build_gemm_plan(graph)
 
