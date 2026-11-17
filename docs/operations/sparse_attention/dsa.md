@@ -318,31 +318,42 @@ with a helper kernel. With the default `deterministic=False`, short query
 batches split each query's top-k range across otherwise idle two-SM clusters;
 the split count is fixed when the plan is compiled.
 
-On SM90, `deterministic=True` uses a row-aware relay with logical cluster size
-`C in {4, 8, 16, 32, 64}` for H16/H32/H64/H96/H128. The public
-`deterministic_relay_cluster_size` argument selects `C` and defaults to 16.
-Each 128-query wave gives one FP32 dKV plane to every logical relay group. The
-plan queries CUDA cluster occupancy and uses the widest launchable physical
-C16, C8, or C4 cluster no larger than the logical relay. A wider logical relay
-runs as ordered same-stream phases. Kernel completion orders phase reuse
-without making a CTA wait for a nonresident cluster. A setup kernel builds
-packed `C`-bit rank masks for every referenced
-`(query wave, M64 head tile, KV row)`. A relay CTA waits only for lower logical
-ranks that actually update the same row; a 128-thread WG1
-barrier carries the acquired visibility to every reducer lane, and the matching
-barrier publishes all relaxed FP32 reductions before one lane release-clears
-that rank's ownership bit at GPU scope when a successor exists. Head tiles and
-later query waves are stream-ordered, while disjoint sparse rows within a
-cluster can progress independently. The postprocess kernel combines the
-`128 / C` planes in fixed order, and one warp per head computes `d_sink` with a
-fixed strided-lane/tree reduction order. Duplicate valid top-k indices within
-one query row remain outside this deterministic contract.
+On SM90, `deterministic=True` and the default
+`deterministic_dkv_mode='records'` use conflict-rank dKV storage for
+H16/H32/H64/H96/H128. A setup kernel builds immutable and mutable 128-bit
+query-selection bitmaps for every referenced
+`(query wave, M64 head tile, KV row)`. Each query computes its stable conflict
+rank by popcounting lower query ordinals. Ranks zero through three accumulate
+into four separate dense FP32 planes. Higher ranks reuse plane zero after all
+lower plane-zero writers for that row publish and clear their mutable bits;
+ranks one through three retire their bits before computing because their planes
+are disjoint. Two ordered 64-query, single-CTA-cluster launches process each
+128-query wave, so every writer that a CTA can wait for is resident on the
+supported SM90 targets. Head tiles and later waves remain stream ordered, and
+the postprocess kernel combines the four planes in fixed order. One warp per
+head computes `d_sink` with a fixed strided-lane/tree reduction order.
+Duplicate valid top-k indices within one query row remain outside this
+deterministic contract.
 
-The SM90 deterministic dKV allocation is
-`(128 / C) * (K64 + mask_rows) * D32 * sizeof(float)`, where
+The conflict-rank dKV allocation is
+`4 * (K64 + mask_rows) * D32 * sizeof(float)`, where
 `K64 = round_up(total_S_kv, 64)`, `D32 = round_up(D, 32)`, and
+`mask_rows = ceil(2 * ceil(total_S_q / 128) * ceil(H / 64) * K64 / D32)`.
+The factor two stores the immutable and mutable bitmaps; their four 32-bit
+words are striped across the four planes.
+
+An explicit `deterministic_relay_cluster_size=C`, for
+`C in {4, 8, 16, 32, 64}`, selects the previous `'shards'` cluster relay even
+when the requested dKV mode is `'records'`. Each 128-query wave then gives one
+FP32 dKV plane to every logical relay group. The plan queries CUDA cluster
+occupancy and uses the widest launchable physical C16, C8, or C4 cluster no
+larger than the logical relay; wider relays use ordered same-stream phases.
+The setup kernel builds packed
+`C`-bit ownership masks, relay CTAs wait only for lower ranks that update the
+same row, and the postprocess combines `128 / C` planes. Its allocation is
+`(128 / C) * (K64 + mask_rows) * D32 * sizeof(float)`, with
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
-(K64 / (mask_bits / C)) * (mask_bits / 32) / D32)`, where `mask_bits` is
+(K64 / (mask_bits / C)) * (mask_bits / 32) / D32)` and `mask_bits` equal to
 64 for C64 and 32 otherwise.
 The caller-owned workspace is cleared and the masks are rebuilt on every
 execution, so changing `topk_idxs` or `topk_length` between launches is safe.
@@ -350,14 +361,11 @@ After one eager execution populates the SM90 concrete-tensor compile caches,
 the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
 the declared tensor shapes and addresses fixed while allowing tensor contents,
 including `topk_idxs` and `topk_length`, to change.
-On the target H200 sweep (BF16 H64 D576/Dv512, KV=65536, top-k 2048), C16
-measured 1.47--1.54x the non-deterministic latency with 1.13--1.26 GiB of
-workspace and remains the conservative default. C32 measured 1.34--1.37x
-with 0.57--0.70 GiB, the best time/memory point in that workload. C64 reduced
-workspace further to 0.29--0.41 GiB, but four sequential physical phases
-raised latency to 2.30--2.37x non-deterministic. C32 and C64 are therefore
-explicit workload-specific choices rather than the automatic default; the
-full table and environment are recorded in `benchmark/dsa/README.md`.
+On H20-3e with BF16 H64/D512, Q=16384, KV=262144, and top-k 2048, conflict-rank
+records measured 120.687 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
+the C16 logical relay baseline split into physical C8 launches: 4.02x faster
+with 33.3% less workspace. Historical explicit-relay H200 measurements and the
+full environments are recorded in `benchmark/dsa/README.md`.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in

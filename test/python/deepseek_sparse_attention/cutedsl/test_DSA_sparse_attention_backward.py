@@ -6820,7 +6820,19 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected_cluster16 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(8 * (sk_r + 1) * hd_r * 4)
     expected_cluster32 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(4 * (sk_r + 2) * hd_r * 4)
     expected_cluster64 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(2 * (sk_r + 4) * hd_r * 4)
+    expected_records = 2 * ws_align(sq_r * num_heads * 4) + ws_align(4 * (sk_r + 4) * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_cluster16
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_dkv_mode="records",
+        )
+        == expected_records
+    )
     assert (
         flash_attn_bwd_sm90_workspace_size(
             s_q,
@@ -6891,7 +6903,19 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected_large_cluster16 = 2 * large_stats + ws_align(8 * (1088 + 17) * 576 * 4)
     expected_large_cluster32 = 2 * large_stats + ws_align(4 * (1088 + 34) * 576 * 4)
     expected_large_cluster64 = 2 * large_stats + ws_align(2 * (1088 + 68) * 576 * 4)
+    expected_large_records = 2 * large_stats + ws_align(4 * (1088 + 68) * 576 * 4)
     assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_cluster16
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_dkv_mode="records",
+        )
+        == expected_large_records
+    )
     assert (
         flash_attn_bwd_sm90_workspace_size(
             1025,
@@ -7117,7 +7141,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_rejects_oversized_accumulator_
     from cudnn import DSA
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
 
-    monkeypatch.setattr(api, "sm90_deterministic_relay_accumulator_elements", lambda *args: (1 << 31) + 1)
+    monkeypatch.setattr(api, "sm90_deterministic_relay_accumulator_elements", lambda *args, **kwargs: (1 << 31) + 1)
     device = torch.device("cuda")
     plan = DSA.SparseAttentionBackward(
         sample_q=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
@@ -7231,6 +7255,75 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
             assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), f"{name} differs at repetition {repeat}"
 
     q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        *reference,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=20261117)
+def test_DSA_sparse_attention_backward_sm90_conflict_rank_high_overlap():
+    """SM90 records overflow ranks serialize plane zero and remain bitwise stable."""
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+
+    _require_sm90_deterministic_relay()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        64,
+        s_q=65,
+        s_kv=256,
+        deterministic=True,
+    )
+    assert plan._deterministic_dkv_route() == "records"
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    topk_idxs.copy_(topk_idxs[0].clone().expand_as(topk_idxs))
+    shared_out, shared_lse = ref_sparse_attention_forward_chunked(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    out.copy_(shared_out)
+    lse.copy_(shared_lse)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def run():
+        dq, dkv, d_sink = outputs
+        for tensor in (*outputs, workspace):
+            tensor.view(torch.uint8).fill_(0xA5)
+        result = plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+        torch.cuda.synchronize()
+        return tuple(tensor.clone() for tensor in result)
+
+    reference = run()
+    for repeat in range(1, 4):
+        actual = run()
+        for name, actual_tensor, reference_tensor in zip(("dQ", "dKV", "dSink"), actual, reference):
+            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), f"{name} differs at repetition {repeat}"
+
     check_ref_dsa_sparse_attention_backward(
         q,
         kv,

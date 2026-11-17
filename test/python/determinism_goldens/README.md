@@ -3380,6 +3380,43 @@ Known gaps, stated rather than tolerated:
 - These layouts have no golden records; their bits depend on the plan, and
   for D576 on the SM count.
 
+### SM90 DSA conflict-rank backward: H20 validation, 2026-11-17
+
+The SM90 default deterministic backward now uses four-plane conflict-rank
+storage; an explicit logical relay keeps the shard layout. Validation used an
+NVIDIA H20-3e (SM90), PyTorch 2.8.0+cu129, CUDA 12.9, cuDNN 9.10.2,
+CuTe DSL 4.8.1 and `cuda-bindings` 12.9.10. Imports resolved to the isolated
+`icavan/sm90-dsa-conflict-rank` checkout based on upstream `3b7cd6cab`.
+
+New BF16 evidence:
+
+- H64/D512, 65 queries, KV 256 and Top-K 64 with every query selecting the
+  same rows: conflict ranks 0 through 64 exercise all four planes and the
+  plane-zero overflow chain. Four fresh poisoned-workspace executions are
+  raw-byte equal for dQ, dKV and dSink and pass the independent FP32 reference.
+- H96/D576, 129 queries, KV 256 and Top-K 128: eager execution and three CUDA
+  Graph replays are raw-byte equal after poisoning outputs/workspace; replay
+  also matches eager execution after changing `topk_idxs` and `topk_length`.
+- The complete SM90 L0 selection in
+  `test_DSA_sparse_attention_backward.py` has 57 passing expanded cases after
+  the changed helper signature is included. It covers ordinary execution,
+  both `topk_length` variants, invalid/padded rows, workspace boundaries,
+  compile-cache reuse, the default records route and every explicit shard
+  relay size. The H20 C16 logical relay selects physical C8.
+
+The long-context performance case is BF16 H64/D512, Q=16384, KV=262144 and
+Top-K 2048. Five warmups and twenty allocation-free calls measure 120.687 ms,
+91.10 TFLOPS and 3.008 GiB workspace. The upstream + physical-cluster-fix C16
+logical/C8 physical baseline measures 484.915 ms and 4.508 GiB: 4.02x speedup
+and 33.3% less workspace.
+
+No support status is upgraded: multi-wave dKV is still not batch invariant,
+so SM90 BF16 remains **Replay only**. Duplicate active indices within one
+query are outside the SM90 contract. FP16, other SM90 head-count/dimension
+combinations, SM100/SM103 and SM107 are unverified for this change. No golden
+record is added because these plan-dependent backward bits already have no
+golden contract; replay and the independent reference are the qualification.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.

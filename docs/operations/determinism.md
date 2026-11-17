@@ -438,6 +438,14 @@ a row alone and inside a batch under the entry's own picks.
   conflict-rank storage, which accept duplicate indices: BF16 H128 two-CTA
   plans and generic plans for which `deterministic_dkv_mode` selects records
   or the chain relay.
+- On SM90, the default `deterministic_dkv_mode='records'` uses four
+  conflict-rank planes and a fixed-order plane-zero overflow chain. An explicit
+  `deterministic_relay_cluster_size` selects the shard relay instead. H20-3e
+  BF16 H64/D512 high-conflict replay/reference and H96/D576 changed-input CUDA
+  Graph replay are verified; cross-wave dKV remains batch dependent, so the
+  SM90 BF16 status stays **Replay only**. Duplicate active indices within one
+  query remain outside the SM90 deterministic contract. FP16 and other SM90
+  head-count/dimension combinations are unverified for this new records path.
 - On SM100/SM103, `deterministic_dkv_mode` selects the sparse attention
   backward dKV storage: `'records'` (default; conflict-rank storage where it
   fits the shard, relay or private-plane layout, that layout elsewhere),

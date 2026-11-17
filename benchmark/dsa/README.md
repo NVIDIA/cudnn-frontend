@@ -362,17 +362,20 @@ Options:
 - `--deterministic` — benchmark deterministic execution `off`, `on`, or
   `both` (default `off`).
 - `--deterministic-relay-cluster-size` — force logical C4/C8/C16/C32/C64.
-  SM90 defaults to C16; SM100 keeps its automatic large-context policy. SM90
-  queries CUDA cluster occupancy and uses the widest launchable physical
+  On SM90 this explicitly selects the shard relay instead of the default
+  conflict-rank records path; SM100 keeps its automatic large-context policy.
+  SM90 queries CUDA cluster occupancy and uses the widest launchable physical
   C16/C8/C4 cluster no larger than the logical relay. Wider logical relays use
   ordered same-stream phases without changing the FP32 relay-plane count.
 - `--deterministic-dkv-mode` — `deterministic_dkv_mode` of deterministic
   plans: `records` (default), `chain` or `shards` (see the deterministic dKV
-  storage section of `docs/operations/sparse_attention/dsa.md`). It selects
-  the dKV storage of SM100 generic M64 and H128 two-CTA plans (`shards` keeps
-  the two-CTA private-plane layout); `chain` is rejected on SM90, on the
-  two-CTA routes, on devices other than SM100/SM103 (where `records` runs as
-  `shards`), and together with `--deterministic-relay-cluster-size`.
+  storage section of `docs/operations/sparse_attention/dsa.md`). SM90 records
+  use four conflict-rank planes, while an explicit relay size
+  selects its shard relay. The option also selects the dKV storage of SM100
+  generic M64 and H128 two-CTA plans (`shards` keeps the two-CTA private-plane
+  layout). `chain` is rejected on SM90, on the two-CTA routes, on devices other
+  than SM100/SM103 (where `records` runs as `shards`), and together with
+  `--deterministic-relay-cluster-size`.
 - `--warmup` / `--repeat` — iterations per config (defaults 10 / 50; the
   first warmup iteration also triggers kernel compilation).
 - `--csv` — write results to a CSV file.
@@ -399,6 +402,21 @@ supported DSL.
 |     8192 |      8192 |  512 |  2.489 |     552.16 |
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
+
+##### SM90 conflict-rank long-context backward (2026-11-17)
+
+Measured on NVIDIA H20-3e with BF16 H64/Dqk512/Dv512, Q=16384, KV=262144,
+top-k 2048, full runtime lengths, synthetic forward statistics, two warm-ups,
+and five allocation-free calls. The environment used PyTorch 2.8.0+cu129,
+CuTe DSL 4.8.1, cuDNN 9.10.2, and `cuda-bindings` 12.9.10. The baseline is
+upstream plus the H20 physical-cluster selection from PR #2715: it retains a
+logical C16 relay but splits it into physical C8 launches. The candidate uses
+the default `--deterministic-dkv-mode records`.
+
+| dKV layout | BWD ms | BWD TFLOPS | Workspace GiB | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| C16 logical / C8 physical relay | 484.915 | 22.67 | 4.508 | 1.00x |
+| Four-plane conflict rank | **120.687** | **91.10** | **3.008** | **4.02x** |
 
 ##### SM90 deterministic relay scheduling (2026-11-02)
 
@@ -430,8 +448,8 @@ non-deterministic variation between rows is measurement noise.
 C32 is the best time/memory point in this workload: it lowers deterministic
 overhead to 1.34--1.37x while using about half the C16 workspace. C64 is the
 memory-first endpoint, but its four serialized physical C16 phases on H200 raise the
-overhead to 2.30--2.37x. C16 remains the conservative SM90 default; C32/C64
-are explicit plan-time choices.
+overhead to 2.30--2.37x. These are explicit shard-relay plan-time choices;
+conflict-rank records are now the SM90 default when no relay size is supplied.
 
 ##### SM100 deterministic relay scheduling (2026-10-30)
 

@@ -60,9 +60,11 @@ def _deterministic_relay_layout(
     head_dim: int,
     num_heads: int,
     relay_cluster_size: int,
+    *,
+    conflict_rank: bool = False,
 ) -> Tuple[int, int, int, int, int]:
     """Return (planes, physical plane elements, mask rows, waves, head tiles)."""
-    return sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size)
+    return sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size, conflict_rank=conflict_rank)
 
 
 def flash_attn_bwd_sm90_workspace_size(
@@ -72,8 +74,9 @@ def flash_attn_bwd_sm90_workspace_size(
     num_heads: int,
     deterministic: bool = False,
     deterministic_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    deterministic_dkv_mode: str = "shards",
 ) -> int:
-    """Caller scratch for SM90 stats and ordinary or relayed FP32 dKV planes."""
+    """Caller scratch for SM90 stats and ordinary, conflict-rank, or relayed FP32 dKV planes."""
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
     stats_bytes = ws_align(seqlen_q_rounded * int(num_heads) * torch.float32.itemsize)
     if deterministic:
@@ -83,6 +86,7 @@ def flash_attn_bwd_sm90_workspace_size(
             head_dim,
             num_heads,
             deterministic_relay_cluster_size,
+            conflict_rank=deterministic_dkv_mode == "records",
         )
         dkv_elems = num_dkv_planes * physical_plane_elems
     else:
@@ -107,6 +111,7 @@ def flash_attn_bwd_sm90(
     current_stream=None,
     deterministic: bool = False,
     deterministic_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    deterministic_dkv_mode: str = "shards",
     *,
     cli_target: Optional[torch.Tensor] = None,
     cli_target_head_count: int = 0,
@@ -137,12 +142,14 @@ def flash_attn_bwd_sm90(
         softmax_scale: float (default: 1/sqrt(headdim))
         topk_length: (total_S_q,) int32, optional per-query valid prefix
             length, clamped to `[0, topk_max]` by the kernel.
-        deterministic: use clustered, row-aware FP32 dKV relays and
-            fixed-order dSink/dKV reductions for bitwise-reproducible results.
+        deterministic: use fixed-order dSink/dKV reductions for
+            bitwise-reproducible results.
         deterministic_relay_cluster_size: SM90 logical dKV relay width: 4, 8,
             16, 32, or 64. A smaller width uses more FP32 planes. Widths 32
             and 64 use ordered physical launches. The widest C16/C8/C4 size
             admitted by the current device is selected before compilation.
+        deterministic_dkv_mode: ``records`` selects four-plane conflict-rank
+            storage; ``shards`` selects the logical cluster relay.
         physical_relay_cluster_size: Preselected physical C4/C8/C16 launch
             width. ``None`` queries the current device before compilation.
             Prepared plans pass their cached support-check result here.
@@ -207,25 +214,31 @@ def flash_attn_bwd_sm90(
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     if deterministic:
         relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_relay_cluster_size)
-        if physical_relay_cluster_size is None:
-            physical_relay_cluster_size = sm90_physical_relay_cluster_size(relay_cluster_size, q.device)
-        if (
-            physical_relay_cluster_size not in (4, 8, 16)
-            or physical_relay_cluster_size > relay_cluster_size
-            or relay_cluster_size % physical_relay_cluster_size != 0
-        ):
-            raise ValueError(
-                "physical_relay_cluster_size must be a launchable C4, C8, or C16 divisor "
-                f"of logical relay C{relay_cluster_size}, got {physical_relay_cluster_size!r}"
-            )
+        conflict_rank = deterministic_dkv_mode == "records"
+        if conflict_rank:
+            physical_relay_cluster_size = 1
+        else:
+            if physical_relay_cluster_size is None:
+                physical_relay_cluster_size = sm90_physical_relay_cluster_size(relay_cluster_size, q.device)
+            if (
+                physical_relay_cluster_size not in (4, 8, 16)
+                or physical_relay_cluster_size > relay_cluster_size
+                or relay_cluster_size % physical_relay_cluster_size != 0
+            ):
+                raise ValueError(
+                    "physical_relay_cluster_size must be a launchable C4, C8, or C16 divisor "
+                    f"of logical relay C{relay_cluster_size}, got {physical_relay_cluster_size!r}"
+                )
         num_dkv_shards, physical_plane_elems, _, num_relay_waves, num_head_tiles = _deterministic_relay_layout(
             total_S_q,
             total_S_kv,
             head_dim,
             num_head,
             relay_cluster_size,
+            conflict_rank=conflict_rank,
         )
     else:
+        conflict_rank = False
         relay_cluster_size = 1
         physical_relay_cluster_size = 1
         physical_plane_elems = seqlen_k_rounded * head_dim_rounded
@@ -244,6 +257,7 @@ def flash_attn_bwd_sm90(
             num_head,
             deterministic=deterministic,
             deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+            deterministic_dkv_mode=deterministic_dkv_mode,
         ),
         _WORKSPACE_OWNER,
     )
@@ -362,6 +376,7 @@ def flash_attn_bwd_sm90(
 
     if deterministic:
         compile_key_relay_masks = (
+            conflict_rank,
             relay_cluster_size,
             have_topk_length,
             max_topk,
@@ -377,6 +392,7 @@ def flash_attn_bwd_sm90(
                 q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS,
                 num_head_tiles=num_head_tiles,
                 padded_head_dim=head_dim_rounded,
+                conflict_rank=conflict_rank,
             )
             flash_attn_bwd_sm90.compile_cache_relay_masks[compile_key_relay_masks] = cute.compile(
                 relay_masks,
@@ -418,6 +434,7 @@ def flash_attn_bwd_sm90(
         max_topk,
         cli_target is not None,
         deterministic,
+        conflict_rank,
         num_dkv_shards,
         relay_cluster_size,
         physical_relay_cluster_size,
@@ -451,6 +468,7 @@ def flash_attn_bwd_sm90(
             have_topk_length=have_topk_length,
             max_topk=max_topk,
             deterministic=deterministic,
+            conflict_rank=conflict_rank,
             num_dkv_shards=num_dkv_shards,
             relay_cluster_size=relay_cluster_size,
             q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,

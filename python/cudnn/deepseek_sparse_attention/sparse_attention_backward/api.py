@@ -76,26 +76,27 @@ class SparseAttentionBackward(APIBase):
 
         ``deterministic_relay_cluster_size`` optionally requests an exact
         4-, 8-, 16-, 32-, or 64-CTA logical deterministic dKV relay. SM90
-        defaults to 16; SM100 generic-M64 large-context plans retain their
-        automatic policy. The widest launchable physical C16/C8/C4 cluster is
-        selected for the plan; wider logical relays use ordered same-stream
-        phases. The logical choice is compiled into the plan and changes its
-        workspace requirement; neither choice can change during CUDA Graph
-        replay.
+        uses this relay only when the option is explicit; otherwise the default
+        ``'records'`` mode uses conflict-rank storage. SM100 generic-M64
+        large-context plans retain their automatic relay policy. The widest
+        launchable physical C16/C8/C4 cluster is selected for an SM90 relay;
+        wider logical relays use ordered same-stream phases. The logical choice
+        is compiled into the plan and changes its workspace requirement;
+        neither choice can change during CUDA Graph replay.
 
         ``deterministic_dkv_mode`` selects the dKV storage of deterministic
-        SM100 plans of the generic M64 kernel and of the H128 D512/D576 two-CTA
-        kernels, and is compiled into the plan:
+        SM90 plans and SM100 plans of the generic M64 kernel and H128 D512/D576
+        two-CTA kernels, and is compiled into the plan:
 
-        - ``'records'`` (default): conflict-rank storage. Within a query wave,
-          a slot whose KV row is selected by ``k`` lower wave positions adds
-          into dense plane ``k`` of that row while ``k`` is below the plan's
-          plane count, and into a slot-private overflow record otherwise;
-          records and planes are combined in a fixed order. Shapes whose
-          conflict-rank workspace would exceed the ``'shards'`` layout use that
-          layout instead. H128 two-CTA plans use their own conflict-rank
-          storage where its workspace fits their private-plane layout, and
-          that layout elsewhere.
+        - ``'records'`` (default): conflict-rank storage. SM90 uses four dense
+          planes: ranks zero to three use separate planes and larger ranks
+          deterministically chain through plane zero. SM100 records plans put
+          rank ``k`` in dense plane ``k`` while it fits and use slot-private
+          overflow records otherwise; records and planes are combined in a
+          fixed order. Shapes whose conflict-rank workspace would exceed the
+          ``'shards'`` layout use that layout instead. H128 two-CTA plans use
+          their own conflict-rank storage where its workspace fits their
+          private-plane layout, and that layout elsewhere.
         - ``'chain'``: the chain relay (every head block of a wave in one
           launch; the CTAs sharing a plane row add along a per-row chain in a
           fixed order) where its workspace fits, and the ``'records'`` rule
@@ -108,10 +109,9 @@ class SparseAttentionBackward(APIBase):
         differently from one another. Values other than the default require
         ``deterministic=True``. ``'chain'`` is rejected on SM90 and on the
         two-CTA backends, and cannot be combined with
-        ``deterministic_relay_cluster_size``; under ``'records'`` and
-        ``'shards'`` an explicit relay size selects that cluster relay.
-        Conflict-rank storage is provided only on SM100/SM103 (compute
-        capability 10.0 and 10.3): on other SM100-family devices a
+        ``deterministic_relay_cluster_size``; an explicit relay size selects
+        the SM90 cluster relay even when the requested mode is ``'records'``.
+        On SM100-family devices other than SM100/SM103, a
         ``'records'`` plan runs the ``'shards'`` layouts and ``'chain'`` is
         rejected.
         """
@@ -265,8 +265,8 @@ class SparseAttentionBackward(APIBase):
             major != 10 and self.deterministic_dkv_mode == "chain",
             "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend",
         )
-        # Conflict-rank dKV storage runs only on SM100/SM103: elsewhere 'chain' is rejected and 'records' plans run
-        # as 'shards' plans. Every selection and sizing call of the plan uses the resolved mode.
+        # SM90 and SM100/SM103 provide conflict-rank dKV storage. Other SM100-family targets run 'records' as
+        # 'shards'. Every selection and sizing call of the plan uses the resolved mode.
         self._dkv_mode = self.deterministic_dkv_mode
         if major == 10:
             mode_error = _iface_sm100.deterministic_dkv_mode_error(self.deterministic_dkv_mode, self.deterministic, device_capability=capability)
@@ -275,6 +275,8 @@ class SparseAttentionBackward(APIBase):
         if major == 9 and self.deterministic:
             relay_requirement_error = sm90_deterministic_relay_requirement_error()
             self._runtime_error_if(relay_requirement_error is not None, relay_requirement_error)
+            if self.deterministic_relay_cluster_size is not None:
+                self._dkv_mode = "shards"
             self._sm90_deterministic_relay_cluster_size = (
                 SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE if self.deterministic_relay_cluster_size is None else self.deterministic_relay_cluster_size
             )
@@ -292,6 +294,7 @@ class SparseAttentionBackward(APIBase):
                 head_dim,
                 num_heads,
                 self._sm90_deterministic_relay_cluster_size,
+                conflict_rank=self._dkv_mode == "records",
             )
             indexing_error = sm90_deterministic_relay_indexing_error(accumulator_elements)
             self._value_error_if(indexing_error is not None, indexing_error)
@@ -414,7 +417,7 @@ class SparseAttentionBackward(APIBase):
         # Defer the one-time driver occupancy query until every inexpensive
         # support check has passed.  The result is part of the prepared plan
         # and is never recomputed by execute() or CUDA Graph replay.
-        if major == 9 and self.deterministic:
+        if major == 9 and self.deterministic and self._dkv_mode == "shards":
             self._sm90_physical_relay_cluster_size = sm90_physical_relay_cluster_size(
                 self._sm90_deterministic_relay_cluster_size,
                 self.q_desc.device,
@@ -552,7 +555,9 @@ class SparseAttentionBackward(APIBase):
         device (the cluster pairs each wave round launches), so query it for
         the device that executes the plan: a size from a device with fewer SMs
         can be too small, and ``execute()`` then rejects the workspace. On
-        SM90, logical cluster sizes 4, 8, 16, 32, and 64 use 32, 16, 8, 4, and
+        SM90, conflict-rank storage uses four FP32 planes followed by two
+        128-bit selection bitmaps per KV row and query wave. An explicit
+        logical cluster size 4, 8, 16, 32, or 64 instead uses 32, 16, 8, 4, or
         2 FP32 planes respectively, followed by packed relay-mask rows. The
         returned size is authoritative for this plan; ``execute()`` accepts a
         larger contiguous uint8 buffer on the plan device but never allocates
@@ -577,6 +582,7 @@ class SparseAttentionBackward(APIBase):
                 num_heads,
                 deterministic=self.deterministic,
                 deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
+                deterministic_dkv_mode=self._dkv_mode,
             )
         launch_pairs = None
         if self.deterministic and self._backend in _iface_d576.BACKENDS:
@@ -599,15 +605,19 @@ class SparseAttentionBackward(APIBase):
         )
 
     def _deterministic_dkv_route(self) -> Optional[str]:
-        """Return the dKV reduction a deterministic generic M64 plan runs (``None`` for other plans).
+        """Return the selected deterministic dKV reduction, or ``None`` where no route applies.
 
         ``'chain'`` (chain relay), ``'records'`` (conflict-rank records) or ``'shards'`` (shard or
         cluster-relay planes: ``deterministic_dkv_mode='shards'``, an explicit
         ``deterministic_relay_cluster_size``, a shape whose conflict-rank workspace would be larger, or a
-        device without conflict-rank storage).
+        device without conflict-rank storage). SM90 reports ``'records'`` for its four-plane conflict-rank
+        path and ``'shards'`` for an explicit logical relay.
         A ``deterministic_dkv_mode='chain'`` plan reports ``'chain'`` only where the chain relay applies.
         """
         self._ensure_support_checked()
+        major, _ = device_capability(self.q_desc.device)
+        if major == 9:
+            return self._dkv_mode if self.deterministic else None
         if not self.deterministic or self._backend != "generic_m64":
             return None
         total_s_q, num_heads, head_dim = self.q_desc.shape
@@ -738,6 +748,7 @@ class SparseAttentionBackward(APIBase):
                     current_stream=current_stream,
                     deterministic=self.deterministic,
                     deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
+                    deterministic_dkv_mode=self._dkv_mode,
                     cli_target=cli_target,
                     cli_target_head_count=(self.cli_target_head_count if self.return_cli_target else 0),
                     physical_relay_cluster_size=self._sm90_physical_relay_cluster_size,
@@ -816,10 +827,11 @@ def sparse_attention_backward_wrapper(
     or workspace on the launch stream; the plan's ``execute()`` does neither.
     ``deterministic_relay_cluster_size`` optionally fixes a deterministic
     SM90 or SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or
-    64-CTA logical relay. Cluster-32/64 use two/four ordered 16-CTA hardware
-    clusters. ``None`` selects C16 on SM90 and the automatic policy on SM100.
-    This plan-time choice changes the required workspace and remains fixed
-    across every execution and CUDA Graph replay of the cached plan.
+    64-CTA logical relay. SM90 uses the widest launchable C16/C8/C4 physical
+    cluster and ordered phases when necessary. ``None`` selects conflict-rank
+    records on SM90 and the automatic policy on SM100. This plan-time choice
+    changes the required workspace and remains fixed across every execution
+    and CUDA Graph replay of the cached plan.
     """
     if return_cli_target and cli_target_head_count is None:
         cli_target_head_count = q.shape[1]
