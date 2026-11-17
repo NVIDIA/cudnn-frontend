@@ -43,6 +43,12 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+For Torch varlen providers, test each op's schema independently: forward and
+backward can select a backend while the out op is still Flash-only. The host
+`test_torch_provider_dispatch.py` matrix checks legacy, mixed and selected
+schemas, including removal. Keep public-selector rejection tests separate
+from direct registered-operator numerics, so upstream architecture/GQA/window
+restrictions do not erase FE forward/backward or synchronization coverage.
 When appending an SDPA adapter constructor argument, update every signature-tail
 pin, including the API-contract, score-stats, SM107 and bias-max suites. Search
 for the previous trailing parameter in `test/python/sdpa/frost`; a new feature's
@@ -1665,3 +1671,9 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+For Torch provider routing checks, record the actual native operator call and
+compare with overrides removed. A selected-backend log on stderr may not
+propagate to pytest's `caplog` under Torch's logging configuration; missing
+captured text does not establish a routing failure. The varlen explicit-KV
+length fallback test checks the cuDNN operator and forwarded length tensor.
