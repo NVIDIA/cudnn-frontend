@@ -19,7 +19,8 @@ per layer and step for ``T`` tokens per sequence at once, the recurrent state af
 own.  The step shape is the entry's compile-time fact, so the row names the tokens per sequence as a field of the form
 (``TOKENS``) beside the two launch knobs, one row per count; the adapter passes the knobs to the entry and holds the slot
 table of every call to the row's ``TOKENS`` (a table of another count is a ``ValueError``: the wiring hands the block a
-step its row does not name).  It is handed the step's slot table (``state.TokenSlots``: the slot of every (sequence,
+step its row does not name), and the call log states the form for the step shape of the table the call handed the entry,
+never for the row's.  It is handed the step's slot table (``state.TokenSlots``: the slot of every (sequence,
 token), the first row of every sequence, the tokens the last step kept) and the pools in the layout of
 ``state.RecurrentSlots`` at that many tokens.  The output is a buffer of the call's own.  The entry's facts take the step
 shape ``(sequences, tokens)``; the name of its kernel carries neither the launch knobs nor the tokens (they sit behind
@@ -217,7 +218,7 @@ class EntryBlock(BlockBase):
     compiles = True
     name = ""  # the entry, as ``cudnn`` exports it
     what = ""  # what the entry is, for the sentence of an older package
-    _served = None  # (entry instance, rows) of the last call
+    _served = None  # (entry instance, rows) of the last call -- in place of ``rows`` the step shape, where an entry's form follows one
     _answer = None  # (entry instance, rows, what ``serving`` says of them): asked of an instance once, not once per call
 
     def _cudnn(self):
@@ -333,21 +334,28 @@ class EntryBlock(BlockBase):
     def serving(self):
         """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
         its kind in this process: one per device, geometry and form) and the fields of the row's form as THAT instance states
-        them for the call's row count (its ``form_for``).  Read from the object that was called, never from the row: an entry
-        built without the row's knobs, or a call served from another instance, shows here.  Before the first call nothing
-        has served and nothing was passed."""
+        them for the call's row count (its ``form_for``; for the call's step shape, where its form follows one).  Read from
+        the object that was called, never from the row: an entry built without the row's knobs, or a call served from
+        another instance, shows here.  Before the first call nothing has served and nothing was passed."""
         if self._served is None:
             return self.entry, ()
         entry, rows = self._served
         if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
             place = next((n for n, built in enumerate((e for e in _ENTRIES.values() if type(e) is type(entry)), 1) if built is entry), 0)
             try:
-                stated = self._stated(entry, rows)
+                stated = self._served_stated(entry, rows)
             except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
                 stated = {}
             form = tuple((name, stated[name]) for name, _ in self._served_form() if name in stated)
             self._answer = (entry, rows, (f"{self.entry} #{place}" if place else self.entry, form))
         return self._answer[2]
+
+    def _served_stated(self, entry, call) -> dict:
+        """The form the instance that served the last call states for THAT call, as the call log reads it: asked with what
+        ``__call__`` kept of the call beside the instance (``_served``) -- its row count.  An adapter whose entry states its
+        form per step shape keeps the shape of the operands it handed the entry and asks with that: what the log then
+        shows is the call, whatever the row says."""
+        return self._stated(entry, call)
 
     def _served_form(self) -> tuple:
         """The fields the call log reads from the instance that served the last call: those of the row's form.  An adapter
@@ -525,7 +533,7 @@ class GdnVerifyFusedBlock(EntryBlock):
         reserve = getattr(self.model, "first_launch_reserve", {})
         return int(reserve.get(f"cc{self.facts.cc[0]}.x", 0))
 
-    def _build(self, device):
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
         import torch
 
         g = self.model.geometry
@@ -598,9 +606,16 @@ class GdnVerifyFusedBlock(EntryBlock):
             p.conv_weight,
         )
 
-    def __call__(self, x, z, hidden, table, params, slots):
-        import torch
+    def _served_stated(self, entry, call) -> dict:
+        """The form the instance states for the step shape of the slot table the last call handed it (``_served``): the
+        ``TOKENS`` of the call log is the tokens per sequence of that table -- read from the call, where the row's own
+        field asked back would say nothing about it."""
+        return entry.form_for(*call)
 
+    def _held(self, table) -> None:
+        """A call's slot table against the row, before anything is launched: the table of a step of several tokens per
+        sequence, at the row's ``TOKENS``.  Anything else is a ``ValueError``: the wiring hands the block a step its row
+        does not name."""
         if not isinstance(table, TokenSlots):
             raise ValueError(
                 f"cudnn.GdnVerifyFused takes the slot table of a step of several tokens per sequence; this block is handed {type(table).__name__}: "
@@ -610,8 +625,15 @@ class GdnVerifyFusedBlock(EntryBlock):
             raise ValueError(
                 f"provider row {self.row.key}: its form says {VERIFY_TOKENS} {self._tokens()}; the step hands it a slot table of {table.tokens} tokens per sequence"
             )
+
+    def __call__(self, x, z, hidden, table, params, slots):
+        import torch
+
+        self._held(table)
         entry, rows = self._build(x.device), int(x.shape[0])
-        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        # what the call log of a traced step reads back (``serving``): the instance, and the step shape of the slot table it is
+        # handed with this call -- its ``state_indices`` operand, [sequences, tokens] -- not the row's
+        self._served = (entry, tuple(int(n) for n in table.indices.shape))
         out = torch.empty((rows, params.value_heads, params.head_dim), dtype=torch.float8_e4m3fn, device=x.device)  # this call's own
         try:
             entry(*self._operands(x, z, hidden, table, params, slots), out)

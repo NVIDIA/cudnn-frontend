@@ -155,7 +155,7 @@ class Session:
         self.record: Optional[Record] = None
         self.tap = None  # tie_out's hook: tap(block name, layer, block, operands) -> the block's result
         self._followers: tuple = ()  # the sessions that will run on this one's weights, as ``plan_table`` was told
-        self._report = Report(model.name, reduced=bool(getattr(model, "reductions", ())))
+        self._report = Report(model.name, reduced=bool(getattr(model, "reductions", ())), tokens=self.tokens)
         self._calls = 0
         self._prefill_start = 0.0
 
@@ -483,11 +483,14 @@ class Session:
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
         calls = self._report.calls_per_step
-        self._report = Report(self.model.name, reduced=bool(getattr(self.model, "reductions", ())))
+        self._report = Report(self.model.name, reduced=bool(getattr(self.model, "reductions", ())), tokens=self.tokens)
         self._report.calls_per_step = calls
 
     def report(self) -> Report:
-        if hasattr(self.model, "bytes_per_step") and self.state is not None:
+        """The report of this session's run.  The bytes of a step are the family's arithmetic for a decode step (one embedding
+        row, one recurrent state and three history columns per sequence): a session of several tokens per sequence states
+        none, and its report says so, as it does of the first-token line and of the rate (``timing.Report``)."""
+        if hasattr(self.model, "bytes_per_step") and self.state is not None and self.tokens == 1:
             # a block of this session's plan that multiplies on the stored format reads its weight there, not as a copy
             # (asked of a family's model only where the plan has such a block)
             stored = self.stored_weights(own=True)

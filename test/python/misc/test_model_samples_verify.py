@@ -501,6 +501,62 @@ def test_what_a_verify_session_refuses_and_what_a_stream_needs():
     assert (verify.record.count, verify.record.accepted, verify.state.position, verify.state.accepted) == (0, [], 0, 0)
 
 
+def test_two_sessions_on_one_load_keep_two_states_and_a_verify_session_reports_no_decode_step_arithmetic():
+    """A decode session and a verify session share a load, never a state: what the decode session has run is no context of
+    the verify session, which starts at position 0 on a zero state of its own.  And the report of a verify session states
+    its step timings; the first-token line, the rate and the bytes of a step are a decode step's and are not stated."""
+    from model_samples.timing import Report
+
+    decode, verify = _pair(2, 6, steps=12)
+    assert decode.weights is verify.weights and decode.state is not verify.state, "one load, two states"
+    assert (decode.state.position, verify.state.position) == (12, 0), "the 12 decode steps moved the decode session alone"
+    assert not any(bool(t.any()) for layer in verify.state.layers for t in layer.tensors()), "the verify session stands on a zero state"
+    assert any(bool(t.any()) for layer in decode.state.layers for t in layer.tensors())
+    ids = torch.zeros((2, 6), dtype=torch.int32)
+    for kept in (5, 2, 0, 3):
+        verify.read(verify.verify(ids, kept))
+    assert (decode.state.position, verify.state.position) == (12, 14), "and the other way round: 6 + 3 + 1 + 4 positions of the verify session"
+    report = verify.report()
+    assert report.bytes == {} and report.tokens == 6, "the family's bytes of a step are a decode step's: one embedding row and one state slot per sequence"
+    lines = report.text().splitlines()
+    assert "first token           not stated: a session of 6 tokens per sequence prefills nothing (its steps are verify steps)" in lines
+    assert "rate                  not printed for verify steps (6 tokens per sequence a step; how many of them a run keeps is its caller's)" in lines
+    assert "bytes per step        not stated for a verify step (the arithmetic of a step is the decode step's)" in lines
+    steps = [line for line in lines if line.startswith("steps (4) ")]
+    assert len(steps) == 1 and steps[0].endswith("| 27 block calls per step"), "its own steps are timed as steps"
+    assert not any(word in line for line in lines for word in ("prefill route", "tokens per second", " GB (")), "no line of a decode step"
+    verify.new_report()
+    assert verify.report().tokens == 6, "a fresh report is still a verify session's"
+    # the decode session's report is what it was
+    plain = decode.report()
+    assert plain.tokens == 1 and plain.bytes == decode.model.bytes_per_step(2, 12) and plain.bytes["state"] > 0
+    assert "first token           reduced model: prefill route: decode step, 5 tokens x one step; not a time to first token of record" in plain.text()
+    assert "bytes per step        reduced model: model " in plain.text() and "rate                  not printed for a reduced model" in plain.text()
+    # ... and a model that is not reduced prints no rate for verify steps either: four steps are not four tokens
+    timed = Report("qwen_dense", reduced=False, tokens=6)
+    for t in range(4):
+        timed.clock.launch.append(0.1 * t)
+        timed.clock.ids.append(0.1 * t + 0.09)
+    timed.bytes = {"weights": 1, "copies": 2, "state": 3}  # whatever a caller put there
+    text = timed.text()
+    assert (
+        "steps (4)            period 100.000 ms median" in text and "rate                  not printed for verify steps (6 tokens per sequence a step" in text
+    )
+    assert "tokens per second" not in text and "bytes per step        not stated for a verify step" in text and "prefill route" not in text
+    assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in _decode_report().text()
+
+
+def _decode_report():
+    """The same four timed steps on a report of one token per sequence: a decode loop's, with its rate."""
+    from model_samples.timing import Report
+
+    timed = Report("qwen_dense", reduced=False)
+    for t in range(4):
+        timed.clock.launch.append(0.1 * t)
+        timed.clock.ids.append(0.1 * t + 0.09)
+    return timed
+
+
 def test_the_rows_of_the_verify_entry_and_what_every_other_block_does_at_its_row_count():
     from model_samples.qwen_dense import Geometry, QwenDense, configs
 
@@ -591,7 +647,7 @@ class _Entry:
         return ((96 if requests == 1 else 48, requests, 1), (256, 1, 1), 98224 + 3536 * tokens + 7072 * (requests == 1))
 
     def kernel_symbols_for(self, requests, tokens):
-        return (VERIFY_SYMBOL,) if (requests, tokens) in self.compiled else ()
+        return tuple([VERIFY_SYMBOL] if (requests, tokens) in self.compiled else [])
 
     def compile(self, *operands):
         self.compiled.append(tuple(operands[7].shape))
@@ -659,6 +715,27 @@ def test_the_verify_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     with pytest.raises(ValueError, match="takes the slot table of a step of several tokens per sequence; this block is handed Tensor"):
         block(x, z, hidden, torch.ones(6, dtype=torch.int32), params, slots)
     assert len(entry.calls) == 1, "nothing was launched for either"
+    assert block._build("cpu", "linear_attention.qkvz") is entry, "the base hook's signature: a call site is taken and, with one form, not read"
+    # the call log is an observation of the call, not the row's field asked back: with the adapter's own guard taken away, a
+    # slot table of two sequences x three tokens -- the same six rows -- reaches the entry, and the log names its tokens
+    with monkeypatch.context() as unguarded:
+        unguarded.setattr(fe.GdnVerifyFusedBlock, "_held", lambda self, table: None)
+        loose = fe.GdnVerifyFusedBlock(row, model, facts, {"device": "cpu"})
+        other_slots = RecurrentSlots(torch.zeros((rows + 1, 1, 1, 1)), torch.zeros((3, 5, 4), dtype=torch.bfloat16), 3)
+        loose(x, z, hidden, TokenSlots.build(2, 3, "cpu"), params, other_slots)
+        assert tuple(entry.calls[-1][7].shape) == (2, 3) and len(_Entry.built) == 1, "the row's own instance was handed state_indices [2, 3]"
+        served = loose.serving()
+        assert served == ("cudnn.GdnVerifyFused #1", (("PDL", True), ("PDL_RELEASE", True), ("TOKENS", 3))), "the tokens of the table the call handed the entry"
+        site = census.Site("linear_attention.step", 0, tuple(loose.kernels), "cudnn.GdnVerifyFused", tuple(row.form), loose.launch_facts(6))
+        assert census.check_forms([site], [[census.Call("linear_attention.step", 0, 6, *served)]]) == [
+            "linear_attention.step (layer 0): the adapter served the call with the form [PDL True, PDL_RELEASE True, TOKENS 3] (cudnn.GdnVerifyFused #1); "
+            "the row says [PDL True, PDL_RELEASE True, TOKENS 6]"
+        ], "item 0 names it: the launch grid would too, but the log does not wait for a trace"
+        loose(x, z, hidden, table, params, slots)  # the next call, in the row's own step shape: the answer follows the call
+        assert loose.serving()[1] == (("PDL", True), ("PDL_RELEASE", True), ("TOKENS", 6)) and loose.launch_facts(6).form["TOKENS"] == 6
+    with pytest.raises(ValueError, match="its form says TOKENS 6; the step hands it a slot table of 3 tokens per sequence"):
+        loose(x, z, hidden, TokenSlots.build(2, 3, "cpu"), params, other_slots)  # the guard is back: nothing reaches the entry
+    assert len(entry.calls) == 3
     # a row the adapter cannot serve is a wrong table: a field it does not pass, a form without the tokens
     from dataclasses import replace
 
