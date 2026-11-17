@@ -17,7 +17,9 @@ family's step hands the site over as the block's last operand, and the adapter d
 on the stored format of its weight says so (``stored_weights``): the loader then keeps that format, and it keeps the bf16
 copy of that weight only where another block of the run's plans reads one.  An adapter whose entry reads that weight in a
 layout of its own also says how the layout is made (``stored_layout(merged)``, its entry's own load-time helper): the
-loader then keeps the weight in that layout and in no other stored form.
+loader then keeps the weight in that layout and in no other stored form.  An adapter to an entry of a step that feeds
+several tokens per sequence takes the step's slot table where the decode step's adapter takes slot ids
+(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from ..census import Kernel
 #: provider key -> what is called, as the served-by table prints it
 ENTRY_NAMES: Dict[str, str] = {
     "fe.gdn_decode_fused": "cudnn.GdnDecodeFused",
+    "fe.gdn_verify_fused": "cudnn.GdnVerifyFused",
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
     "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
     "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
@@ -119,6 +122,10 @@ class BlockBase:
     #: merged stored tensor in that layout, built once per weight at load; the loader keeps what it returns.  ``None``: the
     #: block multiplies on the merged tensor as the checkpoint stores it
     stored_layout = None
+    #: for a block whose entry states that one sequence alone is NOT byte-equal to the same sequence among several: that
+    #: statement, as a run prints it beside the batch-invariance line and wherever it compares such a block across row
+    #: counts.  Empty: the entry states no such difference
+    batch_note = ""
 
     def __init__(self, row, model, facts, options):
         self.row, self.model, self.facts, self.options = row, model, facts, options
@@ -172,6 +179,7 @@ def factories() -> Dict[str, Callable]:
 
     return {
         "fe.gdn_decode_fused": fe.GdnDecodeFusedBlock,
+        "fe.gdn_verify_fused": fe.GdnVerifyFusedBlock,
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
         "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
         "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,

@@ -48,6 +48,18 @@ whatever the block lines say.  What the copies cost is printed under the checks 
 largest, their bytes in all, the seconds), and the largest one is part of the run's memory sentence.  A run that keeps
 every weight as a copy prints neither line.
 
+**A session whose step feeds several tokens per sequence** (the verify step; ``Session(tokens=T)``) is checked by the same
+five checks on its own steps: the rows of a step are sequences x T, the reference stack runs the same verify steps, the
+reference of the fused verify block is T reference decode steps, each started from the state the kernel left for the
+token before it -- so its line says, token by token, that the state the kernel wrote is one decode step on from the state
+it wrote before, in the band of the decode step and with that band's meaning (a rounding on the other side of a midpoint
+is seen at its token, once; a cell is one value head of one sequence over the tokens of its steps) -- and the one
+sequence that runs alone runs with its T rows.  Where an entry itself states that one sequence alone is not byte-equal to the sequence among several
+(``Block.batch_note``), the batch line carries that statement and gates nothing on the block.  ``verify_checks`` then holds
+such a session against the decode steps of a second session on the same weights: the same token stream through verify
+steps that keep every possible number of tokens once, the greedy tokens of both, and after every step the state the
+verify run stands on against the state of the decode steps of the kept tokens.
+
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
@@ -356,6 +368,14 @@ class BlockTap:
             for t, c in zip(_tensors(h), s):
                 t.copy_(c)
 
+    def _own(self, holder, sequence: int) -> tuple:
+        """Where ``sequence`` lives in each tensor of a state holder: a pool or a cache says so itself (``of``); a plain tensor
+        a call updates in place holds one row per row of the step, the rows of a sequence together."""
+        if hasattr(holder, "of"):
+            return holder.of(sequence)
+        tokens = self.plan.tokens
+        return (slice(sequence * tokens, (sequence + 1) * tokens),) * len(_tensors(holder))
+
     def __call__(self, name, layer, block, operands):
         row, ref = self.plan.rows[name], block.twin(self.reference[name])  # the reference block, or the block's own twin
         independent = type(ref) is not type(block)
@@ -371,17 +391,20 @@ class BlockTap:
         after = self._save(holders)
         if independent:
             self._load(holders, before)
+            if hasattr(ref, "anchor"):  # a reference block that follows a kernel through a step of several tokens: handed what the kernel left
+                ref.anchor = after
             ref_out = ref(*(operands if self.on_demand is None else self.on_demand.operands(operands)))  # a copy made now is dropped here
             self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer, ref)
         if alone:
             s = self.step % self.plan.sequences
+            first, last = s * self.plan.tokens, (s + 1) * self.plan.tokens  # the rows of sequence s in a step: one per token it is fed
             self._load(holders, before)
-            single = [(_rows(o, s, s + 1) if i in block.per_row else o) for i, o in enumerate(operands)]
+            single = [(_rows(o, first, last) if i in block.per_row else o) for i, o in enumerate(operands)]
             alone_out = block(*single)
-            same = bytes_equal(tuple(t[s : s + 1] for t in compared), block.compared(alone_out))
+            same = bytes_equal(tuple(t[first:last] for t in compared), block.compared(alone_out))
             for holder, full, one in zip(holders, after, self._save(holders)):
-                at = s + 1 if hasattr(holder, "conv_storage") else s  # a slot pool keeps sequence s in slot s + 1, a cache in row s
-                same = same and bytes_equal(tuple(t[at] for t in full), tuple(t[at] for t in one))
+                at = self._own(holder, s)  # a slot pool keeps sequence s in slot s + 1 (and in a slot per further token), a cache in row s
+                same = same and bytes_equal(tuple(t[i] for t, i in zip(full, at)), tuple(t[i] for t, i in zip(one, at)))
             stats.batch_calls += 1
             stats.batch_equal += int(same)
         self._load(holders, after)
@@ -442,12 +465,19 @@ class BlockTap:
                 and bool(torch.isfinite(recurrent).all())
                 and bool(torch.isfinite(conv).all())
             )
+            equal_cells, inside_cells = same.view(-1, heads, dim).sum(-1), inside.flatten(2).sum(-1)
+            # a step of several tokens per sequence (the twin says how many its last call had): a cell is still one value head
+            # of one sequence -- one block of the launch grid -- over the tokens of the step; the output rows are sequence by
+            # sequence, the state slots token by token
+            tokens = getattr(twin, "tokens", 1)
+            if tokens > 1:
+                equal_cells, inside_cells = equal_cells.view(-1, tokens, heads).sum(1), inside_cells.view(tokens, -1, heads).sum(0)
             cells = stats.cells.get(layer)
             if cells is None:
-                cells = stats.cells[layer] = _Cells(torch.zeros_like(same.view(-1, heads, dim).sum(-1)), torch.zeros_like(inside.flatten(2).sum(-1)))
-            cells.equal += same.view(-1, heads, dim).sum(-1)
-            cells.inside += inside.flatten(2).sum(-1)
-            cells.calls += 1
+                cells = stats.cells[layer] = _Cells(torch.zeros_like(equal_cells), torch.zeros_like(inside_cells))
+            cells.equal += equal_cells
+            cells.inside += inside_cells
+            cells.calls += tokens  # token steps: a call of a step of several tokens is that many
             stats.cell_bytes[layer] = _smallest(cells.equal, cells.calls * dim, layer)
             stats.cell_state[layer] = _smallest(cells.inside, cells.calls * dim * dim, layer)
             stats.ok = (
@@ -691,6 +721,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     if max_steps is not None:
         steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
+    accepted = list(main.accepted[:steps])  # per step the tokens behind the first that the run kept: 0 for a decode step
     facts = session.plan.facts
     # the weights this run keeps on their stored format alone: the reference's copies are made from their stored bytes, so
     # those must be the bytes of the load -- now, after the run's own steps, and again after the last reference pass
@@ -708,6 +739,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         share=session,
         record_steps=steps,
         on_demand=cost,
+        tokens=session.tokens,
     )
     reference.load()
 
@@ -717,14 +749,14 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     try:
         for t in range(steps):
             tap.step = t
-            session._advance(inputs[t])
+            session._advance(inputs[t], accepted[t])
     finally:
         session.tap = None
     replay_ok = bytes_equal(session.record.logits[:steps], logits) and bytes_equal(session.record.outputs[:steps], ids)
 
     reference.reset(fresh=True)
     for t in range(steps):
-        reference._advance(inputs[t])
+        reference._advance(inputs[t], accepted[t])
     band_units = session.model.logits_band_units  # declared by the family, in its configs.py; None: the token line is reported
     band_units = None if band_units is None else float(band_units)
     ref_logits, ref_ids = reference.record.logits[:steps], reference.record.outputs[:steps]
@@ -743,6 +775,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
             share=session,
             record_steps=steps,
             on_demand=cost,
+            tokens=session.tokens,
         )
         matmul = torch.backends.cuda.matmul
         kept = getattr(matmul, "fp32_precision", None)  # a session with IEEE fp32 accumulation sets it for the process
@@ -750,7 +783,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
             second.load()
             second.reset(fresh=True)
             for t in range(steps):
-                second._advance(inputs[t])
+                second._advance(inputs[t], accepted[t])
         finally:
             if kept is not None:
                 matmul.fp32_precision = kept
@@ -769,6 +802,11 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {'the first ' if steps < main.count else ''}{steps} steps: "
         f"{min(prompt_tokens, steps)} prompt + {max(steps - prompt_tokens, 0)} decode)"
     ]
+    if session.tokens > 1:  # the steps of this session are verify steps: no prompt goes through them one token at a time
+        lines = [
+            f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''} x {session.tokens} tokens per sequence, "
+            f"{'the first ' if steps < main.count else ''}{steps} verify steps; tokens kept behind the first: {', '.join(str(count) for count in accepted)})"
+        ]
     lines.append(f"  replay            ids and logits byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     inside = sum(s.ok for s in judged.values())
     if judged:
@@ -799,6 +837,10 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         verdict = _verdict(batch_ok) if gated else "REPORTED"
         rotation = f"one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences})"
         lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
+        for name in tap.stats:  # what an entry itself states about one sequence alone and among several: printed beside the line
+            note = getattr(session.plan[name], "batch_note", "")
+            if note:
+                lines.append(f"    {name}: {note}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
     if alone:  # said only where the run keeps a weight without its bf16 copy: whether the reference's copies were made from the load's bytes
@@ -812,3 +854,187 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     session.reset(fresh=True)
     ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
     return Checks(lines, ok, len(judged), status, unobserved, cost)
+
+
+@dataclass
+class Stream:
+    """The token stream of a run of decode steps, kept for a comparison: per step the ids fed, the logits and the greedy
+    ids of every sequence."""
+
+    inputs: torch.Tensor  # [steps, sequences] int32
+    logits: torch.Tensor  # [steps, sequences, vocabulary] bf16
+    outputs: torch.Tensor  # [steps, sequences] int32
+
+    @classmethod
+    def of(cls, decode: Session, max_steps: Optional[int] = None) -> "Stream":
+        """What ``decode`` -- a session of one token per sequence -- has recorded of its run so far: copies, so that the
+        session can go on (its own checks reset it)."""
+        if decode.tokens != 1:
+            raise ValueError("a token stream is the record of decode steps: of a session of one token per sequence")
+        record = decode.record
+        steps = min(record.count, record.inputs.shape[0], *(() if max_steps is None else (max_steps,)))
+        return cls(record.inputs[:steps].clone(), record.logits[:steps].clone(), record.outputs[:steps].clone())
+
+    @property
+    def steps(self) -> int:
+        return int(self.inputs.shape[0])
+
+
+def accept_schedule(tokens: int, steps: int) -> List[Tuple[int, int]]:
+    """The verify steps that cover a token stream of ``steps`` decode steps at ``tokens`` tokens per sequence, as ``(first
+    token of the step in the stream, tokens kept behind the first)``: the kept counts go 0, 1, .., tokens - 1 and round
+    again, each step starting where the kept tokens of the one before it end, for as long as a whole step fits.
+    ``ValueError`` for a stream too short to keep every count once."""
+    schedule, start = [], 0
+    while start + tokens <= steps:
+        kept = len(schedule) % tokens
+        schedule.append((start, kept))
+        start += kept + 1
+    if len(schedule) < tokens:
+        need = tokens * (tokens - 1) // 2 + tokens
+        raise ValueError(
+            f"a comparison that keeps every count of tokens from 0 to {tokens - 1} once needs a stream of {need} decode steps at {tokens} tokens "
+            f"per sequence; this one has {steps}"
+        )
+    return schedule
+
+
+#: the blocks in front of a model's first mixer: where each is the same row of the table in two plans and that row states that
+#: a row alone is the row in a batch on the GPU class (``batch_invariant``), the two plans feed that mixer the same bytes
+FRONT_BLOCKS = ("embedding", "add_norm_quantize", "projection.fp8.in")
+
+
+def _first_layer_fed_alike(session: Session, decode: Session) -> bool:
+    """Whether the first layer's mixer is fed the same bytes by both sessions by the table's own statements: every block in
+    front of it is the same provider row in both plans, and -- unless it is the embedding lookup -- a row that gates batch
+    invariance on this GPU class (its bytes do not move with the row count)."""
+    cc = session.plan.facts.cc
+    cls = f"cc{cc[0]}.{cc[1]}"
+    for name in FRONT_BLOCKS:
+        mine, theirs = session.plan.rows.get(name), decode.plan.rows.get(name)
+        if mine is None or theirs is None or mine.key != theirs.key or mine.fallback != theirs.fallback:
+            return False
+        if name != FRONT_BLOCKS[0] and not (cls in mine.batch_invariant and cls in theirs.batch_invariant):
+            return False
+    return True
+
+
+def verify_checks(session: Session, decode: Session, stream: Optional[Stream] = None) -> Checks:
+    """The verify steps of ``session`` (several tokens per sequence) against the decode steps of ``decode``: a session of
+    one token per sequence, for the same sequences, on the same weights, whose run is the token stream both are fed
+    (``stream``; default: what ``decode`` has recorded).
+
+    The stream goes through ``session`` in verify steps (:func:`accept_schedule`): each is fed ``tokens`` tokens of the
+    stream per sequence and keeps 0, 1, .., ``tokens - 1`` of them behind the first in turn, so every count is kept at
+    least once and every step after the first starts from a state a partial keep left.  Every row of every step is a
+    token of the stream given the stream in front of it, so each is compared with the decode step of the same token:
+
+    * **tokens** -- the greedy token and the logits of every row against the decode step's, by the family's declared logits
+      band (:func:`token_check`; REPORTED where the family declares none).  The two runs are not byte-equal by
+      construction: a block that is called at another row count may take another kernel, and the entry of the verify
+      step states its own difference (below).
+    * **kept state** -- after every step, what the verify run stands on (``DecodeState.standing``) against the state of
+      the decode steps of the kept tokens.  A linear-attention layer whose three history taps are the same bytes in both
+      runs at every comparison was fed the same rows by both, so there the two kernels are what is compared: its
+      recurrent state is gated by the state rule of band ``gdn_step`` (the share within the band, the cap, finite).
+      A layer whose taps differ was fed other rows -- a block in front of it rounds otherwise at another row count --
+      and its distance is printed, not gated: that every token's state is the state of that many decode steps on the
+      SAME rows is the block line of the session's own checks, in every layer.  The caches of the attention layers
+      are printed likewise.  With no layer gated the line is REPORTED, never PASS.  One layer cannot be excused that
+      way: where the model's first layer is a linear-attention layer and every block in front of it is the same
+      row-wise kernel in both plans (the same provider row, gated on batch invariance on this GPU class), both runs
+      feed it the same bytes by the table's own statements -- taps that differ there mean that the verify run does
+      not stand where its kept tokens end, and the line FAILS.
+    * what the entry of the verify block states about one sequence alone and among several (``Block.batch_note``), where
+      it states something.
+
+    The verify session keeps the steps of the schedule as its record -- its own checks (``run_checks``) and its traced
+    pass then run on them -- and ``decode`` is left reset."""
+    tokens, sequences = session.tokens, session.sequences
+    if tokens == 1 or decode.tokens != 1:
+        raise ValueError("verify_checks compares a session of several tokens per sequence (tokens=) with a session of one token per sequence")
+    if decode.sequences != sequences or decode.weights is not session.weights or decode.weights is None:
+        raise ValueError("verify_checks compares two sessions of the same sequences on one load (share=), both loaded")
+    stream = Stream.of(decode) if stream is None else stream
+    schedule = accept_schedule(tokens, stream.steps)
+    if len(schedule) > session.record_steps:
+        raise ValueError(f"the verify session records {session.record_steps} steps; this comparison makes {len(schedule)} (record_steps=)")
+    session.reset(fresh=True)
+    decode.reset(fresh=True)
+    linear = [i for i, kind in enumerate(session.model.geometry.layer_kinds) if kind == "linear_attention"]
+    same_rows = {i: True for i in linear}  # the layers whose history taps were byte-equal at every comparison so far
+    compared = {i: [] for i in linear}  # per layer and comparison: (elements inside the band, elements, largest distance, within the cap, finite, kept)
+    cache_equal, cache_units, layers = {}, 0.0, len(session.model.geometry.layer_kinds)
+    verify_logits, decode_logits, verify_ids, decode_ids = [], [], [], []
+    for start, kept in schedule:
+        ids = stream.inputs[start : start + tokens].t().contiguous()  # [sequences, tokens]: the stream's tokens of this step
+        verify_ids.append(session.verify(ids, kept))
+        verify_logits.append(session.record.logits[session.record.count - 1].clone())
+        steps = stream.logits[start : start + tokens]  # [tokens, sequences, vocabulary] -> the step's row order, sequence by sequence
+        decode_logits.append(steps.transpose(0, 1).reshape(sequences * tokens, -1))
+        decode_ids.append(stream.outputs[start : start + tokens].t())
+        while decode.state.position < start + kept + 1:
+            decode._advance(stream.inputs[decode.state.position])
+        for i, (mine, theirs) in enumerate(zip(session.state.standing(), decode.state.standing())):
+            if i in compared:
+                (state, taps), (ref_state, ref_taps) = mine, theirs
+                same_rows[i] = same_rows[i] and bytes_equal(taps, ref_taps)
+                distance = (state - ref_state).abs() / max(1.0, float(ref_state.abs().amax()))
+                inside = distance <= GDN_STATE_BAND  # False for a NaN
+                finite = bool(torch.isfinite(state).all())
+                compared[i].append((int(inside.sum()), distance.numel(), float(distance.amax()), bool((distance <= GDN_STATE_CAP).all()), finite, kept))
+            else:
+                equal = bytes_equal(mine, theirs)
+                cache_equal[i] = cache_equal.get(i, True) and equal
+                if not equal:  # caches of two lengths: the two runs do not stand at the same position
+                    units = [float(bf16_units(a, b).amax()) if a.shape == b.shape else float("inf") for a, b in zip(mine, theirs)]
+                    cache_units = _largest(cache_units, max(units))
+    a, r = torch.cat(verify_logits), torch.cat(decode_logits)
+    ids_a, ids_r = torch.cat([ids.reshape(-1) for ids in verify_ids]), torch.cat([ids.reshape(-1) for ids in decode_ids])
+    band_units = session.model.logits_band_units
+    band_units = None if band_units is None else float(band_units)
+    tokens_ok, tokens_text = token_check(a, r, ids_a, ids_r, band_units)
+    tokens_text = tokens_text.replace("equal to the reference;", "equal;")  # of this comparison: the decode steps, named in front
+    tokens_text = f"{int((ids_a == ids_r).sum())} of {ids_a.numel()} greedy tokens equal to those of the decode steps of the same tokens; " + tokens_text
+
+    def worst(layers_of) -> Tuple[float, str]:
+        found = [(largest, f"layer {i}, after keeping {kept}") for i in layers_of for _, _, largest, _, _, kept in compared[i]]
+        return max(found, key=lambda item: (math.isnan(item[0]), item[0]), default=(0.0, "no layer"))
+
+    gated = [i for i in linear if same_rows[i]]
+    loose = [i for i in linear if not same_rows[i]]
+    # the first layer, where the table itself says that both runs feed it the same bytes: other taps there are no rounding
+    astray = bool(linear) and linear[0] == 0 and not same_rows[0] and _first_layer_fed_alike(session, decode)
+    inside = sum(count for i in gated for count, *_ in compared[i])
+    elements = sum(total for i in gated for _, total, *_ in compared[i])
+    # with no layer gated nothing is judged here: the line is then REPORTED and fails nothing
+    state_ok = not gated or (all(within and finite for i in gated for _, _, _, within, finite, _ in compared[i]) and inside > GDN_STATE_SHARE * elements)
+    state_ok = state_ok and not astray
+    text = (
+        f"after each step, the state of the kept tokens against the state of that many decode steps: {len(gated)} of {len(linear)} linear-attention "
+        f"layers were fed the same rows by both runs (their history taps byte-equal at every comparison)"
+    )
+    if gated:
+        text += f": recurrent state {inside / max(elements, 1):.4%} within {GDN_STATE_BAND:g}, largest distance {worst(gated)[0]:.1e} ({worst(gated)[1]})"
+    if loose:
+        text += f"; in the {len(loose)} fed other rows, largest distance {worst(loose)[0]:.1e} ({worst(loose)[1]}; printed, not gated)"
+    if astray:
+        text += (
+            "; LAYER 0 IS FED THE SAME BYTES BY BOTH RUNS (the same row-wise kernels in front of it) AND ITS HISTORY TAPS DIFFER: "
+            "the verify run does not stand where its kept tokens end"
+        )
+    if cache_equal:
+        text += f"; cached keys and values byte-equal in {sum(cache_equal.values())} of {len(cache_equal)} attention layers"
+        text += f", largest distance {cache_units:.2f} bf16 units (printed, not gated)" if not all(cache_equal.values()) else ""
+    counts = ", ".join(str(kept) for _, kept in schedule)
+    lines = [
+        f"verify against decode ({sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence, {len(schedule)} verify steps over "
+        f"{schedule[-1][0] + tokens} tokens of a run of {stream.steps} decode steps; tokens kept behind the first: {counts}; {layers} layers)"
+    ]
+    lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
+    lines.append(f"  kept state        {text}    {(_verdict(state_ok) if gated or astray else 'REPORTED')}")
+    for name, block in session.plan.items():
+        if getattr(block, "batch_note", ""):
+            lines.append(f"    {name}: {block.batch_note}")
+    decode.reset(fresh=True)
+    return Checks(lines, tokens_ok and state_ok, len(gated))

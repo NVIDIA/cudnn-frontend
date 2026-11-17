@@ -1,10 +1,11 @@
 {
   "schema": 2,
   "about": [
-    "The target kernel set of a plain decode step of the dense Qwen 3.5-architecture model: per block call of a step the kernel a stack that reproduces the set launches, in step order.",
+    "The target kernel set of a decode step of the dense Qwen 3.5-architecture model: per block call of a step the kernel a stack that reproduces the set launches, in step order. Two configurations: 'plain', the step of one token per sequence, and 'verify', the step of speculative decoding that feeds several tokens per sequence at once (the token kept last and the tokens drafted behind it) and keeps a recurrent state per token.",
     "kernels: per kernel id what it is, where it comes from and how it stands to the target -- 'target' of kind 'code' (the target's own compiled kernel: an entry, a library call or a framework operator called as the target calls it) or of kind 'port' (a kernel whose home is cuDNN Frontend: an entry that reproduces the target kernel's results byte for byte), or 'stand-in' (a declared replacement for an operation that lives inside a serving engine). 'entry' is null until a stack of this repository calls an entry for the kernel; with an entry comes 'form': what the target passes to it and, for a field only the port has, the value the port's byte comparison ran with ('differences' then says what the target kernel does there).",
     "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file: 'tie_out' says where that comparison stands and on which GPU class it was made, 'differences' what differs from the target's kernel besides its results. A port without an entry here has neither yet.",
     "A kernel the target calls in several forms has, on each entry of a section, 'form': the fields of its form at that call beyond the form it has everywhere (for a multiply the shape of the weight it is called with there; for a kernel whose form follows the row count, the field of the section's row count); 'first_layer' names what differs at a block's first call in the model's first layer.",
+    "A section of 'verify' names 'tokens', the tokens per sequence it was recorded with, and holds for that count alone: the fused verify kernel is compiled per count, and its entry there names it ('form': TOKENS). Its row count is sequences x tokens. The drafter's own launches are not part of a section: it holds the launches of the verify step and of the output head behind it.",
     "configurations: per GPU class and SM count one section. 'geometry' is the layer widths of the model the section holds for; a model with other widths has no section. 'launch' is [grid, block, shared memory in bytes] of one launch at the section's row count; 'at' names further fields of the geometry that one launch shape was recorded with. A section is 'recorded' (launch records of the target on that class) or 'planned' (derived, never claimed); 'claimed' is false until a stack launches every kernel of the section.",
     "The numbers of a section are three, never one: of its launches per step, how many are the target's own compiled kernels (code), how many cuDNN Frontend entries with byte-equal results (port), how many declared stand-ins. They count what a complete stack launches: a port is counted whether or not its entry is called by a stack yet.",
     "A change of a form this file names changes this file in the same commit."
@@ -43,6 +44,7 @@
         "on the host: typed declines, an output the caller owns, 1 to 32 rows per call, the weight's shape a field of the form (served here: 16384 x 5120 and 14336 x 5120)"
       ]},
     "gdn_decode_fused": {"what": "fused linear-attention decode step", "origin": "cuDNN Frontend", "relation": "target", "kind": "code", "entry": "cudnn.GdnDecodeFused", "form": {"PDL": true, "PDL_RELEASE": true}},
+    "gdn_verify_fused": {"what": "fused linear-attention verify step: several tokens per sequence in one launch, the recurrent state after every token in a slot of its own", "origin": "cuDNN Frontend", "relation": "target", "kind": "code", "entry": "cudnn.GdnVerifyFused", "form": {"PDL": true, "PDL_RELEASE": true}},
     "cublaslt_fp8_gemm": {"what": "8-bit out-projection of a layer", "origin": "cuBLASLt through FlashInfer", "relation": "target", "kind": "code", "entry": null, "selection": "the library's tuner chooses the kernel: a pick is recorded and never gated, so no launch shape is held here"},
     "attention_prepare": {"what": "attention preparation: norm, rotary embedding, cache insert", "origin": "Triton", "relation": "target", "kind": "code", "entry": null},
     "fi_decode_attention": {"what": "attention core over a paged cache", "origin": "FlashInfer", "relation": "target", "kind": "code", "entry": null},
@@ -110,6 +112,59 @@
             ],
             "epilogue": [
               ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": null}, "launch": [[1, 1, 1], [640, 1, 1], 80]}]
+            ],
+            "after_step": [
+              ["output_head.quantize", "fi_fp4_quantize", {}],
+              ["output_head", "fi_mm_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424], "at": {"vocab": 248320}}]
+            ]
+          }
+        }
+      }
+    },
+    "verify": {
+      "cc10.0/sm148": {
+        "claimed": false,
+        "basis": "recorded",
+        "tokens": 6,
+        "recorded": {
+          "date": "2026-11-12",
+          "gpu": "compute capability 10.0, 148 SMs",
+          "sequences": 1,
+          "tokens": 6,
+          "steps": 5,
+          "layers": [48, 16],
+          "max_model_len": 2051
+        },
+        "geometry": {"hidden": 5120, "mlp": 17408, "la_key_heads": 16, "la_value_heads": 48, "la_head_dim": 128, "attn_heads": 24, "attn_kv_heads": 4, "attn_head_dim": 256},
+        "numbers": {"launches": 484, "code": 162, "port": 321, "stand_in": 1},
+        "rows": {
+          "6": {
+            "prologue": [
+              ["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]
+            ],
+            "first_layer": {"add_norm_quantize": {"form": {"ADD": false, "STORE_RESIDUAL": true}}},
+            "linear_attention_layer": [
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": "e4m3_static"}, "launch": [[6, 1, 1], [640, 1, 1], 80]}],
+              ["projection.fp8.in", "fp8_projection", {"form": {"OUT_FEATURES": 16384, "IN_FEATURES": 5120}, "launch": [[128, 1, 1], [256, 1, 1], 139520]}],
+              ["linear_attention.step", "gdn_verify_fused", {"form": {"TOKENS": 6}, "launch": [[96, 1, 1], [256, 1, 1], 126512]}],
+              ["projection.fp8.out", "fp8_projection", {"form": {"OUT_FEATURES": 5120, "IN_FEATURES": 6144, "SPLIT_K": 2, "MMA_M": 64, "STAGES": 11}, "launch": [[80, 2, 1], [256, 1, 1], 103808]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "nvfp4"}, "launch": [[6, 1, 1], [640, 1, 1], 80]}],
+              ["mlp.gate_up", "swiglu_fp4", {"form": {"TOKEN_TILE": 8}, "launch": [[1, 1, 148], [192, 1, 1], 231424]}],
+              ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
+            ],
+            "attention_layer": [
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "e4m3_static"}, "launch": [[6, 1, 1], [640, 1, 1], 80]}],
+              ["projection.fp8.in", "fp8_projection", {"form": {"OUT_FEATURES": 14336, "IN_FEATURES": 5120}, "launch": [[112, 1, 1], [256, 1, 1], 139520]}],
+              ["attention.prepare", "attention_prepare", {"launch": [[6, 28, 1], [128, 1, 1], 16]}],
+              ["attention.core", "fi_decode_attention", {"launch": [[30, 4, 1], [512, 1, 1], 178456]}],
+              ["attention.gate_quantize", "gate_quant", {"launch": [[18, 1, 1], [256, 1, 1], 0]}],
+              ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "nvfp4"}, "launch": [[6, 1, 1], [640, 1, 1], 80]}],
+              ["mlp.gate_up", "swiglu_fp4", {"form": {"TOKEN_TILE": 8}, "launch": [[1, 1, 148], [192, 1, 1], 231424]}],
+              ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
+            ],
+            "epilogue": [
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": null}, "launch": [[6, 1, 1], [640, 1, 1], 80]}]
             ],
             "after_step": [
               ["output_head.quantize", "fi_fp4_quantize", {}],

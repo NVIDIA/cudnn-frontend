@@ -31,7 +31,15 @@ process: a kernel loaded where an unloaded one had been was recorded under the u
 kernels loaded and unloaded in turn: about every second launch; none where every module stayed loaded; PyTorch 2.13.0).
 The kernel that runs is the right one; its record's name is not.  A sample process unloads nothing, a test session does:
 the cells of this module drop the sample's modules, and with them the entries of the stack that ran before.  Run in this
-process after the default cell, the kernel check failed one run in three by the name of the fused step alone."""
+process after the default cell, the kernel check failed one run in three by the name of the fused step alone.
+
+The verify cells run the step that feeds several tokens per sequence at once (``Session(tokens=T)``, ``Session.verify``): no
+script reaches it, so a small program drives the helper layer in a fresh interpreter -- a decode session and a verify
+session of the stack ``fe-entries`` on one load of the reduced seeded model; the decode run's token stream through verify
+steps that keep every possible number of tokens once, against the decode steps (``tie_out.verify_checks``); then the
+verify session's own checks with its kernel check (``tie_out.run_checks``).  The fused verify entry is judged, token by
+token, against reference decode steps; its launch against the entry's own facts and, at one sequence of six tokens on a
+GPU the census has a section for, against the recorded launch shape."""
 
 import importlib.util
 import os
@@ -239,3 +247,135 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
 def test_four_layer_run_passes_its_own_checks(sample, capsys):
     out = _run(sample, capsys, ["--layers", "4"])
     assert "4 of 64 layers (3 linear-attention + 1 attention)" in out and "34 block calls per step" in out
+
+
+VERIFY_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import census, tie_out
+from model_samples.qwen_dense import QwenDense
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+model = QwenDense.reduced()
+text = model_samples.TextIO.synthetic(model.geometry.vocab)
+common = dict(stack="fe-entries", device="cuda:0", capacity=40)
+decode = model_samples.Session(model, text, sequences={sequences}, **common)
+verify = model_samples.Session(model, text, sequences={sequences}, tokens={tokens}, share=decode, **common)
+try:
+    say(decode.plan_table([verify]))
+    say(verify.resolve().table())
+    say(census.table(verify.plan, verify.claim()))
+except NotImplementedError as error:
+    say(f"[verify] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[verify] {{model_samples.check_environment().header()}}")
+decode.load()
+verify.load()
+generator = torch.Generator().manual_seed(0)
+ids = decode.prefill([torch.randint(0, model.geometry.vocab, (8,), generator=generator, dtype=torch.int32) for _ in range({sequences})])
+for _ in range(23):
+    ids = decode.step(ids)
+against = tie_out.verify_checks(verify, decode)
+say(against.text())
+verify.trace(32)
+own = tie_out.run_checks(verify, prompt_tokens=0)
+say(own.text())
+passed = against.ok and own.ok
+if passed and own.unobserved:
+    say(f"[verify] RAN fe-entries stack (kernels not observed: {{own.unobserved}})")
+else:
+    say("[verify] PASS" if passed else "[verify] FAIL")
+raise SystemExit(0 if passed else 1)
+"""
+
+
+def _verify(sequences, tokens):
+    """A decode session and a verify session of ``tokens`` tokens per sequence in a fresh interpreter (``VERIFY_PROGRAM``):
+    the run's lines.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
+    import cudnn
+
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    program = VERIFY_PROGRAM.format(
+        deadline=CHILD_SECONDS - 60,
+        package_root=str(Path(cudnn.__file__).resolve().parent.parent),
+        cudnn_file=cudnn.__file__,
+        models=str(MODELS),
+        sequences=sequences,
+        tokens=tokens,
+    )
+    start = time.perf_counter()
+    try:
+        done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=CHILD_SECONDS)
+    except subprocess.TimeoutExpired as late:
+        shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
+        pytest.fail(
+            f"the verify run did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}"
+        )
+    out = done.stderr
+    tagged = [line for line in out.splitlines() if line.startswith("[verify] ")]
+    verdict = tagged[-1] if tagged else f"no verdict (exit code {done.returncode})"
+    versions = next((line[9:] for line in tagged if line.startswith("[verify] cuDNN Frontend ")), "no environment line")
+    key = f"model sample qwen_dense verify step, {sequences} x {tokens} tokens, stack fe-entries"
+    frost_routing.measured(key, f"{verdict}; {versions}; {time.perf_counter() - start:.0f} s")
+    assert done.stdout == "", f"a run of the helper layer writes nothing to standard output; it holds\n{done.stdout[-3000:]}"
+    if verdict.startswith("[verify] SKIP"):
+        assert " FAIL" not in out, out[-6000:]  # a skip never covers a failed check
+        pytest.skip(verdict)
+    held = verdict == "[verify] PASS" or verdict.startswith("[verify] RAN fe-entries stack (kernels not observed: ")
+    assert done.returncode == 0 and held and " FAIL" not in out, out[-8000:]
+    return out
+
+
+def _verify_asserts(out, sequences, tokens):
+    several = f"{sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence"
+    assert f"stack fe-entries, {several}" in out, "the plan of a step of several tokens per sequence"
+    assert f"cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS {tokens}]" in out, "the fused verify entry in the target's form, its tokens a field of it"
+    assert f"verify against decode ({several}, " in out
+    rows = [line for line in out.splitlines() if line.startswith("  tokens  ")]
+    assert len(rows) == 2 and all(line.endswith("    PASS") for line in rows), "against the decode steps, and against the reference stack's verify steps"
+    kept = next(line for line in out.splitlines() if line.startswith("  kept state  "))
+    assert kept.endswith(("    PASS", "    REPORTED")), kept
+    judged = [line for line in out.splitlines() if line.split()[:1] == ["linear_attention.step"] and "[band: gdn_step]" in line]
+    assert len(judged) == 1 and judged[0].endswith("[band: gdn_step]  PASS") and "conv history equal; null slot untouched" in judged[0]
+    assert "byte-identical on a second run from a fresh state    PASS" in out
+    assert (
+        "cudnn.GdnVerifyFused states replay-identical bytes and no batch invariance between one sequence and several" in out
+    ), "what the entry states is printed"
+    observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
+    frost_routing.measured(
+        f"model sample qwen_dense verify step, {sequences} x {tokens} tokens: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
+    )
+
+
+@pytest.mark.L0
+def test_a_verify_step_on_the_fe_entries_stack_is_the_decode_steps_of_its_tokens_and_passes_its_kernel_check():
+    """One sequence of six tokens: the step shape the census of the target has a recorded section for on compute capability
+    10.0 with 148 SMs.  The decode run's 32 tokens go through verify steps that keep 0 to 5 tokens in turn; every row is
+    compared with the decode step of its token, the state of the kept tokens with the decode steps' state, the verify
+    entry token by token with reference decode steps, and every launch of the traced verify steps with the plan."""
+    out = _verify(1, 6)
+    _verify_asserts(out, 1, 6)
+    assert "tokens kept behind the first: 0, 1, 2, 3, 4, 5" in out, "every number of tokens is kept once"
+    assert "batch invariance  not applicable at 1 sequence" in out
+
+
+@pytest.mark.L1
+def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_tokens():
+    """Four sequences of six tokens, the last step shape the row of six tokens claims: one thread block per value head and
+    sequence, and in the batch-invariance check one sequence alone with its six rows -- for which the verify entry takes
+    another form, as its determinism row says (printed, never gated)."""
+    out = _verify(4, 6)
+    _verify_asserts(out, 4, 6)
+    assert "batch invariance  one sequence alone vs among 4 (step t: sequence t mod 4)" in out
+    assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"

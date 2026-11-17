@@ -260,13 +260,17 @@ class Plan(dict):
                 measured += "; unverified in CI"
             lines.append((name, self.calls.get(name, ""), block.provider, block.entry, row.serves, measured))
         widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
-        run = f"stack {self.stack}, {self.sequences} sequence{'s' if self.sequences > 1 else ''}, {self.facts.class_text}"
+        run = f"stack {self.stack}, {self.sequences} sequence{'s' if self.sequences > 1 else ''}{self.tokens_text()}, {self.facts.class_text}"
         text = [f"served by (decided before the load from {self.source}; {run})"]
         text += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in lines]
         text.append("  " + self.by_provider())
         if self.regime is not None:
             text.append(f"  declared regime: {self.regime.name} ({self.regime.note})")
         return "\n".join(text)
+
+    def tokens_text(self) -> str:
+        """`` x 6 tokens per sequence`` for a plan of a step that feeds several; nothing for a plan of the decode step."""
+        return f" x {self.tokens} tokens per sequence" if self.tokens > 1 else ""
 
     def reserve_bytes(self) -> int:
         return sum(block.reserve_bytes() for block in self.values())
@@ -323,6 +327,8 @@ def select_row(
         if row.serves_class(facts.cc) and row.serves_model(model) and row.serves_run(sequences, tokens):
             return row
     first = candidates[0]
+    if tokens > 1:  # a step of several tokens per sequence: a decline is named by the block's rows for such a step, where it has some
+        first = next((r for r in candidates if r.tokens[0] > 1), first)
     of_class = [r for r in candidates if r.serves_class(facts.cc)]
     if not of_class:
         raise NotImplementedError(f"{entry_name(first.key)} serves {first.classes_text()}; this device is {facts.cc[0]}.{facts.cc[1]}")
@@ -330,6 +336,9 @@ def select_row(
         narrow = of_class[0]
         has = f"this model has {narrow.widths_text(model)}" if model is not None else "this plan names no model"
         raise NotImplementedError(f"{entry_name(narrow.key)} serves {narrow.widths_text()}; {has}")
+    if tokens > 1:  # ... by the row of the run's tokens count, else by the last of them
+        several = [r for r in of_class if r.serves_model(model) and r.tokens[0] > 1]
+        first = next((r for r in several if _inside(r.tokens, tokens)), several[-1] if several else first)
     raise NotImplementedError(f"{entry_name(first.key)} serves {first.serves}; this run has {sequences} sequences x {tokens} tokens per sequence")
 
 

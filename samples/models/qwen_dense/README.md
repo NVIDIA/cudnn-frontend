@@ -742,6 +742,115 @@ it as `draft_vocab=`. The loader has run on the CPU and on one GPU class, comput
 run on is uncovered, not passing. And the 8-bit weights are held to the rule above, not to the weights another
 implementation makes of the same checkpoint: no such comparison is part of this repository.
 
+## The verify step
+
+Speculative decoding drafts a few tokens ahead and lets the model check them in one step: every sequence is fed the
+token it kept last and the tokens drafted behind it -- `T` tokens per sequence at once -- and the step returns, for
+each of them, the greedy token that follows it. A run keeps the drafted tokens up to the first one the model would
+not have chosen, and goes on from there. This section is that step, the model's side of speculative decoding. Nothing
+drafts yet (the section above loads the drafter and runs nothing), so no script runs a verify step: it is reached
+from the helper layer, and the caller names the tokens it is fed and how many of them are kept.
+
+```python
+decode = Session(model, text, sequences=1, stack="native")                          # one token per sequence: the decode step
+verify = Session(model, text, sequences=1, stack="native", tokens=6, share=decode)  # six: the verify step, on the same load
+print(decode.plan_table([verify]), file=sys.stderr)   # both plans before the load: nothing declines after it
+decode.load()
+verify.load()
+next_ids = verify.verify(ids, accept)                 # ids [sequences, 6] -> next ids [sequences, 6], on the GPU
+```
+
+`Session(tokens=T)` resolves the provider table for `T` tokens per sequence; the rows of a step are `sequences x T`,
+sequence by sequence. `verify(ids, accept)` is one such step: `next_ids[i, t]` is the greedy token after token `t` of
+sequence `i`, given the tokens in front of it. `accept` is how many of the tokens behind the first the run keeps,
+`0` to `T - 1` -- one number for the fixed set of sequences, so that the attention caches keep one position; the
+next step then goes on `accept + 1` positions later. Which tokens to keep is the caller's rule: the method compares
+nothing, reads nothing to the host and copies nothing. A session of several tokens per sequence has no `prefill` and
+no `step`: the decode step is a row of another plan, and a run that needs both has two sessions on one load, planned
+together, as above.
+
+**The state.** The recurrent state after EVERY token of a step is written to a slot of its own, so the next step can
+start from whichever token the run kept, with nothing copied. The slots are numbered token by token -- sequence `i`,
+token `t` owns slot `1 + t x sequences + i` -- so token 0 of a sequence is its plain slot `i + 1`, and the layout of
+one token per sequence is this layout at `T = 1`. The conv history of a sequence holds `T + 2` columns in its plain
+slot: a step reads its three taps where the last step left them and writes the last two of them followed by its own
+`T` rows. Keeping `n` tokens moves one number on the host; the kernel reads it from a constant table. An attention
+layer inserts `T` positions per sequence, and token `t` attends up to its own.
+
+**Who serves it.** The block `linear_attention.step` is served by `fe.gdn_verify_fused`, `cudnn.GdnVerifyFused`: one
+launch per layer for all tokens of all sequences. The step shape is a compile-time fact of that kernel, so the table
+has one row per tokens count, 2 to 8, with `TOKENS` as a field of the form, for 1 to 16 sequences below six tokens
+per sequence and 1 to 4 from six -- the step shapes the target runs on this kernel; eight tokens is what every form
+of the entry holds on the classes it serves. A step shape beyond these is declined before the load, by name:
+`cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per
+sequence`. In the stacks `native` and `fe-entries` the row is the target's form, `[PDL True, PDL_RELEASE True, TOKENS
+T]`: a dependent launch that waits for the in-projection only before it reads that launch's rows, and releases its
+successor at entry. In `fe-cublas` it is `[PDL False, PDL_RELEASE False, TOKENS T]`. Neither the launch knobs nor the
+tokens are in the kernel's name, which is cut in front of them: the form on the objects shows them, and the shared
+memory of a thread block follows the tokens (126,512 B at six tokens and one sequence on compute capability 10.0).
+
+Every other block is the row its own ranges give at `sequences x T` rows, as at any other row count. At one sequence
+of six tokens the norm entry, the in-projection entry (compute capability 10.0), the fused gate / up entry (the
+8-token tile) and the attention gate entry keep their rows; at 16 sequences of five tokens -- 80 rows -- the
+in-projection (rows 1-32) and the gate / up step (rows 1-64) are on their fallback rows, printed with their reasons.
+The attention preparation and the attention core are reference chains, called once per token. The out-projection of
+a linear-attention layer is still the multiply over a copy: the target runs a kernel of cuDNN Frontend there in a
+verify step (the 8-bit projection in a split of its own), which this stack does not serve yet -- it is counted as
+`not yet`.
+
+**What a verify plan says about the target** (stack `native`, the 64-layer model, compute capability 10.0 with 148
+SMs, one sequence of six tokens: the one step shape the census has a recorded section for):
+
+```text
+the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 162 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
+kernel identity, as planned: 322 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results); not yet: projection.fp8.out 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
+```
+
+The target's verify step has other kernels than its decode step in two places -- the fused step is the verify
+kernel, and the out-projection of a linear-attention layer is a kernel of cuDNN Frontend where the decode step has a
+library multiply -- so the whole is 162 + 321 + 1 where the decode step's is 210 + 273 + 1. The census section holds
+for the tokens per sequence, the row count, the layer widths and the GPU class it was recorded with; any other verify
+step prints `kernel identity: not stated for this run (no recorded section for ...)`. The drafter's own launches are
+not part of it.
+
+**The checks.** A verify session is checked by the checks of every run (`tie_out.run_checks`), on its own steps:
+replay; every provider block against its reference, teacher-forced; the greedy tokens against the reference stack,
+which runs the same verify steps; one sequence alone against the sequence among several, with its `T` rows; the
+kernel check. The reference of the verify block is `T` reference decode steps, each started from the state the
+kernel left for the token before it: the block's line then says, token by token, that the state the kernel wrote
+for a token is one decode step on from the state it wrote for the token before -- which is what "the state of the
+kept tokens" means for every number of tokens a run may keep -- in the band of the decode step (`gdn_step`: a cell is
+one value head of one sequence over the tokens of its steps).
+
+And it is held against the decode steps themselves (`tie_out.verify_checks(verify, decode)`): the token stream of a
+run of decode steps goes through verify steps that keep 0, 1, .., `T - 1` tokens in turn, so every count is kept at
+least once and every step after the first starts from a state a partial keep left. Every row of every step is then
+compared with the decode step of the same token (`tokens`: the greedy tokens and the logits, by the family's logits
+band), and after every step the state the verify run stands on is compared with the state of the decode steps of
+the kept tokens (`kept state`). A linear-attention layer whose history taps are the same bytes in both runs was fed
+the same rows by both: there the recurrent state is gated by the state rule of the band. A layer that was fed other
+rows -- a block in front of it is another kernel at another row count -- is printed, not gated; with no layer gated
+the line is `REPORTED`.
+
+On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded model: at one sequence of six
+tokens and at four, every greedy token of the verify steps was the decode steps' and the logits were the same bytes;
+the recurrent state of the kept tokens was within the band everywhere (at one sequence the same bytes), the history
+and the attention caches byte-equal; the kernel check passed with the verify kernel in the shape its entry states
+and, at one sequence of six tokens, in the shape the census records. These are the runs of one GPU class.
+
+**What the entry states about one sequence alone.** `cudnn.GdnVerifyFused` is replay-identical, and it states no
+batch invariance between one sequence and several: one sequence takes another association of the gated norm's sum
+than two and more, so the last bits of its output may differ by design (`docs/operations/determinism.md`: "Replay
+only"). The rows therefore gate no batch invariance on this block; a run with more than one sequence prints whether
+the bytes were equal and, beside it, this statement.
+
+**What is not here.** No drafter runs, so nothing decides how many tokens to keep: the caller says it. One count
+per step for all sequences: a step that keeps another number of tokens per sequence needs a position per sequence
+in the attention blocks, which is not built. The verify out-projection on its target kernel, the attention blocks
+and the MLP's down multiply on theirs. A captured verify step. A verify step of more than eight tokens per
+sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
+has run on compute capability 10.0 only; every other class is uncovered, not passing.
+
 ## Who serves each block (stack `fe-cublas`)
 
 | block | calls per step (64 layers) | provider key | entry [form] |

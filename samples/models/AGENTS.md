@@ -644,3 +644,38 @@ holds each.
   stored tensor as it is -- was not, and ended after the read in the sentence of a session that was not planned
   with the run, although it was. What a load keeps is one row order per weight, whoever asks for it: every reader of
   the stored form has an owner in that comparison, and both orders of the two plans are a case each.
+
+## What the verify step taught
+
+The verify step feeds several tokens per sequence in one launch sequence (`Session(tokens=T)`, `Session.verify`, the
+key `fe.gdn_verify_fused`). What building it showed:
+
+- A step shape is a field of the form. The fused verify kernel is compiled per tokens count, and its name is cut in
+  front of that count and of its launch knobs: two kernels of two counts share a symbol and a grid, and differ in the
+  shared memory of a thread block. So the row names `TOKENS`, one row per count; the adapter holds the slot table of
+  every call to it; the form check reads it from the instance that was called. An entry whose launch facts take a
+  step shape says which shape a row count stands for (`EntryBlock._step_of`): nothing else about it is special.
+- A band stated for one token per call is applied token by token, not loosened. The band of the fused step tolerates a
+  rounding that falls on the other side of a midpoint as an event, seen once, because the reference starts every
+  call from the kernel's state. A reference that runs the `T` tokens of a verify step on its own state sees such an
+  event at every later token of the step, and a cell of one token over nine steps fails a share that a cell of the
+  decode step passes over 32. The fix is in what is compared, never in the numbers: the reference starts every token
+  from the state the kernel wrote for the token before it (`gdn_verify_step(anchor=)`), and a cell is one value head
+  of one sequence over the tokens of its steps -- one block of the launch grid, as the band says.
+- The layout of one token per sequence is the layout of several at `T = 1`. Slots numbered token by token keep token 0
+  of a sequence in its plain slot and its history in that slot; one state class then serves both kinds of step, and a
+  plan of one token per sequence builds the tensors it built before. Check that with the shapes, in a host test.
+- Keeping tokens launches nothing. How many tokens a step kept is one number on the host; the kernel's operand is a
+  row of a constant table built with the state. A copy or a fill between two steps would be the first record of the
+  next step, where the kernel check declares nothing.
+- An operand of a kernel starts 16-byte aligned, and a row of a table need not. The slot table of one sequence out of
+  several (the batch-invariance check runs a sequence alone) is handed over in tensors of its own, and the rows of the
+  kept-count table are padded to four elements.
+- A decline names the row of the step that was asked for. A verify step no row holds was first declined in the words
+  of the decode entry, the block's first row ("serves rows 1-65,535"). A plan of several tokens per sequence is
+  declined by the block's row for that tokens count, else by the last of its rows for such steps.
+- A census section holds for the step it was recorded with: the tokens per sequence beside the row count, the widths
+  and the class. Six rows are one sequence of six tokens and two of three; only the first is the recorded step.
+- Two runs that feed a block other rows cannot be compared on that block's state. The verify run against the decode
+  run gates the recurrent state where both were fed the same rows (the history taps say so) and prints it elsewhere;
+  what holds in every layer is the block check, teacher-forced. A line that gated nothing is `REPORTED`.

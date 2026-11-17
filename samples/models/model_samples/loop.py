@@ -22,6 +22,12 @@ what the kernel check needs (``census.Traced``): the sites of a step in wiring o
 traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
 say about that set (``claim``).
 
+A session's plan is for one number of tokens per sequence (``tokens``).  At one, its step is the decode step (``prefill``,
+``step``).  At more, its step is the verify step of speculative decoding (``verify``): every sequence is fed that many
+tokens at once -- the token the run kept last and the tokens drafted behind it -- the recurrent state after each of them
+is kept in a slot of its own (``state.TokenSlots``), and the caller says how many of them the run keeps.  The decode step
+is a row of another plan: a run that needs both has two sessions on one load (``share=``), planned together.
+
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
 what ``reset`` clears.
@@ -64,19 +70,23 @@ class StopRule:
 
 
 class Record:
-    """The ids fed to, the logits of and the ids chosen by the first steps of a run, kept on the GPU for the checks."""
+    """The ids fed to, the logits of and the ids chosen by the first steps of a run, kept on the GPU for the checks: one
+    row per row of a step (sequences x tokens per sequence).  ``accepted`` is the host's own list of how many tokens
+    behind the first each of those steps kept (0 for a decode step)."""
 
-    def __init__(self, steps: int, sequences: int, vocab: int, device):
-        self.inputs = torch.zeros((steps, sequences), dtype=torch.int32, device=device)
-        self.outputs = torch.zeros((steps, sequences), dtype=torch.int32, device=device)
-        self.logits = torch.zeros((steps, sequences, vocab), dtype=torch.bfloat16, device=device)
+    def __init__(self, steps: int, rows: int, vocab: int, device):
+        self.inputs = torch.zeros((steps, rows), dtype=torch.int32, device=device)
+        self.outputs = torch.zeros((steps, rows), dtype=torch.int32, device=device)
+        self.logits = torch.zeros((steps, rows, vocab), dtype=torch.bfloat16, device=device)
+        self.accepted: List[int] = []
         self.count = 0
 
-    def add(self, ids: torch.Tensor, logits: torch.Tensor, next_ids: torch.Tensor) -> None:
+    def add(self, ids: torch.Tensor, logits: torch.Tensor, next_ids: torch.Tensor, accept: int = 0) -> None:
         if self.count < self.inputs.shape[0]:
             self.inputs[self.count].copy_(ids)
             self.outputs[self.count].copy_(next_ids)
             self.logits[self.count].copy_(logits)
+            self.accepted.append(accept)
         self.count += 1
 
 
@@ -100,6 +110,7 @@ class Session:
         record_steps: Optional[int] = None,
         check_kernels: bool = False,
         on_demand=None,
+        tokens: int = 1,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
@@ -111,7 +122,9 @@ class Session:
         session it checks: where that load kept a weight on its stored format alone, the blocks of this session get a bf16
         copy of it made for the one call and dropped after it, and the object counts what that cost.  It is refused for
         any other session (``ValueError``): a copy made per call is a cast and two synchronisations in front of a block,
-        which no step of a run that is timed, traced or checked may carry."""
+        which no step of a run that is timed, traced or checked may carry.
+        ``tokens`` is the number of tokens a step of this session feeds per sequence: 1 for the decode step; more for the
+        verify step (``verify``), whose rows are sequences x tokens and whose plan is resolved for that pair."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if on_demand is not None and (share is None or stack != REFERENCE):
@@ -123,7 +136,10 @@ class Session:
             raise ValueError(f"prefill route must be one of {PREFILL_ROUTES}; got {prefill!r}")
         if sequences < 1:
             raise ValueError(f"a session needs at least one sequence; got {sequences}")
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
+            raise ValueError(f"a session's step feeds at least one token per sequence; got tokens={tokens!r}")
         self.model, self.text, self.sequences, self.stack, self.prefill_route = model, text, int(sequences), stack, prefill
+        self.tokens = tokens  # per sequence, of a step of this session's plan
         self.device = torch.device(device)
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
@@ -158,7 +174,7 @@ class Session:
                 self.model.regimes,
                 facts,
                 self.sequences,
-                1,
+                self.tokens,
                 self.stack,
                 self.overrides,
                 model=self.model,
@@ -212,6 +228,11 @@ class Session:
         stored, uncopied = self.stored_weights(), self.uncopied_weights()
         return {**({"stored": stored} if stored else {}), **({"uncopied": uncopied} if uncopied else {})}
 
+    def _per_token(self) -> dict:
+        """The tokens per sequence as a keyword of a family's memory arithmetic, where a step of this session feeds several
+        (a family whose steps all feed one token is never asked)."""
+        return {"tokens": self.tokens} if self.tokens > 1 else {}
+
     def _check_forms(self) -> None:
         """Before the first step: every form of a weight a block of this session's plan reads is one the load of its weights
         kept, and a stored weight is in the row order its block multiplies on.  A session that runs on another session's
@@ -238,7 +259,8 @@ class Session:
         file is not a census of this model."""
         if self.stack not in getattr(self.model, "target_stacks", ()):
             return None
-        return self.model.target().claim(self.resolve(), self.model)
+        plan = self.resolve()
+        return self.model.target().claim(plan, self.model, census.configuration_of(plan))
 
     def plan_table(self, later: Sequence["Session"] = ()) -> str:
         """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
@@ -262,8 +284,10 @@ class Session:
             # what the load of the first session holds follows the plans: the stored format of the weights a block multiplies
             # on, and no bf16 copy of those no block reads as one (asked of a family's model only where a plan has such a block)
             held = self._kept() if self._share is None else {}
-            need = self.model.memory_bytes(self.sequences, self.capacity, **held) - (self.model.copy_bytes() if self._share is not None else 0)
-            need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
+            need = self.model.memory_bytes(self.sequences, self.capacity, **held, **self._per_token()) - (
+                self.model.copy_bytes() if self._share is not None else 0
+            )
+            need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token()) for session in later)
             counts = [self.sequences, *(session.sequences for session in later)]
             what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
             # the part of the need that is the checks': the reference's copy of a weight the load keeps no copy of, one at a time
@@ -295,28 +319,37 @@ class Session:
         self._check_forms()
         for name, block in plan.items():
             if getattr(block, "compiles", False):
-                with self.stages.stage(f"compile and first launch {name} ({self.sequences} row{'s' if self.sequences > 1 else ''})"):
-                    block.compile(self.sequences, 1)
+                rows = self.sequences * self.tokens
+                with self.stages.stage(f"compile and first launch {name} ({rows} row{'s' if rows > 1 else ''})"):
+                    block.compile(self.sequences, self.tokens)
         self.reset(fresh=True)
         with self.stages.stage("warm-up"):
-            self.model.step(self._call, self.weights, self.state, torch.zeros(self.sequences, dtype=torch.int32, device=self.device))
+            self.model.step(self._call, self.weights, self.state, torch.zeros(self.sequences * self.tokens, dtype=torch.int32, device=self.device))
         self._report.calls_per_step = self._calls
         self.reset(fresh=True)
 
     def reset(self, fresh: bool = True) -> None:
         """Back to the start of a prompt set: zero state at position 0 and an empty record; ``fresh`` allocates both anew."""
         if fresh or self.state is None:
-            self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
-            self.record = Record(self.record_steps, self.sequences, self.model.geometry.vocab, self.device)
+            self.state = self._fresh_state()
+            self.record = Record(self.record_steps, self.sequences * self.tokens, self.model.geometry.vocab, self.device)
         else:
             self.state.position = 0
+            if self.state.slots is not None:
+                self.state.slots.accept = 0
             for layer in self.state.layers:
                 for t in layer.tensors():
                     t.zero_()
             self.record.count = 0
+            self.record.accepted.clear()
         self._calls = 0
         self._report.clock.launch.clear()
         self._report.clock.ids.clear()
+
+    def _fresh_state(self) -> DecodeState:
+        """A zero state at position 0 for this session's sequences and tokens per sequence, in allocations of its own."""
+        shapes = self.model.state_shapes()
+        return DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens)
 
     # ------------------------------------------------------------------ run
     def _call(self, name: str, layer: int, *operands):
@@ -326,19 +359,31 @@ class Session:
             operands = self.on_demand.operands(operands)
         out = self.tap(name, layer, block, operands) if self.tap is not None else block(*operands)
         if self._call_log is not None:  # a traced step: the call site, and what the adapter says served the call it has just made
-            self._call_log.append(census.Call(name, layer, self.sequences, *block.serving()))
+            self._call_log.append(census.Call(name, layer, self.sequences * self.tokens, *block.serving()))
         return out
 
-    def _advance(self, ids: torch.Tensor) -> torch.Tensor:
-        if self.state.position >= self.capacity:
+    def _advance(self, ids: torch.Tensor, accept: int = 0) -> torch.Tensor:
+        """One step of this session's plan on the ids of its rows: the decode step, or -- at several tokens per sequence --
+        the verify step, after which the state stands ``accept`` tokens behind the first."""
+        if self.state.position + self.tokens > self.capacity:
             raise ValueError(f"the session was built for {self.capacity} positions per sequence; build it with a larger capacity")
         next_ids, logits = self.model.step(self._call, self.weights, self.state, ids)
-        self.record.add(ids, logits, next_ids)
+        self.record.add(ids, logits, next_ids, accept)
+        if self.tokens > 1:
+            self.state.accept(accept)
         return next_ids
+
+    def _decode_only(self, what: str) -> None:
+        if self.tokens > 1:
+            raise ValueError(
+                f"{what} feeds one token per sequence; a step of this session feeds {self.tokens} (Session.verify).  The decode step is a "
+                "row of another plan: a second session on these weights (share=), planned with this one"
+            )
 
     def prefill(self, prompts: List[torch.Tensor]) -> torch.Tensor:
         """Feed one prompt per sequence and return the first new ids ``[sequences]`` on the GPU.  Route ``decode-step``: every
         prompt token goes through the decode step, one step per token, so the prompts of one run have one length."""
+        self._decode_only("Session.prefill")
         if len(prompts) != self.sequences:
             raise ValueError(f"this session has {self.sequences} sequences; got {len(prompts)} prompts")
         lengths = {int(p.numel()) for p in prompts}
@@ -356,8 +401,31 @@ class Session:
 
     def step(self, ids: torch.Tensor) -> torch.Tensor:
         """One decode step for every sequence: the ids to feed ``[sequences]`` -> the next ids ``[sequences]``, on the GPU."""
+        self._decode_only("Session.step")
         self._report.clock.mark_launch()
         return self._advance(ids)
+
+    def verify(self, ids: torch.Tensor, accept: int) -> torch.Tensor:
+        """One verify step for every sequence: ``ids`` ``[sequences, tokens]`` on the GPU -- per sequence the token the run
+        kept last and the tokens drafted behind it -- -> the next ids ``[sequences, tokens]``: at ``[i, t]`` the greedy
+        token after token ``t`` of sequence ``i``, given the tokens in front of it.  One launch sequence for all rows
+        (sequences x tokens); the recurrent state after every token is written to a slot of its own.
+
+        ``accept`` says how many of the tokens behind the first the run keeps, 0 .. tokens - 1, one number for the fixed
+        set of sequences (so the attention caches keep one position): the state then stands at that token, and the next
+        step goes on ``accept + 1`` positions later.  Which tokens are kept is the caller's rule (a speculative loop
+        keeps a drafted token while it equals the greedy token in front of it); this method compares nothing.  Nothing
+        is read to the host and nothing is copied for it: the one host read of a step is the caller's (``read``)."""
+        if self.tokens == 1:
+            raise ValueError("Session.verify is the step of a session built for several tokens per sequence (tokens=); this session's step is Session.step")
+        if tuple(ids.shape) != (self.sequences, self.tokens):
+            raise ValueError(
+                f"a verify step of this session takes ids [{self.sequences}, {self.tokens}] (sequences, tokens per sequence); got {tuple(ids.shape)}"
+            )
+        if isinstance(accept, bool) or not isinstance(accept, int) or not 0 <= accept < self.tokens:
+            raise ValueError(f"a verify step of {self.tokens} tokens per sequence keeps 0 to {self.tokens - 1} tokens behind the first; got accept={accept!r}")
+        self._report.clock.mark_launch()
+        return self._advance(ids.to(torch.int32).reshape(-1), accept).view(self.sequences, self.tokens)
 
     def read(self, ids: torch.Tensor) -> List[int]:
         """The one host read of a step: the chosen ids, 4 bytes per sequence."""
@@ -388,11 +456,11 @@ class Session:
         if count < 1:
             self._report.trace_missing = "needs a recorded step on a CUDA device"
             if records:
-                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences, claim=claim)
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens, claim=claim)
             return
-        inputs, kept, calls = self.record.inputs[:count], (self.state, self.record), self._calls
-        self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
-        self.record = Record(0, self.sequences, self.model.geometry.vocab, self.device)
+        inputs, accepted, kept, calls = self.record.inputs[:count], list(self.record.accepted[:count]), (self.state, self.record), self._calls
+        self.state = self._fresh_state()
+        self.record = Record(0, self.sequences * self.tokens, self.model.geometry.vocab, self.device)
         call_log: List[list] = []
         launches: list = []
 
@@ -400,7 +468,7 @@ class Session:
             if records:
                 self._call_log = []
                 call_log.append(self._call_log)
-            self._advance(inputs[i]).tolist()
+            self._advance(inputs[i], accepted[i]).tolist()
 
         try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
             if records:
@@ -410,7 +478,7 @@ class Session:
         finally:
             (self.state, self.record), self._calls, self._call_log = kept, calls, None
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences, claim)
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, claim)
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""

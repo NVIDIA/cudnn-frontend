@@ -28,6 +28,13 @@ names the call by what the normed rows feed (``NORM_SITES``; ``sites()`` lists t
 in-projection is called with another weight shape in each kind of layer, and its site says which
 (``IN_PROJECTION_SITES``).  A reference chain and a multiply over a copy ignore the site.
 
+A step feeds one token per sequence -- the decode step -- or, on a state built for several (``DecodeState(tokens=T)``),
+``T`` tokens per sequence at once: the verify step of speculative decoding.  Its rows are sequence by sequence (``rows =
+sequences x T``), every block of the table above runs on all of them, the linear-attention block is handed the slot table
+of the step in place of the slot ids (``state.TokenSlots``: a recurrent state per (sequence, token)), and an attention
+layer inserts and reads ``T`` positions per sequence.  The block calls of a step, their order and their call sites are the
+same at every ``T``.
+
 The weights that feed one multiply are merged at load: the query (with its gate half), key and value projections of an
 attention layer; ``qkv`` and ``z`` of a linear-attention layer; its ``b`` and ``a`` rows, b first; the MLP's gate and up.
 The loader then keeps each multiplied weight in the forms the plans of the run read it in (``STORED_WEIGHTS`` names the
@@ -422,14 +429,16 @@ class QwenDense:
         whose weights the load keeps on their stored format alone."""
         return sum(2 * s.numel for s in self.tensor_specs() if s.fmt != "scalar") - 2 * self._elements(uncopied)
 
-    def state_bytes(self, sequences: int, capacity: int) -> int:
+    def state_bytes(self, sequences: int, capacity: int, tokens: int = 1) -> int:
         """Bytes of the decode state of ``sequences`` sequences: the slot pools of the linear-attention layers (one null slot
-        each) and the key/value caches of the attention layers."""
+        each) and the key/value caches of the attention layers.  At ``tokens`` tokens per sequence a pool holds a
+        recurrent state per (sequence, token) and ``tokens + 2`` history columns per sequence."""
         g = self.geometry
         state = 0
         for kind in g.layer_kinds:
             if kind == "linear_attention":
-                state += (sequences + 1) * (g.la_value_heads * g.la_head_dim**2 * 4 + (g.la_conv_width - 1) * g.qkv_channels * 2)
+                state += (sequences * tokens + 1) * g.la_value_heads * g.la_head_dim**2 * 4
+                state += (sequences + 1) * (g.la_conv_width - 2 + tokens) * g.qkv_channels * 2
             else:
                 state += 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
         return state
@@ -451,10 +460,11 @@ class QwenDense:
         weight has its copy."""
         return max((2 * out * inner for block in uncopied for out, inner in self.weight_shapes(block)[1]), default=0)
 
-    def memory_bytes(self, sequences: int, capacity: int, stored: Sequence[str] = (), uncopied: Sequence[str] = ()) -> int:
+    def memory_bytes(self, sequences: int, capacity: int, stored: Sequence[str] = (), uncopied: Sequence[str] = (), tokens: int = 1) -> int:
         """What a run needs on the GPU besides a kernel's own reservation: the weights held -- the bf16 copies (not those
-        of the blocks ``uncopied``) and the stored tensors of the blocks ``stored`` (``stored_bytes``) -- the state,
-        working memory, and the one copy the checks make on demand at a time (``check_bytes``).
+        of the blocks ``uncopied``) and the stored tensors of the blocks ``stored`` (``stored_bytes``) -- the state (at
+        ``tokens`` tokens per sequence: ``state_bytes``), working memory, and the one copy the checks make on demand at
+        a time (``check_bytes``).
 
         Working memory is load-time temporaries, activations, the reference's fp64 temporaries during the checks and the
         allocator's slack: 2 GiB, or an eighth of the weights held where that is more, and a quarter of the stored
@@ -478,7 +488,7 @@ class QwenDense:
         kept = self.stored_bytes(stored)
         held = self.copy_bytes(uncopied) + kept
         working = max(2 * GIB, held // 8) + kept // 4
-        return held + self.state_bytes(sequences, capacity) + working + self.check_bytes(uncopied)
+        return held + self.state_bytes(sequences, capacity, tokens) + working + self.check_bytes(uncopied)
 
     def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = ()) -> Dict[str, int]:
         """What one decode step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
@@ -658,9 +668,16 @@ class QwenDense:
 
     # ------------------------------------------------------------------ one decode step
     def step(self, call, weights: Weights, state, ids):
-        """One decode step: ``ids`` ``[rows]`` int32 on the device -> ``(next ids [rows] int32, logits [rows, vocabulary])``.
-        ``call(block, layer, *operands)`` runs one block; a session passes the plan's blocks, a check wraps them."""
+        """One step: ``ids`` ``[rows]`` int32 on the device -> ``(next ids [rows] int32, logits [rows, vocabulary])``.
+        ``call(block, layer, *operands)`` runs one block; a session passes the plan's blocks, a check wraps them.
+
+        On a state of one token per sequence this is the decode step: ``rows`` = sequences, and the position moves on by
+        one.  On a state of ``T`` tokens per sequence it is the verify step: ``rows`` = sequences x ``T``, sequence by
+        sequence; the linear-attention block is handed the step's slot table, an attention layer works on ``T``
+        positions per sequence from ``state.position`` on, and the position stays where it is until the caller says how
+        many of the tokens it keeps (``state.accept``)."""
         position = state.position
+        slots = state.slot_ids if state.tokens == 1 else state.slots  # the slot of every row, or the table of a step of several tokens
         branch, residual = call("embedding", -1, ids, weights.embedding), None
         for i, layer in enumerate(weights.layers):
             site = layer.kind if residual is not None else layer.kind + FIRST  # the first norm of a step starts the residual stream
@@ -668,7 +685,7 @@ class QwenDense:
             row = call("projection.fp8.in", i, q, layer.in_proj, IN_PROJECTION_SITES[layer.kind])
             if layer.kind == "linear_attention":
                 x, z = split_qkvz(row, layer.gdn.qkv_channels, layer.gdn.value_heads, layer.gdn.head_dim)
-                mixed = call("linear_attention.step", i, x, z, normed, state.slot_ids, layer.gdn, state.layers[i])
+                mixed = call("linear_attention.step", i, x, z, normed, slots, layer.gdn, state.layers[i])
             else:
                 qh, gate = call("attention.prepare", i, row, state.layers[i], position, layer.attn)
                 attended = call("attention.core", i, qh, state.layers[i], position)
@@ -679,5 +696,6 @@ class QwenDense:
         q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
-        state.position = position + 1
+        if state.tokens == 1:
+            state.position = position + 1
         return next_ids, logits

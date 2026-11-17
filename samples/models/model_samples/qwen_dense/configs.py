@@ -24,6 +24,11 @@ The stacks:
   area's GPU test runs.  Until ``native`` has such a row the two stacks are the same rows;
 * ``reference`` -- every block in plain PyTorch.
 
+A plan is resolved for a number of tokens per sequence.  One is the decode step.  More is the verify step of speculative
+decoding (``Session(tokens=T)``): the linear-attention block is then the fused verify entry's row of that count, and every
+other block is the row its own ranges give at ``sequences x T`` rows -- a row that does not hold the count falls to the
+next one, as at any other row count.
+
 ``readme_table()`` renders the tables as the family README shows them; a host test keeps the two in agreement.
 """
 
@@ -69,6 +74,34 @@ PROJECTION_SITES = (
 #: row count, token tile).  A launch record does not show the tile -- the grid and the block are the same at all four,
 #: the shared memory at three -- so it is held on the objects and in the kernel's symbol
 GATE_UP_TILES = ((1, 8, 8), (9, 16, 16), (17, 32, 32), (33, 64, 64))
+
+#: the fused verify step of a linear-attention layer by tokens per sequence: the step shape is a compile-time fact of its
+#: kernel and a field of the form (``TOKENS``), so the block has one row per count: (tokens per sequence, last sequence
+#: count).  The target runs it up to 16 sequences, and up to 4 from six tokens per sequence; eight tokens is what every
+#: form of the entry holds on the classes it serves.  A step shape beyond these has no row: the plan declines it by name
+VERIFY_STEPS = tuple((tokens, 16 if tokens < 6 else 4) for tokens in range(2, 9))
+
+
+def _verify_rows(stack, form, batch_invariant=()):
+    """The rows of the fused verify entry for ``stack``, one per tokens count of :data:`VERIFY_STEPS`, in the launch form
+    ``form`` (the two launch knobs; the row adds its ``TOKENS``)."""
+    return [
+        ProviderRow(
+            ("cc10.x", "cc12.x"),
+            (1, last),
+            (tokens, tokens),
+            "fe.gdn_verify_fused",
+            stack,
+            serves=f"{tokens} tokens per sequence of 2-8, sequences 1-{last}",
+            band="gdn_step",
+            # no class is listed: the entry states replay-identical bytes and no batch invariance between one sequence
+            # and several (its adapter carries the statement, and a run prints it)
+            batch_invariant=batch_invariant,
+            form=(*form, ("TOKENS", tokens)),
+        )
+        for tokens, last in VERIFY_STEPS
+    ]
+
 
 PROVIDERS = {
     "embedding": [ProviderRow(*ANY, "torch.index_select", EVERY, serves="any")],
@@ -172,6 +205,13 @@ PROVIDERS = {
             # not write this layer's state: in this stack that launch is the in-projection's, as in the target
             form=(("PDL", True), ("PDL_RELEASE", True)),
         ),
+        # a step of several tokens per sequence (the verify step of speculative decoding): the fused verify entry, in the
+        # launch form of the stack's decode row above -- launched without a wait and without an early release in the
+        # reference path; as a dependent of the in-projection that releases its successor at entry in the target's form
+        # (the launch before it must not write this layer's state, its history or the slot table: in these stacks it is
+        # the in-projection's, as in the target).  The reference chain below serves both kinds of step
+        *_verify_rows("fe-cublas", (("PDL", False), ("PDL_RELEASE", False))),
+        *_verify_rows(TARGET_STACKS, (("PDL", True), ("PDL_RELEASE", True))),
         ProviderRow(*ANY, "torch_ref.gdn_decode_step", "reference", serves="any", fallback="reference"),
     ],
     "projection.fp8.out": [
