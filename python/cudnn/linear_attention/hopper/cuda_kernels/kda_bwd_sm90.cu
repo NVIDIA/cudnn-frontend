@@ -1133,20 +1133,27 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
     const int hso    = swz(hr, hc, PCV);
     const size_t vgo = (size_t)rV * gs + vb * BV + cV;
 
-    const float* srcst = (dir == 0) ? ist : dfs;
     float acc[TS::TPW][4];
-    {  // seed state, transposed:  S[d][x] = src[n][h][x][d]
-        const float* p = srcst + ((size_t)nh * DH + vb * BV) * DH;
-        for (int u = tid; u < BV * DH; u += NT) {
-            const int x = u >> 7, d = u & 127;
-            sF[d * 65 + x] = p[(size_t)x * DH + d];
+    if constexpr (REVERSE_ONLY) {
+        // The state-only summary contract is unseeded. Keep its exact zero
+        // seed in registers so this specialization neither owns nor reads a
+        // caller-workspace final-state row.
+        zero_acc<TS::TPW>(acc);
+    } else {
+        const float* srcst = (dir == 0) ? ist : dfs;
+        {  // seed state, transposed:  S[d][x] = src[n][h][x][d]
+            const float* p = srcst + ((size_t)nh * DH + vb * BV) * DH;
+            for (int u = tid; u < BV * DH; u += NT) {
+                const int x = u >> 7, d = u & 127;
+                sF[d * 65 + x] = p[(size_t)x * DH + d];
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < TS::TPW; ++j)
+#pragma unroll
+                for (int r = 0; r < 4; ++r) acc[j][r] = sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)];
+            __syncthreads();
         }
-        __syncthreads();
-#pragma unroll
-        for (int j = 0; j < TS::TPW; ++j)
-#pragma unroll
-            for (int r = 0; r < 4; ++r) acc[j][r] = sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)];
-        __syncthreads();
     }
 
     // ---- prefetch one chunk's operands into stage `st` --------------------

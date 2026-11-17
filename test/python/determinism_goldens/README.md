@@ -8535,6 +8535,29 @@ same-environment A/B because the state-only plan avoids the five token-gradient
 outputs even though its caller workspace is large. These timings are benchmark
 evidence, not CI thresholds.
 
+A same-day follow-up based on `5999e502a8061280edb8595a835b22ced74f24de`
+compiled the unseeded reverse-only seed to register zero and removed the
+caller-workspace final-state row. The controlled RED ran the new exact-workspace
+assertion against the unchanged source and failed at 786,432 versus 393,216
+bytes; the candidate passed that test. On the same H20-3e software stack with
+driver API 13000, the new runtime golden is
+`27cb37748161a3d5/kda_summary_scan_sm90_bwd_bf16.json`. Its input and output
+hashes are identical to the driver-12080 golden. The recording run passed **1
+test, no skips**, and the strict suite passed **14 tests, no skips** in 1.33 s.
+
+At T=65,536/H=32, alternating unchanged/candidate public-plan runs used ten
+groups of twenty CUDA-event-timed executions per arm. The two unchanged-source
+medians were 8.6492 and 8.6499 ms; the candidate medians were 8.5704 and 8.5694
+ms. The mean of the per-arm medians fell 8.6495→8.5699 ms (0.92%), while exact
+caller workspace fell 2,703,237,632→2,701,140,480 bytes (2 MiB). A two-node,
+eight-rank-per-node CP16 weak-decay distributed comparison then passed the
+monolithic output and q/k/v/g/beta gradient envelopes on every rank. These
+latencies are benchmark evidence, not CI thresholds; SM100/103/107 support is
+unchanged. The adjacent ordinary Hopper KDA and FP32-summary L0 suites passed
+**77 tests with 3 skips** in 4.15 s: two skips are missing driver-13000 goldens
+for the unchanged direct FP32 forward/backward summary paths, and one requires
+the optional `cuda.tile` runtime. Their driver-12080 goldens remain unchanged.
+
 From `test/python`, with a complete CUDA toolkit selected because the pip
 runtime headers omit `crt/mma.h`:
 

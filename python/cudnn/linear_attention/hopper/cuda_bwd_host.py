@@ -471,7 +471,7 @@ def launch(
             dO,
             ws["gn2"],
             initial_state if gradient_outputs else 0,
-            d_final_state,
+            d_final_state if gradient_outputs else 0,
             ws["cs_t0"],
             ws["cs_len"],
             ws["seq_c0"],

@@ -315,7 +315,10 @@ a row alone and inside a batch under the entry's own picks.
   int32 offsets, `batch_invariant=True`, and no transition/context output. Its
   output bytes match the ordinary Hopper KDA backward's `d_initial_state`; this
   is intentionally the ordinary mixed-precision scan rather than the direct
-  FP32 summary recurrence. Four fixed-input replays, changed-neighbor packing,
+  FP32 summary recurrence. The unseeded specialization initializes its seed in
+  registers, so the public graph workspace is exactly the reverse-scan scratch
+  and contains no caller-owned final-state row. Four fixed-input replays,
+  changed-neighbor packing,
   duplicated/empty sequences, poisoned caller workspace, changed-input CUDA
   Graph replay, and fresh-address rebinding retain identical bytes. The plan
   does not provide a forward summary, a transition, a seeded state gradient,

@@ -212,7 +212,7 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
     Packed-forward CP already owns the span transition, so this explicit plan
     emits only ``d_initial_state``. It reuses the ordinary backward's prep and
     reverse scan, stops before token gradients, and launches no forward scan
-    CTAs. The absent final-state gradient is a caller-workspace zero row.
+    CTAs. The absent final-state gradient is a compile-time register zero.
     """
 
     plan_name = "kda_summary_hopper_scan"
@@ -234,7 +234,6 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
         self.ports = None
         layout = WorkspaceLayout(align=256)
         self.scratch_offset = layout.add(cuda_bwd_host.reverse_workspace_bytes(self.total, self.heads, self.seqs), align=256)
-        self.zero_offset = layout.add(self.seqs * self.heads * 128 * 128 * 4, align=256)
         self.workspace_bytes = layout.size
         # Compile at plan build, never on the first execute/capture.
         self.library = cuda_bwd_host.library(self.device)
@@ -257,8 +256,6 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
             if start < end and workspace < end and start < workspace + self.workspace_bytes:
                 raise ValueError(f"{self.plan_name}: workspace overlaps {name}")
         stream = int(ctx.stream or 0)
-        zero = workspace + self.zero_offset
-        buffers.memset_zero_async(zero, self.seqs * self.heads * 128 * 128 * 4, stream)
         addr = {name: value[0] for name, value in x.items()}
         cuda_bwd_host.launch(
             device=self.device,
@@ -272,7 +269,7 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
             beta=addr["beta"],
             cu_seqlens=addr["cu_seqlens"],
             initial_state=0,
-            d_final_state=zero,
+            d_final_state=0,
             dq=0,
             dk=0,
             dv=0,

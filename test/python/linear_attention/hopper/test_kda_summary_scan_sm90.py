@@ -164,10 +164,9 @@ def test_scan_workspace_capture_and_changed_inputs(cudnn_handle):
 
     total, heads, _ = case["q"].shape
     seqs = case["cu"].numel() - 1
-    zero_bytes = seqs * heads * 128 * 128 * 4
-    assert workspace_bytes == cuda_bwd_host.reverse_workspace_bytes(total, heads, seqs) + zero_bytes
+    assert workspace_bytes == cuda_bwd_host.reverse_workspace_bytes(total, heads, seqs)
     assert cuda_bwd_host.reverse_workspace_bytes(total, heads, seqs) < cuda_bwd_host.workspace_bytes(total, heads, seqs) // 2
-    assert workspace_bytes > output.numel() * output.element_size()
+    assert workspace_bytes >= output.numel() * output.element_size()
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
     capture = torch.cuda.CUDAGraph()
