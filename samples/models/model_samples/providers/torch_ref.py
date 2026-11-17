@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from ..census import Kernel
 from ..sampling import greedy
-from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, _e2m1, _e4m3, _e4m3_values, dequantize, quantize_fp8, quantize_nvfp4
+from ..weights import BLOCK, E4M3_MAX, BlockScaledTensor, Dequantized, ScaledTensor, _e2m1, _e4m3, _e4m3_values, dequantize, quantize_fp8, quantize_nvfp4
 from . import PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
 
 BF16 = torch.bfloat16
@@ -57,12 +57,14 @@ def add_norm_quantize(branch, residual, weight, quant, eps: float, acc):
 
 def linear(qx, weight: Dequantized, acc, columns_per_chunk: int = 8192) -> torch.Tensor:
     """A multiply on quantised operands: the code values of both sides multiplied and accumulated in ``acc``, the scales applied
-    to the result, one rounding to bf16.  Chunked over the weight's rows so the wide copy is never held twice in ``acc``."""
-    x = dequantize(qx)
+    to the result, one rounding to bf16.  Chunked over the weight's rows so the wide copy is never held twice in ``acc``.
+    It reads the weight's bf16 copy: the one a load kept, or -- in the checks of a run that keeps the weight on its stored
+    format alone -- the one the checks made for this call (``weights.OnDemand``)."""
+    x, copy = dequantize(qx), weight.bf16()
     xa = x.data.to(acc)
-    out = torch.empty((xa.shape[0], weight.data.shape[0]), dtype=acc, device=xa.device)
-    for a in range(0, weight.data.shape[0], columns_per_chunk):
-        out[:, a : a + columns_per_chunk] = xa @ weight.data[a : a + columns_per_chunk].to(acc).T
+    out = torch.empty((xa.shape[0], copy.shape[0]), dtype=acc, device=xa.device)
+    for a in range(0, copy.shape[0], columns_per_chunk):
+        out[:, a : a + columns_per_chunk] = xa @ copy[a : a + columns_per_chunk].to(acc).T
     scale = weight.scale.to(acc) * x.scale if isinstance(weight.scale, torch.Tensor) else float(weight.scale) * float(x.scale)
     return (out * scale).to(BF16)
 
@@ -226,6 +228,72 @@ def nvfp4_code_bracket(y: torch.Tensor, scale_bytes: torch.Tensor, scale: float)
     return _e2m1(exact * (1.0 - NVFP4_ENCODE_BOUND), signed_zero=True), _e2m1(exact * (1.0 + NVFP4_ENCODE_BOUND), signed_zero=True)
 
 
+#: the error bound of ``cudnn.SwigluFp4Decode`` against an fp64 evaluation of its chain, term by term as the entry's own
+#: suite derives it (``test/python/gemm/frost/swiglu_decode/swiglu_fp4_decode_utils.py``; the entry's page states the
+#: contract): one rounding to bf16 (relative), one fp32 unit per product of the accumulation, SiLU's Lipschitz constant,
+#: what the approximate exponential, division and reciprocals add to the second rounding, a floor for a value of zero,
+#: and the relative slack of the three fp32 multiplications of a block scale.  Not tolerances of this sample: they move
+#: only with that suite
+SWIGLU_ROUNDING = 2.0**-8
+SWIGLU_SUM_UNIT = 2.0**-23
+SWIGLU_SILU_LIPSCHITZ = 1.1
+SWIGLU_APPROXIMATE = 2.0**-19
+SWIGLU_FLOOR = 2.0**-120
+SWIGLU_SCALE_SLACK = 2.0**-21
+
+
+def fp32_product(a: float, b: float) -> torch.Tensor:
+    """``fp32(a) * fp32(b)`` as one fp32 element on the host: the scalar a kernel reads for the product of two static
+    scales, formed once per pair of values and never inside a step."""
+    return torch.tensor([float(a)], dtype=torch.float32) * torch.tensor([float(b)], dtype=torch.float32)
+
+
+def e4m3_nearest(x: torch.Tensor) -> torch.Tensor:
+    """Non-negative fp64 values -> E4M3 code bytes, round to nearest even, saturating at 448: a search over the 127 finite
+    non-negative codes, whose values ascend with the byte.  No cast is involved, so a value is rounded once."""
+    values = _e4m3_values(torch.arange(0, 0x7F, dtype=torch.uint8, device=x.device), torch.float64)
+    x = x.clamp(max=E4M3_MAX).contiguous()
+    high = torch.searchsorted(values, x).clamp(max=0x7E)
+    low = (high - 1).clamp(min=0)
+    below, above = x - values[low], values[high] - x
+    return torch.where((above < below) | ((above == below) & (high % 2 == 0)), high, low).to(torch.uint8)
+
+
+def gate_up_bound(qx, weight: Dequantized, rows_per_chunk: int = 4096):
+    """The fused gate / up step of an MLP evaluated in fp64 on the exactly dequantised operands, with the error bound a
+    kernel that accumulates the two products in fp32, rounds each once to bf16, forms ``silu(gate) * up`` with an
+    approximate exponential and division and rounds once more stays inside (``cudnn.SwigluFp4Decode``):
+    ``(value, error, gate, up)``, each ``[rows, intermediate]`` in fp64.  With ``alpha`` the fp32 product of the two
+    scales and ``K`` the input width::
+
+        gate = alpha * sum_k x_k Wg_k          spread_g = |alpha| * sum_k |x_k Wg_k|          (up, spread_u likewise)
+        value = silu(gate) * up
+        d_g = 2^-8 |gate| + (1 + 2^-8) (K + 1) 2^-23 spread_g                                  (d_u likewise)
+        a = 1.1 d_g (|up| + d_u) + |silu(gate)| d_u
+        error = a + (2^-8 + 2^-19) (|value| + a) + 2^-120
+
+    The weight is read as its bf16 copy in the checkpoint's row order: every gate row, then every up row."""
+    x, copy = dequantize(qx), weight.bf16()
+    alpha = float(fp32_product(x.scale, weight.scale))
+    xa = x.data.double()
+    magnitudes = xa.abs()
+    width, half = copy.shape[1], copy.shape[0] // 2
+    sums = torch.empty((2, xa.shape[0], copy.shape[0]), dtype=torch.float64, device=xa.device)
+    for a in range(0, copy.shape[0], rows_per_chunk):  # chunked: the wide copy is never held twice in fp64
+        rows = copy[a : a + rows_per_chunk].double()
+        sums[0, :, a : a + rows_per_chunk] = xa @ rows.T
+        sums[1, :, a : a + rows_per_chunk] = magnitudes @ rows.abs().T
+    gate, up = alpha * sums[0, :, :half], alpha * sums[0, :, half:]
+    silu = gate * torch.sigmoid(gate)
+    value = silu * up
+    unit = (1.0 + SWIGLU_ROUNDING) * (width + 1) * SWIGLU_SUM_UNIT * abs(alpha)
+    d_gate = SWIGLU_ROUNDING * gate.abs() + unit * sums[1, :, :half]
+    d_up = SWIGLU_ROUNDING * up.abs() + unit * sums[1, :, half:]
+    spread = SWIGLU_SILU_LIPSCHITZ * d_gate * (up.abs() + d_up) + silu.abs() * d_up
+    error = spread + (SWIGLU_ROUNDING + SWIGLU_APPROXIMATE) * (value.abs() + spread) + SWIGLU_FLOOR
+    return value, error, gate, up
+
+
 def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> ScaledTensor:
     """One decode step of a gated delta-rule linear-attention layer, for ``rows`` sequences whose slots are ``slot_ids``:
     the beta / alpha projection of the normed hidden state, the causal conv over the slot's history with SiLU, the scaled query
@@ -336,7 +404,7 @@ class AddNormQuantizeBracket(_Reference):
 class Linear(_Reference):
     kernels = PYTORCH_CHAIN_WITH_MULTIPLY
 
-    def __call__(self, qx, weight):
+    def __call__(self, qx, weight, site=""):  # the chain is one function at every call site
         return linear(qx, weight, self.acc)
 
 
@@ -349,6 +417,35 @@ class GateUp(_Reference):
 
     def compared(self, out):
         return self.product
+
+
+class GateUpFp4Bound(_Reference):
+    """The gate / up multiply, ``SiLU(gate) * up`` and the 4-bit quantisation as the contract of a kernel that fuses the
+    three is stated (``cudnn.SwigluFp4Decode``): against an fp64 evaluation on the exactly dequantised operands, with a
+    propagated error bound.  The kernel accumulates both products in fp32 over the whole input width, rounds each once
+    to bf16, forms the SiLU with an approximate exponential and division, rounds the product to bf16 and writes 4-bit
+    codes under block scales it forms from that value; the reference pair of this block (``linear``, then
+    ``silu_mul_quantize``) rounds at the same points from fp64, and no bracket of two values holds the distance of an
+    fp32 sum of thousands of products.  This block is the twin of that entry's adapter, not a row of any table.  It
+    returns the codes and block scales of the fp64 chain at the kernel's rounding points and keeps of the last call
+    what the band of the entry is judged with (``tie_out``: ``swiglu_fp4``): ``bound`` = the fp64 value of every
+    element and its error bound, ``quant`` = the quantisation of the call."""
+
+    entry = "torch_ref.linear + torch_ref.silu_mul_quantize at the kernel's rounding points"
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+    bound = None
+    quant = None
+
+    def __call__(self, qx, weight, quant):
+        if quant is None or quant.fmt != "nvfp4":
+            raise ValueError("the fused gate / up kernel's twin quantises to 4-bit codes")
+        value, error, gate, up = gate_up_bound(qx, weight)
+        self.bound, self.quant = (value, error), quant
+        gate, up = bf16_bracket(gate)[0].double(), bf16_bracket(up)[0].double()  # each product rounded once to bf16
+        nearest = bf16_bracket(gate * torch.sigmoid(gate) * up)[0]  # SiLU x up, the second rounding
+        scales = nvfp4_block_scales(nearest.float().abs().unflatten(-1, (-1, BLOCK)).amax(-1), quant.scale)
+        low, _ = nvfp4_code_bracket(nearest, scales, quant.scale)
+        return BlockScaledTensor(low[..., 0::2] | (low[..., 1::2] << 4), scales, float(quant.scale))
 
 
 class AttentionPrepare(_Reference):

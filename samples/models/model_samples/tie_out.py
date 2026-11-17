@@ -34,10 +34,25 @@ blocks (``model_samples.census``: the form on the objects, attribution, count, o
 the traced pass kept (``Session.traced``).  Where the profiler's records cannot be had it is neither PASS nor FAIL: the line
 says ``NOT OBSERVED`` with the reason, ``Checks.unobserved`` carries it, and a sample then ends in ``RAN``, never in ``PASS``.
 
+**Where the reference's weights come from.**  The reference blocks multiply bf16 copies of the weights' code values.  A
+run keeps such a copy of every weight that a block of its plans reads as one; a weight that every plan multiplies on its
+stored format has none (``Session.uncopied_weights``).  For those the checks make the copy themselves, for one call
+at a time, and drop it after the call (``weights.OnDemand``): in the teacher-forced pass for the twin's call, and in
+the reference stack's own passes for every call (``Session(on_demand=...)``).  Such a copy is made from the stored
+bytes as they are at the call: bit for bit the copy a load would have kept as long as no block has written into its
+weight, and then no check line depends on which of the two a run has.  A block that did write would move its own
+reference with it and pass its band, so that condition is itself a check, **stored weights**: the loader takes a
+checksum of every weight it keeps on its stored format alone, and the checks take it again before their first pass and
+after their last.  A weight whose stored bytes are no longer those of the load fails the run, named by block and layer,
+whatever the block lines say.  What the copies cost is printed under the checks (``on demand``: how many copies, the
+largest, their bytes in all, the seconds), and the largest one is part of the run's memory sentence.  A run that keeps
+every weight as a copy prints neither line.
+
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
+``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``same`` = the provider is the reference
+chain, nothing to compare.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
 other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
@@ -70,6 +85,26 @@ values around it.  Per output of a call, whatever the form of its call site writ
 
 Every value finite.  The line prints how many elements took the other bf16 value, and how many codes are not the ones
 of the nearest value; anything outside these sets is a failure, never a share.
+
+``swiglu_fp4``, the band of the fused 4-bit gate / up entry, is that entry's documented numerics contract as well
+(``docs/operations/gemm_fusions/swiglu_fp4_decode.md``), and it is an interval, not a bracket.  The kernel accumulates the
+gate and the up product in fp32 over the whole input width, rounds each once to bf16, forms ``silu(gate) * up`` with an
+approximate exponential and division, rounds the product to bf16 and writes 4-bit codes under block scales it forms from
+that value; nothing of the product is stored.  An fp32 sum of thousands of products is not within a few units of the
+fp64 one, so the twin keeps no two bf16 values: it evaluates the chain in fp64 on the exactly dequantised operands and
+propagates the entry's error bound to every element (``torch_ref.gate_up_bound``: the terms the entry's own suite
+derives).  Per call:
+
+* every block-scale byte lies in the interval of bytes that bound admits: between the bytes of ``global * (largest -
+  error) / 6`` and of ``global * (largest + error) / 6``, each rounded to nearest even, with the relative slack of the
+  kernel's three fp32 multiplications;
+* every 4-bit code, read under the block scale the kernel stored, is within half a code step of the fp64 value plus
+  that element's error bound (and what a saturating block clips).
+
+Every value finite.  The line prints how many block scales and codes are not those of the fp64 chain rounded at the
+kernel's points, and the largest share of its bound a code used; anything outside is a failure, never a share.  What
+this band cannot see is the entry's to hold: one bf16 unit of the product hides behind half a 4-bit code step, which
+the exact cells of the entry's own suite cover.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -107,8 +142,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from . import census
+from .blocks import GIB
 from .loop import Session
 from .sampling import margin
+from .weights import OnDemand
 
 LOGITS_FACTOR = 2.0
 GDN_EQUAL_BYTES = 0.999
@@ -145,6 +182,11 @@ BANDS = {
         f"the normalised value, the nearest one wherever that value is more than {NORM_MARGIN_ULP32:g} fp32 units from their midpoint; 8-bit codes those of "
         "the normed rows the kernel wrote, or of one of the two bf16 values where it wrote codes alone; 4-bit block scales those of a block maximum the "
         "two values admit, 4-bit codes inside the bracket of the kernel's two approximate reciprocals under its own block scale; every value finite"
+    ),
+    "swiglu_fp4": (
+        "against the gate / up multiply with SiLU x up evaluated in fp64 on the dequantised operands, with the error bound of the kernel's contract: "
+        "every block-scale byte inside the interval of bytes that bound admits for the largest magnitude of its block, every 4-bit code within half "
+        "a code step of the fp64 value under the kernel's own block scale plus that bound; every value finite"
     ),
 }
 
@@ -230,6 +272,9 @@ class BlockStats:
     off_nearest: int = 0  # gate_fp8, add_norm_quant: bytes off the nearest value's code although the judged value is beyond the margin
     other_value: int = 0  # add_norm_quant: normed elements that are the other bf16 value around the normalised value (inside the margin)
     not_of_out: int = 0  # add_norm_quant: 8-bit codes that are not those of the normed rows the same call wrote
+    blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain
+    blocks_equal: int = 0
+    worst_share: float = 0.0  # swiglu_fp4: the largest distance of a code's value from the fp64 value, as a share of its bound
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -267,6 +312,12 @@ class BlockStats:
                 f"{self.not_of_out:,} 8-bit codes not those of the normed rows of their call; {self.off_nearest:,} off the nearest value more than "
                 f"{NORM_MARGIN_ULP32:g} fp32 units from the midpoint; {self.outside:,} outside{loud}"
             )
+        if self.band == "swiglu_fp4":
+            return (
+                f"{self.blocks:,} block scales, {self.blocks - self.blocks_equal:,} of them another byte than the fp64 chain's; {self.total_bytes:,} codes, "
+                f"{self.total_bytes - self.equal_bytes:,} of them another code than the fp64 chain's; the largest distance of a code from the fp64 value "
+                f"{self.worst_share:.0%} of its bound; {self.outside:,} outside their bounds{loud}"
+            )
         share = self.off_by_one / max(self.elements, 1)
         state = "" if self.state_equal else "; STATE DIFFERS"
         return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{state}{loud}"
@@ -282,10 +333,12 @@ def _smallest(counts: torch.Tensor, total: int, layer: int) -> Tuple[float, str]
 class BlockTap:
     """The hook of a checked pass: runs the provider block, then the reference block and -- with more than one sequence -- the
     provider block on one sequence alone (sequence ``step`` modulo the count), each from the same state, and restores the
-    provider's results before it returns them."""
+    provider's results before it returns them.  The reference block reads a bf16 copy of its weight: where the run keeps
+    none, ``on_demand`` (``weights.OnDemand``) makes it for that one call; the provider block is always handed the run's
+    own weight."""
 
-    def __init__(self, plan, reference):
-        self.plan, self.reference = plan, reference
+    def __init__(self, plan, reference, on_demand=None):
+        self.plan, self.reference, self.on_demand = plan, reference, on_demand
         self.stats: Dict[str, BlockStats] = {}
         self.step = 0  # set by the checked pass before every step
 
@@ -318,7 +371,7 @@ class BlockTap:
         after = self._save(holders)
         if independent:
             self._load(holders, before)
-            ref_out = ref(*operands)
+            ref_out = ref(*(operands if self.on_demand is None else self.on_demand.operands(operands)))  # a copy made now is dropped here
             self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer, ref)
         if alone:
             s = self.step % self.plan.sequences
@@ -357,6 +410,11 @@ class BlockTap:
             return
         if stats.band == "add_norm_quant":
             _judge_norm(stats, out, ref, twin)
+            return
+        if stats.band == "swiglu_fp4":
+            _judge_swiglu(stats, out, ref, twin)
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
+            stats.ok = stats.ok and stats.state_equal
             return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
@@ -478,6 +536,43 @@ def _judge_norm(stats: BlockStats, out, ref, twin) -> None:
     stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal
 
 
+def _judge_swiglu(stats: BlockStats, out, ref, twin) -> None:
+    """One call of the fused 4-bit gate / up entry against its twin (band ``swiglu_fp4``): ``out`` are the packed codes and
+    the block scales the kernel wrote, row by row; ``ref`` the same of the fp64 chain at the kernel's rounding points; the
+    twin keeps the fp64 value of every element with its error bound and the quantisation of the call."""
+    from .providers import torch_ref
+    from .weights import BLOCK, E2M1_MAX, _e2m1_values, _e4m3_values
+
+    if getattr(twin, "bound", None) is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError("the band swiglu_fp4 is judged against the gate / up step with its error bound: the block's twin keeps no bound")
+    if len(out) != 2 or len(ref) != 2 or any(o.shape != r.shape for o, r in zip(out, ref)):
+        stats.outside += 1  # the call wrote other outputs than packed codes with their block scales: nothing can be compared
+        stats.ok = False
+        return
+    (packed, scales), (ref_packed, ref_scales) = out, ref
+    value, error = twin.bound
+    scale = torch_ref.nvfp4_global_scale(twin.quant.scale, value.device).double()  # the one element the kernel reads
+    largest, spread = (t.unflatten(-1, (-1, BLOCK)).amax(-1) for t in (value.abs(), error))
+    slack = torch_ref.SWIGLU_SCALE_SLACK
+    low = torch_ref.e4m3_nearest(scale * (largest - spread).clamp(min=0) / E2M1_MAX * (1.0 - slack))
+    high = torch_ref.e4m3_nearest(scale * (largest + spread) / E2M1_MAX * (1.0 + slack))
+    stats.finite = stats.finite and bool(((scales & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+    stats.blocks += scales.numel()
+    stats.blocks_equal += int((scales == ref_scales).sum())
+    stats.outside += int(((scales < low) | (scales > high)).sum())
+    step = (_e4m3_values(scales, torch.float64) / scale).repeat_interleave(BLOCK, dim=-1)  # of the block scale the kernel stored
+    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)  # one code per element, the even element first
+    codes = _e2m1_values(nibbles, torch.float64)
+    half = torch.where(codes.abs() < 2, 0.25, torch.where(codes.abs() < 4, 0.5, 1.0))  # half the step between two codes there
+    bound = half * step + (value.abs() + error - E2M1_MAX * step).clamp(min=0) + error
+    distance = (codes * step - value).abs()
+    stats.total_bytes += nibbles.numel()
+    stats.equal_bytes += int((nibbles == torch.stack((ref_packed & 0xF, ref_packed >> 4), dim=-1).flatten(-2)).sum())
+    stats.outside += int((~(distance <= bound)).sum())  # element by element: outside for a NaN
+    stats.worst_share = _largest(stats.worst_share, float((distance / bound).amax()))
+    stats.ok = stats.finite and stats.outside == 0
+
+
 def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:
     """The end-to-end check of a run's greedy tokens against the reference stack's: ``(held, the text of its line)``.
 
@@ -514,6 +609,7 @@ class Checks:
     judged: int = 0  # provider blocks compared with the reference; 0: every block of the run was the reference chain itself
     kernels: str = ""  # the kernel check, when it was asked for: PASS | FAIL | NOT OBSERVED
     unobserved: str = ""  # why the kernels were not observed
+    on_demand: Optional[OnDemand] = None  # what the reference's copies of the weights the run keeps no copy of cost
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -521,6 +617,41 @@ class Checks:
 
 def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
+
+
+def changed_weights(weights) -> List[str]:
+    """The weights a load keeps on their stored format alone (``alone`` of a family's weights: ``(block, layer, weight)``)
+    whose stored bytes are no longer those of the load, each named by its block and layer: the loader's checksum of the
+    weight against the same checksum taken now (``weights.Dequantized.intact``)."""
+    return [block if layer is None else f"{block} of layer {layer}" for block, layer, weight in getattr(weights, "alone", ()) if not weight.intact()]
+
+
+def stored_weights_line(count: int, before: List[str], after: List[str]) -> str:
+    """The line of the checks about the ``count`` weights the run keeps on their stored format alone: whether each still
+    holds the bytes of its load -- ``before`` and ``after`` name those that did not before the first checked pass and
+    after the last reference pass.  The reference's copy of such a weight is made from these bytes, so a change fails the
+    run and says what the block lines of the named weights are worth."""
+    changed = list(dict.fromkeys((*before, *after)))
+    text = f"  stored weights    {count - len(changed)} of {count} weights this run keeps on their stored format alone hold the bytes of their load"
+    if not changed:
+        return f"{text}, before the checks and after them: the reference's copies were made from what was loaded    PASS"
+    when = [f"{name} ({'before the checks' if name in before else 'during the checks'})" for name in changed]
+    return (
+        f"{text}; written to since: {', '.join(when)}.  The reference's copy of such a weight was made from the changed bytes: "
+        "its block was compared with a reference that moved with it    FAIL"
+    )
+
+
+def on_demand_line(cost: OnDemand, blocks=()) -> str:
+    """The line of the checks that says what the reference's own copies cost (``weights.OnDemand``): how many were made of
+    the weights of ``blocks`` -- those the run keeps on their stored format alone -- the largest one, which is what is held
+    at a time, their bytes in all and the seconds they took.  It carries no verdict: it is a cost, in GiB (2^30 bytes)."""
+    kept = ", ".join(blocks) or "some weights"
+    return (
+        f"  on demand         the reference read {cost.copies:,} bf16 copies of weights this run keeps on their stored format alone ({kept}): "
+        f"each made for one call and dropped after it; the largest {cost.largest / GIB:.2f} GiB, {cost.bytes / GIB:.1f} GiB in all, "
+        f"{cost.seconds:.1f} s of the checks (orientation only)"
+    )
 
 
 def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
@@ -561,6 +692,11 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
     facts = session.plan.facts
+    # the weights this run keeps on their stored format alone: the reference's copies are made from their stored bytes, so
+    # those must be the bytes of the load -- now, after the run's own steps, and again after the last reference pass
+    alone = len(getattr(session.weights, "alone", ()))
+    changed_before = changed_weights(session.weights)
+    cost = OnDemand()  # the reference's bf16 copies of these weights: one per call
     reference = Session(
         session.model,
         session.text,
@@ -571,10 +707,11 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         capacity=session.capacity,
         share=session,
         record_steps=steps,
+        on_demand=cost,
     )
     reference.load()
 
-    tap = BlockTap(session.plan, reference.plan)
+    tap = BlockTap(session.plan, reference.plan, cost)
     session.reset(fresh=True)
     session.tap = tap
     try:
@@ -605,6 +742,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
             capacity=session.capacity,
             share=session,
             record_steps=steps,
+            on_demand=cost,
         )
         matmul = torch.backends.cuda.matmul
         kept = getattr(matmul, "fp32_precision", None)  # a session with IEEE fp32 accumulation sets it for the process
@@ -623,6 +761,8 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
             f"and agrees with it on {int((second.record.outputs[:steps] == ref_ids).sum())} of {ids.numel()} greedy tokens (printed, not gated)"
         )
 
+    changed_after = changed_weights(session.weights)  # after the last pass that read a copy made on demand
+    stored_ok = not changed_before and not changed_after
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
     lines = [
@@ -661,9 +801,14 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
+    if alone:  # said only where the run keeps a weight without its bf16 copy: whether the reference's copies were made from the load's bytes
+        lines.append(stored_weights_line(alone, changed_before, changed_after))
+    if cost.copies:  # what the checks cost beyond the run: said only where a copy was made on demand
+        lines.append(on_demand_line(cost, getattr(session.weights, "uncopied", ())))
     status, unobserved = "", ""
     if kernels:
         status, unobserved, kernel_lines = kernel_check(session)
         lines += kernel_lines
     session.reset(fresh=True)
-    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok and status != census.FAIL, len(judged), status, unobserved)
+    ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
+    return Checks(lines, ok, len(judged), status, unobserved, cost)

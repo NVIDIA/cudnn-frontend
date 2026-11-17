@@ -176,14 +176,20 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("gdn_decode_fused", re.compile(r"^cudnn_kernel_frost_gdn_decode_fused_")),
     ("gate_quant", re.compile(r"^cudnn_kernel_frost_attention_gate_quant_")),
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
+    ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
+    ("swiglu_fp4", re.compile(r"^cudnn_kernel_frost_swiglu_fp4_decode_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
-    ("embedding_gather", re.compile(r"\bat::native::(?:\(anonymous namespace\)::)?indexSelect(?:Small|Large)Index<")),
+    # ``torch.index_select`` launches one of three kernels, by the number of rows it gathers and the size of a table row: the
+    # small-index kernel up to 16 rows, and from 17 the large-index kernel or PyTorch's vectorized gather (seen on a bf16
+    # table of 5120 columns with int32 ids)
+    ("embedding_gather", re.compile(r"\bat::native::(?:\(anonymous namespace\)::)?(?:indexSelect(?:Small|Large)Index|vectorized_gather_kernel)<")),
     ("cublas", re.compile(r"cublas|^nvjet_|\bcutlass::Kernel2?<cutlass_|^(?:maxwell|volta|ampere)_\w*gem[mv]", re.IGNORECASE)),
     ("pytorch", re.compile(r"\bat::native::|\(anonymous namespace\)::(?:softmax_warp_forward|elementwise_kernel_with_index)<")),
 )
 #: a kernel with an id of its own that is also a member of a family.  Where a plan has an exact row for it, every launch of
 #: it in a step is held against that row (a chain that launched the same kernel would count as an extra launch: no chain of
-#: this area does); where it has none, the kernel counts as its family's
+#: this area does -- the embedding is the one ``index_select`` of a step, and a chain that gathers rows indexes its tensor,
+#: which is another kernel of PyTorch); where it has none, the kernel counts as its family's
 FAMILY_OF = {"embedding_gather": "pytorch"}
 FAMILY_IDS = ("cublas", "pytorch")
 COPY = "copy"
@@ -1116,13 +1122,14 @@ class Traced:
         return lines
 
     def served(self) -> List[str]:
-        """For every block whose row names several call sites: which entry instance served how many calls of the first traced
-        step, in which form -- counted from the call log, which the adapters wrote after each call from the object they had
-        called.  (Whether each call was served in the form of ITS site is item 0 of the check; this is the count.)"""
+        """For every block whose row names several call sites of an entry: which entry instance served how many calls of the
+        first traced step, in which form -- counted from the call log, which the adapters wrote after each call from the
+        object they had called.  (Whether each call was served in the form of ITS site is item 0 of the check; this is the
+        count.)  A block that is called at named sites and served by no entry there has no instance to count."""
         lines = []
         if not self.call_log:
             return lines
-        named = {site.block for site in self.sites if site.site}
+        named = {site.block for site in self.sites if site.site and site.facts is not None}
         counts: Dict[str, Counter] = {}
         for call in self.call_log[0]:
             if call.block in named:
