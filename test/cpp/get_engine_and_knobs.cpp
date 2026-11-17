@@ -48,7 +48,9 @@ TEST_CASE("Backend knob vocabulary preserves compiled defaults", "[graph][knobs]
     fe::graph::from_json(encoded, decoded);
     CHECK(decoded == public_type);
 #endif
-    CHECK(fe::convert_from_backend_knob_type(static_cast<cudnnBackendKnobType_t>(999)) == fe::KnobType_t::NOT_SET);
+    // 63 is unmapped but within the backend enum's representable range; a
+    // larger value would make the negative control itself undefined in C++.
+    CHECK(fe::convert_from_backend_knob_type(static_cast<cudnnBackendKnobType_t>(63)) == fe::KnobType_t::NOT_SET);
     CHECK(fe::convert_to_backend_knob_type(fe::KnobType_t::SCHED_POLICY, converted) == CUDNN_STATUS_NOT_SUPPORTED);
 }
 
