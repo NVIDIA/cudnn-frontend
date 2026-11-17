@@ -1335,7 +1335,8 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
         return TRAIL  # paged KV on the prefill body: 15-27x behind the backend at s_q 8-2048 (module docstring)
     if not facts.thd and facts.s_q == 1:
         units = facts.b * facts.h_kv
-        if _selected_d_shape(caps, facts) == (512, 512):
+        paged_mla = facts.has_paged_kv and (facts.d_qk, facts.d_v) == (576, 512)  # same group shape as paged d512 (D576 transfer check)
+        if _selected_d_shape(caps, facts) == (512, 512) or paged_mla:
             group = facts.h_q // max(facts.h_kv, 1)
             if group > SM120_SQ1_MAX_GQA_GROUP:
                 return TRAIL if group & (group - 1) else LEAD

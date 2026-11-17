@@ -930,8 +930,8 @@ TABLE: Dict[Tuple, Entry] = {
     # paged d128 / d256 GQA page 16, d512 / D576xV512 absorbed MLA dense and paged, d64 sink (and window 128) paged MTP; b 1-64, S_kv
     # 8k-131k on and off the tile; 333 train cells + a seeded holdout scored once per class: 0.34-0.67 geomean of the measured default,
     # worst 0.65. The sink-only d64 MTP class lost 1.21x on the holdout and dense d512 s_q 1 stays with the #2497 rule: no entry.
-    # Its paged d512 s_q 1 entries are retired: the group, which the key cannot carry, decides there (sm120_paged_d512_q1_v2_20261117,
-    # fwd/placement._place_sm120_f16))
+    # Its paged d512 and D576 s_q 1 entries are retired: the group, which the key cannot carry, decides there
+    # (sm120_paged_d512_q1_v2_20261117 and the D576 transfer check sm120_paged_d576_q1_xfer_20261117; fwd/placement._place_sm120_f16))
     # study sm120_paged_d128_mtp_20261117 re-fits the d128 paged MTP twins (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 9bdf9a8ab; llama
     # heads 8/1-64/8, b 1-128, s_q 2-4, KV 8k-128k; 129 train cells, a 60-cell seeded holdout scored once: 10 changed at 0.43 / 0.77
     # geomean, worst 0.92). The study's FROST split kept 64 CTAs at 64 KV units; under the paged split rates FROST leads every unit
@@ -964,8 +964,6 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("never", None, "sm120_decode_20261112"),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", False): Entry("always", None, "sm120_decode_20261112"),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", True): Entry("always", None, "sm120_decode_20261112"),
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("never", None, "sm120_decode_20261112"),
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("never", None, "sm120_decode_20261112"),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", False): Entry("ge", 5.0, "sm120_decode_20261112", "tiles"),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", True): Entry("ge", 28.501, "sm120_decode_20261112"),
     # study sm107_decode_q1_20261112 (208-SM Rubin, cuDNN 9.30.0.4; benchmark/attention_inference's generation graph, s_q == 1:

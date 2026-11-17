@@ -239,15 +239,17 @@ def test_sm120_d512_decode_wide_group_leads_when_it_fills_the_tile(b, s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk", [512, 576], ids=["d512", "d576"])
 @pytest.mark.parametrize("b", [1, 16, 128])
-def test_sm120_paged_d512_decode_follows_the_group(b):
-    """Study sm120_paged_d512_q1_v2_20261117 (DSv4 paged decode, page 64): on paged K/V the group decides at any batch -- 40-64
-    query heads lead, 32 and below keep the backend (1.06-1.75x), a wider group leads only as a power of two."""
+def test_sm120_paged_d512_decode_follows_the_group(b, d_qk):
+    """Study sm120_paged_d512_q1_v2_20261117 (DSv4 paged decode, page 64) and its D576 transfer check (Kimi-K3, page 32 / 64): on
+    paged K/V the group decides at any batch -- 40-64 query heads lead, 32 and below keep the backend (1.06-1.75x), a wider group
+    leads only as a power of two."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
     from cudnn.sdpa import placement_table as pt
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
-    paged = dict(b=b, h_kv=1, s_q=1, s_kv=65536, d_qk=512, d_v=512, causal=False, bottom_right=False, device_cc=(12, 0), device_sm_count=188)
+    paged = dict(b=b, h_kv=1, s_q=1, s_kv=65536, d_qk=d_qk, d_v=512, causal=False, bottom_right=False, device_cc=(12, 0), device_sm_count=188)
     paged.update(has_paged_kv=True, page_size=64, padded=True)
     for h_q, verdict in ((8, placement.TRAIL), (16, placement.TRAIL), (32, placement.TRAIL), (40, placement.LEAD), (64, placement.LEAD)):
         assert placement.place(spec, _facts(h_q=h_q, **paged)) == verdict, h_q
