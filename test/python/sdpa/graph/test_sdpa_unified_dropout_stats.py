@@ -7,6 +7,8 @@ The unified SDPA forward must serve dropout together with generate_stats=True.
 That combination is the training forward: the backward needs Stats, and it regenerates
 the dropout mask from the same seed and offset. So the forward's mask has to be the one
 any backward engine will regenerate, whichever forward engine produced O and Stats.
+cuDNN guarantees that for the unified forward from 9.28.0; on older versions the frontend
+declines the combination.
 
 The test therefore checks the unified forward three ways:
   * against a torch reference that applies the mask the engine dumped;
@@ -23,6 +25,10 @@ import torch
 from sdpa.fp16_ref import compute_ref
 
 DROPOUT_PROB = 0.1
+UNIFIED_DROPOUT_WITH_STATS_MIN_CUDNN_VER = 92800
+# (s_q, s_kv, d): a regular shape, the decode shape, and sequence lengths that end inside a tile. The last two are
+# shapes where older cuDNN versions drew a mask that differs from the composite forward's.
+SHAPES = {"regular": (192, 256, 64), "decode": (1, 256, 64), "ragged_tiles": (33, 77, 128)}
 SEED, OFFSET = 123456, 7
 
 
@@ -89,8 +95,10 @@ def _run_sdpa(cudnn_handle, q, k, v, attn_scale, right_bound, implementation, ge
 @pytest.mark.L0
 @pytest.mark.parametrize("right_bound", [None, 0], ids=["no_mask", "causal"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_sdpa_unified_dropout_with_stats(cudnn_handle, dtype, right_bound):
-    b, h_q, h_kv, s_q, s_kv, d = 2, 4, 2, 192, 256, 64
+@pytest.mark.parametrize("shape", list(SHAPES), ids=list(SHAPES))
+def test_sdpa_unified_dropout_with_stats(cudnn_handle, shape, dtype, right_bound):
+    b, h_q, h_kv = 2, 4, 2
+    s_q, s_kv, d = SHAPES[shape]
     attn_scale = 1.0 / math.sqrt(d)
     rng = torch.Generator(device="cuda").manual_seed(0xD0)
     q = torch.randn(b, h_q, s_q, d, dtype=dtype, device="cuda", generator=rng)
@@ -105,6 +113,9 @@ def test_sdpa_unified_dropout_with_stats(cudnn_handle, dtype, right_bound):
         pytest.skip("unified SDPA forward does not serve dropout on this device / cuDNN version")
 
     with_stats = _run_sdpa(cudnn_handle, q, k, v, attn_scale, right_bound, unified, generate_stats=True)
+    if cudnn.backend_version() < UNIFIED_DROPOUT_WITH_STATS_MIN_CUDNN_VER:
+        assert with_stats is None, "dropout with generate_stats=True on the unified forward needs cuDNN 9.28.0"
+        pytest.skip("dropout with generate_stats=True on the unified forward requires cuDNN 9.28.0")
     assert with_stats is not None, "the unified SDPA forward serves dropout but declined dropout with generate_stats=True"
     o, stats, mask = with_stats
 
@@ -113,8 +124,11 @@ def test_sdpa_unified_dropout_with_stats(cudnn_handle, dtype, right_bound):
     allowed = torch.ones(s_q, s_kv, dtype=torch.bool, device="cuda")
     if right_bound is not None:
         allowed = torch.tril(allowed, diagonal=right_bound)
-    keep_fraction = mask[:, :, allowed].mean().item()
-    assert abs(keep_fraction - (1.0 - DROPOUT_PROB)) < 0.02, f"keep fraction {keep_fraction:.4f}"
+    kept = mask[:, :, allowed]
+    keep_fraction = kept.mean().item()
+    # 0.02 for the large shapes; four standard deviations where the allowed region is small (decode, causal).
+    tolerance = max(0.02, 4.0 * math.sqrt(DROPOUT_PROB * (1.0 - DROPOUT_PROB) / kept.numel()))
+    assert abs(keep_fraction - (1.0 - DROPOUT_PROB)) < tolerance, f"keep fraction {keep_fraction:.4f}"
 
     # Reference with the engine's own mask. Stats are the softmax statistics, which dropout does not touch.
     o_ref, stats_ref, _, _ = compute_ref(
