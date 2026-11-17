@@ -29,6 +29,7 @@ from ._sm90_relay import (
     sm90_deterministic_relay_accumulator_elements,
     sm90_deterministic_relay_indexing_error,
     sm90_deterministic_relay_requirement_error,
+    sm90_physical_relay_cluster_size,
 )
 
 
@@ -76,10 +77,11 @@ class SparseAttentionBackward(APIBase):
         ``deterministic_relay_cluster_size`` optionally requests an exact
         4-, 8-, 16-, 32-, or 64-CTA logical deterministic dKV relay. SM90
         defaults to 16; SM100 generic-M64 large-context plans retain their
-        automatic policy. The 32- and 64-CTA options use two and four ordered
-        16-CTA hardware-cluster launches, respectively. The choice is compiled
-        into the plan and changes its workspace requirement; it cannot be
-        changed by ``execute()`` or during CUDA Graph replay.
+        automatic policy. The widest launchable physical C16/C8/C4 cluster is
+        selected for the plan; wider logical relays use ordered same-stream
+        phases. The logical choice is compiled into the plan and changes its
+        workspace requirement; neither choice can change during CUDA Graph
+        replay.
 
         ``deterministic_dkv_mode`` selects the dKV storage of deterministic
         SM100 plans of the generic M64 kernel and of the H128 D512/D576 two-CTA
@@ -130,6 +132,7 @@ class SparseAttentionBackward(APIBase):
         self.q_cluster_mode = q_cluster_mode
         self.deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
         self._sm90_deterministic_relay_cluster_size = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE
+        self._sm90_physical_relay_cluster_size = 1
         self.deterministic_dkv_mode = deterministic_dkv_mode
         self._dkv_mode = deterministic_dkv_mode
         self._backend = None
@@ -407,6 +410,15 @@ class SparseAttentionBackward(APIBase):
             )
         elif self.cli_target_head_count is not None:
             self._value_error_if(True, "cli_target_head_count requires return_cli_target=True")
+
+        # Defer the one-time driver occupancy query until every inexpensive
+        # support check has passed.  The result is part of the prepared plan
+        # and is never recomputed by execute() or CUDA Graph replay.
+        if major == 9 and self.deterministic:
+            self._sm90_physical_relay_cluster_size = sm90_physical_relay_cluster_size(
+                self._sm90_deterministic_relay_cluster_size,
+                self.q_desc.device,
+            )
         self._is_supported = True
         return True
 
@@ -728,6 +740,7 @@ class SparseAttentionBackward(APIBase):
                     deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
                     cli_target=cli_target,
                     cli_target_head_count=(self.cli_target_head_count if self.return_cli_target else 0),
+                    physical_relay_cluster_size=self._sm90_physical_relay_cluster_size,
                 )
             return _iface_sm100.flash_attn_bwd_sm100(
                 q,
