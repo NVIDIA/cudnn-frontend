@@ -13,7 +13,6 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
-from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import geometry as geo_mod
 
 # PTX helpers retain the required rounding, predication and instruction scheduling.
@@ -93,12 +92,6 @@ def _select_u64(cond, a, b, *, loc=None, ip=None):
 @dsl_user_op
 def _select_f32(cond, a, b, *, loc=None, ip=None):
     return _bits_to_f32(_select_u32(cond, _f32_bits(a, loc=loc, ip=ip), _f32_bits(b, loc=loc, ip=ip), loc=loc, ip=ip), loc=loc, ip=ip)
-
-
-_F32_NEG_INF = 0xFF800000
-
-
-_F32_POS_INF = 0x7F800000
 
 
 # ---------------------------------------------------------------- volatile helpers

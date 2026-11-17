@@ -10,8 +10,6 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.tma import st_global
 from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.common import (
-    _F32_NEG_INF,
-    _F32_POS_INF,
     _add_ftz,
     _fma_ftz,
     _ldg_f32_if,
@@ -23,6 +21,8 @@ from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.common import (
 
 HD = 128
 LOG2E = 1.4426950408889634
+_F32_NEG_INF = 0xFF800000  # -LSE term of the padded tail rows: P = 0 in dK/dV
+_F32_POS_INF = 0x7F800000  # LSE copy of the padded tail rows: P = 0 in dQ
 
 
 @cute.kernel
