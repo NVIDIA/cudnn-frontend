@@ -769,6 +769,12 @@ nothing, reads nothing to the host and copies nothing. A session of several toke
 no `step`: the decode step is a row of another plan, and a run that needs both has two sessions on one load, planned
 together, as above.
 
+The two sessions share the load and nothing else. Each has a state of its own -- recurrent state, history, caches,
+position -- so a verify session starts at position 0 on a zero state, whatever the decode session has run: a prompt
+prefilled through `decode` is no context of `verify`, and no error says so. What a verify session is to continue
+reaches it through its own verify steps, `T` tokens at a time, keeping all of them. One state for both kinds of step
+is not built (**What is not here**).
+
 **The state.** The recurrent state after EVERY token of a step is written to a slot of its own, so the next step can
 start from whichever token the run kept, with nothing copied. The slots are numbered token by token -- sequence `i`,
 token `t` owns slot `1 + t x sequences + i` -- so token 0 of a sequence is its plain slot `i + 1`, and the layout of
@@ -836,7 +842,20 @@ On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded
 tokens and at four, every greedy token of the verify steps was the decode steps' and the logits were the same bytes;
 the recurrent state of the kept tokens was within the band everywhere (at one sequence the same bytes), the history
 and the attention caches byte-equal; the kernel check passed with the verify kernel in the shape its entry states
-and, at one sequence of six tokens, in the shape the census records. These are the runs of one GPU class.
+and, at one sequence of six tokens, in the shape the census records. The same held at two sequences of six tokens
+and at two and three of eight. There, on a part of this SM count, the entry takes another form than at one sequence
+and at four: one thread block per value head and sequence, each on an SM of its own, with 224,672 B of shared memory
+at six tokens and 231,744 B at eight, the largest step that form holds. These are the runs of one GPU class.
+
+**Memory.** The memory sentence of a verify plan counts the state of its step shape -- a recurrent state per
+(sequence, token), `T + 2` history columns per sequence -- beside the flat working memory of every plan of the
+reduced models. Up to 32 rows of a step PyTorch reserved within 0.1 GiB of it: one sequence of six tokens asked for
+about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB. Beyond that the sentence is short, as it is
+for a decode plan beyond 33 sequences (the section "Support per GPU class"): 16 sequences of three, four and five
+tokens -- 48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB and grew the
+device by 4.5, 5.8 and 7.1 GiB. A GPU whose free memory is what the sentence says passes the plan of such a run and
+can fail to allocate inside its checks: at these step shapes the device grew by 0.5 to 2.7 GiB more than the
+sentence said.
 
 **What the entry states about one sequence alone.** `cudnn.GdnVerifyFused` is replay-identical, and it states no
 batch invariance between one sequence and several: one sequence takes another association of the gated norm's sum
@@ -846,7 +865,13 @@ the bytes were equal and, beside it, this statement.
 
 **What is not here.** No drafter runs, so nothing decides how many tokens to keep: the caller says it. One count
 per step for all sequences: a step that keeps another number of tokens per sequence needs a position per sequence
-in the attention blocks, which is not built. The verify out-projection on its target kernel, the attention blocks
+in the attention blocks, which is not built. A decode step and a verify step on one state: a session has one kind of
+step, and two sessions on one load keep two states, so no run here prefills a prompt and then verifies drafted
+tokens behind it. The report of a verify session (`Session.report()`) states its step timings and its traced pass
+and says of three lines that they are not stated -- the first-token line (nothing is prefilled through verify
+steps), the rate (a step is not one token), and the bytes of a step (the family's arithmetic is the decode step's:
+one embedding row, one recurrent state and three history columns per sequence). The verify out-projection on its
+target kernel, the attention blocks
 and the MLP's down multiply on theirs. A captured verify step. A verify step of more than eight tokens per
 sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
 has run on compute capability 10.0 only; every other class is uncovered, not passing.
@@ -1159,10 +1184,12 @@ format alone (a driver's own blocks, 1.5 GiB of copies not made) a run asked for
 grew the device by 2.9 GiB. So a GPU whose free memory is within half a GiB of the sentence can still fail to allocate
 after the plan with these models; with the published checkpoint the working memory is an eighth of the weights held
 and the runs stayed inside the sentence (the section on checkpoints).
-Beyond 33 sequences the sentence is short, on every stack: what a run holds per sequence beyond the state the
+Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step -- the
+sentence is short, on every stack: what a run holds per row beyond the state the
 sentence counts is not in its flat allowance. At 64 sequences the default stack asked for about 3.9 GiB, reserved
 6.6 GiB and grew the device by 6.8 GiB; `--stack native` asked for about 3.8 GiB, reserved 6.0 GiB and grew it by
-6.2 GiB; and `--stack native --sequences 64,65` asked for about 4.4 GiB, reserved 8.0 GiB and grew it by 8.2 GiB. At
+6.2 GiB; and `--stack native --sequences 64,65` asked for about 4.4 GiB, reserved 8.0 GiB and grew it by 8.2 GiB. A
+verify plan of 48 to 80 rows is short by 0.3 to 2.6 GiB (the section "The verify step" has the runs). At
 such a count a GPU needs several GiB more than the sentence says.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
 Blackwell GPU: a second or two to plan, which includes building the entries' kernels for both sequence counts (1.1 to

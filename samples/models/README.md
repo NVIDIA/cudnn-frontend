@@ -30,7 +30,8 @@ its launches) follow in that stack. Speculative decoding has its first two piece
 (its tensors, its rows of the output head, its 8-bit weights), and the verify step -- the step that feeds every sequence
 the token it kept last and the tokens drafted behind it at once, on `cudnn.GdnVerifyFused` with a recurrent state per
 token (`Session(tokens=T)`, `Session.verify`; reached from the helper layer and held against the decode steps of the same
-tokens). On compute capability 10.0, at one sequence of six tokens, the same five entries serve
+tokens). On compute capability 10.0, at one sequence of six tokens, five entries -- `cudnn.GdnVerifyFused` in place of
+the fused decode step, the other four the same -- serve
 321 of the 484 launches of a verify step, 48 the target's own compiled kernels + 273 cuDNN Frontend entries with
 byte-equal results (with PyTorch's gather: 49 + 273). No script drafts yet. The destination is a runnable
 performance reference. Until a sample reaches it, its

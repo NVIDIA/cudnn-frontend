@@ -1034,6 +1034,36 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         f"{entries + numbers['target_port']} of the 484 launches of a verify step, {entries} the target's own compiled kernels + {numbers['target_port']} cuDNN Frontend entries"
         in " ".join(area.split())
     ), "the area README states the entries' launches of a verify step with their split"
+    # ... and names the entries that serve them: those of a decode plan, the fused verify entry in place of the fused decode step
+
+    def on_target(tokens):
+        """The cuDNN Frontend entries whose calls are target kernels in the plan of one sequence of ``tokens`` tokens."""
+        planned, whole_model = _plan(1, tokens, model=QwenDense())
+        held = target.claim(planned, whole_model, census.configuration_of(planned), installed=RECORDED)
+        return {planned[name].entry for name in planned if planned[name].provider == "cuDNN FE" and held.of(name).startswith("target")}
+
+    decode_entries, verify_entries = on_target(1), on_target(6)
+    assert len(decode_entries) == len(verify_entries) == 5 and len(decode_entries & verify_entries) == 4
+    assert (decode_entries - verify_entries, verify_entries - decode_entries) == ({"cudnn.GdnDecodeFused"}, {"cudnn.GdnVerifyFused"})
+    assert "five entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other four the same -- serve 321 of the 484" in " ".join(area.split())
+    assert "the same five entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
+    # the form the entry takes between the step shapes at the ends of a row's range -- one thread block per SM, which a host
+    # entry keeps at every step shape (it has no SM count to pick another by): its shared memory at six and at eight
+    # tokens as the family README states them, and eight tokens as the most that form holds, the last count of the rows
+    import cudnn
+    from model_samples.qwen_dense import configs
+
+    host = cudnn.GdnVerifyFused("cpu", model.norm_eps, pdl=True)
+    assert tuple(host.launch_shape_for(2, 6)) == ((48, 2, 1), (256, 1, 1), 224672) and tuple(host.launch_shape_for(3, 8)) == ((48, 3, 1), (256, 1, 1), 231744)
+    assert host.max_tokens_for(2) == host.max_tokens_for(3) == 8 == max(tokens for tokens, _ in configs.VERIFY_STEPS)
+    with pytest.raises(NotImplementedError, match="9 tokens per request need 235280 B of shared memory"):
+        host.launch_shape_for(2, 9)
+    assert "with 224,672 B of shared memory at six tokens and 231,744 B at eight, the largest step that form holds" in section
+    # what the family README says a reader cannot see from the snippet, each held by a test of this module
+    assert "The two sessions share the load and nothing else." in section and "a prompt prefilled through `decode` is no context of `verify`" in section
+    assert "says of three lines that they are not stated -- the first-token line" in section, "the report of a verify session"
+    assert "48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB" in section, "where the memory sentence is short"
+    assert "Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(family.split())
     decline = "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
     assert decline in section, "the decline the README quotes is the plan's own sentence"
     assert "## What the verify step taught" in guide and "fe.gdn_verify_fused" in guide
