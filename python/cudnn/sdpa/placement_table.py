@@ -922,6 +922,28 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm80_paged_wide_verify_v2_20261117"
     ),
+    # study sm80_d576_prefill_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 9fe376094; absorbed-MLA (576, 512) MQA causal over the whole
+    # range: chunks S_q 5-2048 over KV 256-128k and squares 8-4096, on and off the tile, dense and paged THD; 200 train cells). Dense
+    # prefill and verify always, paged prefill from 2^7.5 / 2^3.0 tiles (changed train 0.12-0.69); holdout at fresh h_q, scored once,
+    # 0.08-0.70 (worst 0.878). Paged verify keeps sm80_paged_wide_verify_v2_20261117's entries.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 7.5, "sm80_d576_prefill_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 3.0, "sm80_d576_prefill_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_d576_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "verify", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_d576_prefill_20261117"
+    ),
     # study sm80_paged_mtp_sink_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 9bdf9a8ab; the same generation graph, paged page 16,
     # d64 with a sink, full and 128-key window, s_q 2-4, b 1-128, KV 4k-128k; 280 train cells, a 60-cell seeded holdout scored once:
     # the four classes moved 47 cells at 0.29-0.41 geomean, worst 1.07). The a100 nightly (run-547) had gpt-oss paged MTP at 3.9-8.4x.
