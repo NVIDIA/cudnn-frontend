@@ -226,7 +226,7 @@ def _backward(topk, coefficient, triangular, config, state, cotangents):
 _attention.defvjp(_forward, _backward)
 
 
-def simplified_sparse_attention_jax(
+def simplified_sparse_attention_forward_jax(
     query, key, value, q_idx, k_idx, key_starts, key_ends, query_valid, loss_denominator, *, topk=512, loss_coeff=0.1, triangular_scores=False
 ):
     """Return ``(output, indexer_loss)`` with JIT and first-order reverse-mode gradients.
@@ -243,7 +243,7 @@ def simplified_sparse_attention_jax(
     loop for exact repair of failed rows.
     """
     arrays = (query, key, value, q_idx, k_idx, key_starts, key_ends, query_valid, loss_denominator)
-    error = cutedsl_requirement_error("simplified_sparse_attention_jax", floor=(4, 8, 0))
+    error = cutedsl_requirement_error("simplified_sparse_attention_forward_jax", floor=(4, 8, 0))
     if error:
         raise ImportError(error)
     config = _configuration(arrays, topk, loss_coeff, triangular_scores)

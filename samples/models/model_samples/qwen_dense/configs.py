@@ -4,11 +4,13 @@
 """The provider table and the regime table of the dense Qwen family, as data.
 
 For every block the rows are ordered; the first row whose GPU classes, sequence range, tokens-per-sequence range and stack
-contain the run serves the block.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
+contain the run serves the block.  A row whose entry serves some layer widths only names them (``widths``): a model of the
+family with another width is not that row's, and the next row is asked.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
 reference chain or a multiply over a dequantised copy; ``band`` is the tie-out band of the row against the reference block
 (``model_samples.tie_out.BANDS``) and is never widened in place.  ``form`` is what the row's adapter passes to its entry: fields
-of the entry's own form, which the kernel check compares with the entry's answer.  A stack adds its rows here; it removes
-none.
+of the entry's own form, which the kernel check compares with the entry's answer.  A row whose entry a step calls in several
+forms names them by call site (``sites``; the call sites of this family's wiring: ``QwenDense.sites``).  A stack adds its
+rows here; it removes none.
 
 The stacks:
 
@@ -38,9 +40,46 @@ TARGET_STACKS = ("native", "fe-entries")
 PROVIDER_STACKS = ("fe-cublas", *TARGET_STACKS)
 EVERY = (*BOTH, *TARGET_STACKS)
 
+#: the forms the target calls the add + RMSNorm + quantise kernel in, by call site of the wiring: the residual mode (the first
+#: call of a step starts the residual stream from its operand, every other call adds to it in place) and the outputs the
+#: next block reads.  A layer's input norm writes the 8-bit operand of the in-projection, and the normed bf16 rows too where
+#: the mixer reads them (the linear-attention step does, the attention layer does not); the norm in front of an MLP writes
+#: 4-bit codes alone; the final norm writes bf16 rows alone, and the output head's 4-bit operand is quantised from them by a
+#: launch of its own.  Six forms; a model of 48 + 16 layers calls five of them, 1 / 47 / 16 / 64 / 1 times a step
+NORM_FORMS = (
+    ("linear_attention.first", (("ADD", False), ("STORE_RESIDUAL", True), ("BF16_OUT", True), ("QUANT", "e4m3_static"))),
+    ("full_attention.first", (("ADD", False), ("STORE_RESIDUAL", True), ("BF16_OUT", False), ("QUANT", "e4m3_static"))),
+    ("linear_attention", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", True), ("QUANT", "e4m3_static"))),
+    ("full_attention", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", False), ("QUANT", "e4m3_static"))),
+    ("mlp", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", False), ("QUANT", "nvfp4"))),
+    ("output_head", (("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", True), ("QUANT", None))),
+)
+
 PROVIDERS = {
     "embedding": [ProviderRow(*ANY, "torch.index_select", EVERY, serves="any")],
-    "add_norm_quantize": [ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain")],
+    "add_norm_quantize": [
+        ProviderRow(
+            ("cc10.x",),
+            (1, 1024),
+            (1, None),
+            "fe.add_norm_quant_decode",
+            TARGET_STACKS,
+            serves="rows 1-1,024, hidden 5120",
+            band="add_norm_quant",
+            batch_invariant=("cc10.0",),
+            # the target's launch form at every call site: the kernel waits for its predecessor after it has loaded the norm
+            # weight and the scale and before it reads the rows, and releases its successor directly behind that wait.  The
+            # launch after it in this stack carries no dependent-launch attribute, so the release changes nothing here; the
+            # launch before it must not write the norm weight or the scale, which are constants of the layer
+            form=(("PDL", True), ("PDL_RELEASE", True)),
+            rows=(1, 1024),
+            sites=NORM_FORMS,
+            # the row width the entry serves (its page: 5120, the published model's).  A checkpoint of the family with another
+            # hidden width keeps the block on the reference chain below, and its run states no kernel identity
+            widths=(("hidden", 5120),),
+        ),
+        ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain"),
+    ],
     "projection.fp8.in": [
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 8-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
@@ -184,8 +223,23 @@ def readme_table(calls: dict, stack: str = "fe-cublas", cc=(10, 0)) -> str:
     lines = ["| block | calls per step (64 layers) | provider key | entry [form] |", "|---|---|---|---|"]
     for block, rows in PROVIDERS.items():
         row = next(r for r in rows if stack in r.stacks and r.serves_class(cc))
-        entry = ENTRY_NAMES[row.key] + form_text(row.form) + (f", fallback: {row.fallback}" if row.fallback else "")
+        forms = f" + one of {len(row.sites)} forms, by call site" if row.sites else ""
+        entry = ENTRY_NAMES[row.key] + form_text(row.form) + forms + (f", fallback: {row.fallback}" if row.fallback else "")
         lines.append(f"| {BLOCK_TITLES[block]} | {calls[block]} | `{row.key}` | {entry} |")
+    return "\n".join(lines)
+
+
+def readme_sites(model, stack: str = "native", cc=(10, 0)) -> str:
+    """The call-site table of the family README (markdown): for every row of ``stack`` on ``cc`` that names call sites, the
+    form of each site and how many calls of a step of ``model`` are made there."""
+    from collections import Counter
+
+    calls = Counter(zip((block for block, _ in model.wiring()), model.sites()))
+    lines = ["| block | call site | calls per step (64 layers) | form of the entry there |", "|---|---|---|---|"]
+    for block, rows in PROVIDERS.items():
+        row = next(r for r in rows if stack in r.stacks and r.serves_class(cc))
+        for site, fields in row.sites:
+            lines.append(f"| {BLOCK_TITLES[block]} | `{site}` | {calls[(block, site)]} | {form_text(fields).strip()} |")
     return "\n".join(lines)
 
 

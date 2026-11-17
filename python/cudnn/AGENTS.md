@@ -1171,6 +1171,32 @@ it reads the outputs. Detector: `test_dependent_that_waits_reads_the_eager_bytes
 outputs, eager and captured); the rendering pin counts one
 `launch_dependents`.
 
+**The pairing order of a block reduction is part of a kernel's bytes.** A sum
+over a thread block is a tree of fp32 additions. Pairing the lanes of a warp
+with the shuffle offsets 1, 2, 4, 8, 16 or with 16, 8, 4, 2, 1 gives totals
+that differ in the last bit on some rows, and at EITHER level alone: a body
+that is right inside the warp and wrong over the warp sums passes every row
+whose mass sits in one warp. Spell a row reduction through
+`tile_dsl.rowwise.block_reduce`, whose `order` has no default, and name the
+order in the entry's text. Detector: `test_block_sum_is_the_documented_tree`
+in `test/python/sdpa/frost/test_tile_dsl_rowwise.py` compares every lane with
+a host replay of the tree on three row classes (all mass in one warp, one
+non-zero lane per warp, a full row), each shown to tell a wrong level apart;
+the rendering pin of the same module reads the shuffle offsets in program
+order.
+
+**`redux.sync.max.f32` assembles for compute capability 10.x targets only.**
+The single-instruction fp32 warp maximum is rejected by the assembler for
+`sm_90a`, `sm_110a`, `sm_120a` and `sm_121a` (`Instruction 'redux.f32' not
+supported`); the integer forms assemble there. A kernel that may be admitted
+on such a target takes its warp maximum from a helper that carries the
+shuffle arm. `tile_dsl.rowwise.block_reduce` (`kind="max"`, `"max_index"`)
+chooses by a positive list, so a target nobody named gets the arm that
+assembles everywhere. Detector: `test_rendering_of_every_primitive[sm_120a]`
+(ten shuffles with ten `max.f32`, no `redux.sync.max.f32`) and
+`test_shuffle_arm_is_the_redux_arm` (the two arms bitwise equal on a
+compute-capability-10.x device).
+
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.

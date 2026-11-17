@@ -128,8 +128,8 @@ def _execute(kind, values, config=(1e-5, 1e-6, 20)):
     return tuple(invoke(*values.values()))[:count]
 
 
-def mhc_prepare_jax(x, fn, scale, base, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20):
-    """Return ``(branch_input, stats)``; use mhc_jax for automatic differentiation."""
+def pre_mix_forward_jax(x, fn, scale, base, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20):
+    """Return ``(branch_input, stats)``; use block_forward_jax for automatic differentiation."""
     _, h = _geometry(x)
     for value, shape, name in ((fn, (24, 4 * h), "fn"), (scale, (3,), "scale"), (base, (24,), "base")):
         _validate(value, shape, "float32", name)
@@ -137,7 +137,7 @@ def mhc_prepare_jax(x, fn, scale, base, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_i
     return _execute("fwd_prepare", dict(x=x, fn=fn, scale=scale, base=base), config)
 
 
-def mhc_finish_jax(x, branch, stats):
+def post_mix_forward_jax(x, branch, stats):
     """Return the mixed residual streams as a one-element tuple."""
     t, h = _geometry(x)
     _validate(branch, (t, h), "bfloat16", "branch")
@@ -145,7 +145,7 @@ def mhc_finish_jax(x, branch, stats):
     return _execute("fwd_finish", dict(x=x, b=branch, stats=stats))
 
 
-def mhc_backward_prepare_jax(x, branch, stats, grad_out):
+def post_mix_backward_jax(x, branch, stats, grad_out):
     """Return ``(grad_branch, grad_stats)`` for explicit first-order backward."""
     t, h = _geometry(x)
     for value, shape, dtype, name in (
@@ -157,7 +157,7 @@ def mhc_backward_prepare_jax(x, branch, stats, grad_out):
     return _execute("bwd_prepare", dict(x=x, b=branch, stats=stats, dy=grad_out))
 
 
-def mhc_backward_finish_jax(x, grad_out, grad_u, fn, scale, base, stats, grad_stats, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20):
+def pre_mix_backward_jax(x, grad_out, grad_u, fn, scale, base, stats, grad_stats, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20):
     """Return ``(dx, dfn, dscale, dbase)`` after the external branch backward."""
     t, h = _geometry(x)
     for value, shape, dtype, name in (
@@ -174,13 +174,13 @@ def mhc_backward_finish_jax(x, grad_out, grad_u, fn, scale, base, stats, grad_st
     return _execute("bwd_finish", dict(x=x, dy=grad_out, du=grad_u, fn=fn, scale=scale, base=base, stats=stats, gstats=grad_stats), config)
 
 
-def mhc_head_backward_jax(grad_out):
+def head_backward_jax(grad_out):
     """Return the BF16 broadcast gradient as a one-element tuple."""
     return _execute("head_bwd", dict(dy=grad_out))
 
 
 @jax.custom_vjp
-def mhc_head_forward_jax(x):
+def head_forward_jax(x):
     """Return the four-stream mean as a one-element tuple; supports reverse AD."""
     return _execute("head_fwd", dict(x=x))
 
@@ -190,10 +190,10 @@ def _head_fwd(x):
 
 
 def _head_bwd(residual, gradients):
-    return mhc_head_backward_jax(gradients[0])
+    return head_backward_jax(gradients[0])
 
 
-mhc_head_forward_jax.defvjp(_head_fwd, _head_bwd)
+head_forward_jax.defvjp(_head_fwd, _head_bwd)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
@@ -203,26 +203,26 @@ def _connection(branch_fn, config, x, fn, scale, base, branch_args):
 
 def _connection_fwd(branch_fn, config, x, fn, scale, base, branch_args):
     opts = dict(zip(("rms_eps", "hc_eps", "sinkhorn_iters"), config))
-    u, stats = mhc_prepare_jax(x, fn, scale, base, **opts)
+    u, stats = pre_mix_forward_jax(x, fn, scale, base, **opts)
     branch = branch_fn(u, *branch_args)
-    (y,) = mhc_finish_jax(x, branch, stats)
+    (y,) = post_mix_forward_jax(x, branch, stats)
     return y, (x, fn, scale, base, branch_args, u, branch, stats)
 
 
 def _connection_bwd(branch_fn, config, residual, dy):
     x, fn, scale, base, branch_args, u, branch, stats = residual
-    db, gs = mhc_backward_prepare_jax(x, branch, stats, dy)
+    db, gs = post_mix_backward_jax(x, branch, stats, dy)
     _, pullback = jax.vjp(branch_fn, u, *branch_args)
     du, *dargs = pullback(db)
     opts = dict(zip(("rms_eps", "hc_eps", "sinkhorn_iters"), config))
-    dx, dfn, ds, dbase = mhc_backward_finish_jax(x, dy, du, fn, scale, base, stats, gs, **opts)
+    dx, dfn, ds, dbase = pre_mix_backward_jax(x, dy, du, fn, scale, base, stats, gs, **opts)
     return dx, dfn, ds, dbase, tuple(dargs)
 
 
 _connection.defvjp(_connection_fwd, _connection_bwd)
 
 
-def mhc_jax(x, fn, scale, base, branch_fn, *branch_args, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20):
+def block_forward_jax(x, fn, scale, base, branch_fn, *branch_args, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20):
     """Apply mHC around ``branch_fn(u, *branch_args) -> BF16[T,H]``.
 
     Supports jit and first-order reverse AD, including explicit branch arguments.

@@ -885,7 +885,9 @@ def _softmax_warp_group(
                         if live_cols[jj]:
                             if cutlass.const_expr(SPLIT_KV == 1 and amax_o_tensor is not None):
                                 amax_local = cute.math.max(amax_local, cute.math.abs(val))
-                            o_row = oo[o_batch, tok0 + jg // G, head_idx * G + (jg % G), :]
+                            # Array slices accumulate offsets at the coordinate width.
+                            # Preserve runtime strides and batch products beyond 32 bits.
+                            o_row = oo[cutlass.Int64(o_batch), cutlass.Int64(tok0 + jg // G), cutlass.Int64(head_idx * G + (jg % G)), :]
                             o_row[d_idx] = (val * output_scale).to(o_tensor.element_type)
 
     if cutlass.const_expr(lse_tensor is not None):

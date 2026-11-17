@@ -6,10 +6,10 @@ up gradients from a BF16 output gradient. Values round to BF16 before MXFP8
 quantization, without storing that intermediate.
 
 ```python
-from cudnn.ops import gated_act_mxfp8_forward, gated_act_mxfp8_backward
+from cudnn.ops import swiglu_quantize_forward, swiglu_quantize_backward
 
-row, col, row_sf, col_sf = gated_act_mxfp8_forward(x, rowwise=True, colwise=True)
-drow, dcol, drow_sf, dcol_sf = gated_act_mxfp8_backward(x, dy)
+row, col, row_sf, col_sf = swiglu_quantize_forward(x, rowwise=True, colwise=True)
+drow, dcol, drow_sf, dcol_sf = swiglu_quantize_backward(x, dy)
 ```
 
 `x` is contiguous BF16 `[M, 2K]`; the first K columns are the gate.

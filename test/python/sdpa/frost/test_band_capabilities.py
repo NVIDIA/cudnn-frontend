@@ -52,8 +52,9 @@ def _compiler_targets_available(monkeypatch):
 
 # Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
 # (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
-# The SM80 D64 body likewise serves only the plain aligned corner its selector names; test_sdpa_bwd_explicit_engines pins it.
-_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64"})
+# The SM80 and SM89 D64 bodies likewise serve only the plain aligned corner their shared selector names;
+# test_sdpa_bwd_explicit_engines pins the selector and test_sdpa_bwd_sm89 pins the Ada owner.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm89_f16_d64"})
 
 
 def _rows():
