@@ -15,7 +15,9 @@ into its call log.  An adapter names the block the tie-out compares it with (``t
 call sites (``ProviderRow.sites``) holds one entry instance per form and serves each call with the instance of ITS site: the
 family's step hands the site over as the block's last operand, and the adapter decides nothing.  An adapter that multiplies
 on the stored format of its weight says so (``stored_weights``): the loader then keeps that format, and it keeps the bf16
-copy of that weight only where another block of the run's plans reads one.
+copy of that weight only where another block of the run's plans reads one.  An adapter whose entry reads that weight in a
+layout of its own also says how the layout is made (``stored_layout(merged)``, its entry's own load-time helper): the
+loader then keeps the weight in that layout and in no other stored form.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ ENTRY_NAMES: Dict[str, str] = {
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
     "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
     "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
+    "fe.swiglu_fp4_decode": "cudnn.SwigluFp4Decode",
     "cublas.bf16_dequantized": "torch.matmul over a bf16 copy",
     "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize",
     "torch.index_select": "torch.index_select",
@@ -112,6 +115,10 @@ class BlockBase:
     #: (``weights.Dequantized.stored``) -- and no bf16 copy of the weight where every plan of the run has such a block for
     #: it -- and its memory sentence counts what is kept.  A block that does not say so reads the bf16 copy
     stored_weights = False
+    #: for a block that multiplies on the stored format in a layout of its entry's own: ``stored_layout(merged)`` returns the
+    #: merged stored tensor in that layout, built once per weight at load; the loader keeps what it returns.  ``None``: the
+    #: block multiplies on the merged tensor as the checkpoint stores it
+    stored_layout = None
 
     def __init__(self, row, model, facts, options):
         self.row, self.model, self.facts, self.options = row, model, facts, options
@@ -168,6 +175,7 @@ def factories() -> Dict[str, Callable]:
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
         "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
         "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,
+        "fe.swiglu_fp4_decode": fe.SwigluFp4DecodeBlock,
         "cublas.bf16_dequantized": library.CublasLinear,
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": library.CublasGateUp,
         "torch.index_select": torch_ref.Embedding,

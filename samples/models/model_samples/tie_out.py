@@ -51,7 +51,8 @@ every weight as a copy prints neither line.
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
+``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``same`` = the provider is the reference
+chain, nothing to compare.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
 other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
@@ -84,6 +85,26 @@ values around it.  Per output of a call, whatever the form of its call site writ
 
 Every value finite.  The line prints how many elements took the other bf16 value, and how many codes are not the ones
 of the nearest value; anything outside these sets is a failure, never a share.
+
+``swiglu_fp4``, the band of the fused 4-bit gate / up entry, is that entry's documented numerics contract as well
+(``docs/operations/gemm_fusions/swiglu_fp4_decode.md``), and it is an interval, not a bracket.  The kernel accumulates the
+gate and the up product in fp32 over the whole input width, rounds each once to bf16, forms ``silu(gate) * up`` with an
+approximate exponential and division, rounds the product to bf16 and writes 4-bit codes under block scales it forms from
+that value; nothing of the product is stored.  An fp32 sum of thousands of products is not within a few units of the
+fp64 one, so the twin keeps no two bf16 values: it evaluates the chain in fp64 on the exactly dequantised operands and
+propagates the entry's error bound to every element (``torch_ref.gate_up_bound``: the terms the entry's own suite
+derives).  Per call:
+
+* every block-scale byte lies in the interval of bytes that bound admits: between the bytes of ``global * (largest -
+  error) / 6`` and of ``global * (largest + error) / 6``, each rounded to nearest even, with the relative slack of the
+  kernel's three fp32 multiplications;
+* every 4-bit code, read under the block scale the kernel stored, is within half a code step of the fp64 value plus
+  that element's error bound (and what a saturating block clips).
+
+Every value finite.  The line prints how many block scales and codes are not those of the fp64 chain rounded at the
+kernel's points, and the largest share of its bound a code used; anything outside is a failure, never a share.  What
+this band cannot see is the entry's to hold: one bf16 unit of the product hides behind half a 4-bit code step, which
+the exact cells of the entry's own suite cover.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -161,6 +182,11 @@ BANDS = {
         f"the normalised value, the nearest one wherever that value is more than {NORM_MARGIN_ULP32:g} fp32 units from their midpoint; 8-bit codes those of "
         "the normed rows the kernel wrote, or of one of the two bf16 values where it wrote codes alone; 4-bit block scales those of a block maximum the "
         "two values admit, 4-bit codes inside the bracket of the kernel's two approximate reciprocals under its own block scale; every value finite"
+    ),
+    "swiglu_fp4": (
+        "against the gate / up multiply with SiLU x up evaluated in fp64 on the dequantised operands, with the error bound of the kernel's contract: "
+        "every block-scale byte inside the interval of bytes that bound admits for the largest magnitude of its block, every 4-bit code within half "
+        "a code step of the fp64 value under the kernel's own block scale plus that bound; every value finite"
     ),
 }
 
@@ -246,6 +272,9 @@ class BlockStats:
     off_nearest: int = 0  # gate_fp8, add_norm_quant: bytes off the nearest value's code although the judged value is beyond the margin
     other_value: int = 0  # add_norm_quant: normed elements that are the other bf16 value around the normalised value (inside the margin)
     not_of_out: int = 0  # add_norm_quant: 8-bit codes that are not those of the normed rows the same call wrote
+    blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain
+    blocks_equal: int = 0
+    worst_share: float = 0.0  # swiglu_fp4: the largest distance of a code's value from the fp64 value, as a share of its bound
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -282,6 +311,12 @@ class BlockStats:
                 f"bf16 value around the normalised value; {self.total_bytes:,} codes and block scales, {loose:,} of them not those of the nearest value; "
                 f"{self.not_of_out:,} 8-bit codes not those of the normed rows of their call; {self.off_nearest:,} off the nearest value more than "
                 f"{NORM_MARGIN_ULP32:g} fp32 units from the midpoint; {self.outside:,} outside{loud}"
+            )
+        if self.band == "swiglu_fp4":
+            return (
+                f"{self.blocks:,} block scales, {self.blocks - self.blocks_equal:,} of them another byte than the fp64 chain's; {self.total_bytes:,} codes, "
+                f"{self.total_bytes - self.equal_bytes:,} of them another code than the fp64 chain's; the largest distance of a code from the fp64 value "
+                f"{self.worst_share:.0%} of its bound; {self.outside:,} outside their bounds{loud}"
             )
         share = self.off_by_one / max(self.elements, 1)
         state = "" if self.state_equal else "; STATE DIFFERS"
@@ -375,6 +410,11 @@ class BlockTap:
             return
         if stats.band == "add_norm_quant":
             _judge_norm(stats, out, ref, twin)
+            return
+        if stats.band == "swiglu_fp4":
+            _judge_swiglu(stats, out, ref, twin)
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
+            stats.ok = stats.ok and stats.state_equal
             return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
@@ -494,6 +534,43 @@ def _judge_norm(stats: BlockStats, out, ref, twin) -> None:
         stats.outside += int((~same & ~second).sum())
         stats.off_nearest += int((~same & second & ~loose).sum())
     stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal
+
+
+def _judge_swiglu(stats: BlockStats, out, ref, twin) -> None:
+    """One call of the fused 4-bit gate / up entry against its twin (band ``swiglu_fp4``): ``out`` are the packed codes and
+    the block scales the kernel wrote, row by row; ``ref`` the same of the fp64 chain at the kernel's rounding points; the
+    twin keeps the fp64 value of every element with its error bound and the quantisation of the call."""
+    from .providers import torch_ref
+    from .weights import BLOCK, E2M1_MAX, _e2m1_values, _e4m3_values
+
+    if getattr(twin, "bound", None) is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError("the band swiglu_fp4 is judged against the gate / up step with its error bound: the block's twin keeps no bound")
+    if len(out) != 2 or len(ref) != 2 or any(o.shape != r.shape for o, r in zip(out, ref)):
+        stats.outside += 1  # the call wrote other outputs than packed codes with their block scales: nothing can be compared
+        stats.ok = False
+        return
+    (packed, scales), (ref_packed, ref_scales) = out, ref
+    value, error = twin.bound
+    scale = torch_ref.nvfp4_global_scale(twin.quant.scale, value.device).double()  # the one element the kernel reads
+    largest, spread = (t.unflatten(-1, (-1, BLOCK)).amax(-1) for t in (value.abs(), error))
+    slack = torch_ref.SWIGLU_SCALE_SLACK
+    low = torch_ref.e4m3_nearest(scale * (largest - spread).clamp(min=0) / E2M1_MAX * (1.0 - slack))
+    high = torch_ref.e4m3_nearest(scale * (largest + spread) / E2M1_MAX * (1.0 + slack))
+    stats.finite = stats.finite and bool(((scales & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+    stats.blocks += scales.numel()
+    stats.blocks_equal += int((scales == ref_scales).sum())
+    stats.outside += int(((scales < low) | (scales > high)).sum())
+    step = (_e4m3_values(scales, torch.float64) / scale).repeat_interleave(BLOCK, dim=-1)  # of the block scale the kernel stored
+    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)  # one code per element, the even element first
+    codes = _e2m1_values(nibbles, torch.float64)
+    half = torch.where(codes.abs() < 2, 0.25, torch.where(codes.abs() < 4, 0.5, 1.0))  # half the step between two codes there
+    bound = half * step + (value.abs() + error - E2M1_MAX * step).clamp(min=0) + error
+    distance = (codes * step - value).abs()
+    stats.total_bytes += nibbles.numel()
+    stats.equal_bytes += int((nibbles == torch.stack((ref_packed & 0xF, ref_packed >> 4), dim=-1).flatten(-2)).sum())
+    stats.outside += int((~(distance <= bound)).sum())  # element by element: outside for a NaN
+    stats.worst_share = _largest(stats.worst_share, float((distance / bound).amax()))
+    stats.ok = stats.finite and stats.outside == 0
 
 
 def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:

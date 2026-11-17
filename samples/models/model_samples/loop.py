@@ -9,7 +9,8 @@ follow it on its weights, so that nothing can decline once the first of them has
 entries build their kernels on scratch operands (their first use, where an entry asks what it needs of the installed
 toolchain): the memory sentence comes before the first allocation on the GPU.  ``load()`` then reads (or draws) and
 merges the weights and keeps each in the forms the blocks of these plans read: the stored form of a weight that a block
-multiplies on (``Block.stored_weights``), the bf16 copy of a weight that a block reads as one -- so no copy of a weight
+multiplies on (``Block.stored_weights``; in the layout of that block's provider where it has one of its own:
+``Block.stored_layout``), the bf16 copy of a weight that a block reads as one -- so no copy of a weight
 that every plan of the run multiplies on its stored format.  A block that would read a form the load did not keep fails
 there, by name, before the first step.  ``load()`` then compiles what a provider compiles (a compiled form is launched
 once) and runs one warm-up step, each as a timed stage.  The reference session of a run's checks reads bf16 copies; where
@@ -40,6 +41,8 @@ from .timing import Report, Stages, now, trace_steps
 STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 REFERENCE = "reference"  # the stack of the plain-PyTorch reference blocks: what the checks of a run compare it with
 PREFILL_ROUTES = ("decode-step",)
+#: how a stored weight is laid out for a block that multiplies on it and names no layout of its provider's own
+CHECKPOINT_ORDER = "the checkpoint's row order"
 
 
 class StopRule:
@@ -180,6 +183,29 @@ class Session:
         plans = [self.resolve(), *(session.resolve() for session in self._followers)]
         return tuple(name for name in self.stored_weights() if all(getattr(plan.get(name), "stored_weights", False) for plan in plans))
 
+    def stored_layouts(self) -> dict:
+        """Block -> the layout its provider multiplies the stored weight on (``Block.stored_layout``), for the blocks of
+        ``stored_weights()`` whose provider has one of its own: what the family's loader is handed beside the block names.
+        A load keeps ONE stored form of a weight, so two plans of a run that multiply on it in two row orders are a
+        ``ValueError``, a wrong table: two providers' own layouts, and as much a provider's own layout in one plan beside
+        the checkpoint's row order in another (a block that says ``stored_weights`` and names no layout).  A plan whose
+        block reads the bf16 copy is no reader of the stored form and asks for nothing here."""
+        layouts, owners = {}, {}
+        for plan in (self.resolve(), *(session.resolve() for session in self._followers)):
+            for name, block in plan.items():
+                if not getattr(block, "stored_weights", False):
+                    continue
+                layout = getattr(block, "stored_layout", None)
+                owner = CHECKPOINT_ORDER if layout is None else type(block)  # whose row order this plan multiplies on
+                if owners.setdefault(name, owner) is not owner:
+                    orders = ", ".join(each if isinstance(each, str) else each.__name__ for each in (owners[name], owner))
+                    raise ValueError(
+                        f"the provider table is wrong: two plans of this run multiply on two layouts of the stored weight of {name} ({orders}); a load keeps one"
+                    )
+                if layout is not None:
+                    layouts.setdefault(name, layout)
+        return layouts
+
     def _kept(self) -> dict:
         """What the plans of the run ask the family's loader to keep, as its keyword arguments: nothing for a run whose every
         multiply reads a bf16 copy (a family without such a block is never asked)."""
@@ -188,16 +214,20 @@ class Session:
 
     def _check_forms(self) -> None:
         """Before the first step: every form of a weight a block of this session's plan reads is one the load of its weights
-        kept.  A session that runs on another session's weights was not necessarily planned with it; a ``ValueError`` then
-        names the block and the form."""
+        kept, and a stored weight is in the row order its block multiplies on.  A session that runs on another session's
+        weights was not necessarily planned with it; a ``ValueError`` then names the block and the form."""
         kept, uncopied = getattr(self.weights, "stored", None), getattr(self.weights, "uncopied", ())
         if kept is None:  # a family whose loader holds one form of every weight
             return
+        laid_out = getattr(self.weights, "laid_out", ())
         other = "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
         for name, block in self.plan.items():
             on_stored = getattr(block, "stored_weights", False)
             if on_stored and name not in kept:
                 raise ValueError(f"{block.entry} multiplies on the stored format of the weight of {name}, and the load kept none: {other}")
+            if on_stored and (getattr(block, "stored_layout", None) is not None) != (name in laid_out):
+                wants, has = ("the checkpoint's row order", "a provider's own") if name in laid_out else ("its own row order", "the checkpoint's")
+                raise ValueError(f"{block.entry} multiplies on the stored weight of {name} in {wants}, and the load kept it in {has}: {other}")
             if not on_stored and name in uncopied and self.on_demand is None:
                 raise ValueError(f"{block.entry} reads a bf16 copy of the weight of {name}, and the load kept its stored format alone: {other}")
 
@@ -225,6 +255,8 @@ class Session:
         for session in later:
             session.resolve()
         self._followers = tuple(later)
+        if self._share is None:
+            self.stored_layouts()  # one weight in two row orders is a wrong table: named here, with the plans, before anything is built or read
         sentence = ""
         if self.device.type == "cuda":
             # what the load of the first session holds follows the plans: the stored format of the weights a block multiplies
@@ -244,6 +276,9 @@ class Session:
     # ------------------------------------------------------------------ load
     def load(self) -> None:
         plan = self.resolve()
+        # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
+        # two row orders of one weight end here -- before an entry builds anything, before a byte is read
+        layouts = self.stored_layouts() if self._share is None else {}
         plan.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
             torch.backends.cuda.matmul.fp32_precision = "ieee"
@@ -255,7 +290,8 @@ class Session:
 
                 self.checkpoint = Checkpoint.synthetic(self.model, self.seed)
             # the forms the plans of the run read, asked of a family's loader only where a block multiplies on a stored format
-            self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule, **self._kept())
+            forms = {**self._kept(), **({"layouts": layouts} if layouts else {})}  # ... and the layouts asked above
+            self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule, **forms)
         self._check_forms()
         for name, block in plan.items():
             if getattr(block, "compiles", False):

@@ -27,7 +27,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
    time, on the real device, for the launch of the run's row count, and builds the entry's kernel for that row count on
    scratch operands: an entry asks what it needs of the installed toolchain where it builds, not where it is
    constructed, and that answer is a `SKIP` in the entry's own words before the load. A decline at that point which no
-   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`.
+   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`. An entry that is built
+   from the row count alone, once the entry has stated a launch for that row count, is handed nothing a decline
+   could be about: every typed decline of such a build is the entry's answer about the installation, and the `SKIP`.
 2. **State the environment before the first load.** `check_environment()` compares the installed distribution of cuDNN
    Frontend with `cudnn.__version__`, says whether `cudnn` is an editable checkout and prints a source hash (never a path). A
    mismatch is an error that names both. It runs after the plan, so a GPU the sample does not serve still skips.
@@ -76,7 +78,12 @@ does not hold is printed as not known and ignored, so a new name for one of them
    reference only while those are the bytes of the load: the loader takes a checksum of every weight it keeps on its
    stored format alone and the checks compare it before their first pass and after their last (`stored weights`: a
    weight that was written to fails the run by block and layer). An adapter never writes into its weight. Only the
-   reference session of the checks makes copies per call; any other session is refused the maker. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   reference session of the checks makes copies per call; any other session is refused the maker. A kernel that
+   reads its weight in a row order of its own gets it from the load in that order: the adapter names the layout
+   (`stored_layout`, built by the entry's own helper), the session collects the layouts of its plans, and the load
+   keeps that one stored form -- never a second stored tensor beside it, never a layout made inside a call. The
+   reference's copy is made from that form, into the checkpoint's row order. And an operand that reaches a kernel in
+   another layout than the kernel reads is brought into it by the kernel's adapter, with a launch of its own. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -424,9 +431,9 @@ Each of these passed every test and every GPU run of the first version; a host t
 - A kernel on the stored format needs the stored format. The loader had the merged 8-bit codes in hand and freed them
   after the copy; it now keeps them for the blocks that say they multiply on them, asked by the plan of the session
   and of the sessions that follow on its weights. At that point the copy stayed for the reference (it no longer
-  does: the last section of this guide), so the memory sentence grew, and the allocator's slack with it: the first
-  checkpoint run took 0.4 GiB more than a sentence that had added the stored bytes alone. Measure the sentence
-  against a run whenever what a stack holds changes.
+  does: "What making the loader keep what the plans read taught" below), so the memory sentence grew, and the
+  allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the stored
+  bytes alone. Measure the sentence against a run whenever what a stack holds changes.
 - With a second exactly judged row behind it, a launch behind a layer's input norm fails the check: it now sits
   between two rows that are judged one by one. The same launch behind the in-projection fails in a linear-attention
   layer (the fused step follows) and is counted as the reference chain's in an attention layer. What the check
@@ -562,3 +569,78 @@ Each of these passed every test and every GPU run of the first version.
   copy's two bytes off, the stored bytes on.
 - A line in GiB reads 0.00 on the geometry of a host test, so no test held its figures. The text of the cost line
   is a function, and a host test calls it on the figures of a run at the published widths.
+
+## What building the gate / up row taught
+
+- A kernel's row order of a weight is a form of the stored weight, and a load keeps one. `cudnn.SwigluFp4Decode`
+  reads gate and up rows interleaved in tiles of 64, and its helper returns new tensors. Kept beside the merged
+  tensor that would be the weight twice (12 GiB on the published model), made per call a permutation of 100 MB in
+  front of every launch. The layout is asked of the provider while the run is planned and applied once per weight
+  at load; the merged tensor is dropped. Two plans of one run that multiply on one weight in two row orders are a
+  wrong table, named with the plans; a session on weights that another plan loaded in another row order is named
+  before its first step, like a missing form.
+- The reference's copy is made from the bytes the kernel multiplies on, whatever their order. With the weight kept
+  interleaved, a copy made by un-permuting it into a second packed tensor would have put a stored tensor the
+  checksum does not cover between the kernel's bytes and the reference's. `weights.dequantize` reads the layout a
+  band of rows at a time and writes the checkpoint's row order; a host test holds the copy bit for bit to the copy
+  of the merged weight, and the write-into-the-weight control fails the run on this weight as on the others.
+- A form that follows the row count is a row per value. The entry's token tile is a floor: it runs the narrowest
+  of four tiles that holds the rows of the call. One row with `TOKEN_TILE 8` would have stated at 9 rows a form the
+  kernel does not run, and the form check compares the row with the entry's own form on the objects. The block
+  has four rows of one key by row range, the census names the field of its section's row count, the README table
+  shows the row of 1 to 8 rows and a sentence names the others, and a host test holds each row to the public
+  entry's form at the first and the last row count it claims.
+- Not every kernel has a bracket. The gate and the norm are compared with a twin that keeps the two bf16 values
+  around an fp64 value; an fp32 sum over 5,120 products is not within a few units of the fp64 one, so this entry's
+  contract is an interval: the fp64 chain with a propagated error bound. The band takes the terms of the entry's
+  own suite, a host test holds them to that file, and it holds the reference pair's bytes and a kernel-like fp32
+  chain inside the band and a wrong code and a wrong block scale outside. What the band cannot see is pinned as
+  that: one bf16 unit of the product.
+- The layout between two kernels is theirs; between a kernel and anything else it is the kernel's adapter's. The
+  norm kernel writes block scales in the 128 x 4 layout and the gate / up kernel reads them: handed over as they
+  are, no launch between the two. One row of a batch in the batch check, or the norm row selected away, hands
+  block scales row by row, and the adapter brings them into the layout itself. Asking the producer for the
+  layout would put a launch inside the norm's call, on a path only the checks take.
+- The rounding chain of a fused kernel is its own, and a checkpoint run says so: the greedy tokens of the checkpoint
+  run moved with the row, as they did with the norm row, and the token line stayed where two reference stacks are
+  from each other. On the seeded model the ids hash is the default stack's. State both, and never read the first
+  as a defect of the row or the second as its proof: the block check is what holds the kernel.
+- Measure the sentence again. Without 21.2 GiB of gate / up copies the device grew by 15 GiB less; the room beyond
+  the weights stayed (6.9 GiB), and the sentence held by 0.2 GiB of 37.1. On the one-layer model the same sentence
+  is 0.5 GiB above what the run reserved: the flat allowance of the reduced models is an estimate in both
+  directions, as the section before says.
+- A rule that only fails together with another is not held. The band has two rules, and a block scale outside its
+  interval also puts every code of its block outside its bound: the test of the scale rule passed with that rule
+  switched off. Under zero codes every scale gives the value zero, and a wrong scale byte there fails by its own rule
+  alone. One-line defects applied to the code found it, and found that the test of "half a code step" stepped two
+  codes, and that the chunks of a copy made from an interleaved weight were only read at one chunk length.
+- A count pinned in a test moves with the table. The split rule of the READMEs carried the old numbers in its own
+  pattern (`= 49 + 209`), so the rule would have passed a README that kept them. A test that names numbers of the
+  table is derived from the plan where it can be, and where it cannot, it is on the list of what a new row changes.
+
+## What the review of the gate / up row taught
+
+Each of these passed every host test, every one-line defect and every GPU run of the first version; a host test now
+holds each.
+
+- An interval has two ends, and a test of one of them holds one. The block-scale rule of the band was tested one
+  binade up, one binade down and at a lone byte above a zero block; the case one binade down failed through the code
+  rule, so with the lower end taken out every test stayed green -- and the lower end is the one rule of the band that
+  fails buffers nobody wrote: under a zero scale every code reads as zero, and a code's bound admits the whole value
+  below a scale that is too small. Buffers of zeros are a test of their own, and so is the byte just below the lower
+  end with the codes of its block written under it. Ask of every rule which wrong output it alone would catch, and
+  write that output.
+- "The operands this adapter built" is a sentence about operands. The first use of this entry hands its build a
+  row count and nothing else, and the page of the entry names a requirement no public probe answers (the names its
+  kernel is written on). A decline by that requirement ended in an `ERROR` that blamed the adapter for operands it
+  had not built, where rule 1 asks for the entry's own sentence as a `SKIP`. Where an adapter hands a build nothing
+  of its own, it has nothing to be blamed for there: hold what it does hand over (the row count) in front of the
+  build, and let the entry speak.
+- A question asked inside an error path must not raise. The adapter read the compiler of the installed CuTe DSL to
+  word a decline; a DSL that does not report one turned the entry's decline into an import error from inside the
+  handler. The entry itself declines nothing on a value it could not read, and neither does its adapter.
+- "Two of X are refused" is tested with X and with what stands beside X. Two providers' layouts of one weight were
+  refused before the load; a provider's layout beside the checkpoint's row order -- a block that multiplies on the
+  stored tensor as it is -- was not, and ended after the read in the sentence of a session that was not planned
+  with the run, although it was. What a load keeps is one row order per weight, whoever asks for it: every reader of
+  the stored form has an owner in that comparison, and both orders of the two plans are a case each.
