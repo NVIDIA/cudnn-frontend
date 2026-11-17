@@ -9,6 +9,13 @@ The graph API distinguishes this with `ScalarType`:
 | `RUNTIME_PARAM` | Pass-by-value scalar whose **value can change** each launch (pointer in variant pack). |
 | `COMPILE_TIME_CONST` | Scalar **baked into the graph**; not a separate runtime buffer for that value. |
 
+For `RUNTIME_PARAM`, omitting a binding uses the graph's initial value. Supplying
+that tensor's UID in the variant pack overrides the value for that execution;
+removing the binding restores the graph default. CUDA Graph capture snapshots
+host scalar values at capture time. Updating a host scalar afterwards takes
+effect on a new execute/capture, while device tensor inputs remain live on replay.
+`COMPILE_TIME_CONST` is baked into the graph and is not a runtime input slot.
+
 ## C++ API
 
 Create tensors from a scalar and `ScalarType`:

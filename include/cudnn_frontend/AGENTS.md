@@ -53,3 +53,7 @@ Legacy flat API (`include/cudnn_frontend_*.h`: Tensor, Operation, ExecutionPlan,
 ## Versioning
 
 `cudnn_frontend_version.h` defines `CUDNN_FRONTEND_{MAJOR,MINOR,PATCH}_VERSION`. Keep in sync with `CMakeLists.txt` `project(VERSION ...)` and `python/cudnn/__init__.py.__version__` when bumping.
+
+## Runtime scalar defaults
+
+`ScalarType::RUNTIME_PARAM` values embedded in a graph are defaults, not immutable inputs. A caller binding for the same UID must override the default on every execution entry, including prepared pointer arrays and serialized plans. Keep these slots in the sorted binding schema; only compile-time constants and internal workspace/replacement slots may be omitted. The detector is `test/python/core/graph/test_runtime_scalar_bindings.py`, which covers raw C++, Python mapping/ordered execution, serialization, capture, and exact scalar payload widths.

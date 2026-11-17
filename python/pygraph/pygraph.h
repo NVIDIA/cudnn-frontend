@@ -815,6 +815,9 @@ class PyGraph {
     void
     prepare_variant_pack_template();
 
+    py::dict
+    get_variant_pack_scalar_defaults();
+
     std::vector<int64_t>
     get_variant_pack_uids_sorted() {
         return graph->get_variant_pack_uids_sorted();
