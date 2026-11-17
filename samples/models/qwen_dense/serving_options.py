@@ -9,8 +9,8 @@ answers every field of it:
 
 * **read**: ``messages``, ``tools``, ``chat_template_kwargs``, and the limit of new tokens (``max_tokens`` or its newer name
   ``max_completion_tokens``);
-* **stated**: ``model`` is printed and compared with the name of the checkpoint directory;
-* **not used** (``UNUSED``): a field that does not change the text here, ``seed`` and ``stream`` among them, printed with
+* **stated**: the last part of ``model`` is printed and compared with the name of the checkpoint directory;
+* **not used** (``UNUSED``): a field that does not change the text here, ``seed`` and ``stream`` among them, named with
   the reason;
 * **neutral** (``NEUTRAL``): a field that would change the output is accepted at the value at which it changes nothing --
   ``temperature`` 0, ``n`` 1, ``top_p`` 1, no stop strings -- and at ``null``;

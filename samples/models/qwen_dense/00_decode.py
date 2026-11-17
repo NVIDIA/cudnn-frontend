@@ -197,7 +197,8 @@ def _arguments(argv):
         "--sequences",
         default=None,
         metavar="N[,N...]",
-        help="sequences per run, fixed before the first step; a list repeats the run per count (default 1,4; with --model 1)",
+        help="sequences per run, fixed before the first step; a list repeats the run per count, and the text of a request is written "
+        "once, with the first count (default 1,4; with --model 1)",
     )
     parser.add_argument(
         "--layers",
