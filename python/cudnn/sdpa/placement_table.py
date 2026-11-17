@@ -1089,7 +1089,17 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     # study sm107_paged_d64_sink_prefill_20261117 (Rubin paged gpt-oss d64 + sink prefill, trained on chunks over KV >= 4k): its two
     # entries are retired. A KV-edge supplement (edge_supp_20261117/d64sinkkv: squares and short caches) lost 1.36x on the tile and 1.65x
-    # off it on small squares; re-studied as sm107_paged_d64_sink_v2_20261117.
+    # off it on small squares; re-studied as sm107_paged_d64_sink_v2_20261117 (below).
+    # study sm107_paged_d64_sink_v2_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE c80a51fdb; paged THD exact total-Q gpt-oss d64 + sink
+    # bottom-right causal prefill over the class's whole range: chunks S_q 5-4096 over KV 256-128k and squares 32-8192, on and off the
+    # tile, groups 3-8, b 1-32; 200 train cells). Lead from KV 2^13.5 on the tile and 2^8.5 off it (changed train 0.520 / 0.702);
+    # holdout at fresh heads, scored once, 0.531 / 0.601 (worst 0.996).
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", False): Entry(
+        "ge", 13.5, "sm107_paged_d64_sink_v2_20261117", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", True): Entry(
+        "ge", 8.504, "sm107_paged_d64_sink_v2_20261117", "kv"
+    ),
     # study sm120_decode_20261112 (RTX PRO 6000 Server, cuDNN 9.30.0.4; benchmark/attention_inference's generation graph, s_q 1-4:
     # paged d128 / d256 GQA page 16, d512 / D576xV512 absorbed MLA dense and paged, d64 sink (and window 128) paged MTP; b 1-64, S_kv
     # 8k-131k on and off the tile; 333 train cells + a seeded holdout scored once per class: 0.34-0.67 geomean of the measured default,
