@@ -617,7 +617,7 @@ def test_sm120_paged_window_decode_follows_its_study(s_kv):
 @pytest.mark.parametrize("s_q, s_kv", [(8192, 8192), (1024, 131072), (1024, 131071)], ids=["square", "chunk", "chunk_off_tile"])
 def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
     """Study sm120_window_prefill_20261117: dense windowed d512 prefill leads on SM120, squares included (the hand rule trails every
-    windowed square); d256 (retired after its S_q-edge supplement), d128, the d64 sink class, f16 and another part keep the hand rules."""
+    windowed square); d256 follows its re-study (lead from KV 2^7.5); d128, the d64 sink class, f16 and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm120"
 
     def win(**over):
@@ -629,7 +629,9 @@ def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
     for over in (dict(), dict(h_q=64)):
         assert pt.lookup(row, win(**over)) is True, over
         assert pt.matched_entry(row, win(**over)).study == "sm120_window_prefill_20261117"
-    assert pt.lookup(row, win(h_q=16, h_kv=8, d_qk=256, d_v=256, window_left=1024)) is None  # edge_supp_20261117
+    d256 = dict(h_q=16, h_kv=8, d_qk=256, d_v=256, window_left=1024)
+    assert pt.matched_entry(row, win(**d256)).study == "sm120_window_d256_v2_20261117"  # re-studied over S_q 5-2048
+    assert pt.lookup(row, win(**d256, s_q=33, s_kv=33, b=16)) is False  # the square that lost 1.125 in edge_supp_20261117
     assert pt.lookup(row, win(h_q=32, h_kv=8, d_qk=128, d_v=128, window_left=1024)) is None
     assert pt.lookup(row, win(h_q=64, h_kv=8, d_qk=64, d_v=64, has_sink=True)) is None
     assert pt.lookup(row, win(dtype=cudnn.data_type.HALF)) is None
@@ -909,14 +911,18 @@ def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
 
 
 @pytest.mark.L0
-def test_sm107_dense_d256_chunk_entries_are_retired():
-    """Study sm107_dense_chunk_20261117 trained at S_q >= 256, but its class starts at S_q 5; an edge supplement there
-    (edge_supp_20261117) lost 1.58x on a small square, so the d256 entries are retired and the hand rule decides."""
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm107_dense_d256_prefill_follows_its_v2_study(s_kv):
+    """Study sm107_dense_d256_v2_20261117 replaced sm107_dense_chunk_20261117, whose `always` entries lost 1.58x on small squares
+    below its train grid: dense d256 prefill leads from KV 2^11.5 over the class's whole S_q range."""
     row = "sdpa_fwd_prefill_sm107"
-    base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=131072, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
+    base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
     base.update(has_paged_kv=False, padded=False, page_size=0)
-    for s_kv in (131072, 131071):
-        assert pt.matched_entry(row, _facts(**{**base, "s_kv": s_kv})) is None
+    f = lambda **over: _facts(**{**base, **over})
+    assert pt.matched_entry(row, f()).study == "sm107_dense_d256_v2_20261117"
+    assert pt.lookup(row, f()) is True
+    assert pt.lookup(row, f(b=8, h_q=16, h_kv=1, s_q=64 + (s_kv % 2), s_kv=64 + (s_kv % 2))) is False  # a small square
+    assert pt.lookup(row, f(s_q=8)) is True  # a short chunk over a long cache
 
 
 @pytest.mark.L0

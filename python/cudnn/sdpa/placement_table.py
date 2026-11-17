@@ -1170,7 +1170,7 @@ TABLE: Dict[Tuple, Entry] = {
     # d256 window 1024 and d512 MQA window 128; 221 train cells, a served-pair and an other-group holdout, each scored once: 0.34-0.58
     # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend. The d256
     # twin is retired: an edge supplement at S_q 5-193 (edge_supp_20261117) lost 1.125 off the tile on a b 16 square of 33; the d512
-    # twin passed it (0.484, worst 0.792).
+    # twin passed it (0.484, worst 0.792). The d256 class is re-studied over its whole S_q range (sm120_window_d256_v2_20261117).
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", False): Entry(
         "always", None, "sm120_window_prefill_20261117"
     ),
@@ -1196,7 +1196,18 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("always", None, "sm107_decode_q1_20261112"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_decode_q1_20261112"),
     # study sm107_dense_chunk_20261117 (Rubin dense d256 chunks, trained at S_q >= 256): its two `always` entries are retired. The
-    # class starts at S_q 5, and an edge supplement there (edge_supp_20261117) lost 1.58x off the tile on a b 8 square of 64.
+    # class starts at S_q 5, and an edge supplement there (edge_supp_20261117) lost 1.58x off the tile on a b 8 square of 64. The
+    # class is re-studied over its whole S_q range (sm107_dense_d256_v2_20261117, below).
+    # study sm107_dense_d256_v2_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 65ce81615; benchmark/attention_inference's context graph:
+    # dense d256 bottom-right chunks S_q 5-2048 to KV 128k and squares 32-2048, on and off the tile, groups 5-16, b 1-16; 200 train
+    # cells). Lead from KV 2^11.5 (changed train 0.546 / 0.408, worst 1.050); holdout at fresh heads, scored once, 0.583 / 0.529
+    # (worst 1.099).
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 11.5, "sm107_dense_d256_v2_20261117", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 11.501, "sm107_dense_d256_v2_20261117", "kv"
+    ),
     # study sm100_d576_prefill_20261117, Rubin part (208-SM Rubin, cuDNN 9.30.0.4, FE 8014a2c75): the B200 study's dense cells
     # (160 train). FROST leads everywhere: changed train cells 0.115 (worst 0.310); holdout 0.091-0.104 (worst 0.251). Paged
     # D576 prefill has no FROST plan on Rubin and no entry. Only h_kv 1 was measured.
@@ -1208,6 +1219,16 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     # study sm120_window_sink_prefill_20261117 (dense window-128 sink d192 x 128, trained at S_q >= 256): its two entries are retired.
     # An edge supplement at S_q 5-192 lost up to 2.94x (on the tile, S_q 5) and 1.75x (off it) against the hand rule's lead.
+    # study sm120_window_d256_v2_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 65ce81615; benchmark/attention_inference's context
+    # graph: dense d256 window 1024, bottom-right chunks S_q 5-2048 to KV 128k and squares 32-2048, on and off the tile, groups 2-5,
+    # b 1-16; 200 train cells). Lead from KV 2^7.5 (changed train 0.563 / 0.650, worst 0.919); holdout at fresh heads, scored once,
+    # 0.634 / 0.585 (worst 0.806).
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "prefill", "dense", "window", False, "gqa", False): Entry(
+        "ge", 7.5, "sm120_window_d256_v2_20261117", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "prefill", "dense", "window", False, "gqa", True): Entry(
+        "ge", 7.508, "sm120_window_d256_v2_20261117", "kv"
+    ),
     # study sm100_swa_prefill_20261031 (cuDNN 9.29.0.18; B100 850 W, cc 10.0; the sm103 study's grid and seeds: 320 train + 64 random
     # holdout cells; 90 training cells timed while another process held the GPU were re-timed, 32 of them moved > 5%)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry(
