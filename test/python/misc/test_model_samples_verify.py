@@ -164,6 +164,122 @@ def test_the_slot_table_of_a_step_of_several_tokens():
         DecodeState(kinds, 1, 16, shapes, "cpu", tokens=0)
 
 
+def _layer(sequences, tokens, seed=0):
+    """The operands of one linear-attention layer of the tiny geometry for a step of ``sequences x tokens`` rows, and a state
+    of that layout with random content: ``(x, z, hidden, params, state)``."""
+    from model_samples.providers import GdnParams
+    from model_samples.state import DecodeState
+
+    model = _tiny_model(("linear_attention",))
+    g = model.geometry
+    generator = torch.Generator().manual_seed(seed)
+
+    def draw(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, generator=generator).to(dtype)
+
+    rows, qkv = sequences * tokens, g.qkv_channels
+    params = GdnParams(
+        g.la_key_heads,
+        g.la_value_heads,
+        g.la_head_dim,
+        draw(qkv, g.la_conv_width) * 0.3,
+        draw(g.la_value_heads, dtype=torch.float32) * 0.5,
+        draw(g.la_value_heads) * 0.5,
+        1 + 0.2 * draw(g.la_head_dim),
+        draw(2 * g.la_value_heads, g.hidden) * g.hidden**-0.5,
+        torch.tensor([0.05]),
+        0.05,
+    )
+    state = DecodeState(g.layer_kinds, sequences, 16, model.state_shapes(), "cpu", tokens)
+    state.layers[0].state.copy_(0.1 * draw(*state.layers[0].state.shape, dtype=torch.float32))
+    state.layers[0].conv_storage.copy_(draw(*state.layers[0].conv_storage.shape))
+    return draw(rows, qkv), draw(rows, g.la_value_heads, g.la_head_dim), draw(rows, g.hidden), params, state
+
+
+def test_the_reference_verify_step_is_decode_steps_token_by_token_and_follows_a_kernel_from_its_anchor():
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import configs
+    from model_samples.state import RecurrentSlots
+
+    sequences, tokens, kept = 2, 4, 2
+    x, z, hidden, params, state = _layer(sequences, tokens)
+    pool, table = state.layers[0], state.slots
+    table.accept = kept
+    before = (pool.state.clone(), pool.conv_storage.clone())
+    out = torch_ref.gdn_verify_step(x, z, hidden, table, params, pool, 1e-6, torch.float64)
+    # the same tokens through decode steps, one sequence at a time on a pool in the layout of one token per sequence
+    slot = table.indices.long()
+    for i in range(sequences):
+        plain = RecurrentSlots(torch.zeros((2, *before[0].shape[1:])), torch.zeros((2, 3, before[1].shape[2]), dtype=torch.bfloat16))
+        plain.state[1] = before[0][slot[i, kept]]  # the state of the token the last step kept
+        plain.conv_storage[1] = before[1][i + 1, kept : kept + 3]  # ... and the three history columns that token left
+        taps = plain.conv_storage[1, 1:].clone()
+        for t in range(tokens):
+            row = i * tokens + t
+            step = torch_ref.gdn_decode_step(
+                x[row : row + 1], z[row : row + 1], hidden[row : row + 1], torch.ones(1, dtype=torch.int32), params, plain, 1e-6, torch.float64
+            )
+            assert torch.equal(out.codes[row : row + 1], step.codes), f"sequence {i}, token {t}: the output of that decode step"
+            assert torch.equal(pool.state[slot[i, t]], plain.state[1]), f"sequence {i}, token {t}: the state of {t + 1} decode steps, in the slot of the pair"
+        assert torch.equal(pool.conv_storage[i + 1], torch.cat((taps, x[i * tokens : (i + 1) * tokens]))), "the last two taps, then the step's own rows"
+    assert torch.equal(pool.state[0], before[0][0]) and torch.equal(pool.conv_storage[0], before[1][0]), "the null slot is not touched"
+    # with an anchor every token after the first starts from the anchor's slot of the token before it: one decode step each
+    anchor = 0.1 * torch.randn(before[0].shape, generator=torch.Generator().manual_seed(7))
+    pool.state.copy_(before[0])
+    pool.conv_storage.copy_(before[1])
+    followed = torch_ref.gdn_verify_step(x, z, hidden, table, params, pool, 1e-6, torch.float64, anchor)
+    for i in range(sequences):
+        for t in range(tokens):
+            plain = RecurrentSlots(torch.zeros((2, *before[0].shape[1:])), torch.zeros((2, 3, before[1].shape[2]), dtype=torch.bfloat16))
+            plain.state[1] = anchor[slot[i, t - 1]] if t else before[0][slot[i, kept]]
+            history = torch.cat((before[1][i + 1, kept : kept + 3], x[i * tokens : (i + 1) * tokens]))
+            plain.conv_storage[1] = history[t : t + 3]
+            row = i * tokens + t
+            step = torch_ref.gdn_decode_step(
+                x[row : row + 1], z[row : row + 1], hidden[row : row + 1], torch.ones(1, dtype=torch.int32), params, plain, 1e-6, torch.float64
+            )
+            assert torch.equal(followed.codes[row : row + 1], step.codes) and torch.equal(pool.state[slot[i, t]], plain.state[1]), f"sequence {i}, token {t}"
+    # the block: handed an anchor for ONE call (the block check sets it), it follows it and forgets it
+    row = next(r for r in configs.PROVIDERS["linear_attention.step"] if r.key == "torch_ref.gdn_decode_step")
+    block = torch_ref.GdnDecodeStep(row, _tiny_model(("linear_attention",)), None, {})
+    for handed, want in (([(anchor, before[1])], followed), (None, out), (None, out)):
+        pool.state.copy_(before[0])
+        pool.conv_storage.copy_(before[1])
+        block.anchor = handed if handed is not None else block.anchor
+        got = block(x, z, hidden, table, params, pool)
+        assert torch.equal(got.codes, want.codes) and block.anchor is None and block.tokens == tokens
+
+
+def test_the_block_check_at_several_tokens_per_sequence_folds_a_cell_over_the_tokens_of_a_sequence():
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import RecurrentSlots
+
+    # where a sequence lives in what a call updates: a plain tensor holds a row per token of it, a pool says so itself
+    tap = tie_out.BlockTap(SimpleNamespace(tokens=4, sequences=3), {})
+    assert tap._own(torch.zeros(12, 2), 1) == (slice(4, 8),) and tap._own(None, 1) == ()
+    assert tap._own(RecurrentSlots(torch.zeros(13, 1), torch.zeros(4, 6, 1), 4), 1) == ([2, 5, 8, 11], 2)
+    assert tie_out.BlockTap(SimpleNamespace(tokens=1, sequences=3), {})._own(torch.zeros(3, 2), 1) == (slice(1, 2),)
+    # two sequences of two tokens, two value heads of four: one output row and one state slot differ, of different sequences
+    sequences, tokens, heads, dim = 2, 2, 2, 4
+    twin = SimpleNamespace(tokens=tokens)
+    codes = torch.zeros((sequences * tokens, heads * dim), dtype=torch.uint8)
+    wrong = codes.clone()
+    wrong[2, :dim] = 1  # sequence 1, token 0, value head 0: the rows are sequence by sequence
+    state = torch.zeros((1 + sequences * tokens, heads, dim, dim))
+    moved = state.clone()
+    moved[1 + 1 * sequences + 0, 1, 0] = 0.5e-3  # sequence 0, token 1, value head 1: the slots are token by token
+    conv = torch.zeros((1 + sequences, tokens + 2, 3), dtype=torch.bfloat16)
+    stats = tie_out.BlockStats("gdn_step")
+    tie_out.BlockTap._judge(stats, (wrong,), (codes,), [(moved, conv)], [(state, conv)], 0, twin)
+    assert stats.cell_bytes[0] == (0.5, "layer 0, sequence 1, value head 0"), "four of the eight bytes of that head over the two tokens of sequence 1"
+    assert stats.cell_state[0] == (1 - dim / (tokens * dim * dim), "layer 0, sequence 0, value head 1"), "one row of one of its two slots"
+    assert stats.cells[0].calls == tokens, "a call of a step of several tokens is that many token steps"
+    tie_out.BlockTap._judge(stats, (codes,), (codes,), [(state, conv)], [(state, conv)], 0, twin)
+    assert stats.cell_bytes[0][0] == 0.75 and stats.cells[0].calls == 2 * tokens
+    assert isinstance(torch_ref.GdnDecodeStep.tokens, int) and torch_ref.GdnDecodeStep.anchor is None
+
+
 @pytest.mark.parametrize("sequences, tokens", [(1, 6), (3, 4), (2, 2)])
 def test_a_verify_step_is_that_many_decode_steps_on_the_reference_stack(sequences, tokens):
     from model_samples import census, tie_out
@@ -263,6 +379,12 @@ def test_a_state_that_goes_on_from_the_wrong_place_fails_the_comparison(monkeypa
     assert not checks.ok, f"{defect}:\n{checks.text()}"
     line = next(line for line in checks.lines if line.startswith(f"  {failing} "))
     assert line.endswith("    FAIL"), line
+    if defect.startswith("the next step starts"):  # the history is the right one: both runs fed the layers the same rows, and the state is judged
+        kept = next(line for line in checks.lines if line.startswith("  kept state  "))
+        assert "linear-attention layers were fed the same rows by both runs" in kept and not kept.startswith(
+            "  kept state        after each step, the state of the kept tokens against the state of that many decode steps: 0 of"
+        )
+        assert kept.endswith("    FAIL"), kept
 
 
 def test_the_first_layer_is_not_excused_where_the_table_says_both_runs_feed_it_the_same_bytes(monkeypatch):
@@ -742,6 +864,12 @@ def test_a_stored_form_the_load_did_not_keep_fails_a_verify_session_by_name():
         assert str(failed.value).startswith(sentence)
     session.weights = SimpleNamespace(stored=("projection.fp8.in", "mlp.gate_up"), uncopied=(), laid_out=("mlp.gate_up",))
     session._check_forms()
+    # ... and its claim is held against the verify section of the census, its memory arithmetic asked with its tokens
+    claim = session.claim()
+    assert claim.configuration == "verify" and claim.rows == 6 and session._per_token() == {"tokens": 6}
+    plain = Session(model, TextIO.synthetic(model.geometry.vocab), stack="native", device="cpu")
+    plain.plan = _plan(1, 1)[0]
+    assert plain.claim().configuration == "plain" and plain._per_token() == {}
 
 
 def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_verify_step():
