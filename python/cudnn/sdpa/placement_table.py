@@ -416,6 +416,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm100_d576_prefill_20261117"
     ),
+    # study sm100_d576_paged_v2_20261117 (B200 1000 W, cuDNN 9.24.0.43, FE 5841acc2e; paged THD exact total-Q absorbed-MLA (576, 512)
+    # MQA causal prefill over the class's whole range: chunks S_q 5-2048 over KV 256-128k and squares 8-4096, on and off the tile;
+    # 200 train cells). On the tile `always` (changed train 0.240), off it from cost 2^20.47 (0.224); holdout at fresh h_q, scored once,
+    # 0.209 / 0.231 (worst 1.034). cc 10.0 only: no transfer check names this study.
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_d576_paged_v2_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 20.472, "sm100_d576_paged_v2_20261117"
+    ),
     # study sm100_d576_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid on the tile + the same grid off it)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm100_d576_decode_v2_20261028"
