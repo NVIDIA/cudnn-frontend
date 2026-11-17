@@ -4,8 +4,8 @@
 """Host half of the fused sm90 KDA backward kernels.
 
 The backward is four ``__global__``s, not one: ``k_meta`` (chunk table, varlen
-only), ``k_prep``, ``k_scan_t`` and ``k_bwd``. Seven of the nine entry points
-the launcher can reach are template instantiations, so unlike the forward this
+only), ``k_prep``, ``k_scan_t`` and ``k_bwd``. Most entry points the launcher
+can reach are template instantiations, so unlike the forward this
 cannot go through ``cake.compiler.compile_cubin``: a templated kernel has no
 stable C name, and NVRTC only emits and names one if it is registered with
 ``nvrtcAddNameExpression`` before the compile and looked up with
@@ -65,6 +65,8 @@ _ALIGN = 256
 _NAME_EXPRESSIONS = (
     "k_prep<true>",
     "k_prep<false>",
+    "k_prep<true, true>",
+    "k_prep<false, true>",
     "k_scan_t<16, 128, true, true>",
     "k_scan_t<16, 128, true, false>",
     "k_scan_t<32, 256, true, true>",
@@ -323,6 +325,37 @@ def workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int) -> int:
     return size
 
 
+def _reverse_layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
+    """Compact arena for the state-only reverse summary.
+
+    The specialized prep and scan do not materialize the forward operand/state
+    or any token-gradient intermediates. Keep only the five reverse operands
+    plus the varlen metadata needed to address them.
+    """
+    ncs = _chunk_slots(total_tokens, n_seqs)
+    a = _Arena(workspace)
+    cs_t0 = a.take(ncs, _I32)
+    cs_len = a.take(ncs, _I32)
+    seq_c0 = a.take(n_seqs + 1, _I32)
+    seq_nc = a.take(n_seqs + 1, _I32)
+    gn2 = a.take(ncs * n_heads * DH, _F32)
+    wneg = a.take(total_tokens * n_heads * DH, _BF16)
+    kg = a.take(total_tokens * n_heads * DH, _BF16)
+    dvl = a.take(total_tokens * n_heads * DH, _BF16)
+    pmat = a.take(ncs * n_heads * DH * DH, _BF16)
+    return (
+        dict(cs_t0=cs_t0, cs_len=cs_len, seq_c0=seq_c0, seq_nc=seq_nc, gn2=gn2, wneg=wneg, kg=kg, dvl=dvl, pmat=pmat),
+        ncs,
+        a.off,
+    )
+
+
+def reverse_workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int) -> int:
+    """Scratch for ``gradient_outputs=False`` state-only reverse scans."""
+    _, _, size = _reverse_layout(0, total_tokens, n_heads, n_seqs)
+    return size
+
+
 def launch(
     device: int,
     stream: int,
@@ -356,7 +389,7 @@ def launch(
     ``d_initial_state`` is complete and does not touch dq/dk/dv/dg/dbeta.
     """
     lib = library(device)
-    ws, ncs, _ = _layout(workspace, total_tokens, n_heads, n_seqs)
+    ws, ncs, _ = (_layout if gradient_outputs else _reverse_layout)(workspace, total_tokens, n_heads, n_seqs)
     T, H, N = int(total_tokens), int(n_heads), int(n_seqs)
 
     single_sequence = N == 1
@@ -382,11 +415,27 @@ def launch(
             )
 
         prep = _Params()
-        for address in (q, k, v, g, beta, dO, ws["cs_t0"], ws["cs_len"], ws["amat"], ws["wneg"], ws["uu"], ws["kg"], ws["pmat"], ws["gn2"], ws["dvl"]):
+        for address in (
+            q,
+            k,
+            v if gradient_outputs else 0,
+            g,
+            beta,
+            dO,
+            ws["cs_t0"],
+            ws["cs_len"],
+            ws.get("amat", 0),
+            ws["wneg"],
+            ws.get("uu", 0),
+            ws["kg"],
+            ws["pmat"],
+            ws["gn2"],
+            ws["dvl"],
+        ):
             prep.ptr(address)
         prep.i32(T).i32(H).f32(scale).b(single_sequence)
         compiler.launch(
-            lib.function(f"k_prep<{'true' if full else 'false'}>"),
+            lib.function(f"k_prep<{'true' if full else 'false'}{', true' if not gradient_outputs else ''}>"),
             grid=(ncs, H, 1),
             block=(PNT, 1, 1),
             dynamic_smem=SMEM_PREP,
@@ -415,22 +464,22 @@ def launch(
         scan = _Params()
         for address in (
             ws["wneg"],
-            ws["uu"],
+            ws.get("uu", 0),
             ws["kg"],
             ws["pmat"],
             ws["dvl"],
             dO,
             ws["gn2"],
-            initial_state,
+            initial_state if gradient_outputs else 0,
             d_final_state,
             ws["cs_t0"],
             ws["cs_len"],
             ws["seq_c0"],
             ws["seq_nc"],
-            ws["hst"],
-            ws["dhst"],
-            ws["vnew"],
-            ws["dv2"],
+            ws.get("hst", 0),
+            ws.get("dhst", 0),
+            ws.get("vnew", 0),
+            ws.get("dv2", 0),
             d_initial_state,
         ):
             scan.ptr(address)

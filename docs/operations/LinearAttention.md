@@ -89,9 +89,11 @@ On SM90, a KDA caller that already retains the packed-forward transition can
 request `plan_name="kda_summary_hopper_scan"` for the reverse G term alone. The
 plan requires BF16 packed K=V=128 tensors, equal head counts, int32 offsets,
 `batch_invariant=True`, no final-state gradient, and
-`output_transition=False`. It reuses the ordinary Hopper backward's reverse
-scan byte-for-byte, omits the forward scan CTAs, and exits before token
-gradients. It is an explicit opt-in plan
+`output_transition=False`. It specializes the ordinary Hopper backward's
+preparation and reverse scan, omitting the `v`/forward operand work, forward
+scan CTAs, chunk-state materialization, and token-gradient intermediates. The
+returned FP32 state remains byte-for-byte equal to the ordinary reverse scan.
+It is an explicit opt-in plan
 (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`) and uses caller-owned workspace;
 query `graph.get_workspace_size()` rather than hard-coding its size. It is most
 useful for CP implementations that can transpose/reuse the forward transition

@@ -233,7 +233,7 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
         self.outputs = set(node.outputs)
         self.ports = None
         layout = WorkspaceLayout(align=256)
-        self.scratch_offset = layout.add(cuda_bwd_host.workspace_bytes(self.total, self.heads, self.seqs), align=256)
+        self.scratch_offset = layout.add(cuda_bwd_host.reverse_workspace_bytes(self.total, self.heads, self.seqs), align=256)
         self.zero_offset = layout.add(self.seqs * self.heads * 128 * 128 * 4, align=256)
         self.workspace_bytes = layout.size
         # Compile at plan build, never on the first execute/capture.

@@ -74,14 +74,15 @@ def main() -> None:
     dq, dk, dv = (torch.empty_like(q) for _ in range(3))
     dg = torch.empty_like(g)
     dbeta = torch.empty_like(beta)
-    workspace_bytes = cuda_bwd_host.workspace_bytes(args.tokens, args.heads, 1)
-    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+    full_workspace_bytes = cuda_bwd_host.workspace_bytes(args.tokens, args.heads, 1)
+    reverse_workspace_bytes = cuda_bwd_host.reverse_workspace_bytes(args.tokens, args.heads, 1)
+    full_workspace = torch.empty(full_workspace_bytes, dtype=torch.uint8, device=device)
+    reverse_workspace = torch.empty(reverse_workspace_bytes, dtype=torch.uint8, device=device)
     stream = torch.cuda.current_stream().cuda_stream
 
     common = {
         "device": torch.cuda.current_device(),
         "stream": stream,
-        "workspace": workspace.data_ptr(),
         "dO": d_o.data_ptr(),
         "q": q.data_ptr(),
         "k": k.data_ptr(),
@@ -103,11 +104,12 @@ def main() -> None:
     }
 
     def full() -> None:
-        cuda_bwd_host.launch(**common, d_initial_state=d_initial_full.data_ptr())
+        cuda_bwd_host.launch(**common, workspace=full_workspace.data_ptr(), d_initial_state=d_initial_full.data_ptr())
 
     def carry_only() -> None:
         cuda_bwd_host.launch(
             **common,
+            workspace=reverse_workspace.data_ptr(),
             d_initial_state=d_initial_only.data_ptr(),
             gradient_outputs=False,
         )
@@ -125,7 +127,9 @@ def main() -> None:
             {
                 "tokens": args.tokens,
                 "heads": args.heads,
-                "workspace_bytes": workspace_bytes,
+                "full_workspace_bytes": full_workspace_bytes,
+                "reverse_workspace_bytes": reverse_workspace_bytes,
+                "workspace_reduction": 1.0 - reverse_workspace_bytes / full_workspace_bytes,
                 "full_ms": full_ms,
                 "carry_only_ms": carry_ms,
                 "speedup": full_ms / carry_ms,
