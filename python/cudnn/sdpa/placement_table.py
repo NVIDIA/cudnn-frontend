@@ -1021,6 +1021,22 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 35.878, "sm80_paged_d192x192_v2_20261117", "cost", ("ge", 5.5, "q")
     ),
+    # study sm80_paged_d256_d192_v3_20261117 (A100, FE 72184216d): the retired d256 and d192 x 128 paged THD-Q causal prefill classes,
+    # refit on every earlier cell of them pooled (sm80_prefill_gaps_20261117, its edge supplement, sm80_paged_d256_d192_v2_20261117; 744
+    # cells, default = the backend) with a query-token condition that keeps few-query long-cache chunks on the backend. Fresh holdout at
+    # new head pairs incl. that edge, scored once: d192 x 128 0.680 / 0.678 (worst 0.917), d256 0.587 / 0.592 (worst 1.055).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 35.366, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 6.792, "sm80_paged_d256_d192_v3_20261117", "tiles", ("ge", 7.506, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 36.044, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 36.454, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+    ),
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
     # on and off the tile, windows 512-2048 keys; 660 train cells; the backend ran them 1.2-5.1x behind). Holdout at fresh heads, scored

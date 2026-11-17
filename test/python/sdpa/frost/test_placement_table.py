@@ -578,7 +578,7 @@ def test_sm80_generation_gaps_follow_their_study(s_kv):
 def test_sm80_prefill_gaps_follow_their_study(s_kv):
     """Study sm80_prefill_gaps_20261117 (A100): paged THD-Q prefill (gpt-oss d64 with a sink, causal and windowed; dsv4 d512) and dense
     dsv4 d512 lead past a floor; small chunks keep the backend. Paged d128 has no entry; paged d192 x 128 and d256 were retired after
-    their edge supplement (few query tokens over a long cache lost 1.30-1.47x)."""
+    their edge supplement (few query tokens over a long cache lost 1.30-1.47x) and re-studied as sm80_paged_d256_d192_v3_20261117."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_prefill_gaps_20261117"
 
@@ -599,8 +599,9 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
         assert pt.lookup(row, f(**over)) is True, over
     small = dict(s_q=32, s_kv=1024 + s_kv % 2, max_total_seq_len_q=32)
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
-    for over in (dict(d_qk=128, d_v=128), dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
-        assert pt.matched_entry(row, f(**over)) is None, over
+    assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
+    for over in (dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
+        assert pt.matched_entry(row, f(**over)).study == "sm80_paged_d256_d192_v3_20261117", over
 
 
 @pytest.mark.L0
@@ -645,6 +646,27 @@ def test_sm80_paged_d192x192_prefill_follows_its_study(s_kv):
     assert pt.lookup(row, square) is False
     assert pt.lookup(row, f(s_q=17, max_total_seq_len_q=17)) is False
     assert pt.matched_entry(row, f(window_left=511)) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+@pytest.mark.parametrize("d", [(256, 256), (192, 128)], ids=["d256", "d192x128"])
+def test_sm80_paged_d256_d192_prefill_follow_v3(d, s_kv):
+    """sm80_paged_d256_d192_v3_20261117 (A100): paged THD-Q d256 and d192 x 128 causal prefill lead past a floor only with enough query
+    tokens, so few-query chunks over a long cache with many heads (the edge that retired the earlier floors, 1.30-1.47x) keep the
+    backend."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=4, h_q=32, h_kv=4, s_q=2048, s_kv=s_kv, d_qk=d[0], d_v=d[1], causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=4 * 2048)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == "sm80_paged_d256_d192_v3_20261117"
+    assert pt.lookup(row, f()) is True
+    edge = f(b=32, h_q=64, h_kv=8, s_q=32, max_total_seq_len_q=32 * 32)
+    assert pt.lookup(row, edge) is False
 
 
 @pytest.mark.L0
