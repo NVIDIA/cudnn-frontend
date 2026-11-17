@@ -152,6 +152,9 @@ read_state(std::shared_ptr<cudnn_frontend::KernelCache> const& kc) {
 }  // namespace
 
 TEST_CASE("Implicit kernel cache follows graph plan ownership", "[kernel_cache][lifetime]") {
+#if (CUDNN_VERSION < 90500)
+    SKIP("Implicit kernel cache ownership requires cuDNN >= 9.5 headers");
+#endif
     namespace fe = cudnn_frontend;
     if (fe::detail::get_backend_version() < 90500) {
         SKIP("Requires cuDNN >= 9.5");
@@ -188,6 +191,28 @@ TEST_CASE("Implicit kernel cache follows graph plan ownership", "[kernel_cache][
             CHECK(observed.expired());
         }
     }
+}
+
+TEST_CASE("Static graph construction preserves header runtime compatibility", "[kernel_cache][header_compatibility]") {
+    namespace fe = cudnn_frontend;
+    cudnnHandle_t raw_handle{};
+    REQUIRE(cudnnCreate(&raw_handle) == CUDNN_STATUS_SUCCESS);
+    std::unique_ptr<cudnnContext, decltype(&cudnnDestroy)> handle(raw_handle, cudnnDestroy);
+    auto graph = setup_matmul_graph<CacheProbeGraph>();
+    graph->set_dynamic_shape_enabled(false);
+    REQUIRE(graph->validate().is_good());
+    auto status = graph->build_operation_graph(handle.get());
+    REQUIRE(status.is_good());
+    CHECK(graph->supplied_cache() == nullptr);
+#if (CUDNN_VERSION >= 90500)
+    bool const expect_cache = fe::detail::get_backend_version() >= 90500;
+#else
+    bool const expect_cache = false;
+#endif
+    CHECK(static_cast<bool>(graph->plan_cache()) == expect_cache);
+    status = graph->create_execution_plans({fe::HeurMode_t::A});
+    REQUIRE(status.is_good());
+    CHECK(static_cast<bool>(graph->plan_cache()) == expect_cache);
 }
 
 // ---------------------------------------------------------------------------

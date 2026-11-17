@@ -1407,12 +1407,15 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(kernel_cache->build(operation_graph->get_raw_desc()));
         }
 
-        // Bound implicit kernel residency to this graph's plans instead of the process-wide cache.
+#if (CUDNN_VERSION >= 90500)
+        // Binding a cache to the operation graph requires 9.5 headers as well as a 9.5 runtime.
+        // Older-header builds retain the existing no-cache path on newer runtimes.
         if (!kernel_cache && detail::get_backend_version() >= 90500) {
             auto scoped_cache = std::make_shared<KernelCache>();
             CHECK_CUDNN_FRONTEND_ERROR(scoped_cache->build(operation_graph->get_raw_desc()));
             plans.set_kernel_cache(std::move(scoped_cache));
         }
+#endif
 
         CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH ALL OK === ");
 
