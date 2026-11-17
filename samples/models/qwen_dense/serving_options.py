@@ -362,9 +362,18 @@ def _silence_stdout() -> None:
     """After a write to standard output failed because its reader went away: point the descriptor at the null device, so
     that the interpreter's own flush at exit does not fail a second time with a message of its own."""
     try:
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        null = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    target = -1
+    try:
+        target = sys.stdout.fileno()
+        os.dup2(null, target)
     except (OSError, ValueError, AttributeError):  # no descriptor behind it: a captured or a replaced stream
         pass
+    finally:
+        if null != target:  # opened on the number of a closed standard output, the null device stays where it is
+            os.close(null)
 
 
 class TextSink:

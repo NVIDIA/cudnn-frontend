@@ -1044,6 +1044,41 @@ sys.stderr.write("SINK ERROR=" + sink.error + "\\n")
     assert done.returncode == 0 and done.stderr == f"SINK ERROR={PIPE}\n", done.stderr
 
 
+def test_silencing_standard_output_keeps_no_descriptor_of_its_own(monkeypatch):
+    """The null device is opened to be put where standard output was, and its own descriptor is closed again: where
+    there is no descriptor to take it (a replaced stream, here), and where there is one (a child process whose reader
+    went away: standard output is the null device afterwards, and the process holds as many descriptors as before)."""
+    import serving_options
+
+    def held():
+        return len(os.listdir("/proc/self/fd"))
+
+    monkeypatch.setattr(sys, "stdout", io.StringIO())  # a stream with no descriptor behind it
+    before = held()
+    for _ in range(3):
+        serving_options._silence_stdout()
+    assert held() == before, "the descriptor of the null device was left open"
+
+    code = f"""
+import os, sys
+sys.path.insert(0, {str(FAMILY)!r})
+import serving_options
+before = len(os.listdir("/proc/self/fd"))
+serving_options._silence_stdout()
+serving_options._silence_stdout()
+null = os.stat(os.devnull)
+now = os.fstat(sys.stdout.fileno())
+sys.stderr.write(f"HELD {{len(os.listdir('/proc/self/fd')) - before}} NULL {{(now.st_dev, now.st_ino) == (null.st_dev, null.st_ino)}}\\n")
+"""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        done = subprocess.run([sys.executable, "-c", code], stdout=write_end, stderr=subprocess.PIPE, text=True, timeout=120)
+    finally:
+        os.close(write_end)
+    assert done.returncode == 0 and done.stderr == "HELD 0 NULL True\n", done.stderr
+
+
 def test_a_standard_stream_that_was_closed_before_the_process_started_ends_in_no_traceback():
     """``sample >&-``, ``<&-``, ``2>&-``: the interpreter then starts with ``None`` where the stream would be.  Three child
     processes, each with one descriptor closed before it starts: the sink remembers a standard output that is not there,
