@@ -37,7 +37,7 @@ says ``NOT OBSERVED`` with the reason, ``Checks.unobserved`` carries it, and a s
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``gate_fp8`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
+``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
 other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
@@ -52,6 +52,24 @@ Its kernel forms the gated value as the quotient ``attn / (1 + exp(-gate))`` in 
 around it.  The band: every byte is the code of one of those two bf16 values, and the code of the nearest one wherever the
 quotient is more than 2.5 fp32 units from their midpoint; every value finite.  Inside that margin the fp32 quotient may
 fall on the other side of the midpoint, which is the kernel's own arithmetic; the line prints how many bytes did.
+
+``add_norm_quant``, the band of the add + RMSNorm + quantise entry, is that entry's documented numerics contract too
+(``docs/operations/normalizations/add_norm_quant_decode.md``).  Its kernel normalises in fp32, rounds the normed value
+once to bf16 and forms its codes from that bf16 value; the twin evaluates the same value in fp64 and keeps the two bf16
+values around it.  Per output of a call, whatever the form of its call site writes:
+
+* the residual stream: byte for byte ``bf16(fp32(branch) + fp32(residual))``;
+* the normed rows: every element one of the two bf16 values around the normalised value, and the nearest one wherever
+  that value is more than 20 fp32 units from their midpoint (the entry's page: its fp32 value is within 20 x 2**-24 of
+  the fp64 one);
+* 8-bit codes: where the form also writes the normed rows, byte for byte the static quantisation of THOSE rows; where
+  it writes codes alone, every byte the code of one of the two bf16 values, the nearest one's beyond the margin;
+* 4-bit codes: every block scale ``e4m3(global * (largest * fp32(1/6)))`` of a block maximum the two bf16 values admit;
+  and, under the block scale the kernel stored, every code inside the bracket of its two approximate reciprocals
+  around the code of an admitted bf16 value (``torch_ref.nvfp4_code_bracket``: two adjacent codes at most).
+
+Every value finite.  The line prints how many elements took the other bf16 value, and how many codes are not the ones
+of the nearest value; anything outside these sets is a failure, never a share.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -103,6 +121,10 @@ GDN_STATE_CAP = 2.0**-6
 #: byte is the code of the nearest one (``docs/operations/attention/gate_quant_decode.md``: measured over every operand
 #: pair at five scales, doubled).  Not a tolerance of this sample: it moves only with that page
 GATE_MARGIN_ULP32 = 2.5
+#: the norm entry's contract: its fp32 value before the one rounding to bf16 is within 20 x 2**-24 of the fp64 value
+#: (``docs/operations/normalizations/add_norm_quant_decode.md``), which is at most 20 fp32 units; beyond that distance
+#: from the midpoint of the two bf16 values around it the kernel rounds to the nearest one.  It moves only with that page
+NORM_MARGIN_ULP32 = 20.0
 BANDS = {
     "same": "the provider is the reference chain",
     "bitwise": "byte-identical",
@@ -117,6 +139,12 @@ BANDS = {
         "8-bit bytes against the gate at the kernel's rounding points: every byte the code of one of the two bf16 values around the gated value "
         f"attn / (1 + exp(-gate)), and the code of the nearest one wherever that value is more than {GATE_MARGIN_ULP32:g} fp32 units from their midpoint; "
         "every value finite"
+    ),
+    "add_norm_quant": (
+        "against the norm at the kernel's rounding points: the residual stream byte for byte; every normed element one of the two bf16 values around "
+        f"the normalised value, the nearest one wherever that value is more than {NORM_MARGIN_ULP32:g} fp32 units from their midpoint; 8-bit codes those of "
+        "the normed rows the kernel wrote, or of one of the two bf16 values where it wrote codes alone; 4-bit block scales those of a block maximum the "
+        "two values admit, 4-bit codes inside the bracket of the kernel's two approximate reciprocals under its own block scale; every value finite"
     ),
 }
 
@@ -198,8 +226,10 @@ class BlockStats:
     conv_equal: bool = True
     null_equal: bool = True
     state_equal: bool = True  # of a band without a rule for state: what the call updated, byte for byte
-    outside: int = 0  # gate_fp8: bytes that are the code of neither bf16 value around the gated value
-    off_nearest: int = 0  # gate_fp8: bytes off the nearest value's code although the gated value is beyond the margin
+    outside: int = 0  # gate_fp8, add_norm_quant: bytes (elements) that are the code of neither bf16 value around the judged value
+    off_nearest: int = 0  # gate_fp8, add_norm_quant: bytes off the nearest value's code although the judged value is beyond the margin
+    other_value: int = 0  # add_norm_quant: normed elements that are the other bf16 value around the normalised value (inside the margin)
+    not_of_out: int = 0  # add_norm_quant: 8-bit codes that are not those of the normed rows the same call wrote
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -229,6 +259,14 @@ class BlockStats:
                 f"the code of the other one around the gated value, {self.off_nearest:,} of them more than {GATE_MARGIN_ULP32:g} fp32 units from the "
                 f"midpoint; {self.outside:,} the code of neither{loud}"
             )
+        if self.band == "add_norm_quant":
+            loose = self.total_bytes - self.equal_bytes
+            return (
+                f"residual stream {'equal' if self.state_equal else 'DIFFERS'}; {self.elements:,} normed elements, {self.other_value:,} of them the other "
+                f"bf16 value around the normalised value; {self.total_bytes:,} codes and block scales, {loose:,} of them not those of the nearest value; "
+                f"{self.not_of_out:,} 8-bit codes not those of the normed rows of their call; {self.off_nearest:,} off the nearest value more than "
+                f"{NORM_MARGIN_ULP32:g} fp32 units from the midpoint; {self.outside:,} outside{loud}"
+            )
         share = self.off_by_one / max(self.elements, 1)
         state = "" if self.state_equal else "; STATE DIFFERS"
         return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{state}{loud}"
@@ -256,13 +294,13 @@ class BlockTap:
         return [operands[i] for i in block.state_args]
 
     @staticmethod
-    def _save(holders):
-        return [tuple(t.clone() for t in h.tensors()) for h in holders]
+    def _save(holders):  # a holder is a state object, a plain tensor a call updates in place, or nothing (``None``)
+        return [tuple(t.clone() for t in _tensors(h)) for h in holders]
 
     @staticmethod
     def _load(holders, saved):
         for h, s in zip(holders, saved):
-            for t, c in zip(h.tensors(), s):
+            for t, c in zip(_tensors(h), s):
                 t.copy_(c)
 
     def __call__(self, name, layer, block, operands):
@@ -316,6 +354,9 @@ class BlockTap:
             stats.finite = stats.finite and bool(((codes & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
             stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
             stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.state_equal
+            return
+        if stats.band == "add_norm_quant":
+            _judge_norm(stats, out, ref, twin)
             return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
@@ -375,6 +416,66 @@ class BlockTap:
             stats.ok = stats.ok and bool((units <= 1.0).all())  # element by element: False for a NaN
         stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # no rule of this band for state: byte for byte
         stats.ok = stats.ok and stats.finite and stats.state_equal
+
+
+def _judge_norm(stats: BlockStats, out, ref, twin) -> None:
+    """One call of the add + RMSNorm + quantise entry against its twin (band ``add_norm_quant``): ``out`` / ``ref`` are the
+    compared outputs of the two in the order the twin names (``twin.outputs``); the twin keeps the bf16 bracket of the
+    normalised value and the quantisation of the call.  The residual stream the call updated in place is one of the
+    outputs, so the state is not judged a second time."""
+    from .providers import torch_ref
+    from .weights import BLOCK, quantize_fp8
+
+    if getattr(twin, "bracket", None) is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError("the band add_norm_quant is judged against the norm at the kernel's rounding points: the block's twin keeps no bracket")
+    names = tuple(twin.outputs)
+    if len(out) != len(names) or len(ref) != len(names):
+        stats.outside += 1  # the call wrote other outputs than the form of its site names: nothing can be compared
+        stats.ok = False
+        return
+    got, quant = dict(zip(names, out)), twin.quant
+    nearest, other, margin = twin.bracket
+    loose = margin <= NORM_MARGIN_ULP32  # where the kernel's fp32 value may lie on the other side of the midpoint
+    stats.state_equal = stats.state_equal and bytes_equal(got["residual"], dict(zip(names, ref))["residual"])
+    if "normed" in got:
+        y = got["normed"]
+        bits, at_nearest, at_other = torch_ref._bf16_bits(y), torch_ref._bf16_bits(nearest), torch_ref._bf16_bits(other)
+        same, second = bits == at_nearest, bits == at_other
+        stats.finite = stats.finite and bool(torch.isfinite(y).all())
+        stats.elements += y.numel()
+        stats.other_value += int((~same & second).sum())
+        stats.outside += int((~same & ~second).sum())
+        stats.off_nearest += int((~same & second & ~loose).sum())
+    if "codes" in got and "scales" not in got:  # 8-bit codes
+        codes, of_nearest, of_other = got["codes"], quantize_fp8(nearest, quant.scale).codes, quantize_fp8(other, quant.scale).codes
+        same, second = codes == of_nearest, codes == of_other
+        stats.finite = stats.finite and bool(((codes & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+        stats.total_bytes += codes.numel()
+        stats.equal_bytes += int(same.sum())
+        stats.outside += int((~same & ~second).sum())
+        stats.off_nearest += int((~same & second & ~loose).sum())
+        if "normed" in got:  # the codes are those of the bf16 rows the same launch wrote
+            stats.not_of_out += int((codes != quantize_fp8(got["normed"], quant.scale).codes).sum())
+    if "scales" in got:  # 4-bit codes with their block scales, row by row
+        packed, scales = got["codes"], got["scales"]
+        a, b = nearest.float().abs(), other.float().abs()
+        firm = torch.where(loose, torch.minimum(a, b), a).unflatten(-1, (-1, BLOCK)).amax(-1)  # the smallest and the largest block
+        high = torch.where(loose, torch.maximum(a, b), a).unflatten(-1, (-1, BLOCK)).amax(-1)  # maximum the bracket admits
+        low_scale, high_scale = torch_ref.nvfp4_block_scales(firm, quant.scale), torch_ref.nvfp4_block_scales(high, quant.scale)
+        of_nearest = torch_ref.nvfp4_block_scales(a.unflatten(-1, (-1, BLOCK)).amax(-1), quant.scale)
+        stats.finite = stats.finite and bool(((scales & 0x7F) != 0x7F).all())
+        stats.total_bytes += scales.numel()
+        stats.equal_bytes += int((scales == of_nearest).sum())
+        stats.outside += int(((scales != low_scale) & (scales != high_scale)).sum())
+        codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)  # one nibble per element, the even element first
+        low, top = torch_ref.nvfp4_code_bracket(nearest, scales, quant.scale)  # under the block scales the kernel stored
+        low_other, top_other = torch_ref.nvfp4_code_bracket(other, scales, quant.scale)
+        same, second = (codes == low) | (codes == top), (codes == low_other) | (codes == top_other)
+        stats.total_bytes += codes.numel()
+        stats.equal_bytes += int(same.sum())
+        stats.outside += int((~same & ~second).sum())
+        stats.off_nearest += int((~same & second & ~loose).sum())
+    stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal
 
 
 def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:

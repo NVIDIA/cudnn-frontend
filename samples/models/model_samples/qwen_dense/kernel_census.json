@@ -4,6 +4,7 @@
     "The target kernel set of a plain decode step of the dense Qwen 3.5-architecture model: per block call of a step the kernel a stack that reproduces the set launches, in step order.",
     "kernels: per kernel id what it is, where it comes from and how it stands to the target -- 'target' of kind 'code' (the target's own compiled kernel: an entry, a library call or a framework operator called as the target calls it) or of kind 'port' (a kernel whose home is cuDNN Frontend: an entry that reproduces the target kernel's results byte for byte), or 'stand-in' (a declared replacement for an operation that lives inside a serving engine). 'entry' is null until a stack of this repository calls an entry for the kernel; with an entry comes 'form', what the target passes to it.",
     "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file: 'tie_out' says where that comparison stands and on which GPU class it was made, 'differences' what differs from the target's kernel besides its results. A port without an entry here has neither yet.",
+    "A kernel the target calls in several forms has, on each entry of a section, 'form': the fields of its form at that call beyond the form it has everywhere; 'first_layer' names what differs at a block's first call in the model's first layer.",
     "configurations: per GPU class and SM count one section. 'geometry' is the layer widths of the model the section holds for; a model with other widths has no section. 'launch' is [grid, block, shared memory in bytes] of one launch at the section's row count; 'at' names further fields of the geometry that one launch shape was recorded with. A section is 'recorded' (launch records of the target on that class) or 'planned' (derived, never claimed); 'claimed' is false until a stack launches every kernel of the section.",
     "The numbers of a section are three, never one: of its launches per step, how many are the target's own compiled kernels (code), how many cuDNN Frontend entries with byte-equal results (port), how many declared stand-ins. They count what a complete stack launches: a port is counted whether or not its entry is called by a stack yet.",
     "A change of a form this file names changes this file in the same commit."
@@ -19,7 +20,15 @@
   },
   "kernels": {
     "embedding_gather": {"what": "token embedding lookup", "origin": "PyTorch", "relation": "target", "kind": "code", "entry": "torch.index_select"},
-    "add_norm_quant": {"what": "residual add + RMSNorm + quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
+    "add_norm_quant": {"what": "residual add + RMSNorm + quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.AddNormQuantDecode", "form": {"PDL": true, "PDL_RELEASE": true},
+      "tie_out": "Compared when the entry was written: every output byte against the target kernel's -- the residual, the normed rows, the codes and the whole block-scale buffer -- for all fifteen forms of the entry, 14 row counts from 1 to 1024, eight scales per quantising form, with the dependent-launch arm on and off, on compute capability 10.0 -- no differing byte. No such comparison is recorded for another compute capability. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/normalizations/add_norm_quant_decode.md) and its suites (test/python/norm/frost/).",
+      "differences": [
+        "a kernel of its own: the same count of every floating-point, convert, load, store, shuffle and barrier instruction as the target kernel's, and 8 to 27 fewer integer instructions",
+        "two launch flags where the target kernel has one: the wait for the predecessor and the release of the successor can be chosen apart; the target launches wait + release, the form this file names",
+        "the kernel takes only the operands its form uses (3 to 7 tensors); the target kernel always takes eight",
+        "the form is readable in the kernel's symbol; the target kernel has one symbol for all of its forms",
+        "on the host: typed declines, outputs the caller may own one by one, at most 1024 rows per call, the row width a field of the form (served: 5120)"
+      ]},
     "fp8_projection": {"what": "8-bit in-projection of a layer", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
     "gdn_decode_fused": {"what": "fused linear-attention decode step", "origin": "cuDNN Frontend", "relation": "target", "kind": "code", "entry": "cudnn.GdnDecodeFused", "form": {"PDL": true, "PDL_RELEASE": true}},
     "cublaslt_fp8_gemm": {"what": "8-bit out-projection of a layer", "origin": "cuBLASLt through FlashInfer", "relation": "target", "kind": "code", "entry": null, "selection": "the library's tuner chooses the kernel: a pick is recorded and never gated, so no launch shape is held here"},
@@ -53,28 +62,29 @@
             "prologue": [
               ["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]
             ],
+            "first_layer": {"add_norm_quantize": {"form": {"ADD": false, "STORE_RESIDUAL": true}}},
             "linear_attention_layer": [
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": "e4m3_static"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
               ["projection.fp8.in", "fp8_projection", {"launch": [[128, 1, 1], [256, 1, 1], 139520]}],
               ["linear_attention.step", "gdn_decode_fused", {"launch": [[96, 1, 1], [256, 1, 1], 42112]}],
               ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "nvfp4"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
               ["mlp.gate_up", "swiglu_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424]}],
               ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
             ],
             "attention_layer": [
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "e4m3_static"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
               ["projection.fp8.in", "fp8_projection", {"launch": [[112, 1, 1], [256, 1, 1], 139520]}],
               ["attention.prepare", "attention_prepare", {"launch": [[1, 28, 1], [128, 1, 1], 16]}],
               ["attention.core", "fi_decode_attention", {"launch": [[5, 4, 1], [512, 1, 1], 178456]}],
               ["attention.gate_quantize", "gate_quant", {"launch": [[3, 1, 1], [256, 1, 1], 0]}],
               ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": false, "QUANT": "nvfp4"}, "launch": [[1, 1, 1], [640, 1, 1], 80]}],
               ["mlp.gate_up", "swiglu_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424]}],
               ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
             ],
             "epilogue": [
-              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}]
+              ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": null}, "launch": [[1, 1, 1], [640, 1, 1], 80]}]
             ],
             "after_step": [
               ["output_head.quantize", "fi_fp4_quantize", {}],

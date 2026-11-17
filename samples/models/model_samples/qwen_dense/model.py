@@ -10,7 +10,7 @@ followed by an MLP.  One decode step of ``rows`` sequences, block by block (the 
 block                  operands                                          result
 ====================== ================================================= ==============================================
 embedding              ids ``[rows]`` int32, table                       ``[rows, hidden]`` bf16
-add_norm_quantize      branch, residual, norm weight, ``Quant``          (quantised operand, normed bf16, new residual)
+add_norm_quantize      branch, residual, norm weight, ``Quant``, site    (quantised operand, normed bf16, new residual)
 projection.fp8.in      8-bit operand, weight copy                        ``[rows, 16384 | 14336]`` bf16
 linear_attention.step  x, z, normed hidden, slot ids, params, slots      8-bit ``[rows, 6144]``; state updated in place
 attention.prepare      QKV row, cache, position, params                  (q, gate); key and value inserted in the cache
@@ -22,6 +22,10 @@ mlp.down               4-bit operand, weight copy                        ``[rows
 output_head            4-bit operand, weight copy                        logits ``[rows, vocabulary]`` bf16
 token_choice           logits                                            ids ``[rows]`` int32
 ====================== ================================================= ==============================================
+
+The norm block is called at several sites of a step, and a kernel that serves it is called in another form at each: ``site``
+names the call by what the normed rows feed (``NORM_SITES``; ``sites()`` lists the site of every call of the wiring).  A
+reference chain ignores it.
 
 The weights that feed one multiply are merged at load: the query (with its gate half), key and value projections of an
 attention layer; ``qkv`` and ``z`` of a linear-attention layer; its ``b`` and ``a`` rows, b first; the MLP's gate and up.
@@ -51,6 +55,10 @@ PATTERN = ("linear_attention", "linear_attention", "linear_attention", "full_att
 #: step.  The output head is a seeded permutation of the embedding table, so the greedy token is decided by a wide margin and
 #: the produced ids are a walk through that permutation: the layers move the logits, not the choice.
 BRANCH_GAIN = 0.25
+#: the call sites of the residual add + RMSNorm + quantise block, by what the normed rows feed: the mixer of a layer (the
+#: layer's kind), its MLP, the output head.  The first call of a step has no residual stream yet: ``FIRST`` behind its site
+NORM_SITES = ("linear_attention", "full_attention", "mlp", "output_head")
+FIRST = ".first"
 
 
 @dataclass(frozen=True)
@@ -276,6 +284,25 @@ class QwenDense:
         calls += [("add_norm_quantize", len(kinds)), ("output_head", -1), ("token_choice", -1)]
         return tuple(calls)
 
+    def sites(self) -> Tuple[str, ...]:
+        """The call site of every call of ``wiring()``, in its order: for the norm block what its normed rows feed (the layer's
+        kind for a layer's input norm, ``"mlp"``, ``"output_head"``), with ``".first"`` behind the first call of a step, which
+        has no residual stream to add to; ``""`` for a block that is called in one form everywhere.  ``step`` hands the
+        same names to the norm block; a provider row names the form of each (``ProviderRow.sites``)."""
+        kinds = self.geometry.layer_kinds
+        sites, seen = [], set()
+        for block, layer in self.wiring():
+            if block != "add_norm_quantize":
+                sites.append("")
+            elif layer == len(kinds):
+                sites.append("output_head")
+            elif layer in seen:  # a layer's second call: the norm in front of its MLP
+                sites.append("mlp")
+            else:
+                seen.add(layer)
+                sites.append(kinds[layer] + (FIRST if layer == 0 else ""))
+        return tuple(sites)
+
     def calls_text(self) -> Dict[str, str]:
         return {block: " / ".join(str(c) for c in count) for block, count in self.calls().items()}
 
@@ -482,7 +509,8 @@ class QwenDense:
         position = state.position
         branch, residual = call("embedding", -1, ids, weights.embedding), None
         for i, layer in enumerate(weights.layers):
-            q, normed, residual = call("add_norm_quantize", i, branch, residual, layer.input_norm, layer.in_quant)
+            site = layer.kind if residual is not None else layer.kind + FIRST  # the first norm of a step starts the residual stream
+            q, normed, residual = call("add_norm_quantize", i, branch, residual, layer.input_norm, layer.in_quant, site)
             row = call("projection.fp8.in", i, q, layer.in_proj)
             if layer.kind == "linear_attention":
                 x, z = split_qkvz(row, layer.gdn.qkv_channels, layer.gdn.value_heads, layer.gdn.head_dim)
@@ -492,9 +520,9 @@ class QwenDense:
                 attended = call("attention.core", i, qh, state.layers[i], position)
                 mixed = call("attention.gate_quantize", i, attended, gate, layer.out_quant)
             branch = call("projection.fp8.out", i, mixed, layer.out_proj)
-            q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant)
+            q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
-        q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant)
+        q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
         state.position = position + 1

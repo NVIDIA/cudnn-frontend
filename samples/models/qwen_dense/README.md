@@ -83,37 +83,82 @@ whose home is cuDNN Frontend -- for each of them an entry that reproduces the ta
 which is why a run counts them as "cuDNN Frontend entries with byte-equal results" -- and 1 is an operation that lives
 inside a serving engine and gets a declared stand-in.
 
-These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 16 today, the gate entry's.
-The other 257 (residual add + RMSNorm + quantise 129, the 8-bit in-projection 64, the MLP gate / up multiply 64) are
+These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 145 today: the norm entry's
+129 and the gate entry's 16. The other 128 (the 8-bit in-projection 64, the MLP gate / up multiply 64) are
 not called through an entry by any stack of this sample yet: they stay on fallback rows, and each row arrives with a
 change of its own. And "byte-equal" is the entry's own record, not something this sample measures: the comparison of an
 entry's bytes with the target kernel's is made when the entry is written and needs the target's kernel. The census
 file says for each entry a stack calls where that comparison stands and on which GPU class it was made (`tie_out`,
-`differences`); for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0. What this
+`differences`); for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0; for the norm
+entry it was made on compute capability 10.0. What this
 sample holds an entry to is its documented numerics contract (the band of its row) and its launch facts.
 
 The stack is built block by block. A block whose target kernel is not served here yet stays on the fallback row it has in
-`fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today two entries are on their target forms:
+`fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today three entries are on their target forms:
 
 | block | launches per step (64 layers) | what `native` launches | identity |
 |---|---|---|---|
 | token embedding lookup | 1 | PyTorch's gather | target: the target's own compiled kernel |
+| residual add + RMSNorm + quantise | 129 | `cudnn.AddNormQuantDecode`, waiting for the launch before it and releasing the launch after it (`PDL True`, `PDL_RELEASE True`), in one of five forms by call site (the table below); compute capability 10.x | target: a cuDNN Frontend entry with byte-equal results |
 | linear-attention step | 48 | `cudnn.GdnDecodeFused` launched as a dependent of the launch before it and releasing the launch after it at entry (`PDL True`, `PDL_RELEASE True`) | target: the target's own compiled kernel |
 | gate + quantise | 16 | `cudnn.AttentionGateQuantDecode` with 256 threads per thread block, releasing the launch after it at entry (`THREADS 256`, `PDL_RELEASE True`); compute capability 10.x | target: a cuDNN Frontend entry with byte-equal results |
-| every other block of the table below | 418 | the fallback rows of `fe-cublas` | not yet |
+| every other block of the table below | 289 | the fallback rows of `fe-cublas` | not yet |
 | the 4-bit quantise in front of the output head | 1 | nothing: this sample has no block for it yet | the target's declared stand-in, not yet |
+
+The norm block is called at five kinds of site in a step, and the target calls its kernel in another form at each: the
+first call of a step starts the residual stream from its operand, every later call adds to it in place; and each call
+writes what the block after it reads. The provider row names the form of every call site (`NORM_FORMS` in
+`model_samples/qwen_dense/configs.py`), the model's wiring names the site of every call (`QwenDense.sites()`), the
+census names the form of every call, and a host test holds the three to each other:
+
+| block | call site | calls per step (64 layers) | form of the entry there |
+|---|---|---|---|
+| residual add + RMSNorm + quantise | `linear_attention.first` | 1 | [ADD False, STORE_RESIDUAL True, BF16_OUT True, QUANT e4m3_static] |
+| residual add + RMSNorm + quantise | `full_attention.first` | 0 | [ADD False, STORE_RESIDUAL True, BF16_OUT False, QUANT e4m3_static] |
+| residual add + RMSNorm + quantise | `linear_attention` | 47 | [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT e4m3_static] |
+| residual add + RMSNorm + quantise | `full_attention` | 16 | [ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT e4m3_static] |
+| residual add + RMSNorm + quantise | `mlp` | 64 | [ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4] |
+| residual add + RMSNorm + quantise | `output_head` | 1 | [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT None] |
+
+A call site is named by what the normed rows feed: a layer's mixer (the layer's kind; `.first` for the first call of a
+step, which has no residual stream yet), its MLP, the output head. A linear-attention step reads the normed bf16 rows
+beside the 8-bit operand of its in-projection, an attention layer reads the 8-bit operand alone, an MLP reads 4-bit
+codes, and the final norm writes bf16 rows only: the target quantises the output head's operand with a launch of its
+own. Each form is one compiled kernel of the entry and one entry instance of the adapter, which serves a call with the
+instance of its site and decides nothing. The forms cannot be told apart by a launch record -- one kernel id, grid
+(1, 1, 1), block (640, 1, 1) and 80 B of shared memory at 1 row in every form -- so the kernel check holds them where
+they do show: the form of each site against the entry instance's own form, the instance that served each call of the
+traced steps (the call log), and the kernel's symbol, which carries the form's text. A run prints which instance served
+how many calls of a step: 1, 47, 16, 64 and 1 on the 64-layer model.
+
+The sixth form of the table, `full_attention.first`, is the first call of a step whose first layer is an attention
+layer. The published model starts with a linear-attention layer, so a step of it never calls that form (0 above) and
+the recorded target has no launch in it: the census derives the form, the one of an attention layer's input norm
+with the residual mode of a first call (`first_layer`), and such a call counts as `target` by that rule, not by a
+record. A reduced model that starts with an attention layer calls it -- `--layers 1`, 5, 9 and so on, because the
+reduced model keeps the last layers of the published order -- and the run table below has that run.
+
+The entry serves one hidden width, the published model's 5120, and the row says so (`widths` in `configs.py`). A
+checkpoint of the family with another hidden width is not this row's: its norm block stays on the reference chain in
+both stacks, on every GPU class, and its run states no kernel identity (below).
+
+Two consumers of this block are still on fallback rows, and what they need beyond the kernel's bytes is launched by
+them, never inside the norm's call. The 4-bit operand keeps its block scales in the layout the kernel writes (128 x 4),
+and the multiply over a copy gathers them when it dequantises. And where the form ends at the bf16 rows, the output
+head on its fallback row quantises them itself: that quantisation is the target's declared stand-in, for which this
+sample has no block yet.
 
 So a run with a checkpoint prints under its kernel table:
 
 ```text
 the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
-kernel identity, as planned: 65 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 16 cuDNN Frontend entries with byte-equal results); not yet: add_norm_quantize 129, projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
+kernel identity, as planned: 194 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 145 cuDNN Frontend entries with byte-equal results); not yet: projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
 ```
 
 and with its checks the census line, `target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12): NOT CLAIMED (fallback
-rows present; ...); 65 launches of a step compared by launch shape (49 the target's own compiled kernels + 16 cuDNN
+rows present; ...); 194 launches of a step compared by launch shape (49 the target's own compiled kernels + 145 cuDNN
 Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded one`. The default run on the
-two-layer model counts 3 of 20 (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results;
+two-layer model counts 8 of 20 (2 the target's own compiled kernels + 6 cuDNN Frontend entries with byte-equal results;
 the declared stand-in not yet). The line always says what was compared: `EQUAL`, once a class is claimed, carries the
 number of launches that were held to a recorded launch shape and the number held by membership alone (a kernel a
 library's tuner selects, a stand-in), so it never stands for a comparison that was not made.
@@ -134,13 +179,16 @@ the launch shape of the output head is recorded with the vocabulary as well and 
 target kernel: the provider row's form is the census's form of that kernel and the entry's own form, compared on the
 objects; the launch carries the entry's own symbol and exactly the launch shape the entry states; and where the census
 has a section for the run, the launch shape is the recorded one -- grid (96, 1, 1), block (256, 1, 1) and 42,112 B of
-shared memory for the fused step, grid (3, 1, 1), block (256, 1, 1) and no shared memory for the gate, at 1 row on
-compute capability 10.0 with 148 SMs. A difference fails the run with a sentence that names the block.
+shared memory for the fused step, grid (3, 1, 1), block (256, 1, 1) and no shared memory for the gate, grid (1, 1, 1),
+block (640, 1, 1) and 80 B for the norm in every form, at 1 row on
+compute capability 10.0 with 148 SMs. For the norm block all of it holds per call site. A difference fails the run with
+a sentence that names the block, and for a form the call and its site.
 
 **What this stack is not, today.** It is not a fast path: it holds the same bf16 copies as `fe-cublas`, needs the same
 memory and issues every launch from Python. No timing of it means anything. And a target kernel between fallback rows
-does not run in the target's surroundings: the fused step waits for the launch before it and releases the launch after
-it, the gate releases the launch after it, but the launches around them here are PyTorch's and cuBLAS's, which neither
+does not run in the target's surroundings: the fused step and the norm wait for the launch before them and release the
+launch after them, the gate releases the launch after it, but the launches around them here are PyTorch's and cuBLAS's
+(the one place where two target kernels meet is the gather and the first norm of a step), which neither
 release early nor start early, so both knobs are exercised and change nothing. With `--provider
 linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
@@ -151,22 +199,27 @@ serve there on its fallback row. It needs no package beyond cuDNN Frontend and P
 of this area runs, so the rows of the entries stay verified wherever that test runs. Until `native` has a row a library
 serves, the two stacks are the same rows.
 
-On compute capability 12.x the gate entry does not serve; the block then stays on its reference chain (`not yet (reference
-chain)`) in both stacks, and the census has no section for that class.
+On compute capability 12.x neither the gate entry nor the norm entry serves; both blocks then stay on their reference
+chains (`not yet (reference chain)`) in both stacks, and the census has no section for that class.
 
-The stack was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
+The stack was last run on compute capability 10.0 (2026-11-16, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
 line of every run names the PyTorch version as other than the recorded 2.14.0):
 
 | run | result |
 |---|---|
-| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 460 kernel launches and 37 copies; 3 are judged one by one. At 1 sequence the gather, the fused step and the gate (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The gate entry was inside its band with every byte the code of the nearest bf16 value (350,208 bytes at 1 sequence, 1,400,832 at 4), and equal alone and among 4 |
-| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 65 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 16 of a cuDNN Frontend entry with byte-equal results; the declared stand-in has no block yet), in the wiring order (the gather, then three fused steps and one gate, 16 times), each in the recorded launch shape; 11,574 kernel launches and 968 copies per traced step in all. Replay held; 7 of 7 provider blocks inside their bands; the gate entry over 256 calls with all of its 1,572,864 bytes the code of the nearest bf16 value; the token line reported |
+| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 312 kernel launches and 25 copies; 8 are judged one by one. At 1 sequence the gather, the fused step, the gate and the five norm calls (2 the target's own compiled kernels + 6 cuDNN Frontend entries with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 8 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, all those of the nearest value; nothing outside -- and equal alone and among 4. The gate entry was inside its band with every byte the code of the nearest bf16 value (350,208 bytes at 1 sequence, 1,400,832 at 4), and equal alone and among 4 |
+| the four-layer model, `--stack native --layers 4 --sequences 1` | `[00] PASS`: all five forms a 64-layer model calls (the input norm of a later linear-attention layer is the fifth); 14 launches of a step judged one by one |
+| the one-layer model, `--stack native --layers 1 --sequences 1` | `[00] PASS`: the sixth form, `full_attention.first` -- the model is one attention layer, so the first norm of a step is its input norm. 5 launches of a step judged one by one (the gather, three norm calls and the gate: 1 the target's own compiled kernel + 4 cuDNN Frontend entries with byte-equal results), each in the recorded launch shape; the three norm calls served by three instances, and the symbol of the first carries its form (`store`, `e4m3_static`, wait + release). The norm entry inside its band over 171 calls: 291,840 normed elements and 601,920 codes and block scales, all those of the nearest value |
+| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 194 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 145 cuDNN Frontend entries with byte-equal results; the declared stand-in has no block yet), in the wiring order, each in the recorded launch shape; 7,148 kernel launches and 584 copies per traced step in all. The call log of a step: the five forms of the norm entry served 1, 47, 16, 64 and 1 calls, each from its own instance. Replay held; 8 of 8 provider blocks inside their bands; the norm entry over 2,064 calls with 4,014,080 normed elements, 35 of them on the other bf16 value, and 10,813,440 codes and block scales, 2 of them not those of the nearest value, nothing outside; the gate entry over 256 calls with all of its 1,572,864 bytes the code of the nearest bf16 value; the token line reported |
 | the default run, `--stack fe-entries` | `[00] PASS`, the same lines; also as the L0 cell of the area's GPU test |
-| `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 2 remaining target launches (1 the target's own compiled kernel + 1 of a cuDNN Frontend entry with byte-equal results) in the recorded shape |
+| `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 7 remaining target launches (1 the target's own compiled kernel + 6 cuDNN Frontend entries with byte-equal results) in the recorded shape |
 
 The fused step has the same launch shape in both of its forms, grid (96, 1, 1), block (256, 1, 1), 42,112 B at 1 row:
-that it waits and releases shows in its symbol and in its form, not in a launch record. The stack has not run on
-another GPU class.
+that it waits and releases shows in its symbol and in its form, not in a launch record. With the norm entry on its
+target forms the greedy tokens of a checkpoint run of this stack are not those of the run before it had the row: the
+kernel rounds the normed value once from fp32 and breaks an exact 4-bit tie by its own reciprocal, and on a model with
+4-bit activations that is another token after a few steps, as it is between two reference stacks (the section on
+checkpoints). The stack has not run on another GPU class.
 
 ## A checkpoint from local disk
 
@@ -288,7 +341,7 @@ Frontend 1; fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4); PyTorch as the
 | block | calls per step (64 layers) | provider key | entry [form] |
 |---|---|---|---|
 | token embedding lookup | 1 | `torch.index_select` | torch.index_select |
-| residual add + RMSNorm + quantise | 129 | `torch_ref.add_norm_quantize` | torch_ref.add_norm_quantize, fallback: reference chain |
+| residual add + RMSNorm + quantise | 129 | `fe.add_norm_quant_decode` | cudnn.AddNormQuantDecode [PDL True, PDL_RELEASE True] + one of 6 forms, by call site |
 | 8-bit in-projection (linear attention QKVZ / attention QKV) | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
 | linear-attention step | 48 | `fe.gdn_decode_fused` | cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True] |
 | 8-bit out-projection | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
@@ -300,8 +353,9 @@ Frontend 1; fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4); PyTorch as the
 | output head | 1 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 4-bit weights |
 | token choice | 1 | `torch.argmax` | torch.argmax |
 
-By provider: cuDNN Frontend 2; fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3); PyTorch as the natural provider 2.
-On compute capability 12.x the gate + quantise row is the reference chain of `fe-cublas`.
+By provider: cuDNN Frontend 3; fallbacks 6 (cuBLAS over copies 4, PyTorch chains 2); PyTorch as the natural provider 2.
+The six forms of the norm row, by call site, are in the section on the stack `native`. On compute capability 12.x the
+gate + quantise row and the norm row are the reference chains of `fe-cublas`.
 
 | GPU classes | sequences | regime | note |
 |---|---|---|---|
@@ -315,9 +369,9 @@ Against the plain-PyTorch reference of every block, which keeps the chain's cast
 | check | what must hold |
 |---|---|
 | replay | the same inputs from a fresh state give byte-identical ids and logits |
-| blocks, teacher-forced | every value finite; every multiply within one bf16 rounding of the reference, element by element; the linear-attention step inside its band (below); in the stacks `native` and `fe-entries`, the gate + quantise entry inside its band against its twin (below) |
+| blocks, teacher-forced | every value finite; every multiply within one bf16 rounding of the reference, element by element; the linear-attention step inside its band (below); in the stacks `native` and `fe-entries`, the gate + quantise entry and the add + RMSNorm + quantise entry each inside its band against its twin (below) |
 | tokens | the logits of the two stacks, each run end to end on its own state, are finite. On the reduced seeded model they are also within the declared logits band (`configs.py`: 4 bf16 units of the run's largest reference logit), and the greedy token equals the reference stack's at every step whose margin exceeds twice that band; steps below it are counted and printed as near-ties. On a checkpoint no band is declared and the line is `REPORTED` (the section on checkpoints says why). The largest logit distance and the number of equal greedy tokens are printed either way |
-| batch invariance | one sequence alone gives the bytes it has among 4; the sequence that runs alone rotates with the step, so every row of the batch is covered: a gate for the linear-attention step on compute capability 10.0, 10.3 and 12.0 (in its `native` form on 10.0, the class that form has run on) and for the gate + quantise entry on 10.0, a printed fact for every other block and class |
+| batch invariance | one sequence alone gives the bytes it has among 4; the sequence that runs alone rotates with the step, so every row of the batch is covered: a gate for the linear-attention step on compute capability 10.0, 10.3 and 12.0 (in its `native` form on 10.0, the class that form has run on) and for the gate + quantise entry and the add + RMSNorm + quantise entry on 10.0, a printed fact for every other block and class |
 
 The band of the linear-attention step is judged twice. Over the whole run: more than 99.9 % of its 8-bit output bytes
 equal, more than 99.9 % of its recurrent state within 1e-4 and all of it within two bf16 units of the state's largest
@@ -346,6 +400,28 @@ accumulation precision and keeps the two bf16 values around it; every byte must 
 code of the nearest one wherever the quotient is more than 2.5 fp32 units from their midpoint; every value finite. Inside
 that margin the kernel's fp32 quotient may fall on the other side of the midpoint. The line prints how many bytes did;
 one byte outside the two codes, or off the nearest one beyond the margin, fails the block.
+
+The add + RMSNorm + quantise entry is compared with its twin too, the norm written at the kernel's rounding points
+(`AddNormQuantizeBracket`), and its band (`add_norm_quant`) is the numerics contract on its page
+(`docs/operations/normalizations/add_norm_quant_decode.md`), per output of a call. The kernel adds in fp32, normalises
+in fp32, rounds the normed value once to bf16 and forms its codes from that bf16 value; the twin evaluates the same
+value in fp64 and keeps the two bf16 values around it. The residual stream must be byte for byte `bf16(fp32(branch) +
+fp32(residual))`. Every normed element must be one of the two bf16 values, and the nearest one wherever the value is
+more than 20 fp32 units from their midpoint: the page states the kernel's fp32 value within 20 x 2^-24 of the fp64
+one. 8-bit codes must be byte for byte the static quantisation of the normed rows the same call wrote; where a form
+writes codes alone, each must be the code of one of the two bf16 values, the nearest one's beyond the margin. For 4-bit
+codes the block scale must be `e4m3(global scale x (largest magnitude x fp32(1/6)))` of a block maximum the two values
+admit, bit for bit, and under the block scale the kernel stored every code must lie in the bracket of the kernel's two
+approximate reciprocals around the code of an admitted value -- two adjacent codes at most, and one wherever the
+quotient is not within 5 x 2^-23 of a rounding midpoint, the bound the entry's own suite holds its codes to. Every
+value finite. The line prints how many normed elements took the other bf16 value and how many codes are not those of
+the nearest value; anything outside these sets fails the block.
+
+The 4-bit codes of this kernel are not those of the reference chain's quantiser on every element, and the band does
+not ask for that. Where a bf16 value over its block scale is exactly a 4-bit rounding midpoint, the kernel's code
+follows its own reciprocal and the reference quantiser's follows the one it forms; on random rows at this model's
+scales the two differ by one code on about 6 elements in 10,000. Both are quantisations of the same bf16 value. A
+block that reads the kernel's codes is compared, teacher-forced, with its reference on those same codes.
 
 The token check has a declared band because a band taken from the run's own logit distance cannot fail. With seeded
 weights it guards the path, not the layers: the layers move the logits by little (the two stacks are 1.0 to 1.4 units apart
@@ -434,15 +510,16 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on. The stacks `native` and `fe-entries`: `[00] PASS` at 1 and 4 sequences and with the checkpoint, batch invariance of the fused step and of the gate entry gated and equal; the only class these stacks have run on |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on. The stacks `native` and `fe-entries`: `[00] PASS` at 1 and 4 sequences and with the checkpoint, batch invariance of the fused step, of the gate entry and of the norm entry gated and equal; the only class these stacks have run on |
 | 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
 | 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
 | 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |
 | any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
 A class the current checks have not run on is uncovered, not passing. That holds for the stacks `native` and
-`fe-entries` on every class but 10.0: the gate entry inside this sample, the fused step in its wait + release form, and
-the kernel patterns of the check have run on 10.0 only. So has the build of the entries' kernels while a run is
+`fe-entries` on every class but 10.0: the gate entry and the norm entry inside this sample, the fused step in its wait +
+release form, and the kernel patterns of the check have run on 10.0 only. The norm entry admits every compute
+capability 10.x; its own page lists 10.3 and 10.7 as not run on a device. So has the build of the entries' kernels while a run is
 planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
 decline, not on such an installation.
