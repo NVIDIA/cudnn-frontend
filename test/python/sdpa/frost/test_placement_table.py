@@ -844,7 +844,8 @@ def test_sm80_thd_d256_prefill_follows_its_v2_study(s):
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_d576_mla_prefill_follows_its_study(s_kv):
     """Study sm80_d576_prefill_20261117 (A100): absorbed-MLA (576, 512) dense prefill and verify lead (kimi_k3's prefill ran the
-    backend at up to 2.61x); paged prefill leads past a tile floor; paged verify keeps the wide-verify study's entries."""
+    backend at up to 2.61x); paged prefill leads past a tile floor (on the tile from sm80_d576_paged_v3_20261117, which leads
+    kimi_k3-tp8's long-KV chunks); paged verify keeps the wide-verify study's entries."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_d576_prefill_20261117"
 
@@ -856,8 +857,9 @@ def test_sm80_d576_mla_prefill_follows_its_study(s_kv):
 
     for paged in (False, True):
         assert pt.class_key(row, f(paged))[4] == "prefill"
-        assert pt.matched_entry(row, f(paged)).study == study
+        assert pt.matched_entry(row, f(paged)).study == (study if not paged or s_kv % 2 else "sm80_d576_paged_v3_20261117")
         assert pt.lookup(row, f(paged)) is True
+    assert pt.lookup(row, f(True, h_q=12, s_q=512, max_total_seq_len_q=512)) is True  # kimi_k3-tp8 (2^5.6 tiles)
     assert pt.lookup(row, f(False, s_q=8)) is True  # dense verify
     assert pt.matched_entry(row, f(False, s_q=8)).study == study
     assert pt.matched_entry(row, f(True, s_q=8, max_total_seq_len_q=8)).study == "sm80_paged_wide_verify_v2_20261117"

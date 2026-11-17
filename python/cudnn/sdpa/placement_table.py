@@ -940,9 +940,6 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm80_d576_prefill_20261117"
     ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 7.5, "sm80_d576_prefill_20261117", "tiles"
-    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 3.0, "sm80_d576_prefill_20261117", "tiles"
     ),
@@ -961,6 +958,13 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "le", 12.7925, "sm80_dense_d128_gqa_v2_20261117", "rows", ("ge", 10.501, "kv")
+    ),
+    # study sm80_d576_paged_v3_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE b085f3499; paged THD-Q D576 x 512 MQA causal prefill over the
+    # whole range, stratified by launch tiles and cache; 120 train cells). On the tile it replaces sm80_d576_prefill_20261117's floor of
+    # 2^7.5 tiles, set by one short-cache square, with 2^4.79: kimi_k3-tp8 / tp4 long-KV chunks lead (backend 1.56-1.60x). Holdout at fresh
+    # h_q, scored once: 9 changed at 0.507 (worst 0.747). Off the tile the fit matched the existing entry on every train cell; it stays.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 4.7925, "sm80_d576_paged_v3_20261117", "tiles"
     ),
     # study sm80_prefill_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE b085f3499; causal prefill S_q >= 17 over the whole range:
     # chunks S_q 17-4096 over KV 256-128k and squares 128-8192, on and off the tile, b 1-8; paged THD Q (the context path) d64, d64 + sink,
