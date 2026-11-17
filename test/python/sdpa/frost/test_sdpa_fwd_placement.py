@@ -602,8 +602,9 @@ def test_sm107_fp8_placement_trails_outside_the_measured_domain(over):
 
 @pytest.mark.L0
 def test_sm107_fp8_d64_sink_decode_placement_structure():
-    """cc 10.7 FP8 d64 decode with a sink: s_q 2-4 leads; s_q == 1 leads from the module's KV-unit floor; a window, paging, or
-    no sink keeps the backend. Bounds come from the module, so this pins the gate's structure, not a measured boundary."""
+    """cc 10.7 FP8 d64 decode with a sink: s_q 2-4 leads; s_q == 1 leads from the module's KV-unit floor; a short window leads
+    only for a power-of-two group from the same floor; a longer window, paging, or no sink keeps the backend. Bounds come from
+    the module, so this pins the gate's structure, not a measured boundary."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
@@ -616,6 +617,13 @@ def test_sm107_fp8_d64_sink_decode_placement_structure():
     assert placement.place(spec, _facts(**{**q1, "b": units // 8 - 1})) == placement.TRAIL
     for over in (dict(window_left=127), dict(has_paged_kv=True), dict(has_sink=False), dict(device_cc=(10, 0))):
         assert placement.place(spec, _facts(**{**mtp, **over})) == placement.TRAIL, over
+    window = placement.SM107_FP8_D64_SINK_MAX_WINDOW
+    for shape in (mtp, q1):
+        swa = {**shape, "b": units // 8, "window_left": window}
+        assert placement.place(spec, _facts(**swa)) == placement.LEAD
+        assert placement.place(spec, _facts(**{**swa, "b": units // 8 - 1})) == placement.TRAIL
+        assert placement.place(spec, _facts(**{**swa, "h_q": 48})) == placement.TRAIL  # group 6 does not pack whole
+        assert placement.place(spec, _facts(**{**swa, "b": 128, "window_left": window + 1})) == placement.TRAIL
 
 
 @pytest.mark.L0

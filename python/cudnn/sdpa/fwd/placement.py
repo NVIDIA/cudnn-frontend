@@ -326,7 +326,12 @@ Dense d64 decode / MTP with a sink and no window (gpt-oss): s_q 2-4 LEAD; s_q ==
 208-SM, cuDNN 9.30.0.4, the attention_inference generation graph, back-to-back GPU time; 180 train cells (b 1-128, 64/8, 32/4,
 8/1, KV 4k-128k) and a 36-cell seeded holdout scored once: s_q 2-4 0.11-1.03 (holdout 0.55 geomean, worst 0.88); s_q == 1 at
 <= 16 units 1.03-1.18, from 32 units 0.13-0.65 (holdout worst 1.03). A window of 128 keys won the on-tile train lattice
-(0.10-1.00) but lost 1.10-1.34x on off-tile holdout KV at b 2-24, so windowed graphs keep the backend.
+(0.10-1.00) but lost 1.10-1.34x on off-tile holdout KV at b 2-24. Every loss there had fewer than 32 units or a group FROST
+cannot pack whole (5, 6), so a window of at most ``SM107_FP8_D64_SINK_MAX_WINDOW`` keys leads when the group is a power of two
+and b * h_kv >= 32. Study rubin_fp8_swa_20261117 (2026-11-17, cuDNN 9.30.0.4, FE 9bdf9a8ab, same harness and timing) fixed that
+rule before timing a fresh seeded 56-cell holdout (groups 2-16 and 3 / 5 / 6 / 12, b 1-128, off-tile KV 3k-128k, windows 64 /
+128): the 24 changed cells ran 0.09-0.86 of the default (geomean 0.35), none slower. The vr200 nightly's gpt-oss SWA cells
+(b 128) had run the backend 3.5-11x slower.
 
 d128 chunks (2026-10-22, same board and harness): LEAD when the GQA group is a power of two (the Q tile packs it) and
 either bottom-right causal with s_q <= 512 and S_kv >= 8192, or S_kv >= 4096 and S_kv >= 64 s_q; or mask-free with
@@ -632,6 +637,7 @@ SM107_FP8_D128_LONG_KV = 8192  # bottom-right causal chunk from this cache lengt
 SM107_FP8_D128_MIN_KV = 4096  # ... or from this length when the cache is at least
 SM107_FP8_D128_KV_PER_Q = 64  # ... this many times the query length
 SM107_FP8_D64_SINK_DECODE_MIN_UNITS = 32  # cc 10.7 FP8 d64 + sink, s_q == 1, no window: 16 KV units lose 1.03-1.18, 32+ win
+SM107_FP8_D64_SINK_MAX_WINDOW = 128  # ... with a window of at most this many keys: power-of-two groups from 32 units, 0.09-0.86
 SM107_FP8_D128_MASKFREE_MAX_S_Q = 128  # mask-free chunk on the KV tile: 0.28-0.96
 SM120_FP8_SHORT_KV = 512  # cc 12.x per-tensor FP8 d128 prefill at or below this cache: 0.81-1.19 on 13-60 us launches
 SM120_FP8_MASKFREE_SHORT_KV = 1024  # ... mask-free at or below this cache: 0.93-1.16
@@ -1169,13 +1175,13 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
 
 
 def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
-    """cc 10.7 per-tensor FP8 dense d64 decode / MTP with a sink and no window (module docstring, "SM107 per-tensor FP8 row")."""
+    """cc 10.7 per-tensor FP8 dense d64 decode / MTP with a sink, no window or a short one (module docstring, "SM107 per-tensor FP8 row")."""
     if (
         facts.device_cc != (10, 7)
         or facts.dtype != cudnn.data_type.FP8_E4M3
         or (facts.d_qk, facts.d_v) != (64, 64)
         or not facts.has_sink
-        or facts.window_left is not None
+        or (facts.window_left is not None and facts.window_left > SM107_FP8_D64_SINK_MAX_WINDOW)
         or facts.thd
         or facts.has_paged_kv
         or facts.padded
@@ -1186,6 +1192,9 @@ def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
         or (facts.s_q > 1 and not (facts.causal and facts.bottom_right))
     ):
         return False
+    if facts.window_left is not None:
+        group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
+        return group > 0 and not group & (group - 1) and facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
     return facts.s_q > 1 or facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
 
 
