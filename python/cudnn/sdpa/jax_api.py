@@ -19,14 +19,14 @@ def _spec(x):
 
 
 @lru_cache(maxsize=128)
-def _plan(specs, scale, causal, window, deterministic, backward, device):
+def _plan(specs, scale, causal, window, deterministic, backward, has_dbias, device):
     from cudnn.frost.device import build_device
 
     with build_device(device):
-        return _build_plan(specs, scale, causal, window, deterministic, backward)
+        return _build_plan(specs, scale, causal, window, deterministic, backward, has_dbias)
 
 
-def _build_plan(specs, scale, causal, window, deterministic, backward):
+def _build_plan(specs, scale, causal, window, deterministic, backward, has_dbias):
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16 if specs[0][1] == "bfloat16" else cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -65,7 +65,7 @@ def _build_plan(specs, scale, causal, window, deterministic, backward):
     if backward:
         o, stats, do = [tensor(s, n) for s, n in zip(specs[6:], ("o", "stats", "do"))]
         dbias = None
-        if bias is not None:
+        if has_dbias:
             dbias = graph.tensor_like(bias, name="dbias")
         dq, dk, dv = graph.sdpa_backward(q=q, k=k, v=v, o=o, stats=stats, dO=do, dBias=dbias, use_deterministic_algorithm=deterministic, **options)
         for t, s in zip((dq, dk, dv), specs[:3]):
@@ -87,10 +87,10 @@ def _build_plan(specs, scale, causal, window, deterministic, backward):
 
 
 @lru_cache(maxsize=128)
-def _operation(scale, causal, window, deterministic, device):
+def _operation(scale, causal, window, deterministic, has_dbias, device):
     def forward(q, k, v, bias, lq, lk):
         args = (q, k, v, bias, lq, lk)
-        call = _plan(tuple(map(_spec, args)), scale, causal, window, deterministic, False, device)
+        call = _plan(tuple(map(_spec, args)), scale, causal, window, deterministic, False, has_dbias, device)
         o, stats = call(*(x for x in args if x is not None))
         return (o, stats), (*args, o, stats)
 
@@ -100,9 +100,9 @@ def _operation(scale, causal, window, deterministic, device):
 
     def backward(saved, grads):
         args = (*saved, grads[0])
-        call = _plan(tuple(map(_spec, args)), scale, causal, window, deterministic, True, device)
+        call = _plan(tuple(map(_spec, args)), scale, causal, window, deterministic, True, has_dbias, device)
         result = call(*(x for x in args if x is not None))
-        return (*result[:3], result[3] if saved[3] is not None else None, None, None)
+        return (*result[:3], result[3] if has_dbias else None, None, None)
 
     attention.defvjp(forward, backward)
     return attention
@@ -150,6 +150,7 @@ def sdpa(
         raise ValueError("local_window_size must contain two nonnegative bounds")
     scale = float(scale) if scale is not None else q.shape[-1] ** -0.5
     target = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+    has_dbias = bias is not None
     if bias is not None:
         bias = jnp.asarray(bias)
         bias = jnp.reshape(bias, (1,) * (4 - bias.ndim) + bias.shape)
@@ -172,7 +173,7 @@ def sdpa(
             raise ValueError("sequence lengths must be int32 arrays of shape (B,)")
         lengths = tuple(x.reshape((-1, 1, 1, 1)) for x in lengths)
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (q, k, v))
-    o, stats = _operation(scale, is_causal, window, deterministic, device)(q, k, v, bias, *lengths)
+    o, stats = _operation(scale, is_causal, window, deterministic, has_dbias, device)(q, k, v, bias, *lengths)
     o = o.transpose(0, 2, 1, 3)
     stats = jax.lax.stop_gradient(stats[..., 0].transpose(0, 2, 1).astype(o.dtype))
     if unbatched:
