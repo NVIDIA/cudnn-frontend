@@ -253,6 +253,14 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+For DLPack dtype regressions, assert the descriptor's dtype immediately after
+`tensor_like`, before graph inference can replace `NOT_SET` with the IO default.
+Exercise the raw C++ binding separately from the Python wrapper, with a different
+graph default and mixed storage types. `core/graph/test_raw_tensor_like_dtype.py`
+covers FP8 encodings, scalar lane/width boundaries, and compact/strided buffers
+without requiring a framework's FP8 exporter. A later numerical failure can be
+a misdeclared input, even when the kernel handles explicitly typed inputs correctly.
+
 Before releasing Torch's cache, synchronize every device with reserved memory.
 Expandable-segment cleanup can synchronize a default-stream handle on the wrong
 current device, then unmap memory still used by another GPU. The later CuTe launch
