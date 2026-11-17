@@ -82,6 +82,35 @@ def test_an_argument_error_still_wins_over_the_device_floor(fake_sm89):
 @pytest.mark.L0
 @pytest.mark.norm_rejects_before_launch
 def test_the_floor_matches_this_device():
-    major, _ = torch.cuda.get_device_capability()
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_compiler_requirement_error
+
+    cc = torch.cuda.get_device_capability()
     reason = norm_utils.unsupported_device_reason(torch.device("cuda"))
-    assert (reason is None) == (major >= 9), reason
+    expected = cutedsl_arch_requirement_error(cc) or cutedsl_compiler_requirement_error(cc)
+    assert (reason is None) == (cc[0] >= 9 and expected is None), reason
+
+
+@pytest.mark.L0
+@pytest.mark.norm_rejects_before_launch
+@pytest.mark.parametrize("phase", ["fprop", "bprop"])
+@pytest.mark.parametrize(
+    "target,compiler,match",
+    [(False, (13, 4), r"SM107.*sm_107a.*4.8.0"), (True, (12, 9), r"SM107.*CUDA 13.4.*CUDA 12.9"), (True, (13, 3), r"SM107.*CUDA 13.4.*CUDA 13.3")],
+)
+def test_sm107_without_a_dsl_target_refuses_before_compilation(monkeypatch, phase, target, compiler, match):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(norm_utils, "_DEVICE_FLOOR_ERROR", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: target)
+    monkeypatch.setattr(buffers, "cutedsl_compiler_version", lambda: compiler)
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+    gamma = torch.ones(64, device="cuda", dtype=x.dtype)
+    with pytest.raises(NotImplementedError, match=match):
+        if phase == "fprop":
+            norm_fprop(NormVariant.LAYER_NORM, x, gamma, torch.zeros_like(gamma), normalized_shape=[64])
+        else:
+            norm_bprop(
+                NormVariant.LAYER_NORM, torch.randn_like(x), x, gamma, torch.zeros(4, device="cuda"), torch.ones(4, device="cuda"), normalized_shape=[64]
+            )

@@ -58,7 +58,26 @@ def sm_count() -> int:
     """Multiprocessor count of the build or current CUDA device, cached per device."""
     from cudnn.frost.device import current_device, multiprocessor_count
 
-    return multiprocessor_count(current_device())
+    return _SM_COUNT if _SM_COUNT is not None else multiprocessor_count(current_device())
+
+
+_SM_COUNT = None  # test override
+_DEVICE_PROPERTIES = {}
+
+
+def device_key():
+    from cudnn.frost.device import current_device
+
+    return current_device()
+
+
+def _device_properties():
+    import torch
+
+    key = device_key()
+    if key not in _DEVICE_PROPERTIES:
+        _DEVICE_PROPERTIES[key] = torch.cuda.get_device_properties(key)
+    return _DEVICE_PROPERTIES[key]
 
 
 _COOP_OCC = {}
@@ -78,6 +97,7 @@ def run_coop(key, run):
     answer per kernel shape. The oversize error comes from launch-time validation
     rather than from the device, so a rejected attempt leaves the context usable.
     """
+    key = key + (device_key(),)
     occ = _COOP_OCC.get(key)
     if occ is not None:
         return run(occ)
@@ -93,15 +113,25 @@ def run_coop(key, run):
             occ //= 2
 
 
+_SMEM_CAPACITY = None  # test override
+_SMEM_CAPACITIES = {}
+
+
 def smem_capacity():
-    """Opt-in per-block shared memory limit of the build/current CUDA device.
+    """Shared-memory budget bounded by both the compiler and the build device."""
+    if _SMEM_CAPACITY is not None:
+        return _SMEM_CAPACITY
+    import os
+    from cudnn._cutlass_compat import get_smem_capacity_in_bytes
+    from cudnn.frost.device import oversized_shared_memory_per_block, shared_memory_per_block_optin
 
-    Use the per-device driver cache: the DSL's ambient architecture may describe
-    another GPU, and the larger per-SM limit is not a valid per-block budget.
-    """
-    from cudnn.frost.device import current_device, shared_memory_per_block_optin
-
-    return shared_memory_per_block_optin(current_device())
+    device = device_key()
+    key = (device, os.environ.get("CUTE_DSL_ARCH", "auto"))
+    if key not in _SMEM_CAPACITIES:
+        # SM107 exposes an oversized carveout; the compiler must support it too.
+        limit = max(shared_memory_per_block_optin(device), oversized_shared_memory_per_block(device))
+        _SMEM_CAPACITIES[key] = min(int(get_smem_capacity_in_bytes()), limit)
+    return _SMEM_CAPACITIES[key]
 
 
 def smem_budget(preferred_bytes):
@@ -138,8 +168,10 @@ def unsupported_device_reason(device):
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index not in _DEVICE_FLOOR_ERROR:
         major, minor = torch.cuda.get_device_capability(index)
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_compiler_requirement_error
+
         _DEVICE_FLOOR_ERROR[index] = (
-            None
+            (cutedsl_arch_requirement_error((major, minor)) or cutedsl_compiler_requirement_error((major, minor)))
             if major >= 9
             else (
                 f"cudnn.norm needs an SM90 or newer GPU (its kernels use bulk async copies, mbarrier "
@@ -180,13 +212,21 @@ def smem_per_sm():
     the per-BLOCK limit (232448 on sm_100) and this is the per-SM total (233472), so
     it comes from the device properties -- still queried, not hardcoded.
     """
-    global _SMEM_PER_SM
-    if _SMEM_PER_SM is None:
-        import torch
+    if _SMEM_PER_SM is not None:  # test override
+        return _SMEM_PER_SM
+    capacity = getattr(_device_properties(), "shared_memory_per_multiprocessor", 0)
+    if not capacity:
+        # A per-block ceiling can be smaller than the per-SM total. Using it
+        # to pin occupancy could admit an extra CTA and overcommit TMEM.
+        from cuda.bindings import driver
 
-        prop = torch.cuda.get_device_properties(0)
-        _SMEM_PER_SM = int(getattr(prop, "shared_memory_per_multiprocessor", 0)) or smem_capacity()
-    return _SMEM_PER_SM
+        error, device = driver.cuDeviceGet(device_key())
+        if int(error) != 0:
+            raise RuntimeError("cudnn.norm: cannot resolve the CUDA device for TMEM occupancy")
+        error, capacity = driver.cuDeviceGetAttribute(driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, device)
+        if int(error) != 0 or not capacity:
+            raise RuntimeError("cudnn.norm: cannot determine per-SM shared memory for TMEM occupancy")
+    return int(capacity)
 
 
 _EXT_STREAMS: dict = {}
@@ -292,6 +332,15 @@ class Workspace:
     __slots__ = ("_buf", "_off", "peak")
 
     def __init__(self, buf=None):
+        import torch
+
+        if buf is not None:
+            if not isinstance(buf, torch.Tensor) or not buf.is_cuda or buf.dtype != torch.uint8:
+                raise ValueError("cudnn.norm: workspace must be a CUDA uint8 torch.Tensor")
+            if buf.device.index != torch.cuda.current_device():
+                raise ValueError("cudnn.norm: workspace must be on the current CUDA device")
+            if buf.ndim != 1 or not buf.is_contiguous() or buf.data_ptr() % 16:
+                raise ValueError("cudnn.norm: workspace must be flat, contiguous, and 16-byte aligned")
         self._buf = buf if buf is not None and buf.numel() else None
         self._off = 0
         self.peak = 0  # high-water mark, so a test can check the reported size covers it

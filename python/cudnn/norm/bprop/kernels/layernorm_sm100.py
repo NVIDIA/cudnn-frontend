@@ -20,11 +20,13 @@ from global (``STAGE_NONE``). The DX store (and, unstaged, the X/DY loads) are
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.utils import (
     ws_bytes,
@@ -958,7 +960,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     CHUNK = (ctas + nchunk - 1) // nchunk
 
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = ("pipe", params.io_dtype) + ce
+    key = ("pipe", params.io_dtype) + ce + (device_key(),)
     fn = _KPIPE.get(key)
     if fn is None:
         with dsl_compile_lock():
@@ -1006,7 +1008,7 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, 
     smem_bytes = 2 * STAGES * RPT * C * eb + C * eb + (2 * STAGES + 1) * 8 + 64
 
     ce = (C, V, tpr, ldgs, RPT, et, it_ty, eb, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = ("tiled", params.io_dtype) + ce
+    key = ("tiled", params.io_dtype) + ce + (device_key(),)
     fn = _KTILED.get(key)
     if fn is None:
         with dsl_compile_lock():
@@ -1131,7 +1133,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
         nchunk = min(nslots, max(1, min(32, 256 // fgrid)))
         CHUNK = (nslots + nchunk - 1) // nchunk
         ce = (M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta, nslots, FB, fgrid, nchunk, CHUNK)
-        key = ("slots", params.io_dtype) + ce
+        key = ("slots", params.io_dtype) + ce + (device_key(),)
         fn = _KCACHE.get(key)
         if fn is None:
             with dsl_compile_lock():
@@ -1144,7 +1146,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
         return dx, dgamma, (dbeta if has_beta else None)
 
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta)
-    key = (params.io_dtype,) + ce
+    key = (params.io_dtype,) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

@@ -16,8 +16,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def _supported(monkeypatch):
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("FROST norms require SM100 or SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("FROST norms require SM100, SM103, or SM107")
     reason = dsl_unavailable("FROST norm")
     if reason:
         pytest.skip(reason)

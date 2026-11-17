@@ -16,8 +16,8 @@ pytest.importorskip("cudnn.norm", reason="Frost norm engines require a built fro
 def test_nontrailing_norm_axes_use_backend(cudnn_handle, monkeypatch, backward, variant):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     cc = torch.cuda.get_device_capability()
-    if cc not in ((9, 0), (10, 0), (10, 3)):
-        pytest.skip("Frost norm supports SM90 and SM100-class devices")
+    if cc not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+        pytest.skip("FROST norm supports SM90, SM100, SM103, and SM107")
 
     # Axis 1 is contiguous in storage, so cuDNN supports it, but it is not
     # the trailing logical axis that Frost flattens into each row.

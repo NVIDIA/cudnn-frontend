@@ -1016,6 +1016,8 @@ class pygraph:
                                 out_t.dim = list(d)
                                 if not (reinferred and out_t.stride_assigned):  # a re-inferred port keeps the caller's stride
                                     out_t.stride = _row_major_stride(out_t.dim)
+                if node.node_type == NodeType.BLOCK_SCALE_QUANTIZE:
+                    _infer_block_quant_strides(node)
                 node.validate()
         except ValueError:
             # Inference can reject shapes before the family validator runs
@@ -3393,6 +3395,33 @@ def _block_quant_scale_dims(node):
     axis = len(d) - 1 if axis in (None, -1) else axis
     d[axis] = (d[axis] + bs - 1) // bs
     return d
+
+
+def _infer_block_quant_strides(node):
+    # Match BlockScaleQuantizeNode's physical-axis rotation. Logical dimensions
+    # stay unchanged; transpose also rotates non-singleton batch dimensions.
+    x = node.inputs["input"]
+    axis = node.params.get("axis")
+    if axis == -1:
+        axis = len(x.dim) - 1
+    if axis is not None and not 0 <= axis < len(x.dim):
+        return
+    x_stride = x.stride or _row_major_stride(x.dim)
+    order = sorted(range(len(x.dim)), key=lambda i: (x_stride[i], x.dim[i] != 1))
+    transpose = bool(node.params.get("transpose", False))
+    if transpose and axis is not None:
+        pivot = order.index(axis)
+        order = order[pivot:] + order[:pivot]
+    for port, t in node.outputs.items():
+        if t is None or t.stride_assigned or len(t.dim) != len(x.dim):
+            continue
+        if port == "Y" and not transpose:
+            t.stride = list(x_stride)
+            continue
+        stride, size = [0] * len(t.dim), 1
+        for i in order:
+            stride[i], size = size, size * t.dim[i]
+        t.stride = stride
 
 
 def _adaptive_norm_stats(node):

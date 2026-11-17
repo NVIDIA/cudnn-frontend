@@ -20,14 +20,16 @@ Selected by ``make_warp_cfg`` for LN/RMS (norm dim C == gamma length).
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity, dsl_compile_lock
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, smem_capacity, dsl_compile_lock
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
@@ -601,7 +603,7 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params, out_y=None, out_mean=N
     full_warp = int(intra) == 32
 
     ce = (C, V, tpr, wn, intra, ldgs, rpc, block_threads, et, it_ty, nsteps, full_warp, spec.has_mean, has_beta, _MBPM)
-    key = (params.io_dtype,) + ce
+    key = (params.io_dtype,) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():
@@ -651,7 +653,7 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta, out_y=
     smem_bytes = _pipe_smem(C, has_beta, wn, STAGES, eb)
 
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, spec.has_mean, has_beta, smem_bytes)
-    key = ("pipe", params.io_dtype) + ce
+    key = ("pipe", params.io_dtype) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

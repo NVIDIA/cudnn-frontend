@@ -36,8 +36,8 @@ class NormBwdKnobs:
 @dataclass(frozen=True)
 class Capabilities:
     variants: frozenset = _ALL_VARIANTS
-    # Device ccs served, matched exactly: B200 / GB200 and B300 / GB300 run the same kernels.
-    archs: frozenset = frozenset({(10, 0), (10, 3)})
+    # Exact device capabilities: Blackwell and Rubin share these norm kernels.
+    archs: frozenset = frozenset({(10, 0), (10, 3), (10, 7)})
     phase: str = "bprop"
     dtypes: frozenset = _ALL_DTYPES
 
@@ -49,7 +49,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
     reason = ga.rowwise_axes_mismatch(facts)
     if reason is not None:
         return reason
-    if facts.extended_affine:
+    if facts.quantize_nodes:
+        from cudnn.norm.block_scale import mismatch as block_scale_mismatch
+
+        reason = block_scale_mismatch(facts)
+        if reason is not None:
+            return reason
+    elif facts.extended_affine:
         from cudnn.norm.affine import mismatch as affine_mismatch
 
         reason = affine_mismatch(facts)
@@ -65,7 +71,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
         return f"requires {' or '.join(f'SM{a}{b}' for a, b in sorted(capabilities.archs))}; current device is {facts.device_cc}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
-    if not facts.uniform_dtype and not facts.extended_affine:
+    if not facts.uniform_dtype and not facts.extended_affine and not facts.quantize_nodes:
         return "DY dtype must match X"
     return None
 
@@ -116,6 +122,10 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     """Default lowering: resolve buffers at execute time and call
     :func:`cudnn.norm.bprop.api.norm_bprop` (dispatches by ``facts.variant``);
     outputs are copied into the graph's DX / Dscale / Dbias buffers."""
+    if facts.quantize_nodes:
+        from cudnn.norm.block_scale import lower
+
+        return lower(facts)
     if facts.extended_affine:
         from cudnn.norm.affine import lower
 

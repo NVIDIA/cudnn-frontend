@@ -43,11 +43,13 @@ See ``cudnn/norm/fprop/BN_FWD_NOTES.md``.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.utils import (
     ws_bytes,
@@ -77,12 +79,8 @@ _SM_COUNT = None
 
 
 def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    nsm = _SM_COUNT if _SM_COUNT is not None else sm_count()
+    return nsm
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +96,7 @@ def _vec_width(S: int, elem_bytes: int) -> int:
     return v
 
 
-def nchw_cfg(C: int, N: int, S: int, elem_bytes: int, block_threads: int = _BT):
+def nchw_cfg(C: int, N: int, S: int, elem_bytes: int, block_threads: int = _BT, *, training=True):
     """Resolve ``(VS, UF, WPB, CPW, CT, cparts, BT)`` or ``None`` if unsupported."""
     wpb = block_threads // 32
     if C % wpb != 0 or S < 1:
@@ -117,7 +115,10 @@ def nchw_cfg(C: int, N: int, S: int, elem_bytes: int, block_threads: int = _BT):
     while C // (wpb * cpw) > 2 * _nsm() and (C // (wpb * cpw)) % 2 == 0:
         cpw *= 2
     ct = wpb * cpw
-    if C % ct != 0:
+    # Each thread publishes one entry in the two CT-sized partial planes.
+    # A wider tile would leave the second plane unwritten. The cooperative
+    # grid must also fit at the maximum probed occupancy.
+    if C % ct != 0 or (training and (2 * ct > block_threads or C // ct > 2 * _nsm())):
         return None
     return vs, uf, wpb, cpw, ct, C // ct, block_threads
 
@@ -253,7 +254,9 @@ def _bn_nchw_kernel(
                             acc[cw] = acc[cw] + dz
                             accsq[cw] = accsq[cw] + dz * dz
                     col = wcol + (((r * CPW + cw) * LPT) + j) * VS
-                    tpj = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warpg % 4, col, cutlass.Float32)
+                    # Preserve the allocation's starting column. The warp/column helper
+                    # expects an absolute column, not the relative offset used here.
+                    tpj = nvvm.make_tmem_ptr(tptr[0] + (((warpg % 4) * 32) << 16) + col, cutlass.Float32)
                     nvvm.tcgen05_st(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj, cutlass.Vector.from_elements(tuple(fs), cutlass.Float32))
             n = n + 1
             r = r + 1
@@ -451,7 +454,7 @@ def _bn_nchw_kernel(
                 for j in cutlass.range_constexpr(LPT):
                     kv = j * 32 + lane
                     col = wcol + (((r * CPW + cw) * LPT) + j) * VS
-                    tpj = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warpg % 4, col, cutlass.Float32)
+                    tpj = nvvm.make_tmem_ptr(tptr[0] + (((warpg % 4) * 32) << 16) + col, cutlass.Float32)
                     tout = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj, num=VS)
                     if kv < NV:
                         if cutlass.const_expr(VS == 1):
@@ -846,7 +849,7 @@ def forward(
     eb = DTYPE_BYTES[params.io_dtype]
     et = DTYPE_TO_CUTLASS[params.io_dtype]
     it_ty = _INT_TY[eb]
-    geo = nchw_cfg(C, N, S, eb)
+    geo = nchw_cfg(C, N, S, eb, training=training)
     if geo is None:
         raise ValueError(f"NCHW BatchNorm: C={C} S={S} unsupported by this kernel")
     VS, UF, WPB, CPW, CT, cparts, BT = geo
@@ -866,7 +869,7 @@ def forward(
         nblk = max(1, min(_nsm() * 4 // max(1, cparts), N))
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, cparts, nblk, it_ty, et, float(eps), has_beta)
         # dyn() specializes strides 0 and 1; larger strides are dynamic.
-        key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
+        key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce + (device_key(),)
         args = (dyn(xf), dyn(yf), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(N))
         fn = _KCACHE.get(key)
         if fn is None:
@@ -887,7 +890,7 @@ def forward(
 
     NV = S // VS
     LPT = (NV + 31) // 32  # lane steps per row (constexpr sweep for the TMEM tier)
-    okey = (params.io_dtype, C, S, N, has_beta, update_running)
+    okey = (params.io_dtype, C, S, N, has_beta, update_running) + (device_key(),)
 
     # Try occ=2 first. A coverage-driven choice (prefer whichever occupancy caches
     # more) was tried and MEASURED WORSE -- it pushed 64x56x56 to occ=1 for one extra
@@ -911,7 +914,7 @@ def forward(
             # limiter and the per-CTA TMEM budget is actually enforceable.
             smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, cparts, it_ty, et, count, float(eps), has_beta, update_running, smem_bytes, mbpm)
-        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce + (device_key(),)
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cparts * 2 * mparts * CT, torch.float32, x3d.device)
         ret = ws_zeros(ws, cparts, torch.int32, x3d.device)

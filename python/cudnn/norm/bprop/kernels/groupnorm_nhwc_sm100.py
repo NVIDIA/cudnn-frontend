@@ -49,11 +49,13 @@ InstanceNorm backward does.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count, dsl_compile_lock
@@ -582,7 +584,7 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
             fsmem,
         )
         # dyn() specializes strides 0 and 1; larger strides are dynamic.
-        key = (params.io_dtype, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce + (device_key(),)
         fn = _KCACHE.get(key)
         if fn is None:
             with dsl_compile_lock():

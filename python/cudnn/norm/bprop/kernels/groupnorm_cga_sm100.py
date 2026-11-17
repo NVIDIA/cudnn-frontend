@@ -35,11 +35,13 @@ row-too-big-but-enough-rows case, where the bounded staging alone is the fix.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.strided import fake_strided_vector
@@ -445,7 +447,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     fgrid = (GPS * CPG + fbt - 1) // fbt
 
     ce = (M, V, CPG, SPAN, GPS, bt, CGA, PER, KS, NVS, it_ty, et, bool(spec.has_mean), has_beta, nparts, smem_bytes, fbt, fgrid)
-    key = (params.io_dtype,) + ce
+    key = (params.io_dtype,) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

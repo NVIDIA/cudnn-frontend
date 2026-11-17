@@ -40,11 +40,13 @@ byte budget and only the remainder, if any, is re-read.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.strided import fake_strided_vector
@@ -368,7 +370,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     cfg = cga_cfg(C, R, DTYPE_BYTES[params.io_dtype], _BT)
     if cfg is None:
         return 0
-    CGA = cfg[2] if not isinstance(cfg, int) else cfg
+    CGA = cfg[0]
     nclusters = min(R, max(1, 4 * sm_count() // CGA))
     parts = [(nclusters * C, 4)] * (2 if has_beta else 1)
     return ws_bytes(*parts)
@@ -406,7 +408,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     CHUNK = (nclusters + nchunk - 1) // nchunk
 
     ce = (C, CS, CGA, _BT, V, VPT, KS, it_ty, et, float(C), bool(spec.has_mean), has_beta, nclusters * CGA, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = (params.io_dtype, nclusters) + ce
+    key = (params.io_dtype, nclusters) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

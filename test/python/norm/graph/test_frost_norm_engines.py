@@ -133,13 +133,16 @@ def main():
     expect(fe.mismatch(fcap, fb) is not None, "fprop engine rejects bprop graph")
 
     # Arch rows: the SM90 rows run the same kernels on cc 9.0 only; the SM100 rows
-    # stay cc 10.0 only.
+    # also serve Blackwell SM103 and Rubin SM107.
     fspec = {spec.name: spec.capabilities for spec in fe.ENGINE_SPECS}
     bspec = {spec.name: spec.capabilities for spec in be.ENGINE_SPECS}
     for cc, fwd_ok, bwd_ok in (
         ((9, 0), "norm_fprop_sm90", "norm_bprop_sm90"),
         ((10, 0), "norm_fprop_sm100", "norm_bprop_sm100"),
         ((10, 3), "norm_fprop_sm100", "norm_bprop_sm100"),
+        ((10, 7), "norm_fprop_sm100", "norm_bprop_sm100"),
+        ((10, 9), None, None),
+        ((12, 0), None, None),
         ((8, 0), None, None),
     ):
         for name, cap in fspec.items():
@@ -222,3 +225,42 @@ def test_has_tmem_follows_the_current_device(monkeypatch):
         for device in order:
             current[0] = device
             assert utils.has_tmem() is (caps[device][0] == 10), (order, device)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", ["fprop", "bprop"])
+@pytest.mark.parametrize(
+    "target,compiler,match",
+    [(False, (13, 4), r"SM107.*sm_107a.*4.8.0"), (True, (12, 9), r"SM107.*CUDA 13.4.*CUDA 12.9"), (True, (13, 3), r"SM107.*CUDA 13.4.*CUDA 13.3")],
+)
+def test_sm107_missing_dsl_target_declines_before_lowering(monkeypatch, phase, target, compiler, match):
+    from cudnn.frost import buffers
+    from cudnn.norm.fprop.engine import FrostNormFwdEngine
+    from cudnn.norm.bprop.engine import FrostNormBwdEngine
+
+    node = _Node(
+        "LAYERNORM",
+        {"epsilon": 1e-5},
+        {"input": _T([8, 256]), "scale": _T([256]), "bias": _T([256])},
+        {"Y": _T([8, 256]), "mean": _T([8, 1]), "inv_var": _T([8, 1])},
+    )
+    facts = dataclasses.replace(_facts(node), phase=phase, device_cc=(10, 7))
+    module, cls = (fe, FrostNormFwdEngine) if phase == "fprop" else (be, FrostNormBwdEngine)
+    monkeypatch.setattr(module, "analyze_for", lambda graph: facts)
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: target)
+    monkeypatch.setattr(buffers, "cutedsl_compiler_version", lambda: compiler)
+
+    def unexpected_primitives(what):
+        pytest.fail("unsupported SM107 reached the primitive import check")
+
+    monkeypatch.setattr(buffers, "cutedsl_primitives_error", unexpected_primitives)
+    engine = cls(module.ENGINE_SPECS[0], 21000)
+    with pytest.raises(NotImplementedError, match=match):
+        engine.check_support(_Graph(node))
+
+    # A DSL that knows the target passes the same otherwise-valid graph.
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setattr(buffers, "cutedsl_compiler_version", lambda: (13, 4))
+    monkeypatch.setattr(buffers, "cutedsl_primitives_error", lambda what: None)
+    engine.check_support(_Graph(node))

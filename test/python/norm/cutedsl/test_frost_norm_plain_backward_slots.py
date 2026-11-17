@@ -32,8 +32,8 @@ _EB = {torch.bfloat16: 2, torch.float16: 2}
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("rows, cols", [(16, 96), (1000, 96), (40000, 96), (5000, 80), (8192, 160), (3000, 1000), (2048, 2000)])
 def test_plain_route_gradients(variant, dtype, rows, cols):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("the SM100 norm kernels need compute capability 10.0 or 10.3")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the SM100 norm kernels need compute capability 10.0, 10.3, or 10.7")
     assert _bwd_pipe_cfg(cols, _EB[dtype]) is None or _bwd_pipe_cfg(cols, _EB[dtype])[3] < 2, "not a plain-route width"
     assert bool(_plain_bwd_slots(rows, cols)) == (rows >= 1024), "the case sits on the wrong side of the slot threshold"
     has_beta = variant is NormVariant.LAYER_NORM

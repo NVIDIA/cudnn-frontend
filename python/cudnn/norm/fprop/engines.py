@@ -50,8 +50,8 @@ class Capabilities:
     :class:`NormGraphFacts` in :func:`mismatch`."""
 
     variants: frozenset = _ALL_VARIANTS
-    # Device ccs served, matched exactly: B200 / GB200 and B300 / GB300 run the same kernels.
-    archs: frozenset = frozenset({(10, 0), (10, 3)})
+    # Exact device capabilities: Blackwell and Rubin share these norm kernels.
+    archs: frozenset = frozenset({(10, 0), (10, 3), (10, 7)})
     phase: str = "fprop"
     dtypes: frozenset = _ALL_DTYPES
     running_stats: bool = True  # BatchNorm running mean/var update
@@ -64,7 +64,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
     reason = ga.rowwise_axes_mismatch(facts)
     if reason is not None:
         return reason
-    if facts.extended_affine:
+    if facts.quantize_nodes:
+        from cudnn.norm.block_scale import mismatch as block_scale_mismatch
+
+        reason = block_scale_mismatch(facts)
+        if reason is not None:
+            return reason
+    elif facts.extended_affine:
         from cudnn.norm.affine import mismatch as affine_mismatch
 
         reason = affine_mismatch(facts)
@@ -133,6 +139,10 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     :func:`cudnn.norm.fprop.api.norm_fprop`, which dispatches to the per-flavor
     sm_100 kernel (JIT-compiled + cached on first call) by ``facts.variant``.
     Outputs are copied into the graph's Y / mean / inv_variance buffers."""
+    if facts.quantize_nodes:
+        from cudnn.norm.block_scale import lower
+
+        return lower(facts)
     if facts.extended_affine:
         from cudnn.norm.affine import lower
 

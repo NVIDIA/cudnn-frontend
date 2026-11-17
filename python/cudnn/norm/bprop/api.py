@@ -234,6 +234,10 @@ def norm_bprop(
     ``ws`` is a :class:`cudnn.norm.utils.Workspace` the kernels carve their
     partial buffers from; size it with :func:`bprop_workspace_bytes`.
     """
+    import torch
+
+    if x.is_cuda and x.device.index != torch.cuda.current_device():
+        raise ValueError("cudnn.norm: make the input CUDA device current before calling the direct norm API")
     variant = _as_variant(variant)
     # BatchNorm has a native channels-last backward, so preserve NHWC instead of
     # paying the transpose that .contiguous() would do.

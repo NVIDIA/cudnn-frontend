@@ -604,3 +604,31 @@ def test_record_entries_collects_only_persisted_entries(tmp_path, monkeypatch):
         cc._record("k", "kernel", "--enable-tvm-ffi")  # outside any block: a no-op
     finally:
         cc.set_cache_dir(None)
+
+
+def test_manifest_separates_bound_compiler_and_arch_override(monkeypatch, tmp_path):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_compiler_version", lambda: (13, 4))
+    monkeypatch.delenv("CUTE_DSL_ARCH", raising=False)
+    native = cc.environment_manifest()
+    monkeypatch.setattr(buffers, "cutedsl_compiler_version", lambda: (12, 9))
+    cu12 = cc.environment_manifest()
+    monkeypatch.setattr(buffers, "cutedsl_compiler_version", lambda: (13, 4))
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100f")
+    forced = cc.environment_manifest()
+    entries = [cc._entry_dir(tmp_path, m, "same-kernel") for m in (native, cu12, forced)]
+    assert len(set(entries)) == 3
+
+
+def test_in_process_memo_separates_forced_architecture(monkeypatch):
+    monkeypatch.setattr(cc, "_compile_persistent", lambda *a, **k: object())
+    monkeypatch.setattr(cc, "_record", lambda *a, **k: None)
+    monkeypatch.setattr(cc, "_memo_device", lambda: (0, 0))
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    native = cc.compile_cached(lambda: None, cache_key="arch-test")
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100f")
+    family = cc.compile_cached(lambda: None, cache_key="arch-test")
+    assert family is not native
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    assert cc.compile_cached(lambda: None, cache_key="arch-test") is native

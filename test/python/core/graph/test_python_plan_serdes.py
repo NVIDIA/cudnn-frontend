@@ -95,3 +95,16 @@ def test_an_enum_entry_resolves_only_to_an_enum_with_an_integer_value():
         ps._decode({"$enum": "cudnn._plan_serdes:serialize", "value": 1}, {})
     with pytest.raises(ValueError, match="integer"):
         ps._decode({**data_type, "value": True}, {})
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])
+def test_torch_dtype_tensor_metadata_round_trip(dtype):
+    import torch
+
+    g = cudnn.pygraph()
+    x = g.tensor(dim=[2, 3], data_type=cudnn.data_type.FLOAT)
+    x.set_data_type(getattr(torch, dtype))
+    restored = _round_trip(g)
+    assert restored._tensor_by_uid[x.uid].get_data_type() == x.get_data_type()
+    # Serialization normalizes the external representation, not caller metadata.
+    assert x.data_type is getattr(torch, dtype)

@@ -27,11 +27,13 @@ tile; the partials are L2-resident and it needs no second barrier).
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nhwc_sm100 import nhwc_cfg as _fwd_nhwc_cfg
@@ -67,12 +69,8 @@ def nhwc_cfg(C, eb, block_threads=512):
 
 
 def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    nsm = _SM_COUNT if _SM_COUNT is not None else sm_count()
+    return nsm
 
 
 @cute.kernel
@@ -315,6 +313,7 @@ def _bn_bwd_nhwc_host(
     has_beta: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    cooperative: cutlass.Constexpr,
     stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
@@ -345,7 +344,7 @@ def _bn_bwd_nhwc_host(
         et,
         Mf,
         has_beta,
-    ).launch(stream=stream, grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=cooperative, min_blocks_per_mp=mbpm)
 
 
 _KCACHE = {}
@@ -406,15 +405,17 @@ def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     mbpm, KC, KS = knobs if knobs is not None else _knobs_for(M, C)
     smem_bytes = _smem_bytes(BT, V, CPC, KS, eb)
 
-    ce = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, it_ty, et, float(M), has_beta, smem_bytes, mbpm)
+    ce_base = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, it_ty, et, float(M), has_beta, smem_bytes, mbpm)
     # dyn() specializes strides 0 and 1; larger strides are dynamic.
-    key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
-    okey = key + (M,)
+    base_key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce_base + (device_key(),)
+    okey = base_key + (M,)
     occ0 = _OCC.get(okey, 2 if mbpm != 1 else 1)
     can2 = smem_bytes * 2 <= smem_budget(224 * 1024)
-    fn = _KCACHE.get(key)
     for occ in ([2, 1] if (occ0 == 2 and can2) else [1]):
         mparts = max(1, min(occ * _nsm() // max(1, cblks), (M + PPL - 1) // PPL))
+        ce = ce_base + (mparts > 1,)
+        key = base_key + (mparts > 1,)
+        fn = _KCACHE.get(key)
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cblks * mparts * TPP * V * 2, torch.float32, x2d.device)
         ret = ws_zeros(ws, cblks, torch.int32, x2d.device)

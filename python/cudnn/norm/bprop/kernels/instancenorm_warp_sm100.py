@@ -28,6 +28,8 @@ short row is read exactly once.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -45,12 +47,8 @@ _SM_COUNT = None
 
 
 def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    nsm = _SM_COUNT if _SM_COUNT is not None else sm_count()
+    return nsm
 
 
 @cute.jit
@@ -364,7 +362,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     args = (dyn(dyf), dyn(xf), dyn(dxf), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(W))
     ce = (M, V, GPS, WPB, KREG, it_ty, et, spec.has_mean, has_beta, ctas, fgrid, fbt)
     # dyn() specializes strides 0 and 1; larger strides are dynamic.
-    key = (params.io_dtype, ctas, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
+    key = (params.io_dtype, ctas, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

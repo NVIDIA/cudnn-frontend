@@ -25,7 +25,9 @@ def cutedsl_runtime_available(device_cc=None) -> bool:
     ``device_cc`` names, when one is given.
 
     Two halves, each the engines' own gate (``python/cudnn/AGENTS.md`` Rule 7),
-    so the answer is what their ``check_support`` will decide:
+    establishing common runtime eligibility. Individual engines can require a
+    newer DSL, compiler, or additional primitives; norm requires DSL 4.8.0 and
+    CUDA compiler 13.4 on SM107. True does not imply graph support:
 
     * **version** -- ``nvidia-cutlass-dsl`` is installed and not below
       :data:`cudnn.frost.buffers.CUTEDSL_MIN_VERSION` (4.7.0). This package's

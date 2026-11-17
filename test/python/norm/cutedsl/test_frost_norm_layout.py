@@ -138,9 +138,16 @@ CONTIG = [
     # A row too long for one CTA to stage. It must route to the CGA split, which
     # reduces across a cluster through distributed shared memory -- NOT fail to
     # launch (it used to), and not silently drop to the streaming fallback (0.17 of
-    # achievable against the split's 0.68). The backward has no CGA path yet.
-    _case("LN long row CGA", LN, (64, 65536), ns=[65536], want_fwd="layernorm_cga_sm100"),
+    # achievable against the split's 0.68). Both passes have a CGA route.
+    _case("LN long row CGA", LN, (64, 65536), ns=[65536], want_fwd="layernorm_cga_sm100", smoke=True),
     _case("RMS long row CGA", RMS, (64, 65536), ns=[65536], has_beta=False, want_fwd="layernorm_cga_sm100"),
+    # SM107 has more shared memory than SM100. These widths exercise the
+    # pipeline/tiled choices between the two architectures' admission bounds.
+    _case("LN pipeline boundary 24576", LN, (128, 24576), ns=[24576]),
+    _case("LN pipeline boundary 29184", LN, (128, 29184), ns=[29184]),
+    _case("RMS pipeline boundary 24576", RMS, (128, 24576), ns=[24576], has_beta=False),
+    _case("RMS tiled half boundary 3840", RMS, (128, 3840), ns=[3840], has_beta=False),
+    _case("RMS tiled fp32 boundary 1920", RMS, (128, 1920), ns=[1920], has_beta=False),
     _case("BN", BN, (8, 128, 14, 14), smoke=True),
     _case("IN", IN, (8, 128, 14, 14)),
     _case("GN g=32", GN, (8, 128, 14, 14), groups=32),
@@ -373,3 +380,164 @@ def test_frost_norm_layout_smoke():
 def test_frost_norm_layout():
     """Full matrix: every case x fp32/fp16/bf16, both layouts, fprop + bprop."""
     _entry(full=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sm_count", [68, 108, 148])
+def test_batchnorm_geometry_bounds(monkeypatch, sm_count):
+    from cudnn.norm.fprop.kernels import batchnorm_nchw_sm100 as nchw
+
+    monkeypatch.setattr(nchw, "_SM_COUNT", sm_count)
+    # Adjacent tile counts cross both the partial-write and cooperative limits.
+    for channels in (1752, 2008, 17664, 27904, 32768, 38144, 65536):
+        cfg = nchw.nchw_cfg(channels, 2, 4, 2)
+        if cfg is not None:
+            assert 2 * cfg[4] <= cfg[6]
+            assert cfg[5] <= 2 * sm_count
+    served_channels = {68: 8192, 108: 17664, 148: 32768}[sm_count]
+    assert nchw.nchw_cfg(served_channels, 2, 4, 2) is not None
+    assert nchw.nchw_cfg(65536, 2, 4, 2) is None
+    assert nchw.nchw_cfg(128, 8, 196, 2) is not None
+
+
+@pytest.mark.L0
+def test_batchnorm_small_sm_count_fallback(monkeypatch):
+    from cudnn.norm.fprop.kernels import batchnorm_nchw_sm100 as nf
+    from cudnn.norm.bprop.kernels import batchnorm_nchw_sm100 as nb
+
+    for module in (nf, nb):
+        monkeypatch.setattr(module, "_SM_COUNT", 108)
+    case = _case("BN small-SM fallback", BN, (2, 32768, 2, 2), want="batchnorm_sm100")
+    assert _check_case(case, dtypes=DTYPES)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("has_beta", [False, True])
+def test_layernorm_cga_workspace_uses_cluster_size(monkeypatch, has_beta):
+    from types import SimpleNamespace
+    from cudnn.norm.bprop.kernels import layernorm_cga_sm100 as kernel
+    from cudnn.norm.utils import ws_bytes
+
+    # CGA=2 differs from V=8, so treating cfg[2] as CGA under-reports by 4x.
+    monkeypatch.setattr(kernel, "cga_cfg", lambda *args: (2, 32768, 8, 32, 8))
+    monkeypatch.setattr(kernel, "sm_count", lambda: 108)
+    spec = SimpleNamespace(M=65536, R=1024)
+    params = SimpleNamespace(io_dtype="bf16")
+    clusters = min(spec.R, 4 * 108 // 2)
+    expected = ws_bytes(*[(clusters * spec.M, 4)] * (2 if has_beta else 1))
+    assert kernel.scratch_bytes(spec, params, has_beta=has_beta) == expected
+
+
+@pytest.mark.L0
+def test_batchnorm_nhwc_single_part_preserves_layout(monkeypatch):
+    from cudnn.norm.fprop.kernels import batchnorm_nhwc_sm100 as nf
+    from cudnn.norm.bprop.kernels import batchnorm_nhwc_sm100 as nb
+    import cutlass.cute as cute
+
+    compiled = []
+    original_compile = cute.compile
+
+    def watch_compile(fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") in ("_bn_nhwc_host", "_bn_bwd_nhwc_host"):
+            assert args[-2] is False, "one-part NHWC must compile an ordinary launch"
+            compiled.append(fn.__name__)
+        return original_compile(fn, *args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", watch_compile)
+    for module in (nf, nb):
+        monkeypatch.setattr(module, "_SM_COUNT", 68)
+        monkeypatch.setattr(module, "_KCACHE", {})
+        monkeypatch.setattr(module, "_OCC", {})
+    case = _case("BN NHWC independent channel tiles", BN, (2, 2008, 2, 2), cl=True, want="batchnorm_nhwc_sm100")
+    assert _check_case(case, dtypes=DTYPES)
+    assert set(compiled) == {"_bn_nhwc_host", "_bn_bwd_nhwc_host"}
+
+
+@pytest.mark.L0
+def test_batchnorm_nchw_inference_avoids_training_guard(monkeypatch):
+    from cudnn.norm.fprop.kernels import batchnorm_nchw_sm100 as nf
+
+    monkeypatch.setattr(nf, "_SM_COUNT", 108)
+    assert nf.nchw_cfg(65536, 2, 4, 2) is None
+    assert nf.nchw_cfg(65536, 2, 4, 2, training=False) is not None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("channels", [2520, 65536])
+def test_batchnorm_nchw_wide_inference_executes(monkeypatch, channels):
+    from cudnn.norm import norm_fprop
+    from cudnn.norm.fprop.kernels import batchnorm_nchw_sm100 as nf
+
+    monkeypatch.setattr(nf, "_SM_COUNT", 108)
+    assert nf.nchw_cfg(channels, 2, 4, 4) is None
+    x = torch.randn((2, channels, 2, 2), device="cuda")
+    gamma = torch.randn(channels, device="cuda")
+    beta = torch.randn_like(gamma)
+    mean = torch.randn_like(gamma)
+    var = torch.rand_like(gamma) + 0.5
+    y, _, _ = norm_fprop(BN, x, gamma, beta, training=False, running_mean=mean, running_var=var, eps=1e-5)
+    reference = (x - mean[None, :, None, None]) * torch.rsqrt(var[None, :, None, None] + 1e-5) * gamma[None, :, None, None] + beta[None, :, None, None]
+    torch.testing.assert_close(y, reference)
+
+
+@pytest.mark.L0
+def test_norm_kernel_cache_separates_device_ordinals(monkeypatch):
+    from cudnn.norm import norm_fprop
+    from cudnn.norm.fprop.kernels import batchnorm_nhwc_sm100 as nf
+
+    ordinal = [0]
+    monkeypatch.setattr(nf, "device_key", lambda: ordinal[0])
+    monkeypatch.setattr(nf, "_KCACHE", {})
+    monkeypatch.setattr(nf, "_OCC", {})
+    x = torch.randn((2, 128, 2, 2), device="cuda").contiguous(memory_format=torch.channels_last)
+    gamma = torch.ones(128, device="cuda")
+    baseline = None
+    for turn, index in enumerate((0, 1, 0, 1)):
+        ordinal[0] = index
+        y, _, _ = norm_fprop(BN, x, gamma, None)
+        if baseline is None:
+            baseline = y.clone()
+        else:
+            torch.testing.assert_close(y, baseline, rtol=0, atol=0)
+        assert len(nf._KCACHE) == min(turn + 1, 2)
+    assert len(nf._KCACHE) == 2
+    assert len(nf._OCC) == 2
+
+
+@pytest.mark.L0
+def test_batchnorm_nchw_tmem_cache_executes(monkeypatch):
+    from frost_routing import measured
+    from cudnn.norm.fprop.kernels import batchnorm_nchw_sm100 as nf
+
+    monkeypatch.setattr(nf, "_USE_TMEM", True)
+    monkeypatch.setattr(nf, "_KCACHE", {})
+    monkeypatch.setattr(nf, "_OCC", {})
+    original_rows = nf._tmem_rows
+    rows = []
+
+    def record_rows(*args):
+        result = original_rows(*args)
+        rows.append(result)
+        return result
+
+    monkeypatch.setattr(nf, "_tmem_rows", record_rows)
+    case = _case("BN NCHW TMEM tier", BN, (512, 256, 2, 2), want="batchnorm_nchw_sm100")
+    assert _check_case(case, dtypes=DTYPES)
+    assert rows and all(count > 0 for count in rows), "the regression must execute the TMEM tier"
+    # The cooperative launch may fall back to one block per SM. This checks
+    # the TMEM tier's numerics, not allocation sharing between resident CTAs.
+    measured("norm_nchw_tmem_occupancy", f"selected occupancies {sorted(set(nf._OCC.values()))}; allocation sharing unverified")
+
+
+@pytest.mark.L0
+def test_norm_driver_shared_memory_fallback(monkeypatch):
+    from types import SimpleNamespace
+    from cudnn.norm import utils
+
+    expected = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "shared_memory_per_multiprocessor", None)
+    monkeypatch.setattr(utils, "_SMEM_PER_SM", None)
+    monkeypatch.setattr(utils, "_device_properties", lambda: SimpleNamespace())
+    actual = utils.smem_per_sm()
+    assert actual >= utils.smem_capacity()
+    if expected:
+        assert actual == expected

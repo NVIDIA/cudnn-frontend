@@ -631,6 +631,34 @@ def cutedsl_arch_requirement_error(device_cc):
     return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
 
 
+def cutedsl_compiler_version():
+    """CUDA compiler bound to this process's DSL, if the build reports it."""
+    try:
+        from cutlass.base_dsl.version_info import CUDA_VERSION
+
+        return int(CUDA_VERSION.major), int(CUDA_VERSION.minor)
+    except Exception:  # noqa: BLE001 - internal builds may not report a compiler version
+        return None
+
+
+def cutedsl_compiler_requirement_error(device_cc):
+    """Decline SM107 before JIT when the bound compiler lacks its native target.
+
+    An Arch enum entry alone is insufficient: DSL 4.8's cu12 flavor reports
+    CUDA 12.9 and refuses sm_107a inside compilation. Other devices retain
+    their existing compiler requirements and do not import the DSL here.
+    """
+    if device_cc != (10, 7):
+        return None
+    compiler = cutedsl_compiler_version()
+    if compiler is None or compiler >= (13, 4):
+        return None
+    return (
+        f"SM107 requires a CuTe DSL compiler with CUDA 13.4 or newer; found CUDA {compiler[0]}.{compiler[1]}. "
+        "Install 'nvidia-cutlass-dsl[cu13]' and run under a CUDA 13 driver."
+    )
+
+
 def cutedsl_primitives_error(what):
     """Message when the DSL is new enough but exports no ``cutlass.experimental.primitives``.
 

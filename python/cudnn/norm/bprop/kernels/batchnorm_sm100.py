@@ -16,10 +16,12 @@ atomics. Reductions go through the shared ``block_reduce_sum2``
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.utils import cur_stream, dyn, fake_stream, dsl_compile_lock
 from cudnn.norm._common_sm100 import block_reduce_sum2, red_scratch_len
@@ -148,7 +150,7 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     )
     ce = (cfg.block_threads, has_beta)
     # dyn() specializes strides 0 and 1; larger strides are dynamic.
-    key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
+    key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

@@ -278,6 +278,11 @@ def environment_manifest(device: Optional[int] = None) -> Dict[str, str]:
         manifest["cutlass_dsl"] = str(getattr(cutlass, "__version__", _dist_version("nvidia-cutlass-dsl")))
     except Exception:  # noqa: BLE001
         manifest["cutlass_dsl"] = "unknown"
+    from cudnn.frost.buffers import cutedsl_compiler_version
+
+    compiler = cutedsl_compiler_version()
+    manifest["cutedsl_cuda_compiler"] = str(compiler) if compiler is not None else "unknown"
+    manifest["cute_dsl_arch"] = os.environ.get("CUTE_DSL_ARCH", "auto")
     manifest["tvm_ffi"] = _dist_version("apache-tvm-ffi")
     try:
         from cuda.bindings import driver as _cu
@@ -678,7 +683,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
         _refuse_compile(symbol)
         _count("bypassed")
         return _locked_compile(cute, fn, args, kwargs)
-    memo_key = (*_memo_device(), cache_key, symbol, options) if memo_enabled() else None
+    memo_key = (*_memo_device(), os.environ.get("CUTE_DSL_ARCH", "auto"), cache_key, symbol, options) if memo_enabled() else None
     if memo_key is not None:
         with _LOCK:
             memo = _MEMO.get(memo_key)
