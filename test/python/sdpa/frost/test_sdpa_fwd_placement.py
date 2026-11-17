@@ -1100,6 +1100,26 @@ def test_sm107_dense_d128_chunks_lead_up_to_256_tiles():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm107_dense_d256_long_cache_chunks_lead_past_the_tile_cap(s_kv):
+    """Study sm107_dense_d256_longkv_20261117: Rubin bf16 dense d256 GQA causal chunks past the 128-tile cap lead from a 32k cache (qwen3.5
+    32/2 at b 1, S_q 1024 over 128k ran the backend at 2.3-2.95x); below 32k, below S_q 256, MHA and f16 keep the tile cap."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7), device_sm_count=208)
+    base.update(has_paged_kv=False, padded=False, page_size=0)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert placement.SM107_D256_LONG_CHUNK_MIN_KV == 32768
+    assert place() == placement.LEAD  # 256 tiles over a long cache
+    assert place(b=8, h_q=64, h_kv=8) == placement.LEAD  # 4096 tiles
+    assert place(s_kv=16384 + s_kv % 2) == placement.TRAIL  # below the cache floor, past the tile cap
+    assert place(s_q=192, b=8) == placement.TRAIL  # below S_q 256
+    assert place(h_kv=32) == placement.TRAIL  # MHA was not measured
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(256, 256), (192, 128)])
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
