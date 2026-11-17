@@ -15,7 +15,8 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
-    "sdpa_jax": ("cudnn.sdpa.jax_api", "sdpa"),
+    "sdpa_forward_jax": ("cudnn.sdpa.jax_api", "sdpa_forward_jax"),
+    "sdpa_backward_jax": ("cudnn.sdpa.jax_api", "sdpa_backward_jax"),
     "dense_indexer_kl_forward": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl_forward"),
     "simplified_sparse_attention_forward": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_forward"),
     "simplified_sparse_attention_forward_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_forward_jax"),

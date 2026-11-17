@@ -86,29 +86,7 @@ def _build_plan(specs, scale, causal, window, deterministic, backward, has_dbias
     return make_call(graph, inputs, outputs)
 
 
-@lru_cache(maxsize=128)
-def _operation(scale, causal, window, deterministic, has_dbias, device):
-    def forward(q, k, v, bias, lq, lk):
-        args = (q, k, v, bias, lq, lk)
-        call = _plan(tuple(map(_spec, args)), scale, causal, window, deterministic, False, has_dbias, device)
-        o, stats = call(*(x for x in args if x is not None))
-        return (o, stats), (*args, o, stats)
-
-    @jax.custom_vjp
-    def attention(q, k, v, bias, lq, lk):
-        return forward(q, k, v, bias, lq, lk)[0]
-
-    def backward(saved, grads):
-        args = (*saved, grads[0])
-        call = _plan(tuple(map(_spec, args)), scale, causal, window, deterministic, True, has_dbias, device)
-        result = call(*(x for x in args if x is not None))
-        return (*result[:3], result[3] if has_dbias else None, None, None)
-
-    attention.defvjp(forward, backward)
-    return attention
-
-
-def sdpa(
+def _prepare(
     query,
     key,
     value,
@@ -120,15 +98,7 @@ def sdpa(
     query_seq_lengths=None,
     key_value_seq_lengths=None,
     local_window_size=None,
-    return_residual=False,
-    deterministic=False,
 ):
-    """Dense FP16/BF16 attention in JAX BTNH layout, with reverse-mode AD.
-
-    Requires a CUDA toolkit and C++ compiler for the native bridge's first build.
-    Masks and lengths are device inputs. Flags, scale and shapes are static.
-    Backend support checks apply to each forward/backward configuration.
-    """
     placed = {d for x in (query, key, value) if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for d in x.devices()}
     if len(placed) > 1:
         raise NotImplementedError("SDPA JAX currently requires one CUDA device")
@@ -137,7 +107,6 @@ def sdpa(
         raise NotImplementedError("SDPA JAX requires a CUDA device")
     device = target_device.local_hardware_id
     q, k, v = map(jnp.asarray, (query, key, value))
-    unbatched = q.ndim == 3
     q, k, v = (x[None] if x.ndim == 3 else x for x in (q, k, v))
     if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape:
         raise ValueError("expected BTNH query and matching BSKH key/value")
@@ -150,7 +119,6 @@ def sdpa(
         raise ValueError("local_window_size must contain two nonnegative bounds")
     scale = float(scale) if scale is not None else q.shape[-1] ** -0.5
     target = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-    has_dbias = bias is not None
     if bias is not None:
         bias = jnp.asarray(bias)
         bias = jnp.reshape(bias, (1,) * (4 - bias.ndim) + bias.shape)
@@ -173,9 +141,99 @@ def sdpa(
             raise ValueError("sequence lengths must be int32 arrays of shape (B,)")
         lengths = tuple(x.reshape((-1, 1, 1, 1)) for x in lengths)
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (q, k, v))
-    o, stats = _operation(scale, is_causal, window, deterministic, has_dbias, device)(q, k, v, bias, *lengths)
-    o = o.transpose(0, 2, 1, 3)
-    stats = jax.lax.stop_gradient(stats[..., 0].transpose(0, 2, 1).astype(o.dtype))
-    if unbatched:
-        o, stats = o[0], stats[0]
-    return (o, stats) if return_residual else o
+    return (q, k, v, bias, *lengths), scale, window, device
+
+
+def sdpa_forward_jax(
+    query,
+    key,
+    value,
+    bias=None,
+    mask=None,
+    *,
+    scale=None,
+    is_causal=False,
+    query_seq_lengths=None,
+    key_value_seq_lengths=None,
+    local_window_size=None,
+):
+    """Experimental dense FP16/BF16 SDPA forward in BTNH or TNH layout.
+
+    Returns (output, stats). Output matches query's shape and dtype; stats are
+    FP32 log-sum-exp values with shape query.shape[:-1], saved for backward.
+    Both calls support jax.jit. Autodiff must be supplied by the caller.
+    """
+    args, scale, window, device = _prepare(
+        query,
+        key,
+        value,
+        bias,
+        mask,
+        scale=scale,
+        is_causal=is_causal,
+        query_seq_lengths=query_seq_lengths,
+        key_value_seq_lengths=key_value_seq_lengths,
+        local_window_size=local_window_size,
+    )
+    call = _plan(tuple(map(_spec, args)), scale, is_causal, window, False, False, bias is not None, device)
+    output, stats = call(*(x for x in args if x is not None))
+    output = output.transpose(0, 2, 1, 3).reshape(query.shape)
+    stats = stats[..., 0].transpose(0, 2, 1).reshape(query.shape[:-1])
+    return output, stats
+
+
+def sdpa_backward_jax(
+    query,
+    key,
+    value,
+    output,
+    grad_output,
+    stats,
+    bias=None,
+    mask=None,
+    *,
+    scale=None,
+    is_causal=False,
+    query_seq_lengths=None,
+    key_value_seq_lengths=None,
+    local_window_size=None,
+    deterministic=False,
+):
+    """Experimental SDPA backward using output and FP32 stats from forward.
+
+    Pass the same inputs and options as forward. Returns (dQ, dK, dV, dBias)
+    in the original input shapes and dtypes; dBias is None when bias is absent.
+    Stats and boolean masks have no gradient.
+    """
+    args, scale, window, device = _prepare(
+        query,
+        key,
+        value,
+        bias,
+        mask,
+        scale=scale,
+        is_causal=is_causal,
+        query_seq_lengths=query_seq_lengths,
+        key_value_seq_lengths=key_value_seq_lengths,
+        local_window_size=local_window_size,
+    )
+    output, grad_output, stats = map(jnp.asarray, (output, grad_output, stats))
+    for name, tensor in (("output", output), ("grad_output", grad_output)):
+        if tensor.shape != query.shape or tensor.dtype != query.dtype:
+            raise ValueError(f"{name} must match query's shape and dtype")
+    if stats.shape != query.shape[:-1] or stats.dtype != jnp.float32:
+        raise ValueError("stats must be float32 with shape query.shape[:-1], as returned by forward")
+    shape = (args[0].shape[0], args[0].shape[2], args[0].shape[1], args[0].shape[3])
+    output, grad_output = (x.reshape(shape).transpose(0, 2, 1, 3) for x in (output, grad_output))
+    stats = stats.reshape(shape[:-1]).transpose(0, 2, 1)[..., None]
+    args = (*args, output, stats, grad_output)
+    call = _plan(tuple(map(_spec, args)), scale, is_causal, window, deterministic, True, bias is not None, device)
+    result = call(*(x for x in args if x is not None))
+    dq, dk, dv = (x.transpose(0, 2, 1, 3).reshape(original.shape) for x, original in zip(result[:3], (query, key, value)))
+    dbias = None
+    if bias is not None:
+        original = jnp.asarray(bias)
+        shape = (1,) * (4 - original.ndim) + original.shape
+        axes = tuple(i for i, (before, after) in enumerate(zip(shape, result[3].shape)) if before == 1 and after != 1)
+        dbias = result[3].sum(axis=axes, keepdims=True).reshape(original.shape).astype(original.dtype)
+    return dq, dk, dv, dbias

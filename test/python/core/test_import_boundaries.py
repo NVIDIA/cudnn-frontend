@@ -489,12 +489,17 @@ import cudnn.ops
 assert callable(cudnn.sdpa_torch)
 assert hasattr(torch.ops.cudnn, "sdpa_fwd")
 assert hasattr(torch.ops.cudnn, "sdpa_bwd")
-try:
-    cudnn.sdpa_jax
-except ImportError as error:
-    assert "jax" in str(error).lower(), str(error)
-else:
-    raise AssertionError("JAX entry point loaded without JAX")
+assert not hasattr(cudnn, "sdpa_jax")
+assert not hasattr(cudnn.ops, "sdpa_jax")
+for name in ("sdpa_forward_jax", "sdpa_backward_jax"):
+    assert name in cudnn.ops.__all__
+    assert not hasattr(cudnn, name)
+    try:
+        getattr(cudnn.ops, name)
+    except ImportError as error:
+        assert "jax" in str(error).lower(), str(error)
+    else:
+        raise AssertionError(f"{name} loaded without JAX")
 """)
     assert "cudnn.sdpa.jax_runtime" not in modules
     assert "cudnn.sdpa.jax_api" not in modules

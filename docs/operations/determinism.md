@@ -1045,8 +1045,10 @@ for the implementation boundaries and the
 
 ### Experimental JAX SDPA route
 
-`cudnn.sdpa_jax(..., deterministic=True)` selects deterministic backend backward
-plans. The initial BF16 `(B=2, S=128, H=4, D=64)` test checks O/dQ/dK/dV
-replay and isolated-batch equality on SM100. General batch invariance, FP16
-byte determinism, concurrency, golden hashes, and other GPUs remain unverified.
+`cudnn.ops.sdpa_backward_jax(..., deterministic=True)` selects deterministic
+backend backward plans. The BF16 `(B=2, S=128, H=4, D=64)` case checks output,
+FP32 stats and dQ/dK/dV replay and isolated-batch equality for the explicit
+forward/backward calls on SM90 and SM100. This case has no bias. General batch
+invariance, dBias determinism, FP16 byte determinism, concurrency, golden hashes,
+and other GPUs (including SM103) remain unverified.
 This does not establish determinism for frontend kernel plans.
