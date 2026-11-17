@@ -308,7 +308,11 @@ DTYPE_TRANSFERS: Dict[Tuple[str, str], Tuple[str, FrozenSet[str]]] = {
     # default beyond the noise band.
     ("sdpa_fwd_prefill_sm90", "f16"): ("bf16", frozenset({"sm90_d128_h100_refit_20261114"})),
     # study sm100_paged_f16_transfer_20261112: FlashInfer's exact paged f16 prefill timed against these studies' bf16 verdicts.
-    ("sdpa_fwd_prefill_sm100", "f16"): ("bf16", frozenset({"sm100_paged_d64_d256_prefill_20261111", "sm100_d256_paged_context_20261030"})),
+    # sm100_d256_decode_v4_924_20261116: 32 of its train cells timed in f16 (B200, cuDNN 9.24.0.43): regret 1.000, worst 1.015.
+    ("sdpa_fwd_prefill_sm100", "f16"): (
+        "bf16",
+        frozenset({"sm100_paged_d64_d256_prefill_20261111", "sm100_d256_paged_context_20261030", "sm100_d256_decode_v4_924_20261116"}),
+    ),
 }
 """A dtype with no study of its own may borrow another dtype's entries on a row, study by study, once a transfer check timed
 those studies' classes in it."""
