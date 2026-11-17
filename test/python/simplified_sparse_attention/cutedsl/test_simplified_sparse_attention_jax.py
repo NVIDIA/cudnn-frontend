@@ -10,7 +10,7 @@ import torch
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from cudnn.ops import simplified_sparse_attention_jax
+from cudnn.ops import simplified_sparse_attention_forward_jax
 from ssa_reference import check_reference, pack, sample
 from test_simplified_sparse_attention import supported_gpu
 
@@ -18,9 +18,9 @@ pytestmark = [pytest.mark.L0, pytest.mark.usefixtures("supported_gpu")]
 
 
 def test_public_jax_export():
-    from cudnn.simplified_sparse_attention import simplified_sparse_attention_jax as package_export
+    from cudnn.simplified_sparse_attention import simplified_sparse_attention_forward_jax as package_export
 
-    assert package_export is simplified_sparse_attention_jax
+    assert package_export is simplified_sparse_attention_forward_jax
 
 
 def jax_inputs(inputs):
@@ -47,7 +47,7 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
         tensors, metadata, upstream = arrays[:5], arrays[5:9], arrays[9]
 
         def operation(*values):
-            return simplified_sparse_attention_jax(*values, *metadata, topk=topk, loss_coeff=coefficient, triangular_scores=triangular)
+            return simplified_sparse_attention_forward_jax(*values, *metadata, topk=topk, loss_coeff=coefficient, triangular_scores=triangular)
 
         if not backward:
             return operation(*tensors)
@@ -109,7 +109,7 @@ def test_invalid_inputs(change):
     else:
         tensors[0] = tensors[0][:0]
     with pytest.raises((ValueError, TypeError)):
-        jax.jit(lambda *x: simplified_sparse_attention_jax(*x, *metadata, topk=topk))(*tensors)
+        jax.jit(lambda *x: simplified_sparse_attention_forward_jax(*x, *metadata, topk=topk))(*tensors)
 
 
 @pytest.mark.parametrize("captured", [False, True])
@@ -126,9 +126,9 @@ def test_mixed_architecture_rejected_before_launch(monkeypatch, captured):
     monkeypatch.setattr(jax_api, "_attention", forbidden)
     with pytest.raises(ValueError, match="only SM100 or only SM103"):
         if captured:
-            jax.jit(lambda: simplified_sparse_attention_jax(*tensors, *metadata))()
+            jax.jit(lambda: simplified_sparse_attention_forward_jax(*tensors, *metadata))()
         else:
-            jax.jit(lambda *x: simplified_sparse_attention_jax(*x, *metadata))(*tensors)
+            jax.jit(lambda *x: simplified_sparse_attention_forward_jax(*x, *metadata))(*tensors)
 
 
 def test_captured_jit_uses_native_buffers(monkeypatch):
@@ -141,7 +141,7 @@ def test_captured_jit_uses_native_buffers(monkeypatch):
     with monkeypatch.context() as patch:
         for name in ("empty", "zeros", "empty_like", "zeros_like"):
             patch.setattr(torch, name, forbidden)
-        result = jax.block_until_ready(jax.jit(lambda: simplified_sparse_attention_jax(*tensors, *metadata))())
+        result = jax.block_until_ready(jax.jit(lambda: simplified_sparse_attention_forward_jax(*tensors, *metadata))())
     actual = dict(zip(("output", "indexer_loss"), torch_outputs(result, inputs[0][0].device)))
     check_reference(inputs, actual, False)
 
@@ -151,7 +151,7 @@ def test_dense_workspace_index_limit():
     dtypes = (jnp.bfloat16,) * 5 + (jnp.int32, jnp.int32, jnp.bool_, jnp.float32)
     inputs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in zip(shapes, dtypes)]
     with pytest.raises(ValueError, match="Dense score workspace exceeds"):
-        jax.eval_shape(lambda *x: simplified_sparse_attention_jax(*x, triangular_scores=True), *inputs)
+        jax.eval_shape(lambda *x: simplified_sparse_attention_forward_jax(*x, triangular_scores=True), *inputs)
 
 
 def test_dlpack_device_context(monkeypatch):

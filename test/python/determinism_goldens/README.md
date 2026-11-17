@@ -595,7 +595,7 @@ pytest core/test_determinism_utils.py
 | `norm/frost/test_add_norm_quant_decode_determinism.py` | `AddNormQuantDecode` (the add + RMSNorm + quantize decode step, hidden 5120, rows 1 .. 1024) | the updated BF16 residual, BF16 output `out`, FP8 E4M3 or packed E2M1 `codes`, the NVFP4 E4M3 block `scales` | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
-| `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
+| `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_backward_metadata` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
 | `sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` | the SM90 D128 template (`SdpaFwdDslSm90`, the 128 x 128 tile pinned) | O, Stats | none (forward-only template; no backward) |
 | `sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py` | fixed SM90 dedicated D128 and three-WG D512 bodies, FP16/BF16 | O, Stats; claim counter in stress | none (forward-only qualification) |
 | `sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` | `pygraph.sdpa_mxfp8(causal_exclude_own_block=32)` (SM100/SM103 MXFP8 D128 FROST kernel) | BF16 O, FP32 Stats | — (the option is forward-only) |
@@ -2428,7 +2428,7 @@ unset.
 On the committed suite B300 skips thirteen cases by contract: the nine FP16
 forward cases (four replay, four batch, the golden; the SM100/SM103 blk64
 forward serves BF16 only) and the four prepared-route cases
-(`block_sparse_attention_prepare_backward` serves SM90 only), each after the
+(`block_sparse_attention_backward_metadata` serves SM90 only), each after the
 API rejected a tiny instance of the configuration (`skip_by_contract`,
 `NotImplementedError` naming BF16 or the SM90-only clause). The earlier
 revisions had three FP16 forward cases and no rejection check, so they
@@ -3487,7 +3487,7 @@ The suite lives in `block_sparse_attention/cutedsl/test_BSA_determinism.py`
 and is collected separately from the 330-case attention set above
 (`pytest -m L0 block_sparse_attention/cutedsl/test_BSA_determinism.py --collect-only -q`
 lists 30 node IDs). It drives the public `block_sparse_attention_forward`,
-`block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
+`block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 entry points with `sparse_block_size=64`: the SM90 blk64 kernels, and the
 SM100/SM103 blk64 path through the same API. Head dimension 128, MHA, BHSD.
 A sequence is one batch element with its own KV block lists and counts;
@@ -3510,7 +3510,7 @@ blocks, ten-block lists, a 47-token KV tail marked by `block_sizes`).
 | `TestBlk64Forward::test_replay` | L0 | The four configurations in BF16 and FP16: eight executions with fresh buffers and side-stream work, input mutation check, FP32 reference | 8 |
 | `TestBlk64Forward::test_batch_invariance` | L0 | The four configurations in BF16 and FP16: a batch element alone against its slice of the packed, reversed, duplicated and neighbor-duplicated batches, with reversed heads, and with changed neighbor data and masks (shared block sizes) | 8 |
 | `TestBlk64Forward::test_golden` | L0 | BF16, FP16: B1 H2, three query blocks (one empty), four KV blocks (sizes 64/40/64/23), two-block lists; three executions, reference, saved hashes | 2 |
-| `TestBlk64Backward::test_replay` | L0 | Routes `regular` (one query group: direct dK/dV stores), `grouped` (`bucket_size_blocks=5`: four query groups, FP32 dK/dV workspace), `paired` (paired-KV kernel, task gate forced to 0, four query groups), `prepared-regular` and `prepared-paired` (SM90: `block_sparse_attention_prepare_backward` + `metadata=`); B3 H2, 16 x 16 blocks, six-block lists with empty rows and partial blocks; eight executions, dispatcher decisions asserted, FP32 reference, empty-row dQ zero; dQ/dK/dV bytes measured, asserted only for the prepared-regular dK/dV | 5 |
+| `TestBlk64Backward::test_replay` | L0 | Routes `regular` (one query group: direct dK/dV stores), `grouped` (`bucket_size_blocks=5`: four query groups, FP32 dK/dV workspace), `paired` (paired-KV kernel, task gate forced to 0, four query groups), `prepared-regular` and `prepared-paired` (SM90: `block_sparse_attention_backward_metadata` + `metadata=`); B3 H2, 16 x 16 blocks, six-block lists with empty rows and partial blocks; eight executions, dispatcher decisions asserted, FP32 reference, empty-row dQ zero; dQ/dK/dV bytes measured, asserted only for the prepared-regular dK/dV | 5 |
 | `TestBlk64Backward::test_batch_invariance` | L0 | `regular` and `paired`: a batch element alone against the packed, reversed, duplicated and changed-neighbor batches; forward results asserted bitwise, gradients measured, route asserted | 2 |
 | `TestBlk64Backward::test_prepared_parity` | L0 | SM90: prepared against default route on the regular and paired kernels, within the FP32 reduce-add noise (atol/rtol 1e-2), reused object, reference | 2 |
 | `TestBlk64Backward::test_zero_upstream_gradient` | L0 | Eight executions with zero dO on the regular route; every gradient exactly zero, bitwise | 1 |
@@ -3518,7 +3518,7 @@ blocks, ten-block lists, a 47-token KV tail marked by `block_sizes`).
 
 On SM100/SM103 the nine FP16 forward cases (four replay, four batch, the
 golden) and the four prepared-route cases skip by contract: the blk64 forward
-there serves BF16 only, and `block_sparse_attention_prepare_backward` serves
+there serves BF16 only, and `block_sparse_attention_backward_metadata` serves
 SM90 only. Each skip is gated on the API itself (`skip_by_contract`): the case
 first makes a tiny FP16 forward call or prepare call and requires the
 documented rejection (`NotImplementedError` naming BF16, or the SM90-only
@@ -5187,7 +5187,7 @@ then completed and were checked again in the42-case strict run.
 
 The new suite is
 `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py`.
-It tests the public `cudnn.ops.simplified_sparse_attention` call. There is no
+It tests the public `cudnn.ops.simplified_sparse_attention_forward` call. There is no
 mode that guarantees determinism. All cases are L0 and use BF16 input,
 BF16 output/gradients, and FP32 loss. Tests check output, indexer loss,
 dQ, dK, dV, dIndexerQ, and dIndexerK. They do not expose or compare saved
@@ -5523,7 +5523,7 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 ## Phase 1 dense indexer KL public exports (2026-11-09)
 
 Revision `b1a9c4a`, based on `55b9180`. The installed wheel exposes
-`dense_indexer_kl` through both `cudnn.ops` and
+`dense_indexer_kl_forward` through both `cudnn.ops` and
 `cudnn.simplified_sparse_attention`. The API retains the scalar loss and
 indexer-only autograd contract. `use_kf=False` selects chunked PyTorch;
 `use_kf=True` selects the supplied-LSE CuTe kernel. Both reject external
