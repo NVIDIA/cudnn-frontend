@@ -1261,7 +1261,10 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     the 32-row tile over several Q tiles: the prefill body has no paged d256
     plan, and there the decode tile ran 0.04-0.87 of the backend (studies
     sm120_paged_d256_multiq_probe / _verify_v2_20261117). Past ``s_q`` 8 a group
-    that does not divide 32 lost up to 1.19x (_verify_20261117).
+    that does not divide 32 lost up to 1.19x (_verify_20261117). Paged d64
+    verify rows (``5 <= s_q <= 8``) take it too, over the prefill body the
+    paged guard trails: 0.37 of the backend, worst 0.89 (_d64_verify_v2); d128
+    lost up to 1.36x at groups 5 / 10 / 12 (_d64_d128_verify) and keeps its path.
     """
     if facts.is_fp8 or facts.is_mxfp8 or facts.thd:
         return 0
@@ -1270,7 +1273,9 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     group = facts.h_q // facts.h_kv
     rows = facts.s_q * group
     tile_m = next((tile_m for tile_m in _SM120_DECODE_Q_TILES if tile_m in caps.tile_ms and rows <= tile_m), 0)
-    multi_q = facts.has_paged_kv and facts.s_q <= 8 and max(facts.d_qk, facts.d_v) == 256 and group <= 32 and 32 in caps.tile_ms
+    head = max(facts.d_qk, facts.d_v)
+    verify = 5 <= facts.s_q <= 8
+    multi_q = facts.has_paged_kv and group <= 32 and 32 in caps.tile_ms and ((head == 256 and facts.s_q <= 8) or (head == 64 and verify))
     return tile_m or (32 if multi_q else 0)
 
 

@@ -661,7 +661,9 @@ production kernels gain no debug knob or timing-dependent assertion.
 - The key does not carry the GQA group, so the train grid must span the group range the holdout and serving can carry: a small
   group (2 / 3), a non-power of two (5 / 6 / 7) and the served ones; 64/8, 32/4, 16/2 and 8/1 are all group 8. Three narrow fits
   failed holdouts on a group outside their train range (`sm90_dense_d256_chunk_20261117`: group 2; `sm120_paged_d128_mtp_v3_20261117`:
-  group 5; `sm120_paged_d128_mtp_v4_20261117`, trained on groups 4-8: group 3).
+  group 5; `sm120_paged_d128_mtp_v4_20261117`, trained on groups 4-8: group 3). For a tiled kernel, include groups that do not divide
+  the tile: the SM120 multi-Q decode tile lost at groups 20 / 24 (s_q 13-15) and at d128 groups 5 / 10 / 12, after power-of-two
+  probes had passed (`sm120_paged_d256_multiq_verify_20261117`, `sm120_paged_d64_d128_verify_20261117`).
 - The off-tile twin needs its own train lattice (the on-tile lattice shifted off the 128-key tile), not a handful of cells or a
   mirrored on-tile rule: `sm90_mha_mtp_20261117` (10 off-tile cells) and `sm80_det_bwd_d64mha_supp_20261117` (mirrored) each passed on
   the tile and lost 1.17-1.35x off it.
