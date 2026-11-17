@@ -626,6 +626,28 @@ def test_sm80_paged_d64_no_sink_on_tile_floor_follows_v2():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_paged_d192x192_prefill_follows_its_study(s_kv):
+    """sm80_paged_d192x192_v2_20261117 (A100): paged THD-Q d192 x 192 causal prefill leads past a cost floor with enough query tokens
+    (step5 64/4 at S_q 512-1024 over 128k ran the backend at 1.21-1.42x); short-cache squares and the 512-key window keep the backend."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_paged_d192x192_v2_20261117"
+
+    def f(**over):
+        base = dict(b=1, h_q=64, h_kv=4, s_q=1024, s_kv=s_kv, d_qk=192, d_v=192, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=1024)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == study
+    assert pt.lookup(row, f()) is True
+    square = f(h_q=8, h_kv=4, s_q=8192, s_kv=8192 + s_kv % 2, max_total_seq_len_q=8192)
+    assert pt.lookup(row, square) is False
+    assert pt.lookup(row, f(s_q=17, max_total_seq_len_q=17)) is False
+    assert pt.matched_entry(row, f(window_left=511)) is None
+
+
+@pytest.mark.L0
 def test_sm107_dense_d128_noncausal_mha_follows_its_study():
     """sm107_dense_d128_nc_mha_v2_20261117 (Rubin): dense d128 MHA non-causal leads up to 2^14.246 query rows on the KV tile, which hands
     the hand rule's 256-tile S_q 256 chunks (FROST 1.36-1.53x) back to the backend; off the tile it leads cost <= 2^32.953 over at least

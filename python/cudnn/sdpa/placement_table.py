@@ -1011,6 +1011,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", True): Entry(
         "ge", 7.804, "sm80_prefill_gaps_20261117", "tiles"
     ),
+    # study sm80_paged_d192x192_v2_20261117 (A100, cuDNN 9.24.0.43, FE bb01aa882; paged THD-Q d192 x 192 causal prefill, e.g. step5 64/4):
+    # fit on v1's train and holdout (sm80_paged_d192x192_20261117, whose on-tile floor lost 1.35x on short-cache squares), chunks S_q
+    # 17-4096 over KV 256-128k and squares, groups 2-16. Fresh holdout, scored once: 0.612 (13 changed, worst 0.729) on the tile, 0.626
+    # (11, worst 0.844) off it. The 512-key window class keeps the backend (v1 fit `never`).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 35.442, "sm80_paged_d192x192_v2_20261117", "cost", ("ge", 7.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 35.878, "sm80_paged_d192x192_v2_20261117", "cost", ("ge", 5.5, "q")
+    ),
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
     # on and off the tile, windows 512-2048 keys; 660 train cells; the backend ran them 1.2-5.1x behind). Holdout at fresh heads, scored
