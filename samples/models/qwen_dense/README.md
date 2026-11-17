@@ -871,7 +871,8 @@ value finite. The line prints how many block scales and codes are not those of t
 rounding points, and the largest distance of a code from the fp64 value as a share of its bound; one byte outside
 fails the block. The bound is wider than one bf16 rounding where the products cancel, which is the contract's own
 statement, not a tolerance of this sample: on the published checkpoint no block scale was another byte than the fp64
-chain's, and about 7 codes in 10,000 were.
+chain's in the run of the default prompt and 3 of 1,114,112 were in a run of a chat request body, each inside its
+interval; about 7 codes in 10,000 were another code in both.
 
 The token check has a declared band because a band taken from the run's own logit distance cannot fail. With seeded
 weights it guards the path, not the layers: the layers move the logits by little (the two stacks are 1.0 to 1.4 units apart
@@ -1026,8 +1027,9 @@ planned: what a plan prints on a GPU for which the installed CuTe DSL cannot bui
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
 decline, not on such an installation.
 
-Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
-reserved 3.5 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
+Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak,
+reserved 3.5 GiB and grew the device by 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB
+free there. On compute capability 12.x
 it adds an allowance of 3 GiB and asks for about 6.7 GiB: the first launch of the fused step reserves device memory outside
 PyTorch's pool on that class. The need is stated once, for every sequence count of the run, before anything is loaded: the
 copies, the working memory and the first launch are counted once, the state per count. The run measures that launch and
