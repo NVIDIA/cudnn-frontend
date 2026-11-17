@@ -637,6 +637,23 @@ def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
     assert getattr(pt.matched_entry(row, q1(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_decode_q1_20261112"
 
 
+@pytest.mark.L0
+def test_sm107_dense_d256_chunk_prefill_follows_its_study():
+    """Study sm107_dense_chunk_20261117: dense bottom-right d256 chunks lead on and off the KV tile; d128 has no entry."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def chunk(**over):
+        base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=131072, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
+        base.update(has_paged_kv=False, padded=False, page_size=0)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (131072, 131071, 4096):
+        assert pt.lookup(row, chunk(s_kv=s_kv)) is True
+        assert pt.matched_entry(row, chunk(s_kv=s_kv)).study == "sm107_dense_chunk_20261117"
+    assert getattr(pt.matched_entry(row, chunk(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_dense_chunk_20261117"
+
+
 def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):
     """FlashInfer's ragged cudnn declaration on cc 10.7: the broad envelope (b 4096, S_q 128 or 65536) or a power-of-two
     bounded class (b <= 4, with its packed-Q capacity), always with execute-time shape overrides."""

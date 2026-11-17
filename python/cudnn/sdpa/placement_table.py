@@ -928,6 +928,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_decode_q1_20261112"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("always", None, "sm107_decode_q1_20261112"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_decode_q1_20261112"),
+    # study sm107_dense_chunk_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 9bdf9a8ab; benchmark/attention_inference's context graph,
+    # dense bottom-right chunks; d128 64/8 32/4 8/1 and d256 32/2 16/1 8/1, b 1-4, q 256-2048, KV 4k-128k; 288 train + 96 off-tile).
+    # d256 leads everywhere (train 1.001 vs the default's 1.351; holdouts 0.611 off the tile over 28 cells and 0.698 on it over
+    # 21, worst 1.076). d128 has no entry: its wins form a middle band of work that one threshold cannot express.
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_dense_chunk_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_dense_chunk_20261117"
+    ),
     # study sm100_swa_prefill_20261031 (cuDNN 9.29.0.18; B100 850 W, cc 10.0; the sm103 study's grid and seeds: 320 train + 64 random
     # holdout cells; 90 training cells timed while another process held the GPU were re-timed, 32 of them moved > 5%)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry(
