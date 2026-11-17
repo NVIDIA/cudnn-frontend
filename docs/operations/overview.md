@@ -4,6 +4,7 @@ The API reference groups graph operations and experimental Python kernels by
 operation. Use the sidebar to find an operation and its related APIs.
 
 - [Attention](/operations/Attention)
+- [JAX SDPA Python frontend](sdpa_jax.md)
 - [Sparse Attention](/operations/sparse_attention)
 - [Linear Attention](/operations/LinearAttention)
 - [Matmul and GEMM Fusions](/operations/Matmul)

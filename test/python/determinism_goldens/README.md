@@ -7541,3 +7541,19 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+### JAX SDPA Python frontend route (2026-11-16)
+
+Suite: `sdpa/jax/test_sdpa_jax.py`. Test environment: SM100, cuDNN 9.27,
+CUDA 13.4, JAX source with jaxlib/CUDA plugin `0.12.1.dev20261116`.
+The paired suite uses identical inputs/cotangents with the frontend setting
+unset, `0`, and `1`, and compares with JAX's XLA reference. A separate BF16
+case compares raw output/gradient bytes across fresh allocations and B=1
+isolation. Golden hashes and concurrent-load stress are not yet qualified.
+
+Command from `test/python`, with the companion JAX checkout on `PYTHONPATH`:
+`python -m pytest sdpa/jax/test_sdpa_jax.py -m L0 -x -q`.
+
+Result: **22 passed**, no failures or skips (38.90 s). This includes 20
+paired numerical cases, one native-lowering case, and one replay/isolation
+case. Four companion JAX dispatch tests also passed.
