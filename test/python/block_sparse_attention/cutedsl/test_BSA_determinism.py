@@ -4,7 +4,7 @@
 """Bitwise replay and batch invariance of the blk64 block-sparse attention API (``sparse_block_size=64``).
 
 The suite drives the public ``block_sparse_attention_forward`` / ``block_sparse_attention_backward`` /
-``block_sparse_attention_prepare_backward`` entry points on SM90 (the blk64 kernels this PR changes) and, through the
+``block_sparse_attention_backward_metadata`` entry points on SM90 (the blk64 kernels this PR changes) and, through the
 same API, the SM100/SM103 blk64 path. Every case is L0.
 
 Forward (BF16 and FP16): four configurations, each run in both datatypes for replay and for batch invariance:
@@ -22,7 +22,7 @@ of skipping.
 Backward (BF16, head dimension 128, MHA by contract) on its routes: the regular kernel with direct dK/dV stores
 (one Q group, whole KV blocks), the regular kernel with the FP32 dK/dV workspace (several Q groups), the paired-KV
 kernel (forced through ``_BLK64_PAIRED_KV_MIN_KV_TASKS`` as the sibling tests do, several Q groups), and on SM90
-the prepared-metadata route (``block_sparse_attention_prepare_backward`` + ``metadata=``) over the regular and the
+the prepared-metadata route (``block_sparse_attention_backward_metadata`` + ``metadata=``) over the regular and the
 paired kernels (off SM90 those cases skip by contract, again only after the API has rejected the prepare call).
 Every route is asserted through the dispatcher's own decisions, checked against the FP32 reference, and its
 empty-row dQ must be zero; the prepared route must match the default route numerically and, where the arithmetic
@@ -98,7 +98,7 @@ FORWARD_CASES = {f"{name}-{config}": (DTYPES[name], *FORWARD_CONFIGS[config]) fo
 # instance of it: the text the rejection must carry, and the clause the skip names.
 CONTRACT = {
     "fp16": ("BF16", "the SM100/SM103 blk64 forward serves BF16 only"),
-    "prepared": ("SM90 blk64 backward only", "block_sparse_attention_prepare_backward serves the SM90 blk64 backward only"),
+    "prepared": ("SM90 blk64 backward only", "block_sparse_attention_backward_metadata serves the SM90 blk64 backward only"),
 }
 
 
@@ -321,7 +321,7 @@ def force_paired(monkeypatch, interface):
 
 
 def prepare(ops, inputs, bucket):
-    return ops.block_sparse_attention_prepare_backward(
+    return ops.block_sparse_attention_backward_metadata(
         inputs["idx"],
         inputs["width"],
         inputs["sizes"],

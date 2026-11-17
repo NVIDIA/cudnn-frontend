@@ -51,7 +51,7 @@ class CublasLinear(BlockBase):
     provider = "cuBLAS"
     kernels = CUBLAS_OVER_COPIES
 
-    def __call__(self, qx, weight):
+    def __call__(self, qx, weight, site=""):  # one multiply at every call site
         return matmul_bf16(qx, weight)
 
 

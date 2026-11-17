@@ -36,7 +36,7 @@ def test_invalid_topk_never_compiles(top_k, monkeypatch):
     w = torch.empty((5, 32), dtype=torch.float32)
     cu = torch.tensor([0, 5], dtype=torch.int32)
     with pytest.raises(ValueError, match="top_k"):
-        api.dsa_indexer_topk_forward(q, k, w, cu, cu, top_k)
+        api.indexer_top_k_forward(q, k, w, cu, cu, top_k)
 
 
 def test_plan_metadata_without_gpu():
@@ -97,10 +97,10 @@ def test_native_exact_selection_and_replay(gpu, ties):
     topk = 4
     ids = torch.empty((9, topk), dtype=torch.int32, device=gpu)
     scores = torch.empty((9, topk), dtype=torch.float32, device=gpu)
-    workspace = torch.empty(api.dsa_indexer_topk_workspace_size(9, 17, 2, topk, device=gpu), dtype=torch.uint8, device=gpu)
+    workspace = torch.empty(api.indexer_top_k_workspace_size(9, 17, 2, topk, device=gpu), dtype=torch.uint8, device=gpu)
 
     def run():
-        api.dsa_indexer_topk_forward(*inputs, topk, indices=ids, scores=scores, workspace=workspace)
+        api.indexer_top_k_forward(*inputs, topk, indices=ids, scores=scores, workspace=workspace)
 
     run()
     expected_ids, expected_scores = _reference(inputs, topk)
@@ -137,6 +137,6 @@ def test_alias_and_workspace_checks_precede_launch(gpu, monkeypatch):
     scores = torch.empty((9, topk), dtype=torch.float32, device=gpu)
     workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=gpu)
     with pytest.raises(ValueError, match="alias"):
-        api.dsa_indexer_topk_forward(*inputs, topk, indices=ids, scores=ids.view(torch.float32), workspace=workspace)
+        api.indexer_top_k_forward(*inputs, topk, indices=ids, scores=ids.view(torch.float32), workspace=workspace)
     with pytest.raises(ValueError, match="workspace"):
-        api.dsa_indexer_topk_forward(*inputs, topk, indices=ids, scores=scores, workspace=workspace[:1])
+        api.indexer_top_k_forward(*inputs, topk, indices=ids, scores=scores, workspace=workspace[:1])
