@@ -616,8 +616,8 @@ def test_sm120_paged_window_decode_follows_its_study(s_kv):
 @pytest.mark.L0
 @pytest.mark.parametrize("s_q, s_kv", [(8192, 8192), (1024, 131072), (1024, 131071)], ids=["square", "chunk", "chunk_off_tile"])
 def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
-    """Study sm120_window_prefill_20261117: dense windowed d256 and d512 prefill lead on SM120, squares included (the hand rule
-    trails every windowed square); d128, the d64 sink class, f16 and another part keep the hand rules."""
+    """Study sm120_window_prefill_20261117: dense windowed d512 prefill leads on SM120, squares included (the hand rule trails every
+    windowed square); d256 (retired after its S_q-edge supplement), d128, the d64 sink class, f16 and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm120"
 
     def win(**over):
@@ -626,9 +626,10 @@ def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
         base.update(over)
         return _facts(**base)
 
-    for over in (dict(), dict(h_q=64), dict(h_q=16, h_kv=8, d_qk=256, d_v=256, window_left=1024)):
+    for over in (dict(), dict(h_q=64)):
         assert pt.lookup(row, win(**over)) is True, over
         assert pt.matched_entry(row, win(**over)).study == "sm120_window_prefill_20261117"
+    assert pt.lookup(row, win(h_q=16, h_kv=8, d_qk=256, d_v=256, window_left=1024)) is None  # edge_supp_20261117
     assert pt.lookup(row, win(h_q=32, h_kv=8, d_qk=128, d_v=128, window_left=1024)) is None
     assert pt.lookup(row, win(h_q=64, h_kv=8, d_qk=64, d_v=64, has_sink=True)) is None
     assert pt.lookup(row, win(dtype=cudnn.data_type.HALF)) is None
@@ -908,20 +909,14 @@ def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
 
 
 @pytest.mark.L0
-def test_sm107_dense_d256_chunk_prefill_follows_its_study():
-    """Study sm107_dense_chunk_20261117: dense bottom-right d256 chunks lead on and off the KV tile; d128 has no entry."""
+def test_sm107_dense_d256_chunk_entries_are_retired():
+    """Study sm107_dense_chunk_20261117 trained at S_q >= 256, but its class starts at S_q 5; an edge supplement there
+    (edge_supp_20261117) lost 1.58x on a small square, so the d256 entries are retired and the hand rule decides."""
     row = "sdpa_fwd_prefill_sm107"
-
-    def chunk(**over):
-        base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=131072, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
-        base.update(has_paged_kv=False, padded=False, page_size=0)
-        base.update(over)
-        return _facts(**base)
-
-    for s_kv in (131072, 131071, 4096):
-        assert pt.lookup(row, chunk(s_kv=s_kv)) is True
-        assert pt.matched_entry(row, chunk(s_kv=s_kv)).study == "sm107_dense_chunk_20261117"
-    assert getattr(pt.matched_entry(row, chunk(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_dense_chunk_20261117"
+    base = dict(b=1, h_q=32, h_kv=2, s_q=1024, s_kv=131072, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(10, 7))
+    base.update(has_paged_kv=False, padded=False, page_size=0)
+    for s_kv in (131072, 131071):
+        assert pt.matched_entry(row, _facts(**{**base, "s_kv": s_kv})) is None
 
 
 @pytest.mark.L0
@@ -971,26 +966,14 @@ def test_sm107_paged_d64_sink_prefill_follows_its_study(s_kv):
 
 
 @pytest.mark.L0
-def test_sm120_window_sink_d192_prefill_follows_its_study():
-    """Study sm120_window_sink_prefill_20261117: dense window-128 sink prefill at d192 x 128 (MiMo SWA) leads on few KV-head tiles
-    on the KV tile and from KV 2^15.5 off it; the served MiMo chunks (2^7-2^9 tiles) keep the backend. d64 + sink has no entry."""
+def test_sm120_window_sink_d192_prefill_entries_are_retired():
+    """Study sm120_window_sink_prefill_20261117 trained at S_q >= 256; an edge supplement at S_q 5-192 lost up to 2.94x against the
+    hand rule's lead, so its entries are retired."""
     row = "sdpa_fwd_prefill_sm120"
-    study = "sm120_window_sink_prefill_20261117"
-
-    def chunk(**over):
-        base = dict(b=1, h_q=16, h_kv=1, s_q=1024, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(12, 0))
-        base.update(has_paged_kv=False, padded=False, page_size=0, window_left=127, has_sink=True)
-        base.update(over)
-        return _facts(**base)
-
-    assert pt.matched_entry(row, chunk()).study == study
-    assert pt.lookup(row, chunk()) is False  # MiMo SWA tp8: 2^7 tiles
-    assert pt.lookup(row, chunk(h_q=128, h_kv=8, s_q=512)) is False  # MiMo SWA: 2^9 tiles
-    assert pt.lookup(row, chunk(h_q=16, h_kv=2, s_q=256)) is True  # 2^5 tiles
-    assert pt.lookup(row, chunk(s_kv=16385)) is False  # off the tile, below KV 2^15.5
-    assert pt.lookup(row, chunk(s_kv=131073)) is True
-    assert pt.matched_entry(row, chunk(s_kv=131073)).study == study
-    assert getattr(pt.matched_entry(row, chunk(d_qk=64, d_v=64, h_q=64, h_kv=8)), "study", None) != study
+    base = dict(b=1, h_q=16, h_kv=1, s_q=1024, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(12, 0))
+    base.update(has_paged_kv=False, padded=False, page_size=0, window_left=127, has_sink=True)
+    for s_kv in (131072, 131073):
+        assert getattr(pt.matched_entry(row, _facts(**{**base, "s_kv": s_kv})), "study", None) != "sm120_window_sink_prefill_20261117"
 
 
 def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):

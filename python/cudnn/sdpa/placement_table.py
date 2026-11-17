@@ -1168,13 +1168,9 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     # study sm120_window_prefill_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE c59994a55; dense bottom-right chunks and squares,
     # d256 window 1024 and d512 MQA window 128; 221 train cells, a served-pair and an other-group holdout, each scored once: 0.34-0.58
-    # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend.
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "prefill", "dense", "window", False, "gqa", False): Entry(
-        "always", None, "sm120_window_prefill_20261117"
-    ),
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "prefill", "dense", "window", False, "gqa", True): Entry(
-        "always", None, "sm120_window_prefill_20261117"
-    ),
+    # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend. The d256
+    # twin is retired: an edge supplement at S_q 5-193 (edge_supp_20261117) lost 1.125 off the tile on a b 16 square of 33; the d512
+    # twin passed it (0.484, worst 0.792).
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", False): Entry(
         "always", None, "sm120_window_prefill_20261117"
     ),
@@ -1199,16 +1195,8 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_decode_q1_20261112"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("always", None, "sm107_decode_q1_20261112"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_decode_q1_20261112"),
-    # study sm107_dense_chunk_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 9bdf9a8ab; benchmark/attention_inference's context graph,
-    # dense bottom-right chunks; d128 64/8 32/4 8/1 and d256 32/2 16/1 8/1, b 1-4, q 256-2048, KV 4k-128k; 288 train + 96 off-tile).
-    # d256 leads everywhere (train 1.001 vs the default's 1.351; holdouts 0.611 off the tile over 28 cells and 0.698 on it over
-    # 21, worst 1.076). d128 has no entry: its wins form a middle band of work that one threshold cannot express.
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
-        "always", None, "sm107_dense_chunk_20261117"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "always", None, "sm107_dense_chunk_20261117"
-    ),
+    # study sm107_dense_chunk_20261117 (Rubin dense d256 chunks, trained at S_q >= 256): its two `always` entries are retired. The
+    # class starts at S_q 5, and an edge supplement there (edge_supp_20261117) lost 1.58x off the tile on a b 8 square of 64.
     # study sm100_d576_prefill_20261117, Rubin part (208-SM Rubin, cuDNN 9.30.0.4, FE 8014a2c75): the B200 study's dense cells
     # (160 train). FROST leads everywhere: changed train cells 0.115 (worst 0.310); holdout 0.091-0.104 (worst 0.251). Paged
     # D576 prefill has no FROST plan on Rubin and no entry. Only h_kv 1 was measured.
@@ -1218,17 +1206,8 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm100_d576_prefill_20261117"
     ),
-    # study sm120_window_sink_prefill_20261117 (RTX PRO 6000 Server 600 W, cuDNN 9.24.0.43, FE 6f17f2973; benchmark/attention_inference's
-    # context graph: dense bottom-right window 128 with a sink, d192 x 128 (MiMo SWA) at groups 6-16, b 1-8, S_q 256-4096, squares
-    # and chunks to KV 128k, on and off the tile; 100 train cells). Lead on few KV-head tiles on the tile, and from KV 2^15.5 off it:
-    # changed train cells 0.918 / 0.923; holdout at fresh heads, scored once, 0.934 / 0.961 (worst 1.043). d64 + sink has no
-    # entry (its on-tile rule changed no cell, a vacuous pass).
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
-        "le", 5.5, "sm120_window_sink_prefill_20261117", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
-        "ge", 15.5, "sm120_window_sink_prefill_20261117", "kv"
-    ),
+    # study sm120_window_sink_prefill_20261117 (dense window-128 sink d192 x 128, trained at S_q >= 256): its two entries are retired.
+    # An edge supplement at S_q 5-192 lost up to 2.94x (on the tile, S_q 5) and 1.75x (off it) against the hand rule's lead.
     # study sm100_swa_prefill_20261031 (cuDNN 9.29.0.18; B100 850 W, cc 10.0; the sm103 study's grid and seeds: 320 train + 64 random
     # holdout cells; 90 training cells timed while another process held the GPU were re-timed, 32 of them moved > 5%)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry(

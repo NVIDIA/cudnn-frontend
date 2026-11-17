@@ -405,6 +405,8 @@ launch tiles, against 128 for the other widths. Study sm107_dense_d128_chunk_til
 harness's context legs, groups 3-8, b 1-8, S_q 256-4096, KV 4k-128k) fitted the cap on 216 frozen cells: 256 tiles is the
 largest feasible (24 changed at 0.800 of the backend, worst 0.999). Past it, S_q 256 chunks at b 4-8 over groups 3 / 5 / 6
 lose 1.7-2.0x. A 66-cell holdout at fresh heads, scored once, came to 0.803 over its 8 changed cells (worst 1.008).
+The wider cap holds from S_q 256, the study's smallest: an edge supplement at S_q 17-255 inside the new band (64 cells) came to
+0.607 but lost 1.37x on a group-7 chunk at S_q 192, so shorter chunks keep 128 tiles.
 
 SM100 paged bf16 d128 GQA prefill (2026-10-24, ``_sm100_paged_gqa_prefill``): GQA16 LEAD at b 1-4, 128 < effective Q
 <= 4096, S_kv 2k-32k, causal (bottom-right chunks and top-left full squares), page 16, head-major in-page K. Once
@@ -544,6 +546,7 @@ D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q f
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
 SM107_D128_CHUNKED_MAX_Q_TILES = 256  # Rubin bf16 d128 chunks: study sm107_dense_d128_chunk_tiles_20261117 (module docstring)
+SM107_D128_CHUNKED_MIN_S_Q = 256  # ... from the study's smallest S_q; below it the edge supplement lost 1.37x (module docstring)
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
 NONPAGED_D256_THD_MIN_Q = 256  # nonpaged d256 THD lead: query tokens per request
@@ -1054,7 +1057,7 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         elif facts.s_q > DECODE_SHAPED_MAX_S_Q:
             if flavor == (512, 512):
                 return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
-            d128 = (facts.d_qk, facts.d_v) == (128, 128) and facts.dtype == cudnn.data_type.BFLOAT16
+            d128 = (facts.d_qk, facts.d_v) == (128, 128) and facts.dtype == cudnn.data_type.BFLOAT16 and facts.s_q >= SM107_D128_CHUNKED_MIN_S_Q
             max_tiles = SM107_D128_CHUNKED_MAX_Q_TILES if d128 else CHUNKED_MAX_Q_TILES
             if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= max_tiles:
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)

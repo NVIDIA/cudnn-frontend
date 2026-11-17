@@ -1076,6 +1076,7 @@ def test_sm107_dense_d128_chunks_lead_up_to_256_tiles():
     assert place(s_q=1024) == placement.TRAIL  # 512 tiles
     assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL  # f16 keeps 128 tiles
     assert place(h_q=32, h_kv=4) == placement.LEAD  # 128 tiles, every width
+    assert place(b=2, h_q=56, h_kv=8, s_q=192, s_kv=16384) == placement.TRAIL  # 224 tiles below S_q 256: the edge supplement lost 1.37x
 
 
 @pytest.mark.L0
