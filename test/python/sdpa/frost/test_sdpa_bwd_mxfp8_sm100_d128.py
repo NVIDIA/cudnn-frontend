@@ -689,7 +689,7 @@ def test_execute_from_a_worker_thread(side_stream):
                 state["after"] = (torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream)
                 state["before"] = before
             torch.cuda.synchronize()
-        except BaseException as e:  # surfaced on the test thread
+        except Exception as e:  # surfaced on the test thread
             state["error"] = e
 
     t = threading.Thread(target=worker, daemon=True)

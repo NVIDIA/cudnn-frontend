@@ -192,7 +192,7 @@ def time_cold(runs, reps):
             samples[r["engine"]].append(_elapsed_ms(graphs[r["engine"]].replay))
     out = {n: statistics.median(v) for n, v in samples.items()}
     bad = {n: v for n, v in out.items() if not (math.isfinite(v) and v > 0)}
-    if bad:  # a broken measurement, not a result
+    if bad:  # an invalid measurement, not a result
         raise RuntimeError(f"timing produced non-finite or non-positive medians: {bad}")
     return out
 

@@ -57,12 +57,34 @@ def _compiler_targets_available(monkeypatch):
 _BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm89_f16_d64"})
 
 
+def _row_dsl_floors():
+    """Rows with their own nvidia-cutlass-dsl floor above the library's (Rule 7), checked in their declaration."""
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import contract as d128_mxfp8
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.geometry import CUTEDSL_FLOOR
+
+    return {d128_mxfp8.NAME: CUTEDSL_FLOOR}
+
+
+def _below_row_dsl_floor(spec) -> bool:
+    """The installed DSL (as the probe sees it) is below the row's own floor, so the row declines every graph by version.
+
+    It serves no graph to sample on such a lane; its eligibility tests pin that decline."""
+    floor = _row_dsl_floors().get(spec.name)
+    if floor is None:
+        return False
+    installed, version = bwd_engines.cutedsl_state()
+    return installed and bwd_engines.cutedsl_too_old(version, floor=floor)
+
+
 def _rows():
     """``[(kind, EngineSpec)]`` -- every row the registry actually ships that serves some graph.
 
-    A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample."""
+    A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample.
+    Neither does a row below its own DSL floor (``_below_row_dsl_floor``)."""
     rows = [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
-    return [(kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and _dims(kind, spec.capabilities) is not None]
+    return [
+        (kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and not _below_row_dsl_floor(spec) and _dims(kind, spec.capabilities) is not None
+    ]
 
 
 def _probe(kind: str):
