@@ -74,7 +74,8 @@ CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles 
 
 def _fresh_interpreter(arguments):
     """The sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
-    Returns ``(exit code, stdout)``.  The child arms its own stack dump before the parent's deadline; where the deadline
+    Returns ``(exit code, the run's lines)``: a sample writes every line of a run to standard error and keeps standard
+    output for generated text.  The child arms its own stack dump before the parent's deadline; where the deadline
     passes, the failure carries what the child had printed."""
     import cudnn
 
@@ -93,11 +94,11 @@ def _fresh_interpreter(arguments):
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
         pytest.fail(f"the sample did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
-    if "[00] " not in done.stdout:  # the child never reached the sample's own lines: an import or an environment failure
+    if "[00] " not in done.stderr:  # the child never reached the sample's own lines: an import or an environment failure
         pytest.fail(
             f"the sample printed no verdict in a fresh interpreter (exit code {done.returncode})\n--- stdout\n{done.stdout[-3000:]}\n--- stderr\n{done.stderr[-6000:]}"
         )
-    return done.returncode, done.stdout
+    return done.returncode, done.stderr
 
 
 def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
@@ -110,7 +111,7 @@ def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, un
         code, out = _fresh_interpreter(arguments)
     else:
         code = sample.main(arguments)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err  # the run's lines; standard output is for generated text, and a seeded run writes none
     seconds = time.perf_counter() - start
     tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
     versions = next((line[5:] for line in tagged if line.startswith("[00] cuDNN Frontend ")), "no environment line")

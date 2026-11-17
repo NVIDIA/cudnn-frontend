@@ -1345,7 +1345,7 @@ def test_without_a_profiler_the_run_is_reported_and_never_a_pass(monkeypatch, ca
     session.new_report()
     capsys.readouterr()
     ok, judged, _ = sample._decode(session, text, StopRule(text.eos_ids, force_tokens=4), prompts, tie_out, check=True, checked_steps=None)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert ok and judged == 6 and session.traced.status == census.NOT_OBSERVED and session.traced.unobserved == "needs a recorded step on a CUDA device"
     assert "the tokens); the kernels of the traced steps against the plan" in out, "the line before the checks says that the kernels are checked too"
     assert "  kernels           not observed: needs a recorded step on a CUDA device    NOT OBSERVED" in out
@@ -1355,7 +1355,7 @@ def test_without_a_profiler_the_run_is_reported_and_never_a_pass(monkeypatch, ca
     session.new_report()
     capsys.readouterr()
     ok, judged, _ = sample._decode(session, text, StopRule(text.eos_ids, force_tokens=4), prompts, tie_out, check=True, checked_steps=None)
-    assert ok and "  kernels  " not in capsys.readouterr().out, "without the flag the run prints no kernel line"
+    assert ok and "  kernels  " not in capsys.readouterr().err, "without the flag the run prints no kernel line"
 
 
 def test_the_traced_pass_hands_over_its_launch_records(monkeypatch, tmp_path):
@@ -1477,7 +1477,7 @@ def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB):
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().out
+        return module.main(arguments), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -1491,14 +1491,14 @@ def test_the_kernel_table_is_printed_before_the_load_and_a_decline_is_a_skip(mon
 
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, ["--check-kernels"])
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     served, kernels = out.index("served by (decided before the load"), out.index(
         "kernels, planned (decided before the load from model_samples/qwen_dense/configs.py"
     )
     assert served < kernels and "cudnn.GdnDecodeFused [PDL False, PDL_RELEASE False]" in out[kernels:] and "kernels, as the entries state them" not in out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [])
-    assert "kernels, planned" not in capsys.readouterr().out
+    assert "kernels, planned" not in capsys.readouterr().err
     code, out = _sample_main(monkeypatch, capsys, ["--dump-census", str(tmp_path / "missing" / "census.json")])
     assert code == 1 and out.splitlines()[-1] == "[00] ERROR --dump-census census.json: cannot be written there", out
 
@@ -1553,7 +1553,7 @@ def _sample_run(monkeypatch, capsys, arguments, **stand_in):
         code = module.main(["--force-tokens", "4", *arguments])
     finally:
         sys.path[:] = paths
-    return code, capsys.readouterr().out.splitlines()
+    return code, capsys.readouterr().err.splitlines()
 
 
 def _kernel_lines(lines):
@@ -2734,7 +2734,7 @@ def test_the_target_stacks_always_check_their_kernels(monkeypatch, capsys):
     assert Session(model, text, stack="fe-cublas", device="cpu", capacity=8).claim() is None, "a stack without a target says nothing about one"
     with pytest.raises(AssertionError, match="reached a load"):  # through main(): the kernel table is printed without --check-kernels
         _sample_main(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"])
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert (
         "kernels, planned (decided before the load from model_samples/qwen_dense/configs.py; stack native" in out
         and "kernel identity, as planned: 8 of 20" in out
