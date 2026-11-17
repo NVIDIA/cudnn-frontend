@@ -21,9 +21,15 @@ Two more containers carry what a kernel on the stored formats hands to a block t
 consumer's operand has.  :func:`dequantize` reads both, so the gather out of the layout and the quantisation are launched by
 the block that consumes the operand, never by the one that produced it.
 
-A weight that a block multiplies on its stored format is kept beside its bf16 copy (``Dequantized.stored``): the merged
-8-bit codes with their one scale, as the loader had them before it dequantised them.  The copy stays, because the reference
-block and every fallback row read it; a family's memory sentence counts both.
+A weight is held in the forms the blocks of a run read it in (:class:`Dequantized`): its bf16 copy where a block reads
+one, and its stored form where a block multiplies on that -- the merged 8-bit codes with their one scale, or the packed
+4-bit codes with their block scales and their global scale, as the loader had them before it dequantised them.  A weight
+that every block of the run reads on its stored format has no copy.  The reference blocks of a run's checks read copies:
+for such a weight their copy is made for one call and dropped after it (:class:`OnDemand`), which also counts what
+that costs.  A family's memory sentence counts what is held and the largest copy made that way.  Such a copy is made
+from the bytes the weight's own block multiplies on, so it is a reference only while no block has written into them:
+the loader takes a checksum of every weight it keeps that way (:func:`stored_checksum`), and the checks of a run
+compare it before their first pass and after their last (``Dequantized.intact``).
 
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
@@ -59,6 +65,8 @@ import json
 import os
 import re
 import struct
+import sys
+import time
 import zlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Union
@@ -207,13 +215,114 @@ class Unquantized:
 
 @dataclass
 class Dequantized:
-    """A bf16 copy of code values (exact) and the scale a multiply applies to its result (a float or one scale per row).
-    ``stored`` is the stored tensor the copy was made from, kept where a block of the plan multiplies on the stored format
-    (a family's loader decides it from the plan); ``None`` everywhere else."""
+    """A weight as a multiply is handed it, in the forms the plans of a run read: ``data`` is the bf16 copy of its code
+    values (exact), ``scale`` the scale a multiply applies to its result (a float or one scale per row), ``stored`` the
+    stored tensor the copy is made from (a :class:`ScaledTensor` or a :class:`BlockScaledTensor`).  A family's loader
+    decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies on the stored
+    format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
+    loader of a weight it keeps on its stored format alone (:func:`stored_checksum`): what its stored bytes were at the
+    load, for the checks of the run to hold them to (``intact``)."""
 
-    data: torch.Tensor
+    data: Optional[torch.Tensor]
     scale: Union[float, torch.Tensor]
     stored: Optional[object] = None
+    checksum: Optional[tuple] = None
+
+    def __post_init__(self):
+        if self.data is None and self.stored is None:
+            raise ValueError("a weight is held as a bf16 copy, on its stored format, or as both; this one as neither")
+
+    def intact(self) -> bool:
+        """Whether the stored tensor holds the bytes it held at the load: its checksum taken again equals the loader's.
+        ``True`` for a weight the loader took none of (one that has its bf16 copy: its reference does not read the stored
+        bytes).  Reads the device: for a load and for the checks of a run, never inside a step."""
+        return self.checksum is None or stored_checksum(self.stored) == self.checksum
+
+    def bf16(self) -> torch.Tensor:
+        """The bf16 copy, for a multiply that reads one.  ``ValueError`` where the load kept the stored format alone: no
+        block of the plans it was made for reads a copy of this weight."""
+        if self.data is None:
+            raise ValueError(
+                "this multiply reads a bf16 copy of its weight, and the load kept that weight on its stored format alone: the weights of "
+                "this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+            )
+        return self.data
+
+
+def _word_sums(tensor: torch.Tensor) -> torch.Tensor:
+    """Three 64-bit sums over the bytes of one tensor, each row read as little-endian 64-bit words (a last word that is
+    not whole is filled with zeros): all words, the row sums weighted by the row, the column sums weighted by the column.
+    Each wraps at 64 bits.  A function of the bytes and the row length alone, however the tensor lies in its storage."""
+    tensor = tensor.contiguous()
+    tensor = tensor.reshape(tensor.shape[0], -1) if tensor.dim() > 1 else tensor.reshape(-1, 1)
+    per_word = 8 // tensor.element_size() if 8 % tensor.element_size() == 0 else 0
+    if sys.byteorder == "little" and per_word and tensor.shape[1] % per_word == 0 and tensor.storage_offset() % per_word == 0:
+        words = tensor.view(torch.int64)  # rows of whole words that start on a word of the storage (every weight of the published widths): no copy
+    else:  # any other tensor: the same words, put together byte by byte
+        raw = tensor.view(torch.uint8)
+        raw = torch.nn.functional.pad(raw, (0, -raw.shape[1] % 8))
+        shifts = torch.arange(0, 64, 8, dtype=torch.int64, device=raw.device)
+        words = (raw.reshape(raw.shape[0], -1, 8).to(torch.int64) << shifts).sum(-1)
+    rows, columns = words.sum(1), words.sum(0)
+
+    def weighted(sums):
+        return (sums * torch.arange(1, sums.numel() + 1, dtype=torch.int64, device=sums.device)).sum()
+
+    return torch.stack((rows.sum(), weighted(rows), weighted(columns)))
+
+
+def stored_checksum(stored) -> tuple:
+    """A checksum of a stored weight (a :class:`ScaledTensor` or a :class:`BlockScaledTensor`): three 64-bit sums per
+    tensor of it -- the codes, the block scales, a scale per row -- over its bytes read as 64-bit words: all of them,
+    the row sums weighted by the row and the column sums weighted by the column; and a scale that is one float, as it
+    is.  One changed byte moves the first sum; bytes exchanged between two rows, or along a row, move the others.
+
+    The loader takes it of every weight it keeps on its stored format alone, and the checks of a run take it again
+    (``Dequantized.intact``): the reference of such a weight is a copy made from these bytes, which a block that writes
+    into its weight would change for both sides.  It costs three reductions per tensor and one host read per weight, at
+    a load and in the checks, never in a step; it makes no copy of a tensor whose rows are whole 64-bit words."""
+    scale = stored.scale
+    per_row = isinstance(scale, torch.Tensor)
+    sums = torch.cat([_word_sums(tensor) for tensor in (*stored.tensors(), *((scale,) if per_row else ()))]).tolist()
+    return (*sums, *(() if per_row else (float(scale),)))
+
+
+class OnDemand:
+    """The bf16 copies a reader makes for itself of the weights a run keeps on their stored format alone -- the reference
+    blocks of the checks read copies, and no block of the run's plans does -- and what they cost.
+
+    ``operands(operands)`` returns the operands of one block call with, in place of every weight among them that has no
+    copy, a handle that has one, made now from the stored form.  The handle is the caller's for that call and is dropped
+    with it, so one such copy exists at a time and the weights of the session are never changed.  The copy is exact
+    (:func:`dequantize`): bit for bit the copy a load would have kept, as long as the stored bytes are those of the
+    load -- which is not this object's to know: the checks that use it compare the loader's checksum of every such
+    weight before and after (``Dequantized.intact``).
+
+    Counted over the life of the object: ``copies`` made, their ``bytes`` in all, the ``largest`` one (what is held at a
+    time) and the ``seconds`` they took, the device synchronised at both ends of each -- a reader of this kind is a check,
+    never a timed step."""
+
+    def __init__(self):
+        self.copies = self.bytes = self.largest = 0
+        self.seconds = 0.0
+
+    def operands(self, operands: tuple) -> tuple:
+        if not any(isinstance(o, Dequantized) and o.data is None for o in operands):
+            return operands
+        return tuple(self._with_copy(o) if isinstance(o, Dequantized) and o.data is None else o for o in operands)
+
+    def _with_copy(self, weight: Dequantized) -> Dequantized:
+        device = weight.stored.codes.device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        copy = dequantize(weight.stored).data
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self.seconds += time.perf_counter() - start
+        size = copy.numel() * copy.element_size()
+        self.copies, self.bytes, self.largest = self.copies + 1, self.bytes + size, max(self.largest, size)
+        return Dequantized(copy, weight.scale, weight.stored)
 
 
 def _e4m3(x: torch.Tensor) -> torch.Tensor:

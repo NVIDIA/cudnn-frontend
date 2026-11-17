@@ -320,9 +320,12 @@ and their release (`TMEM_COLS 32`, `HOLD_TMEM True`) are at the values the entry
 kernel ran, while the target kernel allocates 256 columns and releases them right after the accumulator read. The
 census lists both under `differences`; both orders write the same bytes.
 
-The kernel multiplies on the stored format, so the loader keeps the merged 8-bit codes of the in-projections beside
-their bf16 copies for a plan with this row (one more byte per weight element: 4.8 GiB on the published model, counted
-in the memory sentence). The copy stays, because the reference block and the fallback row of other row counts read it.
+The kernel multiplies on the stored format, so the loader keeps the merged 8-bit codes of the in-projections for a plan
+with this row (one byte per weight element: 4.8 GiB on the published model). It keeps the bf16 copy of a weight only
+where a block of the run reads one: a run in which every sequence count is this row's holds no copy of the
+in-projections (9.7 GiB on the published model), and a run with a sequence count on the fallback row, or with the row
+selected away, holds both. The reference blocks of the checks read copies; for these weights the checks make theirs for
+one call at a time ("What a run holds of a weight" below).
 The scale the kernel reads is the fp32 product of the operand's static scale and the weight's scale, one element built
 on the host once per layer. The row claims compute capability 10.0 and 1 to 32 rows -- where the target launches this
 kernel for the in-projections; it has run at 1, 4, 9, 16, 17 and 32 rows (the run table below). On every other class and from 33 rows the block stays on its multiply over a copy
@@ -374,9 +377,8 @@ block (640, 1, 1) and 80 B for the norm in every form, grid (128, 1, 1) or (112,
 compute capability 10.0 with 148 SMs. For the norm block and the in-projection all of it holds per call site. A
 difference fails the run with a sentence that names the block, and for a form the call and its site.
 
-**What this stack is not, today.** It is not a fast path: it holds the same bf16 copies as `fe-cublas` and, beside them,
-the stored 8-bit weights its projection entry multiplies on, needs that much more memory and issues every launch from
-Python. No timing of it means anything. And most target kernels do not run in the target's surroundings yet: the
+**What this stack is not, today.** It is not a fast path: every block but its target kernels reads the bf16 copies
+`fe-cublas` reads, and it issues every launch from Python. No timing of it means anything. And most target kernels do not run in the target's surroundings yet: the
 fused step, the norm and the in-projection wait for the launch before them and release the launch after them, the
 gate releases the launch after it, but around a target kernel that sits between fallback rows the launches are
 PyTorch's and cuBLAS's, which neither release early nor start early, so there both knobs are exercised and change
@@ -398,20 +400,24 @@ On compute capability 12.x neither the gate entry nor the norm entry serves; bot
 chains (`not yet (reference chain)`) in both stacks, and the census has no section for that class. The row of the
 projection entry claims compute capability 10.0 only.
 
-The stack was last run on compute capability 10.0 (2026-11-16, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
-line of every run names the PyTorch version as other than the recorded 2.14.0):
+The stack was last run on compute capability 10.0 (2026-11-17, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
+line of every run names the PyTorch version as other than the recorded 2.14.0). In every run of this table but two --
+the one with the in-projection selected away and the last -- the projection row serves each sequence count, so the
+run holds the in-projections on their stored codes alone and the reference of its checks read bf16 copies made on
+demand:
 
 | run | result |
 |---|---|
-| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 303 kernel launches and 25 copies; 10 are judged one by one. At 1 sequence the gather, the fused step, the gate, the five norm calls and the two in-projections (2 the target's own compiled kernels + 8 cuDNN Frontend entries with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 4 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, 1 of them not that of the nearest value; nothing outside -- and equal alone and among 4. The projection entry was inside the band of the reference multiply at both weight shapes (114 calls; the largest distance one bf16 unit, on fewer than 0.05 % of the elements, where the multiply over a copy it replaces is one unit off on 25.9 %), and equal alone and among 4. The gate entry was inside its band (350,208 bytes at 1 sequence, each the code of the nearest bf16 value; 1,400,832 at 4, one of them the code of the other value around the gated value, inside the margin), and equal alone and among 4 |
-| the four-layer model, `--stack native --layers 4 --sequences 1` | `[00] PASS`: all five forms a 64-layer model calls (the input norm of a later linear-attention layer is the fifth) and four in-projections, three at 16384 x 5120 from one instance and one at 14336 x 5120 from the other; 18 launches of a step judged one by one (4 the target's own compiled kernels + 14 cuDNN Frontend entries with byte-equal results), each in the recorded launch shape |
+| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 303 kernel launches and 25 copies; 10 are judged one by one. At 1 sequence the gather, the fused step, the gate, the five norm calls and the two in-projections (2 the target's own compiled kernels + 8 cuDNN Frontend entries with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 4 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, 1 of them not that of the nearest value; nothing outside -- and equal alone and among 4. The projection entry was inside the band of the reference multiply at both weight shapes (114 calls; the largest distance one bf16 unit, on fewer than 0.05 % of the elements, where the multiply over a copy it replaces is one unit off on 25.9 %), and equal alone and among 4. The gate entry was inside its band (350,208 bytes at 1 sequence, each the code of the nearest bf16 value; 1,400,832 at 4, one of them the code of the other value around the gated value, inside the margin), and equal alone and among 4. At each count the reference read 230 copies of in-projection weights made on demand (two per step and reader, 0.16 GiB the larger), and both weights held the bytes of their load before and after the checks (`stored weights`) |
+| the four-layer model, `--stack native --layers 4 --sequences 1` | `[00] PASS`: all five forms a 64-layer model calls (the input norm of a later linear-attention layer is the fifth) and four in-projections, three at 16384 x 5120 from one instance and one at 14336 x 5120 from the other; 18 launches of a step judged one by one (4 the target's own compiled kernels + 14 cuDNN Frontend entries with byte-equal results), each in the recorded launch shape. Its memory sentence asked for about 5.1 GiB; PyTorch reserved 5.3 GiB and the device grew by 5.5 GiB -- on the reduced models the sentence is an estimate (the last section has the runs) |
 | the one-layer model, `--stack native --layers 1 --sequences 1` | `[00] PASS`: the sixth form, `full_attention.first` -- the model is one attention layer, so the first norm of a step is its input norm. 6 launches of a step judged one by one (the gather, three norm calls, the in-projection at the attention layer's weight shape and the gate: 1 the target's own compiled kernel + 5 cuDNN Frontend entries with byte-equal results), each in the recorded launch shape; the three norm calls served by three instances, and the symbol of the first carries its form (`store`, `e4m3_static`, wait + release). The norm entry inside its band over 171 calls: 291,840 normed elements, 4 of them on the other bf16 value around the normalised value, and 601,920 codes and block scales, all those of the nearest value; the projection entry inside its band over 57 calls |
-| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 258 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 209 cuDNN Frontend entries with byte-equal results; the declared stand-in has no block yet), in the wiring order, each in the recorded launch shape; 6,876 kernel launches and 584 copies per traced step in all. The call log of a step: the five forms of the norm entry served 1, 47, 16, 64 and 1 calls, each from its own instance, and the two instances of the projection entry 48 and 16. Replay held; 8 of 8 provider blocks inside their bands; the norm entry over 2,064 calls with 4,014,080 normed elements, 45 of them on the other bf16 value, and 10,813,440 codes and block scales, 4 of them not those of the nearest value, nothing outside; the projection entry over 1,024 calls, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the gate entry over 256 calls with 1 of its 1,572,864 bytes the code of the other bf16 value around the gated value, inside the margin; the token line reported |
+| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 258 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 209 cuDNN Frontend entries with byte-equal results; the declared stand-in has no block yet), in the wiring order, each in the recorded launch shape; 6,876 kernel launches and 584 copies per traced step in all. The call log of a step: the five forms of the norm entry served 1, 47, 16, 64 and 1 calls, each from its own instance, and the two instances of the projection entry 48 and 16. Replay held; 8 of 8 provider blocks inside their bands; the norm entry over 2,064 calls with 4,014,080 normed elements, 45 of them on the other bf16 value, and 10,813,440 codes and block scales, 4 of them not those of the nearest value, nothing outside; the projection entry over 1,024 calls, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the gate entry over 256 calls with 1 of its 1,572,864 bytes the code of the other bf16 value around the gated value, inside the margin; the token line reported. The reference read 3,200 copies of in-projection weights made on demand, and the 64 weights held the bytes of their load before and after the checks; the memory lines are in the section on checkpoints |
 | the default run, `--stack fe-entries` | `[00] PASS`, the same lines; also as the L0 cell of the area's GPU test |
 | `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 9 remaining target launches (1 the target's own compiled kernel + 8 cuDNN Frontend entries with byte-equal results) in the recorded shape |
-| `--stack native --provider projection.fp8.in=cublas.bf16_dequantized`, 1 sequence | `[00] PASS`: the in-projection back on its multiply over a copy; `NOT CLAIMED (not the target set: projection.fp8.in selected by --provider; ...)`; the 8 remaining target launches (2 the target's own compiled kernels + 6 cuDNN Frontend entries with byte-equal results) in the recorded shape |
+| `--stack native --provider projection.fp8.in=cublas.bf16_dequantized`, 1 sequence | `[00] PASS`: the in-projection back on its multiply over a copy, so every weight has its copy and nothing is made on demand; `NOT CLAIMED (not the target set: projection.fp8.in selected by --provider; ...)`; the 8 remaining target launches (2 the target's own compiled kernels + 6 cuDNN Frontend entries with byte-equal results) in the recorded shape |
 | `--stack native --sequences 9,16` | `[00] PASS` at 9 and at 16 sequences: the projection entry in its 16-row token tile (147,712 B of shared memory per thread block, the grids as at 1 row), each launch in the shape the entry states; inside its band, and each sequence alone equal to itself among 9 and among 16; no identity is stated at these row counts |
 | `--stack native --sequences 17,32` | `[00] PASS` at 17 and at 32 sequences, the last row count of the projection row: the entry in its 32-row token tile (164,096 B of shared memory per thread block, the grids as at 1 row), each launch in the shape the entry states; inside its band, and each sequence alone equal to itself among 17 and among 32. From 17 rows the embedding's gather is PyTorch's vectorized gather, held by name like the kernel of fewer rows. A traced step is 302 kernel launches and 25 copies, 10 judged one by one; no identity is stated at these row counts |
+| `--stack native --sequences 17,33` | `[00] PASS` at both counts: at 33 the in-projection is on its multiply over a copy, so the load of the run keeps both forms of the in-projections -- the codes for the 17 sequences, the copies for the 33 -- and no copy is made on demand at either count |
 
 The fused step has the same launch shape in both of its forms, grid (96, 1, 1), block (256, 1, 1), 42,112 B at 1 row:
 that it waits and releases shows in its symbol and in its form, not in a launch record. With the norm entry on its
@@ -480,10 +486,16 @@ sequence and the default prompt: the copies, the state and working memory, which
 of this size (2 GiB for the default run). A run with this checkpoint held 51.5 GiB in PyTorch at its peak, reserved
 55.2 GiB from the device, and the device grew by 55.4 GiB. A GPU with less free memory than the 56.7 GiB is a `SKIP`
 before a tensor is read. A 32 GB GPU cannot run this stack with a checkpoint of this size; it prints the
-memory sentence and exits 0. On compute capability 10.0 the stack `native` also keeps the stored 8-bit weights of the
-in-projections, 4.8 GiB for this checkpoint: its plan asks for about 62.1 GiB, and a run reserved 61.7 GiB and the
-device grew by 61.9 GiB. A stack on the stored formats alone, which needs less than half, arrives with a later step of
-this area.
+memory sentence and exits 0. On compute capability 10.0 the stack `native` keeps the in-projections on their stored
+8-bit codes alone, 4.8 GiB where their copies are 9.7 GiB: it holds 45.3 GiB of weights, and its plan asks for about
+52.6 GiB -- the weights, the state, working memory (an eighth of the weights held and a quarter of the stored tensors
+kept) and 0.16 GiB for the one copy its checks make at a time. A run held 46.6 GiB in PyTorch at its peak, reserved
+51.7 GiB, and the device grew by 51.9 GiB. The working memory is an allowance taken from runs, not a bound: the room
+a run took beyond its weights did not shrink with the copies it left out -- 5.3 GiB with every weight as a copy, 6.9 GiB
+with the stored in-projections beside every copy (a run whose plans read both forms; its plan asks for about
+63.3 GiB), 6.6 GiB with the stored in-projections alone. The checks of that run read 3,200 copies of in-projection
+weights made on demand, 64 per step and reader, and printed what they cost. A stack on the stored formats alone,
+which needs less than half, arrives with a later step of this area.
 
 The prompt goes through the decode step, one step per token (the `first token` line says so), and a step issues 484 block
 calls from Python: on the run above about twelve thousand kernel launches and a thousand small copies per step, with the
@@ -806,9 +818,50 @@ the same statuses as on 10.0 and 10.3, and this sample's run agrees: the gate he
 the two projection multiplies (cuBLAS) of a sequence differ in bytes between 1 and 4 sequences, inside their band; the run
 prints it. On 10.7 every block was equal.
 
-The provider stack and the reference stack read the same bf16 copies of the weights and use the same quantisers, so the
-checks above cannot see an error in either. `test/python/misc/test_model_samples_weights.py` pins them against a decode
-written from the format definitions.
+The provider stack and the reference stack read the same weights through the same loader and the same dequantisation
+-- the reference reads bf16 copies, kept by the load or made from the stored tensor for one call -- and use the same
+quantisers, so the checks above cannot see an error in either. `test/python/misc/test_model_samples_weights.py` pins
+them against a decode written from the format definitions.
+
+### What a run holds of a weight
+
+A checkpoint stores a multiplied weight as 8-bit codes with one scale (the projections) or as packed 4-bit codes with a
+block scale per 16 elements and a global scale (the MLP's two multiplies, the output head). The loader merges the
+weights of one multiply and then keeps each in the forms the blocks of the run read, decided from the plans of every
+sequence count before the first load:
+
+| a block of the run | what the load keeps of its weight |
+|---|---|
+| reads a bf16 copy (every fallback row; every block of `--stack reference`) | the copy, 2 bytes per element |
+| multiplies on the stored format (an adapter that says so: `stored_weights`) | the merged stored tensor: 1 byte per element of an 8-bit weight, 0.5625 of a 4-bit one |
+| both kinds, at different sequence counts or through `--provider` | both |
+
+So a weight that every plan of the run multiplies on its stored format has no copy. Today one row does that, the FP8
+projection entry for the in-projections on compute capability 10.0; no row multiplies on a 4-bit weight yet, and the
+loader keeps those forms for a host test's own blocks only. A session that runs on weights loaded for another plan and
+finds a form missing ends in an error that names the block, before its first step.
+
+The reference blocks of the checks multiply bf16 copies. For a weight without one the checks make the copy
+themselves, for one call, and drop it after the call (a host test holds that on the tensors: none of an earlier call
+is alive when the next is made). Such a copy is made from the stored bytes as they are at the call -- the bytes the
+weight's own block multiplies on. As long as no block has written into its weight it is bit for bit the copy a load
+would have kept, and no check line depends on which of the two a run has (a host test loads the same plan both ways
+and compares every line). A block that did write would move its reference with it and pass its band, so the checks
+hold that condition themselves: the loader takes a checksum of every weight it keeps on its stored format alone, and
+the checks take it again before their first pass and after their last. A weight whose stored bytes are not those of
+the load fails the run, named by block and layer (`stored weights`); in a run that keeps its copies the same defect
+fails the block's band, because the reference reads the copy of the load. The memory sentence names the checks' part
+-- the largest such copy, one at a time -- and the checks print what the copies cost:
+
+```text
+  this stack needs about 3.8 GiB on this GPU for 1 and 4 sequences, one count after the other, 0.16 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none); 177.7 GiB are free
+  stored weights    2 of 2 weights this run keeps on their stored format alone hold the bytes of their load, before the checks and after them: the reference's copies were made from what was loaded    PASS
+  on demand         the reference read 230 bf16 copies of weights this run keeps on their stored format alone (projection.fp8.in): each made for one call and dropped after it; the largest 0.16 GiB, 33.7 GiB in all, 0.1 s of the checks (orientation only)
+```
+
+A run in which every weight has its copy prints the memory sentence without that part and neither of the two lines:
+the default stack's output is what it was. Only the reference session of the checks makes copies per call: a session
+whose own steps are timed, traced or checked is refused such a maker when it is built.
 
 ## The kernel check
 
@@ -899,6 +952,19 @@ copies, the working memory and the first launch are counted once, the state per 
 prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
 6.9 GiB of growth on the device over the whole run.
+On the reduced models the memory sentence is an estimate: its working memory is a flat 2 GiB, and the runs of this page
+miss it by a few tenths of a GiB in either direction, with the copies of the in-projections, with both of their forms and
+with their codes alone. Over these runs on compute capability 10.0 (one to four layers, 1 to 33 sequences) PyTorch reserved
+between 0.4 GiB less and 0.3 GiB more than the sentence said, and the device grew by about 0.2 GiB more than PyTorch
+reserved. The two widest: `--stack native --sequences 33`, where every weight has its copy, asked for about 3.8 GiB,
+reserved 4.1 GiB and grew the device by 4.3 GiB; the four-layer `native` run, with the in-projections on their codes
+alone, asked for about 5.1 GiB, reserved 5.3 GiB and grew it by 5.5 GiB (the same run with those copies kept asked for
+about 5.5 GiB, reserved 5.5 GiB and grew it by 5.7 GiB). The room a run takes beyond its weights does not follow the
+copies it leaves out: with every multiplied weight of the two-layer model on its stored format alone (a driver's own
+blocks, 1.5 GiB of copies not made) a run asked for about 3.2 GiB, reserved 2.7 GiB and grew the device by 2.9 GiB.
+So a GPU whose free memory is within half a GiB of the sentence can still fail to allocate after the plan with these
+models; with the published checkpoint the working memory is an eighth of the weights held and the runs stayed inside
+the sentence (the section on checkpoints).
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
 Blackwell GPU: a second or two to plan, which includes building the entries' kernels for both sequence counts (1.1 to
 1.7 s in the runs since that build became part of the plan, 3.6 s in the first of them; built after the load, the fused

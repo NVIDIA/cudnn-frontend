@@ -67,8 +67,16 @@ does not hold is printed as not known and ignored, so a new name for one of them
    what a consumer on a fallback row needs beyond the kernel's bytes -- a gather out of the kernel's scale layout, a
    quantisation the target does with a launch of its own -- is launched by that consumer, when it reads its operand
    (`weights.dequantize`). An adapter that multiplies on the stored format of its weight says so (`stored_weights`):
-   the load of the session then keeps that format beside the bf16 copy for the block, as the loader had it, and the
-   memory sentence counts it; the copy stays, because the reference block and every fallback row read it. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   the load of the session then keeps that format for the block, as the loader had it, and keeps the bf16 copy of a
+   weight only where a block of the run's plans reads one -- which forms a weight has is decided from the plans of
+   every sequence count before the first load, never at run time, and a block that finds its form missing is an
+   error that names it. The reference blocks of the checks read copies: where the load kept none the checks make
+   theirs for one call at a time (`weights.OnDemand`), the memory sentence states that part, and the checks print
+   what the copies cost. Such a copy is made from the bytes the weight's own block multiplies on, so it is a
+   reference only while those are the bytes of the load: the loader takes a checksum of every weight it keeps on its
+   stored format alone and the checks compare it before their first pass and after their last (`stored weights`: a
+   weight that was written to fails the run by block and layer). An adapter never writes into its weight. Only the
+   reference session of the checks makes copies per call; any other session is refused the maker. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -415,9 +423,10 @@ Each of these passed every test and every GPU run of the first version; a host t
   have built a form no call of a two-layer model is made in. A host test that pins the forms a run builds holds it.
 - A kernel on the stored format needs the stored format. The loader had the merged 8-bit codes in hand and freed them
   after the copy; it now keeps them for the blocks that say they multiply on them, asked by the plan of the session
-  and of the sessions that follow on its weights. The copy stays for the reference, so the memory sentence grows, and
-  the allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the
-  stored bytes alone. Measure the sentence against a run whenever what a stack holds changes.
+  and of the sessions that follow on its weights. At that point the copy stayed for the reference (it no longer
+  does: the last section of this guide), so the memory sentence grew, and the allocator's slack with it: the first
+  checkpoint run took 0.4 GiB more than a sentence that had added the stored bytes alone. Measure the sentence
+  against a run whenever what a stack holds changes.
 - With a second exactly judged row behind it, a launch behind a layer's input norm fails the check: it now sits
   between two rows that are judged one by one. The same launch behind the in-projection fails in a linear-attention
   layer (the fused step follows) and is counted as the reference chain's in an attention layer. What the check
@@ -507,3 +516,49 @@ Each of these passed every test and every GPU run of the first version.
   the loop is, and held by a run with two counts.
 - A sentence about a stream is held on a device only by a test that reads that stream there. "The seeded run writes
   nothing to standard output" stood in three READMEs while the GPU test dropped standard output.
+
+## What making the loader keep what the plans read taught
+
+- A weight has the forms its readers read, and the readers are the plans of the whole run. The projection row kept
+  the stored codes beside the copy for one block. The rule for every block is two questions asked of every plan
+  before the first load: does some plan multiply on the stored format (keep it), does every plan (make no copy). A
+  sequence count on a fallback row, or a row selected away, keeps the copy; nothing is decided at run time.
+- The reference of the checks is a reader too, and the one reader that may come without its form. It gets a bf16
+  copy for one call, made by the session of the reference and by the tap of the checked pass -- never inside a
+  block, whose call neither reads the device nor synchronises. Such a copy is bit for bit the copy a load keeps as
+  long as no block has written into its weight, and a host test loads the same plan both ways and compares every
+  check line.
+- A reference made from the provider's own operand is no reference until that operand is held still. With the copy
+  gone, the reference's copy of a weight is made from the bytes its block multiplies on: a stand-in that zeroed half
+  of its weight from its first call on passed replay, every block line (distance 0.00), the tokens and the kernel
+  check, where the same stand-in in a run that kept its copies was 255 units off on half of its elements. The loader
+  now takes a checksum of every weight it keeps on its stored format alone, the checks take it again before their
+  first pass and after their last, and a changed weight fails the run by name. When a change takes an independent
+  operand away from a check, give the check a way to see that the shared one has not moved -- and test the defect in
+  both forms of the run.
+- What a memory sentence rests on is tested on the thing itself. "One copy at a time" was held by one run's peak; a
+  defect that kept every copy alive passed every host module, and a two-layer run would have held 34 GiB more
+  without a failure. A host test now holds weak references to the copies' tensors (none of an earlier call alive
+  when the next is made, none when the checks return), and the GPU cell holds PyTorch's peak below the sentence.
+- An option that exists for one caller is refused for every other. The maker of copies was a public parameter of
+  every session; on a checked session it put a cast and two synchronisations in front of blocks of its timed and
+  traced steps, and the run passed. It is refused when the session is built, and such a session is not traced.
+- On the reduced models the memory sentence is an estimate that runs miss by a few tenths of a GiB in either
+  direction (a flat 2 GiB of working memory), with and without their copies; leaving copies out neither widened nor
+  narrowed that in a way the runs agree on (2.3 GiB of room with the in-projections of four layers on their codes
+  alone, 1.7 GiB with every multiplied weight of two layers). State such a sentence with the runs beside it, and do
+  not fit a term to one run.
+- The memory a run takes beyond its weights does not shrink with the copies it leaves out. Without the 9.7 GiB of
+  in-projection copies the device grew by 10 GiB less, but the room beyond the weights held stayed where the stored
+  tensors had put it: 6.6 GiB, against 6.9 GiB with the codes beside every copy and 5.3 GiB with copies alone. The
+  first sentence, an eighth of what is held, was 0.5 GiB short of the run. The lesson of the row before, again:
+  measure the sentence against a run whenever what a stack holds changes.
+- A form that is missing fails where the plan is, not where the multiply is. A session on weights that were loaded
+  for another plan failed at the adapter's first call, in the adapter's words, and a block that reads a copy would
+  have ended in an error about `None`. The load of the session now names the block and the form before anything is
+  compiled or stepped.
+- Arithmetic that was right for one format was wrong for the next. The bytes of a step took a stored weight's bytes
+  off its copy's, which is right at one byte per element and wrong at 0.5625. State such a formula in both forms: the
+  copy's two bytes off, the stored bytes on.
+- A line in GiB reads 0.00 on the geometry of a host test, so no test held its figures. The text of the cost line
+  is a function, and a host test calls it on the figures of a run at the published widths.

@@ -14,7 +14,8 @@ An adapter to an entry that states its launch also answers ``launch_facts(rows)`
 into its call log.  An adapter names the block the tie-out compares it with (``twin``).  An adapter whose row names several
 call sites (``ProviderRow.sites``) holds one entry instance per form and serves each call with the instance of ITS site: the
 family's step hands the site over as the block's last operand, and the adapter decides nothing.  An adapter that multiplies
-on the stored format of its weight says so (``stored_weights``): the loader then keeps that format beside the bf16 copy.
+on the stored format of its weight says so (``stored_weights``): the loader then keeps that format, and it keeps the bf16
+copy of that weight only where another block of the run's plans reads one.
 """
 
 from __future__ import annotations
@@ -106,8 +107,10 @@ class BlockBase:
     kernels: Tuple[Kernel, ...] = ()
     per_row: Tuple[int, ...] = (0,)
     state_args: Tuple[int, ...] = ()
-    #: whether the block multiplies on the stored format of its weight: a session's load then keeps that format beside the
-    #: bf16 copy for the block (``weights.Dequantized.stored``), and its memory sentence counts it
+    #: whether the block multiplies on the stored format of its weight (8-bit codes with their scale; packed 4-bit codes with
+    #: their block scales and global scale).  A session's load then keeps that format for the block
+    #: (``weights.Dequantized.stored``) -- and no bf16 copy of the weight where every plan of the run has such a block for
+    #: it -- and its memory sentence counts what is kept.  A block that does not say so reads the bf16 copy
     stored_weights = False
 
     def __init__(self, row, model, facts, options):

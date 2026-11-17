@@ -157,6 +157,11 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     compute capability 10.0 the FP8 projection entry for the in-projections (one instance per weight shape) inside the
     band of the reference multiply, and on every other class that block on its multiply over a copy; the
     kernel check on every launch of the traced steps; the census line, which claims nothing while a row is a fallback.
+    Where the projection entry serves both sequence counts the run holds the in-projections on their stored codes alone,
+    so the reference of the checks makes its own bf16 copies: the run says that the stored bytes they are made from are
+    those of the load (``stored weights``) and what the copies cost (``on demand``), and PyTorch's peak stays below the
+    memory sentence -- one copy at a time, where all of them together are several times that sentence.  On every other
+    class every weight has its copy and neither line is printed.
     In a fresh interpreter: the kernel check reads kernel names from the profiler, which names them wrongly in a process
     that has unloaded a kernel module (the module docstring)."""
     if not torch.cuda.is_available():  # decided here, before a child is started
@@ -190,7 +195,26 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert len(served) == 2 and all(line.count(" x cudnn.Fp8ProjectionDecode #") == 2 for line in served), "one instance per weight shape"
         stated = [line for line in out.splitlines() if line.strip().startswith("projection.fp8.in at ") and "; the entry states " in line]
         assert len(stated) == 4 and all("block (256, 1, 1), shared memory" in line for line in stated), "both shapes, at both sequence counts"
+        made = [line for line in out.splitlines() if line.startswith("  on demand ")]
+        assert len(made) == 2 and all(
+            "weights this run keeps on their stored format alone (projection.fp8.in)" in line for line in made
+        ), "no bf16 copy of the in-projections is held: the reference of the checks made its own, at both sequence counts"
+        assert (
+            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)" in out
+        ), "and the memory sentence says so"
+        held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
+        assert len(held) == 2 and all(
+            line.startswith("  stored weights    2 of 2 weights this run keeps on their stored format alone hold the bytes of their load, ")
+            and line.endswith("    PASS")
+            for line in held
+        ), "the copies were made from the bytes of the load: no block wrote into its weight, at both sequence counts"
+        # one copy at a time: the copies of a count are 33.7 GiB in all, and what PyTorch held at its peak is below the sentence
+        need = float(out.split("this stack needs about ", 1)[1].split(" GiB", 1)[0])
+        peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
+        assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
     else:
+        assert "\n  on demand " not in out and " for the checks (" not in out, "every weight has its bf16 copy: nothing is made on demand"
+        assert "\n  stored weights " not in out, "and the reference reads the copies of the load: no stored bytes to hold"
         assert "cudnn.Fp8ProjectionDecode" not in out, "the row claims compute capability 10.0 only"
         assert any(line.split()[:1] == ["projection.fp8.in"] and line.endswith("fallback: bf16 copy of 8-bit weights") for line in out.splitlines())
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
