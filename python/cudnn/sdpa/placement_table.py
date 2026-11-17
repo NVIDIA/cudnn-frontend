@@ -839,6 +839,34 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "dense", "causal_br", True, "gqa", True): Entry("ge", 3.5, "sm80_decode_20261112", "tiles"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", False): Entry("always", None, "sm80_decode_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", True): Entry("always", None, "sm80_decode_20261112"),
+    # study sm80_decode_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE dbae6eec5; SM80 decode / MTP / verify classes no study
+    # answered, found by re-timing the a100 nightly on the branch: ar_dit d128 MHA MTP, MiMo-V2 SWA verify (d192 x V128, window 128
+    # + sink), gemma4 SWA paged d256 (window 1024), d192 x V128 and paged d256 single-row decode; 1580 train cells fitted under the
+    # criterion, a 96-cell holdout scored once, plus a 24-cell supplement for the windowed single-row twins). FROST runs 0.28-0.55
+    # of the backend on the windowed classes (the nightly ran them on the backend at 2.2-6x); dense d256 single-row decode failed
+    # its holdout (1.53) and keeps the hand rules.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", False): Entry(
+        "le", 5.792, "sm80_decode_gaps_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", True): Entry(
+        "le", 5.792, "sm80_decode_gaps_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "q1", "dense", "none", False, "gqa", False): Entry("ge", 23.824, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "q1", "dense", "none", False, "gqa", True): Entry("ge", 23.325, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "q1", "paged", "none", False, "gqa", False): Entry("ge", 8.5, "sm80_decode_gaps_20261117", "tiles"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "q1", "paged", "none", False, "gqa", True): Entry("ge", 30.823, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "window", True, "gqa", False): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "window", True, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", False): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 31.5, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 31.001, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("le", 6.5, "sm80_decode_gaps_20261117", "tiles"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("le", 32.001, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "verify", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_decode_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "verify", "paged", "window", False, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
     # study sm80_paged_wide_verify_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 688f00136; paged speculative decode with wide heads: D576 x V512 and
     # d512 at s_q 5-16, d192 x V128 at s_q 2-16; groups 1-128, b 1-64, KV 8k / 128k on and off the tile; 960 train cells, a 100-cell
     # holdout over other head pairs scored once). FROST runs 0.13-0.20 of the backend; the a100 nightly (run-557) ran these on the
