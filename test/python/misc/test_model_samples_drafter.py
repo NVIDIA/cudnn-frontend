@@ -506,9 +506,16 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
     again = QwenDenseDrafter.describe(disk, model, draft_vocab=str(tmp_path / "ids.json"))
     assert again == drafter and set(disk.specs) == set(of_model) | set(names) and read == []
 
-    stages = Stages()
-    weights = drafter.load(disk, "cpu", stages)
+    stages, device, asked = Stages(), torch.device("cpu"), []
+    plain_load = Checkpoint.load
+    monkeypatch.setattr(
+        Checkpoint, "load", lambda checkpoint, name, where, as_format="stored": (asked.append((name, where)), plain_load(checkpoint, name, where, as_format))[1]
+    )
+    weights = drafter.load(disk, device, stages)
     assert list(stages.seconds) == ["read", "quantise", "merge"], "the load of a checkpoint: read, quantise, and merge where a weight has parts"
+    # the output head is read whole on the CPU, whatever the device is, and only its listed rows go to the device; every other tensor is read to the device
+    assert [where for name, where in asked if name == "lm_head.weight"] == ["cpu"] and len(asked) == 18
+    assert all(where is device for name, where in asked if name != "lm_head.weight")
     head_keys = ["lm_head.weight", "lm_head.weight_scale", "lm_head.weight_scale_2", "lm_head.input_scale"]
     wanted = [key for key, _, _ in manifest[:16]] + head_keys
     assert sorted(set(read)) == sorted(wanted), "what a load reads of the checkpoint: the drafter's list and nothing else"
