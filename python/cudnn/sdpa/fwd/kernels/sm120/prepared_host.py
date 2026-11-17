@@ -409,6 +409,10 @@ def fp8_host(
     thd_origin_ptrs,
     thd_origin_caps,
     thd_origin_specs: cutlass.Constexpr,
+    scale_s_ptr: Optional[cute.Pointer],
+    descale_s_ptr: Optional[cute.Pointer],
+    scale_s_value: Optional[cutlass.Float32],
+    descale_s_value: Optional[cutlass.Float32],
     stream: cuda_driver.CUstream,
 ):
     q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
@@ -449,6 +453,11 @@ def fp8_host(
     if cutlass.const_expr(kernel.split_kv == 1 and has_amax):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict(prepared=True)
+    if cutlass.const_expr(scale_s_ptr is not None or scale_s_value is not None):
+        kwargs.update(
+            scale_s_t=scalar(scale_s_ptr) if cutlass.const_expr(scale_s_ptr is not None) else scale_s_value,
+            descale_s_t=scalar(descale_s_ptr) if cutlass.const_expr(descale_s_ptr is not None) else descale_s_value,
+        )
     if cutlass.const_expr(thd_origin_specs is not None):
         origins = tuple(None if ptr is None else cute.make_tensor(ptr, cute.make_layout((problem_size[0] + 1,), stride=(1,))) for ptr in thd_origin_ptrs)
         kwargs.update(thd_origins=origins, thd_origin_specs=thd_origin_specs)
@@ -507,6 +516,7 @@ def compile_host(
     kv_dtype=None,
     thd_origin_specs=None,
     bias_dtype=None,
+    s_scales=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -518,6 +528,11 @@ def compile_host(
         return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
     fp8 = output_dtype is not None
+    if s_scales is not None:
+        if not fp8 or len(s_scales) != 2 or any(type(host) is not bool for host in s_scales):
+            raise ValueError("public S scales require per-tensor FP8 and two host/device mode flags")
+        if cache_key is not None:
+            cache_key = f"{cache_key}:public_s_scales:{s_scales}"
     if bias_dtype is not None and (fp8 or getattr(kernel, "page_size", 0) or thd_origin_specs is not None):
         raise NotImplementedError("SM120 additive bias requires dense unpaged FP16/BF16 without THD origins")
     strides = (cutlass.Int64(0),) * 3
@@ -576,6 +591,16 @@ def compile_host(
         (cutlass.Int64(0),) * 5 if thd_origin_specs is not None else None,
         thd_origin_specs,
         *((ptr(bias_dtype), strides, (cutlass.Int32(0), cutlass.Int32(0))) if bias_dtype is not None else ()),
+        *(
+            (
+                ptr(cutlass.Float32, 4) if s_scales is not None and not s_scales[0] else None,
+                ptr(cutlass.Float32, 4) if s_scales is not None and not s_scales[1] else None,
+                cutlass.Float32(0.0) if s_scales is not None and s_scales[0] else None,
+                cutlass.Float32(0.0) if s_scales is not None and s_scales[1] else None,
+            )
+            if fp8
+            else ()
+        ),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

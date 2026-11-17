@@ -51,6 +51,9 @@ def _case(
     independent_o_offsets=False,
     record=None,
     output_batch_stride=0,
+    s_scale_host=(False, False),
+    s_scale_source="buffer",
+    s_scale_pair=(1.0, 1.0),
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -93,15 +96,25 @@ def _case(
             buffers[name], tensors[name], vp[tensor] = value, tensor, value
         kwargs.update(use_padding_mask=True, seq_len_q=tensors["seq_q"], seq_len_kv=tensors["seq_kv"])
     for name, val in (("descale_q", 0.8), ("descale_k", 0.9), ("descale_v", 0.7), ("descale_s", 1.0), ("scale_s", 1.0), ("scale_o", 1.3)):
-        t = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, name=name)
-        buf = torch.full((1,), val, device="cuda", dtype=torch.float32)
+        if name in ("scale_s", "descale_s"):
+            val = s_scale_pair[("scale_s", "descale_s").index(name)]
+            if s_scale_source == "omitted":
+                continue
+            if s_scale_source == "embedded":
+                t = g.tensor_scalar(float(val), cudnn.scalar_type.RUNTIME_PARAM, name=name).set_data_type(cudnn.data_type.FLOAT)
+                tensors[name], kwargs[name] = t, t
+                continue
+        host = s_scale_host[("scale_s", "descale_s").index(name)] if name in ("scale_s", "descale_s") else False
+        t = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, name=name, is_pass_by_value=host)
+        buf = torch.full((1,), val, device="cpu" if host else "cuda", dtype=torch.float32)
         buffers[name], tensors[name], vp[t] = buf, t, buf
         kwargs[name] = t
     if sink is not None:
         t = g.tensor_like(sink)
         buffers["sinks"], tensors["sinks"], vp[t] = sink, t, sink
         kwargs["sink_token"] = t
-    o, lse, _, am = g.sdpa_fp8(q=tensors["q"], k=tensors["k"], v=tensors["v"], attn_scale=1 / math.sqrt(d), generate_stats=stats, **kwargs)
+    o, lse, amax_s, am = g.sdpa_fp8(q=tensors["q"], k=tensors["k"], v=tensors["v"], attn_scale=1 / math.sqrt(d), generate_stats=stats, **kwargs)
+    amax_s.set_data_type(cudnn.data_type.FLOAT).set_dim([1] * 4).set_stride([1] * 4)
     out_type = {
         torch.bfloat16: cudnn.data_type.BFLOAT16,
         torch.float16: cudnn.data_type.HALF,
@@ -161,6 +174,15 @@ def _case(
         g.create_execution_plans([cudnn.heur_mode.A])
     else:
         g.create_execution_plan(*record)
+    if record is not None:
+        from cudnn.engines.engine_ids import is_python_engine
+
+        if not is_python_engine(record[0]):
+            g.select_plan(len(g.plans) - 1)
+            g.check_support()
+            g.build_plans()
+            workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+            return g, vp, workspace, buffers, tensors
     chosen = select_engine(g, fp8_engine_names(arch), **({"pack_gqa": False} if arch == "sm120" else {}))
     if (chosen.knobs.split_kv or 1) != split_kv:
         from dataclasses import replace

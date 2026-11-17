@@ -164,6 +164,27 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
                 raise ValueError("cudnn.sdpa: this specialization does not produce amax_o")
             ptr = f.ptr
         patches[name + "_ptr"] = ptr
+    if quant.s_scales is not None:
+        # Keep the independent test oracle aligned with the public host ABI.
+        # This retired Python path is never selected by production execution.
+        import ctypes
+
+        for name, host, default in zip(("scale_s", "descale_s"), quant.s_scales, quant.s_defaults):
+            f = facts.get(name)
+            if f is None and default is not None:
+                patches[name + "_value"] = default
+                continue
+            if f is None:
+                raise ValueError(f"cudnn.sdpa: {name} is required by this specialization")
+            if f.dtype != "float32" or f.numel != 1 or not f.contiguous or (f.span >= 0 and f.span < 1) or not f.ptr or f.ptr % 4:
+                raise ValueError(f"cudnn.sdpa: {name} requires one aligned float32 element with sufficient storage")
+            if host:
+                if f.device[0] != 1:
+                    raise ValueError(f"cudnn.sdpa: {name} requires an observed CPU scalar")
+                patches[name + "_value"] = ctypes.c_float.from_address(f.ptr).value
+            else:
+                _on_plan_device(spec, name, f)
+                patches[name + "_ptr"] = f.ptr
     # Scalar output must not overwrite any input or caller output. Workspace alias
     # detection uses each operand's declared element width, including FP8 O.
     amax = patches["amax_o_ptr"]

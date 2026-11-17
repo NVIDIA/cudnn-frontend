@@ -4720,6 +4720,24 @@ def _install_captured_builders() -> None:
                     raise TypeError(f"{op}() got multiple values for {k!r}")
                 kwargs[k] = v
             drop = kwargs.pop("dropout", None)
+            if op == "sdpa_fp8":
+                has_s = kwargs.get("scale_s") is not None
+                has_ds = kwargs.get("descale_s") is not None
+                if has_s != has_ds:
+                    raise ValueError("sdpa_fp8: supply scale_s and descale_s together, or omit both")
+                if not has_s:
+                    q = kwargs.get("q")
+                    q_type = q.get_data_type() if isinstance(q, Tensor) else None
+                    if q_type is None and q is not None and hasattr(q, "dtype"):
+                        q_type = _torch_to_cudnn_data_type(q.dtype)
+                    q_type = q_type or self._context.io_data_type
+                    if q_type != cudnn.data_type.FP8_E4M3 or drop is not None:
+                        raise ValueError("sdpa_fp8: omitted S scales require E4M3 input without dropout; supply an explicit pair")
+                    # Declare the same operands before either provider is selected.
+                    # Runtime PBV works on 9.24; descriptor compile-time constants
+                    # have a separate backend defect on older releases.
+                    for role, value in (("scale_s", 256.0), ("descale_s", 1.0 / 256.0)):
+                        kwargs[role] = self.tensor_scalar(value, cudnn.scalar_type.RUNTIME_PARAM, name=f"{name_}::{role}").set_data_type(cudnn.data_type.FLOAT)
             out_kwargs = spec.get("out_kwargs", ())
             for k, v in kwargs.items():
                 if v is None:

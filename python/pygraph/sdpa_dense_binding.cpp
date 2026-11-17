@@ -5,6 +5,7 @@
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 #include "sdpa_mxfp8_binding.h"
+#include "sdpa_s_scale_binding.h"
 #include "cudnn_frontend.h"
 #include <memory>
 
@@ -310,6 +311,8 @@ class SdpaDenseBinder {
         claim_counter_ = py::hasattr(spec, "claim_counter") && flag("claim_counter");
         if (claim_counter_ && (split_ != 1 || quantized_ || paged_ || ragged_ || seq_kv_ || has_gate_ || block_output_))
             invalid("a work-item claim counter needs a dense unsplit half plan without KV lengths, paging or a gate");
+        if (quantized_ && py::hasattr(quant, "s_scales") && !quant.attr("s_scales").is_none())
+            s_scales_ = std::make_unique<SdpaSScaleBinding>(spec);
         auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
@@ -370,9 +373,7 @@ class SdpaDenseBinder {
     }
     BoundLaunch
     bind_launch(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream, int64_t workspace) {
-        if (indices.size() != (block_output_ ? NumRoles
-                               : mx_scales_  ? MxNumRoles
-                                             : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
+        if (indices.size() != quant_role_prefix() + (s_scales_ ? 2 : 0))
             invalid("native dense binding has the wrong number of role indices");
         auto facts = read_native_operand_views(pack, indices);
         if (block_output_ && output_pack_ == 2 && facts[O].filled && facts[O].dtype.code == kDLFloat4_e2m1fn &&
@@ -529,7 +530,7 @@ class SdpaDenseBinder {
                 if (!f.filled) continue;
                 const auto bytes = storage_span(f);
                 if (bytes && workspace < add(f.pointer, bytes) && f.pointer < counter_end)
-                    invalid("the work-item claim counter's workspace overlaps " + std::string(names[role]));
+                    invalid("the work-item claim counter's workspace overlaps " + std::string(role_name(role)));
             }
         }
         put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : claim_counter_ ? workspace : 0));
@@ -545,7 +546,7 @@ class SdpaDenseBinder {
                     if (!f.filled) continue;
                     const auto bytes = storage_span(f);
                     if (bytes && workspace < add(f.pointer, bytes) && f.pointer < end)
-                        invalid("split workspace overlaps " + std::string(names[role]));
+                        invalid("split workspace overlaps " + std::string(role_name(role)));
                 }
             }
             const auto partial_lse = add(workspace, lse_offset_);
@@ -669,6 +670,15 @@ class SdpaDenseBinder {
     }
 
    private:
+    size_t
+    quant_role_prefix() const {
+        return block_output_ ? NumRoles : (mx_scales_ ? MxNumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles));
+    }
+    const char *
+    role_name(size_t role) const {
+        return s_scales_ && role >= quant_role_prefix() ? SdpaSScaleBinding::name(role - quant_role_prefix())
+                                                        : names[role];
+    }
     void
     reset_claim_counter(int64_t workspace, const py::object &stream) const {
         // The claim counter starts at zero for this launch, on its stream; under capture this is a memset node, so
@@ -722,7 +732,7 @@ class SdpaDenseBinder {
                 continue;
             const auto bytes = storage_span(other);
             if (bytes && f.pointer < add(other.pointer, bytes) && other.pointer < end)
-                invalid("sf_o overlaps " + std::string(names[role]));
+                invalid("sf_o overlaps " + std::string(role_name(role)));
         }
         frame[block_index_] = py::int_(f.pointer);
     }
@@ -753,6 +763,7 @@ class SdpaDenseBinder {
             pointers[role - DescaleQ]              = ptr;
             frame[quant_indices_[role - DescaleQ]] = py::int_(ptr);
         }
+        if (s_scales_) s_scales_->bind(facts, quant_role_prefix(), &frame);
         const auto amax = pointers[AmaxO - DescaleQ], amax_end = add(amax, 4);
         if (facts[AmaxO].filled && workspace < amax_end && amax < end)
             invalid("prepared FP8 workspace overlaps amax_o");
@@ -764,8 +775,8 @@ class SdpaDenseBinder {
             if (!bytes) continue;
             const auto operand_end = add(f.pointer, bytes);
             if (workspace < operand_end && f.pointer < end)
-                invalid("prepared FP8 workspace overlaps " + std::string(names[role]));
-            if (amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(names[role]));
+                invalid("prepared FP8 workspace overlaps " + std::string(role_name(role)));
+            if (amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(role_name(role)));
         }
         if (mx_scales_) {
             for (size_t role = DescaleQ; role <= ScaleO; ++role)
@@ -982,6 +993,7 @@ class SdpaDenseBinder {
     size_t block_index_ = 0;
     std::array<size_t, 5> quant_indices_;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
+    std::unique_ptr<SdpaSScaleBinding> s_scales_;
     py::object packed_layout_, ragged_lse_layout_;
     py::tuple ragged_divs_;
     py::tuple partial_o_strides_, partial_lse_strides_;
@@ -1019,6 +1031,8 @@ init_sdpa_dense_binding(py::module_ &m) {
         .def_prop_ro_static("supports_d576_envelope", [](py::object) { return true; })
         .def_prop_ro_static("supports_fused_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
+        .def_prop_ro_static("supports_public_s_scales", [](py::object) { return true; })
+        .def_prop_ro_static("supports_public_s_defaults", [](py::object) { return true; })
         // The SM90 D128 causal claim counter's binder role (claim_counter spec flag): the adapter keeps a causal plan
         // on its static schedules on an older extension instead of launching a counter kernel whose counter pointer is
         // 0.

@@ -8,8 +8,8 @@ Classic 2-sub-tile pipeline (TILES_Q=2, two softmax warpgroups, four correction
 warps, persistent try_cancel scheduler).  Per-tensor descales are LOADED
 IN-KERNEL from 1-element device tensors and folded into scale_softmax_log2 /
 o_scale_fused (Rule 3 — no host readback); o_scale_fused feeds the correction
-epilogue's threshold_beta.  descale_s/scale_s are accepted and ignored (P is
-cast unscaled; unsupported knobs on this cell).
+epilogue's threshold_beta. Public S scales, when bound, act before the P
+conversion and in the output epilogue while Stats keeps its unscaled meaning.
 Optional output dtype (DTYPE_O): FP8 in → E4M3 / E5M2 / BF16 / FP16 O.  Shares the
 f16 / mxfp8 SM100 d=128 layout plus the FP8-on-Blackwell K-path:
   1. **cga2-only, STAGES_KV=4** (config; FP8 BPE=1 → 128..160 KiB SMEM).
@@ -83,7 +83,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _launch_public_s, _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one, _public_s_scale_factors
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 from dataclasses import dataclass
@@ -181,8 +181,9 @@ else:
         f"for the f16 kernel, or extend this dispatch for new fp8 variants)"
     )
 
-# P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
-# accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE: the
+# Internal P / row-sum coordinates. The legacy entry quantizes P as
+# P * 2**P_CAST_LOG2_SCALE; public S operands replace its P conversion gain
+# and compensate the output without changing the row sum or Stats. The
 # lazy-rescale skip bounds P by 2**RESCALE_THRESHOLD (4.0 for fp8, see
 # config_sm100.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
 # (e4m3 max) — no saturation — while flat-row entries (P ~ 1/S) sit four
@@ -476,9 +477,8 @@ def _kernel(
     o_scale_fused: cutlass.Float32,
     # 1-element fp32 DEVICE scales (Rule 3): the descale/scale factors are
     # loaded and folded HERE — scale_softmax_log2 arrives as attn_scale*log2(e)
-    # and o_scale_fused as 1.0; no host readback exists anywhere. descale_s /
-    # scale_s are NOT taken: this kernel casts P unscaled, so their values are
-    # accepted by the adapter and ignored (unsupported knobs on this cell).
+    # and o_scale_fused as 1.0; no host readback exists anywhere. Public S
+    # operands are optional keyword slots at the end of this private entry.
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -504,9 +504,15 @@ def _kernel(
     sfo_cols: cutlass.Int64 = 0,
     prepared_sfo_geometry: cutlass.Constexpr = None,
     thd_origins: Optional[cute.Tensor] = None,
+    scale_s_t=None,
+    descale_s_t=None,
+    fixed_s_pair: cutlass.Constexpr = None,
 ) -> None:
     # The prepared plan fixes this byte geometry; retain Int64 while allowing
     # constant folding of the SF atom's offset arithmetic.
+    if cutlass.const_expr(fixed_s_pair is not None):
+        scale_s_t = fixed_s_pair[0]
+        descale_s_t = fixed_s_pair[1]
     if cutlass.const_expr(prepared_sfo_geometry is not None):
         sfo_plane_stride = cutlass.Int64(prepared_sfo_geometry[0])
         sfo_row_off_b = cutlass.Int64(prepared_sfo_geometry[1])
@@ -664,7 +670,8 @@ def _kernel(
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = _scale_or_one(scale_o_t)
     scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
-    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
+    p_cast_gain, pv_gain = _public_s_scale_factors(scale_s_t, descale_s_t, P_CAST_LOG2_SCALE, CFG.RESCALE_THRESHOLD)
+    o_scale_fused = o_scale_fused * _dsc_v * _scl_o * pv_gain
 
     # Service roles form one warpgroup and must release at one common
     # instruction before branching into MMA, load, store and scheduler.
@@ -691,6 +698,7 @@ def _kernel(
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
+            p_cast_gain=p_cast_gain,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -713,6 +721,7 @@ def _kernel(
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
+            p_cast_gain=p_cast_gain,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -2133,6 +2142,7 @@ def _softmax_kv_body(
     sP_sub_base,
     p_row,
     p_free_phase,
+    p_cast_gain: cutlass.Float32,
 ):
     """Per-kv-iter softmax body; returns updated (total_max, total_sum).
 
@@ -2287,11 +2297,11 @@ def _softmax_kv_body(
         # P goes to SMEM.  The previous step's PV may still be reading this tile (its QK^T no longer
         # orders it, see _mma_warp_group): wait for that BMM2 to complete first -- normally long done.
         bars.mb_bmm2_done[sub_tile_id].wait(p_free_phase, spin=SPIN_RING_WAITS)
-        _store_p_chunk(sP_sub_base, p_row, 0, chunk_P_0)
+        _store_p_chunk(sP_sub_base, p_row, 0, chunk_P_0 * p_cast_gain)
         nvvm.fence_proxy("async.shared", space="cta")
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
     else:
-        chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
+        chunk_P_0_fp8 = (chunk_P_0 * p_cast_gain).to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",
             nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32),
@@ -2310,11 +2320,11 @@ def _softmax_kv_body(
         # Burst done: admit the other warpgroup's burst.
         cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
         if cutlass.const_expr(P_IN_SMEM):
-            _store_p_chunk(sP_sub_base, p_row, 1, deferred_P_1)
+            _store_p_chunk(sP_sub_base, p_row, 1, deferred_P_1 * p_cast_gain)
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
         else:
-            chunk_P_1_fp8 = deferred_P_1.to(STORAGE_DTYPE)
+            chunk_P_1_fp8 = (deferred_P_1 * p_cast_gain).to(STORAGE_DTYPE)
             nvvm.tcgen05_st(
                 "32x32b",
                 nvvm.make_tmem_ptr(
@@ -2354,6 +2364,73 @@ def _softmax_warp_group(
     leader_cta_id,
     cta_in_pair,
     qh_per_kh,
+    p_cast_gain: cutlass.Float32,
+):
+    """Choose the exact-identity arithmetic once before the persistent loop."""
+    if p_cast_gain == cutlass.Float32(1.0):
+        _softmax_warp_group_impl(
+            sub_tile_id=sub_tile_id,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            scale_log2=scale_log2,
+            tmem_ptr_i32=tmem_ptr_i32,
+            sQ=sQ,
+            sP=sP,
+            bars=bars,
+            sched=sched,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            leader_cta_id=leader_cta_id,
+            cta_in_pair=cta_in_pair,
+            qh_per_kh=qh_per_kh,
+            p_cast_gain=cutlass.Float32(1.0),
+        )
+    else:
+        _softmax_warp_group_impl(
+            sub_tile_id=sub_tile_id,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            scale_log2=scale_log2,
+            tmem_ptr_i32=tmem_ptr_i32,
+            sQ=sQ,
+            sP=sP,
+            bars=bars,
+            sched=sched,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            seq_q_lens_addr=seq_q_lens_addr,
+            n_q_supers=n_q_supers,
+            n_qh=n_qh,
+            n_batch=n_batch,
+            leader_cta_id=leader_cta_id,
+            cta_in_pair=cta_in_pair,
+            qh_per_kh=qh_per_kh,
+            p_cast_gain=p_cast_gain,
+        )
+
+
+@cute.jit
+def _softmax_warp_group_impl(
+    sub_tile_id: cutlass.Constexpr[int],
+    seqlen_q,
+    seqlen_kv,
+    scale_log2: cutlass.Float32,
+    tmem_ptr_i32,
+    sQ,
+    sP,
+    bars,
+    sched,
+    seq_kv_lens_tensor,
+    seq_q_lens_addr,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    leader_cta_id,
+    cta_in_pair,
+    qh_per_kh,
+    p_cast_gain: cutlass.Float32,
 ):
     """Softmax warp group: online softmax per kv iter, one lane per S_acc row.
 
@@ -2484,6 +2561,7 @@ def _softmax_warp_group(
                             sP_sub_base,
                             p_row,
                             p_free_phase,
+                            p_cast_gain=p_cast_gain,
                         )
                     else:
                         if (kv_tile < bounds.unmasked_lo) | (kv_tile >= bounds.unmasked_hi):
@@ -2503,6 +2581,7 @@ def _softmax_warp_group(
                                 sP_sub_base,
                                 p_row,
                                 p_free_phase,
+                                p_cast_gain=p_cast_gain,
                             )
                         else:
                             total_max, total_sum = _softmax_kv_body(
@@ -2521,6 +2600,7 @@ def _softmax_warp_group(
                                 sP_sub_base,
                                 p_row,
                                 p_free_phase,
+                                p_cast_gain=p_cast_gain,
                             )
                 p_free_phase = p_free_phase ^ 1
                 bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
@@ -2545,6 +2625,7 @@ def _softmax_warp_group(
                     sP_sub_base,
                     p_row,
                     p_free_phase,
+                    p_cast_gain=p_cast_gain,
                 )
                 p_free_phase = p_free_phase ^ 1
                 bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
@@ -2569,6 +2650,7 @@ def _softmax_warp_group(
                     sP_sub_base,
                     p_row,
                     p_free_phase,
+                    p_cast_gain=p_cast_gain,
                 )
                 p_free_phase = p_free_phase ^ 1
                 bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
@@ -2592,6 +2674,7 @@ def _softmax_warp_group(
                     sP_sub_base,
                     p_row,
                     p_free_phase,
+                    p_cast_gain=p_cast_gain,
                 )
                 p_free_phase = p_free_phase ^ 1
                 bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
@@ -2615,6 +2698,7 @@ def _softmax_warp_group(
                     sP_sub_base,
                     p_row,
                     p_free_phase,
+                    p_cast_gain=p_cast_gain,
                 )
                 p_free_phase = p_free_phase ^ 1
                 bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
@@ -3321,6 +3405,8 @@ def _host(
     prepared_sfo_geometry: cutlass.Constexpr = None,
     thd_origin_ptrs=None,
     thd_origin_specs: cutlass.Constexpr = None,
+    scale_s_t=None,
+    descale_s_t=None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -3498,45 +3584,54 @@ def _host(
             if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL)
             else (grid_q_supers * (QH // HEADS_PER_TILE) * B * SPLIT_KV, 1, 1)
         )
-    _kernel(
-        tma_q_desc,
-        tma_k_desc,
-        tma_v_desc,
-        tma_o_desc,
-        lse_tensor,
-        sinks_tensor,
-        seq_kv_lens_tensor,
-        o_desc_words,
-        cutlass.Int32(SQ),
-        cutlass.Int32(SKV),
-        cutlass.Int32(q_supers),
-        cutlass.Int32(QH // HEADS_PER_TILE),
-        cutlass.Int32(B),
-        cutlass.Int32(QH // KH),
-        scale_softmax_log2,
-        o_scale_fused,
-        descale_q_t,
-        descale_k_t,
-        descale_v_t,
-        scale_o_t,
-        amax_o_tensor,
-        seq_q_lens_addr,
-        o_partial_f32,
-        block_table_tensor,
-        block_table_v_tensor,
-        paged_hnd,
-        sf_o_tensor,
-        sfo_plane_stride,
-        sfo_row_off_b,
-        sfo_col_off_h,
-        sfo_cols,
-        prepared_sfo_geometry=prepared_sfo_geometry,
-        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
-    ).launch(
-        grid=grid_shape,
-        block=[CFG.THREADS_PER_CTA, 1, 1],
-        cluster=(CFG.CTA_MMA, 1, 1),
-        stream=stream,
+    _launch_public_s(
+        _kernel,
+        (
+            tma_q_desc,
+            tma_k_desc,
+            tma_v_desc,
+            tma_o_desc,
+            lse_tensor,
+            sinks_tensor,
+            seq_kv_lens_tensor,
+            o_desc_words,
+            cutlass.Int32(SQ),
+            cutlass.Int32(SKV),
+            cutlass.Int32(q_supers),
+            cutlass.Int32(QH // HEADS_PER_TILE),
+            cutlass.Int32(B),
+            cutlass.Int32(QH // KH),
+            scale_softmax_log2,
+            o_scale_fused,
+            descale_q_t,
+            descale_k_t,
+            descale_v_t,
+            scale_o_t,
+            amax_o_tensor,
+            seq_q_lens_addr,
+            o_partial_f32,
+            block_table_tensor,
+            block_table_v_tensor,
+            paged_hnd,
+            sf_o_tensor,
+            sfo_plane_stride,
+            sfo_row_off_b,
+            sfo_col_off_h,
+            sfo_cols,
+        ),
+        dict(
+            prepared_sfo_geometry=prepared_sfo_geometry,
+            thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
+        ),
+        dict(
+            grid=grid_shape,
+            block=[CFG.THREADS_PER_CTA, 1, 1],
+            cluster=(CFG.CTA_MMA, 1, 1),
+            stream=stream,
+        ),
+        scale_s_t,
+        descale_s_t,
+        CFG.DTYPE_QKV == 0,
     )
 
 
@@ -3556,6 +3651,7 @@ def compile_prepared(
     scale_o_in_combine: bool = False,
     sfo_geometry: Optional[tuple[int, int, int, int]] = None,
     thd_origin_specs: Optional[tuple] = None,
+    s_scales: Optional[tuple[bool, bool]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
@@ -3596,4 +3692,5 @@ def compile_prepared(
         optional_amax=True,
         amax_prescaled=True,
         thd_origin_specs=thd_origin_specs,
+        s_scales=s_scales,
     )

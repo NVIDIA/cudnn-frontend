@@ -63,7 +63,7 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA, compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, fp32_to_fp8_pack
 from cudnn.sdpa.fwd.kernels._common_blackwell import row_max_for_exp2
-from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax
+from cudnn.sdpa.fwd.kernels._quantized import _launch_public_s, _initialize_split_amax, _public_s_scale_factors
 
 STORAGE_DTYPE = cutlass.Float8E4M3FN if CFG.DTYPE_QKV == 0 else cutlass.Float8E5M2
 MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4
@@ -602,6 +602,8 @@ def _softmax_warp_group(
     amax_o_tensor: Optional[cute.Tensor],
     rz,
     use_pdl: cutlass.Constexpr[bool] = False,
+    scale_s_t=None,
+    descale_s_t=None,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
     tidx = cute.arch.thread_idx()[0]
@@ -620,7 +622,8 @@ def _softmax_warp_group(
         # PDL: the TMEM handshake above is this role's prologue; its first global read (the lengths) is below.
         wait_on_dependent_grids()
     scale_log2 = scale_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-    value_scale = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * cutlass.Float32(0.0625)
+    p_cast_gain, pv_gain = _public_s_scale_factors(scale_s_t, descale_s_t, 4, 0)
+    value_scale = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * cutlass.Float32(0.0625) * pv_gain
     output_scale = cutlass.Float32(1.0)
     if cutlass.const_expr(scale_o_t is not None):
         output_scale = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
@@ -716,7 +719,7 @@ def _softmax_warp_group(
             l_new.append(cutlass.Float32(l_vec[j]) * alpha_j + p_j)
             m_new.append(m_new_j)
             alpha.append(alpha_j)
-            p_cols.append(p_j * cutlass.Float32(16.0) if cutlass.const_expr(FP8) else p_j)
+            p_cols.append(p_j * cutlass.Float32(16.0) * p_cast_gain if cutlass.const_expr(FP8) else p_j)
             is_one = alpha_j == ONE
             all_one = is_one if all_one is None else (all_one & is_one)
         m_vec = cutlass.Vector.from_elements(tuple(m_new), cutlass.Float32)
@@ -936,7 +939,13 @@ def _kernel(
     # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
     use_pdl: cutlass.Constexpr[bool] = False,
     rz_arg: cutlass.Int32 = 0,
+    scale_s_t=None,
+    descale_s_t=None,
+    fixed_s_pair: cutlass.Constexpr = None,
 ) -> None:
+    if cutlass.const_expr(fixed_s_pair is not None):
+        scale_s_t = fixed_s_pair[0]
+        descale_s_t = fixed_s_pair[1]
     rz = release_zero(rz_arg)
     # The following combine owns the reduction; one producer initializes it.
     if cutlass.const_expr(SPLIT_KV > 1 and amax_o_tensor is not None):
@@ -1079,6 +1088,8 @@ def _kernel(
             amax_o_tensor=amax_o_tensor,
             rz=rz,
             use_pdl=use_pdl,
+            scale_s_t=scale_s_t,
+            descale_s_t=descale_s_t,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1155,6 +1166,8 @@ def _host(
     paged_hnd_prepared: cutlass.Constexpr[bool] = False,
     prepared: cutlass.Constexpr[bool] = True,
     stream: _cuda_driver.CUstream = None,
+    scale_s_t=None,
+    descale_s_t=None,
 ):
     B, QH, KH, SQ, SKV, _ = problem_size
     paged_hnd = paged_hnd_prepared
@@ -1208,10 +1221,25 @@ def _host(
         n_tok_units,
     )
 
-    _kernel(*kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, False, cutlass.Int32(0)).launch(
-        grid=grid_shape,
-        block=[CFG.THREADS_PER_CTA, 1, 1],
-        stream=stream,
+    _launch_public_s(
+        _kernel,
+        (
+            *kernel_args,
+            block_table_tensor,
+            block_table_v_tensor,
+            paged_hnd,
+            False,
+            cutlass.Int32(0),
+        ),
+        dict(),
+        dict(
+            grid=grid_shape,
+            block=[CFG.THREADS_PER_CTA, 1, 1],
+            stream=stream,
+        ),
+        scale_s_t,
+        descale_s_t,
+        CFG.DTYPE_QKV == 0,
     )
 
 
@@ -1226,6 +1254,7 @@ def compile_prepared(
     paged_hnd: bool = False,
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
+    s_scales: Optional[tuple[bool, bool]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import compile_host
@@ -1252,6 +1281,7 @@ def compile_prepared(
         paged_hnd,
         optional_amax=True,
         amax_prescaled=True,
+        s_scales=s_scales,
     )
 
 

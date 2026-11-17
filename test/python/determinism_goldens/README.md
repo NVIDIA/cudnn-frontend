@@ -7541,3 +7541,65 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+## Public S forward contract — 2026-11-17
+
+`sdpa/frost/test_sdpa_public_s_determinism.py` and the selected SM107
+`sdpa/frost/test_sdpa_fp8_sm107.py::TestPublicSDeterminism` cover E4M3
+inputs, BF16 O, FP32 Stats and Amax_O with fixed forward engine records.
+The source pair is either two device operands or omitted graph defaults,
+both `(256, 1/256)`. Q=129 and KV=257 exercise partial tiles; swap-AB uses
+Q=3. Unpacked GQA is 4/2 and split count is one.
+
+Each positive case quantizes three requests once, preserves their payloads,
+checks independent numerical references, singleton versus batch-three
+results, reorder/duplicates, changed neighbor isolation, input immutability,
+fresh bound buffers, eight replays with concurrent work and poisoned CUDA
+Graph replay. All O/Stats comparisons use raw bytes. Global Amax_O is the
+maximum of the separately computed request maxima. Backward and automatic
+plan changes are outside this suite.
+
+All runs use actual cuDNN 9.24, Torch 2.11.0+cu130, CuTe DSL 4.8.0 compiled
+with CUDA 13.4, and tvm-ffi 0.1.12. Each runtime has separate golden keys.
+
+| GPU | Final strict result | New goldens | Coverage |
+| --- | --- | --- | --- |
+| B200, 148 SMs, driver 13.4 | 28 passed, zero skipped | 26 | Six bodies, both D128/D192 CGA choices, supported dense/THD; two negative CGA1 THD cases |
+| B300 SXM6 AC, 148 SMs, driver 13.4 | 28 passed, zero skipped | 26 | Same bounded SM100 implementation set on native SM103 |
+| RTX PRO 6000 Blackwell Server Edition, 188 SMs, driver 13.4 | 16 passed, zero skipped | 16 | General D64/D128/D256 and paired D512, dense/THD |
+| SM107, 208 SMs, driver 13.5 | 34 passed, zero skipped | 34 | Four native bodies, both softmax precisions, dense/THD; shared swap-AB dense |
+
+The initial SM100 run had 26 passes and two construction failures because
+the positive matrix incorrectly included unsplit nonpaged CGA1 THD. That
+existing unsupported combination is now an explicit rejection test. No
+numerical threshold was changed. The 26 successful records were retained
+unchanged for the corrected strict run.
+
+All 102 new records were inspected after recording and checked in a separate
+process with recording disabled. No existing golden was replaced. Across
+all 51 device/default pairs, the preserved input and O/Stats/Amax hashes
+match. These results do not establish identity for arbitrary scalars or
+across software versions.
+
+Commands, from `test/python`, use `-m L0` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`:
+
+```bash
+CUDNN_DETERMINISM_RECORD=/tmp/new-public-s-goldens python -m pytest sdpa/frost/test_sdpa_public_s_determinism.py -k test_sm100_public_s -q
+CUDNN_DETERMINISM_GOLDENS=/tmp/new-public-s-goldens python -m pytest sdpa/frost/test_sdpa_public_s_determinism.py -k test_sm100_public_s -q
+# SM120 uses -k test_sm120_public_s_batch_and_golden.
+# SM107 uses sdpa/frost/test_sdpa_fp8_sm107.py -k TestPublicSDeterminism.
+```
+
+Separate SM107 extended checks pass 16 randomized multi-refill cases,
+24 service-release PTX cases and eight warm-stress cases (4,096 launches,
+zero mismatches). The intentional unsafe control fails 200/200; numerical
+references are checked separately from cold-reference byte repeatability.
+CUDA 13.5 synccheck passes all 16 randomized cases with zero reported errors.
+The first memcheck invocation reports PyTorch Fabric/IMEX allocation API
+errors, and its full-grid racecheck times out; these are retained failures,
+not passes. The ordinary-allocator memcheck rerun passes all 16 with zero
+errors. Focused racecheck then passes all eight cases with zero hazards,
+errors or warnings. Those smaller grids still traverse twelve KV tiles and
+assert that every body's KV ring refills within a launch; changed-input
+captured replay retains an independent reference. The original larger-grid
+timeout is not counted as completed racecheck coverage.

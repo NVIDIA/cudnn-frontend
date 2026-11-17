@@ -64,6 +64,9 @@ DSL-only adjustments applied (per the C++-to-DSL porting notes):
     (per project memory: bare nvvm op silently fires sender's local mbar).
   - RegTile(Float8E4M3FN) is illegal at JIT — FP8 P_cast skips the RegTile
     wrap; pass raw vec to store_swizzled / slice via vec_slice on Float32.
+
+Public S operands scale P only at its FP8 conversion and apply descale_s in
+the PV epilogue. HALF exponents and the original unscaled row sums are retained.
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key
@@ -82,7 +85,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _launch_public_s, _public_s_scale_factors, _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.tma import cp_async_bulk_shared_cluster_shared_cta
@@ -772,8 +775,14 @@ def _kernel(
     block_table_v_tensor: Optional[cute.Tensor] = None,
     paged_hnd: cutlass.Constexpr[bool] = False,
     thd_origins: Optional[cute.Tensor] = None,
+    scale_s_t=None,
+    descale_s_t=None,
+    fixed_s_pair: cutlass.Constexpr = None,
 ) -> None:
 
+    if cutlass.const_expr(fixed_s_pair is not None):
+        scale_s_t = fixed_s_pair[0]
+        descale_s_t = fixed_s_pair[1]
     if cutlass.const_expr(_FP32_PARTIALS and amax_o_tensor is not None):
         _initialize_split_amax(amax_o_tensor)
     if cutlass.const_expr(thd_origins is not None):
@@ -793,7 +802,8 @@ def _kernel(
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = _scale_or_one(scale_o_t)
     scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
-    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
+    p_cast_gain, pv_gain = _public_s_scale_factors(scale_s_t, descale_s_t, 0, CFG.RESCALE_THRESHOLD)
+    o_scale_fused = o_scale_fused * _dsc_v * _scl_o * pv_gain
 
     # ------------------------------------------------------------------
     # SMEM allocations — natural Q / K / V / O order, NO Q∪K_ring or
@@ -1051,6 +1061,7 @@ def _kernel(
             amax_o_tensor=amax_o_tensor,
             o_partial_f32=o_partial_f32,
             thd_origins=thd_origins,
+            p_cast_gain=p_cast_gain,
         )
 
     elif warp_idx == cutlass.Int32(CFG.MMA_WARP_ID):
@@ -1219,6 +1230,7 @@ def _sg0_softmax_kv_iter(
     ship_pred,  # K3: is_lead_warp & elect_sync()
     alpha_row_base,  # K4: sAlpha_xfer_raw.subview(tid_in_wg)
     p_row_offs,  # K1: tuple of P_VECS_PER_CHUNK swizzled byte offsets of this lane's 16-B vectors inside a P chunk
+    p_cast_gain: cutlass.Float32 = 1.0,
 ):
     cur_parity_S = sg0_xfer_state.idx
     cur_phase_S = sg0_xfer_state.phase
@@ -1326,7 +1338,7 @@ def _sg0_softmax_kv_iter(
                 vals = []
                 for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
                     vals.append(chunk_S_scaled[k * P_ELEMS_PER_VEC + i])
-                fp8_words, unit_pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC)
+                fp8_words, unit_pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, output_scale=p_cast_gain)
                 p_pairs.extend(unit_pairs)
                 vec_fp8 = cutlass.Vector.from_elements(tuple(fp8_words), cutlass.Int32).bitcast(P_STORAGE_DTYPE)
                 dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
@@ -1350,7 +1362,7 @@ def _sg0_softmax_kv_iter(
             for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
                 vals = []
                 for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
-                    vals.append(chunk_P_fp32[k * P_ELEMS_PER_VEC + i])
+                    vals.append(chunk_P_fp32[k * P_ELEMS_PER_VEC + i] * p_cast_gain)
                 vec_fp8 = fp32_to_fp8_pack(vals, dtype=P_STORAGE_DTYPE).bitcast(P_STORAGE_DTYPE)
                 dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
                 dst.store(vec_fp8, alignment=P_VEC_BYTES)
@@ -1450,6 +1462,7 @@ def _compute_warp_group(
     amax_o_tensor,
     o_partial_f32,
     thd_origins: Optional[cute.Tensor] = None,
+    p_cast_gain: cutlass.Float32 = 1.0,
 ):
     """sg-conditional compute body (4 warps × 32 lanes = 128 threads).
 
@@ -1652,6 +1665,7 @@ def _compute_warp_group(
                             ship_pred,
                             alpha_row_base,
                             p_row_offs,
+                            p_cast_gain=p_cast_gain,
                         )
                 else:
                     for _kv in cutlass.range(kv_left, kv_unmasked_lo, 1, unroll=1):
@@ -1678,6 +1692,7 @@ def _compute_warp_group(
                             ship_pred,
                             alpha_row_base,
                             p_row_offs,
+                            p_cast_gain=p_cast_gain,
                         )
                     for _kv in cutlass.range(kv_unmasked_lo, kv_unmasked_hi, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
@@ -1703,6 +1718,7 @@ def _compute_warp_group(
                             ship_pred,
                             alpha_row_base,
                             p_row_offs,
+                            p_cast_gain=p_cast_gain,
                         )
                     for _kv in cutlass.range(kv_unmasked_hi, kv_right, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
@@ -1728,6 +1744,7 @@ def _compute_warp_group(
                             ship_pred,
                             alpha_row_base,
                             p_row_offs,
+                            p_cast_gain=p_cast_gain,
                         )
 
             # ---- End-of-tile: ship final stats (max, ell) ----
@@ -3100,6 +3117,8 @@ def _host(
     paged_hnd_prepared: cutlass.Constexpr[bool] = False,
     thd_origin_ptrs=None,
     thd_origin_specs: cutlass.Constexpr = None,
+    scale_s_t=None,
+    descale_s_t=None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -3223,42 +3242,49 @@ def _host(
             if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL)
             else (grid_q_supers * (QH // HEADS_PER_TILE) * B * SPLIT_KV, 1, 1)
         )
-    _kernel(
-        tma_q_desc,
-        tma_k_desc,
-        tma_v_desc,
-        tma_o_desc,
-        lse_tensor,
-        sinks_tensor,
-        seq_kv_lens_tensor,
-        o_desc_words,
-        cutlass.Int32(SQ),
-        cutlass.Int32(SKV),
-        cutlass.Int32(q_supers),
-        cutlass.Int32(QH // HEADS_PER_TILE),
-        cutlass.Int32(B),
-        cutlass.Int32(QH // KH),
-        scale_softmax_log2,
-        o_scale_fused,
-        descale_q_t,
-        descale_k_t,
-        descale_v_t,
-        scale_o_t,
-        amax_o_tensor,
-        seq_q_lens_addr,
-        o_partial_f32,
-        block_table_tensor,
-        block_table_v_tensor,
-        paged_hnd_prepared,
-        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
-    ).launch(
-        # cluster = (CGA_M, CGA_N, 1) = (4, 1, 1) under dsv4.
-        grid=grid_shape,
-        block=[CFG.THREADS_PER_CTA, 1, 1],
-        cluster=(CFG.CGA_M, CFG.CGA_N, 1),
-        stream=stream,
-        # Preserve the paged producer/consumer register split in ptxas.
-        min_blocks_per_mp=1 if PAGED_KV else 0,
+    _launch_public_s(
+        _kernel,
+        (
+            tma_q_desc,
+            tma_k_desc,
+            tma_v_desc,
+            tma_o_desc,
+            lse_tensor,
+            sinks_tensor,
+            seq_kv_lens_tensor,
+            o_desc_words,
+            cutlass.Int32(SQ),
+            cutlass.Int32(SKV),
+            cutlass.Int32(q_supers),
+            cutlass.Int32(QH // HEADS_PER_TILE),
+            cutlass.Int32(B),
+            cutlass.Int32(QH // KH),
+            scale_softmax_log2,
+            o_scale_fused,
+            descale_q_t,
+            descale_k_t,
+            descale_v_t,
+            scale_o_t,
+            amax_o_tensor,
+            seq_q_lens_addr,
+            o_partial_f32,
+            block_table_tensor,
+            block_table_v_tensor,
+            paged_hnd_prepared,
+        ),
+        {
+            "thd_origins": origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
+        },
+        {
+            "grid": grid_shape,
+            "block": [CFG.THREADS_PER_CTA, 1, 1],
+            "cluster": (CFG.CGA_M, CFG.CGA_N, 1),
+            "stream": stream,
+            "min_blocks_per_mp": 1 if PAGED_KV else 0,
+        },
+        scale_s_t,
+        descale_s_t,
+        True,
     )
 
 
@@ -3277,6 +3303,7 @@ def compile_prepared(
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
     thd_origin_specs: Optional[tuple] = None,
+    s_scales: Optional[tuple[bool, bool]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
@@ -3312,4 +3339,5 @@ def compile_prepared(
         partial_slot=True,
         optional_amax=True,
         thd_origin_specs=thd_origin_specs,
+        s_scales=s_scales,
     )

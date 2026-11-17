@@ -79,7 +79,8 @@ def facts_of_roles(pack, indices: List[int]) -> List[BufferFacts]:
 
 
 _QUANT_ROLES = ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
-_QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES)
+_S_ROLES = ("scale_s", "descale_s")
+_QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES) | {name + suffix for name in _S_ROLES for suffix in ("_ptr", "_value")}
 _NATIVE_MX_ROLES = _QUANT_ROLES + ("sf_q", "sf_k", "sf_v")
 _NATIVE_BLOCK_ROLES = _NATIVE_MX_ROLES + ("sf_o",)
 
@@ -96,6 +97,41 @@ class QuantizedLaunchSpec(NamedTuple):
     scratch_offset: int  # unused amax and an identity scale, in caller-owned workspace
     sf_sizes: Tuple[int, ...] = ()  # opaque F8_128x4 tile byte sizes; empty for per-tensor FP8
     block_output: Optional[BlockOutputSpec] = None
+    s_scales: Optional[Tuple[bool, bool]] = None  # True = host pass-by-value; False = device pointer
+    s_defaults: Tuple[Optional[float], Optional[float]] = (None, None)
+
+
+def _with_graph_s_defaults(spec, binding, binder_name):
+    """Keep embedded graph scalars in immutable plan metadata, never GPU storage."""
+    if spec.quant is None or spec.quant.s_scales is None:
+        return spec
+    defaults = tuple(getattr(getattr(binding, role), "pass_by_value", None) for role in _S_ROLES)
+    if all(value is None for value in defaults):
+        return spec
+    for host, value in zip(spec.quant.s_scales, defaults):
+        if value is not None and (not host or not isinstance(value, float)):
+            raise ValueError("cudnn.sdpa: embedded S scales require float32 pass-by-value declarations")
+    spec = copy(spec)
+    spec.quant = spec.quant._replace(s_defaults=defaults)
+    from cudnn import _pybind_module
+
+    binder = getattr(_pybind_module, binder_name)
+    if not getattr(binder, "supports_public_s_defaults", False):
+        raise NotImplementedError("cudnn.sdpa: embedded S scales require an updated native binding")
+    spec.native = binder(spec)
+    return spec
+
+
+def _graph_quant_roles(quant, binding):
+    from cudnn import _pybind_module
+
+    # Runtime graph values are defaults, so their UID remains bindable.
+    # Only compile-time constants are removed from the execution schema.
+    return tuple(
+        role
+        for role in _quant_roles(quant)
+        if role not in _S_ROLES or getattr(getattr(binding, role), "scalar_type", None) != _pybind_module.scalar_type.COMPILE_TIME_CONST
+    )
 
 
 def _quant_spec(api):
@@ -116,7 +152,7 @@ def _quant_spec(api):
             sizes = km.mxfp8_sf_sizes(int(api.head_dim_qk), int(api.head_dim_v))
         else:
             sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
-    return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
+    return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block, getattr(api, "_s_scale_modes", None))
 
 
 def _native_quant_roles(quant):
@@ -124,16 +160,15 @@ def _native_quant_roles(quant):
         return ()
     # Keep the native quantized prefix stable: per-tensor block output leaves
     # the three input-SF roles unbound instead of shifting the output-SF slot.
-    if quant.block_output is not None:
-        return _NATIVE_BLOCK_ROLES
-    return _NATIVE_MX_ROLES if quant.sf_sizes else _QUANT_ROLES
+    roles = _NATIVE_BLOCK_ROLES if quant.block_output is not None else (_NATIVE_MX_ROLES if quant.sf_sizes else _QUANT_ROLES)
+    return roles + (_S_ROLES if quant.s_scales is not None else ())
 
 
 def _quant_roles(quant):
     roles = (("sf_q", "sf_k", "sf_v")[: len(quant.sf_sizes)] + ("amax_o",)) if quant.sf_sizes else _QUANT_ROLES
     if quant.block_output is not None:
         roles += ("sf_o",) + (("scale_o",) if quant.sf_sizes else ())
-    return roles
+    return roles + (_S_ROLES if quant.s_scales is not None else ())
 
 
 def _quant_slots(quant):
@@ -488,6 +523,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("nonpaged D64 THD split requires rebuilding the native extension")
     if s.quant is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_fp8_physical_origins", False):
         raise NotImplementedError("paged FP8 THD requires rebuilding the native extension")
+    if s.quant is not None and s.quant.s_scales is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_public_s_scales", False):
+        raise NotImplementedError("public S scales require an updated native SDPA binding extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
@@ -583,6 +620,7 @@ class PreparedThdLaunch:
     """The graph plan's THD f16 launch: the spec plus this graph's operand uids."""
 
     def __init__(self, spec: ThdLaunchSpec, binding, *, stats_stride_override=False):
+        spec = _with_graph_s_defaults(spec, binding, "_SdpaThdBinder")
         if stats_stride_override and spec.has_lse and spec.lse_head_major and not spec.lse_padded and spec.quant is None:
             # Keep the standalone adapter's declared-stride contract immutable.
             # Only override-enabled graph plans bind an effective HN stride.
@@ -610,7 +648,7 @@ class PreparedThdLaunch:
             uids["block_table"] = binding.paged_k_table.get_uid()
             uids["block_table_v"] = binding.paged_v_table.get_uid()
         if spec.quant is not None:
-            for name in _quant_roles(spec.quant):
+            for name in _graph_quant_roles(spec.quant, binding):
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
@@ -1094,6 +1132,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
 
     if s.claim_counter and not getattr(_pybind_module._SdpaDenseBinder, "supports_claim_counter", False):
         raise NotImplementedError(f"{km.__name__}: this extension's native dense binder has no work-item claim counter role")
+    if s.quant is not None and s.quant.s_scales is not None and not getattr(_pybind_module._SdpaDenseBinder, "supports_public_s_scales", False):
+        raise NotImplementedError("public S scales require an updated native SDPA binding extension")
     s.native = _pybind_module._SdpaDenseBinder(s)
     return s
 
@@ -1721,6 +1761,7 @@ class PreparedDenseLaunch:
     """The graph plan's dense f16 launch: the spec plus this graph's operand uids."""
 
     def __init__(self, spec: DenseLaunchSpec, binding, *, seq_kv_src=None, seq_q_src=None, gate_src=None):
+        spec = _with_graph_s_defaults(spec, binding, "_SdpaDenseBinder")
         self.spec = spec
         uids = {"q": binding.q.get_uid(), "k": binding.k.get_uid(), "v": binding.v.get_uid(), "o": binding.o.get_uid()}
         if binding.stats is not None:
@@ -1757,7 +1798,7 @@ class PreparedDenseLaunch:
             if spec.combine is not None and spec.combine.has_stats:
                 uids["ragged_lse"] = binding.ragged_stats.get_uid()
         if spec.quant is not None:
-            for name in _quant_roles(spec.quant):
+            for name in _graph_quant_roles(spec.quant, binding):
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
