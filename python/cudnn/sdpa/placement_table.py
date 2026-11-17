@@ -692,6 +692,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill_short_q", "thd_bounded", "none", False, "mha", False): Entry(
         "always", None, "sm107_thd_prefill_20261111"
     ),
+    # study sm107_dense_d128_nc_mha_v2_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 50a9943c0; dense d128 MHA non-causal: chunks S_q 5-65536
+    # over KV 4k-128k, squares 32-65536 and DiT-style cross-attention S_q 2k-64k over KV 256-1024, b 1-8, heads 8-48; 342 train cells,
+    # stratified by S_q x KV). Holdout at fresh heads, scored once: 0.907 (7 changed, worst 1.013) on the tile, 0.589 (10, worst 1.005)
+    # off it. It supersedes v1 (sm107_dense_d128_nc_mha_20261117, also passed) whose grid barely sampled few-head long-KV chunks. The
+    # on-tile floor hands the hand rule's 256-tile S_q 256 chunks (FROST 1.36-1.53x) back to the backend; large shapes sit at parity.
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", False): Entry(
+        "le", 14.246, "sm107_dense_d128_nc_mha_v2_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", True): Entry(
+        "le", 32.953, "sm107_dense_d128_nc_mha_v2_20261117", "cost", ("ge", 10.501, "kv")
+    ),
     # study sm80_thd_prefill_20261117 (A100 THD d256 GQA causal, trained at S_q >= 500): its four `always` entries are retired. The SM80
     # GQA prefill class starts at S_q 17, and an edge supplement at S_q 17-499 lost on every side (worst 1.13-1.53, geomean 0.68-0.88).
     # Re-studied over S_q 17-8192 as sm80_thd_d256_v2_20261117 (below).

@@ -626,6 +626,29 @@ def test_sm80_paged_d64_no_sink_on_tile_floor_follows_v2():
 
 
 @pytest.mark.L0
+def test_sm107_dense_d128_noncausal_mha_follows_its_study():
+    """sm107_dense_d128_nc_mha_v2_20261117 (Rubin): dense d128 MHA non-causal leads up to 2^14.246 query rows on the KV tile, which hands
+    the hand rule's 256-tile S_q 256 chunks (FROST 1.36-1.53x) back to the backend; off the tile it leads cost <= 2^32.953 over at least
+    2^10.501 keys."""
+    row = "sdpa_fwd_prefill_sm107"
+    study = "sm107_dense_d128_nc_mha_v2_20261117"
+
+    def f(**over):
+        base = dict(b=1, h_q=16, h_kv=16, s_q=512, s_kv=4096, d_qk=128, d_v=128, causal=False, bottom_right=False, device_cc=(10, 7))
+        base.update(has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == study
+    assert pt.lookup(row, f()) is True
+    assert pt.lookup(row, f(b=8, s_q=256, s_kv=32768)) is False
+    off = f(h_q=8, h_kv=8, s_q=128, s_kv=16385)
+    assert pt.FEATURES["cost"](off) <= 32.953
+    assert pt.matched_entry(row, off).study == study and pt.lookup(row, off) is True
+    assert pt.lookup(row, f(h_q=8, h_kv=8, s_q=128, s_kv=1025)) is False
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_two_condition_entry_leads_only_where_both_hold(s_kv):
     """``Entry.also``: sm80_dense_d128_gqa_v2_20261117 leads A100 dense d128 GQA causal prefill only with few query rows AND a long
