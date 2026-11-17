@@ -369,18 +369,19 @@ def test_hw_form_on_the_protocol_bias_ranges(monkeypatch):
 
 def _spy_loaded_forms(monkeypatch):
     """Record ``params.bias_max_form`` of every kernel module the adapter loads (the record the EXECUTED plan carries; a memoised load
-    still passes through the spy)."""
+    still passes through the spy). Explicit implementation engines bypass the legacy architecture loader, so observe the common
+    template-loader boundary used by both paths."""
     from cudnn.sdpa.fwd import api_dsl, config_sm107 as c
 
     monkeypatch.setattr(c, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", None)  # no seam: the adapter's own pick
     seen = []
-    real = api_dsl._load_sm100_kernel_module
+    real = api_dsl.load_template
 
-    def spy(flavor, params, *a, **kw):
+    def spy(path, params, *a, **kw):
         seen.append(int(getattr(params, "bias_max_form", -1)))
-        return real(flavor, params, *a, **kw)
+        return real(path, params, *a, **kw)
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", spy)
+    monkeypatch.setattr(api_dsl, "load_template", spy)
     return seen
 
 

@@ -75,8 +75,23 @@ def paged_origins(qdtype, kvdtype, cga):
 
 @_native
 @pytest.mark.parametrize("qdtype,kvdtype,splits", itertools.product(("bfloat16", "float16"), ("float8_e4m3fn", "float8_e5m2"), (1, 5)))
-def thd_origins(qdtype, kvdtype, splits):
+def thd_origins(qdtype, kvdtype, splits, monkeypatch):
     import test_sdpa_fwd_thd_origins as thd_checks
+    from test_sdpa_fwd_sm107_half_explicit_engines import _fixed_loader
+
+    name = "sdpa_fwd_sm107_shared_single_q" if splits > 1 else "sdpa_fwd_sm107_d128_multi_q"
+    folder = "sm100/d128_f16_single_q" if splits > 1 else "sm107/d128_f16_multi_q"
+    seen = _fixed_loader(monkeypatch, folder + "/kernel.py")
+
+    def check(graph, *args):
+        from cudnn.sdpa.fwd import engines
+
+        assert graph.selected_engine.name == name
+        assert seen and seen[-1].CFG.SPLIT_KV == splits
+        if splits > 1:
+            native = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d128_multi_q")
+            _, reason = engines.analyze_for(native, graph, engines.SdpaFwdKnobs(cga=1, split_kv=splits))
+            assert reason and "shared SM100 single-Q body" in reason
 
     thd_checks.test_independent_thd_origins_rebind_and_capture(
         128,
@@ -86,8 +101,10 @@ def thd_origins(qdtype, kvdtype, splits):
         splits == 1,
         splits,
         kv_dtype_name=kvdtype,
-        engine_name="sdpa_fwd_sm107_d128_multi_q",
+        engine_name=name,
+        extra_checks=check,
     )
+    assert seen and seen[-1].CFG.SPLIT_KV == splits
 
 
 @_native

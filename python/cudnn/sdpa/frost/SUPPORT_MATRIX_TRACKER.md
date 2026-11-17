@@ -1,5 +1,7 @@
 # FROST SDPA — legacy support tracker
 
+Current nonpaged D256 split physical-origin support is documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
+
 > **Historical reference; migration in progress.** Current support documentation
 > starts at [support/README.md](support/README.md), with a
 > [completed SM90 example](support/sm90.md) and a [template](support/TEMPLATE.md).
@@ -8,6 +10,8 @@
 > current support changes to the relevant new architecture section as it is
 > refactored. Do not append development logs here. A pending new section means
 > its documentation has not yet migrated, not that the feature is unsupported.
+> Current SM107 mixed-KV THD split ownership is described in
+> [the SM107 feature combinations](support/sm107.md#feature-combinations).
 
 **SM90 fixed implementation ownership — 2026-11-14**
 
@@ -182,6 +186,28 @@ masks, sinks, split-KV and THD are the legacy rows' at D512. Central selection
 preserves the old candidate order, budget and placement; explicit records pin
 the body. Old exact-D512 20507/20518 recipes must be replanned. No additional
 numerical, determinism or batch-invariance claim is introduced.
+
+**SM100/SM103 half D256 backward head-pair envelope:** dense BSHD graphs with
+D_V in {192, 256}, D_V <= D_QK <= 256 and D_QK a multiple of 8 (192x192,
+224x192, 256x192, ...) run the `sdpa_bwd_sm100_d256` (256, 256) chain. Tensor
+maps keep the real widths, so TMA zero-fills loads past them and clips stores;
+no operand is padded or copied. The backend declines these pairs (its backward
+stops at D <= 128 plus 192x128), so before this no engine served them. Masks,
+GQA/MQA and deterministic requests compose as for D256. THD, and value widths
+that are not multiples of 64 (for example 160x160), remain declined. Validated
+on SM103.
+
+**SM89 half backward:** `sdpa_bwd_sm89` runs the `sdpa_bwd_sm80` mma.sync chain
+on cc 8.9 through `SdpaBwdDslSm89`, which fits the 99 KiB opt-in SMEM with one
+Q/dO stage, direct FP32 dQ atomics and a 64x64 (envelope <= D128) or 32x32 tile
+(the SM120 packed adapter's rule). The capability claim is the SM80 row's:
+FP16/BF16, eight-aligned D_QK >= D_V up to 256, dense and THD with physical
+origins, GQA, causal / bottom-right / window masks, padding, bias / dBias,
+sinks, zero scale and deterministic dQ. The cuDNN backend serves Ada backward
+only up to D128, so above it this row is the only provider; it trails the
+backend everywhere (a prototype of this row ran 1.3-2.9x slower than the
+backend at D128). Validated on an L40S; cc 8.6 has the same budget but is
+not measured and stays declined.
 
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
@@ -1193,7 +1219,7 @@ MMA as d=512.
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ❌ (prefill tile) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | via the native d64 flavorᵗ⁰ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + fp8 + mxfp8 | ✅ᵖ f16 + fp8 + mxfp8 (native 512; (256, 512] envelope; FP8 dense Q only) | ❌ |  ❌  |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
-| Index-list sparse attention (QSA: per-query lists of 4-token blocks + the open tail; frontend-only, the SM100 / SM103 / SM107 engine behind `cudnn.ops.qsa_backward` and `qsa_indexed_backward` (`QSA/_backward.py` launching the kernels of `QSA/kernels/bprop_sm100.py`, and on SM107 the dense pair, query-major and key-major kernels of `QSA/kernels/bprop_sm107.py`), no graph form) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | bf16 ✅ (SM100, SM103 and SM107, cc 10.0 / 10.3 / 10.7; 24 Q / 2 KV heads, 12 Q / 1 KV head or 6 Q / 1 KV head (the two- and four-way tensor-parallel shards; the 6-head shard pads the 12-row query tiles; CuTe DSL CUDA 13 compiler required), any softmax scale, one sequence or packed sequences (`cu_seqlens` of the indexed entry, `tok_base` of the bitmap entry) of `T <= 349525` rows (`699050` at 12 / 1, `1398101` at 6 / 1); blocks may start anywhere and the key bounds may cut them, keys after the query within `hi` are attended, a query past the dense prefix holds at most 513 blocks (a longer list contributes nothing and its dQ is NaN); with `deterministic=True` the gradients repeat bitwise for fixed inputs and a fixed packed layout; no context parallel) |
+| Index-list sparse attention (QSA: per-query lists of 4-token blocks + the open tail; frontend-only, the SM100 / SM103 / SM107 engine behind `cudnn.ops.qsa_backward` and `qsa_indexed_backward` (`QSA/_backward.py` launching the kernels of `QSA/kernels/bprop_sm100.py`, and on SM107 the dense pair and key-major kernels of `QSA/kernels/bprop_sm107.py`), no graph form) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | bf16 ✅ (SM100, SM103 and SM107, cc 10.0 / 10.3 / 10.7; 24 Q / 2 KV heads, 12 Q / 1 KV head or 6 Q / 1 KV head (the two- and four-way tensor-parallel shards; the 6-head shard pads the 12-row query tiles; CuTe DSL CUDA 13 compiler required), any softmax scale, one sequence or packed sequences (`cu_seqlens` of the indexed entry, `tok_base` of the bitmap entry) of `T <= 349525` rows (`699050` at 12 / 1, `1398101` at 6 / 1); blocks may start anywhere and the key bounds may cut them, keys after the query within `hi` are attended, a query past the dense prefix holds at most 513 blocks (a longer list contributes nothing and its dQ is NaN); with `deterministic=True` the gradients repeat bitwise for fixed inputs and a fixed packed layout; no context parallel) |
 
 ᵗ⁰ **The 32-wide small tile on SM100 / SM103 (`sm100/prefill_d128_f16.py` at `d_flavor = 32`; `config_sm100.make_cfg_d32`).** The SM100 twin
 of the Rubin small tile (ᵗ in the SM107 table), landed 2026-10-13 as the first step of the small-tile port: the f16/bf16 d128 FILE at `TILE_K =
@@ -3263,7 +3289,8 @@ on the 80-wide tile.
 ## SM80 (Ampere A100, cc 8.0 exactly)
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
-tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
+tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined
+(the backward runs on cc 8.9 as `sdpa_bwd_sm89`, see the top of this file).
 The backward serves packed THD graphs (ᵏ); the forward serves packed THD graphs
 with per-batch or cumulative Q/KV lengths, token-major Q/K/V/O with independent
 8-element-aligned head/token strides (padding and gaps allowed), and packed
@@ -3450,7 +3477,7 @@ THD graphs.
 | Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), a sink, a band, Q-length trimming of a dense batch, log2 stats; THD together with the in-block indexer (through the block); THD and paged pools on the TOP-LEFT diagonal (the bottom-right composition is served since 2026-10-30); the per-sequence list and split-KV under THD; a shared list at `S_q > 4` | SM107 — frontend-only: the gated attention block's sparse stage (`GatedAttentionBlockGeometry(qsa=QsaSpec(...))`, `execute(block_ids=, block_lens=)`) and the standalone `sparse_gqa_sm107` adapter serve dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths, the fused epilogue gate (`epilogue_gate=` the gate operand on the adapter, `fuse_gate=True` through the block: O gated in place, the LSE untouched; it composes with the paged read and with THD), and packed THD sequences (`thd=True`: per-sequence `[B]` or cumulative `[B + 1]` lengths (`cu_seq_len`), sequence-relative block ids; through the block `GatedAttentionBlockFwd(thd=True, num_sequences=, max_seq_len=, cu_seqlens=)` + `execute(seq_lens=, block_ids=)`); the standalone adapter also reads paged K / V pools (`paged_kv=True`: `[num_pages, H_kv, page_size, D]` HND compact or NHD by strides, one `(B, max_pages)` block table, `page_size` a positive multiple of 4, per-batch lengths required) -- and, since 2026-10-30, the two arms TOGETHER on the bottom-right diagonal (`thd=True, paged_kv=True, bottom_right=True`: the packed EXTEND form over the pools, `SparseCapabilities.thd_paged_kv`; the top-left composition and a prefix-form KV length stay typed declines) -- and the DECODE form (`bottom_right=True`: positions `kv_len - S_q + row`; `list_per_sequence=True`: `block_ids [B, top_k]` shared by the sequence's `S_q <= 4` rows, anchored at the step-0 position; `split_kv=S` up to `ceil((top_k + 1) / 32)`: fp32 partials in the caller's workspace + the split combine, the gate riding the combine) -- through the gated attention block since 2026-10-14 (`kv_source="paged"` on a dense `[B, S_q]` `QsaSpec` block: `block_table` / `kv_lens` / `slot_mapping` / the pools through `_SparseSdpa`, the list form derived from `S_q`); every other arm is a typed decline by name (see the SM107 index-list section below) |
 | Backward pass entirely | SM90 |
 | Backward outside the documented D256/D512 half domains and exact half D192x128; outside exact D256/D192x128 for per-tensor FP8 or D256 for MXFP8 | SM107 — native half D192 is `sdpa_bwd_sm107_d192` (slot 10): dense/THD, independent origins and deterministic execution. The original D256 and D512 restrictions remain as documented in ᵇ, ᵐˣ and ᵇ³. |
-| Backward outside d ∈ (256, 512] ∪ {256, (192, 128), 128, 64} (f16/bf16), {(192, 128), 128, 64} (per-tensor FP8, opt-in) or {256, (192, 128), 128, 64} (MXFP8) | SM100, SM103 — d128 serves compact-BSHD dense MHA with unmasked or top-left causal attention. SM100, SM103 and SM107 (the `sdpa_bwd_sm100_d128` row admits cc 10.7 since 2026-11-03: the same bodies compiled for sm_107a, trailing the backend there until measured) additionally serve THD MHA and BF16 dense/THD GQA/MQA under the d128 gates above. Dense MHA selects one-launch recompute, three-launch accumulation or the deterministic kernel pair; packed/grouped paths use the documented helper chains. f16/bf16 d = 256 uses the 2x2-datapath row ᵇ²; dense MHA (192, 128) half also has the opt-in accumulation row `sdpa_bwd_sm100_d192`; per-tensor FP8 D64 / D128 / (192, 128) are the opt-in `sdpa_bwd_sm100_d128_fp8` / `sdpa_bwd_sm100_d192_fp8` rows; MXFP8 D64 / D128 / (192, 128) ride the block-scale kernel pair of `sdpa_bwd_sm100_mxfp8` |
+| Backward outside d ∈ (256, 512] ∪ {256, (192, 128), 128, 64} ∪ the dense D_V ∈ {192, 256} envelope pairs (f16/bf16), {(192, 128), 128, 64} (per-tensor FP8, opt-in) or {256, (192, 128), 128, 64} (MXFP8) | SM100, SM103 — d128 serves compact-BSHD dense MHA with unmasked or top-left causal attention. SM100, SM103 and SM107 (the `sdpa_bwd_sm100_d128` row admits cc 10.7 since 2026-11-03: the same bodies compiled for sm_107a, trailing the backend there until measured) additionally serve THD MHA and BF16 dense/THD GQA/MQA under the d128 gates above. Dense MHA selects one-launch recompute, three-launch accumulation or the deterministic kernel pair; packed/grouped paths use the documented helper chains. f16/bf16 d = 256 uses the 2x2-datapath row ᵇ²; dense MHA (192, 128) half also has the opt-in accumulation row `sdpa_bwd_sm100_d192`; per-tensor FP8 D64 / D128 / (192, 128) are the opt-in `sdpa_bwd_sm100_d128_fp8` / `sdpa_bwd_sm100_d192_fp8` rows; MXFP8 D64 / D128 / (192, 128) ride the block-scale kernel pair of `sdpa_bwd_sm100_mxfp8` |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |

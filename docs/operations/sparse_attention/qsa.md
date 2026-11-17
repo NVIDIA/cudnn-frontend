@@ -89,7 +89,7 @@ top-k tie rules must also be checked before replacing an external selector.
 
 On every architecture both training entries run one backward engine
 (`cudnn.QSA._backward` launching the kernels of `cudnn.QSA.kernels.bprop_sm100`,
-and on SM107 the Rubin dense pair, query-major and key-major kernels of
+and on SM107 the Rubin dense pair and key-major kernels of
 `cudnn.QSA.kernels.bprop_sm107`): the prefix of every sequence
 (its first 20480 queries, or all of them below 22528 tokens) on a dense
 key-tile kernel that masks per key token through a bitmap, the remaining
@@ -236,13 +236,13 @@ The public functions select one of two architecture families internally:
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_qsa_bwd_*` (dense pair, query-major, key-major and index kernels) |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine with its SM107 dense pair, query-major and key-major kernels) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine with its SM107 dense pair and key-major kernels) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Selection rows are compacted 16 bytes per lane on every architecture, preserving block order.
 CuTeDSL 4.7 or newer is
 required; Rubin also requires a build with the `sm_107a` target. On SM107 the
-backward runs Rubin flavors of the dense pair, query-major and key-major kernels,
+backward runs Rubin flavors of the dense pair and key-major kernels,
 which use the oversized shared memory carveout and a 576-column TMEM allocation
 where those pay off. A driver without the oversized carveout (older than CUDA
 13.4) runs the SM100 kernels on SM107.

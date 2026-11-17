@@ -4,6 +4,62 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### D256 nonpaged split physical origins (2026-11-16)
+
+`sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed
+forward owners 20519 and 20570, FP16/BF16, token/head Stats and splits 2/5.
+It retains the independent FP64 reference and changed-pointer/pitch/length
+CUDA Graph checks, and adds byte comparisons with fresh allocations,
+concurrent work, reordered/duplicated/removed sequences, changed neighbors,
+and a separate B=1 graph carrying the same first sequence. This is forward
+binding coverage; the backward algorithm and its status are unchanged.
+
+On SM100, SM103 and SM107, actual Torch 2.11.0+cu130, cuDNN 9.24.0.43,
+CuTe DSL 4.8 and CUDA 13.4 compiler qualification completed at source
+`50535efb4` (production unchanged from `171bcd81a`). Imports and the matching
+native binding were checked on each target. Each target passed 366 native
+binder checks, two independent-origin reference/rebind/capture cases and 16
+compact split controls without failures or skips.
+
+| Target | SM count | New suite, recording | Separate-process strict check | Runtime fingerprint |
+|---|---|---|---|---|
+| SM100 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `b6cd858eb78e109b` |
+| SM103 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `104472d5f9694663` |
+| SM107 | 216 | 11 passed, 0 skipped | 11 passed, 0 skipped | `d42d57b738f5eead` |
+
+The selected SM107 CI entry also exposes these same checks through
+`test_sdpa_fp8_sm107.py::TestD256HalfSplitOrigins`, preserving their parameter
+marks without duplicating the test bodies. After integrating the mixed-KV
+owner fix, source `7849117b6` passed 11 recording checks and 11 independent
+strict checks through this entry on the 216-SM runtime above. All eight golden
+files were byte-identical to the existing records. Its integrated owner and
+graph-analyzer checks passed all 701 cases on native SM107.
+
+The new suite contains three host extension-gate checks and eight GPU cases.
+Each GPU case completes the reference, replay and batch checks before recording.
+Twenty-four new golden files were inspected and added; no existing golden was
+replaced. The four token-Stats hashes per SM103/SM107 target are byte-identical
+to the earlier successful run before the HN-only fixture correction.
+These results cover B=1/4, splits 2/5, and the stated origin/stride variations;
+they do not change the engines' public behavior notes.
+
+Reproduce from `test/python`, using a fresh recording directory and then a
+separate process for the strict comparison:
+
+```bash
+suite=sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py
+CUDNN_DETERMINISM_RECORD=/tmp/new-d256-origin-goldens pytest "$suite" -m L0 -q
+CUDNN_DETERMINISM_GOLDENS=/tmp/new-d256-origin-goldens pytest "$suite" -m L0 -q
+```
+
+The pre-fix B300 detector produced NaN output for both dtypes when independent
+physical offsets were not forwarded. The historical SM107 strict expected
+failures stopped at the missing-metadata assertion; bypassing only that assertion
+exposed the numerical error. The old native extension also fails all six new
+nonpaged D256 frame cases while passing the six paged controls. Intermediate
+new-fixture failures exposed omitted total-Q capacity and undersized B=1 HN
+storage, both corrected in tests without another production change.
+
 ### Fixed SM107 quantized backward implementations (2026-11-15)
 
 Per-tensor FP8 engine 20605 and MXFP8 engine 20606 retain their records,
@@ -520,6 +576,7 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -531,7 +588,7 @@ pytest core/test_determinism_utils.py
 | `TestDSADeterministicDKV` | `sparse_attention_backward_wrapper` dKV layouts (`deterministic_dkv_mode`, SM100/SM103) | output, max logits, LSE (H128 D576: reference inputs) | dQ, dKV, dSink |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
-| `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
+| `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | — (no backward API for FP8/MXFP8/NVFP4 inputs) |
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
 | `attention_gate/frost/test_gate_quant_decode_determinism.py` | `AttentionGateQuantDecode` (the attention gate + quantize decode step, rows 1 .. 160) | FP8 E4M3 output `out` | — (inference-only step kernel; no backward) |
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
@@ -2020,6 +2077,54 @@ failure is a separate integration blocker; these explicit-plan results do
 not claim it is fixed. Existing measurements below are retained, not rerun
 as part of this addition.
 
+### GLU + Hadamard + quant column-scale packing — SM100, 2026-11-11
+
+The shared columnwise scale store now writes standard GEMM 128x4 scale atoms.
+The existing reference decoder independently gathers those physical bytes
+before checking scales and dequantized RHT values. A negative-control run of
+the updated column-scale test against pristine `683f294b` failed: 3626 of 4096
+scale elements mismatched, with maximum absolute error 93. The legacy decoder
+was self-consistent with the old producer; this fixes its GEMM consumer contract.
+
+Qualification used the edited `683f294b` checkout on NVIDIA GB200 (SM100,
+152 SMs), driver 580.126.20, PyTorch 2.13.0a0+8145d630e8.nv26.06 / CUDA 13.3,
+cuDNN backend 92600, and CuTe DSL 4.8.0 compiling with CUDA 13.4. Import-path
+and source-hash checks confirmed the tested checkout. Results:
+
+- Existing Torch quantization suite: **17 passed, 6 Rubin-only skips**, 17.24 s.
+- New determinism suite: **5 passed**, 11.93 s. The default 32-channel interleaved
+  input uses expert M=[256,0,512], N=256/2048, K=512. Separate independent
+  GEMM/SwiGLU/H16/dequantization checks accompany raw-byte comparisons of every
+  output across fresh allocations, concurrent work, changed-weight/scale graph
+  replay, and expert isolation/reordering/duplication/removal/changed neighbors.
+- JAX selection: **16 passed, 196 deselected**, 45.53 s, using isolated JAX 0.11.1
+  and NumPy 2.2.6. Columnwise cases use an independent input dequantization and
+  GEMM/SwiGLU/H16 reference as well as Torch byte parity and compiled replay.
+  The fixture's RHT maximum 25984 exceeds the 10752 range at encode scale 0.25;
+  columnwise RHT therefore uses 1/64 (range 172032), with finite/per-block scale
+  representability assertions. Inputs and numerical tolerances are unchanged.
+
+The warm-stress case uses M=[1024,0,2048], N=2048, K=4096, crossing the staged
+input ring and reusing epilogue buffers. The unsafe control failed 200/200
+launches. The actual kernel had **0 mismatches in 3000 warm and 3000 poisoned
+launches**. These are cold-reference stability checks; the independent numerical
+reference runs separately, not as an exact-byte stress reference. The kernel
+launches 152 blocks (one per SM), below the control's three blocks per SM.
+Each 3000-launch arm bounds the observed per-launch failure rate below 0.0998%
+at 95% confidence for this tested configuration; it does not establish race
+freedom or transfer the control's geometry to this kernel.
+
+SM103, SM107, CUDA 12 compilation and JAX batch invariance remain unverified.
+This is a forward-only fusion; no backward API is claimed. No runtime golden
+or numerical tolerance was changed. From `test/python`, with the edited source
+on the import path:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py -m L0 -q -rs -s
+python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -k glu_hadamard_quant -m L0 -q -rs
+```
+
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 
 `test_DSA_indexer_compressed_sm90_determinism.py` now covers the public
@@ -3346,6 +3451,35 @@ including their own saved golden. Each device skips the other precision group.
 The [API-by-dtype results](#api-and-datatype-results) keep these gaps separate
 from measured results. FP8/MXFP8 backward is not
 supported by these DSA attention/indexer APIs and has no positive test cases.
+
+### DSA NVFP4 indexer: 17 cases
+
+`deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py` runs the
+17 cases of the table above for SM100/SM103/SM107 NVFP4 as well (parameter ID
+`sm100-sm103-sm107-nvfp4`). Q/K are packed E2M1 with non-negative E4M3 scales,
+one per 16 values, drawn with mantissa bits in [2^-2, 2^3] and quantized once
+from CPU-seeded inputs. Their bytes travel as `uint8` and are viewed as
+`float4_e2m1fn_x2` only for the launch, so input mutation checks compare raw
+payload and scale bytes. The reference decodes the stored E2M1 codes and scales
+independently of the quantizer and computes in FP64; replay and batch
+comparisons remain byte-exact. `test_scale_change` doubles the Q E4M3 scales.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| SM100 B200, 148 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver 590.47, cuDNN `92700`, CuTe DSL `4.8.1` | 16 passed, 1 skipped |
+| SM103 B300, 72 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver 595.84.01, cuDNN `92700`, CuTe DSL `4.8.0` | 16 passed, 1 skipped |
+| SM107 Rubin, 216 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver 620.62, cuDNN `92700`, CuTe DSL `4.8.0` | 16 passed, 1 skipped |
+
+The skip on each GPU is `test_golden`: it passed replay and the FP64 reference,
+then found no committed record for that runtime (MXFP8 has none for these
+runtimes either). No NVFP4 golden is committed yet; until one is recorded on a
+runtime that CI runs, NVFP4 byte stability is checked within a process only
+(replay, batch, boundary, ragged and neighbor cases). Command, from
+`test/python`:
+
+```bash
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py -q -rs
+```
 
 ### Block-sparse attention blk64: 30 cases
 
@@ -7353,3 +7487,57 @@ comes from the frozen implementation revisions; subsequent parent integration
 preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
+
+
+### SM100/SM103 FP8 swap-AB wide output addressing — 2026-11-16
+
+The D128 body now widens all coordinates before an Array row slice accumulates
+runtime stride products. Original compact output controls pass on B200 and
+B300; an output batch stride of `2**31 - 65536` elements at B4 leaves half the
+original output unwritten. The fix changes addressing only, with no arithmetic,
+barrier, capability or plan-selection change. This forward body adds no backward
+implementation.
+
+Native qualification used cuDNN 9.24.0.43, Torch 2.11.0+cu130, CuTeDSL 4.8.0
+with compiler/NVRTC 13.4, and verified checkout imports. Parent kernel source
+is `f1b7ee075`; final candidate adds the coordinate-width fix and maintained
+prepared-output regression. B200/SM100 and B300/SM103 both have 148 SMs in these
+runs. CUDA 12 compiler compatibility was not measured in this qualification.
+
+- B200: **74 passed, 0 skipped** for the 48 new output-layout cases and existing
+  dense/paged replay, batch, golden and warm-refill cases.
+- B300: **58 passed, 0 skipped** for the same 48 output-layout cases and existing
+  dense replay, batch, golden and warm-refill cases. Paged SwapAB is not claimed
+  on SM103.
+- Separate B200 D64/D128 paged, split, optional-output and route controls:
+  **60 passed, 0 skipped** with the identical kernel patch.
+
+The 48-case regression crosses E4M3/E5M2 input, FP16/BF16/E4M3/E5M2 output,
+packed/unpacked heads, compact storage, wide batch products and wide strides.
+It checks O, Stats and Amax against the independent reference, byte equality
+for unchanged replay, changed V/scales, and restored-input replay. Snapshots
+are cloned before mutation. Existing batch tests preserve quantized payloads
+through reordering, duplication and changed neighbors; whole-batch Amax retains
+its separate comparison rule. Warm-refill controls on both GPUs detect the
+unsafe ring; the candidate has zero mismatches in 256 warm plus 256 poisoned
+launches per stress case.
+
+For the exact old-stack environments, record the **unmodified parent** into a
+new private golden directory, then compare the candidate with recording unset.
+All 10 B200 and 4 B300 parent records pass strict candidate comparison; no
+committed baseline is replaced. The parent recording runs are separate from
+the candidate counts above.
+
+From `test/python`, run the maintained wide-output detector plus the affected
+existing CI entries:
+
+```bash
+pytest sdpa/frost/test_sdpa_prepared_fp8.py::test_decode_fp8_physical_output_strides_replay -m L0 -q
+CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
+  pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py -m L0 -q \
+  -k 'TestDenseFp8SwapAB and (test_replay_batch or test_golden or test_warm_refill)'
+# SM100 additionally:
+CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
+  pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
+pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
+```

@@ -10,6 +10,19 @@ TWO_SUBGROUP = "sdpa_bwd_sm80_f16_two_subgroup"
 D64_TILE = (64, 128)
 
 
+def uses_flat_grid(*, is_causal, deterministic, thd):
+    """The two-subgroup LPT schedule is dense, causal and nondeterministic."""
+    return is_causal and not deterministic and not thd
+
+
+def launch_grid_mismatch(batch, heads, *, is_causal, deterministic, thd):
+    from cudnn.sdpa.bwd.launch_grid import yz_grid_mismatch
+
+    if uses_flat_grid(is_causal=is_causal, deterministic=deterministic, thd=thd):
+        return None
+    return yz_grid_mismatch(batch, heads)
+
+
 def _packed_stats(facts) -> bool:
     if facts.stats_t is None:
         return True

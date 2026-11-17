@@ -43,6 +43,12 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+For Torch varlen providers, test each op's schema independently: forward and
+backward can select a backend while the out op is still Flash-only. The host
+`test_torch_provider_dispatch.py` matrix checks legacy, mixed and selected
+schemas, including removal. Keep public-selector rejection tests separate
+from direct registered-operator numerics, so upstream architecture/GQA/window
+restrictions do not erase FE forward/backward or synchronization coverage.
 When appending an SDPA adapter constructor argument, update every signature-tail
 pin, including the API-contract, score-stats, SM107 and bias-max suites. Search
 for the previous trailing parameter in `test/python/sdpa/frost`; a new feature's
@@ -78,9 +84,15 @@ knob; updating architecture-local body tests alone misses these consumers.
 When a fixture changes an unsplit record into a split record, select its
 implementation after computing the final knobs. Small-head SM100 paged THD
 split uses single-Q even when the ranked unsplit candidate used multi-Q.
+SM107 D128 THD split also uses shared single-Q with mixed half-Q/FP8-KV;
+its native multi-Q owner must decline the packed-split record before lowering.
+Check mixed-storage ownership separately from uniform-dtype controls.
 `test_paged_thd_split_capture_lengths_and_stats` and
 `test_native_paged_thd_capture_and_rebind` cover that transition, including
 default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
+The architecture CI selector may omit a newly added standalone test file.
+Mirror SM107 numerical regressions into `test_sdpa_fp8_sm107.py`, its existing
+selected entry, by reusing the same checks and preserving their parameter marks.
 Owner migrations must also update shared fixtures at non-exact head widths.
 An exact-width owner map can pass the new contract suite while scalar-tail,
 THD-interior and D512-origin fixtures still select a delegated row. Resolve the
@@ -382,6 +394,12 @@ check that changing either the delta or a shared barrier still fails the test.
 
 ### Conventions for new tests
 
+- **Test launch bounds against each actual scheduler.** A `B`/`H` limit for
+  grid.y/z does not apply to a flat grid.x scheduler. Exercise 65535 and 65536
+  independently for batch and heads, in graph admission and standalone checks;
+  retain legal flat-grid controls and inspect auxiliary launches too.
+  `sdpa/frost/test_sdpa_bwd_launch_grid.py` covers half backward on SM80/SM120.
+
 - Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
   for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
   inputs. A flat (N,) fixture can be rejected before kernel execution. Preserve
@@ -430,6 +448,7 @@ check that changing either the delta or a shared barrier still fails the test.
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
 - **Check reference GEMM rounding before relaxing a chained-kernel tolerance.** Save the failing inputs and compare the projection in FP64 before its BF16 cast. A small FP32 accumulation error can cross that cast's midpoint, then grow through normalization. The serving pool tests use the existing `acc_dtype=torch.float64` oracle option while retaining all intermediate dtype casts and tolerances; pipeline 74800620 exposed this at token 350, head 0, column 109 on a 212-SM Rubin GPU.
 - **Reference cache (opt-in).** `sdpa/ref_cache.py::cached_reference(name, key, compute)` stores an oracle's outputs on disk, keyed by the reference sources' content (`_REF_SOURCES`, `ref_cache.py` itself included; the list is closed under its own relative / `sdpa.` imports -- `sdpa/test_ref_cache.py::test_the_reference_sources_are_closed_under_their_own_imports` fails when a listed module imports an unlisted one), the WHOLE content of the recipe's files -- the file `compute` is defined in and every file on the call stack at the call that is not the interpreter's own: the recipe module, a shared wrapper that built the oracle closure, the test module (frames of pytest / pluggy / torch / the standard library are skipped, not stopped at); the draw order, the quantization call sites and the oracle wrapper are hashed as files, so an edit anywhere in them is a miss, never a stale hit -- the key names the inputs' recipe literally; a helper the recipe imports and has already returned from when the oracle is called is covered through `_REF_SOURCES` only, so list it there --, the device class (name, compute capability, SM count -- one seed is a different dataset on a different SM count), torch's version and the caller's key -- which names what the files' content does not pin because it arrives as a parameter: shape, seed, scale, mask, dtype; off unless `CUDNN_TEST_REF_CACHE=<node-local dir>` names a directory (never a cross-site network file system). Files are hashed as they are on disk at the call, so an edit made WHILE a cache-enabled run is in progress keys that run's later entries by the new content though the old code computed them: after such an edit run once with VERIFY on, or use a fresh directory. A hit returns a previous run's values bitwise, so tolerances are untouched; the point is `CUDNN_TEST_REF_CACHE_VERIFY=1` (`0` / `false` / `no` / `off` = off), which recomputes on every hit and fails the test if the reference drifted from its own past. Entries are read with torch's weights-only unpickler -- tensors and plain Python containers / scalars, all the cache ever stores -- so a pickle payload or a foreign file at an entry path is refused as a miss, never executed; still, keep the directory writable by the test account / CI job only, since whoever writes it decides what a run compares against. The fp8 d=256 backward suite (`sdpa/frost/test_sdpa_bwd_fp8_sm107.py::_run_fp8`) also memoizes its oracle in-process across the parametrizations of one case (the gradient dtype only casts the fp32 gradients), bounded by bytes; under VERIFY the memo stands aside so every repeat is verified too.
+- **Named-engine rejection has two paths.** If all engines decline, planning raises an aggregate error: assert the target engine's specific decline reason. If another engine supplies plans, a strict selector reports that the named engine has no plan. Test both precise paths instead of inferring backend availability from head size alone; backend version and tensor strides (including Stats layout) also affect eligibility.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
 - Shape-override tests must cover a backend lowering decline as well as a lowered graph. Ragged-offset tensors are backend-only operands and can be absent from the Python-only layout; filter those auxiliary overrides against `_variant_pack_uids()` while requiring every Q/K/V/O, Stats and length operand. `test_thd_cache_shape_grid_tracks_runtime_capacity` exercises both layouts without weakening capture, launch-bound or replay checks.
 - **Plan selection must respect current filters.** When testing build-all after an
@@ -484,6 +503,15 @@ check that changing either the delta or a shared barrier still fails the test.
 - **Poison caller workspace, including physical padding.** A TMA descriptor can expose aligned scratch rows beyond the logical sequence. Initialize workspace bytes to both zero and `0xff`, poison outputs, and compare eager and captured results against the same reference. Numerically masked rows still need defined intermediates: `0 * NaN` remains NaN. A clean initcheck result is insufficient when the caller initialized those stale bytes itself (`test_delta_workspace_padding_does_not_feed_dkdv`).
 - **A harness mirror of an engine's admission rule includes the engine's DSL target gate.** `sdpa/mxfp8.py::block_scaled_o_draw` admits a block-scaled O draw where the FROST MXFP8 row would serve it, and an admitted draw the row then declines FAILS the test (the `sf_o` output has no backend lowering), so the mirror must agree with the row on every gate. When the cc 10.7 row became a default candidate (PR #1478) the mirror asked the manifest but not `cutedsl_arch_requirement_error`: on a cc 10.7 host with the public CuTe DSL 4.7.0 (no `sm_107a`) the row declines through that gate while the mirror admitted the draw, so every flag-less d128 block-scaled draw of `test_sdpa_mxfp8_fwd_L0` would have failed where develop ran the backend on the folded draw (verified host-side with the target modelled absent). Model the target on both sides: `sdpa/test_mxfp8_block_scaled_fold.py::test_cc107_default_admission_needs_the_sm_107a_dsl_target` pins the fold with `buffers._cutedsl_has_sm107` patched absent and present.
 - **A version-bounded backend workaround ships with the detector that re-measures it.** A constant such as `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN` is a measurement, and nothing in an ordinary test run would ever notice the backend getting fixed (the guard keeps it from being asked). `sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0` runs the trigger matrix one interpreter per contract with the guard disabled in the child (the constant set to 0 there; a crash is the child's rc 139, never the runner's) plus a control contract the backend is known to plan, and fails with the version to record once the installed backend plans the matrix cleanly -- or, above a recorded version, once it crashes again. Spawn the children with the test module's own directory and `test/python` on their `sys.path`; they inherit neither pytest's path setup nor its fixtures.
+
+  Retain the original cold input and workspace initialization when adding
+  warmed/replay controls (the SM120 empty-query detector uses `0xff`). A zero
+  query mask with reserved physical rows, or an empty request after a positive
+  launch, does not qualify a cold compact empty sequence.
+  `TestSM120EmptyQueryCompatibility` keeps its raw cold-engine detector in a
+  child, checks lengths and physical origins changed together during replay,
+  and updates both the bound V page pool and the dense reference when changing
+  paged inputs. An arbitrary child failure is not the expected kernel crash.
 - Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
 When an attention oracle is FP64 with tolerances, it is not an exact-byte
 `StressCase.reference`. Validate both cold launches used by the helper against
@@ -673,6 +701,13 @@ backend fallback cannot hide a missing kernel repair. The SM100 selected entry
 `test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
 FP8 D128 cases and checks both prepared and standalone graph execution.
 Default-provider passes alone cannot qualify an advertised native path.
+
+Split batch-invariance fixtures must reserve total-Q capacity for inserted or
+duplicated sequences, not only the initial batch's live sum. Keep a required
+`max_total_seq_len_q` bound instead of dropping it to grow the test. A B=1
+head-major Stats control that retains the original head stride still needs
+storage for `H * head_stride`, including the last head's padding. The D256
+split-origin determinism suite checks these contracts with fixed public records.
 
 ### CUDA Graph test lifetimes
 
@@ -1630,3 +1665,22 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+### Backend workspace capacity
+
+A non-null pointer does not establish sufficient workspace capacity. Test the
+observed byte extent at every mapping/ordered/index transport, including the
+native ordered fast path, Python-only producers, deserialization and effective
+shape overrides. Warm the same plan with a valid buffer before replacing it
+with a short view. Keep that view inside a fully sized owned backing for the
+RED control; assert rejection before either FE scratch initialization or output
+writes. Exact capacity, larger carriers of a different element width, and raw
+integer pointers with unknown capacity are positive controls. See
+`core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+For Torch provider routing checks, record the actual native operator call and
+compare with overrides removed. A selected-backend log on stderr may not
+propagate to pytest's `caplog` under Torch's logging configuration; missing
+captured text does not establish a routing failure. The varlen explicit-KV
+length fallback test checks the cuDNN operator and forwarded length tensor.

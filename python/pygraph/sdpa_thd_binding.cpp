@@ -357,14 +357,14 @@ class SdpaThdBinder {
                                     integer(spec, "d_v") == 128 && splits_ > 1;
             const bool d192_split = !quantized_ && !paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 192 &&
                                     integer(spec, "d_v") == 128 && splits_ > 1;
-            const bool d256_split = !quantized_ && paged_ && cga_tile_m_ == 256 && integer(spec, "d_qk") == 256 &&
+            const bool d256_split = !quantized_ && cga_tile_m_ == 256 && integer(spec, "d_qk") == 256 &&
                                     integer(spec, "d_v") == 256 && splits_ > 1;
             const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
                                     integer(spec, "d_v") == 512 && splits_ > 1;
             if ((quantized_ && !nonpaged_fp8_origin_caps && mx_scales_ && paged_) ||
                 (splits_ != 1 && !d64_split && !d128_split && !d192_split && !d256_split && !d576_split) || has_gate_)
                 invalid(
-                    "physical THD origins require ungated half unsplit/D64/D128 split/nonpaged D192 split/paged D256 "
+                    "physical THD origins require ungated half unsplit/D64/D128 split/nonpaged D192 split/D256 "
                     "split/native D576 "
                     "split or unsplit "
                     "per-tensor FP8/nonpaged MXFP8 map or FP8/MXFP8 per-port-capacity pointer-origin plans");
@@ -1116,6 +1116,7 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def_prop_ro_static("supports_nonpaged_d64_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_d256_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_d256_split_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_d256_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_d256_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_d128_packed_split", [](py::object) { return true; })
