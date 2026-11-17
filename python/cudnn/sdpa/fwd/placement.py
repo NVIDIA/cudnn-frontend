@@ -584,6 +584,8 @@ SM120_PAGED_SQ1_D512_MIN_GROUP = 40  # s_q == 1, paged d512: <= 32 heads lose 1.
 SM120_PAGED_MTP_D128_MIN_GROUP = 4  # bf16 paged d128 MTP: from this group FROST leads at any size (sm120_paged_d128_mtp_v7_20261117) ...
 SM120_PAGED_MTP_D128_MAX_LOG2_TILES = 5.5  # ... and a smaller group up to 2^5.5 tiles (b * h_kv), as the retired table entries did
 _SM120_PAGED_MTP_D128_CLASS = ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa")
+SM120_PAGED_WINDOW_SQ1_D192_MAX_LOG2_TILES = 6.5  # bf16 paged d192 x 192 windowed decode leads up to 2^6.5 KV-head tiles ...
+_SM120_PAGED_WINDOW_SQ1_D192_CLASS = ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa")
 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
@@ -1350,6 +1352,10 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
         group = facts.h_q // facts.h_kv
         lead = group >= SM120_PAGED_MTP_D128_MIN_GROUP or placement_table.log2_tiles(facts) <= SM120_PAGED_MTP_D128_MAX_LOG2_TILES
         return LEAD if lead else TRAIL
+    if key is not None and key[:-1] == _SM120_PAGED_WINDOW_SQ1_D192_CLASS and placement_table.log2_tiles(facts) <= SM120_PAGED_WINDOW_SQ1_D192_MAX_LOG2_TILES:
+        # ... and above it the rules below decide: a table entry would also trail the power-of-two groups they lead, and no
+        # single-feature entry was feasible. Holdout: 52 changed at 0.34-0.37, worst 0.78 (sm120_paged_window_decode_d192x192_v2_20261117).
+        return LEAD
     narrow_paged = facts.has_paged_kv and max(facts.d_qk, facts.d_v) <= _SM120_GENERAL_HEAD_TILE_MAX
     if narrow_paged and _sm120_decode_tile_m(caps, facts) == 0:
         return TRAIL  # paged KV on the prefill body: 15-27x behind the backend at s_q 8-2048 (module docstring)

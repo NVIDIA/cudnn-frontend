@@ -280,6 +280,24 @@ def test_sm120_paged_d128_mtp_follows_the_group(s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
+def test_sm120_paged_d192_window_decode_leads_on_few_tiles(s_kv):
+    """Study sm120_paged_window_decode_d192x192_v2_20261117: bf16 paged d192 x 192 windowed decode (step5 SWA ran the backend at
+    2.49x) leads up to 2^6.5 KV-head tiles; above it the hand rule decides (powers of two lead, other groups trail), and
+    d192 x V128 has its own table entries."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    dec = dict(h_q=64, h_kv=4, s_q=1, s_kv=s_kv, d_qk=192, d_v=192, causal=True, bottom_right=True, window_left=511)
+    dec.update(has_paged_kv=True, page_size=16, padded=True, device_cc=(12, 0), device_sm_count=188)
+    for b, h_q, h_kv in ((1, 64, 4), (16, 40, 4), (8, 96, 8)):  # 2^2 / 2^6 / 2^6 tiles; groups 16 / 10 / 12
+        assert placement.place(spec, _facts(**dict(dec, b=b, h_q=h_q, h_kv=h_kv))) == placement.LEAD, (b, h_q, h_kv)
+    assert placement.place(spec, _facts(**dict(dec, b=64, h_q=40, h_kv=4))) == placement.TRAIL  # 2^8 tiles, group 10: the hand rule
+    assert placement.place(spec, _facts(**dict(dec, b=64, h_q=64, h_kv=4))) == placement.LEAD  # 2^8 tiles, group 16: the hand rule
+    assert placement.place(spec, _facts(**dict(dec, b=1, window_left=None))) == placement.TRAIL  # unwindowed: not this class
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [8, 16, 128, 2048])
 def test_sm120_paged_prefill_body_trails(s_q):
     """SM120 paged K/V on the prefill body (no 16 / 32-row decode tile) keeps the backend first: it ran 15-27x behind on the RTX PRO
