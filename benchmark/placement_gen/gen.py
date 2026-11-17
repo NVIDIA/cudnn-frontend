@@ -4,6 +4,8 @@
 """Fit placement-table entries from a frozen study and score them on its holdout.
 
     python benchmark/placement_gen/gen.py <study.json> [--emit]
+    python benchmark/placement_gen/gen.py <study.json> --constrained [--two-feature] [--rules-out RULES.json] [--emit]
+    python benchmark/placement_gen/gen.py <study.json> --score RULES.json <holdout.jsonl ...>
 
 A study JSON names the row, device, dtype, harness adapter, head pair and the train / holdout JSONL files written by the
 study drivers (one record per (case, leg) with ``ms``, ``plan``, ``case``). Each case is turned into graph facts and
@@ -16,6 +18,14 @@ the direction that keeps more wins. The feature with the lowest training regret 
 frozen holdout, run once at the frozen head, remains the independent qualification. A class whose
 wins and losses interleave so that neither direction keeps a win is reported as NON-MONOTONE and gets no entry: split
 the class (add a key field) rather than fitting around it.
+
+``--constrained`` fits under the holdout criterion instead (AGENTS.md S12). It needs the measured default leg (``cudnn_auto``).
+A rule's changed cells are those whose verdict differs from the default; it is feasible when they run at geomean <= 1.0 and
+worst <= 1.05 against that leg. The feasible rule with the lowest training regret wins (ties: fewer changed cells, then
+``cost``). With ``--two-feature``, a single-feature rule may also carry a second condition, ``ge`` on KV or query tokens
+(``Entry.also``); a single-feature rule wins a tie. No feasible rule means no entry. ``--score`` scores frozen rules on a
+holdout once: per class, changed cells at geomean <= 1.0 and worst <= 1.10; a twin (on / off the KV tile) passes when both
+sides pass with at least one changed cell.
 """
 
 from __future__ import annotations
@@ -154,13 +164,126 @@ def fit(points, margin):
     return min([split, *flat], key=regret)
 
 
+def _cells(paths, s):
+    """Per class key, the cells with all three legs timed: facts, backend / FROST / measured-default ms, and whether the default
+    ran FROST."""
+    to_facts = ADAPTERS[s["adapter"]]
+    by = collections.defaultdict(list)
+    for d in load(paths):
+        if "cudnn_auto" not in d:
+            continue
+        f = to_facts(d["cudnn"]["case"], s)
+        key = pt.class_key(s["row"], f)
+        if key is not None:
+            x = dict(be=d["cudnn"]["ms"], fr=d["cudnn_oss"]["ms"], au=d["cudnn_auto"]["ms"], dflt="sdpa_fwd" in (d["cudnn_auto"].get("plan") or ""))
+            x.update({k: round(fn(f), 6) for k, fn in pt.FEATURES.items()})
+            by[key].append(x)
+    return by
+
+
+def _geo(v):
+    return math.exp(sum(map(math.log, v)) / len(v)) if v else 1.0
+
+
+def _leads(x, rule):
+    """rule: (direction, threshold, feature[, direction, threshold, feature]); the second triple must also hold."""
+    if rule[0] in ("always", "never"):
+        return rule[0] == "always"
+    hold = lambda d, t, feat: x[feat] >= t if d == "ge" else x[feat] <= t  # noqa: E731
+    return hold(*rule[:3]) and (len(rule) < 6 or hold(*rule[3:]))
+
+
+def _changed(xs, rule):
+    regret = _geo([(x["fr"] if _leads(x, rule) else x["be"]) / min(x["be"], x["fr"]) for x in xs])
+    return regret, [(x["fr"] if _leads(x, rule) else x["be"]) / x["au"] for x in xs if _leads(x, rule) != x["dflt"]]
+
+
+def constrained_fit(xs, two_feature=False):
+    """The lowest-train-regret feasible rule of one class (module docstring), or None."""
+
+    def cuts(feat):
+        v = sorted({x[feat] for x in xs})
+        return [round((a + b) / 2, 3) for a, b in zip(v, v[1:])]
+
+    singles = [("always", None, None), ("never", None, None)]
+    singles += [(d, t, feat) for feat in pt.FEATURES for t in cuts(feat) for d in ("le", "ge")]
+    pairs = []
+    if two_feature:
+        pairs = [r + ("ge", t2, f2) for r in singles[2:] for f2 in ("kv", "q") if f2 != r[2] for t2 in cuts(f2)]
+    best = None
+    for i, rule in enumerate(singles + pairs):
+        regret, ch = _changed(xs, rule)
+        if ch and (_geo(ch) > 1.0 or max(ch) > 1.05):
+            continue
+        rank = (round(regret, 6), i >= len(singles), len(ch), rule[2] != "cost")
+        if best is None or rank < best[0]:
+            best = (rank, rule)
+    return None if best is None else best[1]
+
+
+def _entry(key, rule, study):
+    direction, t, feat = rule[:3]
+    args = [repr(direction), repr(t), repr(study)]
+    if feat not in (None, "cost") or len(rule) == 6:
+        args.append(repr(feat or "cost"))
+    if len(rule) == 6:
+        args.append(repr(tuple(rule[3:])))
+    return f"    {key!r}: Entry({', '.join(args)}),"
+
+
+def constrained_main(args, s):
+    if args.score:
+        rules = {tuple(tuple(v) if isinstance(v, list) else v for v in json.loads(k)): tuple(r) for k, r in json.load(open(args.score)).items()}
+        ok = {}
+        for key, xs in sorted(_cells(args.paths, s).items(), key=lambda kv: str(kv[0])):
+            rule = rules.get(key[3:])
+            if rule is None:
+                continue
+            _, ch = _changed(xs, rule)
+            ok[key[3:]] = bool(ch) and _geo(ch) <= 1.0 and max(ch) <= 1.10
+            verdict = "PASS" if ok[key[3:]] else ("VACUOUS" if not ch else "FAIL")
+            print(f"  {key[3:]}  n={len(xs)}  {rule}  changed {len(ch)} geo {_geo(ch):.3f} worst {max(ch, default=1.0):.3f}  {verdict}")
+        twins = collections.defaultdict(list)
+        for tail, v in ok.items():
+            twins[tail[:-1]].append(v)
+        for tail, v in sorted(twins.items(), key=str):
+            print(f"  twin {tail}  {'PASS' if all(v) and len(v) == 2 else 'FAIL'}")
+        return 0
+    rules = {}
+    for key, xs in sorted(_cells(s["train"], s).items(), key=lambda kv: str(kv[0])):
+        rule = constrained_fit(xs, args.two_feature)
+        default = _geo([x["au"] / min(x["be"], x["fr"]) for x in xs])
+        if rule is None:
+            print(f"  {key[3:]}  n={len(xs)}  NO FEASIBLE RULE (default regret {default:.3f}): no entry")
+            continue
+        regret, ch = _changed(xs, rule)
+        print(
+            f"  {key[3:]}  n={len(xs)}  {rule}  regret {regret:.3f} (default {default:.3f})  changed {len(ch)} geo {_geo(ch):.3f} worst {max(ch, default=1.0):.3f}"
+        )
+        rules[key] = rule
+    if args.rules_out:
+        json.dump({json.dumps(list(k[3:])): list(r) for k, r in rules.items()}, open(args.rules_out, "w"), indent=1)
+    if args.emit:
+        print(f"\n    # study {s['id']}")
+        for key, rule in rules.items():
+            print(_entry(key, rule, s["id"]))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("study")
+    ap.add_argument("paths", nargs="*", help="--score: the holdout JSONL files")
     ap.add_argument("--margin", type=float, default=0.03, help="|ratio - 1| within this is neutral")
     ap.add_argument("--emit", action="store_true", help="print the TABLE block for cudnn/sdpa/placement_table.py")
+    ap.add_argument("--constrained", action="store_true", help="fit under the holdout criterion against the measured default leg")
+    ap.add_argument("--two-feature", action="store_true", help="--constrained: also try a second condition on KV or query tokens")
+    ap.add_argument("--rules-out", help="--constrained: write the fitted rules (JSON) for --score")
+    ap.add_argument("--score", help="score these frozen rules (JSON) on the holdout files given as paths")
     args = ap.parse_args()
     s = json.load(open(args.study))
+    if args.constrained or args.score:
+        return constrained_main(args, s)
     to_facts = ADAPTERS[s["adapter"]]
     train, hold = load(s["train"]), load(s["holdout"])
 
