@@ -20,6 +20,10 @@
 * the kernel check on constructed launch records of a verify step: the decode kernel under the row's name, another
   tokens count (another shared memory), a call served without the wait, a launch more or less, another shape than the
   recorded one -- each FAILS with its own sentence.
+* the out-projection of a verify step: the rows of the FP8 projection entry for the linear-attention layers' call, keyed on
+  the rows of the step, with the attention layers' call handed on to the next row; a provider row that hands a call site
+  on and the parts of its block in a plan (``blocks.BySite``); the adapter over a stand-in entry, whose call log states
+  the form for the rows and the split of the call it served.
 
 No GPU, no weights on disk, no profiler."""
 
@@ -45,6 +49,8 @@ DECODE_SYMBOL = (
 )
 VERIFY_SHAPE = ((96, 1, 1), (256, 1, 1), 126512)  # one sequence x six tokens on compute capability 10.0: the pair of thread blocks per value head
 TWO_TOKENS = ((96, 1, 1), (256, 1, 1), 112368)  # the same kernel at two tokens per sequence: the shared memory follows the tokens
+OUT_SHAPE = ((80, 2, 1), (256, 1, 1), 103808)  # the out-projection of a linear-attention layer at 2 to 8 rows: two K slices per 64 weight rows
+OUT_SHAPE_SPLIT_4 = ((80, 4, 1), (256, 1, 1), 84352)  # at 9 to 16 rows: four K slices, a ring of 7 stages, the 16-row token tile
 RECORDED = {"torch": "2.14.0", "nvidia-cutlass-dsl": "4.8.0"}  # installed versions equal to the census's recorded ones
 GATHER = "void at::native::(anonymous namespace)::indexSelectSmallIndex<BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<...>)"
 ELEMENTWISE = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<double>, std::array<char*, 2ul> >(int, ...)"
@@ -575,7 +581,11 @@ def test_the_rows_of_the_verify_entry_and_what_every_other_block_does_at_its_row
         "fe.swiglu_fp4_decode",
         "fe.attention_gate_quant_decode",
     ]
-    assert dict(plan.rows["mlp.gate_up"].form)["TOKEN_TILE"] == 8 and plan.rows["projection.fp8.out"].fallback == "bf16 copy of 8-bit weights"
+    assert dict(plan.rows["mlp.gate_up"].form)["TOKEN_TILE"] == 8
+    # ... and the out-projection is two rows at six rows, by call site: the linear-attention layers' call on the FP8 projection
+    # entry, the attention layers' on the multiply over a copy (the rows: the test of the out-projection below)
+    assert plan.at("projection.fp8.out", "linear_attention.out")[0].key == "fe.fp8_projection_decode"
+    assert plan.at("projection.fp8.out", "full_attention.out")[0].fallback == "bf16 copy of 8-bit weights"
     assert _plan(1, 6, "fe-entries")[0].rows["linear_attention.step"].form == (*wait, ("TOKENS", 6))
     assert _plan(1, 6, "fe-cublas")[0].rows["linear_attention.step"].form == (
         ("PDL", False),
@@ -790,6 +800,16 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
     step = {entry[0]: entry for entry in parts["linear_attention_layer"]}
     assert step["linear_attention.step"][1:] == ["gdn_verify_fused", {"form": {"TOKENS": 6}, "launch": [[96, 1, 1], [256, 1, 1], 126512]}]
     assert step["projection.fp8.out"][1] == "fp8_projection" and step["projection.fp8.out"][2]["launch"] == [[80, 2, 1], [256, 1, 1], 103808]
+    assert step["projection.fp8.out"][2]["form"] == {
+        "OUT_FEATURES": 5120,
+        "IN_FEATURES": 6144,
+        "SPLIT_K": 2,
+        "MMA_M": 64,
+        "STAGES": 11,
+        "TOKEN_TILE": 8,
+        "TMEM_COLS": 32,
+        "HOLD_TMEM": True,
+    }, "the kernel of six rows, stated whole: the split, the ring and the token tile of the row count, and the two fields only the port has"
     assert {entry[0]: entry[1] for entry in parts["attention_layer"]}["projection.fp8.out"] == "cublaslt_fp8_gemm"
     kernel = target.data["kernels"]["gdn_verify_fused"]
     assert (kernel["relation"], kernel["kind"], kernel["entry"], kernel["form"]) == (
@@ -803,14 +823,14 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
         (
             QwenDense(),
             "484 launches per step = 162 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
-            "322 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results)",
-            "projection.fp8.out 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1",
+            "370 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)",
+            "mlp.down 64, attention.prepare 16, attention.core 16, projection.fp8.out 16, output_head 1",
         ),
         (
             QwenDense.reduced(),
             "20 launches per step = 8 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
-            "12 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results)",
-            "projection.fp8.out 2, mlp.down 2, attention.prepare 1, attention.core 1, output_head 1",
+            "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)",
+            "mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1",
         ),
     ):
         plan, _ = _plan(1, 6, model=model)
@@ -820,10 +840,20 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
             f"kernel identity, as planned: {reached}; not yet: {not_yet}; 1 declared stand-in (not yet: output_head.quantize)",
         ]
         assert claim.name == "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)" and claim.of("linear_attention.step") == "target"
-        assert claim.of("projection.fp8.out") == "not yet (bf16 copy of 8-bit weights)"
+        # the out-projection: the target's kernel at the linear-attention layers' call, not yet at the attention layers'
+        assert claim.of("projection.fp8.out") == "target; not yet (bf16 copy of 8-bit weights)"
+        assert claim.of("projection.fp8.out", "linear_attention.out") == "target"
+        assert claim.of("projection.fp8.out", "full_attention.out") == "not yet (bf16 copy of 8-bit weights)"
         assert claim.reasons == ["fallback rows present", "the plan has no block for output_head.quantize"]
         step_call = claim.blocks.index("linear_attention.step")
         assert claim.recorded[step_call] == VERIFY_SHAPE, "item 7: the recorded launch shape of the verify kernel"
+        out_calls = [
+            index for index, (block, site) in enumerate(zip(claim.blocks, claim.sites)) if (block, site) == ("projection.fp8.out", "linear_attention.out")
+        ]
+        assert len(out_calls) == model.geometry.layer_kinds.count("linear_attention") and all(claim.recorded[index] == OUT_SHAPE for index in out_calls)
+        assert not any(
+            index in claim.recorded for index, site in enumerate(claim.sites) if site == "full_attention.out"
+        ), "a multiply over a copy: no launch is held"
     # a section holds for the tokens per sequence, the rows and the class it was recorded with
     for sequences, tokens, cc, sms, reason in (
         (1, 2, (10, 0), 148, "no recorded section for 2 tokens per sequence on cc 10.0 / 148 SMs: recorded is 6"),
@@ -980,28 +1010,62 @@ def test_a_stored_form_the_load_did_not_keep_fails_a_verify_session_by_name():
     plan, model = _plan(1, 6)
     session = Session(model, TextIO.synthetic(model.geometry.vocab), stack="native", device="cpu", tokens=6)
     session.plan = plan
-    assert session.stored_weights() == ("projection.fp8.in", "mlp.gate_up"), "what a verify plan of six rows multiplies on its stored format"
-    for kept, laid_out, sentence in (
-        ((), (), "cudnn.Fp8ProjectionDecode multiplies on the stored format of the weight of projection.fp8.in, and the load kept none"),
-        (("projection.fp8.in",), (), "cudnn.SwigluFp4Decode multiplies on the stored format of the weight of mlp.gate_up, and the load kept none"),
+    out = "projection.fp8.out at linear_attention.out"  # the linear-attention layers' out-projection: a call site of a block two rows serve
+    whole = ("projection.fp8.in", out, "mlp.gate_up")
+    assert session.stored_weights() == whole == session.uncopied_weights(), "what a verify plan of six rows multiplies on its stored format"
+    for kept, uncopied, laid_out, sentence in (
+        ((), (), (), "cudnn.Fp8ProjectionDecode multiplies on the stored format of the weight of projection.fp8.in, and the load kept none"),
+        (("projection.fp8.in",), (), (), f"cudnn.Fp8ProjectionDecode multiplies on the stored format of the weight of {out}, and the load kept none"),
         (
-            ("projection.fp8.in", "mlp.gate_up"),
+            ("projection.fp8.in", "projection.fp8.out at full_attention.out"),  # the other call site's weights: not this part's
+            (),
+            (),
+            f"cudnn.Fp8ProjectionDecode multiplies on the stored format of the weight of {out}, and the load kept none",
+        ),
+        (("projection.fp8.in", out), (), (), "cudnn.SwigluFp4Decode multiplies on the stored format of the weight of mlp.gate_up, and the load kept none"),
+        (
+            whole,
+            (),
             (),
             "cudnn.SwigluFp4Decode multiplies on the stored weight of mlp.gate_up in its own row order, and the load kept it in the checkpoint's",
         ),
+        (
+            ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up"),  # a load that kept every out-projection weight on its stored format alone
+            ("projection.fp8.out",),
+            ("mlp.gate_up",),
+            "torch.matmul over a bf16 copy reads a bf16 copy of the weight of projection.fp8.out at full_attention.out, and the load kept its stored format alone",
+        ),
     ):
-        session.weights = SimpleNamespace(stored=kept, uncopied=(), laid_out=laid_out)
+        session.weights = SimpleNamespace(stored=kept, uncopied=uncopied, laid_out=laid_out)
         with pytest.raises(ValueError, match="the weights of this session were loaded for another plan") as failed:
             session._check_forms()
         assert str(failed.value).startswith(sentence)
-    session.weights = SimpleNamespace(stored=("projection.fp8.in", "mlp.gate_up"), uncopied=(), laid_out=("mlp.gate_up",))
-    session._check_forms()
+    for kept in (whole, ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up")):  # by call site, or the whole block: both hold the part's form
+        session.weights = SimpleNamespace(stored=kept, uncopied=(), laid_out=("mlp.gate_up",))
+        session._check_forms()
+    session.weights = SimpleNamespace(stored=whole, uncopied=whole, laid_out=("mlp.gate_up",))
+    session._check_forms()  # the load of this plan alone: no copy of the linear-attention layers' weight, a copy of the attention layers'
     # ... and its claim is held against the verify section of the census, its memory arithmetic asked with its tokens
     claim = session.claim()
     assert claim.configuration == "verify" and claim.rows == 6 and session._per_token() == {"tokens": 6}
     plain = Session(model, TextIO.synthetic(model.geometry.vocab), stack="native", device="cpu")
     plain.plan = _plan(1, 1)[0]
     assert plain.claim().configuration == "plain" and plain._per_token() == {}
+    # a decode session on the load of a verify plan alone: its out-projection reads a copy of every layer's weight, and that
+    # load kept none of the linear-attention layers' -- named before the first step, by the block
+    assert plain.stored_weights() == ("projection.fp8.in", "mlp.gate_up")
+    plain.weights = SimpleNamespace(stored=whole, uncopied=whole, laid_out=("mlp.gate_up",))
+    with pytest.raises(
+        ValueError, match="^torch.matmul over a bf16 copy reads a bf16 copy of the weight of projection.fp8.out, and the load kept its stored format alone"
+    ):
+        plain._check_forms()
+    # planned together, the load keeps what BOTH plans read: the stored codes for the verify plan, the copy for the decode plan
+    plain._followers = (session,)
+    assert plain.stored_weights() == ("projection.fp8.in", "mlp.gate_up", out), "its own blocks first, then what the plan behind it adds"
+    assert plain.uncopied_weights() == ("projection.fp8.in", "mlp.gate_up")
+    assert plain.stored_weights(own=True) == ("projection.fp8.in", "mlp.gate_up"), "what the decode session's own steps read on a stored format"
+    session._followers = (plain,)
+    assert session.stored_weights() == whole and session.uncopied_weights() == ("projection.fp8.in", "mlp.gate_up"), "whichever of the two loads"
 
 
 def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_verify_step():
@@ -1026,14 +1090,14 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         321,
         1,
         49,
-        273,
+        321,
     )
     family = (MODELS / "qwen_dense" / "README.md").read_text(encoding="utf-8")
     area = (MODELS / "README.md").read_text(encoding="utf-8")
     guide = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     section = " ".join(family.split("## The verify step", 1)[1].split("\n## ", 1)[0].split())
     whole = "484 launches per step = 162 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
-    reached = "322 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results)"
+    reached = "370 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)"
     assert whole in section and reached in section, "the family README: the verify step's target and what is reached of it, each with its split"
     assert "the whole is 162 + 321 + 1 where the decode step's is 210 + 273 + 1" in section and "126,512 B at six tokens and one sequence" in section
     assert "Session.verify" in " ".join(area.split()) and "verify.verify(ids, accept)" in family and "`fe.gdn_verify_fused`" in section
@@ -1048,14 +1112,24 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         """The cuDNN Frontend entries whose calls are target kernels in the plan of one sequence of ``tokens`` tokens."""
         planned, whole_model = _plan(1, tokens, model=QwenDense())
         held = target.claim(planned, whole_model, census.configuration_of(planned), installed=RECORDED)
-        return {planned[name].entry for name in planned if planned[name].provider == "cuDNN FE" and held.of(name).startswith("target")}
+        return {
+            (name, block.entry)
+            for _, name, site, _, block in planned.parts()  # per call site, for a block whose calls two rows serve
+            if block.provider == "cuDNN FE" and held.of(name, site or None).startswith("target")
+        }
 
-    decode_entries, verify_entries = on_target(1), on_target(6)
+    decode_blocks, verify_blocks = on_target(1), on_target(6)
+    decode_entries, verify_entries = ({entry for _, entry in found} for found in (decode_blocks, verify_blocks))
     assert len(decode_entries) == len(verify_entries) == 5 and len(decode_entries & verify_entries) == 4
     assert (decode_entries - verify_entries, verify_entries - decode_entries) == ({"cudnn.GdnDecodeFused"}, {"cudnn.GdnVerifyFused"})
+    # ... and one of the five serves a second block in a verify step: the 8-bit projection entry, the out-projection
+    assert {name for name, entry in decode_blocks if entry == "cudnn.Fp8ProjectionDecode"} == {"projection.fp8.in"}
+    assert {name for name, entry in verify_blocks if entry == "cudnn.Fp8ProjectionDecode"} == {"projection.fp8.in", "projection.fp8.out"}
     assert (
-        "five entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other four the same -- serve 321 of the 484 launches of a verify "
-        "step, 48 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results" in " ".join(area.split())
+        "five entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other four the same, the 8-bit projection entry there for the "
+        "out-projection of the linear-attention layers as well -- serve "
+        "369 of the 484 launches of a verify step, 48 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results "
+        "(with PyTorch's gather: 370 = 49 + 321)" in " ".join(area.split())
     ), "the entries are named beside the count they serve, and the count carries its split"
     assert "the same five entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
     # the form the entry takes between the step shapes at the ends of a row's range -- one thread block per SM, which a host
@@ -1074,7 +1148,652 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "The two sessions share the load and nothing else." in section and "a prompt prefilled through `decode` is no context of `verify`" in section
     assert "says of three lines that they are not stated -- the first-token line" in section, "the report of a verify session"
     assert "48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB" in section, "where the memory sentence is short"
+    # ... and up to 32 rows the sentence is no band of a tenth of a GiB in both directions: one step shape reserved half a GiB
+    # less than its sentence asked for, and the text states that run beside the others
+    assert "PyTorch reserved within 0.1 GiB of it" not in section, "three sequences of three tokens reserved 0.5 GiB less than the sentence said"
+    assert "Up to 32 rows of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said" in section
+    assert (
+        "three sequences of three tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.1 GiB and grew the device by 3.3 GiB"
+        in section
+    )
+    # what the comparison with the decode steps gates is stated for the step shapes where it gated: up to 32 rows.  Beyond
+    # them the in-projection in front of the linear-attention layer is a multiply over a copy in the verify plan and its entry
+    # in the decode plan of the same sequences, so that layer is fed other rows and its state is printed, not gated
+    assert "at every step shape that ran up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows --" in section
+    assert "at every step shape that ran --" not in section, "16 sequences of three, four and five tokens ran too, and their kept state was not gated"
+    in_projection = "projection.fp8.in"
+    for sequences, tokens in ((16, 3), (16, 4), (16, 5)):  # 48, 64 and 80 rows
+        verify_row, decode_row = _plan(sequences, tokens)[0].rows[in_projection], _plan(sequences)[0].rows[in_projection]
+        assert (verify_row.fallback, decode_row.key) == ("bf16 copy of 8-bit weights", "fe.fp8_projection_decode"), (sequences, tokens)
+    for sequences, tokens in ((1, 2), (1, 6), (1, 8), (3, 3), (2, 6), (2, 8), (3, 6), (9, 2), (4, 6), (3, 8), (4, 7), (4, 8), (16, 2)):
+        verify_row, decode_row = _plan(sequences, tokens)[0].rows[in_projection], _plan(sequences)[0].rows[in_projection]
+        assert verify_row.key == decode_row.key == "fe.fp8_projection_decode", "up to 32 rows both plans have the in-projection on its entry"
+    assert (
+        "At 16 sequences of three, four and five tokens -- 48, 64 and 80 rows -- every greedy token was the decode steps' as well, and the kept state "
+        "was printed, not gated: from 33 rows of a step the in-projection is a multiply over a copy in the verify session and its entry in the decode "
+        "session of 16 sequences, so the linear-attention layer was fed other rows" in section
+    )
+    # the out-projection of a verify step, as the family README states it: the two-line table of a plan, the row ranges with the
+    # launch the entry states for each, the form of the first range, and what a load keeps -- each computed elsewhere in this
+    # module or in the census module's loader test, and held here to the text
+    full_plan, _ = _plan(1, 6, model=QwenDense())
+    printed = [" ".join(line.split()) for line in full_plan.table().splitlines() if line.startswith("  projection.fp8.out")]
+    quoted = [" ".join(line.split()) for line in family.splitlines() if line.startswith("projection.fp8.out at ")]
+    assert quoted == printed and len(printed) == 2, "the two lines the README quotes are the plan's own"
+    for row in (
+        "| compute capability 10.0 | 2 to 8 | 2, 64, 11, 8 | (80, 2, 1), (256, 1, 1), 103,808 B |",
+        "| compute capability 10.0 | 9 to 16 | 4, 64, 7, 16 | (80, 4, 1), (256, 1, 1), 84,352 B |",
+        "| compute capability 10.3 and 10.7 | 2 to 8, 9 to 16, 17 to 32 | 4, 64, 7, and 8, 16, 32 | (80, 4, 1), (256, 1, 1), and 71,040 B, 84,352 B, 110,976 B |",
+    ):
+        assert row in family, "the rows of the out-projection, with the launch the entry states (the test of the rows holds each)"
+    assert (
+        "`[SPLIT_K 2, MMA_M 64, STAGES 11, TOKEN_TILE 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True]` for 2 to 8 rows"
+        in section
+    )
+    assert (
+        "(2.8 GiB on the published model; their codes are 1.4 GiB)" in section and "add about 1.9 GiB to the memory sentence of the published model" in section
+    )
+    assert "with 13 launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries" in section
+    assert "Today three kinds of row do that" in " ".join(family.split()) and "its forms are kept per call site" in " ".join(family.split())
+    # ... and the by-provider sentence of a verify plan: the plan's own line on compute capability 10.0 and on another 10.x class
+    counted = "cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2)"
+    for cc, sms, tokens, frontend in (((10, 0), 148, 6, 5), ((10, 0), 148, 1, 5), ((10, 3), 152, 6, 5), ((10, 3), 152, 1, 4), ((10, 7), 212, 6, 5)):
+        line = _plan(1, tokens, cc=cc, sms=sms, model=QwenDense())[0].by_provider()
+        assert line == f"by provider: cuDNN FE {frontend} | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2", (cc, tokens)
+    assert f"counts what the decode plan counts on compute capability 10.0 -- {counted} --" in section
+    assert "makes the verify plan cuDNN Frontend 5 where the decode plan is cuDNN Frontend 4, with the same fallbacks" in section
     assert "Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(family.split())
     decline = "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
     assert decline in section, "the decline the README quotes is the plan's own sentence"
     assert "## What the verify step taught" in guide and "fe.gdn_verify_fused" in guide
+
+
+# ----------------------------------------------------------------------------------------------- the out-projection of a verify step
+LA_OUT, FA_OUT = "projection.fp8.out at linear_attention.out", "projection.fp8.out at full_attention.out"
+
+
+def _out_parts(sequences, tokens, **where):
+    """Of the plan of ``sequences`` x ``tokens``: what serves the out-projection, per part -- (label, key, K slices, token tile)."""
+    plan, _ = _plan(sequences, tokens, **where)
+    return [
+        (label, row.key, dict(row.form).get("SPLIT_K"), dict(row.form).get("TOKEN_TILE"))
+        for label, name, _, row, _ in plan.parts()
+        if name == "projection.fp8.out"
+    ]
+
+
+def test_the_rows_of_the_out_projection_of_a_verify_step():
+    """In a step of several tokens per sequence the target runs the FP8 projection kernel for the out-projection of a
+    linear-attention layer and a library multiply for an attention layer's.  The block has rows of
+    ``cudnn.Fp8ProjectionDecode`` for such steps alone, keyed on the rows of the step: on compute capability 10.0 two K
+    slices and a ring of 11 stages for 2 to 8 rows, four slices and 7 stages for 9 to 16, the multiply over a copy from
+    17; on the other 10.x classes four slices at 2 to 32 rows.  Each row names the kernel whole -- the token tile of its
+    range too -- serves the linear-attention layers' call site and hands the attention layers' on to the next row.  The
+    form a row names is the PUBLIC entry's own at every row count of the row, and equals the entry's pick; the launch it
+    states at six rows is the recorded one.  A step of one token per sequence is the plan it was."""
+    import cudnn
+    from cudnn.gemm import ProjectionForm, ProjectionGeometry
+    from model_samples import blocks, census
+    from model_samples.qwen_dense import Geometry, QwenDense, configs
+
+    assert configs.VERIFY_OUT_ROWS == (
+        (("cc10.0",), 2, 8, 2, 64, 11, 8),
+        (("cc10.0",), 9, 16, 4, 64, 7, 16),
+        (("cc10.3", "cc10.7"), 2, 8, 4, 64, 7, 8),
+        (("cc10.3", "cc10.7"), 9, 16, 4, 64, 7, 16),
+        (("cc10.3", "cc10.7"), 17, 32, 4, 64, 7, 32),
+    ), "(classes, first row count, last row count, K slices, weight tile, ring stages, token tile)"
+    rows = configs.PROVIDERS["projection.fp8.out"]
+    entry_rows = [r for r in rows if r.key == "fe.fp8_projection_decode"]
+    assert rows[: len(entry_rows)] == entry_rows and [r.key for r in rows[len(entry_rows) :]] == ["cublas.bf16_dequantized", "torch_ref.linear"]
+    assert configs.OUT_PROJECTION_SITES == (("linear_attention.out", (("OUT_FEATURES", 5120), ("IN_FEATURES", 6144))), ("full_attention.out", None))
+    for row, (classes, first, last, split, tile, stages, token_tile) in zip(entry_rows, configs.VERIFY_OUT_ROWS):
+        assert (row.classes, row.rows, row.tokens, row.sequences) == (
+            classes,
+            (first, last),
+            (2, None),
+            (1, None),
+        ), "several tokens per sequence, by the rows of the step"
+        assert row.form == (
+            ("SPLIT_K", split),
+            ("MMA_M", tile),
+            ("STAGES", stages),
+            ("TOKEN_TILE", token_tile),
+            ("TMEM_COLS", 32),
+            ("PREWAIT_WEIGHTS", True),
+            ("HOLD_TMEM", True),
+            ("PDL", True),
+            ("PDL_RELEASE", True),
+        ), "the kernel is stated whole: nothing of it is the entry's pick"
+        assert row.sites == configs.OUT_PROJECTION_SITES and row.served == ("linear_attention.out",) and row.passed == ("full_attention.out",)
+        assert set(row.stacks) == {"native", "fe-entries"} and row.band == "bf16_rounding" and not row.fallback and row.ci
+        assert row.batch_invariant == (("cc10.0",) if classes == ("cc10.0",) else ()), "gated on the class this geometry of the entry has run on"
+        top = 16 if classes == ("cc10.0",) else 32
+        assert row.serves == f"rows {first}-{last} of 2-{top} of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144"
+        assert row.site_form("linear_attention.out") == (*row.form, ("OUT_FEATURES", 5120), ("IN_FEATURES", 6144))
+        handed_on = (
+            r"^provider row fe.fp8_projection_decode: it hands the call site 'full_attention.out' on to the next row of its block and has no form there$"
+        )
+        with pytest.raises(ValueError, match=handed_on):
+            row.site_form("full_attention.out")
+        with pytest.raises(ValueError, match=r"no form for the call site 'mlp'; the row names linear_attention.out, full_attention.out$"):
+            row.site_form("mlp")
+
+    # the PUBLIC entry, built for the host as the adapter builds it: it states every field of the row's form at every row count
+    # of the row; the form given whole is the entry's own pick there (so the two fields only the port has are at the values
+    # its byte comparison ran with); and inside a row's range the entry takes ONE form -- one launch shape
+    shapes = {}
+    for row in entry_rows:
+        fields = dict(row.site_form("linear_attention.out"))
+        form = ProjectionForm(**{name: fields[name] for name in ("MMA_M", "STAGES", "TOKEN_TILE", "TMEM_COLS", "PREWAIT_WEIGHTS", "HOLD_TMEM")})
+        given = cudnn.Fp8ProjectionDecode("cpu", ProjectionGeometry(5120, 6144), split_k=fields["SPLIT_K"], form=form, pdl=True, pdl_release=True)
+        pick = cudnn.Fp8ProjectionDecode("cpu", ProjectionGeometry(5120, 6144), split_k=fields["SPLIT_K"], pdl=True, pdl_release=True)
+        launched = set()
+        for count in range(row.rows[0], row.rows[1] + 1):
+            stated = given.form_for(count)
+            assert all({**stated, **stated["GEOM"]}[name] == value for name, value in fields.items()), (row.rows, count)
+            assert stated == pick.form_for(count) and tuple(given.launch_shape_for(count)) == tuple(pick.launch_shape_for(count)), (row.rows, count)
+            launched.add(tuple(given.launch_shape_for(count)))
+        assert len(launched) == 1, f"rows {row.rows}: one form of the entry inside the row's range"
+        shapes[(row.classes, row.rows)] = launched.pop()
+        assert given.form_for(row.rows[1] + 1)["TOKEN_TILE"] != fields["TOKEN_TILE"] if row.rows[1] < 32 else True, "past the range: another token tile"
+    assert shapes == {
+        (("cc10.0",), (2, 8)): OUT_SHAPE,
+        (("cc10.0",), (9, 16)): OUT_SHAPE_SPLIT_4,
+        (("cc10.3", "cc10.7"), (2, 8)): ((80, 4, 1), (256, 1, 1), 71040),
+        (("cc10.3", "cc10.7"), (9, 16)): OUT_SHAPE_SPLIT_4,
+        (("cc10.3", "cc10.7"), (17, 32)): ((80, 4, 1), (256, 1, 1), 110976),
+    }, "one thread block per K slice and 64 weight rows; the shared memory follows the ring depth, the split and the token tile"
+    recorded = QwenDense.target().data["configurations"]["verify"]["cc10.0/sm148"]["rows"]["6"]["linear_attention_layer"]
+    launch = next(entry[2]["launch"] for entry in recorded if entry[0] == "projection.fp8.out")
+    assert (tuple(launch[0]), tuple(launch[1]), launch[2]) == OUT_SHAPE, "what the entry states at six rows is the recorded launch"
+
+    # the plans: by the rows of the step, the first and the last row count of each range, and the first on the fallback row
+    copy = (FA_OUT, "cublas.bf16_dequantized", None, None)
+    alone = [("projection.fp8.out", "cublas.bf16_dequantized", None, None)]
+    for (sequences, tokens), (split, tile) in {
+        (1, 2): (2, 8),
+        (1, 6): (2, 8),
+        (1, 8): (2, 8),
+        (4, 2): (2, 8),
+        (3, 3): (4, 16),
+        (2, 6): (4, 16),
+        (2, 8): (4, 16),
+    }.items():
+        assert _out_parts(sequences, tokens) == [(LA_OUT, "fe.fp8_projection_decode", split, tile), copy], (sequences, tokens)
+        assert _out_parts(sequences, tokens, stack="fe-entries") == _out_parts(sequences, tokens)
+    for sequences, tokens in ((3, 6), (9, 2), (4, 6), (4, 8), (16, 2), (16, 5)):  # 18 rows and more (17 is no step shape): the multiply over a copy, one row
+        assert _out_parts(sequences, tokens) == alone, (sequences, tokens)
+    for cc, sms in (((10, 3), 152), ((10, 7), 212)):
+        for (sequences, tokens), tile in {(1, 2): 8, (1, 8): 8, (3, 3): 16, (2, 8): 16, (3, 6): 32, (16, 2): 32, (4, 8): 32}.items():
+            assert _out_parts(sequences, tokens, cc=cc, sms=sms) == [(LA_OUT, "fe.fp8_projection_decode", 4, tile), copy], (cc, sequences, tokens)
+        assert _out_parts(16, 3, cc=cc, sms=sms) == alone, "48 rows: beyond the entry's 32"
+    assert _out_parts(1, 6, cc=(12, 0), sms=170) == alone, "compute capability 12.x: the entry serves 10.x"
+    for stack in ("fe-cublas", "reference"):
+        assert [key for _, key, _, _ in _out_parts(1, 6, stack=stack)] == ["cublas.bf16_dequantized" if stack == "fe-cublas" else "torch_ref.linear"]
+    narrow = QwenDense(Geometry(layer_kinds=("linear_attention", "full_attention"), la_value_heads=32), ())
+    assert _out_parts(1, 6, model=narrow) == alone, "another value-head count is another weight shape: the next row, never an error"
+
+    # the tables of such a plan: one line per call site of the block, and the by-provider line counts both
+    plan, model = _plan(1, 6)
+    part, other = plan.at("projection.fp8.out", "linear_attention.out"), plan.at("projection.fp8.out", "full_attention.out")
+    assert isinstance(plan["projection.fp8.out"], blocks.BySite) and plan.rows["projection.fp8.out"] is part[0] is entry_rows[0]
+    assert (part[1].entry, part[1].provider, other[1].entry, other[1].provider) == (
+        "cudnn.Fp8ProjectionDecode",
+        "cuDNN FE",
+        "torch.matmul over a bf16 copy",
+        "cuBLAS",
+    )
+    assert plan.calls[LA_OUT] == plan.calls[FA_OUT] == "1" and plan.calls["projection.fp8.out"] == "1 / 1"
+    lines = {line.split("  ")[1].strip(): " ".join(line.split()) for line in plan.table().splitlines() if line.startswith("  projection.fp8.out")}
+    assert lines == {
+        LA_OUT: f"{LA_OUT} 1 cuDNN FE cudnn.Fp8ProjectionDecode rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144 none",
+        FA_OUT: f"{FA_OUT} 1 cuBLAS torch.matmul over a bf16 copy any fallback: bf16 copy of 8-bit weights",
+    }
+    assert plan.by_provider() == "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+    assert _plan(1, 6, cc=(10, 3), sms=152)[0].by_provider() == "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+    assert _plan(1, 1, cc=(10, 3), sms=152)[0].by_provider() == "by provider: cuDNN FE 4 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+    full = _plan(1, 6, model=QwenDense())[0]
+    assert (full.calls[LA_OUT], full.calls[FA_OUT]) == ("48", "16"), "the calls of a step of the 64-layer model at each call site"
+    kernels = census.table(plan, QwenDense.target().claim(plan, model, "verify", installed=RECORDED))
+    form = "[SPLIT_K 2, MMA_M 64, STAGES 11, TOKEN_TILE 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True, OUT_FEATURES 5120, IN_FEATURES 6144]"
+    stated = {line.split("  ")[1].strip(): " ".join(line.split()) for line in kernels.splitlines() if line.startswith("  projection.fp8.out")}
+    assert stated == {
+        LA_OUT: f"{LA_OUT} 1 cuDNN FE cudnn.Fp8ProjectionDecode {form} fp8_projection 1 name and launch shape, as the entry states them target",
+        FA_OUT: f"{FA_OUT} 1 cuBLAS torch.matmul over a bf16 copy cublas, pytorch -- by family not yet (bf16 copy of 8-bit weights)",
+    }, "the part of a call site prints its form whole"
+    assert "per step: 13 launches on 7 exact rows, checked one by one in the wiring order; the launches of 6 fallback calls" in kernels
+    assert "projection.fp8.out at linear_attention.out:" not in kernels, "no line of forms by call site under the table: the part's line has it"
+
+    # a step of one token per sequence is the plan it was, on every stack: one row, the multiply over a copy at both call sites
+    for stack in ("fe-cublas", "native", "fe-entries"):
+        for sequences in (1, 4, 8, 9, 16, 17, 64):
+            plan, _ = _plan(sequences, 1, stack)
+            assert plan.rows["projection.fp8.out"].key == "cublas.bf16_dequantized" and not hasattr(plan["projection.fp8.out"], "parts")
+            assert plan.at("projection.fp8.out", "linear_attention.out") == plan.at("projection.fp8.out", "full_attention.out") == plan.at("projection.fp8.out")
+            assert "projection.fp8.out at " not in plan.table() + census.table(plan) and plan.calls["projection.fp8.out"] == "1 / 1"
+        table = configs.readme_table(QwenDense().calls_text(), stack, (10, 0))
+        assert "| 8-bit out-projection | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |" in table
+    assert "8-bit out-projection" not in configs.readme_sites(QwenDense(), "native"), "the README's call-site table is the decode step's"
+
+    # --provider: the row selected away is one row at both sites, named in the claim; the entry's row at one token per sequence,
+    # or at a row count beyond its ranges, is a decline that names what the entry serves there -- a SKIP, never an ERROR
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148)
+    model = QwenDense.reduced()
+
+    def selected(sequences, tokens, key):
+        return blocks.plan(model.provider_table, model.regimes, facts, sequences, tokens, "native", {"projection.fp8.out": key}, model=model)
+
+    away = selected(1, 6, "cublas.bf16_dequantized")
+    assert away.overridden == ("projection.fp8.out",) and not hasattr(away["projection.fp8.out"], "parts")
+    claim = QwenDense.target().claim(away, model, "verify", installed=RECORDED)
+    assert (
+        claim.reasons[0] == "not the target set: projection.fp8.out selected by --provider"
+        and claim.of("projection.fp8.out") == "not yet (bf16 copy of 8-bit weights)"
+    )
+    asked = selected(1, 6, "fe.fp8_projection_decode")
+    assert [label for label, name, _, _, _ in asked.parts() if name == "projection.fp8.out"] == [LA_OUT, FA_OUT], "the site it hands on is still the next row's"
+    serves = "cudnn.Fp8ProjectionDecode serves rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144"
+    for sequences, tokens in ((1, 1), (3, 6)):
+        with pytest.raises(NotImplementedError) as declined:
+            selected(sequences, tokens, "fe.fp8_projection_decode")
+        assert str(declined.value) == f"{serves}; this run has {sequences} sequences x {tokens} tokens per sequence"
+
+
+class _Projection:
+    """A stand-in for ``cudnn.Fp8ProjectionDecode`` on the host: what it was built with and called with; its launch facts
+    are those of the PUBLIC entry built for the host from the same arguments (``REAL``, set by the test)."""
+
+    REAL = None
+    built = []
+
+    def __init__(self, device, geometry, split_k=None, form=None, pdl=None, pdl_release=None):
+        self.arguments = dict(device=str(device), geometry=geometry, split_k=split_k, form=form, pdl=pdl, pdl_release=pdl_release)
+        self.host = _Projection.REAL("cpu", geometry, split_k=split_k, form=form, pdl=pdl, pdl_release=pdl_release)
+        self.calls, self.compiled = [], []
+        _Projection.built.append(self)
+
+    def form_for(self, rows):
+        return self.host.form_for(rows)
+
+    def launch_shape_for(self, rows):
+        return self.host.launch_shape_for(rows)
+
+    def kernel_symbols_for(self, rows):
+        return tuple([f"cudnn_kernel_frost_fp8_projection_decode_{self.host.cfg_for(rows).SYMBOL_TEXT}_0"] if rows in self.compiled else [])
+
+    def compile(self, rows=None):
+        self.compiled.append(rows)
+
+    def __call__(self, weight, activation, scale, out):
+        self.calls.append((weight, activation, scale, out))
+        return out
+
+
+def test_the_out_projection_rows_adapter_over_a_stand_in_entry(monkeypatch):
+    """The adapter of ``cudnn.Fp8ProjectionDecode`` on a row of the out-projection of a verify step: it builds the sites its
+    row SERVES -- one entry instance, with the split, the whole form (the token tile as the entry's floor) and the launch
+    knobs of the row -- and is never built or called at the site the row hands on.  The call log states the form for the
+    row count and the split of the call it served: asked of the instance that was called, with the rows of the operand
+    that call was handed.  The weight is the stored 8-bit codes with their one scale; the merge rule of a load does not
+    touch a weight that is one stored tensor."""
+    import cudnn
+    from cudnn.gemm import ProjectionForm, ProjectionGeometry
+    from model_samples import blocks, census
+    from model_samples.providers import fe
+    from model_samples.qwen_dense import QwenDense, configs
+    from model_samples.weights import Dequantized, ScaledTensor
+
+    monkeypatch.setattr(_Projection, "REAL", cudnn.Fp8ProjectionDecode)
+    monkeypatch.setattr(_Projection, "built", [])
+    monkeypatch.setattr(cudnn, "Fp8ProjectionDecode", _Projection, raising=False)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    model = QwenDense.reduced()
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148)
+    small, large = (r for r in configs.PROVIDERS["projection.fp8.out"] if r.key == "fe.fp8_projection_decode" and r.classes == ("cc10.0",))
+    block = fe.Fp8ProjectionDecodeBlock(small, model, facts, {"device": "cpu", "check_kernels": True, "merge_rule": "largest_scale"})
+    assert block.stored_weights is True and block.entry == "cudnn.Fp8ProjectionDecode" and block.per_row == (0,) and block.state_args == ()
+    block.check_support(1, 6)
+    assert block._named() == ["linear_attention.out"] == list(block._sites()), "the site the row serves: the one it hands on is no form of this adapter"
+    stated = block.launch_facts(6, "linear_attention.out")
+    (entry,) = _Projection.built
+    assert entry.arguments == dict(
+        device="cpu",
+        geometry=ProjectionGeometry(5120, 6144),
+        split_k=2,
+        form=ProjectionForm(MMA_M=64, STAGES=11, TMEM_COLS=32, TOKEN_TILE=8, PREWAIT_WEIGHTS=True, HOLD_TMEM=True),
+        pdl=True,
+        pdl_release=True,
+    ), "the kernel as the row states it: the form is passed as a whole, so the entry never takes its own pick"
+    assert (
+        tuple(stated.shape) == OUT_SHAPE and stated.symbols == () and all(stated.form[name] == value for name, value in small.site_form("linear_attention.out"))
+    )
+    with pytest.raises(ValueError, match="it hands the call site 'full_attention.out' on to the next row of its block and has no form there"):
+        block.launch_facts(6, "full_attention.out")
+    assert len(_Projection.built) == 1, "nothing is built for the site the row hands on"
+    block.compile(1, 6)
+    assert (
+        entry.compiled == [6] and len(entry.calls) == 1 and tuple(entry.calls[0][0].shape) == (5120, 6144)
+    ), "one form, compiled and launched once before the first step"
+    assert block.launch_facts(6, "linear_attention.out").symbols == ("cudnn_kernel_frost_fp8_projection_decode_n5120k6144s2r6_m64g11t8c32_w1h1p1q1_0",)
+
+    # a call: the stored codes of both operands, the fp32 product of the two scales, an output of the call's own
+    codes = torch.zeros((5120, 6144), dtype=torch.uint8)
+    weight = Dequantized(None, 0.013, stored=ScaledTensor(codes, 0.013), checksum=(0,))
+    qx = ScaledTensor(torch.zeros((6, 6144), dtype=torch.uint8), 0.0625)
+    assert block.serving() == ("cudnn.Fp8ProjectionDecode", ()), "before the first call nothing has served"
+    out = block(qx, weight, "linear_attention.out")
+    w, a, scale, o = entry.calls[-1]
+    assert o is out and tuple(out.shape) == (6, 5120) and out.dtype == torch.bfloat16
+    assert w.data_ptr() == codes.data_ptr() and a.data_ptr() == qx.codes.data_ptr() and w.dtype == a.dtype == torch.float8_e4m3fn, "views, no copy"
+    assert torch.equal(scale, torch.tensor([0.0625], dtype=torch.float32) * torch.tensor([0.013], dtype=torch.float32))
+    served = block.serving()
+    assert served == (
+        "cudnn.Fp8ProjectionDecode #1",
+        small.site_form("linear_attention.out"),
+    ), "read from the instance that was called, for the call's six rows"
+
+    # the call log is an observation of the call: the same instance handed twelve rows -- a step of another row range -- states
+    # the token tile of twelve rows, and item 0 names it against the row's; the next call of six rows is logged as its own
+    block(ScaledTensor(torch.zeros((12, 6144), dtype=torch.uint8), 0.0625), weight, "linear_attention.out")
+    twelve = block.serving()
+    assert dict(twelve[1])["TOKEN_TILE"] == 16 and dict(twelve[1])["SPLIT_K"] == 2 and twelve[0] == "cudnn.Fp8ProjectionDecode #1"
+    site = census.Site("projection.fp8.out", 0, tuple(block.kernels), block.entry, small.site_form("linear_attention.out"), stated, "", "linear_attention.out")
+    text = "[SPLIT_K 2, MMA_M 64, STAGES 11, TOKEN_TILE {tile}, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True, OUT_FEATURES 5120, IN_FEATURES 6144]"
+    assert census.check_forms([site], [[census.Call("projection.fp8.out", 0, 6, *twelve)]]) == [
+        f"projection.fp8.out (layer 0), the call at linear_attention.out: the adapter served the call with the form {text.format(tile=16)} "
+        f"(cudnn.Fp8ProjectionDecode #1); the row says {text.format(tile=8)}"
+    ]
+    block(qx, weight, "linear_attention.out")
+    assert block.serving() == served and census.check_forms([site], [[census.Call("projection.fp8.out", 0, 6, *block.serving())]]) == []
+
+    # the row of the other range is another adapter and another entry instance, in the other split: a call served by it under
+    # this row's name is named by its split and its ring -- the launch grid would show it too, the log does not wait for a trace
+    other = fe.Fp8ProjectionDecodeBlock(large, model, facts, {"device": "cpu", "check_kernels": True})
+    other(ScaledTensor(torch.zeros((6, 6144), dtype=torch.uint8), 0.0625), weight, "linear_attention.out")
+    assert len(_Projection.built) == 2 and _Projection.built[1].arguments["split_k"] == 4 and _Projection.built[1].arguments["form"].STAGES == 7
+    wrong = other.serving()
+    assert wrong[0] == "cudnn.Fp8ProjectionDecode #2" and dict(wrong[1])["SPLIT_K"] == 4 and dict(wrong[1])["TOKEN_TILE"] == 16
+    (sentence,) = census.check_forms([site], [[census.Call("projection.fp8.out", 0, 6, *wrong)]])
+    assert sentence.startswith(
+        "projection.fp8.out (layer 0), the call at linear_attention.out: the adapter served the call with the form [SPLIT_K 4, MMA_M 64, STAGES 7, TOKEN_TILE 16, "
+    ) and sentence.endswith(f"(cudnn.Fp8ProjectionDecode #2); the row says {text.format(tile=8)}")
+    assert tuple(other.launch_facts(12, "linear_attention.out").shape) == OUT_SHAPE_SPLIT_4
+
+    # what it cannot serve is named: the site its row hands on, a weight without its stored codes, an operand that is no 8-bit codes
+    with pytest.raises(ValueError, match="it hands the call site 'full_attention.out' on to the next row of its block and has no form there"):
+        block(qx, weight, "full_attention.out")
+    with pytest.raises(ValueError, match="the weight of this call has no stored 8-bit codes: the weights of this session were loaded for another plan"):
+        block(qx, Dequantized(codes.to(torch.bfloat16), 0.013), "linear_attention.out")
+    assert len(entry.calls) == 4, "nothing was launched for either"
+
+    # the merge rule: a weight that is one stored tensor has one scale under every rule, so this row serves a load that keeps the
+    # in-projections' parts at their own scales; the in-projection's row declines that load, and a family that does not say which
+    # weights a rule gives a scale per row is declined as before
+    kept = {"device": "cpu", "merge_rule": "own_scale"}
+    fe.Fp8ProjectionDecodeBlock(small, model, facts, kept).check_support(1, 6)
+    assert model.scale_per_row("linear_attention.out", "own_scale") is False and model.scale_per_row("full_attention.out", "own_scale") is False
+    assert model.scale_per_row("linear_attention.qkvz", "own_scale") is True and model.scale_per_row("linear_attention.qkvz", "largest_scale") is False
+    assert model.scale_per_row("a site this family does not know", "own_scale") is True
+    declines = r"^cudnn.Fp8ProjectionDecode takes one scale per weight; the merge rule 'own_scale' keeps one per weight row: "
+    with pytest.raises(NotImplementedError, match=declines):
+        fe.Fp8ProjectionDecodeBlock(configs.PROVIDERS["projection.fp8.in"][0], model, facts, kept).check_support(1, 6)
+    silent = SimpleNamespace(geometry=model.geometry, norm_eps=model.norm_eps)
+    with pytest.raises(NotImplementedError, match=declines):
+        fe.Fp8ProjectionDecodeBlock(small, silent, facts, kept).check_support(1, 6)
+
+
+def test_a_row_that_hands_a_call_site_on_and_the_parts_of_its_block():
+    """``ProviderRow.sites`` names a call site with ``None`` in place of its fields where the row serves no call there: the
+    calls of that site are served by the next row of the stack that serves the run.  The plan then holds one part per call
+    site under the block's name (``blocks.BySite``): a call goes to the block of its site, a question about the whole
+    block goes to every part, and the row, the entry and the census entries of a call are those of its site (``Plan.at``,
+    ``Plan.parts``).  A block one row serves is one part.  A site handed on to nothing, or to a row that does not name it,
+    is a wrong table."""
+    from dataclasses import replace
+
+    from model_samples import blocks, census
+    from model_samples.blocks import BySite, DeviceFacts, ProviderRow, call_site, scoped
+    from model_samples.census import Kernel
+
+    assert scoped("mix", "a") == "mix at a" and scoped("mix") == "mix" == scoped("mix", "")
+    assert call_site((1, 2, "a")) == "a" and call_site((1, 2)) == "" == call_site(()), "the last operand, where a step hands a site over"
+    log = []
+
+    def stand_in(provider, entry, kernels, compiles=False, stored=False):
+        class StandIn:
+            per_row, state_args, stored_weights = (0,), (), stored
+
+            def __init__(self, row, model, facts, options):
+                self.row, self.provider, self.entry, self.kernels, self.compiles = row, provider, entry, kernels, compiles
+
+            def check_support(self, sequences, tokens):
+                log.append((entry, "check_support", sequences, tokens))
+
+            def first_use(self, sequences, tokens):
+                log.append((entry, "first_use"))
+
+            def compile(self, sequences, tokens):
+                log.append((entry, "compile"))
+
+            def reserve_bytes(self):
+                return 3 if compiles else 0
+
+            def first_launch(self):
+                return {6: 5} if compiles else {}
+
+            def serving(self):
+                return (f"{entry} #1", tuple(self.row.site_form(self._site))) if compiles else ("", ())
+
+            def launch_facts(self, rows, site=""):
+                return census.Facts(("symbol",), dict(self.row.site_form(site)), ((80, 2, 1), (256, 1, 1), 103808)) if compiles else None
+
+            def compared(self, out):
+                return out
+
+            def __call__(self, x, site=""):
+                self._site = site
+                log.append((entry, "call", site))
+                return (entry, x)
+
+        return StandIn
+
+    exact = (Kernel("fp8_projection", "cuDNN FE", "exact", launches=1, shape="entry"),)
+    chain = (Kernel("cublas", "cuBLAS"), Kernel("pytorch", "PyTorch"))
+    build = {
+        "fe.fp8_projection_decode": stand_in("cuDNN FE", "an entry", exact, compiles=True, stored=True),
+        "cublas.bf16_dequantized": stand_in("cuBLAS", "a multiply over a copy", chain),
+        "torch_ref.linear": stand_in("PyTorch", "a chain", (Kernel("pytorch", "PyTorch"),)),
+        "torch.argmax": stand_in("PyTorch", "torch.argmax", (Kernel("pytorch", "PyTorch", "host"),)),
+    }
+    any_run = (("any",), (1, None))
+    entry_row = ProviderRow(
+        *any_run,
+        (2, None),
+        "fe.fp8_projection_decode",
+        "native",
+        serves="some rows",
+        form=(("SPLIT_K", 2),),
+        sites=(("a", (("OUT_FEATURES", 8),)), ("b", None)),
+    )
+    copy_row = ProviderRow(*any_run, (1, None), "cublas.bf16_dequantized", "native", serves="any", fallback="a copy")
+    table = {"mix": [entry_row, copy_row], "token_choice": [ProviderRow(*any_run, (1, None), "torch.argmax", "native", serves="any")]}
+    model = SimpleNamespace(
+        geometry=SimpleNamespace(layer_kinds=("x", "y", "x")),
+        wiring=lambda: (("mix", 0), ("mix", 1), ("mix", 2), ("token_choice", -1)),
+        sites=lambda: ("a", "b", "a", ""),
+        calls_text=lambda: {"mix": "2 / 1", "token_choice": "1"},
+    )
+    facts = DeviceFacts((10, 0), "stated device", 148)
+
+    def plan_of(tokens, rows=None):
+        return blocks.plan(dict(table, mix=rows) if rows else table, [], facts, 1, tokens, "native", model=model, factories=build)
+
+    plan = plan_of(2)
+    mix = plan["mix"]
+    assert (
+        isinstance(mix, BySite)
+        and plan.rows["mix"] is entry_row
+        and [(site, row.key) for site, row, _ in mix.parts]
+        == [
+            ("a", "fe.fp8_projection_decode"),
+            ("b", "cublas.bf16_dequantized"),
+        ]
+    )
+    assert (
+        plan.at("mix", "a") == (entry_row, mix.parts[0][2])
+        and plan.at("mix", "b") == (copy_row, mix.parts[1][2])
+        and plan.at("token_choice")
+        == (
+            plan.rows["token_choice"],
+            plan["token_choice"],
+        )
+    )
+    with pytest.raises(ValueError, match=r"^block mix: no provider row for the call site 'c'; its rows name a, b$"):
+        plan.at("mix", "c")
+    assert [(label, name, site, row.key) for label, name, site, row, _ in plan.parts()] == [
+        ("mix at a", "mix", "a", "fe.fp8_projection_decode"),
+        ("mix at b", "mix", "b", "cublas.bf16_dequantized"),
+        ("token_choice", "token_choice", "", "torch.argmax"),
+    ]
+    assert plan.calls == {"mix": "2 / 1", "token_choice": "1", "mix at a": "2", "mix at b": "1"}
+    assert (mix.entry, mix.provider, mix.kernels, mix.compiles, mix.per_row, mix.state_args) == (
+        "an entry | a multiply over a copy",
+        "cuDNN FE | cuBLAS",
+        (*exact, *chain),
+        True,
+        (0,),
+        (),
+    )
+    assert mix.stored_weights is False and mix.stored_layout is None, "the form of a weight is asked of the part that reads it"
+    # a call goes to the block of its site, and what served the last call is that part's answer
+    before, first = mix.serving(), mix(7, "a")
+    assert before == ("", ()) and first == ("an entry", 7) and mix.serving() == ("an entry #1", (("SPLIT_K", 2), ("OUT_FEATURES", 8)))
+    second = mix(7, "b")
+    assert second == ("a multiply over a copy", 7) and mix.serving() == ("", ())
+    with pytest.raises(ValueError, match=r"no provider row for the call site ''"):
+        mix(7)
+    assert mix.launch_facts(6, "a").shape == ((80, 2, 1), (256, 1, 1), 103808) and mix.launch_facts(6, "b") is None
+    # what a plan asks of the block as a whole is asked of every part
+    del log[:]
+    plan.first_use()
+    mix.compile(1, 2)
+    mix.check_support(1, 2)
+    assert log == [("an entry", "first_use"), ("a multiply over a copy", "first_use"), ("torch.argmax", "first_use"), ("an entry", "compile")] + [
+        ("an entry", "check_support", 1, 2),
+        ("a multiply over a copy", "check_support", 1, 2),
+    ]
+    assert plan.reserve_bytes() == 3 and mix.first_launch() == {6: 5}
+    # the tables: one line per part, the form of a part printed whole
+    lines = [" ".join(line.split()) for line in plan.table().splitlines()]
+    assert lines[2:5] == [
+        "mix at a 2 cuDNN FE an entry some rows none",
+        "mix at b 1 cuBLAS a multiply over a copy any fallback: a copy",
+        "token_choice 1 PyTorch torch.argmax any none",
+    ]
+    assert plan.by_provider() == "by provider: cuDNN FE 1 | fallbacks 1 (cuBLAS over copies 1) | PyTorch 1"
+    kernels = [" ".join(line.split()) for line in census.table(plan).splitlines()]
+    assert kernels[2:4] == [
+        "mix at a 2 cuDNN FE an entry [SPLIT_K 2, OUT_FEATURES 8] fp8_projection 2 name and launch shape, as the entry states them",
+        "mix at b 1 cuBLAS a multiply over a copy cublas, pytorch -- by family; fallback: a copy",
+    ]
+    assert kernels[-1].startswith("per step: 2 launches on 1 exact row, checked one by one in the wiring order; the launches of 1 fallback call ")
+    assert census.stated(plan).splitlines()[1:] == [
+        "  mix at a  an entry [SPLIT_K 2, OUT_FEATURES 8]: grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
+        "    symbol",
+    ]
+    # the sites of a step: each call has the census entries, the form and the facts of its own part
+    sites = census.expected(plan, model)
+    assert [(site.block, site.layer, site.site, site.entry, site.form, site.facts is not None) for site in sites[:3]] == [
+        ("mix", 0, "a", "an entry", (("SPLIT_K", 2), ("OUT_FEATURES", 8)), True),
+        ("mix", 1, "b", "a multiply over a copy", (), False),
+        ("mix", 2, "a", "an entry", (("SPLIT_K", 2), ("OUT_FEATURES", 8)), True),
+    ]
+    assert [site.kernels for site in sites[:3]] == [exact, chain, exact] and census.check_forms(sites) == []
+    served = [census.Call("mix", 0, 2, "an entry #1", sites[0].form), census.Call("mix", 1, 2, "", ()), census.Call("mix", 2, 2, "an entry #1", sites[0].form)]
+    traced = census.Traced(sites, [served + [census.Call("token_choice", -1, 2, "", ())]])
+    assert traced.served() == [
+        "mix, as the call log of a traced step has it (2 calls): 2 x an entry #1 [SPLIT_K 2, OUT_FEATURES 8]"
+    ], "the calls an entry served"
+
+    # a call site of the wiring that no row of the block names: said on that call -- a wrong table -- and never an exception
+    # out of the check; the identity of such a call is not the target's
+    astray = SimpleNamespace(geometry=model.geometry, wiring=model.wiring, sites=lambda: ("a", "c", "a", ""), calls_text=model.calls_text)
+    lost = census.expected(plan, astray)[1]
+    assert (lost.site, lost.form, lost.facts) == ("c", (), None) and lost.wrong == "block mix: no provider row for the call site 'c'; its rows name a, b"
+    said = census.check_forms([lost])
+    assert said[0] == f"mix at c: an entry | a multiply over a copy states no launch for this run ({lost.wrong}): the provider table is wrong", said
+
+    # against a census of a target: a part on a fallback row is a fallback row of the plan -- also where it is the only one, and
+    # the section says claimed -- and the identity of the block is that of each of its call sites
+    target = census.Target(
+        {
+            "schema": 2,
+            "kernels": {
+                "fp8_projection": {"origin": "cuDNN Frontend", "relation": "target", "kind": "port", "form": {"SPLIT_K": 2}},
+                "library_multiply": {"origin": "a library", "relation": "target", "kind": "code", "selection": "the library's tuner"},
+            },
+            "layers": {"x": "x_layer", "y": "y_layer"},
+            "configurations": {
+                "verify": {
+                    "cc10.0/sm148": {
+                        "claimed": True,
+                        "basis": "recorded",
+                        "tokens": 2,
+                        "geometry": {"hidden": 8},
+                        "rows": {
+                            "2": {
+                                "prologue": [],
+                                "x_layer": [["mix", "fp8_projection", {"form": {"OUT_FEATURES": 8}, "launch": [[80, 2, 1], [256, 1, 1], 103808]}]],
+                                "y_layer": [["mix", "library_multiply", {}]],
+                                "epilogue": [],
+                                "after_step": [],
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    )
+    held = SimpleNamespace(geometry=SimpleNamespace(layer_kinds=("x", "y", "x"), hidden=8), wiring=model.wiring, sites=model.sites)
+    claim = target.claim(plan, held, "verify", installed={})
+    assert claim.reasons == ["fallback rows present"], "the one fallback row of this plan is a part: the class is not claimed"
+    assert [identity.relation for identity in claim.identities] == ["target", "not yet", "target", "host"] and claim.sites == ["a", "b", "a", ""]
+    assert (claim.of("mix"), claim.of("mix", "a"), claim.of("mix", "b")) == ("target; not yet (a copy)", "target", "not yet (a copy)")
+    assert claim.recorded == {0: ((80, 2, 1), (256, 1, 1), 103808), 2: ((80, 2, 1), (256, 1, 1), 103808)}
+    numbers = claim.numbers()
+    assert (numbers["launches"], numbers["code"], numbers["port"], numbers["target_port"], numbers["not_yet"]) == (3, 1, 2, 2, {"mix": 1})
+    identity = [" ".join(line.split()) for line in census.table(plan, claim).splitlines()[2:4]]
+    assert identity[0].endswith("name and launch shape, as the entry states them target") and identity[1].endswith("by family not yet (a copy)")
+
+    # a step the entry's row does not serve: one row, one part, the block as every block is
+    plain = plan_of(1)
+    assert not hasattr(plain["mix"], "parts") and plain.rows["mix"] is copy_row and plain.at("mix", "a") == plain.at("mix", "b") == (copy_row, plain["mix"])
+    assert [label for label, *_ in plain.parts()] == ["mix", "token_choice"] and plain.calls == {"mix": "2 / 1", "token_choice": "1"}
+    assert [site.site for site in census.expected(plain, model)] == ["a", "b", "a", ""], "the wiring names the site of a call whoever serves it"
+
+    # a chain: a row behind the first that serves one more site and hands the last on; then the multiply over a copy
+    three = replace(entry_row, sites=(("a", (("OUT_FEATURES", 8),)), ("b", None), ("c", None)))
+    middle = ProviderRow(*any_run, (1, None), "torch_ref.linear", "native", serves="b alone", sites=(("b", ()), ("c", None)))
+    chained = plan_of(2, [three, middle, copy_row])
+    assert [(site, row.key) for site, row, _ in chained["mix"].parts] == [
+        ("a", "fe.fp8_projection_decode"),
+        ("b", "torch_ref.linear"),
+        ("c", "cublas.bf16_dequantized"),
+    ]
+    # wrong tables: a site handed on to a row that does not name it; a site handed on with no row of the stack behind
+    with pytest.raises(
+        ValueError, match=r"^provider row torch_ref.linear: no form for the call site 'b', which the row of fe.fp8_projection_decode above it hands on$"
+    ):
+        plan_of(2, [entry_row, replace(middle, sites=(("z", ()),)), copy_row])
+    with pytest.raises(
+        ValueError, match=r"^provider row fe.fp8_projection_decode: it hands the call site 'b' of mix on, and no row of stack native stands behind it$"
+    ):
+        plan_of(2, [entry_row, replace(copy_row, stack="fe-cublas")])
+    # ... and a site handed on to a row that does not serve the run is that row's decline: a SKIP
+    with pytest.raises(NotImplementedError, match=r"serves compute capability 12.x; this device is 10.0$"):
+        plan_of(2, [entry_row, replace(copy_row, classes=("cc12.x",))])
+    with pytest.raises(ValueError, match=r"^the provider table is wrong: the rows that serve the call sites of mix do not take the same operands$"):
+        BySite("mix", [("a", entry_row, mix.parts[0][2]), ("b", copy_row, SimpleNamespace(per_row=(0, 1), state_args=(), entry="", provider="", kernels=()))])
+    with pytest.raises(ValueError, match=r"^block mix: no call site to serve$"):
+        BySite("mix", [])

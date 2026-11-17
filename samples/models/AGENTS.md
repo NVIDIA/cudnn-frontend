@@ -149,7 +149,12 @@ does not hold is printed as not known and ignored, so a new name for one of them
     by its place in the wiring, not by its block and layer: a block can be called twice in a layer. A site name
     belongs to one block (an adapter finds the sites of its row in the wiring by name), and what differs between the
     sites of a row may be the operand's shape as well as the kernel's form: an entry that is one weight shape per
-    instance has the shape of each site in its row.
+    instance has the shape of each site in its row. A row may also serve some call sites of its block only: it names
+    each other site without fields, which hands the calls there on to the next row of the stack that serves the run.
+    The plan then holds one part per call site under the block's name (`blocks.BySite`; `Plan.at`, `Plan.parts`), and
+    whatever reads a row or a block of a call -- the census entries, the form, the identity, the band, the batch
+    invariance statement, the form of the weight a load keeps -- reads the part of that call's site. A site a row
+    does not name at all stays a wrong table.
 16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
     target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
@@ -693,3 +698,45 @@ key `fe.gdn_verify_fused`). What building it showed:
   Until a line is taught the new step, the report says that it is not stated, and a host test holds the sentence.
 - Two sessions on one load share weights, never a state. Say so beside the snippet that builds them: a reader who
   prefills a prompt in one and steps the other gets the tokens after an empty context, and no error.
+
+## What the out-projection of a verify step taught
+
+The target serves one block of the wiring with two kernels in a verify step: the out-projection of a linear-attention
+layer is the 8-bit projection kernel, the out-projection of an attention layer a library multiply, and both multiply by
+a weight of one shape (rows of `fe.fp8_projection_decode` in the block `projection.fp8.out`, for steps of several tokens
+per sequence alone). What building it showed:
+
+- A block is not always one row. Splitting the block in two moves lines of every plan of one token per sequence -- a
+  table row, the by-provider line, the coverage line -- for a difference only a verify step has. The call sites
+  carry it instead: the row of the entry names the site it serves and hands the other on, and a plan prints the
+  block once per call site only where two rows serve it. A plan of the decode step is the text it was; hold that
+  with a run of both trees, line by line.
+- What a row hands on is data, never the adapter's choice. An adapter that served one site and called the fallback
+  chain itself at the other would be one row with two kinds of census entry, which the kernel check cannot judge: an
+  exact kernel at one call and a family at the next. The plan resolves the next row; the adapter is never built or
+  called at a site its row hands on.
+- A split is a row range. The target chooses the K slices of the projection kernel by the rows of a step, and the
+  entry fixes them per instance (another split is another byte class), so each range is a row and an entry instance
+  of its own, selected by `rows`. The bytes of the block change where a step's rows cross from one range into the
+  next; say so beside the rows, and gate batch invariance inside a range only.
+- A field that follows the call is named, or the call log cannot show it. The projection adapter already asked the
+  serving instance with the rows of the operand it was handed, but a form without a field that follows the rows
+  logs the same text at every row count. The rows of this block name the token tile of their range, and the entry
+  takes it as a floor: an instance handed the rows of another range states another tile, and item 0 names it.
+- The forms of a weight follow the call sites. One block, two rows: the linear-attention layers' weights are read on
+  their stored codes, the attention layers' as copies. A load is asked per call site (`<block> at <call site>`
+  beside the block names), so a verify plan alone holds no copy of the first and no codes of the second, and a
+  decode session on the same load, which reads every out-projection as a copy, has its copies. Test the loader
+  with each plan alone and with both, and the check that names a missing form with a load made for the other.
+- A decline of a weight's form is asked per weight. The projection adapter declined a load that keeps a scale per
+  merged part for every row of its entry; the out-projection's weight is one stored tensor with one scale under
+  every merge rule. The family says which weights a rule gives a scale per row (`scale_per_row`), per call site.
+- Two sessions of one load that serve a block with two kernels are not byte-equal behind it. Up to the last row
+  count of the entry's rows the verify session rounds the out-projection once and the decode session twice: their
+  logits differ by a bf16 unit and an attention layer behind caches other bytes, printed and not gated. From the
+  first row count on the fallback row both multiply over a copy: the bytes met again at three and four sequences
+  and stayed within half a bf16 unit at nine and 16 sequences of two tokens (a library multiply is another kernel at
+  another row count). Run both sides of that boundary, and say which lines of the comparison are reported there.
+  And state a comparison for the step shapes where it gated: a sentence that begins "at every step shape that ran"
+  is read as a gate on all of them, also on those whose line was `REPORTED`. The memory sentence likewise: "within a
+  tenth of a GiB" is a statement about every run, and one step shape reserved half a GiB less than it asked for.

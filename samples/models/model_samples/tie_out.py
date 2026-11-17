@@ -28,6 +28,9 @@ Four checks, run after the timed loop on the ids the loop produced:
    sequence ``t`` modulo the count), so every row of the batch is covered at no extra launch.  A gate for a block whose
    provider row lists the GPU class under ``batch_invariant``; a printed fact for the rest.
 
+A block whose calls several provider rows serve by call site (``blocks.BySite``) is judged per call site, under ``<block>
+at <call site>``: each part against its own twin, in its own row's band, with its own row's batch-invariance statement.
+
 A fifth check, asked for by the run (``run_checks(..., kernels=True)``; a sample's ``--check-kernels``), is not against the
 reference but against the plan: **kernels** -- every launch of the traced steps is held against the census entries of the
 blocks (``model_samples.census``: the form on the objects, attribution, count, order, launch record, copies).  It reads what
@@ -154,7 +157,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from . import census
-from .blocks import GIB
+from .blocks import GIB, call_site, scoped
 from .loop import Session
 from .sampling import margin
 from .weights import OnDemand
@@ -352,7 +355,19 @@ class BlockTap:
     def __init__(self, plan, reference, on_demand=None):
         self.plan, self.reference, self.on_demand = plan, reference, on_demand
         self.stats: Dict[str, BlockStats] = {}
+        self.rows: Dict[str, object] = {}  # the provider row behind every entry of ``stats``
+        self.blocks: Dict[str, object] = {}  # and the block: for a block several rows serve, the part of that call site
         self.step = 0  # set by the checked pass before every step
+
+    def _part(self, name, block, operands) -> tuple:
+        """``(label, row, block)`` of what serves this call: the block and its row, or -- for a block whose calls several
+        rows serve by call site -- the part of the call's site, judged and counted under ``<block> at <call site>``: each
+        part has the band, the twin and the batch-invariance statement of its own row."""
+        if getattr(block, "of", None) is None:
+            return name, self.plan.rows[name], block
+        site = call_site(operands)
+        row, part = block.of(site)
+        return scoped(name, site), row, part
 
     @staticmethod
     def _state(block, operands):
@@ -377,12 +392,14 @@ class BlockTap:
         return (slice(sequence * tokens, (sequence + 1) * tokens),) * len(_tensors(holder))
 
     def __call__(self, name, layer, block, operands):
-        row, ref = self.plan.rows[name], block.twin(self.reference[name])  # the reference block, or the block's own twin
+        label, row, block = self._part(name, block, operands)
+        ref = block.twin(self.reference[name])  # the reference block, or the block's own twin
         independent = type(ref) is not type(block)
         alone = self.plan.sequences > 1
         if not independent and not alone:
             return block(*operands)
-        stats = self.stats.setdefault(name, BlockStats(row.band if independent else "same"))
+        stats = self.stats.setdefault(label, BlockStats(row.band if independent else "same"))
+        self.rows[label], self.blocks[label] = row, block
         stats.calls += 1
         holders = self._state(block, operands)
         before = self._save(holders)
@@ -826,7 +843,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         cls = f"cc{facts.cc[0]}.{facts.cc[1]}"
         differs, gated = [], []
         for name, s in tap.stats.items():
-            is_gate = cls in session.plan.rows[name].batch_invariant
+            is_gate = cls in tap.rows[name].batch_invariant
             if is_gate:
                 gated.append(f"{name} {'equal' if s.batch_equal == s.batch_calls else 'DIFFERS'} (gated)")
                 batch_ok = batch_ok and s.batch_equal == s.batch_calls
@@ -838,7 +855,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         rotation = f"one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences})"
         lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
         for name in tap.stats:  # what an entry itself states about one sequence alone and among several: printed beside the line
-            note = getattr(session.plan[name], "batch_note", "")
+            note = getattr(tap.blocks[name], "batch_note", "")
             if note:
                 lines.append(f"    {name}: {note}")
     else:
