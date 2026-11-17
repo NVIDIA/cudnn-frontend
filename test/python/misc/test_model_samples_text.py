@@ -1363,3 +1363,49 @@ def test_a_request_beyond_the_context_is_an_error_before_the_load(tmp_path, monk
         in err.splitlines()
     )
     assert "served by (decided before the load" in err and err.index("[00] first token: ") < err.index("served by (decided before the load")
+
+
+def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():
+    """The section "Coming from a serving engine": the table of fields that would change the output is the data, row for
+    row; every other field the sample answers is named; the lines the README quotes are the lines a run prints; and the
+    flags of the section are rows of the flag table."""
+    import serving_options
+
+    readme = (FAMILY / "README.md").read_text()
+    section = readme.split("## Coming from a serving engine", 1)[1].split("\n## ", 1)[0]
+    table = section.split("| field | accepted | another value is refused because |\n|---|---|---|\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    rows = []
+    for name, (values, reason) in serving_options.NEUTRAL.items():
+        accepted = ", ".join([f"`{json.dumps(value)}`" for value in values] + ["`null`"])
+        rows.append(f"| `{name}` | {accepted} | {reason} |")
+    assert table == rows, "one row per field of serving_options.NEUTRAL, in its order, with its values and its reason"
+    for name in (*serving_options.READ, "model", *serving_options.UNUSED):
+        assert f"`{name}`" in section, name
+    example = json.loads(section.split("```json\n", 1)[1].split("```", 1)[0])
+    said = serving_options.parse_request(example, "--messages -", checkpoint="Qwen3.8-27B-NVFP4").line()
+    assert f"[00] {said}\n" in section, "the line the README quotes for its example body is the line a run prints for it"
+    settings = {"do_sample": True, "temperature": 1.0, "top_k": 20, "top_p": 0.95}
+    assert f"[00] {serving_options.greedy_line(settings)}\n" in section
+    assert f"[00] {serving_options.first_token_line([('the default prompt', 58)])}\n" in section
+    with pytest.raises(ValueError) as refusal:
+        serving_options.parse_request({"messages": CHAT, "temperature": 0.6}, "--messages request.json")
+    assert f"[00] ERROR {refusal.value}\n" in section
+    limits = serving_options.parse_request({"messages": CHAT, "max_tokens": 64}, "--messages request.json")
+    assert serving_options.new_tokens(limits, 58, 2051, flag=32)[1].split(": ", 1)[1] in " ".join(section.split())
+    for flag, default in (
+        ("--messages FILE", "--"),
+        ("--max-tokens N", f"`{serving_options.MAX_TOKENS}`"),
+        ("--max-model-len N", f"`{serving_options.MAX_MODEL_LEN}`"),
+        ("--temperature 0", "--"),
+        ("--text-out FILE", "--"),
+        ("--no-stream", "off"),
+    ):
+        assert f"| `{flag}` | {default} | " in readme, flag
+    for document in (
+        readme,
+        (MODELS / "README.md").read_text(),
+        (REPO / "samples" / "README.md").read_text(),
+        (REPO / "docs" / "model-samples.mdx").read_text(),
+    ):
+        commands = [line for line in document.splitlines() if line.startswith("python samples/models/qwen_dense/00_decode.py")]
+        assert commands and not any("--max-new-tokens" in line for line in commands), "the commands of the documents use the flag's first spelling"
