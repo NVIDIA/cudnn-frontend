@@ -1038,6 +1038,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", True): Entry(
         "le", 6.5, "sm120_paged_window_decode_20261117", "tiles"
     ),
+    # study sm120_paged_window_decode_d192_v2_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 9d464839d; paged sliding-window decode at s_q 1,
+    # d192 x V128, groups 2-16 including ones that do not divide the decode tile, windows 512-4096, KV 8k-128k on and off the tile;
+    # 417 train cells plus v1's 197, fitted under the criterion; a 70-cell holdout over groups 4-14 scored once: 45 changed at
+    # 0.31-0.39, worst 1.07). v1 failed at group 12 on a train grid of groups 8 / 16. MiMo-V2's SWA decode (this geometry) carries a
+    # sink, another class; step5 SWA is d192 x 192.
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 6.5, "sm120_paged_window_decode_d192_v2_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (192, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 6.5, "sm120_paged_window_decode_d192_v2_20261117", "tiles"
+    ),
     # study sm120_window_prefill_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE c59994a55; dense bottom-right chunks and squares,
     # d256 window 1024 and d512 MQA window 128; 221 train cells, a served-pair and an other-group holdout, each scored once: 0.34-0.58
     # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend.

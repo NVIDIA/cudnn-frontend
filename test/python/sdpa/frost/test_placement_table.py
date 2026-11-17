@@ -548,6 +548,11 @@ def test_sm120_paged_window_decode_follows_its_study(s_kv):
     assert pt.lookup(row, dec(b=128, h_q=64, h_kv=8, d_qk=128, d_v=128)) is False  # 1024 KV-head units
     unwindowed = pt.matched_entry(row, dec(window_left=None))
     assert unwindowed is None or unwindowed.study != "sm120_paged_window_decode_20261117"  # another class: not this study's
+    # d192 x V128: its own study, groups 2-16 (sm120_paged_window_decode_d192_v2_20261117)
+    wide_k = dict(h_q=64, h_kv=4, d_qk=192, d_v=128, window_left=511)
+    assert pt.lookup(row, dec(**wide_k)) is True
+    assert pt.matched_entry(row, dec(**wide_k)).study == "sm120_paged_window_decode_d192_v2_20261117"
+    assert pt.lookup(row, dec(**dict(wide_k, b=32, h_q=96, h_kv=8))) is False  # 256 KV-head units, group 12
 
 
 @pytest.mark.L0
