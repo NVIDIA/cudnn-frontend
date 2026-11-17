@@ -454,8 +454,9 @@ def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
 
 @pytest.mark.L0
 def test_sm120_decode_entries_follow_their_study():
-    """Study sm120_decode_20261112 (RTX PRO 6000): paged d256 and D576 single-row decode keep the backend, dense D576 and long paged
-    d512 single-row decode lead; dense d512 s_q 1 has no entry (the hand rule decides, #2497); sink-only d64 MTP has no entry."""
+    """Study sm120_decode_20261112 (RTX PRO 6000): paged d256 and D576 single-row decode keep the backend, dense D576 single-row
+    decode leads; d512 s_q 1 has no entry, dense or paged (hand rules decide: #2497, sm120_paged_d512_q1_v2_20261117); sink-only
+    d64 MTP has no entry."""
     row = "sdpa_fwd_prefill_sm120"
 
     def f(**over):
@@ -468,8 +469,8 @@ def test_sm120_decode_entries_follow_their_study():
         assert pt.matched_entry(row, f(s_kv=s_kv)).study == "sm120_decode_20261112"
     assert pt.lookup(row, f(h_q=96, h_kv=1, d_qk=576, d_v=512, page_size=32)) is False
     assert pt.lookup(row, f(h_q=96, h_kv=1, d_qk=576, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is True
-    assert pt.lookup(row, f(b=64, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is True  # 2^12 query rows past 2^11
-    assert pt.lookup(row, f(b=8, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is False
+    assert pt.lookup(row, f(b=64, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is None
+    assert pt.lookup(row, f(b=8, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131071)) is None
     assert pt.lookup(row, f(h_q=128, h_kv=1, d_qk=512, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is None
     sink = dict(h_q=64, h_kv=8, d_qk=64, d_v=64, s_q=2, has_sink=True, causal=True, bottom_right=True)
     assert pt.lookup(row, f(**sink)) is None

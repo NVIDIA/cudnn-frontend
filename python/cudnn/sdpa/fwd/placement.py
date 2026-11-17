@@ -572,6 +572,7 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
 SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a wider group leads when it is a power of two (fills the packed tile), else trails
+SM120_PAGED_SQ1_D512_MIN_GROUP = 40  # s_q == 1, paged d512: <= 32 heads lose 1.06-1.75 at any batch (sm120_paged_d512_q1_v2_20261117)
 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
@@ -1338,6 +1339,9 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
             group = facts.h_q // max(facts.h_kv, 1)
             if group > SM120_SQ1_MAX_GQA_GROUP:
                 return TRAIL if group & (group - 1) else LEAD
+            if facts.has_paged_kv:
+                # Paged: the group decides, not the batch (the class key cannot carry it). Holdout: 24 changed at 0.52, worst 1.02.
+                return LEAD if group >= SM120_PAGED_SQ1_D512_MIN_GROUP else TRAIL
             # one KV head: the b = 1, >=32-query-head win (0.44-0.85) was measured at 128k KV only.
             return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
         group = facts.h_q // max(facts.h_kv, 1)
