@@ -501,6 +501,27 @@ def test_sm120_paged_d128_mtp_follows_its_study(s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
+def test_sm120_paged_window_decode_follows_its_study(s_kv):
+    """Study sm120_paged_window_decode_20261117: paged sliding-window decode at s_q 1 leads on few KV-head units at d64 / d128 and
+    always at d256 (gemma4 31B SWA at TP4 and muse_spark SWA ran the backend at 2.3-4.4x); an unwindowed graph is another class."""
+    row = "sdpa_fwd_prefill_sm120"
+
+    def dec(**over):
+        base = dict(b=1, h_q=8, h_kv=4, s_q=1, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, window_left=1023)
+        base.update(device_cc=(12, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(b=64), dict(h_q=16, h_kv=2, d_qk=64, d_v=64, window_left=2047), dict(h_q=32, h_kv=4, d_qk=128, d_v=128)):
+        assert pt.lookup(row, dec(**over)) is True, over
+        assert pt.matched_entry(row, dec(**over)).study == "sm120_paged_window_decode_20261117"
+    assert pt.lookup(row, dec(b=128, h_q=64, h_kv=8, d_qk=128, d_v=128)) is False  # 1024 KV-head units
+    unwindowed = pt.matched_entry(row, dec(window_left=None))
+    assert unwindowed is None or unwindowed.study != "sm120_paged_window_decode_20261117"  # another class: not this study's
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q, s_kv", [(8192, 8192), (1024, 131072), (1024, 131071)], ids=["square", "chunk", "chunk_off_tile"])
 def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
     """Study sm120_window_prefill_20261117: dense windowed d256 and d512 prefill lead on SM120, squares included (the hand rule

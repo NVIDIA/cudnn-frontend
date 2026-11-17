@@ -969,6 +969,28 @@ TABLE: Dict[Tuple, Entry] = {
     # (sm120_paged_d512_q1_v2_20261117 and the D576 transfer check sm120_paged_d576_q1_xfer_20261117; fwd/placement._place_sm120_f16))
     # Its d128 paged MTP entries (sm120_paged_d128_mtp_20261117, `le 5.5 tiles`) are retired the same way: FROST's time is flat in
     # the GQA group and the backend's grows with it, so the group decides (sm120_paged_d128_mtp_v6_20261117; fwd/placement._place_sm120_f16).
+    # study sm120_paged_window_decode_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE b9eb6fead; paged sliding-window decode at s_q 1,
+    # d64 / d128 / d256, groups 2-16, windows 256-4096, KV 4k-131k on and off the tile; 256 train cells fitted under the criterion, a
+    # 60-cell holdout scored once: 25 changed at 0.20-0.63, worst 1.00). The decode split clips KV to the window (c59994a55), so FROST
+    # leads windowed decode the hand rule trails at d64 / d128 (gemma4 31B SWA at TP4 ran the backend at 3.7x; muse_spark SWA at 2.3-4.4x).
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 5.5, "sm120_paged_window_decode_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 4.5, "sm120_paged_window_decode_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm120_paged_window_decode_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm120_paged_window_decode_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 5.5, "sm120_paged_window_decode_20261117", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 6.5, "sm120_paged_window_decode_20261117", "tiles"
+    ),
     # study sm120_window_prefill_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE c59994a55; dense bottom-right chunks and squares,
     # d256 window 1024 and d512 MQA window 128; 221 train cells, a served-pair and an other-group holdout, each scored once: 0.34-0.58
     # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend.
