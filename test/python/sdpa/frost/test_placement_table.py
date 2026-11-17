@@ -485,7 +485,7 @@ def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
     """Study sm80_paged_mtp_sink_20261117 (A100, gpt-oss's paged generation graph): d64 sink MTP rows lead once enough tiles are in
-    flight and keep the backend at b 1; no sink, f16 and another part keep the hand rules."""
+    flight and keep the backend at b 1; f16 and another part keep the hand rules (no sink: sm80_gen_gaps_20261117)."""
     row = "sdpa_fwd_prefill_sm80"
 
     def mtp(**over):
@@ -499,7 +499,7 @@ def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
         assert pt.matched_entry(row, mtp(b=b)).study == "sm80_paged_mtp_sink_20261117"
     assert pt.lookup(row, mtp(b=1, h_q=8, h_kv=1)) is False
     assert pt.matched_entry(row, mtp(b=1, h_q=8, h_kv=1)).study == "sm80_paged_mtp_sink_20261117"
-    assert pt.lookup(row, mtp(has_sink=False)) is None
+    assert pt.matched_entry(row, mtp(has_sink=False)).study == "sm80_gen_gaps_20261117"  # no sink: the generation-gaps study
     assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, mtp(device_cc=(8, 6))) is None
 
@@ -541,6 +541,36 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
     wide = dict(h_q=64, h_kv=1, d_qk=576, d_v=512, page_size=64, thd=True, max_total_seq_len_q=256)
     assert pt.class_key(row, f(**wide))[8] == "gqa"
     assert pt.matched_entry(row, f(**wide)).study == "sm80_paged_wide_verify_v2_20261117"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [65536, 65537], ids=["on_tile", "off_tile"])
+def test_sm80_generation_gaps_follow_their_study(s_kv):
+    """Study sm80_gen_gaps_20261117 (A100, padded Q): paged d64 (muse_spark), windowed d64 / d128 and d192 x 192 (step5) MTP and verify
+    lead (the backend ran them 1.2-5.1x behind); windowed d64 single-row decode has no entry; THD-Q verify keeps its own class."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_gen_gaps_20261117"
+
+    def f(**over):
+        base = dict(b=4, h_q=128, h_kv=16, s_q=2, s_kv=s_kv, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    leads = (
+        dict(),
+        dict(s_q=8),
+        dict(window_left=2047),
+        dict(d_qk=192, d_v=192, h_q=64, h_kv=4),
+        dict(d_qk=192, d_v=192, h_q=64, h_kv=4, s_q=8),
+        dict(d_qk=128, d_v=128, h_q=80, h_kv=8, s_q=8, window_left=1023),
+    )
+    for over in leads:
+        assert pt.matched_entry(row, f(**over)).study == study, over
+        assert pt.lookup(row, f(**over)) is True, over
+    assert pt.matched_entry(row, f(s_q=1, window_left=2047)) is None
+    thd = f(s_q=8, thd=True, max_total_seq_len_q=32)
+    assert pt.class_key(row, thd)[8] == "gqa_unpacked" and pt.matched_entry(row, thd).study != study
 
 
 @pytest.mark.L0

@@ -996,6 +996,32 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", True): Entry(
         "ge", 7.804, "sm80_prefill_gaps_20261117", "tiles"
     ),
+    # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
+    # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
+    # on and off the tile, windows 512-2048 keys; 660 train cells; the backend ran them 1.2-5.1x behind). Holdout at fresh heads, scored
+    # once: 0.21-0.53 geomean of changed cells (worst 0.932). d64 windowed single-row failed (1.381): no entry. d512 is #2636's.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False): Entry("le", 1.792, "sm80_gen_gaps_20261117", "q"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 0.5, "sm80_gen_gaps_20261117", "tiles"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry("ge", 22.292, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
+        "ge", 9.483, "sm80_gen_gaps_20261117", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", False): Entry("ge", 0.5, "sm80_gen_gaps_20261117", "tiles"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "verify", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "verify", "paged", "causal_br", False, "gqa", True): Entry("ge", 26.832, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "verify", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "verify", "paged", "window", False, "gqa", True): Entry("le", 33.585, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 7.792, "sm80_gen_gaps_20261117", "rows"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "causal_br", False, "gqa", False): Entry("ge", 24.661, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_gen_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", True): Entry("always", None, "sm80_gen_gaps_20261117"),
     # study sm80_thd_verify_unpacked_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE fa4f913c2; paged THD-Q GQA verify, S_q 5-16, b 1-64,
     # KV 256-128k on and off the tile; the k_prefetch / d256 engines run it unpacked and unsplit; 420 train cells). d128, d256 and d256
     # windowed fit `never` (the backend leads: no entry). d192 x 128 leads on few rows, d64 past a rows / cost floor; holdout at fresh heads,
