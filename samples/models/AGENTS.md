@@ -67,8 +67,12 @@ does not hold is printed as not known and ignored, so a new name for one of them
    what a consumer on a fallback row needs beyond the kernel's bytes -- a gather out of the kernel's scale layout, a
    quantisation the target does with a launch of its own -- is launched by that consumer, when it reads its operand
    (`weights.dequantize`). An adapter that multiplies on the stored format of its weight says so (`stored_weights`):
-   the load of the session then keeps that format beside the bf16 copy for the block, as the loader had it, and the
-   memory sentence counts it; the copy stays, because the reference block and every fallback row read it. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   the load of the session then keeps that format for the block, as the loader had it, and keeps the bf16 copy of a
+   weight only where a block of the run's plans reads one -- which forms a weight has is decided from the plans of
+   every sequence count before the first load, never at run time, and a block that finds its form missing is an
+   error that names it. The reference blocks of the checks read copies: where the load kept none the checks make
+   theirs for one call at a time (`weights.OnDemand`), the memory sentence states that part, and the checks print
+   what the copies cost. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -507,3 +511,28 @@ Each of these passed every test and every GPU run of the first version.
   the loop is, and held by a run with two counts.
 - A sentence about a stream is held on a device only by a test that reads that stream there. "The seeded run writes
   nothing to standard output" stood in three READMEs while the GPU test dropped standard output.
+
+## What making the loader keep what the plans read taught
+
+- A weight has the forms its readers read, and the readers are the plans of the whole run. The projection row kept
+  the stored codes beside the copy for one block. The rule for every block is two questions asked of every plan
+  before the first load: does some plan multiply on the stored format (keep it), does every plan (make no copy). A
+  sequence count on a fallback row, or a row selected away, keeps the copy; nothing is decided at run time.
+- The reference of the checks is a reader too, and the one reader that may come without its form. It gets a bf16
+  copy for one call, made by the session of the reference and by the tap of the checked pass -- never inside a
+  block, whose call neither reads the device nor synchronises. Such a copy is bit for bit the copy a load keeps, and
+  a host test loads the same plan both ways and compares every check line.
+- The memory a run takes beyond its weights does not shrink with the copies it leaves out. Without the 9.7 GiB of
+  in-projection copies the device grew by 10 GiB less, but the room beyond the weights held stayed where the stored
+  tensors had put it: 6.6 GiB, against 6.9 GiB with the codes beside every copy and 5.3 GiB with copies alone. The
+  first sentence, an eighth of what is held, was 0.5 GiB short of the run. The lesson of the row before, again:
+  measure the sentence against a run whenever what a stack holds changes.
+- A form that is missing fails where the plan is, not where the multiply is. A session on weights that were loaded
+  for another plan failed at the adapter's first call, in the adapter's words, and a block that reads a copy would
+  have ended in an error about `None`. The load of the session now names the block and the form before anything is
+  compiled or stepped.
+- Arithmetic that was right for one format was wrong for the next. The bytes of a step took a stored weight's bytes
+  off its copy's, which is right at one byte per element and wrong at 0.5625. State such a formula in both forms: the
+  copy's two bytes off, the stored bytes on.
+- A line in GiB reads 0.00 on the geometry of a host test, so no test held its figures. The text of the cost line
+  is a function, and a host test calls it on the figures of a run at the published widths.
