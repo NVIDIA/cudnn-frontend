@@ -362,9 +362,10 @@ Options:
 - `--deterministic` — benchmark deterministic execution `off`, `on`, or
   `both` (default `off`).
 - `--deterministic-relay-cluster-size` — force logical C4/C8/C16/C32/C64.
-  SM90 defaults to C16; SM100 keeps its automatic large-context policy. C32
-  and C64 use two/four ordered physical C16 phases and reduce the dominant
-  FP32 relay planes to four/two.
+  SM90 defaults to C16; SM100 keeps its automatic large-context policy. SM90
+  queries CUDA cluster occupancy and uses the widest launchable physical
+  C16/C8/C4 cluster no larger than the logical relay. Wider logical relays use
+  ordered same-stream phases without changing the FP32 relay-plane count.
 - `--deterministic-dkv-mode` — `deterministic_dkv_mode` of deterministic
   plans: `records` (default), `chain` or `shards` (see the deterministic dKV
   storage section of `docs/operations/sparse_attention/dsa.md`). It selects
@@ -428,7 +429,7 @@ non-deterministic variation between rows is measurement noise.
 
 C32 is the best time/memory point in this workload: it lowers deterministic
 overhead to 1.34--1.37x while using about half the C16 workspace. C64 is the
-memory-first endpoint, but its four serialized physical C16 phases raise the
+memory-first endpoint, but its four serialized physical C16 phases on H200 raise the
 overhead to 2.30--2.37x. C16 remains the conservative SM90 default; C32/C64
 are explicit plan-time choices.
 

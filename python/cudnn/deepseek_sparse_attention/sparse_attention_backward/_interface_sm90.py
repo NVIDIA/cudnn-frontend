@@ -29,6 +29,7 @@ from ._sm90_relay import (
     normalize_sm90_relay_cluster_size,
     sm90_deterministic_relay_layout,
     sm90_deterministic_relay_indexing_error,
+    sm90_physical_relay_cluster_size,
 )
 
 torch2cute_dtype_map = {
@@ -109,6 +110,7 @@ def flash_attn_bwd_sm90(
     *,
     cli_target: Optional[torch.Tensor] = None,
     cli_target_head_count: int = 0,
+    physical_relay_cluster_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -139,7 +141,11 @@ def flash_attn_bwd_sm90(
             fixed-order dSink/dKV reductions for bitwise-reproducible results.
         deterministic_relay_cluster_size: SM90 logical dKV relay width: 4, 8,
             16, 32, or 64. A smaller width uses more FP32 planes. Widths 32
-            and 64 use two and four ordered physical C16 launches.
+            and 64 use ordered physical launches. The widest C16/C8/C4 size
+            admitted by the current device is selected before compilation.
+        physical_relay_cluster_size: Preselected physical C4/C8/C16 launch
+            width. ``None`` queries the current device before compilation.
+            Prepared plans pass their cached support-check result here.
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -201,6 +207,17 @@ def flash_attn_bwd_sm90(
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     if deterministic:
         relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_relay_cluster_size)
+        if physical_relay_cluster_size is None:
+            physical_relay_cluster_size = sm90_physical_relay_cluster_size(relay_cluster_size, q.device)
+        if (
+            physical_relay_cluster_size not in (4, 8, 16)
+            or physical_relay_cluster_size > relay_cluster_size
+            or relay_cluster_size % physical_relay_cluster_size != 0
+        ):
+            raise ValueError(
+                "physical_relay_cluster_size must be a launchable C4, C8, or C16 divisor "
+                f"of logical relay C{relay_cluster_size}, got {physical_relay_cluster_size!r}"
+            )
         num_dkv_shards, physical_plane_elems, _, num_relay_waves, num_head_tiles = _deterministic_relay_layout(
             total_S_q,
             total_S_kv,
@@ -210,6 +227,7 @@ def flash_attn_bwd_sm90(
         )
     else:
         relay_cluster_size = 1
+        physical_relay_cluster_size = 1
         physical_plane_elems = seqlen_k_rounded * head_dim_rounded
         num_relay_waves = 1
         num_head_tiles = 1
@@ -402,6 +420,7 @@ def flash_attn_bwd_sm90(
         deterministic,
         num_dkv_shards,
         relay_cluster_size,
+        physical_relay_cluster_size,
         _DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
         head_dim_rounded if deterministic else 0,
     )
@@ -437,6 +456,7 @@ def flash_attn_bwd_sm90(
             q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
             padded_head_dim=head_dim_rounded if deterministic else 0,
             emit_cli_target=cli_target is not None,
+            physical_relay_cluster_size=physical_relay_cluster_size,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,

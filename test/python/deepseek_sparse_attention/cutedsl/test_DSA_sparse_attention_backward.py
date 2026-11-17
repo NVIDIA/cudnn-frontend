@@ -7063,6 +7063,43 @@ def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "relay_cluster_size,active_sizes,expected",
+    [
+        (4, (4, 8), 4),
+        (8, (4, 8), 8),
+        (16, (4, 8), 8),
+        (32, (4, 8, 16), 16),
+        (64, (4,), 4),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_physical_relay_uses_largest_launchable(monkeypatch, relay_cluster_size, active_sizes, expected):
+    """Logical relays split at the device's actual physical-cluster limit."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.frost import occupancy
+
+    active_clusters = [0] * occupancy.MAX_CLUSTER_SIZE
+    for size in active_sizes:
+        active_clusters[size - 1] = 1
+    monkeypatch.setattr(occupancy, "occupancy_map", lambda device=None: active_clusters)
+
+    assert _sm90_relay.sm90_physical_relay_cluster_size(relay_cluster_size, "cuda:7") == expected
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_physical_relay_rejects_unlaunchable_device(monkeypatch):
+    """A plan declines before compilation when even a physical C4 cannot launch."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.frost import occupancy
+
+    monkeypatch.setattr(occupancy, "occupancy_map", lambda device=None: [0] * occupancy.MAX_CLUSTER_SIZE)
+    with pytest.raises(NotImplementedError, match=r"requires a launchable C4, C8, or C16 physical cluster"):
+        _sm90_relay.sm90_physical_relay_cluster_size(16, "cuda:0")
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("relay_cluster_size", [4, 8, 16, 32, 64])
 def test_DSA_sparse_attention_backward_sm90_relay_host_span_matches_workspace_layout(relay_cluster_size):
     """The support-check span calculation matches the execution workspace."""
