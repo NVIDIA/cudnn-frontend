@@ -17,8 +17,12 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("bias_fp32", [False, True], ids=["io-bias", "fp32-bias"])
-@pytest.mark.parametrize("tile_m,causal", [(64, False), (128, True)], ids=["m64-dense", "m128-causal"])
-def test_sm120_bias_forward_determinism(dtype, bias_fp32, tile_m, causal):
+@pytest.mark.parametrize(
+    "tile_m,tile_n,causal",
+    [(64, 128, False), (128, 128, True), (64, 64, False), (64, 64, True)],
+    ids=["m64-dense", "m128-causal", "m64-n64-dense", "m64-n64-causal"],
+)
+def test_sm120_bias_forward_determinism(dtype, bias_fp32, tile_m, tile_n, causal):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
     from cutlass.base_dsl.version_info import CUDA_VERSION
 
@@ -54,6 +58,7 @@ def test_sm120_bias_forward_determinism(dtype, bias_fp32, tile_m, causal):
             sample_bias=tensors["bias"],
             scale_softmax=128**-0.5,
             tile_m=tile_m,
+            tile_n=tile_n,
             pack_gqa=False,
             is_causal=causal,
         )
@@ -97,8 +102,9 @@ def test_sm120_bias_forward_determinism(dtype, bias_fp32, tile_m, causal):
         assert_bitwise(snapshot({name: fresh_tensors[name] for name in ("o", "lse")}), actual, "captured replay")
         captured.reset()
 
+    n_suffix = "" if tile_n == 128 else f"_n{tile_n}"
     assert_golden(
-        f"sdpa_sm120_bias_fwd_{str(dtype).split('.')[-1]}_{'fp32' if bias_fp32 else 'io'}_m{tile_m}_causal{int(causal)}_cuda{CUDA_VERSION.major}{CUDA_VERSION.minor}",
+        f"sdpa_sm120_bias_fwd_{str(dtype).split('.')[-1]}_{'fp32' if bias_fp32 else 'io'}_m{tile_m}{n_suffix}_causal{int(causal)}_cuda{CUDA_VERSION.major}{CUDA_VERSION.minor}",
         {name: tensors[name] for name in ("q", "k", "v", "bias")},
         original,
     )

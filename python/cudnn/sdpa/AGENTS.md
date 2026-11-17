@@ -1432,6 +1432,13 @@ before pinning a new line.
 
 ## Heuristic geometry regressions
 
+A legal explicit bias plan does not establish ordinary discovery: pack/split
+choices and candidate caps can remove every A-mode plan. Check a real graph's
+A and FALLBACK lists after validating an explicit witness, and test default
+backend ordering with the opt-in flag unset. Recovered configurations must not
+inherit a measured lead from a different configuration. Detectors:
+`test_sdpa_bias_candidates.py` and `test_sdpa_bias_candidate_routing.py`.
+
 When changing tile, packing, CGA or split candidates, spy on the chooser's
 inputs for both split and unsplit legs: physical CTA count can differ from
 public MMA width, and masked KV work depends on the candidate Q span and tile

@@ -7541,3 +7541,35 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+
+## 2026-11-17 — Bias candidate recovery, SM120 N64 qualification (#2595)
+
+A-mode discovery now recovers a validated FALLBACK plan when bias rejects all
+normal candidates. New plans trail backend modes by default; explicit FROST
+opt-in retains its existing priority. Candidate availability is separate from
+performance qualification.
+
+On RTX PRO 6000 Blackwell Server Edition, cc12.0/188 SMs, Torch2.14.1+cu130,
+cuDNN9.28.0.38 preview, CuTe DSL4.8.0/NVRTC13.4, TVM FFI0.1.14.post1:
+
+- The public A-mode routing suite has 16 old-source failures and 16 candidate
+  passes, covering FP16/BF16, input/FP32 bias, dense/causal masks and Q17/Q67.
+  Each candidate passes independent FP64 O/Stats checks, fresh bindings, raw
+  byte comparison and changed-bias/V CUDA Graph replay.
+- The closest bias determinism suite adds eight M64/N64 cases alongside the
+  eight existing N128 cases. All 16 pass reference, repeated execution, batch
+  isolation/reordering/duplication, changed neighbors and capture checks;
+  all 16 pass recording and a fresh-process strict comparison. Runtime key
+  `9c2c767b8a122bff` stores the 16 records. No prior golden is replaced.
+- Twelve additional A-route comparisons retain the old backend engine/knobs
+  under the default flag and have byte-identical default O/Stats. This does
+  not establish a general performance guarantee: the recovered explicit
+  opt-in path is slower in these measurements and remains on a merge hold.
+
+The 891 metadata/heuristic/placement checks include modeled SM80/89/100/103/
+107/120/121 and backward controls; these are not native qualifications for
+those other GPUs. SM100's separate four-case native A-mode qualification
+passes with four old-source failures; SM103 repeats the same four RED/green
+checks on B300. SM121 native execution and cross-GPU/cross-plan/cross-runtime
+byte identity are not claimed here.
