@@ -698,20 +698,28 @@ def test_sm80_deterministic_backward_follows_its_study(s):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("total_fraction", [1.0, 0.75], ids=["thd", "thd_ragged"])
 @pytest.mark.parametrize("s", [8192, 8100], ids=["on_tile", "off_tile"])
-def test_sm80_thd_d256_prefill_entries_are_retired(s, total_fraction):
-    """Study sm80_thd_prefill_20261117 trained at S_q >= 500; its edge supplement at S_q 17-499 lost on every side (worst 1.13-1.53), so
-    its d256 THD entries are retired and the trail-only SM80 row decides."""
+def test_sm80_thd_d256_prefill_follows_its_v2_study(s):
+    """Study sm80_thd_d256_v2_20261117 (A100) replaced sm80_thd_prefill_20261117, whose `always` entries lost below S_q 500: ragged
+    d256 THD causal prefill leads past a floor (S_q 2^7.5 on the tile, 2^9.09 tiles off it); equal lengths keep the trail-only row
+    (their off-tile holdout side reached 1.101)."""
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     row = "sdpa_fwd_prefill_sm80"
-    base = dict(b=64, h_q=8, h_kv=2, s_q=s, s_kv=s, d_qk=256, d_v=256, causal=True, bottom_right=False, has_paged_kv=False, thd=True)
-    base.update(max_total_seq_len_q=int(64 * s * total_fraction), device_cc=(8, 0), device_sm_count=108)
-    assert pt.lookup(row, _facts(**base)) is None
+
+    def thd(total_fraction, **over):
+        base = dict(b=64, h_q=8, h_kv=2, s_q=s, s_kv=s, d_qk=256, d_v=256, causal=True, bottom_right=False, has_paged_kv=False, thd=True)
+        base.update(max_total_seq_len_q=int(base["b"] * s * total_fraction), device_cc=(8, 0), device_sm_count=108)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, thd(0.75)).study == "sm80_thd_d256_v2_20261117"
+    assert pt.lookup(row, thd(0.75)) is True
+    assert pt.lookup(row, thd(1.0)) is None  # equal lengths: no entry
     d256 = [spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_sm80_d256_kv_prefetch"]
-    assert d256 and placement.place(d256[0], _facts(**base)) == placement.TRAIL
+    assert d256 and placement.place(d256[0], thd(0.75)) == placement.LEAD
+    assert placement.place(d256[0], thd(1.0)) == placement.TRAIL
 
 
 @pytest.mark.L0

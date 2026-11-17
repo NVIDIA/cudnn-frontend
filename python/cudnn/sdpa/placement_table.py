@@ -669,6 +669,17 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     # study sm80_thd_prefill_20261117 (A100 THD d256 GQA causal, trained at S_q >= 500): its four `always` entries are retired. The SM80
     # GQA prefill class starts at S_q 17, and an edge supplement at S_q 17-499 lost on every side (worst 1.13-1.53, geomean 0.68-0.88).
+    # Re-studied over S_q 17-8192 as sm80_thd_d256_v2_20261117 (below).
+    # study sm80_thd_d256_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 835bbdb9b; the training harness's THD forward, recorded facts:
+    # d256 GQA causal, squares and bottom-right chunks over S_q 17-8192, groups 2-8, b 8-96; 200 train cells). Ragged lengths lead from
+    # S_q 2^7.5 on the tile and from 2^9.09 tiles off it (changed train 0.537 / 0.531); holdout at fresh heads, scored once, 0.516 /
+    # 0.566 (worst 0.705). Equal lengths (`thd`) have no entry: their off-tile holdout side reached 1.101.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
+        "ge", 7.5, "sm80_thd_d256_v2_20261117", "q"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
+        "ge", 9.085, "sm80_thd_d256_v2_20261117", "tiles"
+    ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
     # holdouts, 96-cell holdout 3; d128 GQA causal is non-monotone and keeps the hand-written order; d256 mask-free MHA,
