@@ -416,7 +416,7 @@ the default `--deterministic-dkv-mode records`.
 | dKV layout | BWD ms | BWD TFLOPS | Workspace GiB | Speedup |
 | --- | ---: | ---: | ---: | ---: |
 | C16 logical / C8 physical relay | 484.915 | 22.67 | 4.508 | 1.00x |
-| Four-plane conflict rank | **119.109** | **92.31** | **3.008** | **4.07x** |
+| Four-plane conflict rank | **119.223** | **92.22** | **3.008** | **4.07x** |
 
 ##### SM90 conflict-rank H200 wave scheduling (2026-11-17)
 
@@ -425,7 +425,7 @@ BF16 H64, Q=16384, KV=262144, top-k 2048, full runtime lengths, synthetic
 forward statistics, five warmups, and 20 allocation-free calls. The environment
 used PyTorch 2.12.1+cu130, CuTe DSL 4.8.1 with its CUDA 13 extra (CUDA 13.4
 lowering), cuDNN 9.19.0, and `cuda-bindings` 13.0.3. The records plan selected
-one 128-CTA wave because the allocation has at least 128 SMs. Each records/C32
+one cooperative 128-CTA wave because the allocation has at least 128 SMs. Each records/C32
 endpoint was repeated after reversing the measurement order.
 
 | Dqk / Dv | dKV layout | BWD ms | BWD TFLOPS | Workspace GiB | Speedup vs C16 |
@@ -449,6 +449,11 @@ the-same-2048-rows stress, this reduced D512 from 151.586 to 87.678 ms (1.73x)
 and D576 from 195.635 to 139.779 ms (1.40x) versus the previous single-ticket
 records path. The two-launch H20 schedule retains one ticket per row because
 additional intra-launch barriers regress that already stream-ordered plan.
+The H200 numbers above were collected before the records launches were marked
+cooperative to make their co-residency contract explicit. The launch geometry
+and kernel body are unchanged; a final H200 rerun is pending test-allocation
+control-plane recovery. The final cooperative H20 run measured 119.223 ms for
+D512 and 117.632 ms for D576, within noise of the earlier values.
 
 ##### SM90 deterministic relay scheduling (2026-11-02)
 

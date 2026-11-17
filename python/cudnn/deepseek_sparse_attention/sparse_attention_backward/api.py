@@ -92,9 +92,9 @@ class SparseAttentionBackward(APIBase):
         - ``'records'`` (default): conflict-rank storage. SM90 uses four dense
           planes: ranks zero to three use separate planes and larger ranks
           deterministically chain through plane zero. A prepared SM90 plan
-          launches a complete 128-query wave on devices with at least 128 SMs
-          and otherwise uses two ordered 64-query phases; this device choice is
-          fixed before execution and CUDA Graph capture. SM100 records plans put
+          divides each 128-query wave into cooperative power-of-two phases with
+          at most one CTA per device SM; this device choice is fixed before
+          execution and CUDA Graph capture. SM100 records plans put
           rank ``k`` in dense plane ``k`` while it fits and use slot-private
           overflow records otherwise; records and planes are combined in a
           fixed order. Shapes whose conflict-rank workspace would exceed the
@@ -840,8 +840,8 @@ def sparse_attention_backward_wrapper(
     64-CTA logical relay. SM90 uses the widest launchable C16/C8/C4 physical
     cluster and ordered phases when necessary. ``None`` selects conflict-rank
     records on SM90 and the automatic policy on SM100. An SM90 records plan
-    uses one 128-query wave on devices with at least 128 SMs and two ordered
-    64-query phases otherwise. These plan-time choices change the required
+    divides each 128-query wave into cooperative power-of-two phases with at
+    most one CTA per device SM. These plan-time choices change the required
     workspace or launch schedule and remain fixed across every execution and
     CUDA Graph replay of the cached plan.
     """

@@ -2,7 +2,7 @@
 # Copyright (c) 2026, Jerry Chen
 # SPDX-License-Identifier: MIT
 import math
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -25,6 +25,7 @@ from .dsa_bwd_sm90 import (
     _FlashAttentionDSABackwardPreprocessSm90,
 )
 from ._sm90_relay import (
+    SM90_CONFLICT_RANK_RELAY_PHASES,
     SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
     normalize_sm90_relay_cluster_size,
     sm90_conflict_rank_relay_phases,
@@ -44,6 +45,34 @@ _N_BLOCK_SIZE = 64
 _HEAD_DIM_MULTIPLE = 32
 _DETERMINISTIC_Q_WAVE_CTAS = 128
 _WORKSPACE_OWNER = "SparseAttentionBackward (SM90)"
+
+
+class _Sm90MainCompileKey(NamedTuple):
+    """Named cache identity; tests must not infer fields from tuple offsets."""
+
+    dtype: object
+    head_dim: int
+    head_dim_v: int
+    qhead_per_kvhead: int
+    m_block_size: int
+    n_block_size: int
+    num_threads: int
+    kv_stage: int
+    pds_stage: int
+    sdp_swap_ab: bool
+    dkv_swap_ab: bool
+    dq_swap_ab: bool
+    have_topk_length: bool
+    max_topk: int
+    emit_cli_target: bool
+    deterministic: bool
+    conflict_rank: bool
+    num_dkv_shards: int
+    relay_cluster_size: int
+    physical_relay_cluster_size: int
+    q_wave_ctas: int
+    conflict_rank_phases: int
+    padded_head_dim: int
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -155,9 +184,10 @@ def flash_attn_bwd_sm90(
         physical_relay_cluster_size: Preselected physical C4/C8/C16 launch
             width. ``None`` queries the current device before compilation.
             Prepared plans pass their cached support-check result here.
-        conflict_rank_phases: Preselected one-wave or two-phase conflict-rank
-            schedule. ``None`` selects from the current device's SM count.
-            Prepared plans cache the result before execution.
+        conflict_rank_phases: Preselected power-of-two phase count for
+            cooperative conflict-rank launches. ``None`` selects phases whose
+            CTA count fits at one CTA per device SM. Prepared plans cache the
+            result before execution.
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -225,8 +255,8 @@ def flash_attn_bwd_sm90(
             if conflict_rank_phases is None:
                 sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
                 conflict_rank_phases = sm90_conflict_rank_relay_phases(sm_count)
-            if conflict_rank_phases not in (1, 2):
-                raise ValueError(f"conflict_rank_phases must be 1 or 2, got {conflict_rank_phases!r}")
+            if conflict_rank_phases not in SM90_CONFLICT_RANK_RELAY_PHASES:
+                raise ValueError(f"conflict_rank_phases must be one of {SM90_CONFLICT_RANK_RELAY_PHASES}, " f"got {conflict_rank_phases!r}")
         else:
             conflict_rank_phases = 1
             if physical_relay_cluster_size is None:
@@ -427,7 +457,7 @@ def flash_attn_bwd_sm90(
             current_stream,
         )
 
-    compile_key = (
+    compile_key = _Sm90MainCompileKey(
         dtype,
         head_dim,
         head_dim_v,

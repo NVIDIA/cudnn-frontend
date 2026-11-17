@@ -686,14 +686,14 @@ class FlashAttentionDSABackwardSm90:
         self.relay_cluster_size = relay_cluster_size
         if conflict_rank:
             self.physical_relay_cluster_size = 1
-            assert conflict_rank_phases in (1, 2)
+            assert conflict_rank_phases in (1, 2, 4, 8, 16, 32, 64, 128)
             # Every overflow writer waits only for lower ordinals in this
-            # launch.  The prepared host selects one 128-CTA wave when all of
-            # it fits concurrently, otherwise two ordered 64-CTA phases.
+            # cooperative launch. The prepared host bounds each phase to at
+            # most one CTA per SM; same-stream phases carry completed tickets.
             self.relay_phases = conflict_rank_phases
             # A full resident wave can pipeline independent dKV column groups.
-            # The split-wave plan keeps one ticket: its second launch cannot
-            # overlap the first, so extra intra-CTA barriers only add cost.
+            # A multi-phase plan keeps one ticket: its ordered launches cannot
+            # overlap, so extra intra-CTA barriers only add cost.
             self.conflict_ticket_phases = (4 if self.same_hdim_kv else 2) if conflict_rank_phases == 1 else 1
         else:
             self.physical_relay_cluster_size = min(relay_cluster_size, 16) if physical_relay_cluster_size is None else physical_relay_cluster_size
@@ -1051,7 +1051,7 @@ class FlashAttentionDSABackwardSm90:
         # serializes head tiles. A logical shard relay wider than the device's
         # widest launchable C16/C8/C4 cluster is split into ordered physical
         # launches that reuse the same FP32 plane. Conflict-rank records use
-        # either one full 128-CTA wave or two ordered 64-CTA phases.
+        # cooperative power-of-two phases bounded to one CTA per SM.
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
         total_q = cute.size(mQ.shape[3])
@@ -1128,6 +1128,7 @@ class FlashAttentionDSABackwardSm90:
                         grid=self.grid_dim,
                         block=[self.num_threads, 1, 1],
                         cluster=[self.physical_relay_cluster_size, 1, 1],
+                        cooperative=self.conflict_rank,
                         smem=self.shared_storage.size_in_bytes(),
                         stream=stream,
                         min_blocks_per_mp=1,

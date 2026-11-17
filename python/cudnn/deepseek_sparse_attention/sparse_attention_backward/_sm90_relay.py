@@ -12,6 +12,7 @@ SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 16
 SM90_PHYSICAL_RELAY_CLUSTER_SIZES = (4, 8, 16)
 SM90_CONFLICT_RANK_PLANES = 4
 SM90_CONFLICT_RANK_WAVE_CTAS = 128
+SM90_CONFLICT_RANK_RELAY_PHASES = (1, 2, 4, 8, 16, 32, 64, 128)
 SM90_SIGNED_INT32_ELEMENT_LIMIT = 1 << 31
 
 
@@ -121,12 +122,13 @@ def sm90_physical_relay_cluster_size(relay_cluster_size, device=None) -> int:
 
 
 def sm90_conflict_rank_relay_phases(sm_count) -> int:
-    """Choose one 128-CTA wave or two ordered 64-CTA phases.
+    """Choose cooperative phases whose launch fits at one CTA per SM.
 
     Conflict-rank overflow writers wait for lower query ordinals, so every CTA
-    in a launch must be resident together.  A device with at least 128 SMs can
-    launch the complete wave; smaller devices split it into two same-stream
-    phases.  The prepared plan caches this plan-time decision.
+    in a launch must be co-resident.  Each phase is therefore a cooperative
+    launch no wider than the largest power of two at or below the device's SM
+    count. Same-stream phase order carries completed tickets across launches.
+    The prepared plan caches this plan-time decision.
     """
     try:
         sm_count = operator.index(sm_count)
@@ -134,4 +136,5 @@ def sm90_conflict_rank_relay_phases(sm_count) -> int:
         raise ValueError(f"SM90 conflict-rank scheduling requires an integer SM count, got {sm_count!r}") from error
     if sm_count <= 0:
         raise ValueError(f"SM90 conflict-rank scheduling requires a positive SM count, got {sm_count}")
-    return 1 if sm_count >= SM90_CONFLICT_RANK_WAVE_CTAS else 2
+    resident_ctas = 1 << (min(sm_count, SM90_CONFLICT_RANK_WAVE_CTAS).bit_length() - 1)
+    return SM90_CONFLICT_RANK_WAVE_CTAS // resident_ctas

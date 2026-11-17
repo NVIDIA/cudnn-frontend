@@ -6076,9 +6076,13 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
 
     # qhpkv controls the query-head tiling and must remain part of the main
     # compile key, independently of the runtime tensor shape.
-    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-5] is False]
+    matching_keys = [
+        key
+        for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache
+        if (key.head_dim, key.head_dim_v, key.qhead_per_kvhead) == (head_dim, head_dim_v, num_heads) and not key.deterministic
+    ]
     assert matching_keys
-    assert all(key[-1] == 0 for key in matching_keys), "non-deterministic kernels must not specialize on rounded head extents"
+    assert all(key.padded_head_dim == 0 for key in matching_keys), "non-deterministic kernels must not specialize on rounded head extents"
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
     assert torch.isfinite(dq).all()
@@ -7124,9 +7128,9 @@ def test_DSA_sparse_attention_backward_sm90_physical_relay_rejects_unlaunchable_
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("sm_count,expected", [(1, 2), (78, 2), (127, 2), (128, 1), (132, 1)])
+@pytest.mark.parametrize("sm_count,expected", [(1, 128), (7, 32), (16, 8), (78, 2), (127, 2), (128, 1), (132, 1)])
 def test_DSA_sparse_attention_backward_sm90_conflict_rank_phases_follow_residency(sm_count, expected):
-    """A complete 128-CTA wave is used only where every CTA can be resident."""
+    """Every cooperative phase fits at one CTA per SM, including small MIGs."""
     _require_sm90_relay_dependencies()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
 

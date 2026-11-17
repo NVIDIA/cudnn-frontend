@@ -445,8 +445,9 @@ a row alone and inside a batch under the entry's own picks.
   selects the shard relay instead. H20-3e BF16 H64/D512 and D576 high-conflict
   replay/reference and H96/D576 changed-input CUDA Graph replay are verified.
   The AIStudio H200 allocation additionally verifies the one-wave schedule with
-  the same high-conflict and changed-input CUDA Graph cases; smaller SM90
-  devices retain two ordered 64-CTA phases. Cross-wave dKV remains batch
+  the same high-conflict and changed-input CUDA Graph cases. Every phase is a
+  cooperative launch with at most one CTA per SM; smaller SM90 devices use
+  additional ordered power-of-two phases. Cross-wave dKV remains batch
   dependent, so the SM90 BF16 status stays **Replay only**.
   Duplicate active indices within one query remain outside the SM90
   deterministic contract. FP16 and other SM90 head-count/dimension combinations

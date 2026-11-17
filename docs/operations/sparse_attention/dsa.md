@@ -324,18 +324,18 @@ H16/H32/H64/H96/H128. A setup kernel builds an immutable 128-bit
 query-selection bitmap and four zero-initialized ticket words for every
 referenced `(query wave, M64 head tile, KV row)`. Each query computes its stable
 conflict rank by popcounting lower query ordinals. Ranks zero through three
-accumulate into four separate dense FP32 planes. Higher ranks reuse plane zero after all
-lower plane-zero writers for that row publish monotonically increasing release
-tickets. On a resident 128-CTA wave, D512 uses four independent column groups
+accumulate into four separate dense FP32 planes. Higher ranks reuse plane zero
+after all lower plane-zero writers for that row publish monotonically increasing
+release tickets. On a resident 128-CTA wave, D512 uses four independent column groups
 and D576 uses two, so adjacent overflow ranks can pipeline disjoint columns
-instead of serializing the complete row update. The two-launch schedule keeps
-one ticket per row because its waves are already stream ordered. Ranks one
+instead of serializing the complete row update. A multi-launch schedule keeps
+one ticket per row because its phases are already stream ordered. Ranks one
 through three require no ticket because their planes are disjoint. A prepared
-plan reads the device SM count once: devices with at
-least 128 SMs process the complete wave in one 128-CTA, single-CTA-cluster
-launch, while smaller devices use two ordered 64-CTA launches. In both cases,
-every writer that a CTA can wait for is resident. The selected phase count is
-compiled into the plan and is not queried during execution or CUDA Graph replay.
+plan reads the device SM count once and divides each wave into cooperative
+power-of-two phases with at most one CTA per SM. Cooperative launch guarantees
+that every writer a CTA can wait for is resident; same-stream phase order
+carries completed tickets across launches. The selected phase count is compiled
+into the plan and is not queried during execution or CUDA Graph replay.
 Head tiles and later waves remain stream ordered, and
 the postprocess kernel combines the four planes in fixed order. One warp per
 head computes `d_sink` with a fixed strided-lane/tree reduction order.
@@ -369,7 +369,7 @@ the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
 the declared tensor shapes and addresses fixed while allowing tensor contents,
 including `topk_idxs` and `topk_length`, to change.
 On H20-3e with BF16 H64/D512, Q=16384, KV=262144, and top-k 2048, conflict-rank
-records measured 119.109 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
+records measured 119.223 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
 the C16 logical relay baseline split into physical C8 launches: 4.07x faster
 with 33.3% less workspace. Historical explicit-relay H200 measurements and the
 full environments are recorded in `benchmark/dsa/README.md`.
