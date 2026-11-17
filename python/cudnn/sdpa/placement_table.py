@@ -925,12 +925,29 @@ TABLE: Dict[Tuple, Entry] = {
     # worst 0.65. The sink-only d64 MTP class lost 1.21x on the holdout and dense d512 s_q 1 stays with the #2497 rule: no entry)
     # study sm120_paged_d128_mtp_20261117 re-fits the d128 paged MTP twins (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE 9bdf9a8ab; llama
     # heads 8/1-64/8, b 1-128, s_q 2-4, KV 8k-128k; 129 train cells, a 60-cell seeded holdout scored once: 10 changed at 0.43 / 0.77
-    # geomean, worst 0.92). FROST trails at 64 KV units, where its split keeps 64 CTAs, so the lead stops below 2^5.5 tiles.
+    # geomean, worst 0.92). The study's FROST split kept 64 CTAs at 64 KV units; under the paged split rates FROST leads every unit
+    # count on its grid (all group 8), but an `always` re-fit lost 1.25x to group 5 on a fresh holdout (sm120_paged_d128_mtp_v3), so
+    # the lead stays below 2^5.5 tiles.
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "le", 5.5, "sm120_paged_d128_mtp_20261117", "tiles"
     ),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
         "le", 5.5, "sm120_paged_d128_mtp_20261117", "tiles"
+    ),
+    # study sm120_window_prefill_20261117 (RTX PRO 6000 Server, cuDNN 9.24.0.43, FE c59994a55; dense bottom-right chunks and squares,
+    # d256 window 1024 and d512 MQA window 128; 221 train cells, a served-pair and an other-group holdout, each scored once: 0.34-0.58
+    # geomean, worst 0.70). The hand rule trailed every windowed square; DSv4 d512 SWA squares ran 0.31-0.34 of the backend.
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "prefill", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm120_window_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "prefill", "dense", "window", False, "gqa", True): Entry(
+        "always", None, "sm120_window_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm120_window_prefill_20261117"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", True): Entry(
+        "always", None, "sm120_window_prefill_20261117"
     ),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "q1", "paged", "none", False, "gqa", False): Entry("never", None, "sm120_decode_20261112"),
     ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "q1", "paged", "none", False, "gqa", True): Entry("never", None, "sm120_decode_20261112"),

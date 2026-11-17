@@ -479,7 +479,7 @@ def test_sm120_decode_entries_follow_their_study():
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm120_paged_d128_mtp_follows_its_study(s_kv):
     """Study sm120_paged_d128_mtp_20261117 (RTX PRO 6000, llama's paged generation graph): d128 MTP leads up to 32 KV units at any
-    cache length and trails from 64, where FROST's split keeps 64 CTAs; f16 and another part keep the hand rules."""
+    cache length and trails from 64 (a group-8-only `always` re-fit did not hold on group 5); f16 and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm120"
 
     def mtp(**over):
@@ -495,6 +495,28 @@ def test_sm120_paged_d128_mtp_follows_its_study(s_kv):
     assert pt.lookup(row, mtp(b=128, h_q=64, h_kv=8, s_q=4)) is False
     assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, mtp(device_cc=(12, 1))) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q, s_kv", [(8192, 8192), (1024, 131072), (1024, 131071)], ids=["square", "chunk", "chunk_off_tile"])
+def test_sm120_windowed_d256_d512_prefill_leads(s_q, s_kv):
+    """Study sm120_window_prefill_20261117: dense windowed d256 and d512 prefill lead on SM120, squares included (the hand rule
+    trails every windowed square); d128, the d64 sink class, f16 and another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm120"
+
+    def win(**over):
+        base = dict(b=2, h_q=128, h_kv=1, s_q=s_q, s_kv=s_kv, d_qk=512, d_v=512, causal=True, bottom_right=True, window_left=128)
+        base.update(has_paged_kv=False, device_cc=(12, 0))
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(h_q=64), dict(h_q=16, h_kv=8, d_qk=256, d_v=256, window_left=1024)):
+        assert pt.lookup(row, win(**over)) is True, over
+        assert pt.matched_entry(row, win(**over)).study == "sm120_window_prefill_20261117"
+    assert pt.lookup(row, win(h_q=32, h_kv=8, d_qk=128, d_v=128, window_left=1024)) is None
+    assert pt.lookup(row, win(h_q=64, h_kv=8, d_qk=64, d_v=64, has_sink=True)) is None
+    assert pt.lookup(row, win(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, win(device_cc=(12, 1))) is None
 
 
 @pytest.mark.L0
