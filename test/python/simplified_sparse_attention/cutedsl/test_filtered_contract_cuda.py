@@ -23,7 +23,7 @@ pytestmark = [
 
 
 def test_cold_filtered_repair_and_changed_input_replays(monkeypatch):
-    from cudnn.ops import simplified_sparse_attention
+    from cudnn.ops import simplified_sparse_attention_forward
     from cudnn.simplified_sparse_attention.cutedsl import backend
     from cudnn.simplified_sparse_attention.cutedsl.kernels import _cuda_preload
     from cudnn.simplified_sparse_attention.cutedsl.kernels import indexer_forward_topk_fused_tcgen05 as fused
@@ -102,7 +102,7 @@ def test_cold_filtered_repair_and_changed_input_replays(monkeypatch):
                 caller_allocations.append((inputs, metadata))
                 upstream = torch.randn(inputs[0].shape, device=device, dtype=torch.bfloat16, generator=generator) * 0.2
                 frozen_upstream = upstream.clone()
-                output, loss = simplified_sparse_attention(*inputs, metadata, topk, loss_coeff=0.1)
+                output, loss = simplified_sparse_attention_forward(*inputs, metadata, topk, loss_coeff=0.1)
                 torch.cuda.synchronize(device)
 
                 new_keys = set(fused._state_filtered) - previous_keys

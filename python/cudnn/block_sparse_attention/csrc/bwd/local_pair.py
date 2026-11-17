@@ -5,7 +5,7 @@
 
 Duplicate edges disable pairing for their eight-KV group, preserving multiset
 semantics through the regular path. The default backward rebuilds all of this metadata on every call;
-``block_sparse_attention_prepare_backward`` builds it once for reuse across backward calls.
+``block_sparse_attention_backward_metadata`` builds it once for reuse across backward calls.
 """
 
 from typing import Optional
