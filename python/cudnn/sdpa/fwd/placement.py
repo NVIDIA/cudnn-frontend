@@ -400,6 +400,12 @@ Bounded (``shape_overrides``) chunks lead the same way, and GQA 4 / 8 / 16 also 
 alignment) with 768 <= S <= 8192, exact or bounded; a bounded square is judged on its declared capacity, which
 FlashInfer's full prefill declares as Q = KV. Performance outcomes remain internal.
 
+Rubin dense bf16 d128 chunks (2026-11-17, ``SM107_D128_CHUNKED_MAX_Q_TILES``): S_q < S_kv chunks from a 4k cache lead up to 256
+launch tiles, against 128 for the other widths. Study sm107_dense_d128_chunk_tiles_20261117 (cuDNN 9.30.0.4, the inference
+harness's context legs, groups 3-8, b 1-8, S_q 256-4096, KV 4k-128k) fitted the cap on 216 frozen cells: 256 tiles is the
+largest feasible (24 changed at 0.800 of the backend, worst 0.999). Past it, S_q 256 chunks at b 4-8 over groups 3 / 5 / 6
+lose 1.7-2.0x. A 66-cell holdout at fresh heads, scored once, came to 0.803 over its 8 changed cells (worst 1.008).
+
 SM100 paged bf16 d128 GQA prefill (2026-10-24, ``_sm100_paged_gqa_prefill``): GQA16 LEAD at b 1-4, 128 < effective Q
 <= 4096, S_kv 2k-32k, causal (bottom-right chunks and top-left full squares), page 16, head-major in-page K. Once
 paged SM100 lists the packed set first for GQA16, the FROST block's first plan (packed, LPT, unsplit cga2) runs
@@ -537,6 +543,7 @@ SQ1_D576_MIN_WORK = 2**20  # the #1933 hand floor; see the D576 arm in _place_sm
 D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q from which FROST wins (0.39-0.88); 2048 rows lose 1.14-1.24
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
+SM107_D128_CHUNKED_MAX_Q_TILES = 256  # Rubin bf16 d128 chunks: study sm107_dense_d128_chunk_tiles_20261117 (module docstring)
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
 NONPAGED_D256_THD_MIN_Q = 256  # nonpaged d256 THD lead: query tokens per request
@@ -1047,7 +1054,9 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         elif facts.s_q > DECODE_SHAPED_MAX_S_Q:
             if flavor == (512, 512):
                 return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
-            if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
+            d128 = (facts.d_qk, facts.d_v) == (128, 128) and facts.dtype == cudnn.data_type.BFLOAT16
+            max_tiles = SM107_D128_CHUNKED_MAX_Q_TILES if d128 else CHUNKED_MAX_Q_TILES
+            if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= max_tiles:
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
     if _sm107_paged_gqa_prefill(facts):
         return LEAD

@@ -1061,6 +1061,24 @@ def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_k
 
 
 @pytest.mark.L0
+def test_sm107_dense_d128_chunks_lead_up_to_256_tiles():
+    """Study sm107_dense_d128_chunk_tiles_20261117: Rubin dense bf16 d128 chunks from a 4k cache lead up to 256 launch tiles
+    (llama3.1 64/8 b 1 at S_q 512 ran the backend at 1.4-1.6x); past it, and for f16 or other widths past 128, the backend stays."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=64, h_kv=8, s_q=512, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7), device_sm_count=208)
+    base.update(has_paged_kv=False, padded=False, page_size=0)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert placement.SM107_D128_CHUNKED_MAX_Q_TILES == 256
+    assert place() == placement.LEAD  # 256 tiles
+    assert place(h_q=32, h_kv=4, s_q=1024) == placement.LEAD  # 256 tiles
+    assert place(s_q=1024) == placement.TRAIL  # 512 tiles
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL  # f16 keeps 128 tiles
+    assert place(h_q=32, h_kv=4) == placement.LEAD  # 128 tiles, every width
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(256, 256), (192, 128)])
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
