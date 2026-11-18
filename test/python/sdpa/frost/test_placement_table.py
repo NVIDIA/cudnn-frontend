@@ -1252,6 +1252,33 @@ def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask, on_tile, off
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, heads, s_qs",
+    [((576, 512), (64, 1), (5, 8, 16, 1024)), ((512, 512), (32, 4), (5, 8, 16, 1024)), ((192, 192), (64, 4), (2, 4, 5, 8, 1024))],
+    ids=["d576", "d512", "d192"],
+)
+def test_sm107_paged_wide_head_verify_entries_lead(d, heads, s_qs):
+    """Study sm107_paged_wide_gaps_20261118 (Rubin, the inference benchmark's paged generation graph): paged D576 MLA, d512 and d192x192
+    GQA under the bottom-right diagonal lead at every measured S_q on and off the tile. Verify rows (S_q 5-16) key `prefill` on SM107.
+    Without the diagonal, f16, and another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def paged(**over):
+        base = dict(b=16, h_q=heads[0], h_kv=heads[1], s_q=8, s_kv=131072, d_qk=d[0], d_v=d[1], causal=True, bottom_right=True)
+        base.update(device_cc=(10, 7), has_paged_kv=True, page_size=64, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for s_q in s_qs:
+        for s_kv in (8192, 131072, 131073):
+            assert pt.lookup(row, paged(s_q=s_q, s_kv=s_kv)) is True, (s_q, s_kv)
+            assert pt.matched_entry(row, paged(s_q=s_q, s_kv=s_kv)).study == "sm107_paged_wide_gaps_20261118"
+    assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
+    assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(512, 512), (576, 512)], ids=["d512", "d576"])
 @pytest.mark.parametrize("h_kv", [1, 2])
 def test_sm107_paged_mla_single_row_decode_follows_the_q1_study(d, h_kv):

@@ -604,6 +604,35 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", True): Entry("ge", 6.915, "sm107_paged_mtp_20261110", "kv"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", False): Entry("always", None, "sm107_paged_mtp_20261110"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    # study sm107_paged_wide_gaps_20261118 (208-SM Rubin, cuDNN 9.30.0.8; the inference benchmark's paged generation graph, page 64,
+    # bottom-right causal; mean of 100 cold launches under 1 ms; D576xV512 MLA over one KV head, d512 and d192x192 GQA; S_q 5-1024 in
+    # the prefill classes (spec-decode verify keys `prefill` on SM107), 2-4 at d192 MTP; b 1-128, KV 8k-128k on and off the tile;
+    # 504 train cells + a 96-cell holdout at fresh head pairs, scored once: changed 0.018-0.072 of the default, worst 0.299;
+    # vr200 run-561 gate: 18 rows at 0.011, worst 0.035)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_paged_wide_gaps_20261118"
+    ),
     # study sm107_thd_prefill_20261111 (208-SM Rubin, cuDNN 9.30.0.3; FlashInfer's cudnn path, recorded graph facts; bf16 HND
     # paged page 16/64 and ragged THD, d64/d128 all masks, D192xV128 / d256 ragged all masks and paged mask-free (paged causal
     # D192/D256 is sm107_paged_prefill_20261109's); short-Q, chunks, squares; GQA groups 3-12 incl. 8/1 and 12/1, MHA 16-128.
