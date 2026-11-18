@@ -9,7 +9,7 @@ from cudnn._causal_conv1d_arch import is_supported_causal_conv1d_update_compute_
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.ops import causal_conv1d_update
 from determinism_utils import assert_bitwise, assert_golden, assert_replays
-from reference import causal_conv1d_decode_reference
+from causal_conv1d_reference import causal_conv1d_decode_reference
 
 pytestmark = [
     pytest.mark.L0,

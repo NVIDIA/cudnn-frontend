@@ -16,7 +16,7 @@ from cudnn._causal_conv1d_arch import (
 )
 
 
-from reference import causal_conv1d_decode_reference as _reference_step
+from causal_conv1d_reference import causal_conv1d_decode_reference as _reference_step
 
 
 def _has_supported_gpu() -> bool:
