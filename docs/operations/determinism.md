@@ -44,6 +44,8 @@ quantize decode step, also under `cudnn.attention_gate.frost`) and
 `cudnn.norm.frost`) is a direct-call step entry of the same kind.
 `SwigluFp4Decode` (the FP4 gate / up product with SwiGLU for decode rows, also
 under `cudnn.gemm`) is a direct-call step entry of the same kind.
+`AttentionPrepareDecode` (the attention preparation decode step, also under
+`cudnn.attention_prepare.frost`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
@@ -68,6 +70,7 @@ arbitrary user callbacks.
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
 | `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
+| `AttentionPrepareDecode` (attention preparation decode step) | fprop (inference step) | BF16 in and out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -455,6 +458,32 @@ a row alone and inside a batch under the entry's own picks.
   fixed runtime, equal bytes across GPU architectures are not claimed, and a
   golden recorded on one runtime does not qualify another. No backward entry
   point exists.
+- Attention preparation decode step (`AttentionPrepareDecode`): no
+  determinism switch and no numerics knob. A head row's sum of squares is one
+  fixed tree whose shape is a function of the head width alone (a fused step
+  over a thread's two elements, a butterfly over a warp's lanes with the
+  offsets 16, 8, 4, 2, 1, a butterfly over the four warp sums) -- never of
+  the token count, of the part or of a knob -- and nothing of another token
+  or head enters a head row's thread block. A token alone writes the bytes it
+  writes inside a call of up to 1024 tokens, at any place and among any
+  neighbours: its `q_out` and `gate_out` rows and the K and V pool rows of its
+  slot. Which pool rows a call writes follows the slot vector (a negative
+  slot, a slot at or past the pools' capacity and a token past the vector's
+  length write none) and never changes `q_out` or `gate_out`. The page size,
+  the integer dtypes of the positions and the slots, the launch knobs (`pdl`,
+  `pdl_release`) and the owner of an output write the same bytes. By the
+  caller's contract two tokens of one call do not share a non-negative slot;
+  a call that breaks it has two thread blocks writing one pool row, and the
+  status does not cover it. SM100 is verified on cc 10.0 (148 SMs) with the
+  committed goldens of that one runtime, under both compiler flavours of
+  CuTe DSL 4.8.0. cc 10.3 and cc 10.7 have not been run, so SM103 and SM107
+  are unverified: the entry admits compute capability 10.x, the kernel's
+  rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets,
+  and cc 10.7 needs the DSL's CUDA 13 compiler flavour. SM90 and SM120 are
+  declined by type. The bytes follow the part's approximate division and
+  approximate reciprocal square root: the status holds on a fixed runtime,
+  equal bytes across GPU architectures are not claimed, and a golden recorded
+  on one runtime does not qualify another. No backward entry point exists.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
