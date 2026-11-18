@@ -96,7 +96,9 @@ restored afterwards. There is no workspace; a warm call allocates nothing and re
 Every bf16 operand starts at a 16-byte aligned address, the integer operands at a multiple of their element size;
 every operand lives on the entry's device. No written operand (`q_out`, `gate_out`, the pools) may share a byte with
 another operand. Two views that interleave in one allocation -- the two halves of a packed cache -- are served: the
-check proves that they share no byte. A layout the check cannot separate is declined.
+check proves that they share no byte. A layout the check cannot separate is declined. A pool is written by one
+thread block per head row, so its own rows may not share a byte either: a pool view with an expanded axis or with
+rows that overlap by a part is declined.
 
 **Caller contracts the host cannot check** (they are device data, and the entry never reads device memory): two
 tokens of one call do not share a non-negative slot (two thread blocks would write one pool row); every position is a
@@ -118,7 +120,8 @@ is not a positive power-of-two `int`, an integer dtype name outside `("int32", "
 `pdl=True`; `NotImplementedError` for a `HEAD_DIM` or `ROTARY_DIM / 2` that is not a power of two, a geometry other
 than `(24, 4, 256, 64)` and a page size other than 64 or 16. Before every launch: `TypeError` for a non-tensor, a
 bf16 operand of another dtype, or a `positions` / `slot_mapping` tensor whose integer dtype is not the entry's;
-`ValueError` for a shape, a stride that is not whole 16-byte vectors, an alignment, a device mismatch, an overlap, a
+`ValueError` for a shape, a stride that is not whole 16-byte vectors, an alignment, a device mismatch, an overlap (a
+written operand with another operand, or a pool's own rows), a
 slot vector longer than the call, an empty call, and everything the paged-pool contract declines about the pools and
 the slot vector (`cudnn.gated_attention_block.cache_write_contract`, with the entry's page size: a pool of another
 page size is named; that contract raises `ValueError` for a non-tensor and for a dtype too); `NotImplementedError` for
@@ -208,14 +211,15 @@ A token count outside 1 .. 1024 is a typed decline (`ValueError` for one that is
 | geometry | `(24, 4, 256, 64)`, fixed at construction; another geometry is declined by name (each head width is its own sum tree) |
 | forms | two position forms, two page sizes, two integer dtypes each for positions and slots; three launch arms (plain, wait, release + wait) |
 | dtypes | bf16 operands and outputs; a bf16 rotary table; int32 or int64 positions and slots; fp32 arithmetic, rounded once to bf16 per stored value |
-| layouts | strided `[tokens, heads, HEAD_DIM]` views and `[pages, heads, page_size, HEAD_DIM]` pools with a contiguous last axis and 16-byte whole outer strides; contiguous weights, table and outputs; no written operand sharing a byte with another |
+| layouts | strided `[tokens, heads, HEAD_DIM]` views and `[pages, heads, page_size, HEAD_DIM]` pools with a contiguous last axis and 16-byte whole outer strides; contiguous weights, table and outputs; no written operand sharing a byte with another, no two rows of a pool sharing a byte |
 | determinism | bitwise replay and batch invariance (the [status page](/operations/determinism)) |
 | DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 the CUDA 12.9 and CUDA 13.4 compiler flavours of 4.8.0 render the same PTX body and are both served (on cc 10.0 both ran and wrote the same bytes); on cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT) |
 
 Tests: `test/python/attention_prepare/frost/test_attention_prepare_decode.py` (the construction declines with the
-three construction facts, the binding declines, the overlap rule on interleaved views, the config's limits and
+three construction facts, the binding declines, the overlap rule on interleaved views and on a pool's own rows, the config's limits and
 tables, the rendering pinned per target, the launch facts against the configuration arithmetic and against the
-profiler's record of a launch, the device cells against the twin above, edge rows, the slot predicate, output
+profiler's record of a launch, the device cells against the twin above, the fused product of each rotary half
+bitwise on rows whose products underflow, edge rows, the slot predicate, output
 ownership, the bit-neutral arms, the wait behind a predecessor that released early, the release beside dependent
 launches, CUDA-graph replay, an entry on a device that is not the caller's current one) and
 `test_attention_prepare_decode_determinism.py` (replay, batch invariance, goldens). Source:

@@ -28,8 +28,9 @@ integer dtypes (they select addresses and load widths), ``PDL`` and ``PDL_RELEAS
 
 THE FORM IS IN THE KERNEL SYMBOL.  ``str(cfg)`` is a compact text (``h24_4_d256_r64_3d_11_11_10_p64_i64_i64_plain_eps358637bd``:
 the geometry, the position form with its section, the page size, the position and slot dtypes, the launch arm and the fp32 bits
-of ``eps``); the DSL appends it to the kernel's name, so two forms never share a symbol and the form is readable inside the first
-100 characters.  ``repr(cfg)`` stays the field list.
+of ``eps``); the DSL appends it to the kernel's name, so two KERNELS never share a symbol and the form is readable inside the first
+100 characters.  (Two ``eps`` floats with one fp32 value are two compile keys of one kernel: the config keeps the caller's float,
+the text and the kernel hold its fp32 value.)  ``repr(cfg)`` stays the field list.
 """
 
 import math
@@ -197,10 +198,10 @@ def validate_geometry(geometry) -> AttentionPrepareGeometry:
 def validate_eps(eps) -> float:
     """``eps`` as a ``float`` when it is a Python ``float`` or ``int`` whose fp32 value -- the kernel's constant -- is finite and
     positive; ``ValueError`` otherwise, naming the type it got (a value of another type is declined, never converted)."""
-    ok = isinstance(eps, (int, float)) and not isinstance(eps, bool) and math.isfinite(eps) and eps > 0
+    ok = isinstance(eps, (int, float)) and not isinstance(eps, bool)
     if ok:
-        try:
-            ok = 0 < eps_bits(float(eps)) < 0x7F800000
+        try:  # an int too large for a float raises OverflowError from the first conversion: declined like every other value
+            ok = math.isfinite(eps) and eps > 0 and 0 < eps_bits(float(eps)) < 0x7F800000
         except (struct.error, OverflowError):
             ok = False
     if not ok:

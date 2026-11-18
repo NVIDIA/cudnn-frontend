@@ -45,7 +45,8 @@ free row stride (``"3d"``); ``k_pool`` / ``v_pool`` bf16 ``[pages, KV_HEADS, pag
 strides whole 16-byte vectors (the two halves of one packed cache bind as they are); ``slot_mapping`` of the entry's ``slot_dtype``,
 contiguous, at most ``tokens`` entries; ``q_out`` / ``gate_out`` bf16 ``[>= tokens, HEADS, D]`` contiguous; every bf16 operand 16-byte
 aligned, the integer operands aligned to their element; every operand on the entry's device; no written operand (``q_out``,
-``gate_out``, the pools) sharing a byte with another operand; a compute capability 10.x part; a CuTe DSL >= 4.8.0 that holds the
+``gate_out``, the pools) sharing a byte with another operand, and no two rows of a pool sharing a byte (a pool view with an
+expanded axis or overlapping rows is declined); a compute capability 10.x part; a CuTe DSL >= 4.8.0 that holds the
 part's target and compiles it (cc 10.7: the CUDA 13 toolchain flavour).  Caller contracts that the host cannot check (device data,
 never read: Rule 3): two tokens of one call do not share a non-negative slot; every position is a row of the table.  A NaN or
 infinite element makes its own head row non-finite; every other row is unaffected.
@@ -272,6 +273,23 @@ def _share_a_byte(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) ->
     return not (lo + first <= hi and hi + second <= lo + period)
 
 
+def _own_rows_overlap(t) -> Optional[Tuple[int, int, int]]:
+    """``(axis, stride, span)`` in elements of the first axis of a pool view whose step is shorter than what the axes inside it
+    span -- two rows of the view then CAN share a byte -- or ``None`` when its rows are proven disjoint.  The axes with more than
+    one entry are walked from the smallest stride outwards, starting from the contiguous last axis: each step must clear the span
+    of everything inside it.  An expanded axis (stride 0) and rows that overlap by a part fail it.  A launch writes a pool row from
+    one thread block per head, so two rows that share a byte are a write race the slot contract cannot exclude.  A layout the walk
+    cannot separate is treated as overlapping (the call is declined, never launched on a guess)."""
+    shape = tuple(int(s) for s in t.shape)
+    strides = tuple(int(s) for s in t.stride())
+    span = shape[-1]  # the paged contract has checked the last axis: contiguous
+    for stride, extent, axis in sorted((strides[a], shape[a], a) for a in range(len(shape) - 1) if shape[a] > 1):
+        if stride < span:
+            return axis, stride, span
+        span += (extent - 1) * stride
+    return None
+
+
 def _written_shape(cfg: Cfg, rows: int, name: str, t) -> Optional[Tuple[int, ...]]:
     """The shape of the part of an operand a launch of ``rows`` tokens can touch: the live tokens of an output, the whole tensor
     otherwise (which pool rows are written is device data)."""
@@ -292,7 +310,8 @@ def check_binding(cfg: Cfg, q, gate, k, v, q_weight, k_weight, cos_sin, position
     """The binding checks of a call, run before every launch (compile-cache hits included).  ``TypeError`` for a non-tensor, a dtype
     of a bf16 operand, or a ``positions`` / ``slot_mapping`` tensor whose integer dtype is not the entry's; ``ValueError`` for an
     inconsistent device, shape, stride, alignment, an empty call, a slot vector longer than the call, a written operand that
-    overlaps another operand, and everything the paged contract declines about the pools and the slot vector
+    overlaps another operand, a pool whose own rows share a byte (an expanded axis, rows that overlap by a part: two thread blocks
+    of one launch would write one address), and everything the paged contract declines about the pools and the slot vector
     (``cudnn.gated_attention_block.cache_write_contract``: its ``ValueError`` also for a non-tensor and a dtype);
     ``NotImplementedError`` for a token count above the served ceiling, a ``cos_sin`` that is not bf16, an operand that is not
     contiguous where the kernel addresses flat, and a host without the CuTe DSL (the paged contract's package imports it).  Returns
@@ -388,6 +407,13 @@ def check_binding(cfg: Cfg, q, gate, k, v, q_weight, k_weight, cos_sin, position
     check_pool, check_slot_mapping = _paged_contract()
     check_pool(k_pool, "k_pool", h=kv_heads, page_size=cfg.PAGE_SIZE, d=d, dtype=bf16, device=want)
     check_pool(v_pool, "v_pool", h=kv_heads, page_size=cfg.PAGE_SIZE, d=d, dtype=bf16, device=want)
+    for name, pool in (("k_pool", k_pool), ("v_pool", v_pool)):  # a written operand: no two of its own rows may share a byte
+        clash = _own_rows_overlap(pool)
+        if clash is not None:
+            raise ValueError(
+                f"{NAME}: {name} must not overlap itself: stride[{clash[0]}] = {clash[1]} elements is shorter than the {clash[2]} elements "
+                f"the axes inside it span, so two of its rows share bytes (two thread blocks of one launch would write one address)"
+            )
     live = int(slot_mapping.numel()) if isinstance(slot_mapping, torch.Tensor) and slot_mapping.dim() == 1 else None
     if live is not None and live > rows:
         raise ValueError(f"{NAME}: slot_mapping holds at most one slot per token ({rows}); got {live} entries")

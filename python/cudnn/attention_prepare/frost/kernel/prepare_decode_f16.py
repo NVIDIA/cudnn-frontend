@@ -14,12 +14,15 @@ paged pools at the token's slot.  Config and forms in ``prepare_decode_config.py
 directory.
 
 CHANGES against the source the file header names: written on the CuTe DSL (the source is a Triton kernel); the geometry, the
-epsilon, the position form, the page size and the two integer dtypes are compile-time constants of a config; a thread's elements are
-loaded once (the source loads the rotary elements and their weights a second time and normalises them again -- the same fp32
-operations on the same operands); the rotary part reads its partner element from another thread of the warp instead of from memory
-and spells its fused multiply-adds explicitly (the source leaves the contraction of its two-product sums to its compiler);
-the keys and values are written into paged pools at a slot (the source writes dense outputs); the pool store is also predicated by
-the pool's capacity; the dependent-launch wait and release are launch arms.
+epsilon, the position form, the page size and the two integer dtypes are compile-time constants of a config; the element type is
+bf16 only (the source takes its input dtype as a constant: fp16 or bf16); the gain is ``1 + weight`` (the source adds a constant
+``norm_beta`` to the weight; this kernel fixes it at 1); the query rows and the gate rows are two operands with their own strides
+(the source reads one ``[q | gate]`` row per head); a thread's elements are loaded once (the source loads the rotary elements and
+their weights a second time and normalises them again -- the same fp32 operations on the same operands); the rotary part reads its
+partner element from another thread of the warp instead of from memory and spells its fused multiply-adds explicitly (the source
+leaves the contraction of its two-product sums to its compiler); the keys are written into a paged pool at a slot and the value
+rows are copied into a second pool beside them (the source writes the keys to a dense output and has no value operand); the pool
+store is also predicated by the pool's capacity; the dependent-launch wait and release are launch arms.
 
 THREAD BLOCK: one per (token, head), ``grid = (tokens, HEADS + KV_HEADS)``; ``cfg.THREADS = HEAD_DIM / 2`` threads in ``cfg.WARPS``
 FULL warps; thread ``i`` owns the two contiguous elements ``2 i``, ``2 i + 1`` of its head row.  A block is a QUERY program
@@ -63,7 +66,9 @@ rotated value is one fp32 multiply and one fused multiply-add of two bf16 values
 rotary half is the fused one follows the position form (step 10).  A product of two bf16 values is exact in fp32 unless it
 underflows, so the two orders write the same bytes on every operand whose products are normal fp32 values and differ -- in the
 sign of a zero, in a subnormal's last bit -- where a product underflows; each form keeps ONE order, and that order is its bytes.
-The test module's rendering cell pins these instructions; its reference cells pin the bytes.
+The test module's rendering cell pins these instructions, the operand selects that make the ``"1d"`` order included (eight
+``selp.f32`` under ``"1d"``, none under ``"3d"``); its reference cells pin the bytes inside a stated band, and one cell of
+underflowing rows pins the fused product of each form BITWISE (there the two orders differ in the sign of a zero).
 
 BATCH INVARIANCE AND REPLAY.  A thread block reads its own head row, the shared weights, its token's positions and slot and the
 table rows those positions select, and nothing of another token or head; the reduction never leaves the block; there is no atomic
