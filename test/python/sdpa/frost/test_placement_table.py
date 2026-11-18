@@ -1475,6 +1475,29 @@ def test_sm107_paged_window_entries_follow_the_study():
 
 
 @pytest.mark.L0
+def test_sm107_paged_d128_unpacked_mtp_entries_follow_the_study():
+    """Study sm107_d128_paged_mtp_unpacked_20261118 (Rubin): paged d128 MTP over the full cache at GQA groups the row cannot pack whole
+    leads below cost 2^36.7 on the KV tile and below 2^9.25 query rows off it."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def mtp(**over):
+        base = dict(b=1, h_q=48, h_kv=8, s_q=4, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7))
+        base.update(has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm107_d128_paged_mtp_unpacked_20261118"
+    assert pt.class_key(row, mtp())[8] == "gqa_unpacked"
+    assert pt.lookup(row, mtp()) is True and pt.matched_entry(row, mtp()).study == study
+    assert pt.lookup(row, mtp(b=128)) is True  # cost 2^36.58
+    assert pt.lookup(row, mtp(b=128, h_q=80)) is False  # cost 2^37.32: the backend
+    assert pt.lookup(row, mtp(s_kv=131073)) is True and pt.matched_entry(row, mtp(s_kv=131073)).study == study
+    assert pt.lookup(row, mtp(s_kv=131073, b=16)) is False  # 3072 query rows
+    assert pt.matched_entry(row, mtp(h_q=64)).study == "sm107_paged_mtp_20261110"  # group 8 packs whole
+    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(512, 512), (576, 512)], ids=["d512", "d576"])
 @pytest.mark.parametrize("h_kv", [1, 2])
 def test_sm107_paged_mla_single_row_decode_follows_the_q1_study(d, h_kv):

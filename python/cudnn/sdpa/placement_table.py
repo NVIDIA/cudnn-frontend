@@ -684,6 +684,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm107_paged_wide_gaps_20261118"
     ),
+    # study sm107_d128_paged_mtp_unpacked_20261118 (Rubin, cuDNN 9.30.0.8; the inference benchmark's paged generation graph, page 16, padded
+    # Q, bottom-right causal, full cache: d128 MTP at GQA groups the row does not pack whole, 3-12; mean of 100 cold launches; 900 train
+    # cells, b 1-128, KV 2k-128k on and off the tile). FROST runs these unpacked with a KV split: on the tile it leads below cost 2^36.7
+    # (447 of 450 train cells changed at 0.548, worst 1.043), off it below 2^9.25 query rows (180 at 0.293, worst 0.997). Holdout at fresh
+    # head pairs, scored once: 24 changed at 0.334 (worst 0.906) / 14 at 0.146 (worst 0.226).
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
+        "le", 36.696, "sm107_d128_paged_mtp_unpacked_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
+        "le", 9.246, "sm107_d128_paged_mtp_unpacked_20261118", "rows"
+    ),
     # study sm107_window_gaps_20261118 (208-SM Rubin, cuDNN 9.30.0.8; the inference benchmark's windowed paged generation graph, page 16,
     # bottom-right causal; mean of 100 cold launches under 1 ms; 2914 train cells at GQA 2-16, S_q 1-1024, windows 512-4096 + a 288-cell
     # holdout at fresh head pairs and windows, scored once (changed 0.12-0.89 of the default); vr200 run-561 gate: 44 rows at 0.266,
