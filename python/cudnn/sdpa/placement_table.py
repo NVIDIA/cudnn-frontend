@@ -1073,18 +1073,21 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_thd_verify_unpacked_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE fa4f913c2; paged THD-Q GQA verify, S_q 5-16, b 1-64,
     # KV 256-128k on and off the tile; the k_prefetch / d256 engines run it unpacked and unsplit; 420 train cells). d128, d256 and d256
     # windowed fit `never` (the backend leads: no entry). d192 x 128 leads on few rows, d64 past a rows / cost floor; holdout at fresh heads,
-    # scored once: 0.866-0.880 and 0.833-0.859 (worst 1.095). The d64 sink twins failed (1.368) or were vacuous: no entry.
+    # scored once: 0.866-0.880 and 0.833-0.859 (worst 1.095). Its d64 floors are re-fit below.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
         "le", 9.5, "sm80_thd_verify_unpacked_20261117", "rows"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
         "le", 9.377, "sm80_thd_verify_unpacked_20261117", "rows"
     ),
+    # study sm80_thd_verify_d64_pcie_20261118 (A100 80GB PCIe 300 W, the nightly's board; the d64 train cells above re-timed, 120 cells):
+    # no sink keeps the incumbent form with lower floors (rows 11.453 -> 9.877, cost 27.161 -> 24.455). Holdout at fresh heads, scored
+    # once: 0.889 / 0.991 (worst 1.028). The sink twin failed off the tile (1.150 at a 257-key cache; on the tile 0.861): no entry.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
-        "ge", 11.453, "sm80_thd_verify_unpacked_20261117", "rows"
+        "ge", 9.877, "sm80_thd_verify_d64_pcie_20261118", "rows"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "verify", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
-        "ge", 27.161, "sm80_thd_verify_unpacked_20261117"
+        "ge", 24.455, "sm80_thd_verify_d64_pcie_20261118"
     ),
     # study sm80_dense_chunk_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE fa4f913c2; dense BSHD causal prefill over the whole range:
     # chunks S_q 5-4096 over KV 256-128k and squares 128-8192, on and off the tile, b 1-8; 480 train cells). Replaces the d256 GQA causal

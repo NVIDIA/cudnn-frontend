@@ -509,10 +509,12 @@ def test_sm80_paged_d64_sink_mtp_follows_its_study(window_left, s_kv):
 def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
     """A100 THD Q cannot pack or split on the k_prefetch / d256 engines: paged THD-Q verify keys ``gqa_unpacked`` (llama3.1 /
     qwen3.5 context re-time: FROST 1.25-3.3x behind). Study sm80_thd_verify_unpacked_20261117: d128 / d256 keep the backend (no
-    entry), d192 x 128 leads on few rows, d64 past a floor. Padded Q keeps its packed class's entry; the wide engine's THD-Q verify
-    keeps its entries (sm80_d576_prefill_20261117 measured FROST at 0.34-0.55)."""
+    entry), d192 x 128 leads on few rows. d64 leads past a floor, re-fit on the nightly's board (sm80_thd_verify_d64_pcie_20261118);
+    its sink twin failed off the tile there. Padded Q keeps its packed class's entry; the wide engine's THD-Q verify keeps its
+    entries (sm80_d576_prefill_20261117 measured FROST at 0.34-0.55)."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_thd_verify_unpacked_20261117"
+    on_tile = s_kv % 128 == 0
 
     def f(**over):
         base = dict(b=16, h_q=64, h_kv=8, s_q=16, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True)
@@ -535,9 +537,12 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
     assert pt.lookup(row, thd(**d192, b=1, h_q=12, h_kv=2)) is True  # few rows
     assert pt.lookup(row, thd(**d192)) is False
     d64 = dict(d_qk=64, d_v=64)
+    assert pt.matched_entry(row, thd(**d64)).study == "sm80_thd_verify_d64_pcie_20261118"
     assert pt.lookup(row, thd(**d64)) is True
-    assert pt.lookup(row, thd(**d64, b=1, h_q=8, h_kv=1)) is False  # below the floor
-    assert pt.lookup(row, thd(**d64, has_sink=True)) is None  # the sink twins did not ship
+    small = dict(d64, b=1, h_q=8, h_kv=1) if on_tile else dict(d64, b=1, h_q=8, h_kv=1, s_kv=1025)
+    assert pt.lookup(row, thd(**small)) is False  # below the floor
+    assert pt.lookup(row, thd(**d64, b=4, h_q=32, h_kv=8)) is True  # llama3.2-1b at b 4: FROST 0.79-0.88 on the nightly's board
+    assert pt.lookup(row, thd(**d64, has_sink=True)) is None  # the sink twin failed off the tile (1.150): neither side ships
     wide = dict(h_q=64, h_kv=1, d_qk=576, d_v=512, page_size=64, thd=True, max_total_seq_len_q=256)
     assert pt.class_key(row, f(**wide))[8] == "gqa"
     assert pt.matched_entry(row, f(**wide)).study == "sm80_paged_wide_verify_v2_20261117"
