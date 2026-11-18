@@ -256,3 +256,68 @@ def test_runner_csv_preserves_small_and_missing_reference_errors(tmp_path):
         measured, unchecked = csv.DictReader(file)
     assert float(measured["max_diff"]) == result.max_diff
     assert unchecked["max_diff"] == ""
+
+
+@pytest.mark.parametrize(
+    ("backend", "sq", "skv", "alignment", "width"),
+    [
+        ("flash_attention", 32, 32, "top_left", 1),
+        ("flash_attention_3", 32, 32, "top_left", 1),
+        ("flash_attention_4", 16, 32, "bottom_right", 4),
+        ("flash_attention_3", 32, 16, "top_left", 20),
+        ("flash_attention_4", 32, 16, "top_left", None),
+        ("flash_attention_4", 16, 32, "top_left", 4),
+        ("flash_attention_3", 32, 16, "top_left", 4),
+        ("pyt_math", 16, 32, "top_left", None),
+    ],
+)
+def test_hopper_training_flash_mask(monkeypatch, capsys, backend, sq, skv, alignment, width):
+    import runpy
+
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("requires Hopper FlashAttention")
+    if backend == "flash_attention":
+        pytest.importorskip("flash_attn_2_cuda")
+    elif backend == "flash_attention_3":
+        pytest.importorskip("flash_attn_interface")
+    else:
+        pytest.importorskip("flash_attn.cute.interface")
+
+    script = _REPO_ROOT / "benchmark/attention_training/benchmark_single_sdpa.py"
+    args = (
+        f"--sdpa_backend {backend} --data_type float16 --batch_size 1 --num_q_heads 1 --num_kv_heads 1 --head_dim 64 "
+        f"--attn_mask {alignment} --q_seqlen {sq} --kv_seqlen {skv} --num_iterations 1 --fa4_num_splits 1"
+    ).split()
+    if width is not None:
+        args.extend(["--sliding_window_size", str(width)])
+    if backend != "pyt_math":
+        args.append("--skip_ref")
+    monkeypatch.syspath_prepend(str(script.parent))
+    monkeypatch.setattr(sys, "argv", [str(script), *args])
+
+    if backend.startswith("flash_") and alignment == "top_left" and (sq < skv or (width is not None and width <= sq - skv)):
+        from benchmark.attention_training.benchmark_single_sdpa import UNSUPPORTED_CONFIG_RETURN_CODE
+
+        with pytest.raises(SystemExit) as exc:
+            runpy.run_path(str(script), run_name="__main__")
+        assert exc.value.code == UNSUPPORTED_CONFIG_RETURN_CODE
+        assert "rectangular top-left" in capsys.readouterr().out
+        return
+
+    state = runpy.run_path(str(script), run_name="__main__")
+    assert "Failed reference check" not in capsys.readouterr().out
+    # An identity V and equal scores expose every attended key in the output.
+    q = torch.zeros(1, sq, 1, 64, dtype=torch.float16, device="cuda")
+    k = q.new_zeros(1, skv, 1, 64)
+    v = torch.eye(skv, 64, dtype=q.dtype, device=q.device).view(1, skv, 1, 64)
+    op = state["flash_attention_4_sdpa"] if backend == "pyt_math" else state["sdpa_function"]
+    actual = op(q, k, v)[0, :, 0]
+    diagonal = torch.arange(sq, device=q.device)[:, None] + (skv - sq if alignment == "bottom_right" else 0)
+    keys = torch.arange(64, device=q.device)
+    visible = (keys < skv) & (keys <= diagonal)
+    if width is not None:
+        visible &= keys > diagonal - width
+    expected = visible / visible.sum(-1, keepdim=True).clamp_min(1)
+    torch.testing.assert_close(actual.float(), expected, atol=5e-4, rtol=1e-3)

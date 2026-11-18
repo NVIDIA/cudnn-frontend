@@ -694,6 +694,8 @@ else:
     else:
         raise ValueError(f"Invalid data type: {args.data_type}")
 
+    if args.sliding_window_size is not None and args.sliding_window_size < 1:
+        raise ValueError("Sliding window size must be positive")
     if args.sliding_window_size is not None and args.attn_mask not in ("top_left", "bottom_right"):
         raise ValueError("Sliding window attention requires attn_mask='top_left' or 'bottom_right' (causal)")
 
@@ -1602,21 +1604,39 @@ else:
                 is_causal=args.attn_mask in ("top_left", "bottom_right"),
             )
 
+    # FlashAttention centers both window radii on its bottom-right diagonal.
+    flash_causal = args.attn_mask != "no_mask"
+    width = args.sliding_window_size
+    flash_window = (width - 1, 0) if width is not None else (None, None)
+    reverse_reference = False
+    if args.attn_mask == "top_left" and q_seqlen != kv_seqlen:
+        shift = q_seqlen - kv_seqlen
+        flash_causal = False
+        # Relative to bottom-right, top-left has right radius shift and left radius W - 1 - shift.
+        if shift >= 0 and (width is None or width > shift):
+            flash_window = (None if width is None else width - 1 - shift, shift)
+        else:
+            if args.sdpa_backend.startswith("flash_attention"):
+                exit_unsupported(f"{args.sdpa_backend} cannot express this rectangular top-left mask with native window radii")
+            # For the untimed reference, reverse Q and KV. The top-left band
+            # becomes a bottom-right band pointing toward increasing key indices.
+            reverse_reference = True
+            flash_window = (0, None if width is None else width - 1)
+    # FA2 and FA3 require integer radii. FA4 uses None for an unbounded side.
+    flash_window_int = tuple(-1 if radius is None else radius for radius in flash_window)
+
     if args.sdpa_backend == "flash_attention":
         import flash_attn
         from flash_attn import flash_attn_func
 
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
-            # flash-attn 2.7+ requires ints here: (-1, -1) is its no-window
-            # sentinel; passing None fails the SymInt cast in the op schema.
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return flash_attn_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window_int,
                 deterministic=args.deterministic_bwd,
             )
 
@@ -1624,13 +1644,12 @@ else:
         from flash_attn_interface import flash_attn_func as fa3_func
 
         def flash_attention_3_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return fa3_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window_int,
                 deterministic=args.deterministic_bwd,
             )
 
@@ -1646,10 +1665,11 @@ else:
             fa4_num_splits = 1
 
         def flash_attention_4_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            if reverse_reference:
+                query, key, value = (t.flip([1]) for t in (query, key, value))
             kwargs = dict(
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window,
                 deterministic=args.deterministic_bwd,
                 num_splits=fa4_num_splits,
             )
@@ -1659,7 +1679,7 @@ else:
                 value,
                 **kwargs,
             )
-            return output
+            return output.flip([1]) if reverse_reference else output
 
     def get_sdpa_function(backend):
         if backend == "pyt_math":
