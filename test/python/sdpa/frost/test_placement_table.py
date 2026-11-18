@@ -601,7 +601,9 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
     assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
     for over in (dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
-        assert pt.matched_entry(row, f(**over)).study == "sm80_paged_d256_d192_v3_20261117", over
+        on_tile_d256 = over["d_qk"] == 256 and s_kv % 128 == 0
+        expected = "sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117"
+        assert pt.matched_entry(row, f(**over)).study == expected, over
 
 
 @pytest.mark.L0
@@ -663,10 +665,32 @@ def test_sm80_paged_d256_d192_prefill_follow_v3(d, s_kv):
         base.update(over)
         return _facts(**base)
 
-    assert pt.matched_entry(row, f()).study == "sm80_paged_d256_d192_v3_20261117"
+    on_tile_d256 = d == (256, 256) and s_kv % 128 == 0
+    assert pt.matched_entry(row, f()).study == ("sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117")
     assert pt.lookup(row, f()) is True
     edge = f(b=32, h_q=64, h_kv=8, s_q=32, max_total_seq_len_q=32 * 32)
     assert pt.lookup(row, edge) is False
+
+
+@pytest.mark.L0
+def test_sm80_paged_d256_on_tile_floor_follows_v7():
+    """sm80_paged_d256_v7_pcie_20261118 (A100 80GB PCIe): on the KV tile paged THD-Q d256 causal prefill leads from cost 2^35.357, so
+    qwen3.5's b 1 long-cache chunks at cost 2^36.0 (backend 1.14-1.47x) lead; off the tile v3's 2^36.454 floor stays, which keeps the
+    single-KV-head chunk a lower floor lost on (FROST 1.33x) with the backend."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=16, h_kv=1, s_q=512, s_kv=131072, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=512)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.FEATURES["cost"](f()) == 36.0
+    assert pt.matched_entry(row, f()).study == "sm80_paged_d256_v7_pcie_20261118"
+    assert pt.lookup(row, f()) is True
+    off = f(h_q=10, s_kv=131073)
+    assert pt.matched_entry(row, off).study == "sm80_paged_d256_d192_v3_20261117"
+    assert pt.lookup(row, off) is False
 
 
 @pytest.mark.L0

@@ -1032,8 +1032,12 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 6.792, "sm80_paged_d256_d192_v3_20261117", "tiles", ("ge", 7.506, "q")
     ),
+    # study sm80_paged_d256_v7_pcie_20261118 (A100 80GB PCIe 300 W, FE e0d68be47): v3's on-tile d256 floor re-fit on the nightly's board
+    # (v3 was fit on a 275 W board that slowed the FROST leg), same form, on 198 cells. qwen3.5 rows at cost 2^36.0 ran the backend at
+    # 1.14-1.47x. Fresh on-tile holdout incl. single-KV-head pairs, scored once: 13 changed at 0.702 (worst 0.896); the nightly rows
+    # it moves run at 0.781 of the backend (0.68-0.88). Off the tile v3 stays: a lower floor there lost 1.33x on a single-KV-head chunk.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 36.044, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+        "ge", 35.357, "sm80_paged_d256_v7_pcie_20261118", "cost", ("ge", 6.5, "q")
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 36.454, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
