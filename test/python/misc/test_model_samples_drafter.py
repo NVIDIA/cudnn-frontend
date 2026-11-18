@@ -1089,7 +1089,7 @@ def test_the_drafters_gate_and_silu_against_their_formulas():
             if _clear_of_a_midpoint(exact):
                 judged += 1
                 assert got == _bf16(exact), (row, column)
-    assert 3040 <= judged < 6 * 512, "99 % of the elements and more are judged; a few sit on a rounding midpoint"
+    assert judged == 6 * 512 - 2, "all but two elements are judged: those sit next to a rounding midpoint"
     codes, scales = _per_row(made.double().tolist())
     assert gated.codes.tolist() == codes and gated.scale.tolist() == scales, "and the rounded rows are quantised per row"
     # a stated element: 1.2109375 * sigmoid(-1.625) = 0.19917.., which is bf16 0.19921875; with the sigmoid rounded to bf16
@@ -1119,7 +1119,9 @@ def test_the_drafters_gate_and_silu_against_their_formulas():
             if _clear_of_a_midpoint(silu):
                 judged += 1
                 assert got == _bf16(_bf16(silu) * u), (row, column)  # the product of two bf16 values is exact in a double: rounded once
-    assert judged >= 3040, "99 % of the elements and more (a gate value on the bf16 grid repeats, and its SiLU with it)"
+    # 19 of 3,072 are not judged, one in 162, where values spread evenly would leave one in 2,048: a gate value on the bf16 grid
+    # repeats, and its SiLU with it
+    assert judged == 6 * 512 - 19
     # the SiLU rounded before the product is the function: on some elements a single rounding of the product is another value
     single = (F.silu(gate.float()) * o.float()).to(bf16)
     assert 100 < int((single != act).sum()) < 2000
@@ -1254,6 +1256,10 @@ def test_a_pass_over_several_rows_is_that_many_passes_of_one_row():
     refused = (
         (dict(hidden=hidden[:5]), "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 5 hidden rows and 6 ids"),
         (dict(ids=ids[:4]), "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 6 hidden rows and 4 ids"),
+        (
+            dict(hidden=hidden[:5], ids=ids[:5]),  # an id per row, and no whole number of rows per sequence
+            "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 5 hidden rows and 5 ids",
+        ),
         (
             dict(hidden=hidden[:1], ids=ids[:1]),
             "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 1 hidden rows and 1 ids",
@@ -1626,7 +1632,8 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     )
     assert "\n## What building the drafter's pass taught\n" in (MODELS / "AGENTS.md").read_text()
     assert "- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3." in guide
-    assert "that a comparison of tokens could hold" in guide and "one in two thousand" in guide
+    assert "that a comparison of tokens could hold" in guide and "with 2,048 rows the same quantiser failed on 954 scales" in guide
+    assert 'so "one in two thousand" was one in a hundred and sixty.' in guide, "the count is the gate / SiLU test's: 19 of 3,072"
     assert (
         "token at 167 of 207 positions. With the two halves in front of the first multiply exchanged it was 0, with the hidden row replaced by zeros 8" in guide
     )

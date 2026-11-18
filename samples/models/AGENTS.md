@@ -818,7 +818,9 @@ The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDraft
   multiplication by that number's reciprocal, and by a tensor as a division: on bf16 values over 448 the two differed
   in the last bit on more than half of the elements, on the device and never on the CPU. A rule that says "a division
   in fp32" forms its constants as tensors on the operand's device, and no host test can show that it does: the device
-  run compares the codes and scales of a stated tensor with the CPU's.
+  run compares the codes and scales of a stated tensor with the CPU's. The first form of that comparison had seven
+  rows and passed a quantiser that divides by a host number, its few scales agreeing by chance; with 2,048 rows the
+  same quantiser failed on 954 scales. Run a check against the defect it is for before believing it.
 - A block that is the reference chain is judged by nothing, so its structure is held where it is made. The block check
   compares a provider with the reference; a row whose provider IS the reference has no line, in any stack, and the
   proposals of seeded weights mean nothing that a comparison of tokens could hold. Three things hold such a pass,
