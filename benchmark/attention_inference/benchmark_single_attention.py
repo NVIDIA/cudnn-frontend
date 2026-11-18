@@ -78,6 +78,14 @@ def get_peak_bw_gbps() -> Optional[float]:
     if env:
         return float(env)
     name = torch.cuda.get_device_name()
+    if "GH200" in name:
+        # GH200 has HBM3 and HBM3e variants. CUDA gives the memory clock in kHz and bus width in bits.
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        clock_khz = getattr(props, "memory_clock_rate", 0)
+        width_bits = getattr(props, "memory_bus_width", 0)
+        if clock_khz and width_bits:
+            return 2 * clock_khz * width_bits / (8 * 1e6)
+        return None
     for key, bw in PEAK_BW_GBPS.items():
         if key in name:
             return bw

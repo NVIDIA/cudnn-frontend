@@ -127,7 +127,8 @@ when resuming. The runner reports a mismatch before reusing any results.
   during warm replay. Results are tagged `[graph-replay xN]`. Compare runs
   using the same timing mode.
 - Peak-bandwidth table for % SOL lives in `benchmark_single_attention.py`
-  (`PEAK_BW_GBPS`); override with `CUDNN_BENCH_PEAK_BW_GBPS=<GB/s>`.
+  (`PEAK_BW_GBPS`). GH200 uses the CUDA-reported memory clock and bus width for its
+  HBM variant. Set `CUDNN_BENCH_PEAK_BW_GBPS=<GB/s>` to supply a peak explicitly.
 - fp8 KV on the cudnn paths runs the fp8 attention graph (q/k/v e4m3, unit
   descales).
 - cuDNN `sink_token` does not support s_q==1; sink decode rows on cudnn
