@@ -1300,7 +1300,7 @@ def _sm89_spec(*, d64=False) -> EngineSpec:
 
     The two-subgroup chain serves the original masks, head envelopes and packed
     features. Plain whole-tile MHA D64 keeps its dedicated body under a separate
-    identity. Both preserve the original Ada row's backend-trailing policy.
+    identity. The dedicated owner has its own measured placement entries.
     """
     name = "sdpa_bwd_sm89_f16_d64" if d64 else "sdpa_bwd_sm89"
     return EngineSpec(
