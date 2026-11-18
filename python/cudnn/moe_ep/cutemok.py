@@ -275,8 +275,9 @@ def cutemok_backward(
     """The gradients of ``cutemok_forward`` with respect to x, the router weights, the six weights and the shared
     output gate's weight.  Collective over the plan's group.  Allocates its results and its scratch
     (``torch.empty``; every element is written by the kernels, so nothing is zeroed) and launches (gated: the fused
-    G * dY / dZ kernel;) the staging copy, a barrier, the counter reset, the metadata builder or tensormap prologue,
-    the backward megakernel, a barrier, the epilogue, the router-weight gradient copy and, with
+    G * dY / dZ kernel;) the staging copy, a barrier, the counter reset, the metadata builder (BF16; MXFP8 when the
+    schedule's capacity holds more than one macrobatch), the MXFP8 tensormap prologue, the backward megakernel, a
+    barrier, the epilogue, the router-weight gradient copy and, with
     ``zero_unrouted_router_grads``, the masking of unrouted slots (gated: the gate weight's gradient GEMM and the
     fused merge into d_x).  The megakernel's scratch is released once it is enqueued, before the epilogue and the
     router-gradient copy allocate.  The forward context must hold the routed activations (as ``cutemok_forward``

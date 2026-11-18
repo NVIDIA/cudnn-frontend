@@ -9,9 +9,10 @@
 ``backward_mxfp8`` takes the workspace, the schedule, the forward context and the weights and returns
 eighteen outputs (``_OUTPUTS``).  The shared expert stays BF16; the routed weights arrive as MXFP8 tuples
 (Gate / Up with their transposes, the transposed Down) and the forward context is the MXFP8 forward's
-(macrobatch-sized; every macrobatch past the first is replayed into it).  Its routed Gate / Up are e4m3 /
-scale pairs (``CONTEXT_NAMES_E4M3_CONTEXT``, a forward with the default ``gate_up_context="mxfp8"``) or one
-BF16 tensor each (``CONTEXT_NAMES``, a ``"bf16"`` forward); the kernel variant follows the context's names.
+(macrobatch-sized: a ring of minibatch slots, into which every minibatch past the first macrobatch is
+replayed).  Its routed Gate / Up are e4m3 / scale pairs (``CONTEXT_NAMES_E4M3_CONTEXT``, a forward with the
+default ``gate_up_context="mxfp8"``) or one BF16 tensor each (``CONTEXT_NAMES``, a ``"bf16"`` forward); the
+kernel variant follows the context's names.
 ``recompute_forward_context=True`` replays macrobatch 0 as well: the caller passes the shared expert's context only and
 the routed context is this call's uninitialized scratch (``prepare_persistent_mxfp8_bwd_routed_context``).
 
@@ -25,6 +26,7 @@ Torch/CUTLASS imports remain lazy.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import functools
 import threading
 from typing import Final
 
@@ -74,16 +76,18 @@ ROUTED_TENSORMAPS: Final = 28
 _CODEGEN_EPOCH: Final = (
     "mxfp8-bwd-ab6-acc1-sf6-tmem-slots-dsl48"
     "-v7-stream-all-macrobatches-32x256-warps7-buffers2-groups4-dy-warpquant"
-    "-tma-desc-gmem-wgrad-valid-end-swiglu-split-quant-bf16gateup"
+    "-tma-desc-gmem-wgrad-valid-end-swiglu-split-quant-bf16gateup-wgrad-segment-order"
+    "-ring-slots-one-stream-segment-wgrad"
 )
-_ABI_EPOCH: Final = "persistent-mxfp8-bwd-eighteen-output-nine-counter-stream-heads-per-macrobatch-tensormaps" "-bf16-gate-up-context-v6"
+_ABI_EPOCH: Final = "persistent-mxfp8-bwd-eighteen-output-twelve-counter-four-metadata-one-stream-head" "-tensormaps-bf16-gate-up-context-v9"
 # The backward of a gate_up_context="mxfp8" forward (the e4m3 / scale Gate / Up context).
 _CODEGEN_EPOCH_E4M3_CONTEXT: Final = (
     "mxfp8-bwd-ab6-acc1-sf6-tmem-slots-dsl48"
     "-v7-stream-all-macrobatches-32x256-warps7-buffers2-groups4-dy-warpquant"
-    "-tma-desc-gmem-wgrad-valid-end-swiglu-split-quant"
+    "-tma-desc-gmem-wgrad-valid-end-swiglu-split-quant-wgrad-segment-order"
+    "-ring-slots-one-stream-segment-wgrad"
 )
-_ABI_EPOCH_E4M3_CONTEXT: Final = "persistent-mxfp8-bwd-eighteen-output-nine-counter-stream-heads-per-macrobatch" "-tensormaps-v5"
+_ABI_EPOCH_E4M3_CONTEXT: Final = "persistent-mxfp8-bwd-eighteen-output-twelve-counter-four-metadata" "-one-stream-head-tensormaps-v8"
 
 _EXECUTOR_CACHE: dict[tuple[object, ...], object] = {}
 _EXECUTOR_CACHE_DEVICES: set[int] = set()
@@ -133,6 +137,18 @@ _COUNTERS: Final = (
     "replayed_gate_up_ready",
     "replayed_hidden_ready",
     "routed_buffers_done",
+    "wgrad_segment_done",
+    "wgrad_read_consumed",
+    "reverse_dispatch_done",
+)
+#: The decoder metadata, packed after the counters (``mxfp8_bwd_metadata_lengths``) and passed to the kernel after
+#: them: the BF16 backward's builder (``_persistent_bf16_bwd_metadata``) fills it before a mega launch with more than
+#: one macrobatch (``_build_metadata``; with one macrobatch the kernel reads none of it).
+_METADATA: Final = (
+    "minibatch_expert_offsets",
+    "completed_segment_offsets",
+    "completed_segment_experts",
+    "task_owner_buckets",
 )
 #: The shared expert's scratch and weight gradients; a routed-only layer has none, and they come
 #: back None.
@@ -206,13 +222,16 @@ def mxfp8_bwd_buffer_specs(
     macrobatch_size: int,
     routed_hidden_size: int | None = None,
     gate_up_context: str = "mxfp8",
+    schedule_capacity: int | None = None,
 ) -> tuple:
     """``(name, shape, kind)`` of one call's allocations, kind in bf16 / e4m3 / scale / f32; ``tensormaps`` (the
     routed TMA descriptors' slots) is uint8, the ``scale`` kind.  ``gate_up_context="mxfp8"`` adds the BF16
     Gate / Up replay ring (the BF16 context is its own replay target).  The routed chain's buffers (the
     replayed x, dY, d_x_routed, the routed weight gradients) are in ``routed_hidden_size`` (the latent MoE;
     ``None`` = ``hidden_size``), the shared chain's (``d_x_shared``, the shared weight gradients) in
-    ``hidden_size``."""
+    ``hidden_size``.  ``router_weights`` has one entry per schedule row (``schedule_capacity``, at least a
+    macrobatch; the kernel preloads every routed row's weight once), the other routed buffers one per macrobatch
+    row."""
 
     t, h, i, e, m = num_local_tokens, hidden_size, intermediate_size, num_local_experts, macrobatch_size
     hr = h if routed_hidden_size is None else routed_hidden_size
@@ -226,7 +245,7 @@ def mxfp8_bwd_buffer_specs(
         *((("gate_routed", (m, i), "bf16"), ("up_routed", (m, i), "bf16")) if gate_up_context == "mxfp8" else ()),
         ("hidden_fp8_routed", (m, i), "e4m3"),
         ("hidden_sc_routed", scales(m, i), "scale"),
-        ("router_weights", (m,), "f32"),
+        ("router_weights", (m if schedule_capacity is None else max(m, schedule_capacity),), "f32"),
         ("d_router_weight_partials", (m, i // 128), "f32"),
         ("d_y_fp8_routed", (m, hr), "e4m3"),
         ("d_y_sc_routed", scales(m, hr), "scale"),
@@ -257,10 +276,21 @@ def mxfp8_bwd_buffer_specs(
 
 
 def mxfp8_bwd_counter_lengths(
-    *, num_local_tokens: int, intermediate_size: int, schedule_capacity: int, macrobatch_size: int, minibatch_size: int
+    *,
+    num_local_tokens: int,
+    intermediate_size: int,
+    schedule_capacity: int,
+    macrobatch_size: int,
+    minibatch_size: int,
+    num_local_experts: int,
+    routed_hidden_size: int,
 ) -> tuple[int, ...]:
-    """The lengths of the nine readiness counters, in ``_COUNTERS`` order; the communication task stream's head
-    words (one per macrobatch, zeroed with the counters) follow ``d_y_routed_ready``'s minibatch entries."""
+    """The lengths of the twelve readiness counters, in ``_COUNTERS`` order.  ``d_y_routed_ready``'s minibatch
+    entries are followed by one word per macrobatch, zeroed with the counters, of which the last is the one
+    communication stream's head.  ``wgrad_segment_done`` has one word per routed dW tile (3 matrices x E x I tiles x
+    routed H tiles); the ring-slot retirement counters ``routed_buffers_done``, ``wgrad_read_consumed`` and
+    ``reverse_dispatch_done`` one per minibatch.  ``router_weights_ready``: word 0 is the communication CTAs' barrier
+    after the router-weight preload."""
 
     minibatches = -(-schedule_capacity // minibatch_size)
     macrobatches = -(-schedule_capacity // macrobatch_size)
@@ -269,15 +299,89 @@ def mxfp8_bwd_counter_lengths(
     column_blocks = -(-intermediate_size // 256)  # an I % 256 != 0 tail is one more tile
     return (
         macrobatches,
-        minibatches + macrobatches,  # + the task stream's head words (macrobatch m's is the (m + 1)-th from the end)
+        minibatches + macrobatches,  # + one word per macrobatch, the last of which is the stream's head
         (shared_row_blocks + routed_row_blocks) * column_blocks,
         shared_row_blocks + routed_row_blocks,
         minibatches,
         minibatches,
         routed_row_blocks * column_blocks,
         routed_row_blocks,
-        macrobatches,
+        minibatches,
+        3 * num_local_experts * column_blocks * -(-routed_hidden_size // 256),
+        minibatches,
+        minibatches,
     )
+
+
+@functools.lru_cache(maxsize=64)
+def mxfp8_bwd_metadata_lengths(
+    *,
+    num_local_tokens: int,
+    intermediate_size: int,
+    schedule_capacity: int,
+    macrobatch_size: int,
+    minibatch_size: int,
+    num_local_experts: int,
+    routed_hidden_size: int,
+) -> tuple[int, ...]:
+    """The lengths of the four decoder-metadata arrays (``_METADATA``), as the BF16 backward sizes them for its
+    builder (``persistent_bf16_bwd_contract.metadata_descriptors``) in the variant that always writes the segment
+    experts (``recompute_forward_context``: the MXFP8 kernel reads them for every macrobatch of a several-macrobatch
+    call, the first included).  The builder's owner buckets follow the BF16 task counts; this kernel does not read
+    them (``task_owner_buckets`` stays a kernel parameter so the four arrays travel together)."""
+    from .persistent_bf16_bwd_contract import BwdGeometry, TaskPlan, metadata_descriptors
+
+    geometry = BwdGeometry(
+        schedule_capacity=schedule_capacity,
+        num_local_tokens=num_local_tokens,
+        macrobatch_size=macrobatch_size,
+        minibatch_size=minibatch_size,
+        num_comm_sms=2,
+        num_local_experts=num_local_experts,
+        hidden_size=routed_hidden_size,
+        intermediate_size=intermediate_size,
+        topk=1,
+        routed_hidden_size=routed_hidden_size,
+        recompute_forward_context=True,
+    )
+    return tuple(descriptor.shape[0] for descriptor in metadata_descriptors(TaskPlan(geometry)))
+
+
+def _metadata_launch(
+    schedule, state, *, num_local_tokens: int, topk: int, macrobatch_size: int, minibatch_size: int, routed_hidden_size: int, intermediate_size: int, stream
+):
+    """The decoder-metadata builder's executor (compiled once per tail flag) and its launch arguments without the
+    stream, over this call's schedule and the metadata views of ``state``."""
+    from types import SimpleNamespace
+
+    from ._persistent_bf16_bwd_metadata import prepare_bwd_metadata_launch
+
+    inputs = SimpleNamespace(
+        schedule_peer_rank=schedule.peer_rank,
+        schedule_peer_token_idx=schedule.peer_token_idx,
+        num_tokens=schedule.num_tokens,
+        tokens_per_expert=schedule.tokens_per_expert,
+    )
+    config = SimpleNamespace(
+        macrobatch_size=macrobatch_size,
+        minibatch_size=minibatch_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        routed_hidden_size=routed_hidden_size,
+        intermediate_size=intermediate_size,
+        recompute_forward_context=True,
+    )
+    return prepare_bwd_metadata_launch(inputs, SimpleNamespace(metadata=tuple(state.counters[name] for name in _METADATA)), config=config, stream=stream)
+
+
+def _build_metadata(schedule, state, stream, **sizes) -> None:
+    """Launch the decoder-metadata builder on ``stream`` (after the counters' zeroing, before the mega), unless the
+    schedule's capacity fits one macrobatch: the kernel reads no metadata with one macrobatch (every expert is one
+    segment), so neither the launch nor its host-side argument packing is needed."""
+    if schedule.peer_rank.shape[0] <= sizes["macrobatch_size"]:
+        return
+    executor, args = _metadata_launch(schedule, state, stream=stream, **sizes)
+    executor(*args, stream)
 
 
 def _dtype(kind: str):
@@ -288,7 +392,7 @@ def _dtype(kind: str):
 
 @dataclass(frozen=True)
 class PersistentMxfp8BwdState:
-    """One call's allocations (``mxfp8_bwd_buffer_specs`` names, in its order) and its nine
+    """One call's allocations (``mxfp8_bwd_buffer_specs`` names, in its order) and its twelve
     counters by name (``counters``, in ``__call__``'s order).  Every buffer is its own allocation
     (``prepare_persistent_mxfp8_bwd_state``); ``tensormaps`` holds the routed TMA descriptors the
     prologue launch writes."""
@@ -403,7 +507,7 @@ def prepare_persistent_mxfp8_bwd_state(
     has_shared: bool = True,
     caller_buffers=None,
 ) -> PersistentMxfp8BwdState | PersistentMxfp8BwdStateE4m3Context:
-    """Allocate the backward's buffers, one ``torch.empty`` per tensor, and the nine counters as
+    """Allocate the backward's buffers, one ``torch.empty`` per tensor, and the twelve counters as
     views of one zeroed allocation.
 
     The buffers are not packed into one allocation per lifetime and dtype: at large macrobatches a
@@ -436,6 +540,7 @@ def prepare_persistent_mxfp8_bwd_state(
         macrobatch_size=macrobatch_size,
         gate_up_context=gate_up_context,
         routed_hidden_size=routed_hidden_size,
+        schedule_capacity=schedule_capacity,
     )
     state_fields = [name for name, _, _ in specs]
     own_combined = combined_fc1 and main_grads is None
@@ -477,22 +582,21 @@ def prepare_persistent_mxfp8_bwd_state(
     buffers = {name: buffer(name, shape, kind) for name, shape, kind in specs if name not in supplied}
     if buffers["tensormaps"].data_ptr() % TENSORMAP_BYTES:
         raise RuntimeError("the tensormaps buffer must be 128-byte aligned (the TMA descriptor slots)")
-    _, counters = packed_int32_views(
-        mxfp8_bwd_counter_lengths(
-            num_local_tokens=num_local_tokens,
-            intermediate_size=intermediate_size,
-            schedule_capacity=schedule_capacity,
-            macrobatch_size=macrobatch_size,
-            minibatch_size=minibatch_size,
-        ),
-        device,
-        storage=counter_storage,
+    sizes = dict(
+        num_local_tokens=num_local_tokens,
+        intermediate_size=intermediate_size,
+        schedule_capacity=schedule_capacity,
+        macrobatch_size=macrobatch_size,
+        minibatch_size=minibatch_size,
+        num_local_experts=num_local_experts,
+        routed_hidden_size=hidden_size if routed_hidden_size is None else routed_hidden_size,
     )
+    _, counters = packed_int32_views(mxfp8_bwd_counter_lengths(**sizes) + mxfp8_bwd_metadata_lengths(**sizes), device, storage=counter_storage)
     buffers.update(supplied)
     if own_combined:
         buffers["d_w_routed_up"] = buffers["d_w_routed_gate"]
     state_class = PersistentMxfp8BwdStateE4m3Context if gate_up_context == "mxfp8" else PersistentMxfp8BwdState
-    return state_class(**{name: buffers[name] for name in state_fields}, counters=dict(zip(_COUNTERS, counters, strict=True)))
+    return state_class(**{name: buffers[name] for name in state_fields}, counters=dict(zip(_COUNTERS + _METADATA, counters, strict=True)))
 
 
 def prepare_persistent_mxfp8_bwd_routed_context(
@@ -1058,6 +1162,17 @@ def backward_mxfp8(
             caller_buffers=caller_buffers,
         )
         stream = current_stream_handle(fast_extra[-4])
+        _build_metadata(
+            schedule,
+            state,
+            stream,
+            num_local_tokens=workspace.num_local_tokens,
+            topk=workspace.topk,
+            macrobatch_size=macrobatch_size,
+            minibatch_size=minibatch_size,
+            routed_hidden_size=getattr(workspace, "routed_hidden_size", None) or workspace.hidden_size,
+            intermediate_size=fast.intermediate_size,
+        )
         fast.executor(
             *fast.template.fill(
                 _fast_bwd_sources(workspace, weights, context, main_grads, d_y_shared, fast_schedule, state, stream),
@@ -1288,6 +1403,18 @@ def backward_mxfp8(
     # on).  The TVM FFI executor is positional; the dict follows __call__'s parameter order (checked
     # in prepare_mega_mxfp8_bwd).  No record_stream: like PyTorch's own ops, inputs are used on the
     # current stream, and a caller that frees them from another stream synchronizes that stream itself.
+    # The decoder metadata first (the mega's task order and ring-slot counts read it).
+    _build_metadata(
+        schedule,
+        state,
+        call_kwargs["stream"],
+        num_local_tokens=workspace.num_local_tokens,
+        topk=workspace.topk,
+        macrobatch_size=macrobatch_size,
+        minibatch_size=minibatch_size,
+        routed_hidden_size=routed_hidden_size or hidden_size,
+        intermediate_size=intermediate_size,
+    )
     executor(*runtime_args.values())
     if fast_extra is not None:
         # Remember this call's launch for the next ones with the same workspace, weights and geometry.
@@ -1368,10 +1495,18 @@ def backward_mxfp8_plan_sizes(
         macrobatch_size=macrobatch_size,
         routed_hidden_size=routed_hidden,
         gate_up_context=gate_up_context,
+        schedule_capacity=schedule_capacity,
     )
-    lengths = mxfp8_bwd_counter_lengths(
-        num_local_tokens=num_local_tokens, intermediate_size=intermediate_size, schedule_capacity=schedule_capacity, macrobatch_size=256, minibatch_size=256
+    sizes = dict(
+        num_local_tokens=num_local_tokens,
+        intermediate_size=intermediate_size,
+        schedule_capacity=schedule_capacity,
+        macrobatch_size=256,
+        minibatch_size=256,
+        num_local_experts=num_local_experts,
+        routed_hidden_size=routed_hidden,
     )
+    lengths = mxfp8_bwd_counter_lengths(**sizes) + mxfp8_bwd_metadata_lengths(**sizes)
     return (tuple((name, math.prod(shape), _dtype(kind)) for name, shape, kind in specs if name not in excluded), _packed_offsets(lengths)[1])
 
 
@@ -1518,6 +1653,18 @@ def compile_backward_mxfp8(
         has_shared=has_shared,
         has_tail=has_tail,
         recompute_forward_context=False,
+    )
+    # The decoder-metadata builder the mega's launches are preceded by (compiled, not launched).
+    _metadata_launch(
+        schedule,
+        state,
+        num_local_tokens=tokens,
+        topk=workspace.topk,
+        macrobatch_size=size,
+        minibatch_size=size,
+        routed_hidden_size=routed_hidden_size,
+        intermediate_size=intermediate_size,
+        stream=current_stream_handle(device_index),
     )
 
 

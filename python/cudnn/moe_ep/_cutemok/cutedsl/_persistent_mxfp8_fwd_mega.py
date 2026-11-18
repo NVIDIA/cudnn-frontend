@@ -974,15 +974,15 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
         (the pending arrivals released first, so a waiting warp never holds back anything).  Arrivals are batched:
         the warp keeps one pending counter address and releases the count when the next block's address differs
         (``red.release.gpu``).  ``phase_bits`` carries the warp's buffer-barrier phases in and out (the backward
-        calls this once per macrobatch on barriers initialized once).
+        calls this once, its one stream covering every macrobatch).
 
         What a block is comes from the caller's hooks, which read their operands from ``operands`` (a list whose
         layout the caller owns): ``_stream_decode`` (task -> queue, macrobatch, 32-row tile), ``_stream_ready_lane0``
         (lane 0's answer whether the block's producer is done), ``_stream_issue`` (the block into a buffer with
         the lane's schedule entries read here), ``_stream_arrival`` (the counter word the processed block arrives
         on, 0 for none), ``_stream_process`` (the block's bytes, landed) and ``_stream_schedule_row`` (the
-        schedule index of the block's first row; the lane's entries are those of that row plus ``lane``).  A hook
-        may ignore ``macro`` (the backward's do: their macrobatch is an operand).  ``reciprocal_groups`` /
+        schedule index of the block's first row; the lane's entries are those of that row plus ``lane``).  The
+        backward's hooks turn ``macro`` and ``row`` into the schedule row (``_stream_schedule_row``).  ``reciprocal_groups`` /
         ``reciprocal_group`` are the caller's ``_reciprocal_u32`` of ``groups`` / STREAM_GROUP_BLOCKS (the per-block
         divisors; no division per block)."""
         thread = cute.arch.thread_idx()[0]

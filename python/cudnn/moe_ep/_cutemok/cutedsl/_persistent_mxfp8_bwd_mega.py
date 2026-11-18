@@ -12,32 +12,48 @@ saved: ``_PersistentMxfp8BwdMegaE4m3Context`` reads it as e4m3 tiles with scales
 ``gate_up_context="mxfp8"`` forward); ``_PersistentMxfp8BwdMega`` reads it as BF16, so its routed SwiGLU
 backward sees Gate / Up unquantized.
 
-* Communication CTAs run one dynamic task stream per macrobatch (``_backward_stream``, the forward
-  stream's shape): the reverse-combine of dY, in a replayed macrobatch the replay dispatch of x, and the
-  reverse-dispatch of dX.
-* The router weight enters in the reverse-combine of dY (each row scaled in place before its
-  quantization), and the routed SwiGLU backward divides by it for the router-weight partial.
-* Every replayed macrobatch reruns Gate, Up and SwiGLU (``REPLAY_SWIGLU``), since Wgrad-down reads the
-  transposed e4m3 Hidden.
+* The routed buffers are a ring of macrobatch / minibatch (mpm) minibatch slots: minibatch g uses slot g % mpm, and
+  its pulls start once minibatch g - mpm has retired the slot -- its routed tasks (``routed_buffers_done[g - mpm]``)
+  and the Wgrad of every segment overlapping it (``wgrad_read_consumed``) are done reading it -- so the next
+  macrobatch's communication overlaps the previous one's Wgrad. The routed SwiGLU backward and Gate / Up dgrad of g
+  wait for the pushes of g - mpm (``reverse_dispatch_done``) before they overwrite the router partials and dX rows.
+* Communication CTAs run one dynamic task stream over every minibatch (``_backward_stream``, the forward stream's
+  loop; order ``_backward_stream_task``): the reverse-combine of dY, for every replayed minibatch the replay
+  dispatch of x, and the reverse-dispatch of dX.
+* The router weight enters in the reverse-combine of dY (each row scaled in place before its quantization; every
+  row's weight is preloaded once at the start, one entry per schedule row), and the routed SwiGLU backward divides
+  by it for the router-weight partial.
+* Every replayed macrobatch reruns Gate, Up and SwiGLU (``REPLAY_SWIGLU``), since Wgrad-down reads the transposed
+  e4m3 Hidden.
 * ``recompute_forward_context`` (a compile-time variant flag): macrobatch 0 is a replayed macrobatch as well -- its
   stream pulls x, its minibatches run the replay tasks and its tasks wait on the replay's products -- so the routed
-  context holds nothing on entry and the replay writes it before anything reads it.  The shared expert's context is
+  context holds nothing on entry and the replay writes it before anything reads it. The shared expert's context is
   the forward's either way.
-* The compute task grid is fixed by the runtime sizes (3 x E x weight tiles of Wgrad per macrobatch).  A
-  routed Wgrad task's K range stops at its expert's last valid row, rounded up to the K tile, when the
-  per-CTA expert table has room for the valid ends (``_write_expert_valid_ends``: SMEM_BINARY and
-  2 E <= EXPERT_TABLE_CAP); otherwise it is the 256-padded range.  The skipped tiles hold only
-  dispatch-zeroed rows, so the two ranges give the same dW up to the sign of a zero (a -0 partial sum
-  that the extra +0 tiles would turn into +0).
+* Compute tasks run minibatch by minibatch (``_decode_mxfp8_task``): its replay, its routed backward, then the Wgrad
+  of the expert x macrobatch segments whose last row it holds -- the decoder metadata of the BF16 backward's builder
+  (``_persistent_bf16_bwd_metadata``, launched before the mega when there is more than one macrobatch), so there
+  is no Wgrad task for an expert outside a macrobatch and a segment's Wgrad runs as soon as its rows are done --
+  except in the last macrobatch, whose segments all follow its last minibatch (none of its ring slots is reused; with
+  one macrobatch this is the dense order: every dgrad, then every Wgrad, with no metadata read at all). A routed
+  Wgrad task's K range stops at its
+  expert's last valid row, rounded up to the K tile, when the per-CTA expert table has room for the valid ends
+  (``_write_expert_valid_ends``: SMEM_BINARY and 2 E <= EXPERT_TABLE_CAP); otherwise it is the 256-padded range. The
+  skipped tiles hold only dispatch-zeroed rows, so the two ranges give the same dW up to the sign of a zero (a -0
+  partial sum that the extra +0 tiles would turn into +0).
+* An expert's routed dW tile is written by one Wgrad segment per macrobatch the expert has rows in: segment 0
+  stores, segment k > 0 reduce-adds once the k earlier segments published on ``wgrad_segment_done`` (per tile, as
+  the BF16 backward), so the sum keeps macrobatch order whatever order the tasks run in.
 
 All sizes (tokens, hiddens, intermediate, experts, top-k, batch sizes, comm SMs) are runtime values; the
 compile-time variant flags of the kernel class select code.
 
 This module holds the device side -- task decode and geometry first, then the routed GEMMs, the SwiGLU
 tasks and the communication prefix -- and the host half (``_launch``, the argument builder and the
-compile entry).  A backward is two launches on the stream: a one-warp prologue (``_write_tensormaps``)
-copies the routed GEMMs' TMA descriptors into the state's ``tensormaps`` buffer, and the mega's producer
-warps read them from global memory (``ROUTED_TMA_POSITIONS``) instead of the kernel parameters.
+compile entry).  A backward is up to three launches on the stream: the decoder-metadata builder (only with more
+than one macrobatch), a one-warp prologue (``_write_tensormaps``) that copies the routed GEMMs' TMA descriptors into
+the state's ``tensormaps`` buffer, and the mega, whose producer warps read them from global memory
+(``ROUTED_TMA_POSITIONS``) instead of the kernel parameters; ``_zero_empty_routed_wgrads`` follows for the experts
+without rows.
 
 Named barriers (ids 0 and 3 are the CuTe pipelines' / cluster's): 1 the GEMM epilogue's 128 threads,
 2 the TMEM allocator's 256 threads, 4 the D-store tail's 128 (``_persistent_mxfp8_fwd_gemm`` holds the
@@ -494,27 +510,115 @@ assert MXFP8_BWD_SHARED_MEMORY_BYTES <= DYNAMIC_SHARED_MEMORY_BYTES
 
 
 @cute.jit
-def _backward_stream_task(task: Int32, tiles: Int32, pull_tasks: Int32) -> tuple[Int32, Int32]:
-    """Stream task ``task`` of one macrobatch -> (queue, 32-row tile).  Tasks ``0 .. pull_tasks - 1`` are the
-    pulls: macrobatch 0's dY pulls in tile order (``pull_tasks == tiles``), or a replayed macrobatch's x pull and
-    dY pull of each tile in turn (``pull_tasks == 2 tiles``: even = x, odd = dY; the compute side's first tasks
-    of a replayed macrobatch, the replay Gate / Up, read x, and its Down dgrad reads dY only after them).  Tasks
-    ``pull_tasks .. pull_tasks + tiles - 1`` are the dX pushes in tile order.  No division."""
+def _backward_stream_task(
+    task: Int32,
+    generations: Int32,
+    tiles: Int32,
+    last_tiles: Int32,
+    saved: Int32,
+    lag: Int32,
+    reciprocal_tiles: Int32,
+    reciprocal_2tiles: Int32,
+    reciprocal_3tiles: Int32,
+) -> tuple[Int32, Int32, Int32]:
+    """Task ``task`` of the backward's one communication stream -> (queue, minibatch g, 32-row tile of g).  Every
+    minibatch has ``tiles`` tiles, the last one ``last_tiles``; minibatch g sits in ring slot g % mpm.  In order:
+
+      the dY pulls of the ``saved`` minibatches (the first macrobatch, whose x is the forward's; 0 with
+      ``recompute_forward_context``), tile by tile;
+      with later minibatches: the pushes of minibatches 0 .. saved - lag - 1; then per minibatch g >= saved one step,
+      its x and dY pulls alternating tile by tile (the replay's Gate / Up read x first), then the pushes of g - lag
+      (when g >= lag);
+      the pushes of the minibatches not placed yet (the last lag ones; all of them with one macrobatch).
+
+    ``lag`` = max(mpm - 1, 1): a push of g needs its Gate / Up dgrad, done about one minibatch before the pulls of
+    g + mpm may reuse its slot, so it rides with the pulls of g + mpm - 1 (and the pushes of g - mpm, which the Gate /
+    Up dgrad of g waits for, come before it).  A pull of g >= mpm waits for slot g - mpm to retire, whose readers
+    need nothing later in the stream, so the smallest unfinished task is always ready.  The ``reciprocal_*`` are
+    ``_reciprocal_u32`` of tiles, 2 x tiles and 3 x tiles: no division."""
     queue = Int32(STREAM_PUSH)
-    tile = task - pull_tasks
-    if task < pull_tasks:
+    generation = Int32(0)
+    tile = Int32(0)
+    # Section sizes, in stream order.
+    saved_pulls = Int32(0)
+    if saved > Int32(0):
+        saved_pulls = (saved - Int32(1)) * tiles + tiles
+        if saved == generations:
+            saved_pulls = (saved - Int32(1)) * tiles + last_tiles
+    steps = generations > saved
+    early_pushes = Int32(0)
+    tail_first = Int32(0)
+    first_push_step = cutlass.max(saved, cutlass.min(lag, generations))  # the first step that carries pushes
+    plain_steps = Int32(0)  # full steps without pushes (recompute_forward_context, g < lag), the last one excluded
+    push_steps = Int32(0)  # full steps with pushes, the last minibatch excluded
+    last_pulls = Int32(0)
+    last_pushes = Int32(0)
+    if steps:
+        early_pushes = cutlass.max(Int32(0), saved - lag) * tiles
+        plain_steps = cutlass.max(Int32(0), cutlass.min(first_push_step, generations - Int32(1)) - saved)
+        push_steps = cutlass.max(Int32(0), generations - Int32(1) - first_push_step)
+        last_pulls = Int32(2) * last_tiles
+        if generations - Int32(1) >= lag:
+            last_pushes = tiles
+        tail_first = cutlass.max(Int32(0), generations - lag)
+    index = task
+    if index < saved_pulls:
         queue = Int32(STREAM_PULL)
-        tile = task
-        if pull_tasks > tiles:
-            tile = task >> Int32(1)
-            if (task & Int32(1)) == Int32(0):
+        generation = _divide_u32(index, tiles, reciprocal_tiles)
+        tile = index - generation * tiles
+    else:
+        index = index - saved_pulls
+        if index < early_pushes:
+            generation = _divide_u32(index, tiles, reciprocal_tiles)
+            tile = index - generation * tiles
+        else:
+            index = index - early_pushes
+            if index < plain_steps * Int32(2) * tiles:
+                step = _divide_u32(index, Int32(2) * tiles, reciprocal_2tiles)
+                pull = index - step * Int32(2) * tiles
+                generation = saved + step
                 queue = Int32(STREAM_PULL_X)
-    return queue, tile
+                if (pull & Int32(1)) != Int32(0):
+                    queue = Int32(STREAM_PULL)
+                tile = pull >> Int32(1)
+            else:
+                index = index - plain_steps * Int32(2) * tiles
+                if index < push_steps * Int32(3) * tiles:
+                    step = _divide_u32(index, Int32(3) * tiles, reciprocal_3tiles)
+                    position = index - step * Int32(3) * tiles
+                    generation = first_push_step + step
+                    if position < Int32(2) * tiles:
+                        queue = Int32(STREAM_PULL_X)
+                        if (position & Int32(1)) != Int32(0):
+                            queue = Int32(STREAM_PULL)
+                        tile = position >> Int32(1)
+                    else:
+                        generation = generation - lag
+                        tile = position - Int32(2) * tiles
+                else:
+                    index = index - push_steps * Int32(3) * tiles
+                    if index < last_pulls:
+                        generation = generations - Int32(1)
+                        queue = Int32(STREAM_PULL_X)
+                        if (index & Int32(1)) != Int32(0):
+                            queue = Int32(STREAM_PULL)
+                        tile = index >> Int32(1)
+                    else:
+                        index = index - last_pulls
+                        if index < last_pushes:
+                            generation = generations - Int32(1) - lag
+                            tile = index
+                        else:
+                            index = index - last_pushes
+                            step = _divide_u32(index, tiles, reciprocal_tiles)
+                            generation = tail_first + step
+                            tile = index - step * tiles
+    return queue, generation, tile
 
 
 @enum.unique
 class _Bs(enum.IntEnum):
-    """Positions in the backward stream hooks' operand list (``_backward_stream`` builds it per macrobatch,
+    """Positions in the backward stream hooks' operand list (``_backward_stream`` builds it once,
     ``_run_stream`` hands it to every hook)."""
 
     D_Y_ROUTED_READY = 0
@@ -540,16 +644,96 @@ class _Bs(enum.IntEnum):
     TOPK = 20
     MACROBATCH_SIZE = 21
     MINIBATCH_SIZE = 22
-    MACRO = 23
-    TILES = 24
-    PULL_TASKS = 25
-    RECIPROCAL_MINI = 26
-    RECIPROCAL_TOPK = 27
-    HIDDEN_BLOCKS = 28
-    SWIGLU_COLUMNS = 29
-    DONE_ADDRESS = 30
-    MACRO_OFFSET = 31
-    COUNT = 32
+    GENERATIONS = 23
+    MINI_TILES = 24
+    LAST_TILES = 25
+    SAVED = 26
+    LAG = 27
+    RECIPROCAL_MINI = 28
+    RECIPROCAL_TOPK = 29
+    HIDDEN_BLOCKS = 30
+    SWIGLU_COLUMNS = 31
+    MPM = 32
+    RECIPROCAL_MPM = 33
+    RECIPROCAL_TILES = 34
+    RECIPROCAL_2TILES = 35
+    RECIPROCAL_3TILES = 36
+    ROUTED_BUFFERS_DONE = 37
+    WGRAD_READ_CONSUMED = 38
+    REVERSE_DISPATCH_DONE = 39
+    SLOT_ROUTED_REQUIRED = 40
+    WGRAD_PER_EXPERT = 41
+    MINIBATCH_EXPERT_OFFSETS = 42
+    COUNT = 43
+
+
+@cute.jit
+def _wgrad_segment(macro: Int32, expert_begin: Int32, expert_end: Int32, macrobatch_size: Int32, num_tokens: Int32) -> tuple[Int32, Int32, Int32, Int32, Int32]:
+    """``(k_start, k_end, first, segment, has_next)`` of one expert's routed Wgrad in macrobatch ``macro``: the K range
+    (global token rows, empty when the expert has no row in the macrobatch), whether it holds the expert's first row,
+    the segment index k (macrobatches since the expert's first one), and whether a later macrobatch has a segment
+    of the expert.  ``expert_end`` is the end the K ranges use (the valid end when ``_write_expert_valid_ends``
+    has it), so ``has_next`` agrees with the next macrobatch's K range being non-empty.
+
+    The per-tile order of the BF16 backward (``wgrad_segment_done``): segment 0 stores the dW tile, segment k > 0
+    reduce-adds after the k earlier segments published, so the sum has one order whatever order the tasks run in."""
+    k_start = cutlass.max(expert_begin, macro * Int32(macrobatch_size))
+    k_end = cutlass.min(expert_end, cutlass.min((macro + Int32(1)) * Int32(macrobatch_size), num_tokens))
+    first = Int32(k_start == expert_begin)
+    segment = Int32(0)
+    if k_start < k_end and first == Int32(0):
+        # The only runtime division, on the rare path: rows are expert-sorted, so a macrobatch boundary splits at most
+        # one expert (plus an expert longer than a macrobatch).  Every warp decodes every Wgrad task, the empty ones of
+        # experts outside the macrobatch included, so a division per task would sit on the producer warps' path.
+        segment = macro - expert_begin // Int32(macrobatch_size)
+    has_next = Int32(expert_end > (macro + Int32(1)) * Int32(macrobatch_size))
+    return k_start, k_end, first, segment, has_next
+
+
+@cute.jit
+def _slot_reused(generation: Int32, num_tokens: Int32, minibatch_size: Int32, macrobatch_size: Int32) -> Int32:
+    """1 when minibatch ``generation + mpm`` exists: it pulls into the same ring slot, so the readers of
+    ``generation`` must retire it (otherwise nobody waits and they skip the arrival)."""
+    return Int32(generation * Int32(minibatch_size) + Int32(macrobatch_size) < num_tokens)
+
+
+@cute.jit
+def _segment_minibatches(
+    macro: Int32, expert_begin: Int32, expert_end: Int32, macrobatch_size: Int32, minibatch_size: Int32, num_tokens: Int32
+) -> tuple[Int32, Int32]:
+    """``(first, last)`` minibatch the rows of one expert x macrobatch segment fall in (padded rows: the decoder
+    metadata's overlap; ``last < first`` for an expert without rows).  The segment's Wgrad reads those ring slots."""
+    lo = cutlass.max(expert_begin, macro * Int32(macrobatch_size))
+    hi = cutlass.min(expert_end, cutlass.min((macro + Int32(1)) * Int32(macrobatch_size), num_tokens))
+    first = lo // Int32(minibatch_size)
+    last = first - Int32(1)
+    if hi > lo:
+        last = (hi - Int32(1)) // Int32(minibatch_size)
+    return first, last
+
+
+@cute.jit
+def _retire_wgrad_reads(
+    wgrad_read_consumed: cute.Tensor, macro: Int32, expert_begin: Int32, expert_end: Int32, num_tokens: Int32, minibatch_size: Int32, macrobatch_size: Int32
+) -> None:
+    """One segment's Wgrad task (empty or not) is done reading the ring: one arrival on ``wgrad_read_consumed`` for
+    each minibatch its rows overlap whose slot a later minibatch reuses.  A minibatch's count is then (the experts
+    overlapping it) x 3 x weight tiles, which the pull of the minibatch mpm later waits for (``_stream_ready_lane0``,
+    from the decoder metadata).  The last macrobatch's slots are not reused: nothing to do there (no division)."""
+    if (macro + Int32(1)) * Int32(macrobatch_size) < num_tokens:
+        first, last = _segment_minibatches(macro, expert_begin, expert_end, macrobatch_size, minibatch_size, num_tokens)
+        generation = first
+        while generation <= last:
+            if _slot_reused(generation, num_tokens, minibatch_size, macrobatch_size) != Int32(0):
+                _counter_arrive_release_gpu(wgrad_read_consumed, generation)
+            generation = generation + Int32(1)
+
+
+@cute.jit
+def _wgrad_counter_index(matrix: Int32, expert: Int32, row: Int32, column: Int32, col_blocks: Int32, num_local_experts: Int32, weight_tiles: Int32) -> Int32:
+    """The ``wgrad_segment_done`` word of one routed dW tile: matrix (0 Down, 1 Gate, 2 Up), expert, then the tile
+    ``(row, column)`` of the matrix's ``(row blocks, col_blocks)`` grid (Down: H x I blocks, Gate / Up: I x H)."""
+    return (matrix * num_local_experts + expert) * weight_tiles + row * col_blocks + column
 
 
 @cute.jit
@@ -797,71 +981,62 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         self.routed_mn = mxgemm._Mxfp8Gemm() if self.native_columnwise else self.routed
 
     @cute.jit
-    def _preload_router_weights(
-        self,
-        router_peer_table: cute.Tensor,
-        schedule_peer_rank: cute.Tensor,
-        schedule_peer_token_idx: cute.Tensor,
-        router_weights: cute.Tensor,
-        router_weights_ready: cute.Tensor,
-        routed_buffers_done: cute.Tensor,
-        num_tokens: Int32,
-        macro: Int32,
-        comm_cta: Int32,
-        previous_required: Int32,
-        macrobatch_size: Int32,
-        num_comm_sms: Int32,
-    ) -> None:
-        """Loads macrobatch ``macro``'s router weights (0 for padding rows) once the previous
-        macrobatch's buffers have retired (``previous_required`` arrivals), then a barrier over
-        every communication CTA (the reverse-combine of dY reads all of them)."""
-        thread = cute.arch.thread_idx()[0]
-        if thread == Int32(0) and macro > Int32(0):
-            _counter_wait_gpu(routed_buffers_done, macro - Int32(1), previous_required)
-        cute.arch.sync_threads()
-        rows = cutlass.min(Int32(macrobatch_size), num_tokens - macro * Int32(macrobatch_size))
-        row = comm_cta * Int32(THREADS_PER_CTA) + thread
-        while row < rows:
-            global_row = macro * Int32(macrobatch_size) + row
-            peer = schedule_peer_rank[global_row]
-            value = Float32(0.0)
-            if peer >= Int32(0):
-                value = _load_peer_float(router_peer_table, peer, schedule_peer_token_idx[global_row])
-            router_weights[row] = value
-            row = row + num_comm_sms * Int32(THREADS_PER_CTA)
-        cute.arch.sync_threads()
-        if thread == Int32(0):
-            _counter_arrive_release_gpu(router_weights_ready, macro)
-            _counter_wait_gpu(router_weights_ready, macro, num_comm_sms)
-        cute.arch.sync_threads()
-
-    @cute.jit
     def _stream_decode(self, operands: list, task: Int32) -> tuple[Int32, Int32, Int32]:
-        """``_run_stream``'s decode hook: stream task -> (queue, this macrobatch, 32-row tile),
-        ``_backward_stream_task``."""
-        queue, tile = _backward_stream_task(task, operands[_Bs.TILES], operands[_Bs.PULL_TASKS])
-        return queue, operands[_Bs.MACRO], tile
+        """``_run_stream``'s decode hook: stream task -> (queue, macrobatch, 32-row tile of the macrobatch), from
+        ``_backward_stream_task``'s (queue, minibatch, tile of the minibatch)."""
+        queue, generation, tile = _backward_stream_task(
+            task,
+            operands[_Bs.GENERATIONS],
+            operands[_Bs.MINI_TILES],
+            operands[_Bs.LAST_TILES],
+            operands[_Bs.SAVED],
+            operands[_Bs.LAG],
+            operands[_Bs.RECIPROCAL_TILES],
+            operands[_Bs.RECIPROCAL_2TILES],
+            operands[_Bs.RECIPROCAL_3TILES],
+        )
+        macro = _divide_u32(generation, operands[_Bs.MPM], operands[_Bs.RECIPROCAL_MPM])
+        return queue, macro, (generation - macro * operands[_Bs.MPM]) * operands[_Bs.MINI_TILES] + tile
 
     @cute.jit
     def _stream_schedule_row(self, operands: list, macro: Int32, row: Int32) -> Int32:
-        """``_run_stream``'s schedule-row hook: this macrobatch's offset plus ``row`` (``macro`` is the stream's
-        one macrobatch, an operand; the loop's copy is not read)."""
-        return operands[_Bs.MACRO_OFFSET] + row
+        """``_run_stream``'s schedule-row hook: the macrobatch's first row plus ``row`` (macrobatch-local, which is
+        the ring row)."""
+        return macro * operands[_Bs.MACROBATCH_SIZE] + row
 
     @cute.jit
     def _stream_ready_lane0(self, operands: list, queue: Int32, macro: Int32, row: Int32) -> Int32:
         """``_run_stream``'s readiness hook, lane 0's answer whether a block waits for nothing more (the other
-        lanes return 1): a pull of dY or of x never (the macrobatch's router weights are preloaded and the previous
-        macrobatch's buffers have retired before its stream starts), a dX push for its minibatch's Gate / Up dgrad
-        epilogues (``d_x_routed_ready``)."""
+        lanes return 1): a dX push of minibatch g for g's Gate / Up dgrad epilogues (``d_x_routed_ready``); a pull of
+        dY or x of g >= mpm for ring slot g % mpm, i.e. minibatch g - mpm, to retire -- its routed tasks
+        (``routed_buffers_done``) and the Wgrad of every expert x macrobatch segment overlapping it
+        (``wgrad_read_consumed``, the decoder metadata's overlapping experts x 3 x weight tiles) are done reading
+        it; the earlier minibatches of the first macrobatch never wait."""
         ready = Int32(1)
-        if cute.arch.lane_idx() == Int32(0) and queue == Int32(STREAM_PUSH):
+        if cute.arch.lane_idx() == Int32(0):
             minibatch_size = operands[_Bs.MINIBATCH_SIZE]
             mini = _divide_u32(self._stream_schedule_row(operands, macro, row), minibatch_size, operands[_Bs.RECIPROCAL_MINI])
-            mini_rows = cutlass.min(Int32(minibatch_size), operands[_Bs.NUM_TOKENS] - mini * minibatch_size)
-            required = _ceil_div_i32(mini_rows, Int32(256)) * (operands[_Bs.HIDDEN_BLOCKS] * Int32(2))
-            if cute.arch.load(operands[_Bs.D_X_ROUTED_READY].iterator + mini, Int32, sem="acquire", scope="gpu") < required:
-                ready = Int32(0)
+            if queue == Int32(STREAM_PUSH):
+                mini_rows = cutlass.min(Int32(minibatch_size), operands[_Bs.NUM_TOKENS] - mini * minibatch_size)
+                required = _ceil_div_i32(mini_rows, Int32(256)) * (operands[_Bs.HIDDEN_BLOCKS] * Int32(2))
+                if cute.arch.load(operands[_Bs.D_X_ROUTED_READY].iterator + mini, Int32, sem="acquire", scope="gpu") < required:
+                    ready = Int32(0)
+            elif mini >= operands[_Bs.MPM]:
+                previous = mini - operands[_Bs.MPM]
+                if (
+                    cute.arch.load(operands[_Bs.ROUTED_BUFFERS_DONE].iterator + previous, Int32, sem="acquire", scope="gpu")
+                    < operands[_Bs.SLOT_ROUTED_REQUIRED]
+                ):
+                    ready = Int32(0)
+                else:
+                    # Every Wgrad segment overlapping the slot's minibatch: one per expert its rows overlap.
+                    offsets = operands[_Bs.MINIBATCH_EXPERT_OFFSETS]
+                    experts = Int32(offsets[previous + Int32(1)]) - Int32(offsets[previous])
+                    if (
+                        cute.arch.load(operands[_Bs.WGRAD_READ_CONSUMED].iterator + previous, Int32, sem="acquire", scope="gpu")
+                        < experts * operands[_Bs.WGRAD_PER_EXPERT]
+                    ):
+                        ready = Int32(0)
         return ready
 
     @cute.jit
@@ -899,14 +1074,19 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
     @cute.jit
     def _stream_arrival(self, operands: list, queue: Int32, macro: Int32, row: Int32) -> Int64:
         """``_run_stream``'s arrival-word hook: ``d_y_routed_ready[minibatch]`` (dY pull),
-        ``replayed_x_routed_ready[minibatch]`` (x pull), ``routed_buffers_done[macrobatch]`` for a push before the
-        last macrobatch (0 in the last)."""
-        address = operands[_Bs.DONE_ADDRESS]
-        if queue != Int32(STREAM_PUSH):
-            mini = _divide_u32(self._stream_schedule_row(operands, macro, row), operands[_Bs.MINIBATCH_SIZE], operands[_Bs.RECIPROCAL_MINI])
+        ``replayed_x_routed_ready[minibatch]`` (x pull), ``reverse_dispatch_done[minibatch]`` for a push whose ring
+        slot a later minibatch reuses (0 otherwise: nobody waits)."""
+        minibatch_size = operands[_Bs.MINIBATCH_SIZE]
+        schedule_row = self._stream_schedule_row(operands, macro, row)
+        mini = _divide_u32(schedule_row, minibatch_size, operands[_Bs.RECIPROCAL_MINI])
+        address = Int64(0)
+        if queue == Int32(STREAM_PUSH):
+            if mini * minibatch_size + operands[_Bs.MACROBATCH_SIZE] < operands[_Bs.NUM_TOKENS]:
+                address = (operands[_Bs.REVERSE_DISPATCH_DONE].iterator + mini).toint()
+        elif queue == Int32(STREAM_PULL):
+            address = (operands[_Bs.D_Y_ROUTED_READY].iterator + mini).toint()
+        else:
             address = (operands[_Bs.REPLAYED_X_ROUTED_READY].iterator + mini).toint()
-            if queue == Int32(STREAM_PULL):
-                address = (operands[_Bs.D_Y_ROUTED_READY].iterator + mini).toint()
         return address
 
     @cute.jit
@@ -954,7 +1134,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 # chunks staggered by lane so the 512 B row stride stays conflict-free.  Eight chunks are
                 # loaded before any of them is scaled and stored: the shared-memory accessors are ordered
                 # asm, so a load-scale-store chain per chunk would serialize on the load latency.
-                weight = Float32(operands[_Bs.ROUTER_WEIGHTS][row + lane])
+                # The lane's router weight, preloaded per schedule row by _run_mxfp8_comm_prefix.
+                weight = Float32(operands[_Bs.ROUTER_WEIGHTS][self._stream_schedule_row(operands, macro, row) + lane])
                 row_address = buffer.toint() + lane * Int32(STREAM_COLUMNS * 2)
                 for batch in cutlass.range_constexpr(STREAM_COLUMNS * 2 // 16 // 8):
                     loaded = []
@@ -1049,6 +1230,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         replayed_x_routed_ready: cute.Tensor,
         d_x_routed_ready: cute.Tensor,
         routed_buffers_done: cute.Tensor,
+        wgrad_read_consumed: cute.Tensor,
+        reverse_dispatch_done: cute.Tensor,
         router_weights: cute.Tensor,
         d_x_routed: cute.Tensor,
         d_router_partials: cute.Tensor,
@@ -1064,57 +1247,46 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         topk: Int32,
         macrobatch_size: Int32,
         minibatch_size: Int32,
-        macro: Int32,
-        last_macro: Int32,
         comm_cta: Int32,
         num_comm_sms: Int32,
         d_y_bases: list,
         x_bases: list,
-        phase_bits: Int32,
-    ) -> Int32:
-        """One macrobatch's communication -- the reverse-combine of dY, in a replayed macrobatch the replay
-        dispatch of x, and the reverse-dispatch of dX (with the router-weight gradient) -- on the forward's stream
-        loop (``_run_stream``) with the backward's hooks; called once per macrobatch by ``_run_mxfp8_comm_prefix``
-        after the macrobatch's router weights are preloaded (which waits for the previous macrobatch's buffers to
-        retire).  ``phase_bits`` carries the warp's buffer-barrier phases from one macrobatch to the next (the
-        barriers are initialized once, by the prefix).
+        slot_routed_required: Int32,
+        wgrad_per_expert: Int32,
+        minibatch_expert_offsets: cute.Tensor,
+    ) -> None:
+        """The backward's communication -- the reverse-combine of dY, the replay dispatch of x for every replayed
+        minibatch, and the reverse-dispatch of dX (with the router-weight gradient) -- as one stream over every
+        minibatch (``_backward_stream_task``) on the forward's stream loop (``_run_stream``) with the backward's hooks.
 
-        Stream tasks (``_backward_stream_task``): the pulls first (macrobatch 0: its dY pulls in tile order; a
-        replayed macrobatch, which macrobatch 0 is with ``recompute_forward_context``: tile ``t``'s x pull then its dY
-        pull), then the dX pushes in tile order; the head word is this macrobatch's among the extra last elements of
-        ``d_y_routed_ready``.  A dY pull block arrives on ``d_y_routed_ready[minibatch]``, an x pull block on
-        ``replayed_x_routed_ready[minibatch]`` (the arrivals batch a minibatch's worth in a macrobatch that pulls
-        dY alone, one group's worth in a replayed macrobatch, where x and dY blocks alternate); before the last
-        macrobatch each push block counts on ``routed_buffers_done[macrobatch]``.
-        Every warp has released its pending arrivals when this returns: thread 0 waits for routed_buffers_done in
-        the next macrobatch's router-weight preload, and this CTA's own push arrivals count there."""
-        macro_offset = macro * Int32(macrobatch_size)
-        rows = cutlass.min(Int32(macrobatch_size), num_tokens - macro_offset)
-        # 32-row tiles: num_tokens and the macrobatch are multiples of STREAM_ROWS (the schedule pads every expert to
-        # 256 rows, the macrobatch is a multiple of 256), so the floor here and the consumers' ceil agree.
-        tiles = rows // Int32(STREAM_ROWS)
-        pull_tasks = tiles
+        The routed buffers are a ring of mpm = macrobatch / minibatch minibatch slots (macrobatch-local rows):
+        minibatch g pulls into slot g % mpm once minibatch g - mpm has retired it (``_stream_ready_lane0``:
+        ``slot_routed_required`` = CLUSTER_SIZE x the routed tasks of a minibatch on ``routed_buffers_done``,
+        ``wgrad_per_expert`` = 3 x weight tiles per expert overlapping it, from ``minibatch_expert_offsets``, on
+        ``wgrad_read_consumed``), so the pulls of the next macrobatch overlap the Wgrad of the previous one.  A dY pull
+        block arrives on ``d_y_routed_ready[minibatch]``, an x pull block on ``replayed_x_routed_ready[minibatch]``, a
+        push block on ``reverse_dispatch_done[minibatch]`` while a later minibatch reuses the slot (the Gate / Up dgrad
+        and the SwiGLU backward of g + mpm overwrite the dX rows and router partials the push read).  The stream's
+        head is the last extra word of ``d_y_routed_ready`` (zero at launch)."""
+        generations = _ceil_div_i32(num_tokens, Int32(minibatch_size))
+        mpm = Int32(macrobatch_size) // Int32(minibatch_size)
+        mini_tiles = Int32(minibatch_size) // Int32(STREAM_ROWS)
+        # num_tokens and the minibatch are multiples of STREAM_ROWS (the schedule pads every expert to 256 rows, the
+        # minibatch is a multiple of 256), so the floors here and the consumers' ceils agree.
+        last_tiles = (num_tokens - (generations - Int32(1)) * Int32(minibatch_size)) // Int32(STREAM_ROWS)
+        saved = cutlass.min(mpm, generations)  # the first macrobatch's minibatches: x is the forward's
+        saved_rows = cutlass.min(num_tokens, Int32(macrobatch_size))
         if cutlass.const_expr(self.recompute_forward_context):
-            pull_tasks = Int32(2) * tiles  # macrobatch 0 pulls its x as well
-        else:
-            if macro > Int32(0):
-                pull_tasks = Int32(2) * tiles
+            saved = Int32(0)
+            saved_rows = Int32(0)
+        lag = cutlass.max(mpm - Int32(1), Int32(1))
+        tiles = num_tokens // Int32(STREAM_ROWS)
+        tasks = Int32(2) * tiles + (num_tokens - saved_rows) // Int32(STREAM_ROWS)  # dY pulls, pushes, x pulls
         column_blocks = _ceil_div_i32(hidden_size, Int32(STREAM_COLUMNS))
         group_blocks = Int32(STREAM_GROUP_BLOCKS)
         groups = _ceil_div_i32(column_blocks, group_blocks)
-        blocks = (pull_tasks + tiles) * groups
-        head = cute.make_ptr(
-            Int32, (d_y_routed_ready.iterator + (d_y_routed_ready.shape[0] - Int32(1) - macro)).toint(), cute.AddressSpace.gmem, assumed_align=4
-        )
-        reciprocal_groups = _reciprocal_u32(groups)
-        reciprocal_group = _reciprocal_u32(group_blocks)
-        reciprocal_mini = _reciprocal_u32(minibatch_size)
-        reciprocal_topk = _reciprocal_u32(topk)
-        hidden_blocks = _tile_blocks(hidden_size, self.has_tail)  # the dX push waits for an H tail's dgrad tile too
-        swiglu_columns = intermediate_size // Int32(128)
-        done_address = Int64(0)  # the push blocks' arrival word: routed_buffers_done[macro] before the last macrobatch
-        if macro < last_macro:
-            done_address = (routed_buffers_done.iterator + macro).toint()
+        blocks = tasks * groups
+        head = cute.make_ptr(Int32, (d_y_routed_ready.iterator + (d_y_routed_ready.shape[0] - Int32(1))).toint(), cute.AddressSpace.gmem, assumed_align=4)
         operands = [None] * _Bs.COUNT  # the hooks' operands, by position
         operands[_Bs.D_Y_ROUTED_READY] = d_y_routed_ready
         operands[_Bs.REPLAYED_X_ROUTED_READY] = replayed_x_routed_ready
@@ -1133,17 +1305,28 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         operands[_Bs.TOPK] = topk
         operands[_Bs.MACROBATCH_SIZE] = macrobatch_size
         operands[_Bs.MINIBATCH_SIZE] = minibatch_size
-        operands[_Bs.MACRO] = macro
-        operands[_Bs.TILES] = tiles
-        operands[_Bs.PULL_TASKS] = pull_tasks
-        operands[_Bs.RECIPROCAL_MINI] = reciprocal_mini
-        operands[_Bs.RECIPROCAL_TOPK] = reciprocal_topk
-        operands[_Bs.HIDDEN_BLOCKS] = hidden_blocks
-        operands[_Bs.SWIGLU_COLUMNS] = swiglu_columns
-        operands[_Bs.DONE_ADDRESS] = done_address
-        operands[_Bs.MACRO_OFFSET] = macro_offset
+        operands[_Bs.GENERATIONS] = generations
+        operands[_Bs.MINI_TILES] = mini_tiles
+        operands[_Bs.LAST_TILES] = last_tiles
+        operands[_Bs.SAVED] = saved
+        operands[_Bs.LAG] = lag
+        operands[_Bs.RECIPROCAL_MINI] = _reciprocal_u32(minibatch_size)
+        operands[_Bs.RECIPROCAL_TOPK] = _reciprocal_u32(topk)
+        operands[_Bs.HIDDEN_BLOCKS] = _tile_blocks(hidden_size, self.has_tail)  # a dX push waits for an H tail tile too
+        operands[_Bs.SWIGLU_COLUMNS] = intermediate_size // Int32(128)
+        operands[_Bs.MPM] = mpm
+        operands[_Bs.RECIPROCAL_MPM] = _reciprocal_u32(mpm)
+        operands[_Bs.RECIPROCAL_TILES] = _reciprocal_u32(mini_tiles)
+        operands[_Bs.RECIPROCAL_2TILES] = _reciprocal_u32(Int32(2) * mini_tiles)
+        operands[_Bs.RECIPROCAL_3TILES] = _reciprocal_u32(Int32(3) * mini_tiles)
+        operands[_Bs.ROUTED_BUFFERS_DONE] = routed_buffers_done
+        operands[_Bs.WGRAD_READ_CONSUMED] = wgrad_read_consumed
+        operands[_Bs.REVERSE_DISPATCH_DONE] = reverse_dispatch_done
+        operands[_Bs.SLOT_ROUTED_REQUIRED] = slot_routed_required
+        operands[_Bs.WGRAD_PER_EXPERT] = wgrad_per_expert
+        operands[_Bs.MINIBATCH_EXPERT_OFFSETS] = minibatch_expert_offsets
         assert all(operand is not None for operand in operands)
-        return self._run_stream(
+        self._run_stream(
             operands,
             schedule_peer_rank,
             schedule_peer_token_idx,
@@ -1152,12 +1335,12 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             stream_mbarriers,
             blocks,
             groups,
-            reciprocal_groups,
-            reciprocal_group,
+            _reciprocal_u32(groups),
+            _reciprocal_u32(group_blocks),
             column_blocks,
             comm_cta,
             num_comm_sms,
-            phase_bits,
+            Int32(0),
         )
 
     @cute.jit
@@ -1179,6 +1362,9 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         d_x_routed_ready: cute.Tensor,
         replayed_x_routed_ready: cute.Tensor,
         routed_buffers_done: cute.Tensor,
+        wgrad_read_consumed: cute.Tensor,
+        reverse_dispatch_done: cute.Tensor,
+        minibatch_expert_offsets: cute.Tensor,
         arena: cute.Pointer,
         stream_mbarriers: cute.Pointer,
         cluster_index: Int32,
@@ -1195,83 +1381,78 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         minibatch_size: Int32,
         num_comm_sms: Int32,
     ) -> None:
-        """The communication CTAs' branch of the kernel: per macrobatch, its router weights
-        (``_preload_router_weights``: after the previous macrobatch's routed buffers retire, then a barrier over
-        every communication CTA), then its communication on the dynamic task stream (``_backward_stream``: the
-        reverse-combine of dY, in a replayed macrobatch the replay dispatch of x, and the reverse-dispatch of
-        dX).  Every row moved here is a routed-chain row (``routed_hidden_size``
-        columns); ``shared_hidden_size`` only sizes the shared task counts.  ``d_y_quant`` / ``x_quant``: the plain
-        row-major e4m3 outputs (normal, transposed) and the two scale tensors of dY / of the replayed x."""
-        _, _, _, _, _, _, _, routed, _, _, _, _, wgrad = _task_counts(
+        """The communication CTAs' branch of the kernel: the backward's one stream (``_backward_stream``: the
+        reverse-combine of dY, the replay dispatch of x and the reverse-dispatch of dX).  Every row moved here is a
+        routed-chain row (``routed_hidden_size`` columns); ``shared_hidden_size`` only sizes the shared task counts.
+        ``d_y_quant`` / ``x_quant``: the plain row-major e4m3 outputs (normal, transposed) and the two scale tensors
+        of dY / of the replayed x."""
+        _, _, _, _, _, _, _, routed, _, _, _, _, _ = _task_counts(
             num_local_tokens, shared_hidden_size, routed_hidden_size, intermediate_size, num_local_experts, minibatch_size, self.has_shared, self.has_tail
         )
+        wgrad_per_expert = Int32(3) * (_tile_blocks(intermediate_size, self.has_tail) * _tile_blocks(routed_hidden_size, self.has_tail))
         thread = cute.arch.thread_idx()[0]
         comm_cta = cluster_index * Int32(CLUSTER_SIZE) + cta_rank
         if thread == Int32(0):
             for i in cutlass.range_constexpr(STREAM_WARPS * STREAM_BUFFERS):
                 cute.arch.mbarrier_init(stream_mbarriers + Int32(i), STREAM_ROWS)  # one arrival per pulled row
         cute.arch.mbarrier_init_fence()
+        # Every routed row's router weight (0 for a padding row), once, into router_weights[row] (one entry per row of
+        # the schedule, outside the ring: no slot to retire), then a barrier over the comm CTAs; the dY pulls scale by
+        # it and the routed SwiGLU backward divides by it.  Four independent peer loads per thread and step.
+        stride = num_comm_sms * Int32(THREADS_PER_CTA)
+        row = comm_cta * Int32(THREADS_PER_CTA) + thread
+        while row < num_tokens:
+            values = []
+            for k in cutlass.range_constexpr(4):
+                value = Float32(0.0)
+                if row + Int32(k) * stride < num_tokens:
+                    peer = schedule_peer_rank[row + Int32(k) * stride]
+                    if peer >= Int32(0):
+                        value = _load_peer_float(router_peer_table, peer, schedule_peer_token_idx[row + Int32(k) * stride])
+                values.append(value)
+            for k in cutlass.range_constexpr(4):
+                if row + Int32(k) * stride < num_tokens:
+                    router_weights[row + Int32(k) * stride] = values[k]
+            row = row + Int32(4) * stride
         cute.arch.sync_threads()
-        d_y_bases = [tensor.iterator.toint() for tensor in d_y_quant]
-        x_bases = [tensor.iterator.toint() for tensor in x_quant]
-        column_blocks = _ceil_div_i32(routed_hidden_size, Int32(STREAM_COLUMNS))
-        macro_count = _ceil_div_i32(num_tokens, Int32(macrobatch_size))
-        last_macro = macro_count - Int32(1)
-        phase_bits = Int32(0)
-        for macro in cutlass.range(macro_count, unroll=1):
-            # The previous macrobatch's routed buffers retire when its routed and Wgrad tasks (CLUSTER_SIZE arrivals
-            # each) and its stream's push blocks (one each) have all arrived on routed_buffers_done.
-            required = Int32(0)
-            if macro > Int32(0):
-                previous_rows = cutlass.min(Int32(macrobatch_size), num_tokens - (macro - Int32(1)) * Int32(macrobatch_size))
-                required = (
-                    Int32(CLUSTER_SIZE) * (_ceil_div_i32(previous_rows, Int32(minibatch_size)) * routed + wgrad)
-                    + previous_rows // Int32(STREAM_ROWS) * column_blocks
-                )
-            self._preload_router_weights(
-                router_peer_table,
-                schedule_peer_rank,
-                schedule_peer_token_idx,
-                router_weights,
-                router_weights_ready,
-                routed_buffers_done,
-                num_tokens,
-                macro,
-                comm_cta,
-                required,
-                macrobatch_size,
-                num_comm_sms,
-            )
-            phase_bits = self._backward_stream(
-                schedule_peer_rank,
-                schedule_peer_token_idx,
-                d_y_routed_ready,
-                replayed_x_routed_ready,
-                d_x_routed_ready,
-                routed_buffers_done,
-                router_weights,
-                d_x_routed,
-                d_router_partials,
-                d_y_peer_table,
-                x_peer_table,
-                d_x_peer_table,
-                d_router_peer_table,
-                arena,
-                stream_mbarriers,
-                num_tokens,
-                routed_hidden_size,
-                intermediate_size,
-                topk,
-                macrobatch_size,
-                minibatch_size,
-                macro,
-                last_macro,
-                comm_cta,
-                num_comm_sms,
-                d_y_bases,
-                x_bases,
-                phase_bits,
-            )
+        if thread == Int32(0):
+            _counter_arrive_release_gpu(router_weights_ready, Int32(0))
+            _counter_wait_gpu(router_weights_ready, Int32(0), num_comm_sms)
+        cute.arch.sync_threads()
+        # A ring slot retires when its minibatch's routed tasks (CLUSTER_SIZE arrivals each) and the Wgrad of every
+        # segment overlapping it (the leader CTA's arrival each) are done with it.
+        self._backward_stream(
+            schedule_peer_rank,
+            schedule_peer_token_idx,
+            d_y_routed_ready,
+            replayed_x_routed_ready,
+            d_x_routed_ready,
+            routed_buffers_done,
+            wgrad_read_consumed,
+            reverse_dispatch_done,
+            router_weights,
+            d_x_routed,
+            d_router_partials,
+            d_y_peer_table,
+            x_peer_table,
+            d_x_peer_table,
+            d_router_peer_table,
+            arena,
+            stream_mbarriers,
+            num_tokens,
+            routed_hidden_size,
+            intermediate_size,
+            topk,
+            macrobatch_size,
+            minibatch_size,
+            comm_cta,
+            num_comm_sms,
+            [tensor.iterator.toint() for tensor in d_y_quant],
+            [tensor.iterator.toint() for tensor in x_quant],
+            Int32(CLUSTER_SIZE) * routed,
+            wgrad_per_expert,
+            minibatch_expert_offsets,
+        )
 
     @cute.jit
     def _run_replay_swiglu(
@@ -1362,11 +1543,6 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         return phase_bits
 
     @cute.jit
-    def _minibatches_of(self, num_tokens: Int32, macro: Int32, macrobatch_size: Int32, minibatch_size: Int32) -> Int32:
-        rows = cutlass.min(Int32(macrobatch_size), num_tokens - macro * Int32(macrobatch_size))
-        return _ceil_div_i32(rows, Int32(minibatch_size))
-
-    @cute.jit
     def _true_clusters(
         self,
         comm_clusters: Int32,
@@ -1378,19 +1554,23 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         num_local_experts: Int32,
         macrobatch_size: Int32,
         minibatch_size: Int32,
+        completed_segments: cute.Tensor,
     ) -> Int32:
-        """The clusters that have work for the actual token count (comm + shared + routed + replay +
-        Wgrad); the launch grid is sized for the schedule's capacity."""
-        _, _, _, shared, _, _, _, routed, _, replay, _, _, wgrad = _task_counts(
+        """The clusters that have work for the actual token count (comm + shared + every minibatch's routed and
+        replay tasks + the Wgrad of every expert x macrobatch segment); the launch grid is sized for the schedule's
+        capacity.  ``completed_segments``: the decoder metadata's per-minibatch segment prefix (``_segment_prefix``)."""
+        _, _, _, shared, _, _, _, routed, _, replay, _, _, _ = _task_counts(
             num_local_tokens, shared_hidden_size, routed_hidden_size, intermediate_size, num_local_experts, minibatch_size, self.has_shared, self.has_tail
         )
+        routed_weight_tiles = _tile_blocks(intermediate_size, self.has_tail) * _tile_blocks(routed_hidden_size, self.has_tail)
         minis = _ceil_div_i32(num_tokens, Int32(minibatch_size))
-        macros = _ceil_div_i32(num_tokens, Int32(macrobatch_size))
+        minibatches_per_macrobatch = Int32(macrobatch_size) // Int32(minibatch_size)
+        replay_minis = minis - cutlass.min(minis, minibatches_per_macrobatch)
         if cutlass.const_expr(self.recompute_forward_context):
             replay_minis = minis  # macrobatch 0's minibatches run the replay tasks too
-        else:
-            replay_minis = minis - self._minibatches_of(num_tokens, Int32(0), macrobatch_size, minibatch_size)
-        return comm_clusters + shared + minis * routed + replay_minis * replay + macros * wgrad
+        last_first = cutlass.max(minis - Int32(1), Int32(0)) // minibatches_per_macrobatch * minibatches_per_macrobatch
+        segments = self._segment_prefix(completed_segments, minis, minis, last_first, num_local_experts)
+        return comm_clusters + shared + minis * routed + replay_minis * replay + segments * Int32(3) * routed_weight_tiles
 
     @cute.jit
     def _task_table(
@@ -1404,21 +1584,20 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         macrobatch_size: Int32,
         minibatch_size: Int32,
     ):
-        """The per-launch constants of the task table, computed once per CTA before the task loop:
-        the task counts of ``_task_counts``, the minibatches per macrobatch, the number of
-        macrobatches, the minibatches of the first and of the last macrobatch, and the tasks of
-        macrobatch 0 and of a full replayed macrobatch.  ``_decode_mxfp8_task`` then spends at most
-        two runtime divisions per task.  With ``recompute_forward_context`` no macrobatch has the saved layout
-        (``saved_tasks`` is 0): the replayed macrobatches start at macrobatch 0."""
-        shared_down, shared_swiglu, _, shared, routed_down, routed_swiglu, _, routed, replay_gate_up, replay, weight_tiles, wgrad_matrix, wgrad = _task_counts(
+        """The per-launch constants of the task table, computed once per CTA before the task loop: the task counts
+        of ``_task_counts``, the routed weight tiles of one Wgrad matrix (per segment), the minibatches per
+        macrobatch, the saved minibatches (the first macrobatch's, whose x / Gate / Up are the forward's; none
+        with ``recompute_forward_context``), the minibatches, the last macrobatch's first one and the experts."""
+        shared_down, shared_swiglu, _, shared, routed_down, routed_swiglu, _, routed, replay_gate_up, replay, weight_tiles, _, _ = _task_counts(
             num_local_tokens, shared_hidden_size, routed_hidden_size, intermediate_size, num_local_experts, minibatch_size, self.has_shared, self.has_tail
         )
+        routed_weight_tiles = _tile_blocks(intermediate_size, self.has_tail) * _tile_blocks(routed_hidden_size, self.has_tail)
         minibatches_per_macrobatch = macrobatch_size // minibatch_size
-        num_macros = _ceil_div_i32(num_tokens, Int32(macrobatch_size))
-        first_minis = self._minibatches_of(num_tokens, Int32(0), macrobatch_size, minibatch_size)
-        last_minis = self._minibatches_of(num_tokens, cutlass.max(num_macros - Int32(1), Int32(0)), macrobatch_size, minibatch_size)
-        saved_tasks = Int32(0) if cutlass.const_expr(self.recompute_forward_context) else first_minis * routed + wgrad
-        replayed_tasks = minibatches_per_macrobatch * (replay + routed) + wgrad
+        minibatches = _ceil_div_i32(num_tokens, Int32(minibatch_size))
+        saved = cutlass.min(minibatches, minibatches_per_macrobatch)
+        if cutlass.const_expr(self.recompute_forward_context):
+            saved = Int32(0)
+        last_first = cutlass.max(minibatches - Int32(1), Int32(0)) // minibatches_per_macrobatch * minibatches_per_macrobatch
         return (
             shared_down,
             shared_swiglu,
@@ -1429,19 +1608,59 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             replay_gate_up,
             replay,
             weight_tiles,
-            wgrad_matrix,
+            routed_weight_tiles,
             minibatches_per_macrobatch,
-            num_macros,
-            first_minis,
-            last_minis,
-            saved_tasks,
-            replayed_tasks,
+            saved,
+            minibatches,
+            last_first,
+            num_local_experts,
         )
 
     @cute.jit
-    def _decode_mxfp8_task(
+    def _segment_prefix(self, completed_segments: cute.Tensor, generation: Int32, minibatches: Int32, last_first: Int32, experts: Int32) -> Int32:
+        """The Wgrad segments scheduled before minibatch ``generation``: the decoder metadata's prefix of segments
+        completed (``completed_segments``), except that the last macrobatch's segments (from minibatch
+        ``last_first`` on) all run after its last minibatch.  None of its ring slots is reused, and a Wgrad
+        right behind its own minibatch's dgrad waits for it; with one macrobatch this is every dgrad, then every
+        Wgrad.  One macrobatch (``last_first`` 0) reads no metadata, which the host then does not build: every one
+        of the ``experts`` is one segment, all after the last minibatch."""
+        count = Int32(0)
+        if last_first == Int32(0):
+            if generation >= minibatches and minibatches > Int32(0):
+                count = experts
+        else:
+            if generation > last_first and generation < minibatches:
+                generation = last_first
+            count = Int32(completed_segments[generation])
+        return count
+
+    @cute.jit
+    def _generation_end(
         self,
-        task: Int32,
+        generation: Int32,
+        routed: Int32,
+        replay: Int32,
+        routed_weight_tiles: Int32,
+        saved: Int32,
+        completed_segments: cute.Tensor,
+        minibatches: Int32,
+        last_first: Int32,
+        experts: Int32,
+    ) -> Int32:
+        """The routed-task prefix up to the end of minibatch ``generation`` (relative to the first routed task):
+        every earlier minibatch's routed tasks, replay tasks (from minibatch ``saved`` on) and the Wgrad of the
+        segments scheduled so far (``_segment_prefix``, 3 x weight tiles each)."""
+        after = generation + Int32(1)
+        return (
+            after * routed
+            + cutlass.max(Int32(0), after - saved) * replay
+            + self._segment_prefix(completed_segments, after, minibatches, last_first, experts) * Int32(3) * routed_weight_tiles
+        )
+
+    @cute.jit
+    def _decode_cursor(
+        self,
+        completed_segments: cute.Tensor,
         shared_down: Int32,
         shared_swiglu: Int32,
         shared: Int32,
@@ -1451,27 +1670,63 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         replay_gate_up: Int32,
         replay: Int32,
         weight_tiles: Int32,
-        wgrad_matrix: Int32,
+        routed_weight_tiles: Int32,
         minibatches_per_macrobatch: Int32,
-        num_macros: Int32,
-        first_minis: Int32,
-        last_minis: Int32,
-        saved_tasks: Int32,
-        replayed_tasks: Int32,
+        saved: Int32,
+        minibatches: Int32,
+        last_first: Int32,
+        experts: Int32,
     ):
-        """``(kind, macro, generation, local)`` of compute task ``task``, from the constants of
-        ``_task_table``.
+        """The decode cursor at minibatch 0: ``(minibatch, macrobatch, end of the minibatch's tasks, its first
+        segment, the next minibatch's first segment)``."""
+        return (
+            Int32(0),
+            Int32(0),
+            self._generation_end(Int32(0), routed, replay, routed_weight_tiles, saved, completed_segments, minibatches, last_first, experts),
+            self._segment_prefix(completed_segments, Int32(0), minibatches, last_first, experts),
+            self._segment_prefix(completed_segments, Int32(1), minibatches, last_first, experts),
+        )
 
-        Task order: the shared tasks; then macrobatch 0's routed backward and Wgrad; then per
-        replayed macrobatch its minibatches' replay (Gate, Up, SwiGLU), their routed backward, and
-        its Wgrad.  With ``recompute_forward_context`` macrobatch 0 is the first replayed macrobatch (``saved_tasks``
-        is 0).  ``generation`` is the global minibatch.  Each quotient's remainder is formed by
-        a multiply and subtract, so a task costs at most two runtime divisions.
-        """
+    @cute.jit
+    def _decode_mxfp8_task(
+        self,
+        task: Int32,
+        cursor_generation: Int32,
+        cursor_macro: Int32,
+        cursor_end: Int32,
+        cursor_first: Int32,
+        cursor_next: Int32,
+        completed_segments: cute.Tensor,
+        shared_down: Int32,
+        shared_swiglu: Int32,
+        shared: Int32,
+        routed_down: Int32,
+        routed_swiglu: Int32,
+        routed: Int32,
+        replay_gate_up: Int32,
+        replay: Int32,
+        weight_tiles: Int32,
+        routed_weight_tiles: Int32,
+        minibatches_per_macrobatch: Int32,
+        saved: Int32,
+        minibatches: Int32,
+        last_first: Int32,
+        experts: Int32,
+    ):
+        """``(kind, macro, generation, local, segment_base)`` of compute task ``task`` and the moved cursor
+        (``_decode_cursor``).
+
+        Task order: the shared tasks; then minibatch by minibatch (``generation``, in macrobatch ``macro``) its
+        replay (Gate, Up, SwiGLU; from minibatch ``saved`` on), its routed backward (Down dgrad, SwiGLU-backward,
+        Gate+Up dgrad) and the Wgrad of the expert x macrobatch segments scheduled there (``_segment_prefix``:
+        where they complete, the last macrobatch's at its end): Down tiles of every segment, then Gate, then Up;
+        ``local`` = segment lane x weight tiles + tile, ``segment_base`` the minibatch's first segment.  The cursor
+        only moves forward, as a warp's tasks do, one metadata load per minibatch passed: no division."""
         kind = Int32(SHARED_DOWN_DGRAD)
         macro = Int32(0)
         generation = Int32(0)
         local = task
+        segment_base = Int32(0)
         if task < shared_down:
             kind = Int32(SHARED_DOWN_DGRAD)
         elif task < shared_down + shared_swiglu:
@@ -1482,27 +1737,34 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             local = task - shared_down - shared_swiglu
         elif task < shared:
             local = task - (shared - Int32(3) * weight_tiles)
-            matrix = local // weight_tiles
+            matrix = Int32(0)
+            if local >= weight_tiles:
+                matrix = Int32(1)
+                local = local - weight_tiles
+                if local >= weight_tiles:
+                    matrix = Int32(2)
+                    local = local - weight_tiles
             kind = Int32(SHARED_WGRAD_DOWN) + matrix
-            local = local - matrix * weight_tiles
         else:
             index = task - shared
-            macro_minis = first_minis
-            replay_count = Int32(0)
-            if index >= saved_tasks:
-                index = index - saved_tasks
-                step = index // replayed_tasks
-                macro = (Int32(0) if cutlass.const_expr(self.recompute_forward_context) else Int32(1)) + step
-                index = index - step * replayed_tasks
-                # Every macrobatch but the last is full (macrobatch_size is a multiple of minibatch_size).
-                macro_minis = minibatches_per_macrobatch
-                if macro == num_macros - Int32(1):
-                    macro_minis = last_minis
-                replay_count = macro_minis * replay
-            if index < replay_count:
-                mini = index // replay
-                generation = macro * minibatches_per_macrobatch + mini
-                local = index - mini * replay
+            while index >= cursor_end:
+                cursor_generation = cursor_generation + Int32(1)
+                if cursor_generation == (cursor_macro + Int32(1)) * minibatches_per_macrobatch:
+                    cursor_macro = cursor_macro + Int32(1)
+                cursor_first = cursor_next
+                cursor_next = self._segment_prefix(completed_segments, cursor_generation + Int32(1), minibatches, last_first, experts)
+                cursor_end = self._generation_end(
+                    cursor_generation, routed, replay, routed_weight_tiles, saved, completed_segments, minibatches, last_first, experts
+                )
+            generation = cursor_generation
+            macro = cursor_macro
+            segments_here = cursor_next - cursor_first
+            replay_here = replay
+            if generation < saved:
+                replay_here = Int32(0)
+            offset = index - (cursor_end - Int32(3) * routed_weight_tiles * segments_here - routed - replay_here)
+            if offset < replay_here:
+                local = offset
                 if local < replay_gate_up:
                     kind = Int32(REPLAY_GATE)
                 elif local < Int32(2) * replay_gate_up:
@@ -1512,12 +1774,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                     kind = Int32(REPLAY_SWIGLU)
                     local = local - Int32(2) * replay_gate_up
             else:
-                index = index - replay_count
-                routed_count = macro_minis * routed
-                if index < routed_count:
-                    mini = index // routed
-                    generation = macro * minibatches_per_macrobatch + mini
-                    local = index - mini * routed
+                local = offset - replay_here
+                if local < routed:
                     if local < routed_down:
                         kind = Int32(ROUTED_DOWN_DGRAD)
                     elif local < routed_down + routed_swiglu:
@@ -1527,11 +1785,17 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                         kind = Int32(ROUTED_GATE_UP_DGRAD)
                         local = local - routed_down - routed_swiglu
                 else:
-                    local = index - routed_count
-                    matrix = local // wgrad_matrix
-                    kind = Int32(ROUTED_WGRAD_DOWN) + matrix
-                    local = local - matrix * wgrad_matrix
-        return kind, macro, generation, local
+                    local = local - routed
+                    matrix_tasks = segments_here * routed_weight_tiles
+                    kind = Int32(ROUTED_WGRAD_DOWN)
+                    if local >= matrix_tasks:
+                        kind = kind + Int32(1)
+                        local = local - matrix_tasks
+                        if local >= matrix_tasks:
+                            kind = kind + Int32(1)
+                            local = local - matrix_tasks
+                    segment_base = cursor_first
+        return (kind, macro, generation, local, segment_base, cursor_generation, cursor_macro, cursor_end, cursor_first, cursor_next)
 
     @cute.jit
     def _routed_gemm_geometry(
@@ -1550,17 +1814,23 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         macrobatch_size: Int32,
         minibatch_size: Int32,
         valid_end_offset: Int32,
+        segment_base: Int32,
+        segment_experts: cute.Tensor,
     ):
-        """``(valid, expert, row, column, k_start, k_end, first)`` of a routed GEMM task.
+        """``(valid, expert, row, column, k_start, k_end, first, expert_begin, expert_end, padded_end)`` of a routed
+        GEMM task (the last three: a Wgrad's expert K bounds, for its segment order in the epilogue,
+        ``_wgrad_segment``, and the padded end of its rows, for its ring-slot retirement).
 
         The expert comes from the BF16 forward's compile-time decode (``TaskDecode``) over the
         per-CTA row-block table.  Replay / dgrad tasks: the minibatch's row blocks
         that fall in each expert, in order, each a swizzled (row, column) grid; ``row`` is
-        macrobatch-local.  Wgrad: ``local`` = expert x (row_blocks x col_blocks); K is the expert's
+        macrobatch-local.  Wgrad: ``local`` = segment lane x (row_blocks x col_blocks), the segment
+        ``segment_base`` + lane of the decoder metadata (``segment_experts`` names its expert; with one
+        macrobatch the lane is the expert); K is the expert's
         token rows inside this macrobatch -- the padded range, cut at the expert's valid end
         (``_write_expert_valid_ends``, whole K tiles of zero padding rows; a non-empty expert keeps at
         least one tile) when ``valid_end_offset`` >= 0; the first macrobatch an expert appears in
-        stores, later ones accumulate.
+        stores, later ones accumulate in macrobatch order.
         """
         intermediate_blocks = _tile_blocks(intermediate_size, self.has_tail)
         hidden_blocks = _tile_blocks(hidden_size, self.has_tail)
@@ -1571,6 +1841,9 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         k_start = Int32(0)
         k_end = Int32(0)
         first = Int32(0)
+        wgrad_begin = Int32(0)
+        wgrad_end = Int32(0)
+        padded_end = Int32(0)
         if kind >= Int32(ROUTED_WGRAD_DOWN):
             # Wgrad-down: M = hidden, N = intermediate; Wgrad-gate / -up: M = intermediate, N = hidden.
             row_blocks = intermediate_blocks
@@ -1578,8 +1851,14 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             if kind == Int32(ROUTED_WGRAD_DOWN):
                 row_blocks = hidden_blocks
                 col_blocks = intermediate_blocks
-            expert = local // (row_blocks * col_blocks)
+            lane = local // (row_blocks * col_blocks)
+            # One macrobatch: every expert is one segment, so the lane is the expert (expert order, no dependent
+            # metadata load on the task's start); otherwise the decoder metadata names the segment's expert.
+            expert = lane
+            if num_tokens > Int32(macrobatch_size):
+                expert = Int32(segment_experts[segment_base + lane])
             expert_begin, expert_end = _expert_token_range(tokens_per_expert, expert_cu_end, expert_stride, self.task_decode, expert)
+            padded_end = expert_end
             if valid_end_offset >= Int32(0):
                 # The valid-end entries are token rows (the first entries are 256-row blocks): the K range
                 # ends at the expert's last valid row rounded up to the K tile.  The padding rows skipped
@@ -1590,9 +1869,11 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             k_start = cutlass.max(expert_begin, macro * Int32(macrobatch_size))
             k_end = cutlass.min(expert_end, cutlass.min((macro + Int32(1)) * Int32(macrobatch_size), num_tokens))
             first = Int32(k_start == expert_begin)
+            wgrad_begin = expert_begin
+            wgrad_end = expert_end
             if k_start < k_end:
                 valid = Int32(1)
-                tile_row, tile_column = _swizzled_tile_i32(row_blocks, col_blocks, local % (row_blocks * col_blocks))
+                tile_row, tile_column = _swizzled_tile_i32(row_blocks, col_blocks, local - lane * (row_blocks * col_blocks))
                 row = tile_row
                 column = tile_column
         else:
@@ -1608,7 +1889,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 expert = owner
                 row = row_block - macro * Int32(macrobatch_size // MLP_TILE_M)
                 column = tile_column
-        return valid, expert, row, column, k_start, k_end, first
+        return valid, expert, row, column, k_start, k_end, first, wgrad_begin, wgrad_end, padded_end
 
     @cute.jit
     def _wait_routed_wgrad_operands(
@@ -1774,6 +2055,20 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 )
 
     @cute.jit
+    def _wait_wgrad_segment(self, warp: Int32, wgrad_segment_done: cute.Tensor, wgrad_counter: Int32, wgrad_segment: Int32) -> None:
+        """Segment k > 0 of a routed dW tile waits until the k earlier segments published (k x CLUSTER_SIZE
+        arrivals: both cluster CTAs store their half), so the stores and reduce-adds land in macrobatch order
+        (deterministic sum).  The store warp (warp 0, ``gemm._is_store_warp``) waits: it issues every D store.
+        Segment 0 waits for nothing (its store, or with main_grad its first add, comes first).  Called before the
+        epilogue reads the accumulator, so the wait (rarely blocking: a macrobatch boundary splits at most one expert)
+        precedes every TMEM read of the task; the MMAs of the task may still be filling the accumulator meanwhile."""
+        if warp == Int32(0):
+            if wgrad_segment > Int32(0):
+                with cute.arch.elect_one():
+                    _counter_wait_gpu(wgrad_segment_done, wgrad_counter, wgrad_segment * Int32(CLUSTER_SIZE))
+            cute.arch.sync_warp()
+
+    @cute.jit
     def _run_routed_gemm(
         self,
         epi_tiled_mma: cute.TiledMma,
@@ -1859,6 +2154,13 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         sfb2_desc_ptr=None,
         d_desc_ptr=None,
         d_row_tile_offset=None,
+        wgrad_segment_done: Optional[cute.Tensor] = None,
+        wgrad_read_consumed: Optional[cute.Tensor] = None,
+        wgrad_expert: Int32 = Int32(0),
+        wgrad_begin: Int32 = Int32(0),
+        wgrad_end: Int32 = Int32(0),
+        wgrad_padded_end: Int32 = Int32(0),
+        wgrad_experts: Int32 = Int32(0),
     ):
         """One routed MXFP8 GEMM task.
 
@@ -1875,6 +2177,10 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         from the second collective, while A, the scales and the ring bytes are the shared ones.
         ``*_desc_ptr``: a split operand's own descriptor, None for the global tensormap slot.
         ``d_row_tile_offset`` (Int32 CTA tiles, None without one): the Up half of a combined FC1 main_grad.
+        Wgrad: the epilogue orders the contributions to this dW tile on its ``wgrad_segment_done`` word
+        (``_wgrad_counter_index``; ``wgrad_experts`` local experts): the segment of expert ``wgrad_expert`` (K bounds
+        ``wgrad_begin`` .. ``wgrad_end``, ``_wgrad_segment``) stores or reduce-adds only after the earlier segments
+        published, and publishes itself when a later segment follows.
         """
         intermediate_blocks = _tile_blocks(intermediate_size, self.has_tail)
         k_tiles = Int32(cute.size(a_tensor, mode=[1])) // Int32(FP8_K_TILE)
@@ -2052,6 +2358,23 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         # Epilogue warpgroup: TMEM -> registers -> quantize / store
         #
         elif warp <= Int32(EPILOGUE_WARP_LAST):
+            wgrad_counter = Int32(0)
+            wgrad_has_next = Int32(0)
+            if cutlass.const_expr(is_wgrad):
+                # The segment order first, before the accumulator is taken, so that the store code below stays the
+                # one of a kernel without it (the wait almost never blocks: a macrobatch boundary splits at most one
+                # expert).  row / column are the tile's coordinates in the matrix's grid.  With one macrobatch every
+                # expert is one segment (segment 0, no next one): nothing to order.
+                if num_tokens > Int32(macrobatch_size):
+                    _, _, _, wgrad_segment, wgrad_has_next = _wgrad_segment(macro, wgrad_begin, wgrad_end, macrobatch_size, num_tokens)
+                    hidden_blocks = _tile_blocks(hidden_size, self.has_tail)
+                    col_blocks = hidden_blocks
+                    if kind == Int32(ROUTED_WGRAD_DOWN):
+                        col_blocks = intermediate_blocks
+                    wgrad_counter = _wgrad_counter_index(
+                        kind - Int32(ROUTED_WGRAD_DOWN), wgrad_expert, row, column, col_blocks, wgrad_experts, intermediate_blocks * hidden_blocks
+                    )
+                    self._wait_wgrad_segment(warp, wgrad_segment_done, wgrad_counter, wgrad_segment)
             # The BF16 ABt collective's epilogue partitions: the same 2-CTA 256 x 256 FP32
             # accumulator and BF16 D tile as every routed task.  A Wgrad accumulating into main_grad
             # partitions with the Wgrad collective instead, the one that owns its D atoms there: FP32
@@ -2121,7 +2444,12 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                     else:
                         gemm.store_acc_all(collective, registers, r2s, s_d_partition, copy_D, thread)
             # Publish the task's readiness arrivals only after its stores complete.
-            retires = num_tokens > Int32(macrobatch_size) and kind >= Int32(ROUTED_DOWN_DGRAD)
+            # The routed dgrad tasks retire their share of the ring slot of their minibatch (when a later minibatch
+            # reuses it); a Wgrad task, which reads the slots of its whole macrobatch, arrives on wgrad_read_consumed.
+            retires = Int32(0)
+            if cutlass.const_expr(not is_wgrad):
+                if kind >= Int32(ROUTED_DOWN_DGRAD):
+                    retires = _slot_reused(generation, num_tokens, minibatch_size, macrobatch_size)
             if cutlass.const_expr(d_add_atom is not None):
                 if warp == Int32(0):
                     cute.arch.cp_async_bulk_wait_group(0, read=False)
@@ -2138,8 +2466,17 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                     _counter_arrive_release_gpu(d_x_routed_ready, generation)
                 elif kind == Int32(REPLAY_GATE) or kind == Int32(REPLAY_UP):
                     _counter_arrive_release_gpu(replayed_gate_up_ready, global_row * intermediate_blocks + column)
-                if retires:
-                    _counter_arrive_release_gpu(routed_buffers_done, macro)
+                if cutlass.const_expr(is_wgrad):
+                    # This CTA's half of the dW tile has landed (the wait_group above): the expert's next segment
+                    # may add to it.  One arrival per CTA, so k segments are k x CLUSTER_SIZE arrivals.
+                    if wgrad_has_next != Int32(0):
+                        _counter_arrive_release_gpu(wgrad_segment_done, wgrad_counter)
+                    # The MMAs read both CTAs' operands before the accumulator was handed over: the leader speaks for
+                    # the cluster.
+                    if cta_rank == Int32(0):
+                        _retire_wgrad_reads(wgrad_read_consumed, macro, wgrad_begin, wgrad_padded_end, num_tokens, minibatch_size, macrobatch_size)
+                if retires != Int32(0):
+                    _counter_arrive_release_gpu(routed_buffers_done, generation)
         return (ab_producer_state, ab_consumer_state, sf_producer_state, sf_consumer_state, acc_producer_state, acc_consumer_state)
 
     @cute.jit
@@ -2295,7 +2632,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         tiles_per_minibatch = Int32(minibatch_size // SWIGLU_TILE) * col_blocks
         first_tile = generation * tiles_per_minibatch + local * Int32(CLUSTER_SIZE * SWIGLU_BWD_STAGES) + cta_rank * Int32(SWIGLU_BWD_STAGES)
         tile_end = cutlass.min(num_tiles, (generation + Int32(1)) * tiles_per_minibatch)
-        retires = num_tokens > Int32(macrobatch_size)
+        retires = _slot_reused(generation, num_tokens, minibatch_size, macrobatch_size)
         d_gate_sc, d_up_sc, d_gate_sc_t, d_up_sc_t, d_gate_fp8, d_up_fp8 = scale_tensors
         sc_columns = col_blocks  # scale tiles per macrobatch row tile (normal layout)
         sc_rows_t = Int32(macrobatch_size // SWIGLU_TILE)  # scale tiles per column tile (transposed)
@@ -2365,7 +2702,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                     tile_row = thread & Int32(SWIGLU_TILE - 1)
                     local_token = local_row * Int32(SWIGLU_TILE) + tile_row
                     peer_rank = schedule_peer_rank[row * Int32(SWIGLU_TILE) + tile_row]
-                    inverse = inverse_router_weight(router_weights[local_token])
+                    inverse = inverse_router_weight(router_weights[row * Int32(SWIGLU_TILE) + tile_row])
                     d_hidden = arena + SWIGLU_BWD_D_HIDDEN + stage * BF16_TILE_BYTES
                     gate = arena + SWIGLU_BWD_GATE + stage * BF16_TILE_BYTES
                     up = arena + SWIGLU_BWD_UP + stage * BF16_TILE_BYTES
@@ -2430,8 +2767,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                         if first_col + Int32(stage) >= col_blocks:
                             row = row + Int32(1)
                         _counter_arrive_release_gpu(d_gate_up_ready, Int32(num_local_tokens // MLP_TILE_M) + row // Int32(2))
-        if thread == Int32(0) and retires:
-            _counter_arrive_release_gpu(routed_buffers_done, macro)
+        if thread == Int32(0) and retires != Int32(0):
+            _counter_arrive_release_gpu(routed_buffers_done, generation)
         return phase_bits
 
     @cute.jit
@@ -2481,7 +2818,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         tiles_per_minibatch = Int32(minibatch_size // SWIGLU_TILE) * col_blocks
         first_tile = generation * tiles_per_minibatch + local * Int32(CLUSTER_SIZE * SWIGLU_BWD_STAGES) + cta_rank * Int32(SWIGLU_BWD_STAGES)
         tile_end = cutlass.min(num_tiles, (generation + Int32(1)) * tiles_per_minibatch)
-        retires = num_tokens > Int32(macrobatch_size)
+        retires = _slot_reused(generation, num_tokens, minibatch_size, macrobatch_size)
         gate_sc, up_sc, d_gate_sc, d_up_sc, d_gate_sc_t, d_up_sc_t = scale_tensors
         sc_columns = col_blocks  # scale tiles per macrobatch row tile (normal layout)
         sc_rows_t = Int32(macrobatch_size // SWIGLU_TILE)  # scale tiles per column tile (transposed)
@@ -2563,7 +2900,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                     tile_row = thread & Int32(SWIGLU_TILE - 1)
                     local_token = local_row * Int32(SWIGLU_TILE) + tile_row
                     peer_rank = schedule_peer_rank[row * Int32(SWIGLU_TILE) + tile_row]
-                    inverse = inverse_router_weight(router_weights[local_token])
+                    inverse = inverse_router_weight(router_weights[row * Int32(SWIGLU_TILE) + tile_row])
                     d_hidden = arena + E4M3_CONTEXT_SWIGLU_BWD_D_HIDDEN + stage * BF16_TILE_BYTES
                     gate = arena + E4M3_CONTEXT_SWIGLU_BWD_GATE + stage * FP8_TILE_BYTES
                     up = arena + E4M3_CONTEXT_SWIGLU_BWD_UP + stage * FP8_TILE_BYTES
@@ -2631,8 +2968,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                         if first_col + Int32(stage) >= col_blocks:
                             row = row + Int32(1)
                         _counter_arrive_release_gpu(d_gate_up_ready, Int32(num_local_tokens // MLP_TILE_M) + row // Int32(2))
-        if thread == Int32(0) and retires:
-            _counter_arrive_release_gpu(routed_buffers_done, macro)
+        if thread == Int32(0) and retires != Int32(0):
+            _counter_arrive_release_gpu(routed_buffers_done, generation)
         return phase_bits
 
     @cute.jit
@@ -2703,9 +3040,9 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         d_w_routed_gate: cute.Tensor,  # bf16 (I, H, E) view of the (E, I, H) out
         d_w_routed_up: cute.Tensor,  # bf16 (I, H, E) view of the (E, I, H) out
         d_w_routed_down: cute.Tensor,  # bf16 (H, I, E) view of the (E, H, I) out
-        router_weights: cute.Tensor,  # f32 (M,): the macrobatch's router weights
+        router_weights: cute.Tensor,  # f32 (schedule capacity,): every routed row's router weight
         d_router_weight_partials: cute.Tensor,  # f32 (M, I / 128)
-        router_weights_ready: cute.Tensor,  # int32 counter (macrobatches,)
+        router_weights_ready: cute.Tensor,  # int32 counter (macrobatches,): word 0 = the comm CTAs' barrier after the router-weight preload
         d_y_routed_ready: cute.Tensor,  # int32 counter (minibatches + macrobatches,): + the stream's head words
         d_hidden_ready: cute.Tensor,  # int32 counter (row blocks x column blocks,)
         d_gate_up_ready: cute.Tensor,  # int32 counter (row blocks,)
@@ -2713,7 +3050,17 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         replayed_x_routed_ready: cute.Tensor,  # int32 counter (minibatches,)
         replayed_gate_up_ready: cute.Tensor,  # int32 counter (routed row blocks x column blocks,)
         replayed_hidden_ready: cute.Tensor,  # int32 counter (routed row blocks,)
-        routed_buffers_done: cute.Tensor,  # int32 counter (macrobatches,)
+        routed_buffers_done: cute.Tensor,  # int32 counter (minibatches,): ring slot g's routed readers
+        wgrad_segment_done: cute.Tensor,  # int32 counter (3 x E x routed weight tiles,): the per-tile Wgrad order
+        wgrad_read_consumed: cute.Tensor,  # int32 counter (minibatches,): ring slot g's Wgrad readers
+        reverse_dispatch_done: cute.Tensor,  # int32 counter (minibatches,): ring slot g's dX rows pushed
+        # The decoder metadata (the BF16 backward's builder, launched before the mega): per minibatch the experts
+        # its rows overlap and the expert x macrobatch segments completed in it (prefixes), the segments' experts;
+        # the builder's task owner buckets (BF16 task counts) are not read.
+        minibatch_expert_offsets: cute.Tensor,
+        completed_segment_offsets: cute.Tensor,
+        completed_segment_experts: cute.Tensor,
+        task_owner_buckets: cute.Tensor,
         tensormaps: cute.Tensor,  # uint8 (ROUTED_TENSORMAPS x 128,): the routed TMA descriptors (_write_tensormaps)
         schedule_capacity: Int32,
         num_local_tokens: Int32,  # T
@@ -2763,7 +3110,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         * the routed MXFP8 context and scratch (x, Gate, Up, Hidden, dY in e4m3 + e8m0, normal and
           transposed), d_hidden / d_x, the quantized d_gate / d_up and the three weight gradients;
         * the router weights of the macrobatch and the router-weight partials;
-        * the nine counters (``persistent_mxfp8_bwd._COUNTERS`` order) and the tensormap buffer;
+        * the twelve counters and the four decoder-metadata arrays (``persistent_mxfp8_bwd._COUNTERS`` order) and
+          the tensormap buffer;
         * the runtime scalars (schedule capacity, geometry, batch sizes, comm SMs, clamp limit, the
           SiTU betas, the combined-FC1 row offsets), the split-weight tables and descriptors, and
           the stream.
@@ -2845,6 +3193,13 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             replayed_gate_up_ready,
             replayed_hidden_ready,
             routed_buffers_done,
+            wgrad_segment_done,
+            wgrad_read_consumed,
+            reverse_dispatch_done,
+            minibatch_expert_offsets,
+            completed_segment_offsets,
+            completed_segment_experts,
+            task_owner_buckets,
             tensormaps,
             schedule_capacity,
             num_local_tokens,
@@ -2943,6 +3298,13 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         replayed_gate_up_ready: cute.Tensor,
         replayed_hidden_ready: cute.Tensor,
         routed_buffers_done: cute.Tensor,
+        wgrad_segment_done: cute.Tensor,
+        wgrad_read_consumed: cute.Tensor,
+        reverse_dispatch_done: cute.Tensor,
+        minibatch_expert_offsets: cute.Tensor,
+        completed_segment_offsets: cute.Tensor,
+        completed_segment_experts: cute.Tensor,
+        task_owner_buckets: cute.Tensor,
         tensormaps: cute.Tensor,
         schedule_capacity: Int32,
         num_local_tokens: Int32,
@@ -3245,21 +3607,25 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         routed_hidden_size = Int32(d_x_routed.shape[1])
         # The launch grid covers the schedule's capacity; the kernel computes the clusters that have a task
         # from the actual token count (_true_clusters) and the rest drain.
-        _, _, _, shared, _, _, _, routed_tasks, _, replay, _, _, wgrad = _task_counts(
+        _, _, _, shared, _, _, _, routed_tasks, _, replay, _, wgrad_matrix, _ = _task_counts(
             num_local_tokens, shared_hidden_size, routed_hidden_size, intermediate_size, num_local_experts, minibatch_size, self.has_shared, self.has_tail
         )
         capacity_minibatches = _ceil_div_i32(schedule_capacity, minibatch_size)
         capacity_macrobatches = _ceil_div_i32(schedule_capacity, macrobatch_size)
+        # Wgrad: one task per weight tile and matrix of every expert x macrobatch segment, at most one segment per
+        # expert plus one per macrobatch boundary (an expert without rows has one, in minibatch 0).
+        segment_capacity = capacity_macrobatches + num_local_experts - Int32(1)
+        wgrad = Int32(3) * (wgrad_matrix // num_local_experts) * segment_capacity
         if cutlass.const_expr(self.recompute_forward_context):
             # Every minibatch of the capacity runs the replay tasks, macrobatch 0's included.
-            capacity_clusters = num_comm_sms // Int32(CLUSTER_SIZE) + shared + capacity_minibatches * (routed_tasks + replay) + capacity_macrobatches * wgrad
+            capacity_clusters = num_comm_sms // Int32(CLUSTER_SIZE) + shared + capacity_minibatches * (routed_tasks + replay) + wgrad
         else:
             capacity_clusters = (
                 num_comm_sms // Int32(CLUSTER_SIZE)
                 + shared
                 + capacity_minibatches * routed_tasks
                 + (capacity_macrobatches - Int32(1)) * (macrobatch_size // minibatch_size) * replay
-                + capacity_macrobatches * wgrad
+                + wgrad
             )
         scheduler_params = utils.ClcDynamicPersistentTileSchedulerParams((capacity_clusters * CLUSTER_SIZE, 1, 1), gemm.CLUSTER_SHAPE)
         # The routed TMA descriptors into their global slots, read by the mega's producer K loops
@@ -3343,6 +3709,13 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             replayed_gate_up_ready,
             replayed_hidden_ready,
             routed_buffers_done,
+            wgrad_segment_done,
+            wgrad_read_consumed,
+            reverse_dispatch_done,
+            minibatch_expert_offsets,
+            completed_segment_offsets,
+            completed_segment_experts,
+            task_owner_buckets,
             tensormaps,
             num_local_tokens,
             shared_hidden_size,
@@ -3433,9 +3806,10 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         weight) into ``d``; ``a2`` / ``b2``: dgrad Gate+Up's second pair; ``d_add``: Wgrad's
         reduce-add for later contributions.  ``ctx``: the kernel's fixed arguments of
         ``_run_routed_gemm``; ``task``: ``(kind, macro, generation, row, column, k_start, k_end,
-        first)``; ``states``: the six pipeline states, returned advanced.  ``b_weight``: B is a
-        transposed routed weight, so it is MN-major when the columnwise payload is
-        TransformerEngine's native one."""
+        first, wgrad_begin, wgrad_end, padded_end)`` (the last three: a Wgrad's expert K bounds and the padded end
+        of its rows, for the segment order and the ring-slot retirement); ``states``: the six
+        pipeline states, returned advanced.  ``b_weight``: B is a transposed routed weight, so it is MN-major when
+        the columnwise payload is TransformerEngine's native one."""
         (
             epi_mma,
             routed_mma,
@@ -3481,8 +3855,23 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             main_grad_up_row_offset,
             routed_mn_mma,
             sB_mn,
+            wgrad_segment_done,
+            wgrad_read_consumed,
         ) = ctx
-        kind, macro, generation, row, column, k_start, k_end, first = task
+        kind, macro, generation, row, column, k_start, k_end, first, wgrad_begin, wgrad_end, padded_end = task
+        # A Wgrad's segment order and slot retirement are the epilogue's business alone (_run_routed_gemm): it gets
+        # the expert and its K bounds, the other warps nothing more than before.
+        wgrad_args = {}
+        if cutlass.const_expr(is_wgrad):
+            wgrad_args = dict(
+                wgrad_segment_done=wgrad_segment_done,
+                wgrad_read_consumed=wgrad_read_consumed,
+                wgrad_expert=expert,
+                wgrad_begin=wgrad_begin,
+                wgrad_end=wgrad_end,
+                wgrad_padded_end=padded_end,
+                wgrad_experts=num_experts,
+            )
         if cutlass.const_expr(is_wgrad and self.accumulate_wgrad):
             # Accumulating into main_grad: a Wgrad's D belongs to the Wgrad collective, whose atoms
             # the host built, so its epilogue partitions with that one (a float32 main_grad gets an
@@ -3633,6 +4022,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             sfb2_desc_ptr=sfb2_desc,
             d_desc_ptr=d_desc,
             d_row_tile_offset=d_row_tile_offset,
+            **wgrad_args,
         )
 
     @cute.kernel
@@ -3683,6 +4073,13 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         replayed_gate_up_ready: cute.Tensor,
         replayed_hidden_ready: cute.Tensor,
         routed_buffers_done: cute.Tensor,
+        wgrad_segment_done: cute.Tensor,
+        wgrad_read_consumed: cute.Tensor,
+        reverse_dispatch_done: cute.Tensor,
+        minibatch_expert_offsets: cute.Tensor,
+        completed_segment_offsets: cute.Tensor,
+        completed_segment_experts: cute.Tensor,
+        task_owner_buckets: cute.Tensor,
         tensormaps: cute.Tensor,
         num_local_tokens: Int32,
         shared_hidden_size: Int32,
@@ -3733,6 +4130,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             num_local_experts,
             macrobatch_size,
             minibatch_size,
+            completed_segment_offsets,
         )
         storage = utils.SmemAllocator().allocate(_Mxfp8BwdSharedStorage)
         arena = storage.arena.data_ptr().align(min_align=1024)
@@ -3782,6 +4180,9 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 d_x_routed_ready,
                 replayed_x_routed_ready,
                 routed_buffers_done,
+                wgrad_read_consumed,
+                reverse_dispatch_done,
+                minibatch_expert_offsets,
                 arena,
                 stream_mbarriers,
                 cluster_index,
@@ -3943,6 +4344,8 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 main_grad_up_row_offset,
                 routed_mn_mma,
                 sB_mn,
+                wgrad_segment_done,
+                wgrad_read_consumed,
             ]
             scheduler = utils.ClcDynamicPersistentTileScheduler.create(scheduler_params, cute.arch.block_idx(), cute.arch.grid_dim(), clc_response)
             clc_consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
@@ -3958,10 +4361,17 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             work = scheduler.initial_work_tile_info()
             logical_cluster = work.tile_idx[0] // Int32(CLUSTER_SIZE)
             active = Int32(work.is_valid_tile and logical_cluster >= comm_clusters and logical_cluster < true_clusters)
+            # Ring-slot reuse: a minibatch's slot is the one of the minibatch mpm earlier, whose push blocks (a full
+            # minibatch: only the last one is short, and it has no successor) the routed SwiGLU backward and Gate /
+            # Up dgrad wait for.
+            minibatches_per_macrobatch = Int32(macrobatch_size) // Int32(minibatch_size)
+            reverse_dispatch_required = (Int32(minibatch_size) // Int32(STREAM_ROWS)) * _ceil_div_i32(routed_hidden_size, Int32(STREAM_COLUMNS))
             # The task table's constants once per CTA; the per-task decode reads them.
             task_table = self._task_table(
                 num_tokens, num_local_tokens, shared_hidden_size, routed_hidden_size, intermediate_size, num_local_experts, macrobatch_size, minibatch_size
             )
+            # The decode cursor (minibatch, macrobatch, end of its tasks, its segment range), moved forward per task.
+            cursor_g, cursor_macro, cursor_end, cursor_first, cursor_next = self._decode_cursor(completed_segment_offsets, *task_table)
             # The routed TMA descriptors (the prologue launch's global copies) into the tensormap proxy once per CTA,
             # before this CTA's first use of them: in each producer warp the elected lane, which issues every TMA of
             # the warp, fences the descriptors it issues copies with; the warp syncs after (see ROUTED_TMA_POSITIONS).
@@ -3976,11 +4386,26 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                         cpasync.fence_tma_desc_acquire(_tensormap_ptr(tensormaps, position))
                 cute.arch.sync_warp()
             while active != Int32(0):
-                kind, macro, generation, local = self._decode_mxfp8_task(logical_cluster - comm_clusters, *task_table)
+                kind, macro, generation, local, segment_base, cursor_g, cursor_macro, cursor_end, cursor_first, cursor_next = self._decode_mxfp8_task(
+                    logical_cluster - comm_clusters, cursor_g, cursor_macro, cursor_end, cursor_first, cursor_next, completed_segment_offsets, *task_table
+                )
                 if warp == Int32(CLC_PRODUCER_WARP) and cta_rank == Int32(0):
                     clc_pipeline.producer_acquire(clc_producer)
                     scheduler.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer))
                     clc_producer.advance()
+                # The routed SwiGLU backward and Gate / Up dgrad of minibatch g overwrite the router partials and the dX
+                # rows of ring slot g % mpm, which the pushes of g - mpm read: those pushes first.  The SwiGLU task's
+                # every thread may write a partial (a CTA barrier after the wait); the dgrad's D stores are issued by
+                # the store warp alone (warp 0, gemm._is_store_warp).
+                if generation >= minibatches_per_macrobatch:
+                    if kind == Int32(ROUTED_SWIGLU_BWD):
+                        if thread == Int32(0):
+                            _counter_wait_gpu(reverse_dispatch_done, generation - minibatches_per_macrobatch, reverse_dispatch_required)
+                        cute.arch.sync_threads()
+                    elif kind == Int32(ROUTED_GATE_UP_DGRAD) and warp == Int32(0):
+                        with cute.arch.elect_one():
+                            _counter_wait_gpu(reverse_dispatch_done, generation - minibatches_per_macrobatch, reverse_dispatch_required)
+                        cute.arch.sync_warp()
                 #
                 # CTA-local tasks: the SwiGLU backward (shared, routed) and the replayed SwiGLU
                 #
@@ -4379,7 +4804,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 # Routed GEMM tasks (e4m3 + e8m0): replay Gate / Up, dgrad, Wgrad
                 #
                 else:
-                    valid, expert, row, column, k_start, k_end, first = self._routed_gemm_geometry(
+                    valid, expert, row, column, k_start, k_end, first, wgrad_begin, wgrad_end, padded_end = self._routed_gemm_geometry(
                         kind,
                         macro,
                         generation,
@@ -4394,13 +4819,19 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                         macrobatch_size,
                         minibatch_size,
                         valid_end_offset,
+                        segment_base,
+                        completed_segment_experts,
                     )
                     if valid == Int32(0):
-                        # An empty task still retires its buffers.
-                        if thread == Int32(0) and kind >= Int32(ROUTED_DOWN_DGRAD) and num_tokens > macrobatch_size:
-                            _counter_arrive_release_gpu(routed_buffers_done, macro)
+                        # An empty task still retires its share of the ring slot.
+                        if thread == Int32(0) and kind >= Int32(ROUTED_DOWN_DGRAD):
+                            if kind >= Int32(ROUTED_WGRAD_DOWN):
+                                if cta_rank == Int32(0):
+                                    _retire_wgrad_reads(wgrad_read_consumed, macro, wgrad_begin, padded_end, num_tokens, minibatch_size, macrobatch_size)
+                            elif _slot_reused(generation, num_tokens, minibatch_size, macrobatch_size) != Int32(0):
+                                _counter_arrive_release_gpu(routed_buffers_done, generation)
                     else:
-                        task = [kind, macro, generation, row, column, k_start, k_end, first]
+                        task = [kind, macro, generation, row, column, k_start, k_end, first, wgrad_begin, wgrad_end, padded_end]
                         if kind == Int32(REPLAY_GATE):
                             if cutlass.const_expr(self.E4M3_CONTEXT):
                                 ab_producer, ab_consumer, sf_producer, sf_consumer, acc_producer, acc_consumer = self._routed_gemm(
@@ -4539,7 +4970,9 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
                 if _is_cta_local(kind) != Int32(0) and work.is_valid_tile:
                     next_local = Int32(0)
                     if next_active != Int32(0):
-                        next_kind, _, _, _ = self._decode_mxfp8_task(next_logical - comm_clusters, *task_table)
+                        next_kind, _, _, _, _, _, _, _, _, _ = self._decode_mxfp8_task(
+                            next_logical - comm_clusters, cursor_g, cursor_macro, cursor_end, cursor_first, cursor_next, completed_segment_offsets, *task_table
+                        )
                         next_local = _is_cta_local(next_kind)
                     if next_local == Int32(0):
                         cute.arch.cluster_arrive()
@@ -4646,9 +5079,9 @@ class _PersistentMxfp8BwdMegaE4m3Context(_PersistentMxfp8BwdMega):
         d_w_routed_gate: cute.Tensor,  # bf16 (I, H, E) view of the (E, I, H) out
         d_w_routed_up: cute.Tensor,  # bf16 (I, H, E) view of the (E, I, H) out
         d_w_routed_down: cute.Tensor,  # bf16 (H, I, E) view of the (E, H, I) out
-        router_weights: cute.Tensor,  # f32 (M,): the macrobatch's router weights
+        router_weights: cute.Tensor,  # f32 (schedule capacity,): every routed row's router weight
         d_router_weight_partials: cute.Tensor,  # f32 (M, I / 128)
-        router_weights_ready: cute.Tensor,  # int32 counter (macrobatches,)
+        router_weights_ready: cute.Tensor,  # int32 counter (macrobatches,): word 0 = the comm CTAs' barrier after the router-weight preload
         d_y_routed_ready: cute.Tensor,  # int32 counter (minibatches + macrobatches,): + the stream's head words
         d_hidden_ready: cute.Tensor,  # int32 counter (row blocks x column blocks,)
         d_gate_up_ready: cute.Tensor,  # int32 counter (row blocks,)
@@ -4656,7 +5089,17 @@ class _PersistentMxfp8BwdMegaE4m3Context(_PersistentMxfp8BwdMega):
         replayed_x_routed_ready: cute.Tensor,  # int32 counter (minibatches,)
         replayed_gate_up_ready: cute.Tensor,  # int32 counter (routed row blocks x column blocks,)
         replayed_hidden_ready: cute.Tensor,  # int32 counter (routed row blocks,)
-        routed_buffers_done: cute.Tensor,  # int32 counter (macrobatches,)
+        routed_buffers_done: cute.Tensor,  # int32 counter (minibatches,): ring slot g's routed readers
+        wgrad_segment_done: cute.Tensor,  # int32 counter (3 x E x routed weight tiles,): the per-tile Wgrad order
+        wgrad_read_consumed: cute.Tensor,  # int32 counter (minibatches,): ring slot g's Wgrad readers
+        reverse_dispatch_done: cute.Tensor,  # int32 counter (minibatches,): ring slot g's dX rows pushed
+        # The decoder metadata (the BF16 backward's builder, launched before the mega): per minibatch the experts
+        # its rows overlap and the expert x macrobatch segments completed in it (prefixes), the segments' experts;
+        # the builder's task owner buckets (BF16 task counts) are not read.
+        minibatch_expert_offsets: cute.Tensor,
+        completed_segment_offsets: cute.Tensor,
+        completed_segment_experts: cute.Tensor,
+        task_owner_buckets: cute.Tensor,
         tensormaps: cute.Tensor,  # uint8 (ROUTED_TENSORMAPS x 128,): the routed TMA descriptors (_write_tensormaps)
         schedule_capacity: Int32,
         num_local_tokens: Int32,  # T
@@ -4756,6 +5199,13 @@ class _PersistentMxfp8BwdMegaE4m3Context(_PersistentMxfp8BwdMega):
             replayed_gate_up_ready,
             replayed_hidden_ready,
             routed_buffers_done,
+            wgrad_segment_done,
+            wgrad_read_consumed,
+            reverse_dispatch_done,
+            minibatch_expert_offsets,
+            completed_segment_offsets,
+            completed_segment_experts,
+            task_owner_buckets,
             tensormaps,
             schedule_capacity,
             num_local_tokens,
