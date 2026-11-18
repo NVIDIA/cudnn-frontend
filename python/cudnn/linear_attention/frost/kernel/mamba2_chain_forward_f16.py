@@ -31,6 +31,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 
 from ..common.host import get_dtype
 from ..common.piece_chain import CHAIN_THREADS, dtype_name, launch_scalar_state_chain
@@ -470,7 +471,7 @@ def build_chain_forward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_forward_cache[key] = cute.compile(
+        chain_forward_cache[key] = compile_cached(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -525,6 +526,8 @@ def build_chain_forward(
             from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
             fold_rows,
             *fold_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_forward_cache[key]
@@ -855,7 +858,7 @@ def build_chain_summary(
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
         work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        chain_summary_cache[key] = cute.compile(
+        chain_summary_cache[key] = compile_cached(
             chain_summary_host,
             int(unit_chunks),
             int(b_t),
@@ -895,6 +898,8 @@ def build_chain_summary(
             from_dlpack(transition, assumed_align=4).mark_layout_dynamic(leading_dim=1) if transition is not None else None,
             cuda.CUstream(int(stream)),
             from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_chain_summary_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_summary_cache[key]

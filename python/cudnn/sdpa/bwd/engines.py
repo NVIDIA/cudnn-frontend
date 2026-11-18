@@ -41,6 +41,7 @@ _SM100 = "SdpaBwdDslSm100"
 _SM100_D512_ROLE_SPLIT = "SdpaBwdDslSm100D512RoleSplit"
 _SM100_D512_TWO_BY_TWO = "SdpaBwdDslSm100D512TwoByTwo"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
+_SM100_D128_MXFP8 = "SdpaBwdDslSm100D128Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_D256_NATIVE = "SdpaBwdDslSm107D256FourByOne"
 _SM107_D256_2X2 = "SdpaBwdDslSm107D256TwoByTwo"
@@ -194,6 +195,10 @@ def _mxfp8_adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
         return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
+    if name == _SM100_D128_MXFP8:
+        from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100_d128
+
+        return api_dsl_mxfp8_sm100_d128.SdpaBwdDslSm100D128Mxfp8
     from cudnn.sdpa.bwd import api_dsl_sm107
 
     return getattr(api_dsl_sm107, name)
@@ -1300,7 +1305,7 @@ def _sm89_spec(*, d64=False) -> EngineSpec:
 
     The two-subgroup chain serves the original masks, head envelopes and packed
     features. Plain whole-tile MHA D64 keeps its dedicated body under a separate
-    identity. Both preserve the original Ada row's backend-trailing policy.
+    identity. The dedicated owner has its own measured placement entries.
     """
     name = "sdpa_bwd_sm89_f16_d64" if d64 else "sdpa_bwd_sm89"
     return EngineSpec(
@@ -1580,6 +1585,63 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         workspace_bytes=total_workspace_bytes,
         prepared=PreparedBwdLaunch(api._prepared, binding),
         default_stream=lambda: _cuda_driver().CUstream(torch.cuda.current_stream(api.q_desc.device).cuda_stream),
+    )
+
+
+def _sm100_d128_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.geometry import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
+
+    if cutedsl_too_old(version, floor=CUTEDSL_FLOOR):
+        want = ".".join(str(v) for v in CUTEDSL_FLOOR)
+        return f"the sm100 d128 MXFP8 backward requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
+    if (facts.d_qk, facts.d_v) != (128, 128):
+        return f"the sm100 d128 MXFP8 backward serves (D_QK, D_V) = (128, 128); graph has ({facts.d_qk}, {facts.d_v})"
+    if facts.s_q != facts.s_kv:
+        return f"the sm100 d128 MXFP8 backward serves S_q == S_kv only; graph has S_q={facts.s_q}, S_kv={facts.s_kv}"
+    if facts.scale is None:
+        return "the sm100 d128 MXFP8 backward needs a plan-time attn_scale; the graph's scale is not modeled"
+    if not (math.isfinite(facts.scale) and 0 < facts.scale <= MAX_SCALE):
+        return f"the sm100 d128 MXFP8 backward serves a finite attn_scale in (0, 2^12]; graph has {facts.scale!r}"
+    if padded_rows(facts.b, facts.h_q, facts.s_q) > MAX_ROWS:
+        return "the sm100 d128 MXFP8 backward indexes rows in int32: B * H_q * S (S rounded up to 256) must stay below 2^31"
+    for name, dim, stride in facts.port_layouts:
+        if name in ("q", "k", "v", "o", "dO", "dQ", "dK", "dV", "q_T", "k_T", "dO_T", "dO_f16"):
+            b, h, s, d = (int(x) for x in dim)
+            if tuple(int(x) for x in stride) != (h * s * d, s * d, d, 1):
+                return f"the sm100 d128 MXFP8 backward needs {name} BHSD-compact (stride (H*S*D, S*D, D, 1)); got stride {tuple(stride)}"
+    return None
+
+
+def _sm100_d128_mxfp8_spec() -> EngineSpec:
+    """Opt-in SM100 / SM103 D128 MXFP8 backward for compact BHSD self-attention.
+
+    Dense and causal graphs share the three-kernel chain. Deterministic mode
+    chooses the dK/dV walk split per batch element to preserve batch invariance.
+    """
+    from .kernels.sm100.d128_mxfp8 import contract
+    from .kernels.sm100.d128_mxfp8.host import lower
+
+    return EngineSpec(
+        name=contract.NAME,
+        capabilities=Capabilities(
+            implementation=contract.NAME,
+            sm_lo=100,
+            sm_hi=103,  # measured on cc 10.0 (B200) and cc 10.3 (B300)
+            d=frozenset({128}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            out_dtypes=frozenset({cudnn.data_type.BFLOAT16}),
+            is_mxfp8=True,
+            amax_dgrad=True,
+            gqa=True,
+            causal=True,
+            bottom_right=True,  # S_q == S_kv only (declaration check): the bottom-right diagonal is the top-left one
+            deterministic=True,
+            decode=False,
+            layouts=frozenset({"dense_flex"}),
+            declaration_check=_sm100_d128_mxfp8_declaration_mismatch,
+            band=band.BandSupport.from_legacy_flags(causal=True, bottom_right=True),
+        ),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_D128_MXFP8)),
     )
 
 
@@ -2446,13 +2508,15 @@ def _sm100_d128_pair_spec() -> EngineSpec:
 
 
 def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
+    """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or causal in either alignment, MHA or an integral head ratio."""
     from .d128_contract import validate_dense_bounds, validate_relay_launch
 
     if facts.thd or facts.padded:
         return "the SM90 backward chain serves dense graphs without padding masks"
-    if facts.bottom_right or facts.window_left is not None:
-        return "the SM90 backward chain serves unmasked or top-left causal attention"
+    if facts.bottom_right and facts.s_q > facts.s_kv:
+        return "unpadded bottom-right causal requires S_q <= S_kv"
+    if facts.window_left is not None:
+        return "the SM90 backward chain does not serve sliding windows"
     if facts.has_bias or facts.has_sink or facts.has_dropout:
         return "the SM90 backward chain serves graphs without bias, sinks or dropout"
     if facts.h_kv <= 0 or facts.h_q % facts.h_kv:
@@ -2483,6 +2547,7 @@ def _sm90_spec() -> EngineSpec:
             sm_hi=90,
             d=frozenset({64, 128}),
             causal=True,
+            bottom_right=True,
             deterministic=True,
             compact_bshd=True,
             gqa=True,
@@ -2785,6 +2850,7 @@ ENGINE_SPECS = (
     _sm100_spec(),
     _sm100_d512_role_split_spec(),
     _sm100_d512_two_by_two_spec(),
+    _sm100_d128_mxfp8_spec(),  # BHSD-compact D=128 on cc 10.0 / 10.3; ahead of the MXFP8 kernel pair (BSHD) where both admit
     _sm100_mxfp8_spec(),
     _sm100_mxfp8_pair_spec(),
     _sm100_d256_mxfp8_spec(),

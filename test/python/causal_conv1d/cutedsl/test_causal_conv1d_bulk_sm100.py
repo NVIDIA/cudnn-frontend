@@ -12,7 +12,7 @@ import pytest
 import torch
 from cuda.bindings import driver as cuda
 
-from causal_conv1d.cutedsl.reference import (
+from causal_conv1d.cutedsl.causal_conv1d_reference import (
     causal_conv1d_bulk_reference,
     causal_conv1d_update_reference,
 )

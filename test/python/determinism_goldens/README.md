@@ -36,6 +36,24 @@ Compiler check command inside the isolated container:
 Native qualification command from `test/python`:
 `pytest sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py -m L0 -k "four_column_groups or wide_tile_renderings"`.
 
+### FP16 causal convolution decode update
+
+`causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` exercises the
+public width-four inference API with identity and SiLU, compact three- and
+four-element state, and channel-last three-element state. It checks the output
+and in-place state against an independent FP32-compute reference and compares
+their bytes over eight launches with fresh state and output allocations and
+concurrent CUDA work. The stress cases use 33 rows and 1025 channels with padded
+input strides, an indexed padding row, and state slots outside the live batch.
+Batch checks replay one sequence alone, reorder the batch, replace neighbors,
+and duplicate the sequence into a distinct state slot. The six small golden
+cases use two rows and 17 channels, recording both outputs after the replay and
+reference checks. The operation is inference-only and has no backward.
+
+Replay, isolated batch checks, and all six goldens passed on GeForce RTX 4090
+(SM89), with PyTorch 2.12.1+cu130 and CuTe DSL 4.8.0. The goldens are in
+`c74756f44f441362/`.
+
 ### D256 nonpaged split physical origins (2026-11-16)
 
 `sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed
@@ -610,6 +628,7 @@ pytest core/test_determinism_utils.py
 | --- | --- | --- | --- |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
+| `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
@@ -631,6 +650,7 @@ pytest core/test_determinism_utils.py
 | `sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` | the SM90 D128 template (`SdpaFwdDslSm90`, the 128 x 128 tile pinned) | O, Stats | none (forward-only template; no backward) |
 | `sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py` | fixed SM90 dedicated D128 and three-WG D512 bodies, FP16/BF16 | O, Stats; claim counter in stress | none (forward-only qualification) |
 | `sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` | `pygraph.sdpa_mxfp8(causal_exclude_own_block=32)` (SM100/SM103 MXFP8 D128 FROST kernel) | BF16 O, FP32 Stats | — (the option is forward-only) |
+| `sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py` | `sdpa_mxfp8_backward` on the `sdpa_bwd_sm100_d128_mxfp8` row (SM100 / SM103, D128) | — (backward only) | BF16 dQ, dK, dV; FP32 amax_dQ / dK / dV when requested |
 | `sdpa/frost/test_sdpa_bwd_sm90.py` | `pygraph.sdpa_backward` through the opt-in `sdpa_bwd_sm90` row (the Hopper dense D64 / D128 key-owner chain with the ordered dQ relay) | — (backward-only engine row) | dQ, dK, dV |
 
 ### SM90 D128 template forward (issue #378): validation, 2026-11-13 (UTC)
@@ -1747,6 +1767,74 @@ selects the preceding record phase. The environment sets
 `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, preloads CUDA 13.4 NVRTC, and uses
 the cuDNN 9.30.0.4 library directory with isolated source/cache paths.
 
+### SM100 / SM103 D128 MXFP8 backward — qualification, 2026-11-13 (UTC)
+
+`sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py` covers the cc 10.0 / 10.3 CuTeDSL
+chain (prep, dK/dV, persistent dQ) behind `sdpa_mxfp8_backward`. The only atomics
+are the dQ kernel's work counter and the amax maximum. The counter decides which
+cluster computes a unit, not the order the unit sums in, and a maximum is exact in
+any order. Every plan fixes the dK/dV walk split, so repeated calls are bitwise
+identical. Under `use_deterministic_algorithm` the walk
+split is decided from one batch element, so results are also batch invariant.
+Without that request a large batch may keep the walk unsplit: a different order,
+still repeatable ([status page](../../../docs/operations/determinism.md)).
+
+The checks:
+- Repeats into NaN-poisoned outputs, eager and CUDA-graph replay, compare raw
+  bytes (dense, tail, causal, and causal + tail + amax).
+- Batch invariance: B = 2 against two B = 1 problems on the same data, and, where
+  the default plan differs (dense, tail, causal), the deterministic B = 8 plan.
+- Concurrent load and fresh allocations; a warm execute that compiles, allocates
+  and synchronizes nothing; a first build inside a capture.
+- A warm stress of the dQ kernel's `ld.shared`-released stages.
+- An L1 case past 2^32-byte offsets: the last batch element of B = 34 is bitwise
+  the B = 1 problem on its data.
+- Accuracy against the repo's MXFP8 reference, and error against FP32 matched to
+  the cuDNN backend's.
+
+`test_golden` holds one golden per distinct numerical path of the chain:
+- the walk-split dK/dV plan (B = 1, S = 1024, deterministic request);
+- the unsplit plan (B = 8, default request);
+- causal with an odd block count (S = 1152);
+- a sequence tail with amax (S = 1000, all three amax outputs).
+
+Each case passes the MXFP8 reference check and three replays before its bytes are
+hashed. The four records were written into a new directory under
+`CUDNN_DETERMINISM_RECORD` and passed a strict `CUDNN_DETERMINISM_GOLDENS` check in a
+fresh process (4 passed) before they were copied to `76371bd3c67774a8/`. That runtime
+is B300, CUDA driver API 13.4, Torch 2.11.0+cu130, cuDNN 9.28, CuTe DSL 4.8.1 and
+TVM FFI 0.1.15.post2. Other runtimes skip the comparison until a reviewed baseline is
+recorded for them.
+
+Qualification on 2026-11-14: B300 SXM6 AC (148 SMs), driver 615.71.10, Torch
+2.11.0+cu130, cuDNN 9.28.0, CuTe DSL 4.8.1 (compiling with CUDA 13.4). The row
+module passes **55 tests** at L0 + L1 with zero skips, the four goldens included. The
+GPU-free eligibility module passes **42**. The warm stress has 0 mismatches in 3000
+warm and 3000 poisoned launches; its unsafe control fails 200 / 200 on the same GPU.
+From `test/python`:
+
+```bash
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m "L0 or L1" \
+  sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128_eligibility.py
+```
+
+On 2026-11-16, after the row was extended to cc 10.0, the same B300 runtime passed the row module (55, the
+goldens included), the eligibility module (43, with the new cc 10.0 admission case) and `test_band_capabilities.py`
+(26) with zero skips.
+
+B200 qualification on 2026-11-16 (UTC): B200 (148 SMs), driver 615.71.10, otherwise the
+runtime above. The four cells were recorded into a new directory under
+`CUDNN_DETERMINISM_RECORD`, passed a strict `CUDNN_DETERMINISM_GOLDENS` check in a fresh
+process, and were copied to `ea37b1c6cd40d408/`. Their input and output hashes equal the
+B300 records: the `sm_100a` and `sm_103a` builds write the same bytes for these cells. The
+command above passes the row module (55 tests, the goldens included) and the eligibility
+module (43) with zero skips. The warm stress has 0 mismatches in 3000 warm and 3000
+poisoned launches; its unsafe control fails 200 / 200.
+
+Compute Sanitizer has not run on this row: the 12.9 sanitizer (2025.2.1) reports the B300 as
+an unsupported device, and a CUDA 13 build was not available on the test node.
+
 ### D128 paged live-column decode — qualification, 2026-11-12 (UTC)
 
 `sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py` covers FP16/BF16
@@ -1869,6 +1957,22 @@ CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 compute-sanitizer --tool racecheck --kerne
 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 compute-sanitizer --tool racecheck --kernel-name kns=bprop_sm90 \
   python -c "import torch; from test_sdpa_bwd_sm90 import _case; _case(torch.float16, 128, True, 1, 3, 1, 65, 257)"
 ```
+
+### SM90 bottom-right causal backward — validation, 2026-11-18 (UTC)
+
+On GH200 (cc 9.0), the opt-in `sdpa_bwd_sm90` chain passed the 57-case suite
+with cuDNN 9.27.0, PyTorch 2.14.0+cu130 and CuTe DSL 4.8.1. The tested
+kernel source has Git blob `f4a85ee168ee`. Run from `test/python` with
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m pytest -q sdpa/frost/test_sdpa_bwd_sm90.py`.
+
+The FP64 gradient checks pin this engine at both FP16 and BF16. Cases include
+a square control, offsets 63 and 65 on opposite sides of the 64-row query
+tile boundary, and one query attending to 513 keys. The same rectangular
+geometry also runs with top-left, bottom-right and unmasked graphs in one
+process. The 144-CTA rectangular GQA case checks repeated gradients bytewise.
+D128 GQA covers poisoned workspace, capture, replay and a changed upstream
+gradient under both request modes. FP16 D64 and BF16 D128 GQA compare dQ, dK
+and dV bytes across reordered and duplicated batches and the sequence alone.
 
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 

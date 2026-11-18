@@ -181,14 +181,20 @@ def _kmajor_offset(k, rows):
 
 
 @cute.jit
-def _walk(kv_tile, sq, causal: cutlass.Constexpr[bool]):
+def _walk(kv_tile, sq, diagonal_offset: cutlass.Constexpr):
     """The CTA's query steps: ``count`` 64-row tiles from ``start``; causal CTAs walk down from the sequence end to their
     diagonal, unmasked CTAs walk up from the first tile."""
     tiles = (sq + STEP_ROWS - 1) // STEP_ROWS
-    diagonal = kv_tile * (OWNED_ROWS // STEP_ROWS)
-    if cutlass.const_expr(causal):
+    if cutlass.const_expr(diagonal_offset is not None):
+        # The first query that sees any key in this tile satisfies q >= first_key - diagonal_offset.
+        # For each query tile the participating key tiles still form a prefix, as the ordered relay requires.
+        if cutlass.const_expr(diagonal_offset == 0):
+            first_tile = kv_tile * (OWNED_ROWS // STEP_ROWS)
+        else:
+            first_q = cute.math.max(cutlass.Int32(0), kv_tile * OWNED_ROWS - diagonal_offset)
+            first_tile = first_q // STEP_ROWS
         start = tiles - 1
-        count = _select_i32(diagonal < tiles, tiles - diagonal, cutlass.Int32(0))
+        count = _select_i32(first_tile < tiles, tiles - first_tile, cutlass.Int32(0))
     else:
         start = cutlass.Int32(0)
         count = tiles
@@ -196,8 +202,8 @@ def _walk(kv_tile, sq, causal: cutlass.Constexpr[bool]):
 
 
 @cute.jit
-def _q_tile(start, i, causal: cutlass.Constexpr[bool]):
-    if cutlass.const_expr(causal):
+def _q_tile(start, i, diagonal_offset: cutlass.Constexpr):
+    if cutlass.const_expr(diagonal_offset is not None):
         return start - i
     return start + i
 
@@ -291,17 +297,17 @@ def _epilogue(acc, slab, region_offset, tid, bar_id: cutlass.Constexpr[int], dty
 
 
 @cute.jit
-def _producer(slab, bars, k_desc, v_desc, q_desc, do_desc, kv_tile, kv_head, batch, sq, dtype: cutlass.Constexpr, causal: cutlass.Constexpr[bool]):
+def _producer(slab, bars, k_desc, v_desc, q_desc, do_desc, kv_tile, kv_head, batch, sq, dtype: cutlass.Constexpr, diagonal_offset: cutlass.Constexpr):
     bars.a_full.arrive(n_bytes=RESIDENT_BYTES, pred=prims.elect_sync())
     tma_load_tile(_tile(slab, 0, dtype, OWNED_ROWS), GmemTileTma(k_desc)(0, kv_tile * OWNED_ROWS, kv_head, batch), bars.a_full.smem_ptr)
     bars.b_full.arrive(n_bytes=RESIDENT_BYTES, pred=prims.elect_sync())
     tma_load_tile(_tile(slab, RESIDENT_BYTES, dtype, OWNED_ROWS), GmemTileTma(v_desc)(0, kv_tile * OWNED_ROWS, kv_head, batch), bars.b_full.smem_ptr)
-    start, count, tiles = _walk(kv_tile, sq, causal)
+    start, count, tiles = _walk(kv_tile, sq, diagonal_offset)
     state = PipelineState.start(phase=1)
     for outer in cutlass.range(0, count * RATIO, 1, unroll=1):
         i = outer // RATIO
         g = outer % RATIO
-        q_tile = _q_tile(start, i, causal)
+        q_tile = _q_tile(start, i, diagonal_offset)
         head = kv_head * RATIO + g
         _wait(bars.x_empty[state.idx], state.phase)
         bars.x_full[state.idx].arrive(n_bytes=STEP_BYTES, pred=prims.elect_sync())
@@ -321,14 +327,14 @@ def _producer(slab, bars, k_desc, v_desc, q_desc, do_desc, kv_tile, kv_head, bat
 
 
 @cute.jit
-def _stats_loader(slab, bars, lse, delta, kv_tile, kv_head, batch, sq, lane, causal: cutlass.Constexpr[bool]):
+def _stats_loader(slab, bars, lse, delta, kv_tile, kv_head, batch, sq, lane, diagonal_offset: cutlass.Constexpr):
     """Stage each step's LSE (log2 units) and delta rows in the stage's stats slot; rows past the sequence read the last row."""
-    start, count, tiles = _walk(kv_tile, sq, causal)
+    start, count, tiles = _walk(kv_tile, sq, diagonal_offset)
     state = PipelineState.start(phase=1)
     for outer in cutlass.range(0, count * RATIO, 1, unroll=1):
         i = outer // RATIO
         g = outer % RATIO
-        q0 = _q_tile(start, i, causal) * STEP_ROWS
+        q0 = _q_tile(start, i, diagonal_offset) * STEP_ROWS
         head = kv_head * RATIO + g
         _wait(bars.x_empty[state.idx], state.phase)
         slot = STATS + state.idx * STATS_BYTES
@@ -357,16 +363,16 @@ def _spin(slot, target):
 
 
 @cute.jit
-def _relay(slab, bars, dq_desc, turns, kv_tile, kv_head, batch, sq, lane, causal: cutlass.Constexpr[bool]):
+def _relay(slab, bars, dq_desc, turns, kv_tile, kv_head, batch, sq, lane, diagonal_offset: cutlass.Constexpr):
     """Add every step's dQ partial into the accumulator once the query tile's turn counter reaches the key tile index."""
-    start, count, tiles = _walk(kv_tile, sq, causal)
+    start, count, tiles = _walk(kv_tile, sq, diagonal_offset)
     phase = cutlass.Int32(0)
     tile = _dq_tile(slab)
     counters = turns.iterator.raw_ptr()
     for outer in cutlass.range(0, count * RATIO, 1, unroll=1):
         i = outer // RATIO
         g = outer % RATIO
-        q_tile = _q_tile(start, i, causal)
+        q_tile = _q_tile(start, i, diagonal_offset)
         head = kv_head * RATIO + g
         slot = counters + (
             cutlass.Int64(batch) * cutlass.Int64(turns.stride[0])
@@ -418,7 +424,7 @@ def _step(
     dv,
     dk,
     dtype: cutlass.Constexpr,
-    causal: cutlass.Constexpr[bool],
+    diagonal_offset: cutlass.Constexpr,
 ):
     _wait(bars.x_full[state.idx], state.phase)
     _wait(bars.y_full[state.idx], state.phase)
@@ -451,8 +457,8 @@ def _step(
         value = cute.math.exp2(cs[i] * scale_log2 - stats[c], fastmath=True)
         value = _select(q < sq, value)
         value = _select(kv < skv, value)
-        if cutlass.const_expr(causal):
-            value = _select(q >= kv, value)
+        if cutlass.const_expr(diagonal_offset is not None):
+            value = _select(q + diagonal_offset >= kv, value)
         p.append(value)
         ds.append(value * (cdp[i] - deltas[c]) * scale)
     p_words = cutlass.Vector.from_elements(tuple(p), cutlass.Float32).to(dtype).bitcast(cutlass.Uint32)
@@ -484,9 +490,9 @@ def _step(
 
 @cute.jit
 def _consumer(
-    slab, bars, w, tid, lse, delta, dk_desc, dv_desc, kv_tile, kv_head, batch, sq, skv, scale, dtype: cutlass.Constexpr, causal: cutlass.Constexpr[bool]
+    slab, bars, w, tid, lse, delta, dk_desc, dv_desc, kv_tile, kv_head, batch, sq, skv, scale, dtype: cutlass.Constexpr, diagonal_offset: cutlass.Constexpr
 ):
-    start, count, tiles = _walk(kv_tile, sq, causal)
+    start, count, tiles = _walk(kv_tile, sq, diagonal_offset)
     dv_acc = cutlass.Array(cutlass.Float32, D // 2, alignment=16)
     dk_acc = cutlass.Array(cutlass.Float32, D // 2, alignment=16)
     dv_acc.store(_zeros(D // 2))
@@ -505,7 +511,7 @@ def _consumer(
         for outer in cutlass.range(0, count * RATIO, 1, unroll=1):
             i = outer // RATIO
             g = outer % RATIO
-            q_tile = _q_tile(start, i, causal)
+            q_tile = _q_tile(start, i, diagonal_offset)
             head = kv_head * RATIO + g
             buf = step % 2
             dv, dk = _step(
@@ -531,7 +537,7 @@ def _consumer(
                 dv_acc.load(0, D // 2),
                 dk_acc.load(0, D // 2),
                 dtype,
-                causal,
+                diagonal_offset,
             )
             dv_acc.store(dv)
             dk_acc.store(dk)
@@ -565,7 +571,7 @@ def bprop_sm90_kernel(
     heads_kv: cutlass.Int32,
     scale: cutlass.Float32,
     dtype: cutlass.Constexpr,
-    causal: cutlass.Constexpr[bool],
+    diagonal_offset: cutlass.Constexpr,
 ):
     block, _, batch = cute.arch.block_idx()
     kv_head = block % heads_kv
@@ -594,14 +600,14 @@ def bprop_sm90_kernel(
     if wg == 0:
         prims.setmaxregister(PRODUCER_REGS, prims.SetMaxRegisterAction.DECREASE)
         if warp == 0:
-            _producer(slab, bars, k_desc, v_desc, q_desc, do_desc, kv_tile, kv_head, batch, sq, dtype, causal)
+            _producer(slab, bars, k_desc, v_desc, q_desc, do_desc, kv_tile, kv_head, batch, sq, dtype, diagonal_offset)
         if warp == 1:
-            _relay(slab, bars, dq_desc, turns, kv_tile, kv_head, batch, sq, tid % cute.arch.WARP_SIZE, causal)
+            _relay(slab, bars, dq_desc, turns, kv_tile, kv_head, batch, sq, tid % cute.arch.WARP_SIZE, diagonal_offset)
         if warp == 2:
-            _stats_loader(slab, bars, lse, delta, kv_tile, kv_head, batch, sq, tid % cute.arch.WARP_SIZE, causal)
+            _stats_loader(slab, bars, lse, delta, kv_tile, kv_head, batch, sq, tid % cute.arch.WARP_SIZE, diagonal_offset)
     else:
         prims.setmaxregister(CONSUMER_REGS, prims.SetMaxRegisterAction.INCREASE)
-        _consumer(slab, bars, wg - 1, tid, lse, delta, dk_desc, dv_desc, kv_tile, kv_head, batch, sq, skv, scale, dtype, causal)
+        _consumer(slab, bars, wg - 1, tid, lse, delta, dk_desc, dv_desc, kv_tile, kv_head, batch, sq, skv, scale, dtype, diagonal_offset)
 
 
 bprop_sm90_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -620,7 +626,7 @@ def bprop_host(
     dk: cute.Tensor,
     dv: cute.Tensor,
     scale: cutlass.Float32,
-    causal: cutlass.Constexpr[bool],
+    diagonal_offset: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     if cutlass.const_expr(q.element_type not in (cutlass.BFloat16, cutlass.Float16)):
@@ -644,5 +650,5 @@ def bprop_host(
         k.shape[2],
         scale,
         q.element_type,
-        causal,
+        diagonal_offset,
     ).launch(grid=(nk * k.shape[2], 1, q.shape[0]), block=(THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)

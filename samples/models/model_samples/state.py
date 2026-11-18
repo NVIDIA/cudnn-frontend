@@ -18,6 +18,11 @@ three taps where the last step left them and writes ``[the last two of them, x o
 :class:`TokenSlots` is that table as a step hands it to its block, and ``DecodeState.accept`` says how many tokens behind
 the first the run kept: the state then stands at that token, with nothing copied.
 
+**A decode step on such a state** (the prompt of a session that verifies behind it) works on token 0: the slots of token 0
+are the plain slots, the history columns 0 to 2 the plain history, the cache rows the plain cache.  ``DecodeState.decode_layers``
+are those views -- the same memory in the layout of one token per sequence, built with the state -- and
+``DecodeState.prompt_layers()`` hands them out while the state stands at token 0 in front of its first verify step.
+
 ``snapshot`` / ``restore`` exist for the replay and batch-invariance checks of ``tie_out``; a sample has no other use for them.
 """
 
@@ -50,6 +55,10 @@ class KvCache:
     def of(self, sequence: int) -> tuple:
         """Where ``sequence`` lives in each tensor of ``tensors()``."""
         return (sequence, sequence)
+
+    def first_token(self) -> "KvCache":
+        """The same cache as a decode step takes it: one position per sequence and step."""
+        return KvCache(self.k, self.v, 1)
 
 
 @dataclass
@@ -125,6 +134,15 @@ class RecurrentSlots:
         sequences = (self.state.shape[0] - 1) // self.tokens
         return ([1 + token * sequences + sequence for token in range(self.tokens)] if self.tokens > 1 else sequence + 1, sequence + 1)
 
+    def first_token(self) -> "RecurrentSlots":
+        """Token 0 of this pool in the layout of one token per sequence, on the same memory: the null slot and the slots of
+        token 0 (the plain slots), and the history columns 0 to 2.  A decode step that is handed this view reads and writes
+        what a step of several tokens reads at count 1; the slots of the later tokens and the later columns are not part
+        of it.  The history view keeps the pool's slot stride: ``tokens + 2`` columns apart."""
+        sequences = (self.state.shape[0] - 1) // self.tokens
+        taps = self.conv_storage.shape[1] - self.tokens + 1
+        return RecurrentSlots(self.state[: sequences + 1], self.conv_storage[:, :taps], 1)
+
 
 class DecodeState:
     """Per-layer state of ``sequences`` fixed sequences plus the position of the next token.  ``tokens``: the tokens per
@@ -157,6 +175,10 @@ class DecodeState:
                 self.layers.append(
                     KvCache(torch.zeros(kv, dtype=torch.bfloat16, device=self.device), torch.zeros(kv, dtype=torch.bfloat16, device=self.device), self.tokens)
                 )
+        #: the layers as a decode step takes them: the layers themselves at one token per sequence, else their token-0 views
+        self.decode_layers: List[object] = self.layers if self.tokens == 1 else [layer.first_token() for layer in self.layers]
+        #: the steps of several tokens per sequence this state has run: a decode step comes in front of the first of them
+        self.verify_steps = 0
 
     @property
     def accepted(self) -> int:
@@ -173,6 +195,19 @@ class DecodeState:
             raise ValueError(f"a step of {self.tokens} tokens per sequence keeps 0 to {self.tokens - 1} tokens behind the first; got {count!r}")
         self.slots.accept = count
         self.position += count + 1
+
+    def prompt_layers(self) -> List[object]:
+        """The layers a decode step is handed (``decode_layers``).  On a state of several tokens per sequence a decode step
+        is a step of the prompt: it works on token 0 and comes in front of the first verify step.  Behind one -- or with
+        the state standing at a later token -- its views would name slots and columns the run no longer stands on, and
+        that is a ``ValueError``."""
+        if self.tokens > 1 and (self.accepted or self.verify_steps):
+            steps = self.verify_steps
+            raise ValueError(
+                "a decode step on a state of several tokens per sequence starts from token 0, in front of its first verify step; "
+                f"this state stands at token {self.accepted} behind {steps} verify step{'' if steps == 1 else 's'}"
+            )
+        return self.decode_layers
 
     def standing(self) -> List[tuple]:
         """Per layer what the next step starts from, as tensors in the layout of one token per sequence: the recurrent state
@@ -194,12 +229,18 @@ class DecodeState:
         return sum(t.numel() * t.element_size() for layer in self.layers for t in layer.tensors())
 
     def snapshot(self) -> dict:
-        """A copy of every state tensor, the position and the tokens kept."""
-        return {"position": self.position, "accepted": self.accepted, "layers": [tuple(t.clone() for t in layer.tensors()) for layer in self.layers]}
+        """A copy of every state tensor, the position, the tokens kept and the verify steps run."""
+        return {
+            "position": self.position,
+            "accepted": self.accepted,
+            "verify_steps": self.verify_steps,
+            "layers": [tuple(t.clone() for t in layer.tensors()) for layer in self.layers],
+        }
 
     def restore(self, snap: dict) -> None:
         """Write a snapshot back into the existing allocations."""
         self.position = snap["position"]
+        self.verify_steps = snap.get("verify_steps", 0)
         if self.slots is not None:
             self.slots.accept = snap.get("accepted", 0)
         for layer, saved in zip(self.layers, snap["layers"]):

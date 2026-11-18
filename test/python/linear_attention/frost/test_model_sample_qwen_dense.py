@@ -302,42 +302,46 @@ raise SystemExit(0 if passed else 1)
 """
 
 
-def _verify(sequences, tokens):
-    """A decode session and a verify session of ``tokens`` tokens per sequence in a fresh interpreter (``VERIFY_PROGRAM``):
-    the run's lines.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
+def _program(program, tag, key, what, **fields):
+    """A small program that drives the helper layer in a fresh interpreter (``program``, formatted with ``fields``): the
+    run's lines.  ``tag`` starts its own lines (``[verify]``), ``key`` names the run in the routing record, ``what`` in a
+    failure.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
     import cudnn
 
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
-    program = VERIFY_PROGRAM.format(
+    program = program.format(
         deadline=CHILD_SECONDS - 60,
         package_root=str(Path(cudnn.__file__).resolve().parent.parent),
         cudnn_file=cudnn.__file__,
         models=str(MODELS),
-        sequences=sequences,
-        tokens=tokens,
+        **fields,
     )
     start = time.perf_counter()
     try:
         done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=CHILD_SECONDS)
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
-        pytest.fail(
-            f"the verify run did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}"
-        )
+        pytest.fail(f"the {what} did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
     out = done.stderr
-    tagged = [line for line in out.splitlines() if line.startswith("[verify] ")]
+    tagged = [line for line in out.splitlines() if line.startswith(f"{tag} ")]
     verdict = tagged[-1] if tagged else f"no verdict (exit code {done.returncode})"
-    versions = next((line[9:] for line in tagged if line.startswith("[verify] cuDNN Frontend ")), "no environment line")
-    key = f"model sample qwen_dense verify step, {sequences} x {tokens} tokens, stack fe-entries"
+    versions = next((line[len(tag) + 1 :] for line in tagged if line.startswith(f"{tag} cuDNN Frontend ")), "no environment line")
     frost_routing.measured(key, f"{verdict}; {versions}; {time.perf_counter() - start:.0f} s")
     assert done.stdout == "", f"a run of the helper layer writes nothing to standard output; it holds\n{done.stdout[-3000:]}"
-    if verdict.startswith("[verify] SKIP"):
+    if verdict.startswith(f"{tag} SKIP"):
         assert " FAIL" not in out, out[-6000:]  # a skip never covers a failed check
         pytest.skip(verdict)
-    held = verdict == "[verify] PASS" or verdict.startswith("[verify] RAN fe-entries stack (kernels not observed: ")
+    held = verdict == f"{tag} PASS" or verdict.startswith(f"{tag} RAN fe-entries stack (kernels not observed: ")
     assert done.returncode == 0 and held and " FAIL" not in out, out[-8000:]
     return out
+
+
+def _verify(sequences, tokens):
+    """A decode session and a verify session of ``tokens`` tokens per sequence in a fresh interpreter (``VERIFY_PROGRAM``):
+    the run's lines."""
+    key = f"model sample qwen_dense verify step, {sequences} x {tokens} tokens, stack fe-entries"
+    return _program(VERIFY_PROGRAM, "[verify]", key, "verify run", sequences=sequences, tokens=tokens)
 
 
 def _verify_asserts(out, sequences, tokens):
@@ -410,3 +414,125 @@ def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_token
     _verify_asserts(out, 4, 6)
     assert "batch invariance  one sequence alone vs among 4 (step t: sequence t mod 4)" in out
     assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"
+
+
+SPECULATIVE_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import census, loop, sampling, tie_out
+from model_samples.qwen_dense import QwenDense
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+drafted, new, tokens = {drafted}, 32, {drafted} + 1
+model = QwenDense.reduced()
+text = model_samples.TextIO.synthetic(model.geometry.vocab)
+common = dict(stack="fe-entries", device="cuda:0", capacity=8 + new + 2 * drafted)
+plain = model_samples.Session(model, text, **common)
+session = model_samples.Session(model, text, draft_tokens=drafted, share=plain, **common)
+try:
+    say(plain.plan_table([session]))
+    say(session.resolve().table())
+    say(loop.PROMPT_ROWS)
+    say(session.prefill_plan.table())
+    say(census.table(session.prefill_plan))
+    say(census.table(session.plan, session.claim()))
+except NotImplementedError as error:
+    say(f"[speculative] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[speculative] {{model_samples.check_environment().header()}}")
+plain.load()
+session.load()
+generator = torch.Generator().manual_seed(0)
+prompts = [torch.randint(0, model.geometry.vocab, (8,), generator=generator, dtype=torch.int32)]
+ids = plain.prefill(prompts)
+stream = plain.read(ids)
+for _ in range(new + drafted - 1):
+    ids = plain.step(ids)
+    stream += plain.read(ids)
+out = session.read(session.prefill(prompts))
+scheduled = []
+while len(out) < new:  # the loop is the caller's: a window, the step, the one host read, the count, the keep
+    length = len(scheduled) % tokens
+    window = [out[-1], *tie_out.forced_drafts(stream[len(out):], length, drafted, model.geometry.vocab)]
+    (greedy,) = session.read(session.verify(torch.tensor([window], dtype=torch.int32, device="cuda:0")))
+    kept = sampling.accepted(window, greedy)
+    session.accept(kept)
+    out += greedy[: kept + 1]
+    scheduled.append(length)
+same = out[:new] == stream[:new]
+say(f"[speculative] the {{new}} new tokens are the plain session's: {{same}}; kept {{session.record.accepted}}")
+against = tie_out.speculative_checks(session, plain, scheduled)
+say(against.text())
+session.trace(32)
+say(session.report().text())
+own = tie_out.run_checks(session, prompt_tokens=8)
+say(own.text())
+passed = same and against.ok and own.ok
+if passed and own.unobserved:
+    say(f"[speculative] RAN fe-entries stack (kernels not observed: {{own.unobserved}})")
+else:
+    say("[speculative] PASS" if passed else "[speculative] FAIL")
+raise SystemExit(0 if passed else 1)
+"""
+
+
+@pytest.mark.L1
+def test_a_session_with_draft_tokens_verifies_behind_its_prompt_on_the_fe_entries_stack():
+    """One session for a prompt and the verify steps behind it, on real launches: one sequence, five drafted tokens.  The
+    prompt goes through decode steps on token 0 of the state of six tokens per sequence -- the decode entry on that
+    layout -- and the verify steps follow on the same state, the caller supplying drafted tokens that are scheduled to be
+    kept 0 to 5 in turn.  The output is the plain session's; the comparison with decode steps holds its lines; the traced
+    pass holds the verify steps alone behind the replayed prompt, and the kernel check holds them against the verify
+    plan.  In a fresh interpreter, with both streams held: a run of the helper layer writes nothing to standard output."""
+    key = "model sample qwen_dense session with draft tokens, 1 x 6 tokens, stack fe-entries"
+    out = _program(SPECULATIVE_PROGRAM, "[speculative]", key, "run of a session with draft tokens", drafted=5)
+    lines = out.splitlines()
+    assert "the prompt of this session goes through decode steps, one per prompt token, on these rows:" in lines
+    assert "stack fe-entries, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS 6]" in out
+    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the prompt's decode steps on the fused decode entry in the target's form"
+    assert "[speculative] the 32 new tokens are the plain session's: True; kept [0, 1, 2, 3, 4, 5, 0, 1, 2, 3]" in lines
+    assert "speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind a prompt of 8 tokens; " in out
+    for name in ("tokens", "position", "prompt", "recorded", "rejected rows", "acceptance"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ") and "greedy tokens equal to the reference stack's" not in line]
+        assert line.endswith("    PASS"), line
+    # what the comparison replayed is the run this program's loop ran: its recorded steps, and where it ended
+    assert "ids and logits of 18 of 18 steps the session recorded of its own run (8 of its prompt, 10 verify steps) are this replay's bytes" in out
+    assert "8 prompt tokens + the kept ones = 39; the session's own run ended there    PASS" in out
+    kept = next(line for line in lines if line.startswith("  kept state  "))
+    assert kept.endswith(("    PASS", "    REPORTED")), kept
+    reported = next(line for line in lines if line.startswith("  bytes  "))
+    assert reported.endswith("    REPORTED") and "(reported: on stack fe-entries the two kinds of step may launch other kernels for a block)" in reported
+    assert (
+        "checks (1 sequence x 6 tokens per sequence, 10 verify steps; tokens kept behind the first: 0, 1, 2, 3, 4, 5, 0, 1, 2, 3; behind a prompt of 8 decode steps)"
+        in lines
+    )
+    assert "byte-identical on a second run from a fresh state    PASS" in out
+    judged = [line for line in lines if line.startswith("  blocks  ")]
+    assert len(judged) == 2 and all(line.endswith("    PASS") for line in judged), "the prompt's decode steps and the verify steps, each against the reference"
+    steps = [line for line in lines if line.split()[:1] == ["linear_attention.step"] and "[band: gdn_step]" in line]
+    assert len(steps) == 2 and all(line.endswith("[band: gdn_step]  PASS") and "conv history equal; null slot untouched" in line for line in steps)
+    assert any(line.startswith("rate                  not printed: the drafted tokens of these steps are their caller's") for line in lines)
+    traced = [line for line in lines if line.startswith("traced pass (")]
+    assert not traced or traced[0].endswith(" | behind the prompt's 8 decode steps, replayed untraced")
+    if "kernel identity, as planned: " in out:  # a GPU the census has a section for: the verify plan's share of the target, with its split
+        reached = "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
+        assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1" in out
+    observed = [line for line in lines if line.startswith("  kernels  ")]
+    # the kernel check is of the verify steps: beside its verdict the run says that the prompt's decode steps were not observed
+    assert (
+        not observed
+        or "    the prompt's decode steps: 8 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)" in lines
+    )
+    frost_routing.measured(
+        "model sample qwen_dense session with draft tokens, 1 x 6 tokens: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
+    )

@@ -688,11 +688,12 @@ records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
 arguments, which pin shapes, strides and flags the way the params pin dtypes
 and masks (SDPA + GEMM suites: 5867 tests, 53:06 cold, 2:53 warm). An
 argument that is not a plain value (a tensor, a device, a stream) makes the
-key None and the call compiles as before. The GDN/GDP warmup forwards and GDN2/KDA uncut and piece-chain forwards
+key None and the call compiles as before. The linear-attention hosts the FROST engines build (GDN/GDP/Mamba-2 warmup,
+GDN2/KDA uncut and every family's piece-chain hosts: forward, backward and summary)
 also use this cache, with their existing static specialization tuples as keys.
 Those tuples include dtype, rank/layout specialization, device, schedule and
-gate/state flags; packed token totals remain dynamic. Other linear-attention
-compilers and the SDPA adapters'
+gate/state flags; packed token totals remain dynamic. The stand-alone linear-attention
+`chunk_*` launchers and the SDPA adapters'
 helper kernels in `api_dsl` still compile without persistent artifacts. A
 hit is the same object a miss produced, so the reloaded kernel is called
 exactly as the in-process one.

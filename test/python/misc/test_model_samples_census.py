@@ -7285,3 +7285,128 @@ def test_the_loader_keeps_the_out_projection_weights_by_call_site(monkeypatch):
     assert (
         step["stored"] - before["stored"] == codes and before["copies"] - step["copies"] == codes
     ), "a step reads these weights at one byte per element, not two"
+
+
+def _draft_run(monkeypatch, drafted=5, steps=3, stack="native", verify=True, **stand_in):
+    """A session built with ``draft_tokens=`` on the stand-in providers and the stand-in profiler of :func:`_stand_ins`,
+    behind a plain session on the same load: a prompt through ``prefill``, then ``steps`` verify steps of seeded ids, each
+    keeping another count (``verify=False``: the prompt alone).  Returns the session, its run recorded and no traced pass
+    made yet.  The ids are those of seed 1: with some ids the fp32 chains of the stand-ins leave the logits band on this
+    tiny geometry, which says nothing about the session; what a test of a defect asserts is that defect's own line."""
+    from model_samples import Session, TextIO, blocks, census
+
+    from model_samples.qwen_dense import QwenDense
+
+    stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))
+    build = _stand_ins(monkeypatch, **stand_in)
+    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
+    model = _tiny_model()
+    monkeypatch.setattr(QwenDense, "_target", _census_of(model))
+    text = TextIO.synthetic(model.geometry.vocab)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    tokens = drafted + 1
+
+    def plan(per_sequence, **more):
+        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True, **more}
+        return blocks.plan(model.provider_table, model.regimes, facts, 1, per_sequence, stack, model=model, options=options, factories=build)
+
+    common = dict(sequences=1, stack=stack, device="cpu", capacity=40, check_kernels=True)
+    first = Session(model, text, **common)
+    session = Session(model, text, share=first, draft_tokens=drafted, **common)
+    first.plan, session.plan, session.prefill_plan = plan(1), plan(tokens), plan(1, state_tokens=tokens)
+    first._followers = (session,)  # as ``plan_table([session])`` leaves it: the load keeps what all three plans read
+    first.load()
+    session.load()
+    session.read(session.prefill([text.encode("abc")]))
+    generator = torch.Generator().manual_seed(1)
+    for step in range(steps if verify else 0):
+        ids = torch.randint(0, model.geometry.vocab, (1, tokens), generator=generator, dtype=torch.int32)
+        greedy = session.read(session.verify(ids))
+        assert len(greedy[0]) == tokens
+        session.accept(step % tokens)
+    return session
+
+
+def test_a_traced_pass_of_engine_steps_replays_the_prompt_untraced(monkeypatch):
+    """The traced pass of a session that prefills and verifies behind its prompt: the prompt is replayed from a zero state
+    in front of the profiler and ended by its host read, the traced window holds the verify steps alone -- one call log
+    per traced step, the records of the verify plan's launches -- and the kernel check holds them against the verify
+    plan, saying beside its verdict that the prompt's decode steps were not observed.  A launch more inside a verify
+    step fails it; a session that has recorded no verify step says why it has no traced pass."""
+    from model_samples import census, tie_out
+
+    session = _draft_run(monkeypatch)
+    position, counts = session.state.position, list(session.record.accepted)
+    assert counts == [0, 1, 2] and session.prompt_record.count == 3
+    from model_samples import loop
+
+    fed, order, feed, window = [], [], type(session)._feed, loop.trace_steps
+
+    class Chosen:  # the ids a prompt step chose, as the traced pass is handed them: a host read of them is seen
+        def __init__(self, ids):
+            self.ids = ids
+
+        def tolist(self):
+            order.append(f"host read behind prompt token {len(fed)}")
+            return self.ids.tolist()
+
+    monkeypatch.setattr(type(session), "_feed", lambda self, ids: Chosen(feed(self, ids)) if fed.append(int(ids[0])) is None else None)
+    monkeypatch.setattr(loop, "trace_steps", lambda *operands, **more: window(*operands, **more) if order.append("the traced window") is None else None)
+    session.trace(8)
+    assert fed == session.prompt_record.prompt[0].tolist() and len(fed) == 3, "the prompt was replayed in front of the traced steps, token by token"
+    # ... and ended as the loop ends a prompt, by the one host read of its last ids: nothing of it is in flight when the window opens
+    assert order == ["host read behind prompt token 3", "the traced window"], order
+    traced = session.traced
+    assert len(traced.steps) == len(traced.call_log) == 3, "three verify steps were recorded: one call log and one cut of the records per traced step"
+    assert all(len(calls) == 20 and {call.rows for call in calls} == {6} for calls in traced.call_log), "the calls of a verify step, at its six rows"
+    names = [[record.name for record in step] for step in traced.steps]
+    assert all(sum(name == VERIFY_SYMBOL for name in step) == 1 for step in names), "the fused verify step of the linear-attention layer"
+    assert not any("gdn_decode_fused" in name for step in names for name in step), "no decode step of the prompt is in the traced window"
+    assert all(step[-1] == HOST_READ and step.count(HOST_READ) == 1 for step in names), "a traced step ends in its one host read"
+    assert (session.state.position, session.record.accepted, session.prompt_record.count) == (position, counts, 3), "the run's state and records are put back"
+    assert traced.rows == 6 and traced.claim is not None and census.configuration_of(session.plan) == "verify"
+    report = next(line for line in session.report().text().splitlines() if line.startswith("traced pass (3)"))
+    assert report.endswith(" | behind the prompt's 3 decode steps, replayed untraced")
+    checks = tie_out.run_checks(session, prompt_tokens=3)
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
+    assert (
+        checks.lines[0]
+        == "checks (1 sequence x 6 tokens per sequence, 3 verify steps; tokens kept behind the first: 0, 1, 2; behind a prompt of 3 decode steps)"
+    )
+    blocks_lines = [line for line in checks.lines if line.startswith("  blocks ")]
+    assert len(blocks_lines) == 2 and all(line.endswith("    PASS") for line in blocks_lines), "the stand-ins of both plans are judged against the reference"
+    # the kernel check looked at the verify steps: beside its verdict the run says what it did not look at
+    unseen = "    the prompt's decode steps: 3 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
+    assert checks.lines[[line.startswith("  kernels ") for line in checks.lines].index(True) + 1 :].count(unseen) == 1, checks.text()
+    # the block check of the prompt covers the steps it was asked for: one call of the fused decode step where all three have three
+    step = next(line for line in checks.lines if line.split()[:1] == ["linear_attention.step"])
+    assert "   3 calls " in step and "[band: gdn_step]  PASS" in step, step
+    some = _draft_run(monkeypatch)
+    some.trace(8)
+    first = tie_out.run_checks(some, prompt_tokens=3, max_prompt_steps=1)
+    assert first.ok and first.lines[0].endswith("behind a prompt of 3 decode steps, the first 1 of them judged)")
+    assert "   1 calls " in next(line for line in first.lines if line.split()[:1] == ["linear_attention.step"])
+    # ... and a prompt of which no step is judged says that, not that its provider blocks are the reference chain
+    unjudged = _draft_run(monkeypatch)
+    unjudged.trace(8)
+    nothing = tie_out.run_checks(unjudged, prompt_tokens=3, max_prompt_steps=0)
+    assert nothing.ok and "  blocks            the prompt's decode steps: no step of this kind was judged    REPORTED" in nothing.lines
+    assert not any("no provider block to judge" in line for line in nothing.lines), nothing.text()
+    # a launch more inside a verify step: the kernel check of the verify plan fails with its sentence, in every traced step
+    wrong = _draft_run(monkeypatch, projection_defect="extra")
+    wrong.trace(8)
+    checks = tie_out.run_checks(wrong, prompt_tokens=3)
+    kernels = [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
+    assert not checks.ok and checks.kernels == census.FAIL and kernels, checks.text()
+    assert all("which no row there declares; nothing may sit between two exact rows" in line for line in kernels), kernels
+    assert (
+        kernels[0].startswith("kernels: step 0 (and 2 more of the 3 traced steps): launched ")
+        and "add_norm_quantize (layer 0) and projection.fp8.in (layer 0)" in kernels[0]
+    )
+    # a session that has fed its prompt and verified nothing: why there is no traced pass, and the kernels are not observed
+    idle = _draft_run(monkeypatch, verify=False)
+    idle.trace(8)
+    why = "needs a recorded verify step behind the prompt on a CUDA device"
+    assert idle.traced.steps is None and idle.traced.missing == why and idle.report().trace_missing == why
+    status, unobserved, lines = tie_out.kernel_check(idle)
+    assert (status, unobserved) == (census.NOT_OBSERVED, why) and lines[0].endswith(f"not observed: {why}    {census.NOT_OBSERVED}")

@@ -730,7 +730,7 @@ class QwenDense:
         )
 
     # ------------------------------------------------------------------ one decode step
-    def step(self, call, weights: Weights, state, ids):
+    def step(self, call, weights: Weights, state, ids, tokens: Optional[int] = None):
         """One step: ``ids`` ``[rows]`` int32 on the device -> ``(next ids [rows] int32, logits [rows, vocabulary])``.
         ``call(block, layer, *operands)`` runs one block; a session passes the plan's blocks, a check wraps them.
 
@@ -738,9 +738,22 @@ class QwenDense:
         one.  On a state of ``T`` tokens per sequence it is the verify step: ``rows`` = sequences x ``T``, sequence by
         sequence; the linear-attention block is handed the step's slot table, an attention layer works on ``T``
         positions per sequence from ``state.position`` on, and the position stays where it is until the caller says how
-        many of the tokens it keeps (``state.accept``)."""
+        many of the tokens it keeps (``state.accept``).
+
+        ``tokens`` is the tokens per sequence of THIS step; left out, it is the state's.  ``tokens=1`` on a state of
+        several is the decode step of a prompt in front of the verify steps: ``rows`` = sequences, the blocks are handed
+        the plain slot ids and the token-0 views of the state (``state.prompt_layers()``: a ``ValueError`` once the state
+        stands behind a verify step), and the position moves on by one.  Any other count than the state's is a
+        ``ValueError``: a state serves its own step and the decode step of its prompt."""
+        tokens = state.tokens if tokens is None else tokens
+        if tokens == state.tokens:
+            layers = state.layers
+        elif tokens == 1:
+            layers = state.prompt_layers()  # token 0 of every pool and cache, in the layout of one token per sequence
+        else:
+            raise ValueError(f"a state of {state.tokens} tokens per sequence runs steps of {state.tokens} tokens or of one (its prompt); got tokens={tokens!r}")
         position = state.position
-        slots = state.slot_ids if state.tokens == 1 else state.slots  # the slot of every row, or the table of a step of several tokens
+        slots = state.slot_ids if tokens == 1 else state.slots  # the slot of every row, or the table of a step of several tokens
         branch, residual = call("embedding", -1, ids, weights.embedding), None
         for i, layer in enumerate(weights.layers):
             site = layer.kind if residual is not None else layer.kind + FIRST  # the first norm of a step starts the residual stream
@@ -748,10 +761,10 @@ class QwenDense:
             row = call("projection.fp8.in", i, q, layer.in_proj, IN_PROJECTION_SITES[layer.kind])
             if layer.kind == "linear_attention":
                 x, z = split_qkvz(row, layer.gdn.qkv_channels, layer.gdn.value_heads, layer.gdn.head_dim)
-                mixed = call("linear_attention.step", i, x, z, normed, slots, layer.gdn, state.layers[i])
+                mixed = call("linear_attention.step", i, x, z, normed, slots, layer.gdn, layers[i])
             else:
-                qh, gate = call("attention.prepare", i, row, state.layers[i], position, layer.attn)
-                attended = call("attention.core", i, qh, state.layers[i], position)
+                qh, gate = call("attention.prepare", i, row, layers[i], position, layer.attn)
+                attended = call("attention.core", i, qh, layers[i], position)
                 mixed = call("attention.gate_quantize", i, attended, gate, layer.out_quant)
             branch = call("projection.fp8.out", i, mixed, layer.out_proj, OUT_PROJECTION_SITES[layer.kind])
             q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
@@ -759,6 +772,8 @@ class QwenDense:
         q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
-        if state.tokens == 1:
+        if tokens == 1:
             state.position = position + 1
+        else:
+            state.verify_steps += 1  # the kept count moves the position (``state.accept``); a decode step no longer fits this state
         return next_ids, logits

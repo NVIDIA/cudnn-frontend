@@ -82,3 +82,14 @@ pytest tools/cudnn_repro/tests/ -vv
 # Control test targets
 CUDNN_REPRO_TARGETS="test1,test2" pytest tools/cudnn_repro/tests/
 ```
+
+With the repository's CUDA test environment active and `cudnn-repro` installed,
+run the FP16 and BF16 paged SDPA round-trip checks from the repository root.
+
+```bash
+python -m pytest -v -rs tools/cudnn_repro/tests/test_cudnn_repro_closed_loop.py::test_reproducer_json_matches_paged_fwd
+```
+
+Both cases should report `PASSED`. Each captures a graph with a logical KV
+length of 300 and 32-token pages, runs the generated pytest command, and
+compares the original and replayed graph logs.
