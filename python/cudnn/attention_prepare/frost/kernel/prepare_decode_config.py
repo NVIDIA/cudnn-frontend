@@ -19,7 +19,7 @@ One thread block per (token, head) of ``HEADS`` query rows and ``KV_HEADS`` key 
 ``WARPS`` full warps, thread ``i`` owns the two elements ``2 i``, ``2 i + 1`` of its row.  The row's sum of squares is ONE fixed tree
 (a fused step over a thread's two elements, a butterfly over the 32 lanes of a warp with the offsets 16, 8, 4, 2, 1, a butterfly
 over the warp sums); everything behind it is element-wise except the rotary part, where a thread reads its partner element from
-the lane ``HALF / 2`` away.
+the thread ``HALF / 2`` lanes away.
 
 WHAT CHANGES BYTES: the geometry (the tree and the divisor), ``EPS``, ``POSITIONS`` with its ``SECTION`` (which position row a
 rotary index reads; and which product of the second rotary half is the fused one -- ``n[r + HALF] * cos`` under ``"3d"``,
@@ -302,7 +302,7 @@ def position_row_of(cfg: Cfg, rotary_index: int) -> int:
 
 
 def position_row_masks(cfg: Cfg) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    """``((h0, w0), (h1, w1))``: per element of a thread's pair (rotary index ``2 j`` and ``2 j + 1`` for lane group index
+    """``((h0_mask, w0_mask), (h1_mask, w1_mask))``: per element of a thread's pair (rotary index ``2 j`` and ``2 j + 1`` for lane group index
     ``j = lane % (HALF / 2)``) the bit masks over ``j`` of the indices that read position row 1 and position row 2
     (:func:`position_row_of`).  Compile-time constants of the kernel: the select needs no division."""
     masks = []

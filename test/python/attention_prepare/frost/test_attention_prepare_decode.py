@@ -106,10 +106,10 @@ def test_config_constants_and_tables():
     rows = [kcfg.position_row_of(cfg, r) for r in range(HALF)]
     assert rows == [(r % 3) if not (r % 3 == 2 and r >= 30) else 0 for r in range(HALF)]
     assert all(kcfg.position_row_of(_cfg("1d-p64-i64-i64"), r) == 0 for r in range(HALF))
-    (h0, w0), (h1, w1) = kcfg.position_row_masks(cfg)
+    (h0_mask, w0_mask), (h1_mask, w1_mask) = kcfg.position_row_masks(cfg)
     for j in range(HALF // 2):
-        assert ((h0 >> j) & 1, (w0 >> j) & 1) == (int(rows[2 * j] == 1), int(rows[2 * j] == 2)), j
-        assert ((h1 >> j) & 1, (w1 >> j) & 1) == (int(rows[2 * j + 1] == 1), int(rows[2 * j + 1] == 2)), j
+        assert ((h0_mask >> j) & 1, (w0_mask >> j) & 1) == (int(rows[2 * j] == 1), int(rows[2 * j] == 2)), j
+        assert ((h1_mask >> j) & 1, (w1_mask >> j) & 1) == (int(rows[2 * j + 1] == 1), int(rows[2 * j + 1] == 2)), j
     short = replace(cfg, SECTION=(20, 4, 8))  # another section: the masks follow it
     assert [kcfg.position_row_of(short, r) for r in range(HALF)] == [
         1 if (r % 3 == 1 and r < 12) else (2 if (r % 3 == 2 and r < 24) else 0) for r in range(HALF)

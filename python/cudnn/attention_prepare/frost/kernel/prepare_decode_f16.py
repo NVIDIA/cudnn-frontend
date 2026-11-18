@@ -16,7 +16,7 @@ directory.
 CHANGES against the source the file header names: written on the CuTe DSL (the source is a Triton kernel); the geometry, the
 epsilon, the position form, the page size and the two integer dtypes are compile-time constants of a config; a thread's elements are
 loaded once (the source loads the rotary elements and their weights a second time and normalises them again -- the same fp32
-operations on the same operands); the rotary part reads its partner element from another lane of the warp instead of from memory
+operations on the same operands); the rotary part reads its partner element from another thread of the warp instead of from memory
 and spells its fused multiply-adds explicitly (the source leaves the contraction of its two-product sums to its compiler);
 the keys and values are written into paged pools at a slot (the source writes dense outputs); the pool store is also predicated by
 the pool's capacity; the dependent-launch wait and release are launch arms.
@@ -46,7 +46,7 @@ PIPELINE, in order, for every thread:
    one addition, the approximate reciprocal square root with flush-to-zero.
 9. ``n_j = bf16( (x_j x inv) x (w_j + 1) )``: two fp32 multiplications and one addition, then nearest-even to bf16 -- THE normalized
    value of record, widened back exactly for the rotation.
-10. Warp 0 only (the elements ``0 .. ROTARY_DIM - 1``): the partner value of each element from the lane ``HALF / 2`` away (one
+10. Warp 0 only (the elements ``0 .. ROTARY_DIM - 1``): the partner value of each element from the thread ``HALF / 2`` lanes away (one
     ``shfl.sync.bfly`` per element); the position of each of the thread's two rotary indices (``"3d"``: one of three position rows
     by a compile-time mask over the index); the cosine and the sine of each index from the bf16 table row of that position (32-bit
     loads of the table word that holds the pair); ONE fp32 multiply (the rounded product) and ONE fused multiply-add per value,
@@ -232,12 +232,12 @@ def frost_attention_prepare(
         pos1 = pos0
         if cutlass.const_expr(cfg.POSITIONS == "3d"):
             # the position row of a rotary index is a compile-time fact of the index: a mask over j per element of the pair
-            (h0, w0_mask), (h1, w1_mask) = position_row_masks(cfg)
+            (h0_mask, w0_mask), (h1_mask, w1_mask) = position_row_masks(cfg)
             pos_h = _load_int(at_token + position_row, wide)
             pos_w = _load_int(at_token + position_row + position_row, wide)
             pos_t = pos0
-            pos0 = pos_h if ((INT32(h0) >> j) & 1) != 0 else (pos_w if ((INT32(w0_mask) >> j) & 1) != 0 else pos_t)
-            pos1 = pos_h if ((INT32(h1) >> j) & 1) != 0 else (pos_w if ((INT32(w1_mask) >> j) & 1) != 0 else pos_t)
+            pos0 = pos_h if ((INT32(h0_mask) >> j) & 1) != 0 else (pos_w if ((INT32(w0_mask) >> j) & 1) != 0 else pos_t)
+            pos1 = pos_h if ((INT32(h1_mask) >> j) & 1) != 0 else (pos_w if ((INT32(w1_mask) >> j) & 1) != 0 else pos_t)
         table_row_bytes = INT64(cfg.ROTARY_DIM * ELEMENT_BYTES)
         in_row = (j * PAIR_BYTES).to(INT64)  # the table word that holds the pair of rotary indices 2 j, 2 j + 1
         sin_half = INT64(cfg.HALF * ELEMENT_BYTES)
