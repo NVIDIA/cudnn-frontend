@@ -1,0 +1,105 @@
+{
+  "inputs": {
+    "descale_k": {
+      "dtype": "torch.float32",
+      "sha256": "10c938d7382c04f0aff147e22409fd648eabe0359684a33c4ba3ca8264dd42a2",
+      "shape": [
+        1
+      ]
+    },
+    "descale_q": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1
+      ]
+    },
+    "descale_v": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1
+      ]
+    },
+    "k": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "497508f4fc64cf8731093a2336071317676c5432a5e9b7d13ddd122a1fb04f2d",
+      "shape": [
+        1,
+        1,
+        32768,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "25d805ef8735f8047ed7d4e6a8ad937842f66c6c44d0de946c3f5fddb61fe0fc",
+      "shape": [
+        1,
+        1,
+        16,
+        128
+      ]
+    },
+    "scale_o": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "cea505d15342fef4b3ccf25d2166f660cbd312d20bed317a3d92489de3e02256",
+      "shape": [
+        1,
+        1,
+        32768,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "amax_o": {
+      "dtype": "torch.float32",
+      "sha256": "8bee9e610ea69cb6535ade1b89f93304d6b5ea5463cef22acc0cf4c5cc63e8b6",
+      "shape": [
+        1
+      ]
+    },
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "058426a88ca9c56662c43e2266e2cf439c178193447bd77bb7c3f74198b8bbf0",
+      "shape": [
+        1,
+        1,
+        16
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "1dc02cf5907244a63732f7630e67e4393002f09ba8dfde82875b54d07bbfb2fa",
+      "shape": [
+        1,
+        1,
+        16,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13040,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "sm": [
+      10,
+      3
+    ],
+    "sm_count": 148,
+    "torch": "2.11.0+cu130",
+    "tvm_ffi": "0.1.12"
+  },
+  "schema": 1
+}

@@ -7919,3 +7919,47 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+
+## 2026-11-16 — D128 FP8 probability range and fixed-plan isolation
+
+`sdpa/frost/test_sdpa_fp8_probability_range_sm100.py` pins the D128 multi-Q
+(CGA1/CGA2) and dual-KV (CGA1) records. The analytic 32K-row check separates
+anchor and tail probability mass into output channels. A quantized-P oracle
+alone hid the old E4M3 tail loss. The expanded suite checks O, natural-log Stats
+and Amax, retained capture, unchanged inputs, and quantized payloads/scales
+preserved across batch insertion, duplication, reordering and changed neighbors.
+The same-input E5M2 controls retain their arithmetic constants.
+
+With cuDNN 9.24.0.43, Torch 2.11.0+cu130 and CuTe DSL 4.8.0 compiling with CUDA
+13.4, both SM100 (B200) and SM103 (B300) reproduce 9 E4M3 numerical failures
+and pass 9 E5M2 controls on the parent. Each candidate packet passes 80 new and
+neighbor cases plus 40 prepared-binding/replay cases. These are Python-source
+overlays using an existing compatible native extension, not release-wheel
+acceptance. The initial SM100 wide neighbor run was deliberately interrupted
+once performance measurements rejected its first arithmetic candidate:
+507 passed, 8 skipped, 27 deselected, exit 2; it is not a complete suite result.
+
+The final test-only packet passes 30 cases on each GPU, including six golden
+checks per GPU and gradual maximum increases against the E4M3 range bound.
+Each implementation passes 512 warm plus 512 shared-memory-poisoned launches:
+3,072 counted launches per GPU. Both cluster controls reproduce the unsafe ring.
+The stress uses small one/two-CTA geometries; it is a bounded stability check,
+not a universal race proof. The callback checks the actual cold baseline against
+the analytic oracle before byte comparisons. An intentionally invalid
+high-bias/four-bit-rescale variant fails all three headroom controls on both GPUs.
+Twelve new golden JSON records are committed from the six-per-GPU recording
+packets, after independent reference and repeat checks. No existing baseline
+was overwritten. There are no skipped cases in the final 30-case packets.
+
+Run from `test/python`:
+
+```bash
+pytest -m L0 -q sdpa/frost/test_sdpa_fp8_probability_range_sm100.py
+```
+
+The implementation is forward only. No backward implementation or backward
+qualification is added. E4M3 golden changes are expected from recovering small
+probabilities; they require the independent analytic checks and repeatability
+before recording. This packet does not claim arbitrary batch invariance or
+cross-version byte equality.

@@ -181,18 +181,16 @@ else:
         f"for the f16 kernel, or extend this dispatch for new fp8 variants)"
     )
 
-# P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
-# accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE: the
-# lazy-rescale skip bounds P by 2**RESCALE_THRESHOLD (4.0 for fp8, see
-# config_sm100.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
-# (e4m3 max) — no saturation — while flat-row entries (P ~ 1/S) sit four
-# binades above e4m3's subnormal cliff (quantization stays normal out to
-# S ~ 2^13). The bias rides the exp2 argument, so total_sum accumulates in
-# the SAME 2^4-scaled units and the O normalization (O_acc / total_sum)
-# cancels it exactly; only the LSE subtracts the constant (and the sink
-# denominator term is scaled up to match). Invariant:
-# RESCALE_THRESHOLD + P_CAST_LOG2_SCALE <= log2(448).
-P_CAST_LOG2_SCALE = 4.0
+# P is relative to the online row maximum, before normalization. E4M3
+# needs a 2^8 cast bias to retain small probabilities whose total mass can
+# be significant in a long peaked row. Reserve a 0.75-bit lazy-rescale
+# allowance: 2^(8 + 0.75) < 448, including headroom for exp2 rounding. The
+# former four-bit allowance would overflow E4M3 with this bias. E5M2 retains
+# its existing bias and threshold.
+# The denominator uses the same bias, so normalization cancels it; LSE and
+# sink handling explicitly compensate below. These are internal constants,
+# independent of the currently ignored graph Scale_S/Descale_S operands.
+P_CAST_LOG2_SCALE = 8.0 if CFG.DTYPE_QKV == 0 else 4.0
 
 # exp2 split between MUFU and the FMA pipe.  With 128 exps per row per KV step the
 # MUFU pipe (4 lanes/clk/SMSP) is the softmax warps' longest pipe on SM100 (2 x 128
@@ -2153,7 +2151,7 @@ def _softmax_kv_body(
     P_COLS_PER_CHUNK = CHUNK // 4
     N_CHUNKS = CFG.N_BMM2_CHUNKS
     NEG_INF = cutlass.Float32(-3.4028235e38)
-    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+    RESCALE_THRESHOLD = cutlass.Float32(0.75 if CFG.DTYPE_QKV == 0 else CFG.RESCALE_THRESHOLD)
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
@@ -2257,8 +2255,8 @@ def _softmax_kv_body(
 
     # Manual unroll — tracer intercepts range_constexpr in ways that break
     # slice.indices() inside RegTile[]; N_CHUNKS ∈ {1,2} so explicit is cleaner.
-    # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P — the sum picks up
-    # the same factor, so normalization cancels it (see P_CAST_LOG2_SCALE).
+    # The P-cast bias also scales the sum, so normalization cancels it.
+    # E4M3 uses 2^8; E5M2 retains 2^4 (see P_CAST_LOG2_SCALE).
     reg_S = reg_S * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
 
     # Exp-burst mutual exclusion between the two softmax warpgroups (FA4-style
