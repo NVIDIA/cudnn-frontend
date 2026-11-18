@@ -27,7 +27,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
    time, on the real device, for the launch of the run's row count, and builds the entry's kernel for that row count on
    scratch operands: an entry asks what it needs of the installed toolchain where it builds, not where it is
    constructed, and that answer is a `SKIP` in the entry's own words before the load. A decline at that point which no
-   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`.
+   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`. An entry that is built
+   from the row count alone, once the entry has stated a launch for that row count, is handed nothing a decline
+   could be about: every typed decline of such a build is the entry's answer about the installation, and the `SKIP`.
 2. **State the environment before the first load.** `check_environment()` compares the installed distribution of cuDNN
    Frontend with `cudnn.__version__`, says whether `cudnn` is an editable checkout and prints a source hash (never a path). A
    mismatch is an error that names both. It runs after the plan, so a GPU the sample does not serve still skips.
@@ -67,8 +69,21 @@ does not hold is printed as not known and ignored, so a new name for one of them
    what a consumer on a fallback row needs beyond the kernel's bytes -- a gather out of the kernel's scale layout, a
    quantisation the target does with a launch of its own -- is launched by that consumer, when it reads its operand
    (`weights.dequantize`). An adapter that multiplies on the stored format of its weight says so (`stored_weights`):
-   the load of the session then keeps that format beside the bf16 copy for the block, as the loader had it, and the
-   memory sentence counts it; the copy stays, because the reference block and every fallback row read it. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   the load of the session then keeps that format for the block, as the loader had it, and keeps the bf16 copy of a
+   weight only where a block of the run's plans reads one -- which forms a weight has is decided from the plans of
+   every sequence count before the first load, never at run time, and a block that finds its form missing is an
+   error that names it. The reference blocks of the checks read copies: where the load kept none the checks make
+   theirs for one call at a time (`weights.OnDemand`), the memory sentence states that part, and the checks print
+   what the copies cost. Such a copy is made from the bytes the weight's own block multiplies on, so it is a
+   reference only while those are the bytes of the load: the loader takes a checksum of every weight it keeps on its
+   stored format alone and the checks compare it before their first pass and after their last (`stored weights`: a
+   weight that was written to fails the run by block and layer). An adapter never writes into its weight. Only the
+   reference session of the checks makes copies per call; any other session is refused the maker. A kernel that
+   reads its weight in a row order of its own gets it from the load in that order: the adapter names the layout
+   (`stored_layout`, built by the entry's own helper), the session collects the layouts of its plans, and the load
+   keeps that one stored form -- never a second stored tensor beside it, never a layout made inside a call. The
+   reference's copy is made from that form, into the checkpoint's row order. And an operand that reaches a kernel in
+   another layout than the kernel reads is brought into it by the kernel's adapter, with a launch of its own. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -134,7 +149,12 @@ does not hold is printed as not known and ignored, so a new name for one of them
     by its place in the wiring, not by its block and layer: a block can be called twice in a layer. A site name
     belongs to one block (an adapter finds the sites of its row in the wiring by name), and what differs between the
     sites of a row may be the operand's shape as well as the kernel's form: an entry that is one weight shape per
-    instance has the shape of each site in its row.
+    instance has the shape of each site in its row. A row may also serve some call sites of its block only: it names
+    each other site without fields, which hands the calls there on to the next row of the stack that serves the run.
+    The plan then holds one part per call site under the block's name (`blocks.BySite`; `Plan.at`, `Plan.parts`), and
+    whatever reads a row or a block of a call -- the census entries, the form, the identity, the band, the batch
+    invariance statement, the form of the weight a load keeps -- reads the part of that call's site. A site a row
+    does not name at all stays a wrong table.
 16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
     target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
@@ -415,9 +435,10 @@ Each of these passed every test and every GPU run of the first version; a host t
   have built a form no call of a two-layer model is made in. A host test that pins the forms a run builds holds it.
 - A kernel on the stored format needs the stored format. The loader had the merged 8-bit codes in hand and freed them
   after the copy; it now keeps them for the blocks that say they multiply on them, asked by the plan of the session
-  and of the sessions that follow on its weights. The copy stays for the reference, so the memory sentence grows, and
-  the allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the
-  stored bytes alone. Measure the sentence against a run whenever what a stack holds changes.
+  and of the sessions that follow on its weights. At that point the copy stayed for the reference (it no longer
+  does: "What making the loader keep what the plans read taught" below), so the memory sentence grew, and the
+  allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the stored
+  bytes alone. Measure the sentence against a run whenever what a stack holds changes.
 - With a second exactly judged row behind it, a launch behind a layer's input norm fails the check: it now sits
   between two rows that are judged one by one. The same launch behind the in-projection fails in a linear-attention
   layer (the fused step follows) and is counted as the reference chain's in an attention layer. What the check
@@ -507,3 +528,215 @@ Each of these passed every test and every GPU run of the first version.
   the loop is, and held by a run with two counts.
 - A sentence about a stream is held on a device only by a test that reads that stream there. "The seeded run writes
   nothing to standard output" stood in three READMEs while the GPU test dropped standard output.
+
+## What making the loader keep what the plans read taught
+
+- A weight has the forms its readers read, and the readers are the plans of the whole run. The projection row kept
+  the stored codes beside the copy for one block. The rule for every block is two questions asked of every plan
+  before the first load: does some plan multiply on the stored format (keep it), does every plan (make no copy). A
+  sequence count on a fallback row, or a row selected away, keeps the copy; nothing is decided at run time.
+- The reference of the checks is a reader too, and the one reader that may come without its form. It gets a bf16
+  copy for one call, made by the session of the reference and by the tap of the checked pass -- never inside a
+  block, whose call neither reads the device nor synchronises. Such a copy is bit for bit the copy a load keeps as
+  long as no block has written into its weight, and a host test loads the same plan both ways and compares every
+  check line.
+- A reference made from the provider's own operand is no reference until that operand is held still. With the copy
+  gone, the reference's copy of a weight is made from the bytes its block multiplies on: a stand-in that zeroed half
+  of its weight from its first call on passed replay, every block line (distance 0.00), the tokens and the kernel
+  check, where the same stand-in in a run that kept its copies was 255 units off on half of its elements. The loader
+  now takes a checksum of every weight it keeps on its stored format alone, the checks take it again before their
+  first pass and after their last, and a changed weight fails the run by name. When a change takes an independent
+  operand away from a check, give the check a way to see that the shared one has not moved -- and test the defect in
+  both forms of the run.
+- What a memory sentence rests on is tested on the thing itself. "One copy at a time" was held by one run's peak; a
+  defect that kept every copy alive passed every host module, and a two-layer run would have held 34 GiB more
+  without a failure. A host test now holds weak references to the copies' tensors (none of an earlier call alive
+  when the next is made, none when the checks return), and the GPU cell holds PyTorch's peak below the sentence.
+- An option that exists for one caller is refused for every other. The maker of copies was a public parameter of
+  every session; on a checked session it put a cast and two synchronisations in front of blocks of its timed and
+  traced steps, and the run passed. It is refused when the session is built, and such a session is not traced.
+- On the reduced models the memory sentence is an estimate that runs miss by a few tenths of a GiB in either
+  direction (a flat 2 GiB of working memory), with and without their copies; leaving copies out neither widened nor
+  narrowed that in a way the runs agree on (2.3 GiB of room with the in-projections of four layers on their codes
+  alone, 1.7 GiB with every multiplied weight of two layers). State such a sentence with the runs beside it, and do
+  not fit a term to one run.
+- The memory a run takes beyond its weights does not shrink with the copies it leaves out. Without the 9.7 GiB of
+  in-projection copies the device grew by 10 GiB less, but the room beyond the weights held stayed where the stored
+  tensors had put it: 6.6 GiB, against 6.9 GiB with the codes beside every copy and 5.3 GiB with copies alone. The
+  first sentence, an eighth of what is held, was 0.5 GiB short of the run. The lesson of the row before, again:
+  measure the sentence against a run whenever what a stack holds changes.
+- A form that is missing fails where the plan is, not where the multiply is. A session on weights that were loaded
+  for another plan failed at the adapter's first call, in the adapter's words, and a block that reads a copy would
+  have ended in an error about `None`. The load of the session now names the block and the form before anything is
+  compiled or stepped.
+- Arithmetic that was right for one format was wrong for the next. The bytes of a step took a stored weight's bytes
+  off its copy's, which is right at one byte per element and wrong at 0.5625. State such a formula in both forms: the
+  copy's two bytes off, the stored bytes on.
+- A line in GiB reads 0.00 on the geometry of a host test, so no test held its figures. The text of the cost line
+  is a function, and a host test calls it on the figures of a run at the published widths.
+
+## What building the gate / up row taught
+
+- A kernel's row order of a weight is a form of the stored weight, and a load keeps one. `cudnn.SwigluFp4Decode`
+  reads gate and up rows interleaved in tiles of 64, and its helper returns new tensors. Kept beside the merged
+  tensor that would be the weight twice (12 GiB on the published model), made per call a permutation of 100 MB in
+  front of every launch. The layout is asked of the provider while the run is planned and applied once per weight
+  at load; the merged tensor is dropped. Two plans of one run that multiply on one weight in two row orders are a
+  wrong table, named with the plans; a session on weights that another plan loaded in another row order is named
+  before its first step, like a missing form.
+- The reference's copy is made from the bytes the kernel multiplies on, whatever their order. With the weight kept
+  interleaved, a copy made by un-permuting it into a second packed tensor would have put a stored tensor the
+  checksum does not cover between the kernel's bytes and the reference's. `weights.dequantize` reads the layout a
+  band of rows at a time and writes the checkpoint's row order; a host test holds the copy bit for bit to the copy
+  of the merged weight, and the write-into-the-weight control fails the run on this weight as on the others.
+- A form that follows the row count is a row per value. The entry's token tile is a floor: it runs the narrowest
+  of four tiles that holds the rows of the call. One row with `TOKEN_TILE 8` would have stated at 9 rows a form the
+  kernel does not run, and the form check compares the row with the entry's own form on the objects. The block
+  has four rows of one key by row range, the census names the field of its section's row count, the README table
+  shows the row of 1 to 8 rows and a sentence names the others, and a host test holds each row to the public
+  entry's form at the first and the last row count it claims.
+- Not every kernel has a bracket. The gate and the norm are compared with a twin that keeps the two bf16 values
+  around an fp64 value; an fp32 sum over 5,120 products is not within a few units of the fp64 one, so this entry's
+  contract is an interval: the fp64 chain with a propagated error bound. The band takes the terms of the entry's
+  own suite, a host test holds them to that file, and it holds the reference pair's bytes and a kernel-like fp32
+  chain inside the band and a wrong code and a wrong block scale outside. What the band cannot see is pinned as
+  that: one bf16 unit of the product.
+- The layout between two kernels is theirs; between a kernel and anything else it is the kernel's adapter's. The
+  norm kernel writes block scales in the 128 x 4 layout and the gate / up kernel reads them: handed over as they
+  are, no launch between the two. One row of a batch in the batch check, or the norm row selected away, hands
+  block scales row by row, and the adapter brings them into the layout itself. Asking the producer for the
+  layout would put a launch inside the norm's call, on a path only the checks take.
+- The rounding chain of a fused kernel is its own, and a checkpoint run says so: the greedy tokens of the checkpoint
+  run moved with the row, as they did with the norm row, and the token line stayed where two reference stacks are
+  from each other. On the seeded model the ids hash is the default stack's. State both, and never read the first
+  as a defect of the row or the second as its proof: the block check is what holds the kernel.
+- Measure the sentence again. Without 21.2 GiB of gate / up copies the device grew by 15 GiB less; the room beyond
+  the weights stayed (6.9 GiB), and the sentence held by 0.2 GiB of 37.1. On the one-layer model the same sentence
+  is 0.5 GiB above what the run reserved: the flat allowance of the reduced models is an estimate in both
+  directions, as the section before says.
+- A rule that only fails together with another is not held. The band has two rules, and a block scale outside its
+  interval also puts every code of its block outside its bound: the test of the scale rule passed with that rule
+  switched off. Under zero codes every scale gives the value zero, and a wrong scale byte there fails by its own rule
+  alone. One-line defects applied to the code found it, and found that the test of "half a code step" stepped two
+  codes, and that the chunks of a copy made from an interleaved weight were only read at one chunk length.
+- A count pinned in a test moves with the table. The split rule of the READMEs carried the old numbers in its own
+  pattern (`= 49 + 209`), so the rule would have passed a README that kept them. A test that names numbers of the
+  table is derived from the plan where it can be, and where it cannot, it is on the list of what a new row changes.
+
+## What the review of the gate / up row taught
+
+Each of these passed every host test, every one-line defect and every GPU run of the first version; a host test now
+holds each.
+
+- An interval has two ends, and a test of one of them holds one. The block-scale rule of the band was tested one
+  binade up, one binade down and at a lone byte above a zero block; the case one binade down failed through the code
+  rule, so with the lower end taken out every test stayed green -- and the lower end is the one rule of the band that
+  fails buffers nobody wrote: under a zero scale every code reads as zero, and a code's bound admits the whole value
+  below a scale that is too small. Buffers of zeros are a test of their own, and so is the byte just below the lower
+  end with the codes of its block written under it. Ask of every rule which wrong output it alone would catch, and
+  write that output.
+- "The operands this adapter built" is a sentence about operands. The first use of this entry hands its build a
+  row count and nothing else, and the page of the entry names a requirement no public probe answers (the names its
+  kernel is written on). A decline by that requirement ended in an `ERROR` that blamed the adapter for operands it
+  had not built, where rule 1 asks for the entry's own sentence as a `SKIP`. Where an adapter hands a build nothing
+  of its own, it has nothing to be blamed for there: hold what it does hand over (the row count) in front of the
+  build, and let the entry speak.
+- A question asked inside an error path must not raise. The adapter read the compiler of the installed CuTe DSL to
+  word a decline; a DSL that does not report one turned the entry's decline into an import error from inside the
+  handler. The entry itself declines nothing on a value it could not read, and neither does its adapter.
+- "Two of X are refused" is tested with X and with what stands beside X. Two providers' layouts of one weight were
+  refused before the load; a provider's layout beside the checkpoint's row order -- a block that multiplies on the
+  stored tensor as it is -- was not, and ended after the read in the sentence of a session that was not planned
+  with the run, although it was. What a load keeps is one row order per weight, whoever asks for it: every reader of
+  the stored form has an owner in that comparison, and both orders of the two plans are a case each.
+
+## What the verify step taught
+
+The verify step feeds several tokens per sequence in one launch sequence (`Session(tokens=T)`, `Session.verify`, the
+key `fe.gdn_verify_fused`). What building it showed:
+
+- A step shape is a field of the form. The fused verify kernel is compiled per tokens count, and its name is cut in
+  front of that count and of its launch knobs: two kernels of two counts share a symbol and a grid, and differ in the
+  shared memory of a thread block. So the row names `TOKENS`, one row per count; the adapter holds the slot table of
+  every call to it; and the call log states the form for the step shape of the table that call handed the entry
+  (`_served_stated`). An entry whose launch facts take a step shape says which shape a row count stands for
+  (`EntryBlock._step_of`): that is the plan's question. The call log's is another one -- what was this call handed --
+  and the first version answered it with the plan's: it asked the instance for the row's own tokens and logged the
+  echo, so with the adapter's guard taken away a table of two sequences x three tokens was logged as `TOKENS 6`. A
+  field of a form that is an argument of the question says nothing as the answer: read it from the operands.
+- A band stated for one token per call is applied token by token, not loosened. The band of the fused step tolerates a
+  rounding that falls on the other side of a midpoint as an event, seen once, because the reference starts every
+  call from the kernel's state. A reference that runs the `T` tokens of a verify step on its own state sees such an
+  event at every later token of the step, and a cell of one token over nine steps fails a share that a cell of the
+  decode step passes over 32. The fix is in what is compared, never in the numbers: the reference starts every token
+  from the state the kernel wrote for the token before it (`gdn_verify_step(anchor=)`), and a cell is one value head
+  of one sequence over the tokens of its steps -- one block of the launch grid, as the band says.
+- The layout of one token per sequence is the layout of several at `T = 1`. Slots numbered token by token keep token 0
+  of a sequence in its plain slot and its history in that slot; one state class then serves both kinds of step, and a
+  plan of one token per sequence builds the tensors it built before. Check that with the shapes, in a host test.
+- Keeping tokens launches nothing. How many tokens a step kept is one number on the host; the kernel's operand is a
+  row of a constant table built with the state. A copy or a fill between two steps would be the first record of the
+  next step, where the kernel check declares nothing.
+- An operand of a kernel starts 16-byte aligned, and a row of a table need not. The slot table of one sequence out of
+  several (the batch-invariance check runs a sequence alone) is handed over in tensors of its own, and the rows of the
+  kept-count table are padded to four elements.
+- A decline names the row of the step that was asked for. A verify step no row holds was first declined in the words
+  of the decode entry, the block's first row ("serves rows 1-65,535"). A plan of several tokens per sequence is
+  declined by the block's row for that tokens count, else by the last of its rows for such steps.
+- A census section holds for the step it was recorded with: the tokens per sequence beside the row count, the widths
+  and the class. Six rows are one sequence of six tokens and two of three; only the first is the recorded step.
+- Two runs that feed a block other rows cannot be compared on that block's state. The verify run against the decode
+  run gates the recurrent state where both were fed the same rows (the history taps say so) and prints it elsewhere;
+  what holds in every layer is the block check, teacher-forced. A line that gated nothing is `REPORTED`.
+- A row is run in every form its entry takes inside the row's range, not only at the range's ends. The verify entry
+  picks its form by the sequences and the SM count: on a 148-SM part two thread blocks per value head at one
+  sequence, one thread block per SM at two and three, two per SM from four. The first runs were at 1, 4 and 16
+  sequences and never launched the middle form, whose shared memory at eight tokens is 704 B below the part's limit.
+  Ask the entry's launch facts for every step shape a row claims, group them by form, and run one of each.
+- A session of another kind of step does not inherit the report of the first kind. The report of a verify session
+  printed the decode step's bytes per step, a prefill route of 0 tokens and a rate that counted steps as tokens.
+  Until a line is taught the new step, the report says that it is not stated, and a host test holds the sentence.
+- Two sessions on one load share weights, never a state. Say so beside the snippet that builds them: a reader who
+  prefills a prompt in one and steps the other gets the tokens after an empty context, and no error.
+
+## What the out-projection of a verify step taught
+
+The target serves one block of the wiring with two kernels in a verify step: the out-projection of a linear-attention
+layer is the 8-bit projection kernel, the out-projection of an attention layer a library multiply, and both multiply by
+a weight of one shape (rows of `fe.fp8_projection_decode` in the block `projection.fp8.out`, for steps of several tokens
+per sequence alone). What building it showed:
+
+- A block is not always one row. Splitting the block in two moves lines of every plan of one token per sequence -- a
+  table row, the by-provider line, the coverage line -- for a difference only a verify step has. The call sites
+  carry it instead: the row of the entry names the site it serves and hands the other on, and a plan prints the
+  block once per call site only where two rows serve it. A plan of the decode step is the text it was; hold that
+  with a run of both trees, line by line.
+- What a row hands on is data, never the adapter's choice. An adapter that served one site and called the fallback
+  chain itself at the other would be one row with two kinds of census entry, which the kernel check cannot judge: an
+  exact kernel at one call and a family at the next. The plan resolves the next row; the adapter is never built or
+  called at a site its row hands on.
+- A split is a row range. The target chooses the K slices of the projection kernel by the rows of a step, and the
+  entry fixes them per instance (another split is another byte class), so each range is a row and an entry instance
+  of its own, selected by `rows`. The bytes of the block change where a step's rows cross from one range into the
+  next; say so beside the rows, and gate batch invariance inside a range only.
+- A field that follows the call is named, or the call log cannot show it. The projection adapter already asked the
+  serving instance with the rows of the operand it was handed, but a form without a field that follows the rows
+  logs the same text at every row count. The rows of this block name the token tile of their range, and the entry
+  takes it as a floor: an instance handed the rows of another range states another tile, and item 0 names it.
+- The forms of a weight follow the call sites. One block, two rows: the linear-attention layers' weights are read on
+  their stored codes, the attention layers' as copies. A load is asked per call site (`<block> at <call site>`
+  beside the block names), so a verify plan alone holds no copy of the first and no codes of the second, and a
+  decode session on the same load, which reads every out-projection as a copy, has its copies. Test the loader
+  with each plan alone and with both, and the check that names a missing form with a load made for the other.
+- A decline of a weight's form is asked per weight. The projection adapter declined a load that keeps a scale per
+  merged part for every row of its entry; the out-projection's weight is one stored tensor with one scale under
+  every merge rule. The family says which weights a rule gives a scale per row (`scale_per_row`), per call site.
+- Two sessions of one load that serve a block with two kernels are not byte-equal behind it. Up to the last row
+  count of the entry's rows the verify session rounds the out-projection once and the decode session twice: their
+  logits differ by a bf16 unit and an attention layer behind caches other bytes, printed and not gated. From the
+  first row count on the fallback row both multiply over a copy: the bytes met again at three and four sequences
+  and stayed within half a bf16 unit at nine and 16 sequences of two tokens (a library multiply is another kernel at
+  another row count). Run both sides of that boundary, and say which lines of the comparison are reported there.
+  And state a comparison for the step shapes where it gated: a sentence that begins "at every step shape that ran"
+  is read as a gate on all of them, also on those whose line was `REPORTED`. The memory sentence likewise: "within a
+  tenth of a GiB" is a statement about every run, and one step shape reserved half a GiB less than it asked for.

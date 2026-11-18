@@ -144,6 +144,7 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in) | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -323,6 +324,22 @@ a row alone and inside a batch under the entry's own picks.
   it is not a hard workspace cap. The new H/X alias and sixteen-wave paths
   have not been requalified on SM103 or SM107; earlier architecture coverage
   remains recorded separately in the test report.
+- Linear attention cuTile engine (GDN, KDA): the launch autotune times
+  occupancy and worker-warp candidates, and the worker-warp count changes the
+  cross-warp summation trees of the kernels that reduce with `ct.sum`, so two
+  processes that time their own candidates can write different bytes. Every
+  candidate replays its own bytes, and a run whose tuning fails or times out
+  launches the first candidate's hints rather than the unhinted kernel. A host
+  that needs the same bytes on every rank and in every run pins the pick
+  through the hooks in `cutile/kernels/common.py`: `record_hint` is told each
+  timed winner, `select_hints` returns the candidate to run and skips the
+  timing (Megatron-LM's `megatron.core.tuning` records a table and pins from
+  it). The hooks are read only when a launch misses the in-process hint
+  cache, so a host installs them before the first launch or clears
+  `launch_hint_cache` when its policy changes; a failed or timed-out search
+  launches the first candidate and records nothing. The cuTile engine is not on this page's table: per-candidate replay and
+  the hooks are verified on cc 10.3 by `test_la.py`'s determinism tests, batch
+  invariance is not claimed.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
@@ -559,6 +576,17 @@ duplicated and129-request batches, then mutate dO and a canonical scale
 atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
+
+The SM90 D64 / D128 half-precision backward chain (`sdpa_bwd_sm90`) owns dK and
+dV per key tile and reduces every query tile's dQ over its key tiles in index
+order through per-tile turn counters, so the deterministic flag and the default
+request run the same arithmetic. Repeatability: dQ / dK / dV bytes are compared
+across repeated executions with a poisoned workspace on causal and unmasked MHA
+and GQA graphs at D64 and D128, including grids beyond one CTA wave, and across
+CUDA Graph replays for causal GQA at D128. Batch invariance: the same bytes are
+compared across reordered and duplicated batches and against the sequence
+declared alone, in four cells: BF16 D128 causal GQA, FP16 D64 unmasked MHA,
+BF16 D64 causal MHA and FP16 D128 unmasked GQA.
 
 ## Split-combine zero-weight qualification
 
