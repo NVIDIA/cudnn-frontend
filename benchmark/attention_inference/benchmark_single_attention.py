@@ -41,6 +41,8 @@ import argparse
 import math
 import os
 import sys
+from contextlib import nullcontext
+from statistics import median
 from typing import Optional, Tuple
 
 import torch
@@ -158,6 +160,34 @@ def time_fn(fn, num_warmup, num_iters) -> float:
         times.append(sum(it.device_time_total for it in matched) / 1000.0)
     times.sort()
     return times[len(times) // 2]
+
+
+def time_graph_replay(fn, num_warmup, num_iters, calls_per_replay) -> float:
+    """Median CUDA-event milliseconds per execution in a warm graph replay."""
+    stream = torch.cuda.current_stream()
+    for _ in range(max(1, num_warmup)):
+        fn()
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(calls_per_replay):
+            fn()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    graph.replay()
+    end.record(stream)
+    end.synchronize()
+    samples = []
+    for _ in range(num_iters):
+        start.record(stream)
+        graph.replay()
+        end.record(stream)
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / calls_per_replay)
+    return median(samples)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +367,7 @@ def setup_cudnn(args, dtype, oss=False, auto=False):
     if sink_gpu is not None:
         variant_pack[sdpa_kwargs["sink_token"]] = sink_gpu
     handle = cudnn.create_handle()
+    cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
 
     def fn():
         graph.execute(variant_pack, workspace, handle=handle)
@@ -496,6 +527,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     for n in ones:
         variant_pack[scalars[n]] = ones[n]
     handle = cudnn.create_handle()
+    cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
 
     def fn():
         graph.execute(variant_pack, workspace, handle=handle)
@@ -985,6 +1017,7 @@ def main():
     p.add_argument("--has_sink", action="store_true", help="per-head attention sinks")
     p.add_argument("--num_iterations", type=int, default=20)
     p.add_argument("--num_warmup_iterations", type=int, default=5)
+    p.add_argument("--graph_replay", type=int, default=0, metavar="N", help="capture N cuDNN executions per graph and measure warm replay with CUDA events")
     p.add_argument("--fa4_num_splits", default="auto", help="'auto', or an integer for a fixed split count")
     p.add_argument(
         "--kv_layout",
@@ -1023,13 +1056,25 @@ def main():
     dtype = torch.bfloat16 if args.data_type == "bfloat16" else torch.float16
 
     cudnn_leg = args.backend in ("cudnn", "cudnn_oss", "cudnn_auto")
+    if args.graph_replay < 0:
+        p.error("--graph_replay must be nonnegative")
+    if args.graph_replay and not cudnn_leg:
+        p.error("--graph_replay is supported for cuDNN backends only")
+    if args.graph_replay and args.num_iterations < 1:
+        p.error("--graph_replay requires at least one timed iteration")
     fi_leg = args.backend.startswith("flashinfer")
     if min(args.kv_min_fill, args.q_min_fill) < 1.0 and not ((cudnn_leg and args.kv_layout == "paged") or fi_leg):
         raise NotImplementedError("per-request lengths are wired for the paged cudnn legs and flashinfer only")
     if args.q_min_fill < 1.0 and args.phase != "context":
         raise NotImplementedError("--q_min_fill applies to the context phase")
-    fn, detail = SETUPS[args.backend](args, dtype)
-    ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
+    # Build and bind the cuDNN handle on the side stream before capture.
+    with torch.cuda.stream(torch.cuda.Stream()) if args.graph_replay else nullcontext():
+        fn, detail = SETUPS[args.backend](args, dtype)
+        if args.graph_replay:
+            ms = time_graph_replay(fn, args.num_warmup_iterations, args.num_iterations, args.graph_replay)
+            detail += f" [graph-replay x{args.graph_replay}]"
+        else:
+            ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
 
     # FLOPs and bytes per request, at each request's own lengths.
     flops = byts = 0.0
