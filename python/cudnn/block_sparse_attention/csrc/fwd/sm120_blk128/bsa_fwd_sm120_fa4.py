@@ -454,6 +454,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 o_regs[i] = 0.0
 
             basic_params = SimpleNamespace(
+                bias=None,
                 phase_base=cutlass.Int32(0),
                 pipeline_threads=pipeline_threads,
                 seqlen_q=seqlen_q,
