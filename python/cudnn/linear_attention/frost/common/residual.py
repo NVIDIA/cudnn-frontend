@@ -5,7 +5,8 @@
 
 The projection ``K decay @ S`` is already FP32 in TMEM.  BF16 paths form the write-gated value, the residual and the beta
 scaling in FP32 and round once into the packed Y operand; FP16 paths retain their packed arithmetic.  KDA scales by the
-per-token ``beta`` (its ``W`` is one); GDN-2 scales by the per-value write gate ``W`` (its beta is folded into K decay).
+per-token ``beta`` (its ``W`` is one); GDN uses the bare residual because beta is applied by its state-update key; GDN-2
+scales by the per-value write gate ``W`` (its beta is folded into K decay).
 Register-only: the caller still owns the projection-ready wait and the packed-Y publication.
 """
 
@@ -37,9 +38,10 @@ def residual_operand(value_word, projection0=None, projection1=None, beta0=None,
     """Pack ``Y = beta * (W .* V - projection)`` for two io-dtype elements.
 
     ``value_word`` (and ``w_word`` when given) pack two values of compile-time ``dtype``; the projection and beta
-    components are FP32 registers.  Omit the projections for a zero state, the betas where beta is already folded into the
-    operands (GDN-2, prep-fed KDA), ``w_word`` where there is no write gate (KDA).  BF16 rounds once after the FP32
-    arithmetic; FP16 rounds the projection and beta to FP16 and keeps its packed multiply and subtraction.
+    components are FP32 registers.  Omit the projections for a zero state, the betas where beta is applied outside this
+    residual or already folded into the operands (GDN, GDN-2, prep-fed KDA), and ``w_word`` where there is no write gate
+    (GDN, KDA).  BF16 rounds once after the FP32 arithmetic; FP16 rounds the projection and beta to FP16 and keeps its
+    packed multiply and subtraction.
     """
     if cutlass.const_expr(dtype == cutlass.BFloat16):
         v0, v1 = f16x2_to_f32(value_word, dtype=dtype)

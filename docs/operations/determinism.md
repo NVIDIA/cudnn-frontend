@@ -58,7 +58,7 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `gated_delta_net` (GDN) | fprop, bprop | FP16; BF16 with the FROST state-update residual formed in FP32 before one final conversion | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
