@@ -597,9 +597,10 @@ A checkpoint of this family can carry a second, small network beside the model: 
 drafter proposes the next few tokens from the model's last hidden row, and the model then checks all of them in one step
 instead of producing them one by one. `nvidia/Qwen3.8-27B-NVFP4` carries one.
 
-**What is here today is its loader, and nothing else** (`QwenDenseDrafter`, `model_samples/qwen_dense/drafter.py`). No
-script of this folder drafts yet: there is no draft step, no block and no provider row for the drafter, and
-`00_decode.py` neither reads it nor has a flag for it. The loader is called from Python, from the root of this checkout:
+**What is here today is its loader and its draft pass on reference blocks, both reached from the library**
+(`QwenDenseDrafter`, `model_samples/qwen_dense/drafter.py`). No script of this folder drafts yet, no session runs a
+draft pass, and `00_decode.py` neither reads the drafter nor has a flag for it. The loader is called from Python, from
+the root of this checkout:
 
 ```python
 import sys
@@ -621,7 +622,8 @@ list of token ids, `draft_vocab.json`, which the recipe below makes.
 Called as above, `load` also reads the model's embedding table, which the last line of the manifest below leaves out:
 248,320 x 5,120 elements in bf16, 2.37 GiB for the published checkpoint. A caller that has loaded the model passes the
 table it holds, `drafter.load(checkpoint, device, embedding=table)`: the drafter then reads none and keeps no second
-copy.
+copy. The load also makes bf16 copies of the five weights and of the listed head rows, which the reference blocks of
+the draft pass multiply on: 1.42 GiB with 65,536 ids, the last line of the manifest. `copies=False` leaves them out.
 
 The loader does three things, each from the checkpoint itself.
 
@@ -657,6 +659,7 @@ drafter of checkpoint Qwen3.8-27B-NVFP4 (local): 15 tensors of its own under 'mt
   lm_head.input_scale                           fp32 scalar           head_quant: the static scale of the head's 4-bit operand
   draft vocabulary draft_vocab.json: 65,536 ids of the model's 248,320, in ascending order (65,536 entries listed, none dropped)
   loaded, besides the model's embedding table: 0.57 GiB (8-bit weights 0.40, norm weights 0.00, head rows 0.18)
+  and the bf16 copies its reference blocks multiply on (a load keeps them unless told copies=False): 1.42 GiB (of the five weights 0.79, of the head rows 0.62)
 ```
 
 **It quantises the weights of the drafter's five multiplies to 8 bits when it loads them**
@@ -716,6 +719,83 @@ with open("draft_vocab.json", "w") as f:
     json.dump(sorted(listed), f)
 ```
 
+**The draft pass.** A loaded drafter runs its pass on reference blocks -- plain PyTorch with fp64 accumulation, as
+every block of the model that has no kernel yet -- in every stack (`QwenDenseDrafter.body`, `propose`, `draft`). One
+pass is 18 block calls. The body is 15 of them: the embedding of a token and a hidden row of the model -- the row the
+model's output head reads, behind its final norm -- are each normed and laid side by side, the embedding half first;
+one multiply makes of them the residual stream of the pass; one attention layer with its MLP follows, at the model's
+widths and on a cache of the drafter's own; a final norm gives the output rows. The head is 3 calls on one row per
+sequence: the 4-bit quantisation of the head's operand, the multiply over the listed rows of the model's output head,
+and the token of the largest logit -- the first of equal columns, then the token id of that column.
+
+Every 8-bit operand of a pass is quantised per row of the step, at a scale formed from the row
+(`weights.quantize_fp8_per_row`): the scale is the row's largest magnitude, taken over its bf16 values, divided by 448
+and never below 1 / (448 x 512); a code is the element *multiplied by the reciprocal* of that scale; the division, the
+reciprocal and the product are fp32 operations. This is a third rule beside the static scale of the model's
+activations and the division of the weights above: where a quotient sits exactly between two codes it gives the code
+above and the division the even one, and a host test holds a row with two such elements. A multiply then applies, to
+each element of its result, the scale of the operand's row and the scale of the weight's row. The first norm block
+quantises its two halves as one row, so both share one scale.
+
+`draft` is the passes of one step of speculative decoding. The first pass runs over the rows it is handed: per
+sequence the final-norm rows of the model's last step and, for each, the token that follows it -- one row per token of
+a verify step, or one row behind a prompt. Of its output the row of the last kept token goes to the head: a view, by a
+host integer. Every later pass runs at one row per sequence, on the pass's own output row and its own last proposal,
+one position further. A pass writes the keys and values of its rows into the drafter's cache at their positions and
+is told where they stand; it writes nothing of the model.
+
+| block | calls per pass | provider key | entry [form] |
+|---|---|---|---|
+| token embedding lookup | 1 | `torch.index_select` | torch.index_select |
+| RMSNorm of the embedding rows and of the hidden rows + one quantisation per row over both | 1 | `torch_ref.pre_fc_norm_quantize` | torch_ref.pre_fc_norm_quantize, fallback: reference chain |
+| 8-bit multiply, a scale per weight row and per row of the step | 5 | `torch_ref.linear` | torch_ref.linear, fallback: reference chain |
+| (residual add +) RMSNorm + quantise per row | 2 | `torch_ref.add_norm_quantize` | torch_ref.add_norm_quantize, fallback: reference chain |
+| attention preparation | 1 | `torch_ref.attention_prepare` | torch_ref.attention_prepare, fallback: reference chain |
+| attention core | 1 | `torch_ref.attention` | torch_ref.attention, fallback: reference chain over a plain cache of the drafter's own |
+| gate + quantise per row | 1 | `torch_ref.gate_row_quantize` | torch_ref.gate_row_quantize, fallback: reference chain |
+| SiLU x up | 1 | `torch_ref.silu_mul` | torch_ref.silu_mul, fallback: reference chain |
+| quantise per row | 1 | `torch_ref.quantize` | torch_ref.quantize, fallback: reference chain |
+| residual add + RMSNorm | 1 | `torch_ref.add_norm_quantize` | torch_ref.add_norm_quantize, fallback: reference chain |
+| 4-bit quantisation of the head's operand | 1 | `torch_ref.quantize` | torch_ref.quantize, fallback: reference chain |
+| output head over the listed rows | 1 | `torch_ref.linear` | torch_ref.linear, fallback: reference chain |
+| token choice over the listed rows | 1 | `torch.argmax+lookup` | torch.argmax + the token id of the chosen row, fallback: reference chain |
+
+Every row of this table serves every stack, every GPU class and any row count. The multiply is called at five sites
+and the norm + quantise at two, and the family hands each call the name of its site (`QwenDenseDrafter.sites()`). A
+reference chain is one function at every site, so the rows name no form; what differs between the sites is data for
+the kernels that are to serve these blocks (`configs.DRAFT_PROJECTION_SITES`, `configs.DRAFT_NORM_SITES`):
+
+| block | call site | what differs there |
+|---|---|---|
+| 8-bit multiply, a scale per weight row and per row of the step | `fc` | weight 5120 x 10240 |
+| 8-bit multiply, a scale per weight row and per row of the step | `qkv` | weight 14336 x 5120 |
+| 8-bit multiply, a scale per weight row and per row of the step | `o` | weight 5120 x 6144 |
+| 8-bit multiply, a scale per weight row and per row of the step | `gate_up` | weight 34816 x 5120 |
+| 8-bit multiply, a scale per weight row and per row of the step | `down` | weight 5120 x 17408 |
+| (residual add +) RMSNorm + quantise per row | `input` | no add: its rows are the residual stream |
+| (residual add +) RMSNorm + quantise per row | `mlp` | the branch is added to the residual stream first |
+
+`drafter.state(sequences, capacity, device)` is the cache: keys and values per position, zero at the start of a
+prompt set, with no position of its own. With the copies and that cache, `drafter.memory_bytes(sequences, capacity)`
+is what a loaded drafter holds on the device besides the model's embedding table: 2.00 GiB at the published widths
+with 65,536 ids, one sequence and 2,051 positions. A pass on a load without its copies is an error that names
+`copies=True`.
+
+**What holds the pass.** Every block of it is its own reference chain, so the tie-out of a run judges none of them.
+The drafter's blocks are held to their definitions, to each other at one row and at several, and to the model's own
+tokens on a checkpoint; they are not compared with another implementation of the drafter in this repository.
+
+- *To their definitions* (host tests, `test/python/misc/test_model_samples_drafter.py` and
+  `test_model_samples_weights.py`): the row quantiser and the joint quantiser of the two normed halves against a
+  quantiser written in the test from the 8-bit format, scales and codes; the gate with its one rounding and SiLU x up
+  with its two against their formulas, element by element; the multiply with a scale per row of both operands
+  against a loop over the code values; the token choice on stated logits with equal columns.
+- *To each other*: a pass over 2 and over 6 rows of a sequence gives the rows and the cache of that many passes of
+  one row, byte for byte, at one sequence and at two; and a recording stand-in for the blocks shows what every pass of
+  a step is handed, for every kept count 0 to 5: the row of the last kept token, then the pass's own output row, its
+  own last proposal and the next position.
+- *To the model's tokens*: the checkpoint run below, with the same pass run on wrong inputs beside it.
+
 **The runs behind this section** (2026-11-17; PyTorch 2.13.0, safetensors 0.8.0; the published checkpoint, manifest
 hash `95049016a247`). On the CPU, without a GPU:
 
@@ -737,9 +817,45 @@ hash `95049016a247`). On the CPU, without a GPU:
 And the same load on a GPU of compute capability 10.0 (a 148-SM part): every byte of the five 8-bit weights, of the
 norm weights and of the head rows equals the byte the CPU made, and every scale is the same bit for bit.
 
-**What is not here.** No draft step and no speculative decoding: nothing runs the loaded drafter, so nothing compares
-its output with anything, and no kernel has read these 8-bit weights. No script takes the list yet; the loader takes
-it as `draft_vocab=`. The loader has run on the CPU and on one GPU class, compute capability 10.0; a class it has not
+**The runs of the draft pass** (2026-11-18; PyTorch 2.13.0; a GPU of compute capability 10.0, a 148-SM part shared
+with other users: correctness only, by hand, with drivers that are not part of this repository).
+
+*The seeded drafter of the reduced model, at the published widths.* A pass over six rows of a sequence gave the rows
+and the cache of six passes of one row, byte for byte, at one sequence and at two. `draft` with every kept count 0 to
+5 behind six rows, and behind one row, gave the five proposals and the cache of the same passes made one row at a
+time. The row quantiser gave, for a stated tensor, the codes and the scales the CPU gives. Every kernel of those
+calls is PyTorch's or cuBLAS's, by name: one gather per pass, the embedding lookup, and none for the id of the chosen
+row or for a concatenation. A second run printed the same bytes.
+
+*The published checkpoint, against the model's own tokens* (reported; no line of it is a gate of this sample). The
+model decoded three prompts greedily on the stack `native`, 70 new tokens each: the default prompt and two arithmetic
+word problems, 58, 117 and 78 prompt tokens. The drafter then ran over each of them teacher-forced: one body pass per
+prompt position fills its cache, and from the last prompt position on every position is one draft step of five passes
+behind one row, handed the model's final-norm row of that position and the token the model chose there. The list is
+the one the recipe above made in the runs of 2026-11-17: the 342 ids of six dump files, then the lowest ids; the
+default prompt is one of the three prompts behind those dumps, the other two are not.
+
+- The first proposal equals the model's next token at 167 of 207 positions (46, 56 and 65 of 69 by prompt), the
+  second at 128 of 204, the third at 94 of 201, the fourth at 70 of 198, the fifth at 54 of 195. At 4 of the 207
+  positions the model's token is not in the list. Had a step started at every position, the proposals would have
+  kept 2.37 drafted tokens a step on average over 195 positions: none at 37 of them, all five at 42.
+- The same pass with one input wrong, first proposal, same positions: the two halves in front of the first multiply
+  exchanged, 0 of 207; the hidden row replaced by zeros, 8 of 207; the hidden row of the position before, 108 of
+  207; the hidden row of the position after, 150 of 207. The hidden row carries the proposal and the pass reads the
+  right one. A row that is one position old is still a row of the same text: half of the proposals survive it.
+- The first pass over six rows -- the six rows that end at a position, the last of them kept -- gave the five
+  proposals of the pass behind one row at 36 of 36 positions.
+- A plain fp32 evaluation of the drafter's network on the checkpoint's bf16 tensors -- no 8-bit codes, no quantiser
+  per row, written for this run from the checkpoint's layout -- gave the pass's first proposal at 200 of 207
+  positions and the model's token at 166. It is not part of this repository.
+- With a cache of 194 positions the loaded drafter held 2,135,219,200 bytes, which is `memory_bytes(1, 194)`.
+
+**What is not here.** The drafter has a draft pass on reference blocks, reached from the library
+(`QwenDenseDrafter.body`, `propose`, `draft`): every block of it is a reference chain in every stack, and its embedding
+lookup is PyTorch's gather. No session runs a draft pass yet, and no script takes the list; the loader takes it as
+`draft_vocab=`. No kernel serves a block of the drafter and none has read these 8-bit weights: the kernel census
+holds the model's steps and no draft pass, so nothing here says which kernels a pass has in the target kernel set.
+The loader and the pass have run on the CPU and on one GPU class, compute capability 10.0; a class they have not
 run on is uncovered, not passing. And the 8-bit weights are held to the rule above, not to the weights another
 implementation makes of the same checkpoint: no such comparison is part of this repository.
 

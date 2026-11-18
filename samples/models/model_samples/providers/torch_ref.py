@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Every block of a model in plain PyTorch: the reference of the tie-out, and the provider of the blocks that have no kernel yet.
+"""Every block of a model in plain PyTorch: the reference of the tie-out, and the provider of the blocks that have no kernel yet
+-- among them every block of a drafter's pass.
 
 The functions keep the quantisation rules and every intermediate cast of a serving chain (a norm output, a SiLU, a gate, the
 conv taps and the core output of the linear-attention step are each rounded to bf16 where the chain rounds them), and they
@@ -21,20 +22,36 @@ import torch.nn.functional as F
 from ..census import Kernel
 from ..sampling import greedy
 from ..state import RecurrentSlots, TokenSlots
-from ..weights import BLOCK, E4M3_MAX, BlockScaledTensor, Dequantized, ScaledTensor, _e2m1, _e4m3, _e4m3_values, dequantize, quantize_fp8, quantize_nvfp4
-from . import PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
+from ..weights import (
+    BLOCK,
+    E4M3_MAX,
+    BlockScaledTensor,
+    Dequantized,
+    ScaledTensor,
+    _e2m1,
+    _e4m3,
+    _e4m3_values,
+    dequantize,
+    quantize_fp8,
+    quantize_fp8_per_row,
+    quantize_nvfp4,
+)
+from . import FP8_ROW, PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
 
 BF16 = torch.bfloat16
 
 
 def quantize(y: torch.Tensor, quant):
-    """The quantised operand of a consumer, from a bf16 activation: static 8-bit or 4-bit with a static global scale."""
+    """The quantised operand of a consumer, from a bf16 activation: static 8-bit, 4-bit with a static global scale, or
+    8-bit with one scale per row that is formed from the row (``weights.quantize_fp8_per_row``)."""
     if quant is None:
         return None
     if quant.fmt == "fp8":
         return quantize_fp8(y, quant.scale)
     if quant.fmt == "nvfp4":
         return quantize_nvfp4(y, quant.scale)
+    if quant.fmt == FP8_ROW:
+        return quantize_fp8_per_row(y)
     raise ValueError(f"unknown quantisation format {quant.fmt!r}")
 
 
@@ -60,21 +77,39 @@ def linear(qx, weight: Dequantized, acc, columns_per_chunk: int = 8192) -> torch
     """A multiply on quantised operands: the code values of both sides multiplied and accumulated in ``acc``, the scales applied
     to the result, one rounding to bf16.  Chunked over the weight's rows so the wide copy is never held twice in ``acc``.
     It reads the weight's bf16 copy: the one a load kept, or -- in the checks of a run that keeps the weight on its stored
-    format alone -- the one the checks made for this call (``weights.OnDemand``)."""
+    format alone -- the one the checks made for this call (``weights.OnDemand``).  An operand whose rows were each
+    quantised at a scale of their own brings one scale per row: element ``[i, j]`` of the result then takes the scale of
+    row ``i`` of the operand times the scale of row ``j`` of the weight (or the weight's one scale)."""
     x, copy = dequantize(qx), weight.bf16()
     xa = x.data.to(acc)
     out = torch.empty((xa.shape[0], copy.shape[0]), dtype=acc, device=xa.device)
     for a in range(0, copy.shape[0], columns_per_chunk):
         out[:, a : a + columns_per_chunk] = xa @ copy[a : a + columns_per_chunk].to(acc).T
-    scale = weight.scale.to(acc) * x.scale if isinstance(weight.scale, torch.Tensor) else float(weight.scale) * float(x.scale)
+    if isinstance(x.scale, torch.Tensor):  # one scale per row of the operand, beside the weight's own
+        per_weight = weight.scale.to(acc) if isinstance(weight.scale, torch.Tensor) else float(weight.scale)
+        scale = x.scale.to(acc).unsqueeze(1) * per_weight
+    else:
+        scale = weight.scale.to(acc) * x.scale if isinstance(weight.scale, torch.Tensor) else float(weight.scale) * float(x.scale)
     return (out * scale).to(BF16)
 
 
-def silu_mul_quantize(gate_up: torch.Tensor, quant):
-    """``SiLU(gate) * up`` on the two halves of a merged gate/up output, with the chain's two bf16 roundings, then quantise."""
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """``SiLU(gate) * up`` on the two halves of a merged gate/up output, with the chain's two bf16 roundings: the SiLU is
+    formed in fp32 and rounded, and so is its product with ``up``."""
     half = gate_up.shape[-1] // 2
-    act = (F.silu(gate_up[:, :half].float()).to(BF16).float() * gate_up[:, half:].float()).to(BF16)
-    return quantize(act, quant)
+    return (F.silu(gate_up[:, :half].float()).to(BF16).float() * gate_up[:, half:].float()).to(BF16)
+
+
+def silu_mul_quantize(gate_up: torch.Tensor, quant):
+    """:func:`silu_mul`, then quantise."""
+    return quantize(silu_mul(gate_up), quant)
+
+
+def pre_fc_norm_quantize(embedding: torch.Tensor, hidden: torch.Tensor, weight_embedding, weight_hidden, quant, eps: float, acc):
+    """The operand of a drafter's first multiply: the embedding rows and the hidden rows, each normed with its own weight and
+    rounded to bf16 (:func:`rms_norm`), laid side by side -- the embedding half first -- and quantised as ONE row
+    ``[rows, 2 * hidden]``: under a scale per row both halves of a row share it."""
+    return quantize(torch.cat((rms_norm(embedding, weight_embedding, eps, acc), rms_norm(hidden, weight_hidden, eps, acc)), dim=-1), quant)
 
 
 def rope_cos_sin(position: int, rotary_dim: int, theta: float, device):
@@ -139,6 +174,20 @@ def attention_tokens(q: torch.Tensor, cache, position: int, tokens: int, acc) ->
 def gate_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
     """``sigmoid(gate) * attention output`` with the chain's bf16 roundings, then the static 8-bit quantisation."""
     return quantize((o.float() * torch.sigmoid(gate.float()).to(BF16).float()).to(BF16), quant)
+
+
+def gate_row_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
+    """``attention output * sigmoid(gate)`` formed in fp32 and rounded to bf16 ONCE, then quantised.  Not
+    :func:`gate_quantize`, which rounds the sigmoid to bf16 before the product: another function, and another byte on
+    some elements."""
+    return quantize((o.float() * torch.sigmoid(gate.float())).to(BF16), quant)
+
+
+def listed_argmax(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """The token of every row of ``logits`` ``[rows, listed]``, the logits of a head cut to listed rows: the column of the
+    largest value, the first of equal ones, then the token id of that column (``ids`` ``[listed]``, in the dtype the ids
+    are returned in).  The id is read by indexing ``ids``: a gather of a step is its embedding lookup alone."""
+    return ids[torch.argmax(logits, dim=-1)]
 
 
 #: the largest fp32 value: an fp32 exponential beyond it is +inf, and the value it divides is then +-0
@@ -410,6 +459,31 @@ class TokenChoice(_Reference):
         return greedy(logits)
 
 
+class ListedTokenChoice(_Reference):
+    """The token choice of a head cut to listed rows, with the lookup of the chosen row's token id: a block of a drafter's
+    pass, which a kernel is to serve -- a reference chain, not the sample's host path."""
+
+    def __call__(self, logits, ids):
+        return listed_argmax(logits, ids)
+
+
+class PreFcNormQuantize(_Reference):
+    per_row = (0, 1)
+
+    def __call__(self, embedding, hidden, weight_embedding, weight_hidden, quant):
+        return pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, quant, self.eps, self.acc)
+
+
+class Quantize(_Reference):
+    def __call__(self, rows, quant):
+        return quantize(rows, quant)
+
+
+class SiluMul(_Reference):
+    def __call__(self, gate_up):
+        return silu_mul(gate_up)
+
+
 class AddNormQuantize(_Reference):
     per_row = (0, 1)
 
@@ -525,6 +599,13 @@ class GateQuantize(_Reference):
 
     def __call__(self, o, gate, quant):
         return gate_quantize(o, gate, quant)
+
+
+class GateRowQuantize(_Reference):
+    per_row = (0, 1)
+
+    def __call__(self, o, gate, quant):
+        return gate_row_quantize(o, gate, quant)
 
 
 class GateQuantizeQuotient(_Reference):

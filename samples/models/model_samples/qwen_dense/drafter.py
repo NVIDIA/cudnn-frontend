@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The drafter of a dense Qwen 3.5-architecture checkpoint: which tensors it is, what a load makes of them, and the rows of
-the model's output head it proposes tokens from.
+"""The drafter of a dense Qwen 3.5-architecture checkpoint: which tensors it is, what a load makes of them, the rows of the
+model's output head it proposes tokens from, and its draft pass on reference blocks.
 
 A checkpoint of this family can carry a drafter beside the model: a small network that reads the model's last hidden row
 and the embedding of the last token and proposes the next tokens, which the model then verifies in one step (speculative
-decoding).  This module is its LOADER and nothing more: no draft step, no block, no provider row.  It answers three
+decoding).  This module is its loader and its draft pass; no session runs a pass yet.  The loader answers three
 questions, each from the checkpoint itself:
 
 * **Which tensors.**  The drafter's own tensors sit under one prefix of the checkpoint, found in its shard headers: two
@@ -24,6 +24,52 @@ questions, each from the checkpoint itself:
 
 ``QwenDenseDrafter.seeded(model)`` is the drafter of the reduced seeded model: the same tensor list drawn from a seed, and a
 draft vocabulary drawn from that seed instead of a file.
+
+**The draft pass.**  One pass is 18 block calls (``wiring()``; the provider table ``configs.DRAFTER_PROVIDERS``): the body,
+15 calls that end in the final norm (``body``), and the head, 3 calls (``propose``).  ``rows`` rows of a step, sequence
+by sequence:
+
+========================= ================================================== ===========================================
+block (call site)         operands                                           result
+========================= ================================================== ===========================================
+draft.embedding           ids ``[rows]`` int32, the model's table            ``[rows, hidden]`` bf16
+draft.pre_fc_norm         embedding rows, hidden rows, two norm weights,     8-bit ``[rows, 2 hidden]``, the embedding
+                          ``Quant``                                          half first, one scale per row over both
+draft.projection (fc)     8-bit operand, weight copy, site                   ``[rows, hidden]`` bf16: the residual stream
+draft.norm_quantize       branch, residual, norm weight, ``Quant``, site     (8-bit operand, normed bf16, new residual)
+ (input, mlp)
+draft.projection (qkv)    8-bit operand, weight copy, site                   ``[rows, 2 x 6144 + 2 x 1024]`` bf16
+draft.attention.prepare   QKV row, cache, position, params                   (q, gate); key and value inserted
+draft.attention.core      q, cache, position                                 ``[rows, 6144]`` bf16
+draft.gate_quantize       attention output, gate, ``Quant``                  8-bit ``[rows, 6144]``
+draft.projection (o)      8-bit operand, weight copy, site                   ``[rows, hidden]`` bf16
+draft.projection (gate_up) 8-bit operand, weight copy, site                  ``[rows, 2 x 17408]`` bf16: gate, then up
+draft.silu_mul            gate / up rows                                     ``[rows, 17408]`` bf16
+draft.activation_quantize those rows, ``Quant``                              8-bit ``[rows, 17408]``
+draft.projection (down)   8-bit operand, weight copy, site                   ``[rows, hidden]`` bf16
+draft.final_norm          branch, residual, norm weight, no ``Quant``        the output rows ``[rows, hidden]`` bf16
+draft.head.quantize       one row per sequence, the head's ``Quant``         4-bit ``[sequences, hidden]``
+draft.head                4-bit operand, copy of the listed head rows        logits ``[sequences, listed ids]`` bf16
+draft.token_choice        logits, the token id of every listed row           ids ``[sequences]`` int32
+========================= ================================================== ===========================================
+
+Every 8-bit operand of a pass is quantised per row of the step, at a scale formed from the row
+(``weights.quantize_fp8_per_row``, ``providers.ROW_QUANT``), and every multiply applies the scale of the operand's row
+and the scale of the weight's row.  The first multiply reads the embedding of a token and a hidden row side by side;
+its result is the residual stream of the pass, which the layer's input norm reads without an add.  The attention layer
+has a cache of the drafter's own (``state``): a pass writes its keys and values at the positions of its rows and is told
+where they stand; the cache has no position.  The model's caches and state are never written by a pass.
+
+``draft`` is the passes of one step of speculative decoding: the first pass over the rows it is handed -- the final-norm
+rows of the model's last step and the token that follows each -- then the row of the last kept token, the head, and
+every later pass on the pass's own output row and its own last proposal, one position further each.  ``call(block,
+pass, *operands)`` runs one block, as a family's step takes it; the pass, counted from 0, stands where a step hands
+over the layer.
+
+Every block of a pass is a reference chain in every stack, so nothing judges it against another implementation of
+itself: each function is held to its definition by a host test, and a pass over several rows to passes of one row.
+The reference blocks multiply on bf16 copies of the five weights and of the listed head rows, which a load keeps beside
+the codes (``load(copies=True)``).
 """
 
 from __future__ import annotations
@@ -31,13 +77,15 @@ from __future__ import annotations
 import json
 import os
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ..providers import Quant
-from ..weights import BLOCK, BlockScaledTensor, ScaledTensor, TensorSpec, quantize_fp8_per_channel
+from ..providers import ROW_QUANT, AttentionParams, Quant
+from ..state import KvCache
+from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TensorSpec, dequantize, quantize_fp8_per_channel
+from . import configs
 from .model import BRANCH_GAIN, Geometry
 
 #: this family's names of the drafter's own tensors start with this; the checkpoint's prefix for them is found in its headers
@@ -65,6 +113,26 @@ NORMS = (
     ("post_norm", "layers.0.post_attention_layernorm"),
     ("final_norm", "norm"),
 )
+#: the block calls of one pass in the order ``body`` and ``propose`` make them, each with its call site (``""`` for a block
+#: that is called once): the body ends in the final norm, the head runs on one row per sequence
+BODY = (
+    ("draft.embedding", ""),
+    ("draft.pre_fc_norm", ""),
+    ("draft.projection", "fc"),
+    ("draft.norm_quantize", "input"),
+    ("draft.projection", "qkv"),
+    ("draft.attention.prepare", ""),
+    ("draft.attention.core", ""),
+    ("draft.gate_quantize", ""),
+    ("draft.projection", "o"),
+    ("draft.norm_quantize", "mlp"),
+    ("draft.projection", "gate_up"),
+    ("draft.silu_mul", ""),
+    ("draft.activation_quantize", ""),
+    ("draft.projection", "down"),
+    ("draft.final_norm", ""),
+)
+HEAD = (("draft.head.quantize", ""), ("draft.head", ""), ("draft.token_choice", ""))
 READS = "it reads a drafter stored in bf16, whose multiplies it quantises to 8 bits when it loads"
 RECIPE = 'samples/models/qwen_dense/README.md, "The checkpoint\'s drafter"'
 _JSON_KINDS = {dict: "an object", str: "a string", bool: "true or false", int: "a number", float: "a number", type(None): "null"}
@@ -139,7 +207,10 @@ class ManifestRow:
 class DrafterWeights:
     """A loaded drafter.  The five weights are 8-bit codes with one fp32 scale per row; the norm weights are the
     checkpoint's bf16 tensors; ``head`` is the rows of the model's 4-bit output head at the draft vocabulary's ids and
-    ``head_ids`` the token id of each of those rows; ``embedding`` is the model's table."""
+    ``head_ids`` the token id of each of those rows; ``embedding`` is the model's table.  ``copies`` is what the
+    reference blocks of a pass multiply on: per weight (``fc``, ``qkv``, ``o``, ``gate_up``, ``down``) and for the
+    listed head rows (``head``) the bf16 copy of the code values with the scale a multiply applies and the stored
+    tensor it was made from (``weights.Dequantized``); ``None`` for a load that kept none."""
 
     embedding: object  # [vocabulary, hidden] bf16
     pre_fc_norm_embedding: object  # [hidden] bf16
@@ -157,6 +228,7 @@ class DrafterWeights:
     head: BlockScaledTensor  # [listed ids, hidden]
     head_quant: Quant  # how the head's operand is quantised: 4-bit, the head's static input scale
     head_ids: object  # [listed ids] int32
+    copies: Optional[Dict[str, Dequantized]] = None  # fc, qkv, o, gate_up, down, head: what a reference block multiplies on
 
 
 @dataclass
@@ -164,19 +236,24 @@ class QwenDenseDrafter:
     """The drafter of one model: its tensor list, its draft vocabulary and its load.  ``describe`` makes it from a described
     checkpoint, ``seeded`` for the reduced seeded model."""
 
-    geometry: Geometry
+    geometry: Geometry  # the model's widths; its one layer is an attention layer
     vocabulary: DraftVocab
     shared: Tuple[TensorSpec, ...]  # the model's own specs of the tensors the drafter reads from it
     label: str = "seeded weights"  # what it was described from
     prefix: str = ""  # the checkpoint's prefix of the drafter's own tensors
     keys: Dict[str, str] = field(default_factory=dict)  # this family's tensor names -> the checkpoint's own
     name: str = "qwen_dense drafter"
+    # what a plan asks of a model (``blocks.plan(drafter.provider_table, drafter.regimes, .., model=drafter)``).  The drafter
+    # names no target stacks: no kernel census holds a draft pass, and a plan of it states no kernel identity
+    provider_table = configs.DRAFTER_PROVIDERS
+    regimes = configs.REGIMES
+    table_source = "model_samples/qwen_dense/configs.py"
 
     @classmethod
     def seeded(cls, model, rows: Optional[int] = None, seed: int = 0) -> "QwenDenseDrafter":
         """The drafter of a seeded model: its tensors are drawn by name like the model's (``Checkpoint.synthetic(drafter,
         seed)``; with the model's seed the head it cuts its rows from is the model's), its draft vocabulary from ``seed``."""
-        return cls(model.geometry, DraftVocab.seeded(model.geometry.vocab, rows, seed), _shared(model))
+        return cls(_one_layer(model.geometry), DraftVocab.seeded(model.geometry.vocab, rows, seed), _shared(model))
 
     @classmethod
     def describe(cls, checkpoint, model, draft_vocab: Optional[str] = None) -> "QwenDenseDrafter":
@@ -215,7 +292,132 @@ class QwenDenseDrafter:
                 "a checkpoint's drafter needs a draft vocabulary: a JSON list of the token ids its head is cut to. "
                 f"A recipe that makes one from the files --dump-tokens writes: {RECIPE}"
             )
-        return cls(model.geometry, DraftVocab.read(draft_vocab, model.geometry.vocab), shared, checkpoint.label, prefix, keys)
+        return cls(_one_layer(model.geometry), DraftVocab.read(draft_vocab, model.geometry.vocab), shared, checkpoint.label, prefix, keys)
+
+    # ------------------------------------------------------------------ what a plan asks of a model
+    @property
+    def norm_eps(self) -> float:
+        return self.geometry.norm_eps
+
+    def calls(self) -> Dict[str, int]:
+        """Calls per pass of every block: five for the multiply, two for the norm + quantise, one for every other block."""
+        counts: Dict[str, int] = {}
+        for block, _ in (*BODY, *HEAD):
+            counts[block] = counts.get(block, 0) + 1
+        return counts
+
+    def calls_per_pass(self) -> int:
+        return len(BODY) + len(HEAD)
+
+    def calls_text(self) -> Dict[str, str]:
+        return {block: str(count) for block, count in self.calls().items()}
+
+    def wiring(self) -> Tuple[Tuple[str, int], ...]:
+        """The block calls of ONE pass in the order ``body`` and ``propose`` make them, as ``(block, pass)``: the pass stands
+        where a model's wiring has the layer, and this is pass 0.  The passes of a step are this list once per pass, with
+        the pass's number (``draft`` hands it to ``call``)."""
+        return tuple((block, 0) for block, _ in (*BODY, *HEAD))
+
+    def sites(self) -> Tuple[str, ...]:
+        """The call site of every call of ``wiring()``, in its order: the weight's name for the multiply (``fc``, ``qkv``,
+        ``o``, ``gate_up``, ``down``: ``configs.DRAFT_PROJECTION_SITES``), what the codes feed for the norm + quantise
+        (``input``, ``mlp``: ``configs.DRAFT_NORM_SITES``), ``""`` for a block that is called once."""
+        return tuple(site for _, site in (*BODY, *HEAD))
+
+    # ------------------------------------------------------------------ the draft pass
+    def state(self, sequences: int, capacity: int, device) -> KvCache:
+        """The drafter's own attention cache for ``sequences`` sequences of up to ``capacity`` positions: keys and values
+        ``[sequences, kv_heads, capacity, head_dim]`` bf16, zero.  It has no position of its own: every pass is told
+        where its rows stand."""
+        if sequences < 1 or capacity < 1:
+            raise ValueError(f"a drafter's cache needs at least one sequence and one position; got sequences={sequences}, capacity={capacity}")
+        g = self.geometry
+        shape = (sequences, g.attn_kv_heads, capacity, g.attn_head_dim)
+        return KvCache(torch.zeros(shape, dtype=torch.bfloat16, device=device), torch.zeros(shape, dtype=torch.bfloat16, device=device))
+
+    def _copies(self, weights: DrafterWeights) -> Dict[str, Dequantized]:
+        if weights.copies is None:
+            raise ValueError(
+                "the reference blocks of a draft pass multiply on bf16 copies of the drafter's weights, and this load kept none: "
+                "load the drafter with copies=True"
+            )
+        return weights.copies
+
+    def body(self, call, weights: DrafterWeights, cache: KvCache, hidden, ids, position: int, index: int = 0):
+        """The body of one pass, 15 block calls: ``hidden`` ``[rows, hidden]`` bf16 and ``ids`` ``[rows]`` int32 on the device
+        -> the final-norm rows ``[rows, hidden]`` bf16.  The rows stand sequence by sequence, ``rows / sequences`` per
+        sequence (the sequences are the cache's); row ``t`` of a sequence reads hidden row ``t`` and the embedding of id
+        ``t`` and stands at ``position + t``, where its key and value are written into ``cache``.  ``call(block, pass,
+        *operands)`` runs one block; ``index`` is the pass this is, counted from 0, which ``call`` is handed in the
+        place a step hands over the layer.  Nothing is read from the device.
+
+        The attention blocks are handed the cache as a view of their own (``KvCache(k, v, rows / sequences)``): how many
+        positions a pass inserts is the pass's, not a property of the cache.  ``ValueError`` for rows that are not a
+        whole number per sequence, for ids that are not one per row, and for a pass that would write past the cache."""
+        sequences, rows = cache.k.shape[0], hidden.shape[0]
+        if rows < sequences or rows % sequences or ids.shape[0] != rows:
+            raise ValueError(
+                f"a draft pass takes a whole number of rows per sequence of its cache ({sequences}) and one id per row; "
+                f"got {rows} hidden rows and {ids.shape[0]} ids"
+            )
+        tokens = rows // sequences
+        if position < 0 or position + tokens > cache.k.shape[2]:
+            raise ValueError(
+                f"the drafter's cache was built for {cache.k.shape[2]} positions per sequence; this pass writes {position} to {position + tokens - 1}"
+            )
+        copies, g = self._copies(weights), self.geometry
+        view = KvCache(cache.k, cache.v, tokens)
+        attention = AttentionParams(g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim, g.rope_theta, weights.q_norm, weights.k_norm)
+        embedded = call("draft.embedding", index, ids, weights.embedding)
+        q = call("draft.pre_fc_norm", index, embedded, hidden, weights.pre_fc_norm_embedding, weights.pre_fc_norm_hidden, ROW_QUANT)
+        stream = call("draft.projection", index, q, copies["fc"], "fc")  # the residual stream of the pass
+        q, _, residual = call("draft.norm_quantize", index, stream, None, weights.input_norm, ROW_QUANT, "input")
+        row = call("draft.projection", index, q, copies["qkv"], "qkv")
+        qh, gate = call("draft.attention.prepare", index, row, view, position, attention)
+        attended = call("draft.attention.core", index, qh, view, position)
+        q = call("draft.gate_quantize", index, attended, gate, ROW_QUANT)
+        branch = call("draft.projection", index, q, copies["o"], "o")
+        q, _, residual = call("draft.norm_quantize", index, branch, residual, weights.post_norm, ROW_QUANT, "mlp")
+        gate_up = call("draft.projection", index, q, copies["gate_up"], "gate_up")
+        q = call("draft.activation_quantize", index, call("draft.silu_mul", index, gate_up), ROW_QUANT)
+        branch = call("draft.projection", index, q, copies["down"], "down")
+        _, normed, _ = call("draft.final_norm", index, branch, residual, weights.final_norm, None)
+        return normed
+
+    def propose(self, call, weights: DrafterWeights, rows, index: int = 0):
+        """The head of one pass, 3 block calls: the final-norm rows of one row per sequence ``[sequences, hidden]`` bf16 ->
+        the proposed token of every sequence ``[sequences]`` int32, on the device: the head's static 4-bit quantisation,
+        the multiply over the listed rows of the model's output head, the column of the largest logit (the first of
+        equal ones) and its token id.  ``index``: as for ``body``."""
+        q = call("draft.head.quantize", index, rows, weights.head_quant)
+        logits = call("draft.head", index, q, self._copies(weights)["head"])
+        return call("draft.token_choice", index, logits, weights.head_ids)
+
+    def draft(self, call, weights: DrafterWeights, cache: KvCache, hidden, ids, position: int, kept: int, passes: int):
+        """The ``passes`` passes of one step of speculative decoding -> the proposed tokens ``[sequences, passes]`` int32, on
+        the device.
+
+        Pass 0 is ``body`` on what it is handed: per sequence the final-norm rows of the model's last step and, for each
+        of them, the token that follows it; ``position`` is where the first row of a sequence stands.  Of its output the
+        row ``kept`` of every sequence is taken -- the row of the last token the run kept; a view by a host integer,
+        nothing is launched for it -- and ``propose`` gives the first proposal.  Pass ``j`` = 1, 2, .. is ``body`` on
+        the output row of pass ``j - 1`` and the proposal of pass ``j - 1``, one row per sequence at position ``position
+        + kept + j``, then ``propose``.  The rows of pass 0 behind ``kept`` write cache positions that the later passes
+        and the first pass of the next step write again before a row reads them.
+
+        ``ValueError`` for a ``kept`` that is not a row of a sequence, and for no pass."""
+        sequences = cache.k.shape[0]
+        tokens = hidden.shape[0] // sequences
+        if isinstance(kept, bool) or not isinstance(kept, int) or not 0 <= kept < max(tokens, 1):
+            raise ValueError(f"a draft step continues from one of the {tokens} rows per sequence it is handed, 0 to {tokens - 1}; got kept={kept!r}")
+        if isinstance(passes, bool) or not isinstance(passes, int) or passes < 1:
+            raise ValueError(f"a draft step has at least one pass; got passes={passes!r}")
+        row = self.body(call, weights, cache, hidden, ids, position).unflatten(0, (sequences, tokens))[:, kept]
+        drafts = [self.propose(call, weights, row)]
+        for index in range(1, passes):
+            row = self.body(call, weights, cache, row, drafts[-1], position + kept + index, index)
+            drafts.append(self.propose(call, weights, row, index))
+        return torch.stack(drafts, dim=1)
 
     # ------------------------------------------------------------------ the tensor list
     def tensor_specs(self) -> List[TensorSpec]:
@@ -265,6 +467,22 @@ class QwenDenseDrafter:
         rows, hidden = len(self.vocabulary.ids), self.geometry.hidden
         return {"weights": weights, "norms": norms, "head": rows * (hidden // 2 + hidden // BLOCK + 4)}
 
+    def copy_bytes(self) -> Dict[str, int]:
+        """What the bf16 copies of a load with ``copies=True`` hold, in bytes: 2 per element of the five weights
+        (``weights``) and of the listed head rows (``head``).  The reference blocks of a pass multiply on them."""
+        specs = {spec.name: spec for spec in self.tensor_specs()}
+        weights = sum(2 * specs[OWN + part + ".weight"].numel for _, parts in MULTIPLIES for part in parts)
+        return {"weights": weights, "head": 2 * len(self.vocabulary.ids) * self.geometry.hidden}
+
+    def memory_bytes(self, sequences: int, capacity: int, copies: bool = True) -> int:
+        """What a loaded drafter and its cache hold on the device besides the model's embedding table, in bytes: what the
+        load holds (``load_bytes``), the bf16 copies of a load with ``copies`` (``copy_bytes``), and the cache of
+        ``sequences`` sequences of ``capacity`` positions (keys and values, 2 bytes per element).  No working memory:
+        a run that states what it needs adds its own allowance."""
+        g = self.geometry
+        cache = 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
+        return sum(self.load_bytes().values()) + (sum(self.copy_bytes().values()) if copies else 0) + cache
+
     def manifest_text(self) -> str:
         """The manifest as a run prints it: no path, a file by its own name."""
         rows = self.manifest()
@@ -282,14 +500,22 @@ class QwenDenseDrafter:
             f"  loaded, besides the model's embedding table: {sum(held.values()) / gib:.2f} GiB "
             f"(8-bit weights {held['weights'] / gib:.2f}, norm weights {held['norms'] / gib:.2f}, head rows {held['head'] / gib:.2f})"
         )
+        copied = self.copy_bytes()
+        lines.append(
+            f"  and the bf16 copies its reference blocks multiply on (a load keeps them unless told copies=False): {sum(copied.values()) / gib:.2f} GiB "
+            f"(of the five weights {copied['weights'] / gib:.2f}, of the head rows {copied['head'] / gib:.2f})"
+        )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ load
-    def load(self, checkpoint, device, stages=None, embedding=None) -> DrafterWeights:
+    def load(self, checkpoint, device, stages=None, embedding=None, copies: bool = True) -> DrafterWeights:
         """Read (or draw) the drafter's tensors, concatenate the parts of its merged weights, quantise the five weights to
         8 bits per row, and cut the head.  The head is read whole on the CPU and only its listed rows go to ``device``.
         ``embedding``: the table the model loaded, so that the drafter holds no second copy; without it the table is read.
-        ``stages`` (``timing.Stages``) accumulates the seconds of read (or draw), merge and quantise."""
+        ``copies``: beside the codes, the bf16 copies the reference blocks of a pass multiply on -- of the five weights
+        and of the listed head rows, each made from the codes the load keeps (``DrafterWeights.copies``; exact:
+        ``weights.dequantize``).  A pass on a load without them is a ``ValueError``.
+        ``stages`` (``timing.Stages``) accumulates the seconds of read (or draw), merge, quantise and dequantise."""
         from ..timing import Stages
 
         stages = Stages() if stages is None else stages
@@ -313,11 +539,19 @@ class QwenDenseDrafter:
             index = torch.tensor(self.vocabulary.ids, dtype=torch.int64)
             head = BlockScaledTensor(whole.codes[index].to(device), whole.block_scales[index].to(device), whole.scale)
             del whole
+        copied = None
+        if copies:  # what a reference block multiplies on: the code values in bf16, with the scale and the stored tensor beside them
+            copied = {}
+            with stages.stage("dequantise"):
+                for name, held in (*((name, loaded[name]) for name, _ in MULTIPLIES), ("head", head)):
+                    copied[name] = dequantize(held)
+                    copied[name].stored = held
         return DrafterWeights(
             embedding=stored(SHARED[0]) if embedding is None else embedding,
             head=head,
             head_quant=Quant("nvfp4", checkpoint.load(SHARED[2], device)),
             head_ids=index.to(torch.int32).to(device),
+            copies=copied,
             **loaded,
         )
 
@@ -332,6 +566,11 @@ def _prefix(checkpoint) -> str:
     if len(found) > 1:
         raise NotImplementedError(f"{checkpoint.label}: the drafter's tensors are not under one prefix (found: {', '.join(repr(p) for p in found)})")
     return found[0]
+
+
+def _one_layer(geometry: Geometry) -> Geometry:
+    """The geometry of a model's drafter: the model's widths, and one layer, an attention layer."""
+    return replace(geometry, layer_kinds=("full_attention",))
 
 
 def _own_specs(g: Geometry) -> List[TensorSpec]:

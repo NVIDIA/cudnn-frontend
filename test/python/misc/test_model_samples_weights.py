@@ -4,7 +4,8 @@
 """Host-only tests of the weight formats of the model samples (``samples/models/model_samples/weights.py``): the bf16 copies a
 multiply reads, against a decode of the stored codes written here from the format definitions -- 8-bit E4M3 with a scale;
 packed 4-bit E2M1, low nibble first, with E4M3 block scales and a global scale -- with an all-zero and a saturated block,
-both merge rules, and the reference multiply on a product computed by hand.  The provider stack and the reference stack of a
+both merge rules, and the reference multiply on a product computed by hand -- also where both operands bring a scale per
+row, as a drafter's do, with the slice of such an operand by rows.  The provider stack and the reference stack of a
 sample read the same copies and use the same quantisers, so the tie-out between them cannot see an error in either: these
 tests are the pin.
 
@@ -160,6 +161,94 @@ def test_the_reference_multiply_on_a_product_computed_by_hand():
     packed = weights.quantize_nvfp4(torch.tensor([[0.5, 6.0, -1.0, 1.5, 2.0, -3.0, 4.0, 0.0, -0.5, 1.0, -6.0, 3.0, -1.5, -2.0, -4.0, 0.5]]), 2.0)
     ones = weights.Dequantized(torch.ones((1, 16), dtype=torch.bfloat16), 1.0)
     assert torch_ref.linear(packed, ones, torch.float64).tolist() == [[0.5]], "a 4-bit operand: its code values, its block scale and its global scale"
+
+
+def test_a_multiply_with_a_scale_per_row_of_both_operands():
+    """``torch_ref.linear`` on an operand whose rows were each quantised at a scale of their own, over a weight with one
+    scale per row: element ``[i, j]`` is the accumulated product of the code values times the scale of row ``i`` of the
+    operand times the scale of row ``j`` of the weight, rounded once -- against a loop over the format's code values.
+    ``ScaledTensor.rows`` slices such a scale with its codes, so one row of a step is multiplied with its own scale."""
+    from model_samples import weights
+    from model_samples.providers import torch_ref
+
+    bf16 = torch.bfloat16
+    generator = torch.Generator().manual_seed(31)
+    rows = (torch.randn((4, 24), generator=generator) * torch.tensor([0.01, 1.0, 40.0, 3.0]).unsqueeze(1)).to(bf16)
+    operand = weights.quantize_fp8_per_row(rows)
+    weight = weights.quantize_fp8_per_channel((torch.randn((6, 24), generator=generator) * torch.logspace(-2, 1, 6).unsqueeze(1)).to(bf16))
+    copy = weights.dequantize(weight)
+    assert tuple(operand.scale.shape) == (4,) and tuple(copy.scale.shape) == (6,) and copy.scale is weight.scale
+    assert len(set(operand.scale.tolist())) == 4 and len(set(copy.scale.tolist())) == 6, "every row of either side has a scale of its own"
+    x, w = _e4m3(operand.codes).tolist(), _e4m3(weight.codes).tolist()  # the code values, from the format
+    xs, ws = operand.scale.double().tolist(), weight.scale.double().tolist()
+
+    def by_hand(row_scale, weight_scale):
+        """The loop: per element the sum of the products of the code values (exact in a double), times the two scales, cast
+        to bf16 as the reference casts an fp64 value (through fp32)."""
+        loop = [[sum(a * b for a, b in zip(x[i], w[j])) * (row_scale(i) * weight_scale(j)) for j in range(6)] for i in range(4)]
+        return torch.tensor(loop, dtype=torch.float64).float().to(bf16)
+
+    product = torch_ref.linear(operand, copy, torch.float64)
+    assert product.dtype == bf16 and tuple(product.shape) == (4, 6) and torch.equal(product, by_hand(lambda i: xs[i], lambda j: ws[j]))
+    # each of the wrong scales gives other bytes: the next row's, the weight's alone, the two sides exchanged in their roles
+    assert not torch.equal(product, by_hand(lambda i: xs[(i + 1) % 4], lambda j: ws[j]))
+    assert not torch.equal(product, by_hand(lambda i: 1.0, lambda j: ws[j])) and not torch.equal(product, by_hand(lambda i: xs[i], lambda j: 1.0))
+    assert not torch.equal(product, by_hand(lambda i: xs[0], lambda j: ws[j])), "one scale for the step is not the scale of its rows"
+    # a weight with ONE scale under an operand with a scale per row
+    one = weights.Dequantized(copy.data, 0.125)
+    assert torch.equal(torch_ref.linear(operand, one, torch.float64), by_hand(lambda i: xs[i], lambda j: 0.125))
+    # the fp32 accumulation of a run that asks for it: the same sums (exact at this width) and scales, one bf16 unit at most apart
+    single = torch_ref.linear(operand, copy, torch.float32)
+    unit = torch.pow(2.0, torch.floor(torch.log2(product.float().abs())) - 7)
+    assert single.dtype == bf16 and bool(((single.float() - product.float()).abs() <= unit).all())
+
+    # rows(): the codes of the rows with THEIR scales; a multiply of two rows of the step is two rows of the multiply
+    part = operand.rows(1, 3)
+    assert torch.equal(part.codes, operand.codes[1:3]) and torch.equal(part.scale, operand.scale[1:3]) and tuple(part.scale.shape) == (2,)
+    assert torch.equal(torch_ref.linear(part, copy, torch.float64), product[1:3])
+    for start, stop in ((0, 1), (3, 4), (0, 4), (2, 2)):
+        sliced = operand.rows(start, stop)
+        assert torch.equal(sliced.scale, operand.scale[start:stop]) and sliced.codes.shape[0] == sliced.scale.shape[0] == stop - start
+    # one scale for every row is handed on as it is: a float, and a tensor that is not one entry per row
+    static = weights.quantize_fp8(rows, 0.5)
+    assert static.rows(1, 3).scale == 0.5 and torch.equal(static.rows(1, 3).codes, static.codes[1:3])
+    scalar, other = torch.tensor(0.5), torch.tensor([0.5, 0.25, 0.125])
+    assert weights.ScaledTensor(operand.codes, scalar).rows(1, 3).scale is scalar and weights.ScaledTensor(operand.codes, other).rows(1, 3).scale is other
+
+
+def test_the_models_multiply_and_quantisers_are_byte_for_byte_what_they_were():
+    """The reference functions every plain run goes through took a second kind of operand (a scale per row of a step, a
+    format whose scale is formed per call).  On the model's own kinds -- one static scale for the operand, a weight with
+    one scale or one per row; the two static formats -- they are the operations they were, written out here."""
+    from model_samples import weights
+    from model_samples.providers import Quant, torch_ref
+
+    bf16 = torch.bfloat16
+    generator = torch.Generator().manual_seed(37)
+    rows = (torch.randn((5, 32), generator=generator) * 0.4).to(bf16)
+    data = (torch.randn((9, 32), generator=generator) * 0.2).to(bf16)
+    per_row = torch.rand(9, generator=generator) * 0.1 + 0.01
+    for operand in (weights.quantize_fp8(rows, 8.0 / 448.0), weights.quantize_nvfp4(rows, 8.0 / 2688.0)):
+        x = weights.dequantize(operand)
+        assert isinstance(x.scale, float)
+        for acc in (torch.float64, torch.float32):
+            summed = x.data.to(acc) @ data.to(acc).T
+            assert torch.equal(torch_ref.linear(operand, weights.Dequantized(data, 0.25), acc), (summed * (0.25 * float(x.scale))).to(bf16))
+            assert torch.equal(torch_ref.linear(operand, weights.Dequantized(data, per_row), acc), (summed * (per_row.to(acc) * x.scale)).to(bf16))
+    static8, static4 = Quant("fp8", 8.0 / 448.0), Quant("nvfp4", 8.0 / 2688.0)
+    assert (
+        torch.equal(torch_ref.quantize(rows, static8).codes, weights.quantize_fp8(rows, static8.scale).codes)
+        and torch_ref.quantize(rows, static8).scale == static8.scale
+    )
+    four, direct = torch_ref.quantize(rows, static4), weights.quantize_nvfp4(rows, static4.scale)
+    assert torch.equal(four.codes, direct.codes) and torch.equal(four.block_scales, direct.block_scales) and four.scale == direct.scale
+    assert torch_ref.quantize(rows, None) is None
+    with pytest.raises(ValueError, match="^unknown quantisation format 'fp16'$"):
+        torch_ref.quantize(rows, Quant("fp16", 1.0))
+    normed = torch_ref.add_norm_quantize(rows, rows.flip(0), data[0], static8, 1.0e-6, torch.float64)
+    summed = rows.flip(0).float() + rows.float()
+    assert torch.equal(normed[2], summed.to(bf16)) and torch.equal(normed[1], torch_ref.rms_norm(summed, data[0], 1.0e-6, torch.float64))
+    assert torch.equal(normed[0].codes, weights.quantize_fp8(normed[1], static8.scale).codes)
 
 
 # --------------------------------------------------------------------------- a checkpoint on local disk

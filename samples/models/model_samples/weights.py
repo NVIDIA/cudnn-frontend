@@ -42,7 +42,10 @@ make the midpoint choices of another quantiser.
 
 A weight that a checkpoint stores in bf16 can be brought to 8 bits when it is loaded, with one scale per row -- per output
 channel of the multiply (:func:`quantize_fp8_per_channel`).  That rule is fixed down to its division, because the codes are
-what a kernel on them reads: a host test pins it against the format definition.
+what a kernel on them reads: a host test pins it against the format definition.  The rows of a step can be brought to 8
+bits each at a scale of its own, formed from the row (:func:`quantize_fp8_per_row`): a third rule beside the static scale
+of :func:`quantize_fp8` and the weight's, fixed down to its multiplication by the reciprocal of the scale and pinned the
+same way.
 
 ``Checkpoint.synthetic`` draws every tensor on the CPU generator from a seed and the tensor's name, so a tensor's values depend
 on neither the device nor the load order.
@@ -91,7 +94,8 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 class ScaledTensor:
     """8-bit E4M3 codes with a scale: ``value = code * scale``.  ``codes`` holds the code bytes (``uint8``; view them as
     ``torch.float8_e4m3fn`` for a kernel); ``scale`` is a float, or a 1-D fp32 tensor with one scale per row: of a merged
-    weight whose parts kept their scales, or of a weight quantised per channel."""
+    weight whose parts kept their scales, of a weight quantised per channel, or of the rows of a step that were each
+    quantised at a scale of their own (:func:`quantize_fp8_per_row`)."""
 
     codes: torch.Tensor
     scale: Union[float, torch.Tensor]
@@ -101,7 +105,12 @@ class ScaledTensor:
         return self.codes.shape
 
     def rows(self, start: int, stop: int) -> "ScaledTensor":
-        return ScaledTensor(self.codes[start:stop], self.scale)
+        """The rows ``start`` to ``stop`` with their scale: a scale per row (one entry per row of the codes) is sliced with
+        the codes, one scale for every row is handed on as it is."""
+        scale = self.scale
+        if isinstance(scale, torch.Tensor) and scale.dim() == 1 and scale.shape[0] == self.codes.shape[0]:
+            scale = scale[start:stop]
+        return ScaledTensor(self.codes[start:stop], scale)
 
     def clone(self) -> "ScaledTensor":
         return ScaledTensor(self.codes.clone(), self.scale)
@@ -461,6 +470,35 @@ def quantize_fp8_per_channel(x: torch.Tensor, rows_per_chunk: int = 2048) -> Sca
         scale[where] = torch.maximum(largest / top, floor)
         codes[where] = _e4m3(rows / scale[where].unsqueeze(1))
     return ScaledTensor(codes, scale)
+
+
+#: a row of a step quantised at a scale of its own never gets a smaller scale than ``1 / (448 * PER_ROW_FLOOR)``
+PER_ROW_FLOOR = 512
+
+
+def quantize_fp8_per_row(x: torch.Tensor) -> ScaledTensor:
+    """8-bit quantisation of the rows of a step ``[rows, width]``, each at a scale of its own that is formed from the row:
+    the operand of a multiply whose activation scale is no constant of the checkpoint.
+
+    * The largest magnitude of a row is taken over its bf16 values (rows handed over in another dtype are rounded to bf16
+      first, and their codes are those of the rounded values);
+    * ``scale = max(largest / 448, 1 / (448 * 512))``: a division in fp32, the floor formed in fp32, so a row of zeros has
+      a scale and the codes 0;
+    * ``code = e4m3(value * (1 / scale))``, saturating at +-448, round to nearest even: the reciprocal of the scale is
+      formed in fp32 and the product is an fp32 multiplication.
+
+    Three fp32 operations, none formed in a wider type and rounded.  This is NOT the rule of a weight quantised per
+    channel (:func:`quantize_fp8_per_channel`), which divides every element by the scale: where a quotient is the
+    midpoint of two codes the two rules give two codes.  A row is quantised by itself: the rows of a step, quantised
+    together or one by one, give the same bytes.  Nothing is read from the device.  Returns a :class:`ScaledTensor`
+    whose ``scale`` is the fp32 tensor ``[rows]``.  ``ValueError`` for a tensor that is not ``[rows, width]``."""
+    if x.dim() != 2:
+        raise ValueError(f"the per-row 8-bit quantisation takes the rows of a step [rows, width]; got {list(x.shape)}")
+    one = torch.tensor(1.0, dtype=torch.float32, device=x.device)
+    top = torch.tensor(E4M3_MAX, dtype=torch.float32, device=x.device)
+    values = x.to(torch.bfloat16).float()
+    scale = torch.maximum(values.abs().amax(dim=1) / top, one / (top * PER_ROW_FLOOR))
+    return ScaledTensor(_e4m3(values * (one / scale).unsqueeze(1)), scale)
 
 
 def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) -> BlockScaledTensor:

@@ -9,7 +9,8 @@ and a self-check against a plain-PyTorch reference. Start with [README.md](READM
 A model sample has no socket, no request queue and no admission of work while a step runs. The set of sequences is fixed
 before the first step. A model sample keeps no state between two prompt sets, has no cache keyed by content, and chooses
 nothing at run time: every provider and route is a row of the printed table. The list of provider keys is closed; it changes
-only together with a kernel. A change that needs any of these belongs in a serving engine, not here.
+only together with a kernel, or with the reference chain of a block that a kernel is to serve. A change that needs any of
+these belongs in a serving engine, not here.
 
 Also out: a `generate()` method on the helper layer (the loop is in the script), stop strings, constrained output, logit
 processors, tool-call parsing of the output, automatic choice of a stack or a route. A field of a request body that asks
@@ -800,3 +801,56 @@ A session built with `draft_tokens=` feeds its prompt through decode steps and r
 - A check says what it looked at. The traced window of such a session holds its verify steps; the prompt's decode
   steps launch a compiled form of their own that the kernel check never sees. The run says so beside the verdict, a
   line that compares nothing is `REPORTED`, and a kind of step of which no step was judged is named as that.
+
+## What building the drafter's pass taught
+
+The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDrafter.body`, `propose`, `draft`; the table
+`configs.DRAFTER_PROVIDERS`; the keys `torch_ref.pre_fc_norm_quantize`, `torch_ref.gate_row_quantize`,
+`torch_ref.silu_mul`, `torch_ref.quantize`, `torch.argmax+lookup`). No session runs it yet. What building it showed:
+
+- A quantiser per row of a step is a third rule beside the loader's two, and it is pinned to its operation like them.
+  The static scale of the model's activations multiplies by a reciprocal that is one number per layer; the loader's
+  weights divide by a scale per row; the rows of a drafter's step multiply by the reciprocal of a scale formed from
+  the row itself. The stated row that tells the division from the reciprocal for the weights tells them apart here
+  too, in the other direction: two elements whose quotient is the midpoint of two codes take the code above. Name the
+  operation in the docstring and hold both rules on one row.
+- A division by a host number is not a division on a GPU. PyTorch divides a CUDA tensor by a Python number as a
+  multiplication by that number's reciprocal, and by a tensor as a division: on bf16 values over 448 the two differed
+  in the last bit on more than half of the elements, on the device and never on the CPU. A rule that says "a division
+  in fp32" forms its constants as tensors on the operand's device, and no host test can show that it does: the device
+  run compares the codes and scales of a stated tensor with the CPU's.
+- A block that is the reference chain is judged by nothing, so its structure is held where it is made. The block check
+  compares a provider with the reference; a row whose provider IS the reference has no line, in any stack, and the
+  proposals of seeded weights mean nothing that a comparison of tokens could hold. Three things hold such a pass,
+  and each sees what the others do not: every function against a version written from its definition in the
+  test (an error inside a block); a pass over several rows against that many passes of one row, byte for byte (rows
+  that read each other, a scale shared across a step, a cache position written twice or not at all); and a recording
+  stand-in for the blocks, which is handed what each pass of a step reads -- the row the step kept, the pass's own
+  last output and proposal, its position (an error between the blocks, which passes every numeric test with seeded
+  weights because every row is as good as the next).
+- A value that a function hands on only in quantised form can still be read. The gate with one rounding and the
+  model's gate with two differ by one bf16 unit and give the same 8-bit code on almost every element; a row of ONE
+  element has that element as its largest, so its scale states its bf16 value exactly.
+- A formula with a transcendental function is not pinned to the last bit by a double. An fp32 sigmoid differs from
+  the double's by a unit in the last place, which moves a bf16 rounding only next to a midpoint: judge every element
+  that is clear of one, count them, and assert the count -- on bf16 inputs the values repeat, so "one in two
+  thousand" was one in a hundred and sixty.
+- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3.
+  One block may stand for more than one operation of another implementation (the attention preparation also writes
+  the cache), so a count read off another table is not this one. This area states no count of the launches of a
+  draft pass: no kernel census holds one.
+- A call says which pass it belongs to. The model's step hands every block its layer; a drafter has one layer and a
+  step has several passes, so `call(block, pass, *operands)` carries the pass where a step carries the layer, and
+  the wiring lists one pass. Whatever records the calls of a step can then tell its passes apart without counting.
+- A reference row names no form. A provider row that names call sites with fields is compared with what its entry
+  instance states, and a reference chain states nothing: the five sites of the drafter's multiply and the two of its
+  norm are data beside the table, handed to the blocks by name and read by the README, until a kernel's row takes them.
+- An arm that takes an input away has to take it away. On the checkpoint the pass's first proposal was the model's
+  token at 167 of 207 positions. With the two halves in front of the first multiply exchanged it was 0, with the
+  hidden row replaced by zeros 8 -- and with the hidden row of the position before, 108: a row one position old is
+  a row of the same text, and the token embeddings and the cache carry the rest. An arm that shifts an input is a
+  measurement of how much the shift costs, not a collapse; before a figure is held against an arm, run the arm and
+  see what it leaves.
+- What a load keeps for today's blocks is said where the load is shown. The reference blocks multiply on bf16 copies
+  that a kernel on the codes will not need; a default load makes them, the manifest's last line counts them, and the
+  argument that leaves them out is named in the same sentence.
