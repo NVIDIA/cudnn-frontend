@@ -1529,3 +1529,47 @@ def test_sm80_paged_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, spli
         device_cc=(8, 0),
     )
     assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+@pytest.mark.parametrize(
+    "layout,d,b,h_q,h_kv,s_q,s_kv,window,split",
+    [
+        # The cap binds on small grids over long caches. A100 80GB PCIe, new / old split time
+        # (study sm80_window_decode_split_cap_pcie_20261118; the nightly's rows):
+        ("paged", 128, 1, 10, 1, 1, 131072, 1024, 32),  # 64 -> 32: 0.908
+        ("paged", 128, 1, 16, 2, 4, 131072, 512, 16),  # 32 -> 16: 0.847
+        ("dense", 256, 1, 6, 1, 1, 90973, 384, 16),  # 32 -> 16: 0.847 (holdout)
+        # Not binding: large grids already split less, and a 2048-key window holds 34 tiles.
+        ("paged", 128, 128, 10, 1, 1, 131072, 1024, 4),
+        ("paged", 64, 1, 16, 2, 1, 131072, 2048, 32),
+    ],
+)
+def test_sm80_window_decode_split_cap(layout, d, b, h_q, h_kv, s_q, s_kv, window, split):
+    """SM80 windowed decode never splits past the smallest power of two covering the window's KV tiles: the kernels partition only
+    the clipped window, while the shared model counts the whole cache."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm80")
+    paged = layout == "paged"
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_paged_kv=paged,
+        page_size=16 if paged else 0,
+        padded=paged,
+        window_left=window,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split

@@ -2680,6 +2680,31 @@ def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional
     return split
 
 
+def _sm80_window_decode(caps: Capabilities, facts) -> bool:
+    """SM80 half sliding-window decode without a sink, S_q <= 16 and not THD: the domain of _sm80_window_split_cap, the range its study timed."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.window_left is not None
+        and not facts.has_sink
+        and not facts.thd
+        and facts.s_q <= 16
+    )
+
+
+def _sm80_window_split_cap(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int) -> int:
+    """The smallest power of two covering the window's issued KV tiles for one Q tile. The SM80 kernels partition only the clipped
+    window, so further splits run empty and add combine work; the shared model counts the whole cache (A100 nightly: b 1 over 131k keys
+    split 64 under a 1024-key window ran 1.5x the best; study sm80_window_decode_split_cap_pcie_20261118)."""
+    tile_m = tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)
+    tile_n = tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m)
+    tiles = _swa_kv_tiles(facts, token_span=max(1, tile_m // pack_g), tile_n=tile_n)
+    cap = 1
+    while cap < tiles:
+        cap *= 2
+    return cap
+
+
 def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
     """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
     return (
@@ -2931,6 +2956,8 @@ def _split_points(
         )
 
     split = _sm80_paged_d256_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_paged_d256_split(caps, facts, tile_m) else _choose(physical=True)
+    if _sm80_window_decode(caps, facts):
+        split = min(split, _sm80_window_split_cap(facts, tile_m, tile_n, pack_g))
     if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
         # The physical CTA count is a one-sided correction: every measured win of
         # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,
