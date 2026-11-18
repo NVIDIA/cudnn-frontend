@@ -33,6 +33,7 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
 _OFFERED = {
     "sdpa_bwd_sm120": 20600,
     "sdpa_bwd_sm80": 20601,
+    "sdpa_bwd_sm90": 20634,
     "sdpa_bwd_sm100": 20602,
     "sdpa_bwd_sm100_d512_role_split": 20626,
     "sdpa_bwd_sm100_d512_2x2": 20627,
@@ -118,7 +119,7 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20632]), ((11, 0), [20632]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20618])],
+    [((10, 7), [20632]), ((11, 0), [20607]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20618])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
@@ -170,7 +171,7 @@ def test_sm100_d256_row_lists_ahead_of_the_d192_half_row_on_dense_graphs(monkeyp
         assert [p.engine_id for p in recommend("A", _facts(**base, causal=causal, **thd), offered)] == [20612, 20607], causal
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7"])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7), (11, 0)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7", "cc11.0"])
 def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
     """Dense MHA offers recompute explicitly; grouped and THD retain the accumulation row."""
     from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
@@ -182,7 +183,8 @@ def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
         expected.append((20629, None))
     assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == expected
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20630, None), (20631, None)] if cc in ACCUMULATION_CCS else [])
+    two_cta = [(20631, None)] if cc != (11, 0) else []  # the two-CTA accumulation row keeps its named parts (no Thor)
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20630, None)] + two_cta if cc in ACCUMULATION_CCS else [])
     assert ((10, 7) in ACCUMULATION_CCS) and ((10, 6) not in ACCUMULATION_CCS)  # the admitted parts are named, the envelope's hypothetical ccs are not
     assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
@@ -191,14 +193,14 @@ def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
     "cc, d, want",
     [
         ((10, 7), 512, [20608]),
-        ((11, 0), 512, [20608]),
+        ((11, 0), 512, [20626, 20627]),  # Thor: the SM100 d512 explicit rows (sm_extra)
         ((10, 7), 264, [20608]),
         ((10, 7), 504, [20608]),
         ((10, 0), 512, [20626, 20627]),
         ((10, 3), 512, [20626, 20627]),
         ((10, 7), 256, [20632]),
         ((10, 7), 128, [20630, 20628]),  # accumulation default, followed by explicit recompute; never the d512 row
-        ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
+        ((11, 0), 128, [20630, 20628]),  # Thor: the SM100 d128 rows (sm_extra), the cc 10.7 order
         ((12, 0), 512, [20621]),  # SM120's two-subgroup body
     ],
     ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
@@ -231,7 +233,7 @@ def test_sm107_fp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20625]), ((10, 3), [20625]), ((12, 0), [])],
+    [((10, 7), [20606]), ((11, 0), []), ((10, 0), [20625]), ((10, 3), [20625]), ((12, 0), [])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_mxfp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
@@ -372,6 +374,49 @@ def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatc
     assert order(padded=True) == trails  # runtime lengths
     assert order(seq_q_trim=True) == trails
     assert order(causal=False, s_q=512, s_kv=1024)[0] == "frost"  # the GB10 studies are not square-only
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+def test_sm89_fixed_d64_leads_only_for_measured_square_class(monkeypatch, dtype):
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.sdpa import placement_table
+    from cudnn.sdpa.bwd import heuristics
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    fixed = _OFFERED["sdpa_bwd_sm89_f16_d64"]
+    generic = _OFFERED["sdpa_bwd_sm89"]
+    offer = {name: _OFFERED[name] for name in ("sdpa_bwd_sm89_f16_d64", "sdpa_bwd_sm89")}
+    base = dict(d_qk=64, d_v=64, dtype=dtype, causal=False, device_cc=(8, 9))
+
+    def order(**overrides):
+        return heuristics.propose("A", _facts(**{**base, **overrides}), offer)
+
+    short_dtype = "f16" if dtype == cudnn.data_type.HALF else "bf16"
+    study = placement_table.matched_entry("sdpa_bwd_sm89_f16_d64", _facts(**base))
+    assert study.study == f"sm89_bwd_d64_4090_{short_dtype}_20261118"
+    assert placement_table.class_key("sdpa_bwd_sm89_f16_d64", _facts(**base, s_q=192, s_kv=192)) is None
+    for length in (128, 768, 2048):
+        assert order(s_q=length, s_kv=length)[0].engine_id == fixed
+    for overrides in (
+        dict(s_q=128, s_kv=256),
+        dict(s_q=256, s_kv=128),
+        dict(s_q=192, s_kv=192),
+        dict(s_q=2176, s_kv=2176),
+        dict(b=5),
+        dict(h_q=3, h_kv=3),
+        dict(h_q=17, h_kv=17),
+        dict(causal=True),
+        dict(padded=True),
+        dict(deterministic=True),
+        dict(h_kv=4),
+        dict(d_qk=128, d_v=128),
+    ):
+        assert is_backend_block(order(**overrides)[0]), overrides
+
+    # A placement entry for the fixed body must not lift the generic owner.
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(generic, None)])
+    assert is_backend_block(order()[0])
 
 
 def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):

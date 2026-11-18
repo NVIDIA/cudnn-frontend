@@ -12,6 +12,8 @@ _LAZY_EXPORTS = {
     "indexer_backward": ("cudnn.deepseek_sparse_attention", "indexer_backward_wrapper"),
     "dense_indexer_backward": ("cudnn.deepseek_sparse_attention", "dense_indexer_backward_wrapper"),
     "top_k_forward": ("cudnn.deepseek_sparse_attention", "indexer_top_k_wrapper"),
+    "indexer_top_k_forward": ("cudnn.deepseek_sparse_attention.cake.api", "indexer_top_k_forward"),
+    "indexer_top_k_workspace_size": ("cudnn.deepseek_sparse_attention.cake.api", "indexer_top_k_workspace_size"),
     "sparse_attention_forward": ("cudnn.deepseek_sparse_attention", "sparse_attention_forward_wrapper"),
     "sparse_attention_backward": ("cudnn.deepseek_sparse_attention", "sparse_attention_backward_wrapper"),
     "compressor_forward_jax": ("cudnn.csa.compressor.jax_api", "compressor_forward_jax"),

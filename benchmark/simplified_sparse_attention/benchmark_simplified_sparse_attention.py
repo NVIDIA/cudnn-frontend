@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from cudnn.ops import SimplifiedSparseAttentionMetadata, dense_indexer_kl, simplified_sparse_attention, simplified_sparse_attention_reserve
+from cudnn.ops import SimplifiedSparseAttentionMetadata, dense_indexer_kl_forward, simplified_sparse_attention_forward, simplified_sparse_attention_reserve
 
 
 def main():
@@ -57,7 +57,7 @@ def main():
         simplified_sparse_attention_reserve(tq, tk, args.topk)
 
     def run():
-        output, loss = simplified_sparse_attention(*tensors, metadata, args.topk)
+        output, loss = simplified_sparse_attention_forward(*tensors, metadata, args.topk)
         if training:
             return torch.autograd.grad((output, loss), tensors, (upstream, loss_grad))
         return output, loss
@@ -76,7 +76,7 @@ def main():
             del scores
 
         def run():
-            loss = dense_indexer_kl(
+            loss = dense_indexer_kl_forward(
                 q,
                 k,
                 iq,
@@ -97,7 +97,7 @@ def main():
     if args.framework == "jax":
         import jax
         import jax.numpy as jnp
-        from cudnn.ops import simplified_sparse_attention_jax
+        from cudnn.ops import simplified_sparse_attention_forward_jax
 
         jax_version = jax.__version__
         jtensors = tuple(jax.dlpack.from_dlpack(t.detach()) for t in tensors)
@@ -107,7 +107,7 @@ def main():
         @jax.jit
         def jrun(*values):
             def operation(*inputs):
-                return simplified_sparse_attention_jax(*inputs, *bounds, topk=args.topk)
+                return simplified_sparse_attention_forward_jax(*inputs, *bounds, topk=args.topk)
 
             if training:
                 (_, loss), pullback = jax.vjp(operation, *values)

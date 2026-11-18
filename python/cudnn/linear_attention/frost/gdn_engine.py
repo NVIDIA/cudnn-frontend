@@ -12,6 +12,7 @@ import math
 from operator import itemgetter
 
 import cudnn
+from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -61,7 +62,6 @@ def gdn_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'state_indices' must be int32 or int64, got {facts.state_indices_dtype}")
         if facts.is_bwd:
             raise NotImplementedError(f"{engine}: 'state_indices' is a forward-only pool addressing mode")
-    io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
     if facts.beta_dtype not in beta_wants + (None,):
@@ -89,8 +89,8 @@ def gdn_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
         if facts.dg_dtype not in (facts.g_dtype, None):
             raise NotImplementedError(f"{engine}: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-        if facts.do_dtype not in io + (None,):
-            raise NotImplementedError(f"{engine}: 'dO' must be fp16/bf16, got {facts.do_dtype}")
+        if facts.do_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError(f"{engine}: 'dO' must match the io dtype ({facts.io_dtype}), got {facts.do_dtype}")
         if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
             raise NotImplementedError(
                 f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
@@ -563,7 +563,9 @@ class CompiledGdn:
             carved = workspace.carve(self.carve)
             context_views = context.carve(self.context.carve) if self.has_context else ()
             merged = (*views, *carved, *context_views, None)
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *self.chain_lead(merged))
+            cpp_launcher.launch(
+                self.chain_launch, *self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *self.chain_lead(merged)
+            )
             return
         k = views[self.index_k]
         v = views[self.index_v]

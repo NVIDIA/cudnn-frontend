@@ -170,7 +170,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.33.0"
+__version__ = "1.34.0"
 # Keep in sync with the JAX dependency minimum in pyproject.toml.
 CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
 CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
@@ -503,7 +503,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
-    "block_sparse_attention_prepare_backward": (".block_sparse_attention", "block_sparse_attention_prepare_backward"),
+    "block_sparse_attention_backward_metadata": (".block_sparse_attention", "block_sparse_attention_backward_metadata"),
     "kpage_prepare_layout": (".block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": (".block_sparse_attention", "KPageLayout"),
     "BsaBackwardMetadata": (".block_sparse_attention", "BsaBackwardMetadata"),
