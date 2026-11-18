@@ -49,8 +49,11 @@ names (``model_samples/qwen_dense/kernel_census.json``), in the form the target 
 served here yet stays on its fallback row and is printed as ``not yet``; the run says how many launches of a step are target
 kernels, always as three numbers, and why its GPU class is ``NOT CLAIMED``.  It always checks its kernels, and it holds the
 launch shape of every target launch against the census.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with
-the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  Until ``native`` has a row a library serves, the two
-are the same rows.
+the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has three rows more: the multiplies the
+target runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone
+(``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``); without it, or with
+a version this area has not validated, ``--stack native`` is a ``SKIP`` before anything is loaded.  The library builds its
+kernels at its first use: the run makes that use while it plans and says so.
 
 ``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
 launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's
@@ -155,7 +158,9 @@ The default run needs no checkpoint and no extra package; it needs a GPU of comp
 With --model: pip install -r samples/models/requirements.txt first.  The checkpoint is your own download (nothing is
 fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas, which holds a
 bf16 copy of every weight.  The stacks native and fe-entries keep a weight their kernels multiply on its stored format
-without that copy: about 37 GiB on compute capability 10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere.
+without that copy.  fe-entries: about 37 GiB on compute capability 10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere.
+native, whose three library rows need FlashInfer (pip install -c samples/models/constraints-native.txt -r
+samples/models/requirements-flashinfer.txt; the README: "The rows a library serves"): about 28 GiB and about 32 GiB there.
 The generated text goes to standard output; every other line of a run goes to standard error.
 The checkpoint, the memory, the checks, a request body field by field and every flag: samples/models/qwen_dense/README.md
 """
@@ -646,6 +651,9 @@ def main(argv=None) -> int:
         )
     planning = time.perf_counter()
     try:
+        # what a library row of the stack does at its first use beyond an entry's build, said before it is made
+        for note in dict.fromkeys(note for session, _ in runs for note in session.resolve().announcements()):
+            _say(f"{TAG} planning: {note}", flush=True)
         tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
         claims = [session.claim() for session, _ in runs]  # of a stack that declares a target: how each run stands to it
     except NotImplementedError as error:

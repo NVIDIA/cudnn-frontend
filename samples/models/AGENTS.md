@@ -9,8 +9,9 @@ and a self-check against a plain-PyTorch reference. Start with [README.md](READM
 A model sample has no socket, no request queue and no admission of work while a step runs. The set of sequences is fixed
 before the first step. A model sample keeps no state between two prompt sets, has no cache keyed by content, and chooses
 nothing at run time: every provider and route is a row of the printed table. The list of provider keys is closed; it changes
-only together with a kernel, or with the reference chain of a block that a kernel is to serve. A change that needs any of
-these belongs in a serving engine, not here.
+only together with a kernel, with the reference chain of a block that a kernel is to serve, or with a declared library
+entry. A library's own tuner may choose among that library's kernels for a call a row names; the choice is printed with
+the kernel check and is never a row. A change that needs any of these belongs in a serving engine, not here.
 
 Also out: a `generate()` method on the helper layer (the loop is in the script), stop strings, constrained output, logit
 processors, tool-call parsing of the output, automatic choice of a stack or a route. A field of a request body that asks
@@ -44,7 +45,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
    A checkpoint is described from its `config.json` and shard headers first (`Checkpoint.describe`, the family's
    `describe`, its drafter's): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
    a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
-   the tests generate what they read.
+   the tests generate what they read. A third-party provider may build its own kernels at its first use; a sample makes
+   that first use while the run is planned, before anything is loaded, and says so in one line.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
    defined by the target kernel set of the family's census, not by a list of what happens to be fast; `fe-entries` is its
    cuDNN Frontend rows with every other block on a fallback row, so that those rows run where no further package is
@@ -59,8 +61,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
    key to `providers.KEYS` with its factory, add its row above the rows it should win against (and below a row of the
    same key that an existing command selects with `--provider`), name its tie-out band, and regenerate the family
    README's tables (`configs.readme_table`); a host test keeps them in agreement. A third-party
-   provider is imported inside its adapter, its version is checked there, and a missing or unvalidated version is a `SKIP`
-   that names it.
+   provider is imported inside its adapter, on a device; its version is read from the distribution's metadata there and
+   held to the validated list, and a missing or unvalidated version is a `SKIP` that names it, the requirement file and
+   the nearest command that runs without it. A plan on stated device facts imports no third-party package.
 8. **Bands are never widened in place.** The band of a block against the reference is named in its provider row
    (`tie_out.BANDS`). A provider whose kernel rounds at other points than the reference chain is compared with its twin
    (`Block.twin`): a reference block written at the kernel's rounding points, in the reference's accumulation precision.
@@ -107,7 +110,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
     change as the code that needs it (for `jinja2`, whose sandbox a checkpoint's template runs in, with a sandbox fix). The
     family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
     package versions and the GPU class of the last run with a checkpoint. Dependency alerts come through the `pip` entry for
-    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.
+    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose kernels
+    a stack calls has a requirement file of its own, a lower bound with its "Validated with" line
+    (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the versions
+    the launch records of the family's census were recorded with. The maintainers of this area own that list; a version
+    joins it with a recorded run, never with an update of the pin alone.
 13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events.** An event is stamped
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
@@ -996,3 +1003,33 @@ serving engine key by key, the comparison with decode steps and the checks of ev
 - A stand-in that rounds otherwise is not given the product's band. On the tiny geometry of the host tests the fp32
   chains of the stand-in providers leave the seeded model's logits band at six tokens per sequence: the test of the
   last line holds `PASS` at three drafted tokens and says, for the default, which line fails.
+
+## What the rows a library serves taught
+
+Three blocks of the target kernel set are multiplies of a library, and the stack `native` calls FlashInfer for them on
+the stored weights (`providers/flashinfer_calls.py`). What building these rows showed:
+
+- A library's pick of a kernel is a function of the call only until something tunes the operation. Outside a tuning
+  context the 4-bit multiply launched the same kernel class in the same grid for a weight shape and a row count every
+  time; inside one, the winner was not the same kernel in every process, and it outlived the context. So the row
+  names what makes the pick a function of the call (`TUNED False`), the adapter reads the library's tuner after each
+  call and the call log carries what it found, and the kernel class and launch shape of the untuned pick are census
+  data that the kernel check holds exactly. A row that cannot name such a condition holds its launch by membership and
+  prints the pick: the 8-bit multiply.
+- The class and the grid of a pick follow the weight shape: the output head of a reduced vocabulary is another kernel
+  launch than the published one's. The census entry of such a call names the widths it was recorded at (`at`), and a
+  run of another width says that no launch shape is held for that block instead of failing.
+- A library that builds kernels at its first use must make that first use while the run is planned. Its first build
+  of a compiled module took more than a minute and printed nothing; inside a decode loop that would have been a
+  stalled step. The first use is the call of the run's own row count on scratch operands, after the memory sentence
+  and before any load, announced in one line; a decline there is typed -- the adapter's operands an `ERROR`, the
+  installation a `SKIP` with the type of the exception and never its text, which can hold a local path.
+- A library kernel's name may reach the profiler mangled. The family pattern of such a kernel matches the head of the
+  mangled name; the table prints what the profiler printed.
+- A third-party adapter is tested as it is, over a stand-in of the library: the adapter reaches the library through
+  one method, and a host test replaces that method. A stand-in of the adapter would test the stand-in.
+- A library's tuner may start worker processes that import the main module again. A script that calls a sample
+  inside a tuning context of the library needs its `if __name__ == "__main__":` guard, or every worker runs the
+  sample.
+- When a stack gains rows, every dated run of that stack in a README becomes a run of another row set. Say which
+  rows a dated run selected, and move the counts that the tree computes to the stack that still selects those rows.

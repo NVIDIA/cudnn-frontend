@@ -1209,18 +1209,20 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     table = session.plan_table()
     assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
     numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
-    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 49, 321)
-    stored = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
-    alone = ("projection.fp8.in", "mlp.gate_up")
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 130, 321)
+    # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
+    stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     assert session.stored_weights() == stored and session.uncopied_weights() == alone
     # the same forms as a decode session and a verify session on one load: the linear-attention out-projections in both forms
     decode, verify = new(), new(tokens=6)
     verify._share = decode
     two = decode.plan_table([verify])
     assert set(decode.stored_weights()) == set(stored) and set(decode.uncopied_weights()) == set(alone)
-    assert (
-        new(tokens=6).uncopied_weights() == stored
-    ), "a verify plan alone keeps no copy of that weight; with a prompt in front of it the decode plan reads one"
+    assert new(tokens=6).uncopied_weights() == stored, "a verify plan alone keeps the same forms: every multiplied weight on its stored codes, no copy"
+    entries = Session(model, text, **{**common, "stack": "fe-entries"}, draft_tokens=5)  # the cuDNN Frontend rows alone: the two plans differ there
+    entries.resolve()
+    assert entries.stored_weights() == ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
+    assert entries.uncopied_weights() == ("projection.fp8.in", "mlp.gate_up"), "the decode plan of its prompt reads a copy of the out-projections"
     # the tables: the verify steps' rows, one line, the prompt's rows, then ONE memory sentence
     head, line, rest = table.partition(f"\n{loop.PROMPT_ROWS}\n")
     assert line and head == session.plan.table() and rest.startswith(session.prefill_plan.table() + "\n  this stack needs about ")

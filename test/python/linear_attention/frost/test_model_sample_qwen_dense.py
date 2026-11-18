@@ -26,6 +26,11 @@ Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entr
 the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
 there, not verified.
 
+The ``native`` cell runs the default run on the stack ``native`` itself, which has three rows more: the multiplies the target
+runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone, so the cell runs
+where it is installed at a validated version and is skipped elsewhere -- by this module where the package is absent, by the
+sample's own ``[00] SKIP`` line where its version is not validated.  A skipped cell is uncovered, not passing.
+
 That cell runs the sample in a FRESH INTERPRETER, as a user does.  The kernel check compares the profiler's kernel names
 with the symbols the entries state, and the profiler names a kernel wrongly after a kernel module was unloaded in the same
 process: a kernel loaded where an unloaded one had been was recorded under the unloaded kernel's name (two raw CUDA
@@ -105,6 +110,10 @@ FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorc
 FE_ENTRIES = "by provider: cuDNN FE 4 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
 #: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
 FE_ENTRIES_CC100 = "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+#: the stack native on compute capability 10.x: the three multiplies FlashInfer serves are no fallbacks, and no lane of this
+#: repository runs them
+NATIVE = "by provider: cuDNN FE 4 | FlashInfer 3 | fallbacks 3 (cuBLAS over copies 1, PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
+NATIVE_CC100 = "by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
@@ -336,6 +345,50 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         assert kernels["on_target"] == kernels["code"] + kernels["port"] + kernels["stand_ins"] and kernels["launches"] == 20
     else:
         assert (stack == "fe-cublas") == (not kernels["declared"]), "fe-cublas declares no target kernel set; fe-entries does"
+
+
+@pytest.mark.L0
+def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
+    """The stack ``native`` with the rows a library serves, on real launches, where FlashInfer is installed: the MLP's down
+    multiply and the output head on ``flashinfer.gemm.mm_fp4`` and the out-projections on ``flashinfer.gemm.bmm_fp8``, each
+    on the stored weight and each inside the band of the reference multiply at both sequence counts; the first use of the
+    library announced while the run is planned; the 4-bit multiply outside any tuning context (``TUNED False`` in the call
+    log, or the kernel check fails); every weight of a multiply on its stored format alone.  On the GPU class the family's
+    census has a section for, the down multiply is held to the recorded kernel class and launch shape, and the kernel the
+    library chose for the out-projection is printed beside the recorded pick.  Skipped where the package is absent."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the library rows of the stack native claim compute capability 10.x")
+    if importlib.util.find_spec("flashinfer") is None:  # looked up, not imported: the package is the child's to import
+        pytest.skip("the stack native calls FlashInfer, which is not installed here (samples/models/requirements-flashinfer.txt): uncovered, not passing")
+    cc100 = tuple(torch.cuda.get_device_capability()) == (10, 0)
+    out = _run(None, capsys, ["--stack", "native"], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)
+    assert "stack native" in out and out.count("[00] planning: first use of FlashInfer ") == 1, "the library's first use is announced once, while the run plans"
+    for block in ("projection.fp8.out", "mlp.down", "output_head"):
+        judged = [line for line in out.splitlines() if line.split()[:1] == [block] and "calls" in line and "[band: " in line]
+        assert len(judged) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), f"{block} was judged at both sequence counts"
+    down = [
+        line for line in out.splitlines() if line.strip().startswith("mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step")
+    ]
+    assert len(down) == 2, "one launch per MLP at both sequence counts, outside any tuning context"
+    kept, count = (
+        ("projection.fp8.in, projection.fp8.out, mlp.gate_up, mlp.down, output_head", 9)
+        if cc100
+        else ("projection.fp8.out, mlp.gate_up, mlp.down, output_head", 7)
+    )
+    made = [line for line in out.splitlines() if line.startswith("  on demand ")]
+    assert len(made) == 2 and all(
+        f"weights this run keeps on their stored format alone ({kept})" in line for line in made
+    ), "no bf16 copy of a multiply's weight"
+    held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
+    assert len(held) == 2 and all(line.startswith(f"  stored weights    {count} of {count} weights") and line.endswith("    PASS") for line in held)
+    if cc100 and torch.cuda.get_device_properties(0).multi_processor_count == 148:  # the class the census has a section for, at 1 sequence
+        assert "17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results)" in out
+        assert sum("in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records" in line for line in down) == 1
+        assert out.count("chosen by the library for projection.fp8.out at ") == 2, "the library's pick at both call sites: printed and compared, never gated"
+    observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
+    frost_routing.measured("model sample qwen_dense 00_decode --stack native: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
 
 
 @pytest.mark.L1

@@ -338,6 +338,12 @@ class Plan(dict):
                 found += [(scoped(name, site), name, site, row, part) for site, row, part in split]
         return found
 
+    def announcements(self) -> list:
+        """What the first use of this plan will do beyond building an entry's kernel, one sentence per kind
+        (``Block.first_use_note``; a library that builds kernels of its own with the installed compiler), in table order.  A
+        sample prints them before it makes that first use (``first_use``): a first build prints nothing while it runs."""
+        return list(dict.fromkeys(note for _, _, _, _, block in self.parts() if (note := getattr(block, "first_use_note", ""))))
+
     def __eq__(self, other):
         """Two plans are equal when they hold the same blocks and the same decisions.  Against a plain mapping the comparison is
         the mapping's own (the blocks alone)."""
