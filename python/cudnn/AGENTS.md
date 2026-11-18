@@ -1036,6 +1036,9 @@ different path; do not infer a slicing guarantee from it. Detector:
 `TestNativeHalfStrides::test_physical_wide_stride` in the SM100/SM107 forward
 suites physically allocates a wide batch stride and checks output and replay,
 including D256 SwapAB decode at one query row.
+Wide-index fixes can increase register pressure. Retain the wide indexing and
+rerun spill checks for each admitted form and dtype. The SM107 D256 decode
+spill probe checks both half precisions at the 96-register limit.
 
 Widen operands before triangular workspace products, in both producer and
 consumer. Widening an already-overflowed offset cannot recover it. Derive tile
