@@ -724,6 +724,16 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "verify", "paged", "window", True, "gqa_partial", True): Entry(
         "le", 6.5, "sm107_d192x128_sink_verify_20261118", "tiles"
     ),
+    # study sm107_d128_window_mtp_verify_20261118 (Rubin, cuDNN 9.30.0.8; windowed paged d128 spec-decode verify priced at the 104th
+    # commit's split; 1200 train cells at groups 2-16, windows 128-2048; 84 holdout cells at fresh head pairs and windows 256 / 1024, scored
+    # once): groups the row packs whole lead from 2^10.8 query rows on the tile (holdout 0.733) and 2^5.3 parallel tiles off it (0.271).
+    # Partial packs keep the backend; the MTP twin failed its holdout (1.557), so the 91st commit's MTP entries stay
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry(
+        "ge", 10.792, "sm107_d128_window_mtp_verify_20261118", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
+        "ge", 5.292, "sm107_d128_window_mtp_verify_20261118", "tiles"
+    ),
     # study sm107_window_gaps_20261118 (208-SM Rubin, cuDNN 9.30.0.8; the inference benchmark's windowed paged generation graph, page 16,
     # bottom-right causal; mean of 100 cold launches under 1 ms; 2914 train cells at GQA 2-16, S_q 1-1024, windows 512-4096 + a 288-cell
     # holdout at fresh head pairs and windows, scored once (changed 0.12-0.89 of the default); vr200 run-561 gate: 44 rows at 0.266,

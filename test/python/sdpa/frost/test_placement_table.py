@@ -1469,8 +1469,8 @@ def test_sm90_d64_sink_mtp_entries_follow_the_study():
 @pytest.mark.L0
 def test_sm107_paged_window_entries_follow_the_study():
     """Study sm107_window_gaps_20261118 (Rubin, the inference benchmark's windowed paged generation graph): windowed paged d192 x 192 and
-    d256 lead at S_q 1 through prefill, d64 up to S_q 45, d128 MTP (whole-pack groups) on caches up to 32k. Windowed d128 verify
-    and the unpacked d128 MTP classes have no entry, as do f16 and another part."""
+    d256 lead at S_q 1 through prefill, d64 up to S_q 45, d128 MTP (whole-pack groups) on caches up to 32k. The unpacked d128 MTP
+    classes have no entry, as do f16 and another part; windowed d128 verify answers from sm107_d128_window_mtp_verify_20261118."""
     row = "sdpa_fwd_prefill_sm107"
 
     def windowed(**over):
@@ -1490,7 +1490,7 @@ def test_sm107_paged_window_entries_follow_the_study():
     d128 = dict(d_qk=128, d_v=128, h_q=64, h_kv=8)
     assert pt.lookup(row, windowed(**d128, s_kv=16384)) is True
     assert pt.lookup(row, windowed(**d128, s_kv=131072)) is False
-    assert pt.lookup(row, windowed(**d128, s_q=8)) is None  # windowed d128 verify: no entry
+    assert pt.matched_entry(row, windowed(**d128, s_q=8)).study == "sm107_d128_window_mtp_verify_20261118"  # windowed d128 verify
     assert pt.lookup(row, windowed(**{**d128, "h_q": 80})) is None  # group 10 runs unpacked: no entry
     assert pt.lookup(row, windowed(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, windowed(device_cc=(10, 3))) is None
@@ -1524,6 +1524,29 @@ def test_sm107_padded_verify_keys_apart_and_d192x128_sink_window_entries_follow_
         assert pt.class_key(row, d128)[4] == "verify" and pt.class_key(row, d128)[8] == group
         fallback = pt._class_entry(pt.class_key(row, d128, verify=False))
         assert fallback is not None and pt.matched_entry(row, d128) is fallback
+
+
+@pytest.mark.L0
+def test_sm107_d128_window_verify_entries_follow_the_study():
+    """Study sm107_d128_window_mtp_verify_20261118 (Rubin): windowed paged d128 verify the row packs whole leads from 2^10.8 query rows
+    on the KV tile and 2^5.3 parallel tiles off it; partial packs keep the hand rule, and MTP keeps the 91st commit's entries."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def v(**over):
+        base = dict(b=128, h_q=64, h_kv=8, s_q=8, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7))
+        base.update(has_paged_kv=True, page_size=16, padded=True, window_left=511)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm107_d128_window_mtp_verify_20261118"
+    assert pt.class_key(row, v())[4:9] == ("verify", "paged", "window", False, "gqa")
+    for kv in (131072, 131073):
+        assert pt.lookup(row, v(s_kv=kv)) is True and pt.matched_entry(row, v(s_kv=kv)).study == study  # step37_swa b 128
+        assert pt.lookup(row, v(s_kv=kv, b=1)) is False  # 2^9 query rows / 2^3 tiles: under both floors
+    assert pt.lookup(row, v(b=4)) is True  # 2^11 query rows
+    assert pt.lookup(row, v(s_kv=131073, b=8)) is True  # 2^6 tiles
+    assert pt.class_key(row, v(h_q=80))[8] == "gqa_partial" and pt.matched_entry(row, v(h_q=80)) is None
+    assert pt.matched_entry(row, v(s_q=4)).study == "sm107_window_gaps_20261118"
 
 
 @pytest.mark.L0
