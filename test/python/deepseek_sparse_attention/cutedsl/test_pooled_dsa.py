@@ -91,11 +91,14 @@ def test_expand_indices_rebinds_dynamic_shapes_and_replays_without_allocations()
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
     assert _compile_indices.cache_info().misses == misses
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        plan.execute(ids2, pos2, out2)
-    pos2.add_(1)
-    graph.replay()
-    torch.testing.assert_close(out2.cpu(), _reference(ids2, pos2, 4, out2.shape), rtol=0, atol=0)
+    try:
+        with torch.cuda.graph(graph):
+            plan.execute(ids2, pos2, out2)
+        pos2.add_(1)
+        graph.replay()
+        torch.testing.assert_close(out2.cpu(), _reference(ids2, pos2, 4, out2.shape), rtol=0, atol=0)
+    finally:
+        graph.reset()
 
 
 def test_expand_indices_uses_explicit_stream_and_rejects_contract_changes():
@@ -237,14 +240,17 @@ def test_pool_cache_update_rebinds_shapes_and_replays_without_allocations():
     assert _compile_cache_update.cache_info().misses == misses
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        plan.execute(*args)
-    args[0].fill_(1)
-    graph.replay()
-    expected = _pool_reference(torch.ones(4, 128), torch.zeros(4, 128), torch.zeros(4, 128))
-    actual = args[3].view(torch.bfloat16).reshape(64, 128)[:3]
-    torch.testing.assert_close(actual.cpu(), expected.expand(3, 128), rtol=0, atol=0)
-    torch.testing.assert_close(args[4][0, 0].cpu(), torch.ones(4, 128, dtype=torch.bfloat16), rtol=0, atol=0)
+    try:
+        with torch.cuda.graph(graph):
+            plan.execute(*args)
+        args[0].fill_(1)
+        graph.replay()
+        expected = _pool_reference(torch.ones(4, 128), torch.zeros(4, 128), torch.zeros(4, 128))
+        actual = args[3].view(torch.bfloat16).reshape(64, 128)[:3]
+        torch.testing.assert_close(actual.cpu(), expected.expand(3, 128), rtol=0, atol=0)
+        torch.testing.assert_close(args[4][0, 0].cpu(), torch.ones(4, 128, dtype=torch.bfloat16), rtol=0, atol=0)
+    finally:
+        graph.reset()
 
 
 def test_pool_cache_update_explicit_stream_and_contract_errors():
@@ -461,36 +467,39 @@ def test_fused_select_boundaries_ties_and_replay(mode, score_dtype, columns, poo
 
     run()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    for shift in (0, -1):
-        positions.add_(shift)
-        if shift:
-            scores.normal_()
-        output.fill_(-9)
-        graph.replay()
-        for row, position in enumerate(positions.cpu().tolist()):
-            length = position + 1 if 0 <= position < 2**31 - 1 else 0
-            actual = output[row].cpu()
-            if length <= boundary:
-                expected = torch.full_like(actual, -1)
-                expected[:length] = torch.arange(length)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            else:
-                groups = actual[:boundary].view(topk, pool_size)
-                ids = groups[:, 0] // pool_size
-                assert ids.unique().numel() == topk
-                assert ids.min() >= 0 and ids.max() < min(length // pool_size, columns)
-                values = scores[row].float().cpu()
-                torch.testing.assert_close(
-                    values[ids].sort().values, values[: min(length // pool_size, columns)].topk(topk).values.sort().values, rtol=0, atol=0
-                )
-                torch.testing.assert_close(groups, ids[:, None] * pool_size + torch.arange(pool_size, dtype=torch.int32), rtol=0, atol=0)
-                expected = torch.full_like(actual[boundary:], -1)
-                expected[: length % pool_size] = torch.arange(length // pool_size * pool_size, length)
-                torch.testing.assert_close(actual[boundary:], expected, rtol=0, atol=0)
-        assert (output[rows:] == -1).all()
-        assert (storage[:, width:] == 12345).all()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        for shift in (0, -1):
+            positions.add_(shift)
+            if shift:
+                scores.normal_()
+            output.fill_(-9)
+            graph.replay()
+            for row, position in enumerate(positions.cpu().tolist()):
+                length = position + 1 if 0 <= position < 2**31 - 1 else 0
+                actual = output[row].cpu()
+                if length <= boundary:
+                    expected = torch.full_like(actual, -1)
+                    expected[:length] = torch.arange(length)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                else:
+                    groups = actual[:boundary].view(topk, pool_size)
+                    ids = groups[:, 0] // pool_size
+                    assert ids.unique().numel() == topk
+                    assert ids.min() >= 0 and ids.max() < min(length // pool_size, columns)
+                    values = scores[row].float().cpu()
+                    torch.testing.assert_close(
+                        values[ids].sort().values, values[: min(length // pool_size, columns)].topk(topk).values.sort().values, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(groups, ids[:, None] * pool_size + torch.arange(pool_size, dtype=torch.int32), rtol=0, atol=0)
+                    expected = torch.full_like(actual[boundary:], -1)
+                    expected[: length % pool_size] = torch.arange(length // pool_size * pool_size, length)
+                    torch.testing.assert_close(actual[boundary:], expected, rtol=0, atol=0)
+            assert (output[rows:] == -1).all()
+            assert (storage[:, width:] == 12345).all()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -633,11 +642,14 @@ def test_pooled_indexer_dynamic_layouts_graph_and_explicit_stream(dtype, padding
     assert [fn.cache_info().misses for fn in caches] == misses
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        execute()
-    changed[5].sub_(1)
-    graph.replay()
-    _check_indexer_result(changed, reference, workspace)
+    try:
+        with torch.cuda.graph(graph):
+            execute()
+        changed[5].sub_(1)
+        graph.replay()
+        _check_indexer_result(changed, reference, workspace)
+    finally:
+        graph.reset()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
