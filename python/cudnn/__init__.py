@@ -402,6 +402,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowQuantizeFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -438,6 +439,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     # and the keys and values written into paged pools, in one launch, SM100-class parts): a direct-call entry like the steps above (also
     # `cudnn.attention_prepare.frost.AttentionPrepareDecode`, with its `AttentionPrepareGeometry`)
     "AttentionPrepareDecode": (".attention_prepare.frost.prepare_decode", "AttentionPrepareDecode"),
+    # the FP4 row quantization decode step (the block-scaled FP4 quantization of bf16 rows under a global scale -- E2M1 codes, one E4M3
+    # block scale per sixteen elements in the 128 x 4 scale layout -- in one launch, SM100-class parts): a direct-call entry like the
+    # steps above (also `cudnn.row_quantize.frost.RowQuantizeFp4Decode`)
+    "RowQuantizeFp4Decode": (".row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
