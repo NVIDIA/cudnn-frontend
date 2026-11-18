@@ -2648,13 +2648,15 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
 
 
 def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
-    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice."""
+    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice. S_q <= 16: the range its
+    study timed; longer padded chunks on the same tile keep the shared model."""
     return (
         caps.sm_hi == 80
         and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
         and facts.d_qk == facts.d_v == 256
         and not facts.thd
         and facts.has_paged_kv
+        and facts.s_q <= 16
         and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 64
     )
 

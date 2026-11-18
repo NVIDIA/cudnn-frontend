@@ -1493,6 +1493,8 @@ def test_sm80_d128_chunks_split_on_the_adapter_grid(b, h_q, h_kv, s_q, s_kv, spl
         # One CTA of single-row decode splits to 128 (sm80_d256_split128_q1_20261118; of the backend: 64: 1.11, 128: 0.81).
         ("paged", 1, 8, 1, 1, 131072, 128),
         ("paged", 1, 8, 1, 4, 131072, 64),  # S_q 4 keeps the 64 cap
+        # Past the calibrated S_q 1-16 the shared model's choice stands.
+        ("paged", 4, 32, 2, 64, 32768, 2),
         # Dense d256 keeps the shared model's choice.
         ("dense", 8, 40, 4, 1, 32768, 2),
     ],
