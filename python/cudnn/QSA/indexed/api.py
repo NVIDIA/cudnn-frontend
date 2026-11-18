@@ -115,8 +115,8 @@ class _QsaIndexedPlan(APIBase):
             self._metadata = _metadata.compile_metadata(self.arch, self.width // 4)
             if self.direction == "fprop":
                 module = "fprop_sm100"
-                if self.arch == 107 and self.total >= 32768 and self.hq == 12 * self.hkv and self.dtype == torch.bfloat16:
-                    module = "fprop_n64_sm107"  # specialised for BF16 and 12 heads per KV head
+                if self.arch == 107 and self.total >= 32768 and self.hq == 12 * self.hkv:
+                    module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
                 self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
                 self._compiled_kernel = self.impl.compile_kernel(dtype, self.hq, self.hkv, self.arch)
             else:

@@ -158,8 +158,8 @@ def compile_kernel(dtype, hq, hkv, arch, gated, n64=False):
 
 def launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, out, out_fp32, lse, scale, stream):
     total, hq, _ = q.shape
-    # The 64-key Rubin forward is specialised for BF16 and 12 heads per KV head; other calls stay on the shared gathered body.
-    n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768 and q.dtype == torch.bfloat16
+    # The 64-key Rubin forward is specialised for 12 heads per KV head; 6:1 stays on the shared gathered body.
+    n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768
     # Each query tile takes the dense or the gathered kernel on the device. The 64-key forward reads no tile modes.
     gated = total > 512 and not n64
     dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[q.dtype]

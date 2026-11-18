@@ -27,7 +27,7 @@ def native_forward(inputs):
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = compact(inputs["sel_blocks"], inputs["lo"], inputs["hi"], inputs["block_first"], inputs["block_last"], 107, stream)
     outputs = (torch.empty_like(q), torch.empty_like(q, dtype=torch.float32), torch.empty((q.shape[1], q.shape[0]), device=q.device))
-    kernel = fprop_n64_sm107.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], 107)
+    kernel = fprop_n64_sm107.compile_kernel(cutlass.BFloat16 if q.dtype == torch.bfloat16 else cutlass.Float16, q.shape[1], k.shape[1], 107)
     fprop_n64_sm107.launch(
         kernel, q, k, v, *outputs, ids, counts, inputs["lo"], inputs["hi"], inputs["block_first"], inputs["block_last"], inputs["scale"], stream
     )
@@ -37,8 +37,9 @@ def native_forward(inputs):
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
 @pytest.mark.parametrize("lengths", [(1,), (3, 5, 9), (61, 68), (127, 129, 5)])
 @pytest.mark.parametrize("scale", [1 / 16, 0.0, -0.125])
-def test_native_forward_and_saved_state(rubin, heads, lengths, scale):
-    inputs = make_inputs(lengths, *heads, empty=True)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_native_forward_and_saved_state(rubin, heads, lengths, scale, dtype):
+    inputs = make_inputs(lengths, *heads, empty=True, dtype=dtype)
     inputs["scale"] = scale
     out, saved, lse = native_forward(inputs)
     for actual, expected in zip((out, saved, lse), reference(inputs)):
@@ -64,7 +65,7 @@ def test_native_forward_masks_nonfinite_kv(rubin):
 @pytest.mark.parametrize("lengths", [(32768,), (16385, 16386)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_bitmap_long_public_dispatch(rubin, lengths, dtype):
-    """Exercise the public long-row launcher with aligned and packed bitmaps. FP16 takes the gathered body."""
+    """Exercise the public long-row launcher with aligned and packed bitmaps."""
     total = sum(lengths)
     torch.manual_seed(92)
     q = torch.randn((total, 12, 256), device="cuda", dtype=dtype)
