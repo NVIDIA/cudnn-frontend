@@ -88,6 +88,8 @@ def summary_support_gates(engine: str, facts, graph) -> None:
     beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
     if facts.beta_dtype not in beta_wants + (None,):
         raise NotImplementedError(f"{engine}: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
+    if facts.do_dtype not in (facts.io_dtype, None):
+        raise NotImplementedError(f"{engine}: 'dO' must match the io dtype ({facts.io_dtype}), got {facts.do_dtype}")
     gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
         if got not in gate_param_dtypes + (None,):
