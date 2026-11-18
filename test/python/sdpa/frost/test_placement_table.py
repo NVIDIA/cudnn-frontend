@@ -1403,7 +1403,7 @@ def test_sm100_paged_d192x128_context_entries_follow_the_study(device_cc):
 def test_sm90_d192x128_verify_entries_follow_the_study():
     """Study sm90_d192x128_verify_20261118 (H100): mimo d192 x 128 spec-decode verify. Dense full cache leads on the KV tile past a cost
     floor and always off it; paged leads with the full cache and with a window + sink on and off the tile; dense window + sink failed
-    its holdout and keeps no verify entry."""
+    its holdout here (the v2 study answers it)."""
     row = "sdpa_fwd_prefill_sm90"
 
     def g(**over):
@@ -1422,6 +1422,27 @@ def test_sm90_d192x128_verify_entries_follow_the_study():
         assert pt.matched_entry(row, g(**paged, window_left=127, has_sink=True, b=1, h_q=16, h_kv=2, s_kv=kv)).study == study
     dense_sink = pt.matched_entry(row, g(window_left=127, has_sink=True, h_q=64, h_kv=8))
     assert dense_sink is None or dense_sink.study != study
+
+
+@pytest.mark.L0
+def test_sm90_d192x128_dense_sink_verify_v2_entries_follow_the_study():
+    """Study sm90_d192x128_dense_sink_verify_v2_20261118 (H100): mimo dense d192 x 128 verify with a window and a sink leads from 2^4.16
+    parallel tiles on the KV tile and 2^4.40 off it."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def g(**over):
+        base = dict(b=128, h_q=128, h_kv=8, s_q=8, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(9, 0))
+        base.update(window_left=127, has_sink=True, has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm90_d192x128_dense_sink_verify_v2_20261118"
+    for kv in (131072, 131073):
+        assert pt.class_key(row, g(s_kv=kv))[4:7] == ("verify", "dense", "window")
+        assert pt.lookup(row, g(s_kv=kv)) is True and pt.matched_entry(row, g(s_kv=kv)).study == study
+        assert pt.lookup(row, g(s_kv=kv, b=1)) is False  # 8 parallel tiles: under both floors
+    assert pt.lookup(row, g(b=1, h_q=16, h_kv=1, s_q=16, s_kv=16384)) is False
+    assert pt.lookup(row, g(dtype=cudnn.data_type.HALF)) is None
 
 
 @pytest.mark.L0

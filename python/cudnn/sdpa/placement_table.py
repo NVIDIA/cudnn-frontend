@@ -1732,7 +1732,7 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm90_d192x128_verify_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 900 train + 648 off-tile train cells, 120 holdout
     # cells at fresh head pairs scored once): mimo d192 x 128 spec-decode verify. Dense full cache from cost 2^28.1 on the tile (holdout
     # 0.312), always off it (0.309); paged always (full cache 0.201 / 0.206, window + sink 0.418 / 0.461). Dense window + sink failed
-    # its on-tile holdout (1.189): no entry
+    # its on-tile holdout (1.189) and is answered by sm90_d192x128_dense_sink_verify_v2_20261118 below
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "dense", "causal_br", False, "gqa", False): Entry(
         "ge", 28.114, "sm90_d192x128_verify_20261118"
     ),
@@ -1750,6 +1750,16 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", True): Entry(
         "always", None, "sm90_d192x128_verify_20261118"
+    ),
+    # study sm90_d192x128_dense_sink_verify_v2_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; the first study's dense window + sink
+    # cells and its scored holdout as train, plus 774 cells at windows 128-4096, b 1-128, on and off the tile; 48 holdout cells at fresh
+    # head pairs and windows scored once per build): mimo dense d192 x 128 verify with a window and a sink leads from 2^4.16 / 2^4.40
+    # parallel tiles on / off the tile (holdout 0.360-0.399, worst 1.013 / 0.314-0.347, worst 0.612).
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "dense", "window", True, "gqa", False): Entry(
+        "ge", 4.161, "sm90_d192x128_dense_sink_verify_v2_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "dense", "window", True, "gqa", True): Entry(
+        "ge", 4.404, "sm90_d192x128_dense_sink_verify_v2_20261118", "tiles"
     ),
     # study sm90_d64_sink_mtp_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 813 + 318 off-tile train cells, 60 holdout cells at
     # fresh head pairs scored once): gpt-oss paged d64 MTP with a sink, which the row runs unpacked. Full cache leads up to 2^4.5 parallel
