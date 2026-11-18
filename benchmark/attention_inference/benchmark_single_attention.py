@@ -246,7 +246,7 @@ def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
     return k, v, kwargs, pack, bind_o, (t["q_off"] if thd else None)
 
 
-def setup_cudnn(args, dtype, oss=False, auto=False):
+def setup_cudnn(args, dtype, oss=False, auto=False, each=False):
     import cudnn
 
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
@@ -254,7 +254,7 @@ def setup_cudnn(args, dtype, oss=False, auto=False):
     sq, skv = args.q_tokens, args.kv_len
 
     if args.kv_cache_dtype == "fp8_e4m3":
-        return setup_cudnn_fp8(args, cudnn, oss=oss, auto=auto)
+        return setup_cudnn_fp8(args, cudnn, oss=oss, auto=auto, each=each)
 
     # Allocate (B, S, H, D) and transpose to the logical (B, H, S, D) the graph
     # takes. Same logical tensor either way — only the physical stride order
@@ -330,13 +330,16 @@ def setup_cudnn(args, dtype, oss=False, auto=False):
         _deselect_frost_sdpa(graph)
     graph.create_execution_plans(modes)
     graph.check_support()
-    graph.build_plans()
+    if not each:  # the each-leg builds plan by plan in _each_plan
+        graph.build_plans()
 
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    workspace = None if each else torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     variant_pack = {q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, **paged_pack}
     if sink_gpu is not None:
         variant_pack[sdpa_kwargs["sink_token"]] = sink_gpu
     handle = cudnn.create_handle()
+    if each:
+        return _each_plan(graph, variant_pack, handle, "cudnn_oss_each")
 
     def fn():
         graph.execute(variant_pack, workspace, handle=handle)
@@ -390,6 +393,38 @@ def setup_cudnn_oss(args, dtype):
     return setup_cudnn(args, dtype, oss=True)
 
 
+def _each_plan(graph, variant_pack, handle, label):
+    """One (fn, detail) per FROST plan, in the order the heuristics proposed them; the detail carries the plan's rank."""
+    sizes = {}
+    for i in range(graph.get_execution_plan_count()):
+        name = graph.get_plan_name_at_index(i)
+        if name == "backend_heuristics":
+            continue
+        try:
+            sizes[i] = graph.get_workspace_size_plan_at_index(i)  # builds the plan
+        except Exception as error:
+            print(f"SKIP {label} rank={i} plan={name}: not built: {type(error).__name__}: {error}", file=sys.stderr)
+    workspace = torch.empty(max(list(sizes.values()) + [1]), device="cuda", dtype=torch.uint8)
+    runs = []
+    for i in sizes:
+        name = graph.get_plan_name_at_index(i)
+
+        def fn(i=i):
+            graph.execute_plan_at_index(variant_pack, workspace, i, handle=handle)
+
+        runs.append((fn, f"{label} rank={i} plan={name}"))
+    if not runs:
+        raise NotImplementedError("cudnn_oss_each: no python OSS engine serves this case")
+    return runs
+
+
+def setup_cudnn_oss_each(args, dtype):
+    """Every FROST plan the heuristics propose for the case, each timed on its own (the opted-in OPENSOURCE walk of
+    `cudnn_oss`, past its first entry): measures the order among FROST engines and knob sets, which no other leg sees."""
+    os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "1"
+    return setup_cudnn(args, dtype, oss=True, each=True)
+
+
 def setup_cudnn_auto(args, dtype):
     """cuDNN frontend default dispatch: the plan the heuristics rank first for a user, with no engine deselected or
     pinned. The FROST opt-in is cleared so graduated FROST rows compete through placement, as in production."""
@@ -397,7 +432,7 @@ def setup_cudnn_auto(args, dtype):
     return setup_cudnn(args, dtype, auto=True)
 
 
-def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
+def setup_cudnn_fp8(args, cudnn, oss=False, auto=False, each=False):
     """FP8 attention graph (q/k/v e4m3 with unit descales) for the fp8-KV axis."""
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
     dqk, dvo = args.head_dim_qk, args.head_dim_vo
@@ -479,14 +514,17 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
         _deselect_frost_sdpa(graph)
     graph.create_execution_plans(modes)
     graph.check_support()
-    graph.build_plans()
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    if not each:  # the each-leg builds plan by plan in _each_plan
+        graph.build_plans()
+    workspace = None if each else torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     variant_pack = {q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, amax_o: amax_o_gpu, **paged_pack}
     if sink_gpu is not None:
         variant_pack[kwargs["sink_token"]] = sink_gpu
     for n in ones:
         variant_pack[scalars[n]] = ones[n]
     handle = cudnn.create_handle()
+    if each:
+        return _each_plan(graph, variant_pack, handle, "cudnn_oss_each fp8")
 
     def fn():
         graph.execute(variant_pack, workspace, handle=handle)
@@ -944,6 +982,7 @@ SETUPS = {
     "cudnn": setup_cudnn,
     "cudnn_oss": setup_cudnn_oss,
     "cudnn_auto": setup_cudnn_auto,
+    "cudnn_oss_each": setup_cudnn_oss_each,
     "flashinfer": setup_flashinfer,
     # FlashInfer with its attention backend pinned (the FLASHINFER_BENCH_BACKEND default otherwise): the reference a serving
     # stack compares cuDNN against, and cuDNN through FlashInfer's own graph declaration.
@@ -1013,14 +1052,14 @@ def main():
         args.sm_scale = 1.0 / math.sqrt(args.head_dim_qk)
     dtype = torch.bfloat16 if args.data_type == "bfloat16" else torch.float16
 
-    cudnn_leg = args.backend in ("cudnn", "cudnn_oss", "cudnn_auto")
+    cudnn_leg = args.backend in ("cudnn", "cudnn_oss", "cudnn_auto", "cudnn_oss_each")
     fi_leg = args.backend.startswith("flashinfer")
     if min(args.kv_min_fill, args.q_min_fill) < 1.0 and not ((cudnn_leg and args.kv_layout == "paged") or fi_leg):
         raise NotImplementedError("per-request lengths are wired for the paged cudnn legs and flashinfer only")
     if args.q_min_fill < 1.0 and args.phase != "context":
         raise NotImplementedError("--q_min_fill applies to the context phase")
-    fn, detail = SETUPS[args.backend](args, dtype)
-    ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
+    setup = SETUPS[args.backend](args, dtype)
+    runs = setup if isinstance(setup, list) else [setup]
 
     # FLOPs and bytes per request, at each request's own lengths.
     flops = byts = 0.0
@@ -1040,12 +1079,19 @@ def main():
             # the cudnn fp8 graph holds Q and O in e4m3 as well
             qo_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" and cudnn_leg else 2,
         )
-    tflops = flops / (ms * 1e-3) / 1e12
-    gbps = byts / (ms * 1e-3) / 1e9
     peak = get_peak_bw_gbps()
-    sol = f"{gbps / peak * 100.0:.4f}" if peak else ""
-
-    print(f"RESULT,{ms:.6f},{tflops:.3f},{gbps:.3f},{sol}," f"{torch.cuda.get_device_name().replace(',', ';')},{detail.replace(',', ';')}")
+    for fn, detail in runs:
+        try:
+            ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
+        except Exception as error:
+            if len(runs) == 1:
+                raise
+            print(f"SKIP {detail}: {type(error).__name__}: {error}", file=sys.stderr)
+            continue
+        tflops = flops / (ms * 1e-3) / 1e12
+        gbps = byts / (ms * 1e-3) / 1e9
+        sol = f"{gbps / peak * 100.0:.4f}" if peak else ""
+        print(f"RESULT,{ms:.6f},{tflops:.3f},{gbps:.3f},{sol}," f"{torch.cuda.get_device_name().replace(',', ';')},{detail.replace(',', ';')}")
 
 
 if __name__ == "__main__":
