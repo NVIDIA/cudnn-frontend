@@ -140,6 +140,7 @@ def test_benchmark_fits_one_workspace_across_iterations(profile_pass):
 
 @pytest.mark.parametrize("skip_ref", [False, True])
 def test_hopper_fa3_benchmark_runs_requested_provider(monkeypatch, capsys, skip_ref):
+    import math
     import runpy
 
     torch = pytest.importorskip("torch")
@@ -165,11 +166,93 @@ def test_hopper_fa3_benchmark_runs_requested_provider(monkeypatch, capsys, skip_
     monkeypatch.syspath_prepend(str(script.parent))
     args = (
         "--sdpa_backend flash_attention_3 --data_type bfloat16 --batch_size 1 --q_seqlen 128 --kv_seqlen 128 "
-        "--num_q_heads 4 --num_kv_heads 2 --head_dim 64 --profile_pass both --num_iterations 1 --fa4_num_splits 1"
+        "--num_q_heads 4 --num_kv_heads 2 --head_dim 64 --profile_pass both --num_iterations 1 --fa4_num_splits 1 --format_output"
     ).split()
     monkeypatch.setattr(sys, "argv", [str(script), *args] + (["--skip_ref"] if skip_ref else []))
     runpy.run_path(str(script), run_name="__main__")
     assert calls[0][0] == "FA3"
     assert sum(provider == "FA4" for provider, _, _ in calls) == int(not skip_ref)
     assert all(q == (1, 128, 4, 64) and k == (1, 128, 2, 64) for _, q, k in calls)
-    assert "Failed reference check" not in capsys.readouterr().out
+    stdout = capsys.readouterr().out
+    assert "Failed reference check" not in stdout
+    assert math.isnan(float(stdout.strip().splitlines()[-1].split(",")[12])) == skip_ref
+
+
+@pytest.mark.parametrize(
+    ("profile_pass", "perturbation", "iterations"),
+    [("bwd", None, 1), ("bwd", "gradient", 1), ("fwd", "output", 6)],
+)
+def test_benchmark_reports_reference_check_for_single_pass(monkeypatch, capsys, profile_pass, perturbation, iterations):
+    import math
+    import runpy
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("requires Hopper for the FA4 reference")
+    pytest.importorskip("flash_attn_interface")
+    fa4 = pytest.importorskip("flash_attn.cute.interface")
+    original = fa4.flash_attn_func
+    calls = 0
+
+    def reference(q, k, v, **kwargs):
+        nonlocal calls
+        calls += 1
+        if perturbation == "gradient":
+            q = q.view_as(q)
+            q.register_hook(lambda grad: grad + 1)
+        output, lse = original(q, k, v, **kwargs)
+        if perturbation == "output" and calls == 1:
+            output = output + 1
+        return output, lse
+
+    monkeypatch.setattr(fa4, "flash_attn_func", reference)
+    script = _REPO_ROOT / "benchmark/attention_training/benchmark_single_sdpa.py"
+    monkeypatch.syspath_prepend(str(script.parent))
+    args = (
+        "--sdpa_backend flash_attention_3 --data_type bfloat16 --batch_size 1 --q_seqlen 128 --kv_seqlen 128 "
+        "--num_q_heads 4 --num_kv_heads 2 --head_dim 64 --fa4_num_splits 1 --format_output"
+    ).split()
+    monkeypatch.setattr(sys, "argv", [str(script), *args, "--profile_pass", profile_pass, "--num_iterations", str(iterations)])
+    runpy.run_path(str(script), run_name="__main__")
+    stdout = capsys.readouterr().out
+    fields = stdout.strip().splitlines()[-1].split(",")
+    assert float(fields[8 if profile_pass == "fwd" else 9]) > 0
+    assert calls == iterations
+    assert ("Failed reference check" in stdout) == (perturbation is not None)
+    assert math.isnan(float(fields[12])) == (perturbation is not None)
+
+
+def test_runner_csv_preserves_small_and_missing_reference_errors(tmp_path):
+    import csv
+    from dataclasses import replace
+
+    pytest.importorskip("pandas")
+    from benchmark.attention_training.config_types import BenchmarkConfig, BenchmarkResult, ModelPreset
+    from benchmark.attention_training.runner import BenchmarkRunner
+
+    config = BenchmarkConfig(name="reference", models=[ModelPreset("gqa", 4, 2)], seqlens=[(128, 128)])
+    result = BenchmarkResult(
+        config_name=config.name,
+        model_name="gqa",
+        backend="cudnn",
+        data_type="float16",
+        attn_mask="no_mask",
+        batch_size=1,
+        q_seqlen=128,
+        kv_seqlen=128,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim_qk=64,
+        head_dim_vo=64,
+        profile_pass="fwd",
+        deterministic_bwd=False,
+        time_ms=0.125,
+        tflops=1,
+        max_diff=2.0**-22,
+        num_iterations=1,
+    )
+    path = BenchmarkRunner().save_csv([result, replace(result, max_diff=float("nan"))], config, tmp_path / "results.csv")
+    with path.open() as file:
+        measured, unchecked = csv.DictReader(file)
+    assert float(measured["max_diff"]) == result.max_diff
+    assert unchecked["max_diff"] == ""
