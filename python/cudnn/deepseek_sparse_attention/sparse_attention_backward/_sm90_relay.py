@@ -10,6 +10,9 @@ from packaging.version import InvalidVersion, Version
 SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8, 16, 32, 64)
 SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 16
 SM90_PHYSICAL_RELAY_CLUSTER_SIZES = (4, 8, 16)
+SM90_CONFLICT_RANK_PLANES = 4
+SM90_CONFLICT_RANK_WAVE_CTAS = 128
+SM90_CONFLICT_RANK_RELAY_PHASES = (1, 2, 4, 8, 16, 32, 64, 128)
 SM90_SIGNED_INT32_ELEMENT_LIMIT = 1 << 31
 
 
@@ -17,13 +20,22 @@ def _round_up(value: int, multiple: int) -> int:
     return (int(value) + multiple - 1) // multiple * multiple
 
 
-def sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size):
+def sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size, *, conflict_rank=False):
     """Return (planes, physical plane elements, mask rows, waves, head tiles)."""
     relay_cluster_size = normalize_sm90_relay_cluster_size(relay_cluster_size)
     seqlen_k_rounded = _round_up(total_s_kv, 64)
     head_dim_rounded = _round_up(head_dim, 32)
     num_waves = _round_up(total_s_q, 128) // 128
     num_head_tiles = _round_up(num_heads, 64) // 64
+    if conflict_rank:
+        # One immutable 128-bit query bitmap plus four 32-bit column-phase
+        # tickets per KV row, wave, and 64-head tile.  The words are striped
+        # over the four dense dKV planes so every plane has the same extent.
+        num_dkv_planes = SM90_CONFLICT_RANK_PLANES
+        mask_storage_elems = 2 * num_waves * num_head_tiles * seqlen_k_rounded
+        mask_rows = _round_up(mask_storage_elems, head_dim_rounded) // head_dim_rounded
+        physical_plane_elems = (seqlen_k_rounded + mask_rows) * head_dim_rounded
+        return num_dkv_planes, physical_plane_elems, mask_rows, num_waves, num_head_tiles
     num_dkv_planes = 128 // relay_cluster_size
     mask_word_bits = 64 if relay_cluster_size == 64 else 32
     mask_rows_per_word = mask_word_bits // relay_cluster_size
@@ -34,9 +46,24 @@ def sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, 
     return num_dkv_planes, physical_plane_elems, mask_rows, num_waves, num_head_tiles
 
 
-def sm90_deterministic_relay_accumulator_elements(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size) -> int:
+def sm90_deterministic_relay_accumulator_elements(
+    total_s_q,
+    total_s_kv,
+    head_dim,
+    num_heads,
+    relay_cluster_size,
+    *,
+    conflict_rank=False,
+) -> int:
     """Return the flat FP32 relay-workspace span addressed by SM90 kernels."""
-    num_dkv_planes, physical_plane_elems, *_ = sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size)
+    num_dkv_planes, physical_plane_elems, *_ = sm90_deterministic_relay_layout(
+        total_s_q,
+        total_s_kv,
+        head_dim,
+        num_heads,
+        relay_cluster_size,
+        conflict_rank=conflict_rank,
+    )
     return num_dkv_planes * physical_plane_elems
 
 
@@ -92,3 +119,22 @@ def sm90_physical_relay_cluster_size(relay_cluster_size, device=None) -> int:
     raise NotImplementedError(
         "deterministic SM90 DSA backward requires a launchable C4, C8, or C16 " f"physical cluster for logical relay C{relay_cluster_size}"
     )
+
+
+def sm90_conflict_rank_relay_phases(sm_count) -> int:
+    """Choose cooperative phases whose launch fits at one CTA per SM.
+
+    Conflict-rank overflow writers wait for lower query ordinals, so every CTA
+    in a launch must be co-resident.  Each phase is therefore a cooperative
+    launch no wider than the largest power of two at or below the device's SM
+    count. Same-stream phase order carries completed tickets across launches.
+    The prepared plan caches this plan-time decision.
+    """
+    try:
+        sm_count = operator.index(sm_count)
+    except TypeError as error:
+        raise ValueError(f"SM90 conflict-rank scheduling requires an integer SM count, got {sm_count!r}") from error
+    if sm_count <= 0:
+        raise ValueError(f"SM90 conflict-rank scheduling requires a positive SM count, got {sm_count}")
+    resident_ctas = 1 << (min(sm_count, SM90_CONFLICT_RANK_WAVE_CTAS).bit_length() - 1)
+    return SM90_CONFLICT_RANK_WAVE_CTAS // resident_ctas

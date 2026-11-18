@@ -3421,6 +3421,75 @@ Known gaps, stated rather than tolerated:
 - These layouts have no golden records; their bits depend on the plan, and
   for D576 on the SM count.
 
+### SM90 DSA conflict-rank backward: H20 and H200 validation, 2026-11-17
+
+The SM90 default deterministic backward now uses four-plane conflict-rank
+storage; an explicit logical relay keeps the shard layout. Validation used an
+NVIDIA H20-3e (SM90), PyTorch 2.8.0+cu129, CUDA 12.9, cuDNN 9.10.2,
+CuTe DSL 4.8.1 and `cuda-bindings` 12.9.10. Imports resolved to the isolated
+`icavan/sm90-dsa-conflict-rank` checkout based on upstream `3b7cd6cab`.
+
+New BF16 evidence:
+
+- H64/D512 and D576, 65 queries, KV 256 and Top-K 64 with every query selecting
+  the same rows: conflict ranks 0 through 64 exercise all four planes and the
+  column-phase overflow tickets. Four fresh poisoned-workspace executions per
+  shape are raw-byte equal for dQ, dKV and dSink and pass the independent FP32
+  reference.
+- H96/D576, 129 queries, KV 256 and Top-K 128: eager execution and three CUDA
+  Graph replays are raw-byte equal after poisoning outputs/workspace; replay
+  also matches eager execution after changing `topk_idxs` and `topk_length`.
+- The complete SM90 L0 selection in
+  `test_DSA_sparse_attention_backward.py` has 67 passing expanded cases. It
+  covers ordinary execution,
+  both `topk_length` variants, invalid/padded rows, workspace boundaries,
+  compile-cache reuse, the default records route and every explicit shard
+  relay size. The H20 C16 logical relay selects physical C8.
+
+The long-context performance case is BF16 H64, Q=16384, KV=262144 and Top-K
+2048. Five warmups and twenty allocation-free calls measure 119.223 ms for
+D512 (92.22 TFLOPS, 3.008 GiB workspace) and 117.632 ms for D576 (100.48
+TFLOPS, 3.258 GiB). The upstream + physical-cluster-fix D512 C16
+logical/C8 physical baseline measures 484.915 ms and 4.508 GiB: 4.07x speedup
+and 33.3% less workspace.
+
+The AIStudio H200 allocation (runtime name `NVIDIA L20X`) used PyTorch
+2.12.1+cu130, CUDA 13.0, cuDNN 9.19.0, CuTe DSL 4.8.1 with the CUDA 13 extra
+(CUDA 13.4 lowering), and `cuda-bindings` 13.0.3. The prepared plan selected
+one 128-CTA wave instead of two 64-CTA phases. The same high-conflict reference
+case and all three CUDA Graph variants passed, including poisoned workspace and
+changed sparse inputs. Those 65 native/host cases predate the later cooperative
+launch contract; the two added small-device policy cases expand the current
+selection to 67. Records and shard-relay compile-cache reuse across changing
+runtime extents was covered.
+One-wave overflow writers use four independent column-phase tickets for D512
+and two for D576; the tickets preserve rank order within every disjoint column
+group while allowing adjacent ranks to pipeline. Long-context performance with
+five warmups and 20 calls is 69.147--69.217 ms for D512 and 83.164--83.285 ms
+for D576. The previous single-chain records implementation measured
+75.056--75.151 and 85.201--85.257 ms; upstream C16 baselines were 84.643 and
+100.126 ms. Thus the final records path is 1.224x and 1.204x faster than
+upstream, respectively. In a high-conflict stress where every query shares the
+same 2048 KV rows, two warmups and five calls reduced D512 from 151.586 to
+87.678 ms (1.73x) and D576 from 195.635 to 139.779 ms (1.40x) relative to the
+previous records implementation.
+
+H20-3e retained the two ordered cooperative 64-CTA phases and a single overflow ticket per
+row; extra intra-launch column barriers regress this split-wave schedule and
+are deliberately disabled. Its phase-policy, prepared-plan cache,
+records/shards compile-cache, D512/D576 high-conflict references, and all three
+changed-input CUDA Graph cases passed after the H200 scheduling change. The
+complete SM90 L0 selection passed 67 cases on H20-3e (CUDA 12.9 lowering); the
+earlier 65-case revision passed on the AIStudio H200 allocation (CUDA 13.4
+lowering) before the two host-only small-device policy cases were added.
+
+No support status is upgraded: multi-wave dKV is still not batch invariant,
+so SM90 BF16 remains **Replay only**. Duplicate active indices within one
+query are outside the SM90 contract. FP16, other SM90 head-count/dimension
+combinations, SM100/SM103 and SM107 are unverified for this change. No golden
+record is added because these plan-dependent backward bits already have no
+golden contract; replay and the independent reference are the qualification.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
