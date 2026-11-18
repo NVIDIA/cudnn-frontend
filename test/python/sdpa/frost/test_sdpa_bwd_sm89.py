@@ -271,30 +271,41 @@ def test_deterministic_replay_and_capture(dtype):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [256, 128])
+@pytest.mark.parametrize("d,sq,skv,expected_first", [(256, 128, 128, ENGINE), (128, 128, 128, None), (64, 128, 128, D64_ENGINE), (64, 128, 256, None)])
 @_ON_SM89
 @requires_dsl
-def test_default_plan_order(d, monkeypatch):
-    """Default ranking (no FROST opt-in): the row serves D256, which the backend declines on Ada, and stays behind the
-    backend's plans at D128."""
+def test_default_plan_order(d, sq, skv, expected_first, monkeypatch):
+    """The backend declines D256; the fixed D64 owner leads only for qualifying squares."""
     import cudnn
 
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
 
-    b, h, s = 2, 4, 128
+    b, h = 2, 4
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    stride = [s * h * d, d, h * d, 1]
-    t = {n: graph.tensor(name=n, dim=[b, h, s, d], stride=stride) for n in ("q", "k", "v", "o", "do")}
-    stats = graph.tensor(name="stats", dim=[b, h, s, 1], stride=[h * s, s, 1, 1], data_type=cudnn.data_type.FLOAT)
-    outs = graph.sdpa_backward(q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=stats, attn_scale=d**-0.5, use_causal_mask=True)
-    for out in outs:
-        out.set_output(True).set_dim([b, h, s, d]).set_stride(stride).set_data_type(cudnn.data_type.BFLOAT16)
+
+    def dims(length):
+        return [b, h, length, d], [length * h * d, d, h * d, 1]
+
+    tensors = {}
+    for name, length in (("q", sq), ("k", skv), ("v", skv), ("o", sq), ("do", sq)):
+        shape, stride = dims(length)
+        tensors[name] = graph.tensor(name=name, dim=shape, stride=stride)
+    stats = graph.tensor(name="stats", dim=[b, h, sq, 1], stride=[h * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
+    outs = graph.sdpa_backward(
+        q=tensors["q"], k=tensors["k"], v=tensors["v"], o=tensors["o"], dO=tensors["do"], stats=stats, attn_scale=d**-0.5, use_causal_mask=d != 64
+    )
+    for out, length in zip(outs, (sq, skv, skv)):
+        shape, stride = dims(length)
+        out.set_output(True).set_dim(shape).set_stride(stride).set_data_type(cudnn.data_type.BFLOAT16)
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     names = [graph.get_plan_name_at_index(i) for i in range(graph.get_execution_plan_count())]
-    assert ENGINE in names, names
-    if d > 128:
-        assert names == [ENGINE], names
+    owner = D64_ENGINE if d == 64 else ENGINE
+    assert owner in names, names
+    if expected_first is None:
+        assert names.index(owner) > 0, names
     else:
-        assert names.index(ENGINE) > 0, names
+        assert names[0] == expected_first, names
+    if d == 256:
+        assert names == [ENGINE], names
