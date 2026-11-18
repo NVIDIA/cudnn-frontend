@@ -52,13 +52,13 @@ def _field(name, byte_offset):
 
 
 @dsl_user_op
-def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_b=False, accumulate=True, loc=None, ip=None) -> cutlass.Vector:
+def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_a=False, transpose_b=False, accumulate=True, loc=None, ip=None) -> cutlass.Vector:
     """Dispatch one ``m64n{64|128|256}k16`` WGMMA and return its FP32 C vector.
 
     SS A is a SMEM descriptor/value; RS A is a four-word ``Vector``.
     Both forms accept 32, 64 or 128 C slots (n64, n128 or n256).
     B is always a SMEM descriptor/value; ``transpose_b`` selects its major
-    layout. The caller owns the surrounding fence/commit/wait and operand
+    layout, ``transpose_a`` that of a SMEM A operand. The caller owns the surrounding fence/commit/wait and operand
     lifetime.
     """
     if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
@@ -69,8 +69,12 @@ def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_b=False, accumulate=
     if cutlass.const_expr(register_a):
         if cutlass.const_expr(a.shape != (4,)):
             raise ValueError(f"wgmma_m64nNk16_f32: RS A must be four packed words, got shape {a.shape}")
+        if cutlass.const_expr(transpose_a):
+            raise ValueError("wgmma_m64nNk16_f32: a register A operand has no major layout")
     kind = nvvm.WGMMATypes.f16 if cutlass.const_expr(ab_dtype == cutlass.Float16) else nvvm.WGMMATypes.bf16
-    return _tied(_wgmma_rs if cutlass.const_expr(register_a) else _wgmma_ss, c, a, b_desc, kind, transpose_b, accumulate, loc=loc, ip=ip)
+    if cutlass.const_expr(register_a):
+        return _tied(_wgmma_rs, c, a, b_desc, kind, transpose_b, accumulate, loc=loc, ip=ip)
+    return _tied(_wgmma_ss, c, a, b_desc, kind, transpose_a, transpose_b, accumulate, loc=loc, ip=ip)
 
 
 def _tied(issue, c, *args, loc, ip):
@@ -81,7 +85,7 @@ def _tied(issue, c, *args, loc, ip):
     return cutlass.Vector.from_elements(values, cutlass.Float32, loc=loc, ip=ip)
 
 
-def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, ip):
+def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_a, transpose_b, accumulate, *, loc, ip):
     """Issue an SS WGMMA through the NVVM dialect op.
 
     The 4.8.0.dev0 public wrapper re-wraps descriptors as DSL ``Int64`` values;
@@ -103,7 +107,7 @@ def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, i
         scale_d=nvvm.WGMMAScaleOut.one if cutlass.const_expr(accumulate) else nvvm.WGMMAScaleOut.zero,
         scale_a=nvvm.WGMMAScaleIn.one,
         scale_b=nvvm.WGMMAScaleIn.one,
-        layout_a=nvvm.MMALayout.row,
+        layout_a=nvvm.MMALayout.col if cutlass.const_expr(transpose_a) else nvvm.MMALayout.row,
         layout_b=nvvm.MMALayout.row if cutlass.const_expr(transpose_b) else nvvm.MMALayout.col,
         loc=loc,
         ip=ip,

@@ -82,8 +82,10 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False, spl
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
     compiled = g._compiled_plans[g._plan_index]._compiled
     assert compiled.kernel_module.__file__.endswith("sm107/d256_fp8_single_q/kernel.py")
-    expected_owner = "sdpa_fwd_sm107_d256_fp8_single_q" if (d, dv) == (256, 256) else "sdpa_fwd_prefill_sm107_fp8"
-    assert g.selected_engine.name == expected_owner
+    from cudnn.sdpa.fwd.kernels.sm107.d256_fp8_single_q.contract import NAME
+
+    # The explicit implementation also owns its narrower D256 envelopes.
+    assert g.selected_engine.name == NAME, g.selected_engine.name
     assert g.plans[g._plan_index].knobs.pack_gqa == pack
     for name in ("q", "k", "v"):
         value = bufs[name]

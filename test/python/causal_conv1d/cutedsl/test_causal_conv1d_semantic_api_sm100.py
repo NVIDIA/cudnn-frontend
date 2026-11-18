@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.utils.checkpoint
-from causal_conv1d.cutedsl.reference import causal_conv1d_bulk_reference
+from causal_conv1d.cutedsl.causal_conv1d_reference import causal_conv1d_bulk_reference
 
 pytestmark = [
     pytest.mark.L1,

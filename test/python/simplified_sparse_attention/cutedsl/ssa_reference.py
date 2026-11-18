@@ -5,7 +5,7 @@
 
 import torch
 
-from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention
+from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention_forward
 from determinism_utils import snapshot
 
 
@@ -44,7 +44,7 @@ def pack(samples, denominator=257.0):
 def run(inputs, backward=False, topk=512):
     tensors, metadata, upstream = inputs
     local = [t.detach().clone().requires_grad_(backward) for t in tensors]
-    output, loss = simplified_sparse_attention(*local, metadata, topk)
+    output, loss = simplified_sparse_attention_forward(*local, metadata, topk)
     result = {"output": output, "indexer_loss": loss}
     if backward:
         grads = torch.autograd.grad((output, loss), local, (upstream, torch.ones_like(loss)))

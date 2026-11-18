@@ -1313,11 +1313,9 @@ def _dense_kernel(q, k, v, scale, kv_lens=None):
     """The dense sm107 d256 prefill kernel (top-left causal, the query head's KV head = head // group) on the same operands
     through the shared explicit pointer ABI: the FUNCTION twin of the sparse kernel at the identity bound and the
     ignore-the-list twin of the adversarial cell.  Returns sentinel-filled (O, LSE) after the launch."""
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import make_ptr
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from frost_test_utils import launch_f16
 
     dev = q.device
     B, S, H, _ = q.shape
@@ -1326,41 +1324,28 @@ def _dense_kernel(q, k, v, scale, kv_lens=None):
     params = TemplateParams(dtype_qkv=code, window_right=0, qh_per_kh=H // KH, seq_kv_lens_present=kv_lens is not None)
     mod = _load_sm100_kernel_module((D, D), params, rubin=True)
     fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
-    gmem = cute.AddressSpace.gmem
-    half = cutlass.BFloat16 if code == 2 else cutlass.Float16
-
-    def P(t, cdt, align=16):
-        return None if t is None else make_ptr(cdt, t.data_ptr(), gmem, assumed_align=align)
-
     sent = _sentinel(q.dtype)
     o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
     lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32)
     meta = torch.tensor(kv_lens if kv_lens is not None else [SKV] * B, dtype=torch.int32, device=dev)
-    fn(
-        q_ptr=P(q, half),
-        k_ptr=P(k, half),
-        v_ptr=P(v, half),
-        o_ptr=P(o, half),
-        lse_ptr=P(lse, cutlass.Float32, 4),
-        sinks_ptr=P(torch.zeros(H, dtype=torch.float32, device=dev), cutlass.Float32),
-        meta_ptr=P(meta, cutlass.Int32),
-        o_desc_ptr=P(torch.zeros(1, dtype=torch.int64, device=dev), cutlass.Int64),
-        problem_size=(B, H, KH, S, SKV, 0),
-        q_strides=tuple(q.stride()[:3]),
-        k_strides=tuple(k.stride()[:3]),
-        v_strides=tuple(v.stride()[:3]),
-        o_strides=tuple(o.stride()[:3]),
-        lse_strides=tuple(lse.stride()),
-        lse_ext=0,
-        scale_softmax_log2=cutlass.Float32(scale * math.log2(math.e)),
-        n_thd_units=cutlass.Int32(0),
-        seq_q_lens_addr=0,
-        thd_q_lens_ptr=None,
-        thd_kv_lens_ptr=None,
-        thd_lens_form=None,
-        gate_ptr=None,
-        gate_strides=(0, 0, 0),
+    sinks = torch.zeros(H, dtype=torch.float32, device=dev)
+    o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
+    launch_f16(
+        fn,
+        q,
+        k,
+        v,
+        o,
+        lse,
+        sinks,
+        meta,
+        o_desc,
+        (B, H, KH, S, SKV, 0),
+        scale * math.log2(math.e),
+        0,
+        0,
         stream=_stream(),
+        host=mod._host,
     )
     torch.cuda.synchronize()
     return o, lse

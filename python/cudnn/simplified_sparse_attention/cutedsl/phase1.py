@@ -30,7 +30,7 @@ _FLASH_ATTN4_VARLEN = None
 def _phase1_kf_kernel_module():
     """Check the DSL version before importing the selected CuTe kernel."""
     global _KF_KERNEL
-    error = cutedsl_requirement_error("dense_indexer_kl", floor=(4, 8, 0))
+    error = cutedsl_requirement_error("dense_indexer_kl_forward", floor=(4, 8, 0))
     if error:
         raise ImportError(error)
     if _KF_KERNEL is None:
@@ -695,7 +695,7 @@ class _SSAPhase1KFIndexerKL(torch.autograd.Function):
         )
 
 
-def dense_indexer_kl(
+def dense_indexer_kl_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     q_idx: torch.Tensor,
@@ -746,7 +746,7 @@ def dense_indexer_kl(
     if query.is_cuda:
         with torch.cuda.device(query.device):
             if torch.cuda.is_current_stream_capturing():
-                raise NotImplementedError("dense_indexer_kl does not support external CUDA graph capture.")
+                raise NotImplementedError("dense_indexer_kl_forward does not support external CUDA graph capture.")
     query, key, q_idx, k_idx = _canonicalize_inputs(query, key, q_idx, k_idx)
     query_length = query.size(0)
     key_length = key.size(0)

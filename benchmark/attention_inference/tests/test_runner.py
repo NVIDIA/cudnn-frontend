@@ -7,6 +7,8 @@ from dataclasses import replace
 import subprocess
 import importlib.util
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -146,6 +148,60 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual({c["kv_layout"] for c in cases}, {"dense"})
 
 
+class CheckpointTest(unittest.TestCase):
+    def test_interrupted_sweep_resumes_only_unfinished_cases_in_order(self):
+        runner = InferenceBenchmarkRunner()
+        config = InferenceBenchmarkConfig(
+            "resume",
+            models=[ModelPreset("gqa", num_q_heads=8, num_kv_heads=2)],
+            context_seqlens=[128, 128, 256, 512],
+        )
+        ok = subprocess.CompletedProcess([], 0, stdout="RESULT,1,2,3,,test-device,cudnn plan=x\n")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="failed to initialize")
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sweep.sqlite"
+            with (
+                patch("benchmark.attention_inference.runner._benchmark_environment", return_value={"device": "first", "capability": [8, 9]}),
+                patch("benchmark.attention_inference.runner.subprocess.run", side_effect=[ok, failed, KeyboardInterrupt]) as run,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_config(config, checkpoint=checkpoint)
+                self.assertEqual([call.args[0][call.args[0].index("--q_tokens") + 1] for call in run.call_args_list], ["128", "256", "512"])
+                run.side_effect = [ok, failed]
+                run.reset_mock()
+                results = runner.run_config(config, checkpoint=checkpoint, resume=True)
+                self.assertEqual([call.args[0][call.args[0].index("--q_tokens") + 1] for call in run.call_args_list], ["256", "512"])
+                self.assertEqual([(r.q_tokens, r.success) for r in results], [(128, True), (256, True), (512, False)])
+                self.assertEqual(results[-1].error_message, "failed to initialize")
+
+                run.side_effect = [ok, ok, ok]
+                run.reset_mock()
+                runner.run_config(replace(config, num_warmup_iterations=7), checkpoint=checkpoint, resume=True)
+                self.assertEqual(run.call_count, 3)
+
+            with (
+                patch("benchmark.attention_inference.runner._benchmark_environment", return_value={"device": "changed", "capability": [8, 9]}),
+                patch("benchmark.attention_inference.runner.subprocess.run") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "environment differs"):
+                    runner.run_config(config, checkpoint=checkpoint, resume=True)
+                run.assert_not_called()
+
+    def test_checkpoint_requires_explicit_resume_and_preserves_existing_files(self):
+        runner = InferenceBenchmarkRunner()
+        config = InferenceBenchmarkConfig("resume", [ModelPreset("gqa", 8, 2)], context_seqlens=[128])
+        with TemporaryDirectory() as directory, patch("benchmark.attention_inference.runner._benchmark_environment", return_value={"capability": [8, 9]}):
+            checkpoint = Path(directory) / "sweep.sqlite"
+            with self.assertRaisesRegex(ValueError, "Checkpoint does not exist"):
+                runner.run_config(config, checkpoint=checkpoint, resume=True)
+            self.assertFalse(checkpoint.exists())
+
+            checkpoint.write_text("existing data")
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                runner.run_config(config, checkpoint=checkpoint)
+            self.assertEqual(checkpoint.read_text(), "existing data")
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch"), "request_lens builds torch tensors")
 class RequestLensTest(unittest.TestCase):
     def test_request_lens_is_deterministic_and_bounded(self):
@@ -194,3 +250,27 @@ def test_attn_mask_names_the_alignment_the_graph_is_built_with():
     assert attn_mask("generation", True, 1, 8192, None) == "no_mask"
     assert attn_mask("generation", True, 1, 8192, 128) == "bottom_right"
     assert attn_mask("generation", True, 4, 8192, None) == "bottom_right"
+
+
+@pytest.mark.parametrize(
+    "name,clock_khz,width_bits,expected",
+    [
+        ("NVIDIA GH200 480GB", 2619000, 6144, 4022.784),
+        ("NVIDIA GH200", 3200000, 6144, 4915.2),
+        ("NVIDIA GH200", None, None, None),
+        ("NVIDIA H200", None, None, 4800.0),
+    ],
+)
+def test_peak_bandwidth_for_gh200(monkeypatch, name, clock_khz, width_bits, expected):
+    torch = pytest.importorskip("torch")
+    from benchmark.attention_inference.benchmark_single_attention import get_peak_bw_gbps
+
+    monkeypatch.delenv("CUDNN_BENCH_PEAK_BW_GBPS", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: name)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    props = SimpleNamespace() if clock_khz is None else SimpleNamespace(memory_clock_rate=clock_khz, memory_bus_width=width_bits)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+    assert get_peak_bw_gbps() == expected
+
+    monkeypatch.setenv("CUDNN_BENCH_PEAK_BW_GBPS", "3750")
+    assert get_peak_bw_gbps() == 3750

@@ -10,7 +10,7 @@ import cutlass
 import pytest
 import torch
 
-from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention, simplified_sparse_attention_reserve
+from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention_forward, simplified_sparse_attention_reserve
 from determinism_utils import assert_bitwise
 from ssa_reference import check_reference, pack, run, sample
 
@@ -89,7 +89,7 @@ def test_host_threads_share_stream(monkeypatch, key_length, stream_mode):
 
     def invoke(i):
         with torch.cuda.stream(streams[i]):
-            result = simplified_sparse_attention(q, k, v, queries[i], ik, metadata, 512)
+            result = simplified_sparse_attention_forward(q, k, v, queries[i], ik, metadata, 512)
             return {name: tensor.detach().clone() for name, tensor in result.items()}
 
     expected = [invoke(i) for i in range(2)]
@@ -169,17 +169,17 @@ import cudnn.simplified_sparse_attention
 assert "torch" not in sys.modules
 assert "cutlass" not in sys.modules
 assert "jax" not in sys.modules
-assert "simplified_sparse_attention" in cudnn.ops.__all__
-assert "simplified_sparse_attention_jax" in cudnn.ops.__all__
+assert "simplified_sparse_attention_forward" in cudnn.ops.__all__
+assert "simplified_sparse_attention_forward_jax" in cudnn.ops.__all__
 from cudnn.simplified_sparse_attention import (
     SimplifiedSparseAttentionMetadata,
-    dense_indexer_kl,
-    simplified_sparse_attention,
+    dense_indexer_kl_forward,
+    simplified_sparse_attention_forward,
     simplified_sparse_attention_reserve,
 )
 assert SimplifiedSparseAttentionMetadata is cudnn.ops.SimplifiedSparseAttentionMetadata
-assert dense_indexer_kl is cudnn.ops.dense_indexer_kl
-assert simplified_sparse_attention is cudnn.ops.simplified_sparse_attention
+assert dense_indexer_kl_forward is cudnn.ops.dense_indexer_kl_forward
+assert simplified_sparse_attention_forward is cudnn.ops.simplified_sparse_attention_forward
 assert simplified_sparse_attention_reserve is cudnn.ops.simplified_sparse_attention_reserve
 assert "jax" not in sys.modules
 assert "flash_attn" not in sys.modules
@@ -237,9 +237,9 @@ def test_jax_old_dsl_allows_inspection_but_rejects_execution():
 import sys
 from cudnn.frost import buffers
 buffers.cutedsl_state = lambda: (True, ("nvidia-cutlass-dsl", "4.7.1"))
-from cudnn.ops import simplified_sparse_attention_jax
+from cudnn.ops import simplified_sparse_attention_forward_jax
 try:
-    simplified_sparse_attention_jax(*([None] * 9))
+    simplified_sparse_attention_forward_jax(*([None] * 9))
 except ImportError as error:
     assert "4.8.0" in str(error) and "found 4.7.1" in str(error), str(error)
 else:
@@ -260,7 +260,7 @@ def test_capture_rejected_before_allocation():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.graph(graph, stream=stream):
         with pytest.raises(NotImplementedError, match="external CUDA graph capture"):
-            simplified_sparse_attention(*inputs, metadata, 512)
+            simplified_sparse_attention_forward(*inputs, metadata, 512)
         with pytest.raises(NotImplementedError, match="external CUDA graph capture"):
             simplified_sparse_attention_reserve(128, 131072, 512)
         probe.add_(1)
@@ -283,7 +283,7 @@ def test_rejects_unsupported_inputs(change):
     else:
         inputs[0] = inputs[0][:0]
     with pytest.raises(NotImplementedError):
-        simplified_sparse_attention(*inputs, metadata, topk)
+        simplified_sparse_attention_forward(*inputs, metadata, topk)
 
 
 @pytest.mark.usefixtures("supported_gpu")
