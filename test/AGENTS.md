@@ -1725,3 +1725,11 @@ instead of collapsing to `NOT_SET`. Run the C++ `[knob-vocabulary]` detector wit
 both older and current headers, and run restored-record replay with the backend
 version used by CI. Keep the engine, knob values and returned error in failures.
 An extra default knob alone does not prove that a different algorithm ran.
+
+Deprecated backend knob identities remain valid in heuristic and restored plans.
+Do not exclude them from the C++ `[knob-vocabulary]` round-trip detector or reject
+them as unknown. Metadata changes must also exercise ordinary graph planning,
+which enumerates every candidate before choosing one: include convolution,
+matmul and SDPA, raw/Python entry points, serialization and fresh execution.
+`core/graph/test_restored_plan_metadata.py` covers these consumer paths; a
+restored-plan-only check can miss an ordinary convolution build regression.

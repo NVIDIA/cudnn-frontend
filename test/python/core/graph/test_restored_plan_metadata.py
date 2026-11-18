@@ -47,6 +47,12 @@ def _graph_case(handle, api, kind, dtype):
         b = torch.randn(2, 64, 32, device="cuda", dtype=dtype)
         out = graph.matmul(A=tensor(a), B=tensor(b))
         output(out, torch.empty(2, 16, 32, device="cuda", dtype=dtype), a.double() @ b.double())
+    elif kind == "conv":
+        x = (torch.randn(2, 8, 16, 16, device="cuda", dtype=dtype) * 0.125).contiguous(memory_format=torch.channels_last)
+        w = (torch.randn(8, 8, 3, 3, device="cuda", dtype=dtype) * 0.125).contiguous(memory_format=torch.channels_last)
+        out = graph.conv_fprop(image=tensor(x), weight=tensor(w), padding=[0, 0], stride=[1, 1], dilation=[1, 1])
+        value = torch.empty(2, 8, 14, 14, device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last)
+        output(out, value, torch.nn.functional.conv2d(x.double(), w.double()))
     else:
         q = torch.randn(2, 2, 17, 64, device="cuda", dtype=dtype) * 0.25
         k = torch.randn(2, 2, 65, 64, device="cuda", dtype=dtype) * 0.25
@@ -80,13 +86,15 @@ def _graph_case(handle, api, kind, dtype):
 @pytest.mark.parametrize("as_bytes", [False, True], ids=["byte_list", "bytes"])
 @pytest.mark.parametrize(
     "api,kind,provider",
-    [(api, kind, "backend") for api in ("raw", "python") for kind in ("matmul", "forward", "backward")]
+    [(api, kind, "backend") for api in ("raw", "python") for kind in ("matmul", "conv", "forward", "backward")]
     + [("python", "forward", "frost"), ("raw", "matmul", "backend_defaults"), ("python", "matmul", "backend_defaults")],
     ids=[
         "raw_matmul",
+        "raw_conv",
         "raw_forward",
         "raw_backward",
         "python_matmul",
+        "python_conv",
         "python_forward",
         "python_backward",
         "frost_forward",
@@ -110,6 +118,11 @@ def test_restored_plan_metadata(cudnn_handle, monkeypatch, dtype, as_bytes, api,
     stream = torch.cuda.ExternalStream(cudnn.get_stream(cudnn_handle))
     with torch.cuda.stream(stream):
         graph, cls, native_handle, bindings, outputs, refs = _graph_case(cudnn_handle, api, kind, dtype)
+        # Normal Python planning enumerates every heuristic candidate's record.
+        # Exercise the same consumer through the raw API, not just the winner.
+        for candidate in range(graph.get_execution_plan_count()):
+            candidate_engine, candidate_knobs = graph.get_engine_and_knobs_at_index(candidate)
+            assert candidate_engine >= 0 and cudnn.knob_type.NOT_SET not in candidate_knobs
         for index in range(graph.get_execution_plan_count()):
             record = graph.get_engine_and_knobs_at_index(index)
             if is_backend_engine(record[0]) != (provider != "frost"):

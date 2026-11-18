@@ -55,11 +55,9 @@ TEST_CASE("Backend knob vocabulary preserves compiled defaults", "[graph][knobs]
 }
 
 TEST_CASE("Backend knob vocabulary covers active header types", "[graph][knobs][knob-vocabulary]") {
-    // Deprecated entries without public mirrors are intentionally excluded.
-    // A new active backend enum must fail this test until its mirror is added.
-    std::vector<int64_t> const deprecated{0, 3, 5, 6, 7, 8, 9, 10, 16, 19, 20, 21, 22, 32};
+    // Deprecation does not mean a knob disappeared from runtime plans.
+    // Cover every declared identity, including legacy convolution knobs.
     for (int64_t value = 0; value < static_cast<int64_t>(CUDNN_KNOB_TYPE_COUNTS); ++value) {
-        if (std::find(deprecated.begin(), deprecated.end(), value) != deprecated.end()) continue;
         CAPTURE(value);
         auto const backend_type = static_cast<cudnnBackendKnobType_t>(value);
         auto const public_type  = fe::convert_from_backend_knob_type(backend_type);
@@ -67,6 +65,13 @@ TEST_CASE("Backend knob vocabulary covers active header types", "[graph][knobs][
         cudnnBackendKnobType_t converted = CUDNN_KNOB_TYPE_SWIZZLE;
         REQUIRE(fe::convert_to_backend_knob_type(public_type, converted) == CUDNN_STATUS_SUCCESS);
         CHECK(converted == backend_type);
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        nlohmann::json encoded;
+        fe::graph::to_json(encoded, public_type);
+        auto decoded = fe::KnobType_t::NOT_SET;
+        fe::graph::from_json(encoded, decoded);
+        CHECK(decoded == public_type);
+#endif
     }
 }
 
