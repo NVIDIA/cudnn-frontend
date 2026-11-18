@@ -208,6 +208,12 @@ tests and samples use this separation.
 
 ## Python tests (`test/python`)
 
+When adding a public Python export, including an enum member, regenerate
+`test/python/api_index/api_index.txt` using the same built package and inspect
+the diff. Run the API-index unittest suite with `CUDNN_API_INDEX_PACKAGE_ROOT`
+set to that package; without it, the runtime API check is skipped. This check
+needs no GPU.
+
 Architecture-specific test adjustments use device capability, not an engine-name
 suffix. Explicit implementation names can change during a migration while the
 scheduler domain stays the same. The D64 origins-helper host control exercises
@@ -1699,3 +1705,31 @@ errors, and check that retained alternatives execute against an independent
 reference. Include neighboring dense/prefill and backward controls rather than
 asserting a fixed engine order. Detector:
 `sdpa/frost/test_sdpa_native_decode_candidates.py` (#1084).
+
+For restored-plan metadata, compare plan count, name, engine/knob record, notes
+and workspace against the selected original plan. Native deserialization can
+retain executable plans without a heuristic engine-config list. Query both
+raw and Python entry points, reject neighboring invalid indices, and execute
+with fresh bindings before reporting query failures. Include another operation
+and a FROST control; the shared regression is
+`core/graph/test_restored_plan_metadata.py`.
+
+A backend may materialize implicit default knobs when restoring a compiled
+plan. Preserve every originally offered knob value, then rebuild from the
+complete restored record and check its name, record, workspace and output bytes.
+
+Compiled plans can expose default knobs absent from the heuristic record, including
+knobs introduced by a newer runtime than the build headers. Preserve their numeric
+identity through C++, JSON and Python; an unknown backend type must report an error
+instead of collapsing to `NOT_SET`. Run the C++ `[knob-vocabulary]` detector with
+both older and current headers, and run restored-record replay with the backend
+version used by CI. Keep the engine, knob values and returned error in failures.
+An extra default knob alone does not prove that a different algorithm ran.
+
+Deprecated backend knob identities remain valid in heuristic and restored plans.
+Do not exclude them from the C++ `[knob-vocabulary]` round-trip detector or reject
+them as unknown. Metadata changes must also exercise ordinary graph planning,
+which enumerates every candidate before choosing one: include convolution,
+matmul and SDPA, raw/Python entry points, serialization and fresh execution.
+`core/graph/test_restored_plan_metadata.py` covers these consumer paths; a
+restored-plan-only check can miss an ordinary convolution build regression.
