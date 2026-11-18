@@ -37,7 +37,7 @@ def skip_without_cuda13_for_12q1kv(hkv):
         pytest.skip("12Q/1KV QSA backward requires the CUDA 13 build of CuTe DSL")
 
 
-def make_inputs(lengths, hq, hkv, *, empty=False, all_selected=False):
+def make_inputs(lengths, hq, hkv, *, empty=False, all_selected=False, dtype=torch.bfloat16):
     rng = torch.Generator().manual_seed(123)
     total = sum(lengths)
     first, last, bases, origins = [], [], [], []
@@ -58,7 +58,7 @@ def make_inputs(lengths, hq, hkv, *, empty=False, all_selected=False):
         sel[::7] = False
 
     def normal(heads):
-        return torch.randn((total, heads, 256), generator=rng).to(torch.bfloat16).cuda()
+        return torch.randn((total, heads, 256), generator=rng).to(dtype).cuda()
 
     return dict(
         q=normal(hq),
@@ -174,7 +174,7 @@ def test_dsl_gate_before_kernel_import(supported_gpu, monkeypatch, state, match)
         qsa_forward(**inputs)
 
 
-def check_case(inputs):
+def check_forward(inputs):
     expected = reference(inputs)
     result = qsa_forward(**inputs)
     assert list(result.keys()) == ["out", "out_fp32", "lse"]
@@ -182,6 +182,11 @@ def check_case(inputs):
         assert_close(actual, ref)
     assert result["out"].dtype == inputs["q"].dtype
     assert result["out_fp32"].dtype == result["lse"].dtype == torch.float32
+    return result
+
+
+def check_case(inputs):
+    result = check_forward(inputs)
     grad_out = inputs["q"].flip(0).contiguous()
     expected_grads = reference(inputs, grad_out, result["out_fp32"], result["lse"])
     skip_without_cuda13_for_12q1kv(inputs["k"].shape[1])
@@ -221,6 +226,19 @@ def test_backward_bounds_reach_keys_after_the_query(supported_gpu, heads, length
 def test_six_query_heads_forward_routes(supported_gpu, lengths):
     """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV. Neither is specialised for 12 heads."""
     check_case(make_inputs(lengths, 6, 1, empty=True))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
+@pytest.mark.parametrize("lengths", [(3, 5, 9), (513,), (2056,)], ids=["packed", "gated-dense", "gathered"])
+def test_fp16_forward(supported_gpu, heads, lengths):
+    """BF16 and FP16 calls of one shape alternate in one process, so each must compile its own kernels."""
+    for dtype in (torch.bfloat16, torch.float16, torch.bfloat16):
+        inputs = make_inputs(lengths, *heads, empty=True, dtype=dtype)
+        result = check_forward(inputs)
+    inputs = make_inputs(lengths, *heads, empty=True, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="BF16"):
+        qsa_backward(inputs["q"], **inputs, out_fp32=result["out_fp32"], lse=result["lse"])
 
 
 @pytest.mark.L1

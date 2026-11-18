@@ -100,6 +100,8 @@ def qsa_backward(
     if not isinstance(deterministic, bool):
         raise ValueError("deterministic must be a bool")
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError("QSA backward requires BF16 q, k, v and grad_out")
     check_tensor("grad_out", grad_out, q.shape, q.dtype, q.device, 16)
     check_tensor("out_fp32", out_fp32, q.shape, torch.float32, q.device, 16)
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)

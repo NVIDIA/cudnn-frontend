@@ -126,15 +126,15 @@ all sequences. All tensors must be contiguous and on the same CUDA device.
 
 | Tensor | Shape | Dtype | Meaning |
 |---|---|---|---|
-| `q` | `[T, Hq, 256]` | BF16 | Query vectors |
-| `k`, `v` | `[T, Hkv, 256]` | BF16 | Key and value vectors |
+| `q` | `[T, Hq, 256]` | BF16 or FP16 | Query vectors |
+| `k`, `v` | `[T, Hkv, 256]` | Same as `q` | Key and value vectors |
 | `sel_blocks` | `[T, NB]` | uint8 | Nonzero selects a global block for that query |
 | `lo`, `hi` | `[T]` | int32 | Inclusive allowed key-token bounds |
 | `blk_base` | `[T]` | int32 | First global block of the query's sequence |
 | `tok_base` | `[T]` | int32 | First global token of the query's sequence |
 | `block_first`, `block_last` | `[NB]` | int32 | Inclusive global token span of each block |
-| `out` | `[T, Hq, 256]` | BF16 | Attention output |
-| `out_fp32` | `[T, Hq, 256]` | FP32 | Output before its BF16 cast; save for backward |
+| `out` | `[T, Hq, 256]` | Same as `q` | Attention output |
+| `out_fp32` | `[T, Hq, 256]` | FP32 | Output before its cast to the input type; save for backward |
 | `lse` | `[Hq, T]` | FP32 | Natural-log softmax normalizer; save for backward |
 | `grad_out` | `[T, Hq, 256]` | BF16 | Upstream output gradient |
 | `dq` | Same as `q` | BF16 | Query gradient |
@@ -164,7 +164,7 @@ other tiles. GPU preparation checks the current K/V values and bounds, then
 builds exact masks. Nonfinite K/V uses the gather path to exclude unused values
 before arithmetic. Both paths compute scaled QK scores, apply the bounds, and
 use online softmax followed by PV. They write FP32 output and natural-log LSE,
-then cast output to BF16. Empty rows produce zero output and negative-infinity LSE.
+then cast output to the input type. Empty rows produce zero output and negative-infinity LSE.
 
 Backward compacts the current selection, computes
 `delta = sum(grad_out * out_fp32, dim=-1)`, reconstructs probabilities from QK
@@ -226,7 +226,7 @@ and a plan without a sparse path carries two more FP32 dK / dV accumulators.
 
 ## Support and execution
 
-Supported geometry is BF16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
+Supported geometry is BF16 or FP16 (the backward BF16 only), head dimension 256, head counts 24Q/2KV, 12Q/1KV or
 6Q/1KV (the full model and its two- and four-way tensor-parallel shards, the KV
 head replicated at four-way), and `block_size=4`. `T > 0`, `NB > 0`, and `T * Hq * 256 <= INT32_MAX` are required.
 `scale` is a finite host scalar, normally `1 / sqrt(256)`.
