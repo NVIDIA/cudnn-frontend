@@ -1857,6 +1857,22 @@ CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 compute-sanitizer --tool racecheck --kerne
   python -c "import torch; from test_sdpa_bwd_sm90 import _case; _case(torch.float16, 128, True, 1, 3, 1, 65, 257)"
 ```
 
+### SM90 bottom-right causal backward — validation, 2026-11-18 (UTC)
+
+On GH200 (cc 9.0), the opt-in `sdpa_bwd_sm90` chain passed the 57-case suite
+with cuDNN 9.27.0, PyTorch 2.14.0+cu130 and CuTe DSL 4.8.1. The tested
+kernel source has Git blob `f4a85ee168ee`. Run from `test/python` with
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m pytest -q sdpa/frost/test_sdpa_bwd_sm90.py`.
+
+The FP64 gradient checks pin this engine at both FP16 and BF16. Cases include
+a square control, offsets 63 and 65 on opposite sides of the 64-row query
+tile boundary, and one query attending to 513 keys. The same rectangular
+geometry also runs with top-left, bottom-right and unmasked graphs in one
+process. The 144-CTA rectangular GQA case checks repeated gradients bytewise.
+D128 GQA covers poisoned workspace, capture, replay and a changed upstream
+gradient under both request modes. FP16 D64 and BF16 D128 GQA compare dQ, dK
+and dV bytes across reordered and duplicated batches and the sequence alone.
+
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
 Twenty-six SM100/SM107 forward templates now release the unchanged service
