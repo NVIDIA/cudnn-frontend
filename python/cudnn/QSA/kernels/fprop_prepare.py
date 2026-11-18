@@ -13,11 +13,12 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cuda.bindings import driver as cuda
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
-from .. import _metadata
+from .. import _metadata, _metadata_fast
 
 DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 FROST_SOURCE_DIGEST = DIGEST
 TILE_M, MAX_SPAN = 128, 8192
+MASK_WORDS = MAX_SPAN // 32  # a dense tile's widest key mask row
 
 
 @cute.kernel
@@ -157,8 +158,8 @@ def frost_qsa_pack_bits(
                                 if left <= right:
                                     mask = ((Int32(1) << (right - left + 1)) - 1) << (left - key0)
                                     word = word | mask
-                bits[row, Int64(word_index)] = word
-        else:
+                bits[row, Int64(word_index - first_word)] = word
+        elif not _metadata._fast_scan(sel):
             _metadata._compact_row(sel, lo, hi, first, last, ids, counts, row, lane)
 
 
@@ -191,6 +192,8 @@ def prepare(
     frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts).launch(
         grid=(cute.ceil_div(bits.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
     )
+    if _metadata._fast_scan(sel):
+        _metadata_fast.frost_qsa_fast_compact_host(sel, lo, hi, first, last, ids, counts, modes, stream)
 
 
 def compile_kernel(arch):
