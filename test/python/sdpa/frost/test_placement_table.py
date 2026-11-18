@@ -137,7 +137,8 @@ def test_kv_off_the_tile_is_its_own_class_with_its_own_entry():
             # The dedicated Ada body requires a whole KV tile.
             assert key[-1] is False, key
             continue
-        assert key[:-1] + (not key[-1],) in pt.TABLE, key
+        twin = key[:-1] + (not key[-1],)
+        assert twin in pt.TABLE or twin in pt.HAND_RULE_SIDES, key
     assert pt.lookup(row, _facts(s_kv=49151, h_q=16, b=1)) is True
 
 
@@ -1488,8 +1489,8 @@ def test_sm107_paged_window_entries_follow_the_study():
     assert pt.lookup(row, windowed(**d64, s_q=16)) is True  # `le q 5.5`: log2 S_q, so up to S_q 45
     assert pt.lookup(row, windowed(**d64, s_q=128)) is False  # longer prefill keeps the backend
     d128 = dict(d_qk=128, d_v=128, h_q=64, h_kv=8)
-    assert pt.lookup(row, windowed(**d128, s_kv=16384)) is True
-    assert pt.lookup(row, windowed(**d128, s_kv=131072)) is False
+    assert pt.lookup(row, windowed(**d128, s_kv=16384)) is None  # on the tile: the SM107 hand rule (sm107_d128_window_mtp_v4_20261118)
+    assert pt.lookup(row, windowed(**d128, s_kv=131072)) is None
     assert pt.matched_entry(row, windowed(**d128, s_q=8)).study == "sm107_d128_window_mtp_verify_20261118"  # windowed d128 verify
     assert pt.lookup(row, windowed(**{**d128, "h_q": 80})) is None  # group 10 runs unpacked: no entry
     assert pt.lookup(row, windowed(dtype=cudnn.data_type.HALF)) is None
@@ -1546,7 +1547,8 @@ def test_sm107_d128_window_verify_entries_follow_the_study():
     assert pt.lookup(row, v(b=4)) is True  # 2^11 query rows
     assert pt.lookup(row, v(s_kv=131073, b=8)) is True  # 2^6 tiles
     assert pt.class_key(row, v(h_q=80))[8] == "gqa_partial" and pt.matched_entry(row, v(h_q=80)) is None
-    assert pt.matched_entry(row, v(s_q=4)).study == "sm107_window_gaps_20261118"
+    assert pt.matched_entry(row, v(s_q=4)) is None  # MTP on the tile: the SM107 hand rule (sm107_d128_window_mtp_v4_20261118)
+    assert pt.matched_entry(row, v(s_q=4, s_kv=131073)).study == "sm107_window_gaps_20261118"
 
 
 @pytest.mark.L0

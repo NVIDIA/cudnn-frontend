@@ -591,6 +591,9 @@ SM107_D192_LONG_CHUNK_MIN_KV = 32768  # Rubin bf16 d192 x 128 causal chunks lead
 SM107_D192_LONG_CHUNK_MIN_S_Q = 512  # ... from the study's smallest winning S_q (256 lost up to 1.49x)
 SM107_D128_WHOLE_PACK_MAX_Q_TILES = 512  # Rubin bf16 d128 GQA chunks the row packs whole lead up to this many tiles (module docstring)
 SM107_D128_WHOLE_PACK_MIN_KV = 8192  # ... from this cache
+SM107_D128_WINDOW_MTP_MIN_KV = 65536  # Rubin d128 windowed MTP over a cache this long keeps the backend in two bands (module docstring):
+SM107_D128_WINDOW_MTP_UNITS_BAND = (32, 95)  # ... b x h_kv in this band with a window of at most 8 KV tiles,
+SM107_D128_WINDOW_MTP_NEAR_PARITY_TILES = 4  # ... or a window of at most this many tiles at S_q >= 4 below 96 units
 SM107_D256_DECODE_MIN_CTAS = 32  # Rubin bf16 dense d256 GQA single-row decode leads from this many planned CTAs (module docstring)
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
@@ -1084,10 +1087,19 @@ def _sm107_paged_gqa_prefill(facts) -> bool:
 
 
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
+    from cudnn.sdpa import placement_table
     from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
     if facts.device_cc != (10, 7):
         return TRAIL
+    key = placement_table.class_key("sdpa_fwd_prefill_sm107", facts)
+    if key is not None and key[2:10] == ("bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False):
+        # sm107_d128_window_mtp_v4_20261118: FROST 0.32 of the default across windows 128-4096 (holdout 38 changed at 0.442, worst
+        # 1.037); long caches keep the backend where FROST lost (up to 1.35) or sat within the boards' ~15% gap.
+        units, tiles = facts.b * facts.h_kv, -(-facts.window_left // 128)
+        lo, hi = SM107_D128_WINDOW_MTP_UNITS_BAND
+        band = (lo <= units <= hi and tiles <= 8) or (tiles <= SM107_D128_WINDOW_MTP_NEAR_PARITY_TILES and facts.s_q >= 4 and units <= hi)
+        return TRAIL if facts.s_kv >= SM107_D128_WINDOW_MTP_MIN_KV and band else LEAD
     d256_decode = _sm107_dense_d256_decode_leads(caps, facts)
     if d256_decode is not None:
         return LEAD if d256_decode else TRAIL

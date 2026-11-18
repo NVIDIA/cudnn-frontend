@@ -1168,6 +1168,25 @@ def test_sm107_dense_d128_whole_pack_chunks_lead_to_512_tiles(s_kv):
 
 
 @pytest.mark.L0
+def test_sm107_d128_window_mtp_leads_outside_two_long_cache_bands():
+    """Study sm107_d128_window_mtp_v4_20261118: Rubin bf16 paged d128 windowed MTP on the tile leads, except over caches of 2^16 keys
+    or more with 32-95 units and a window of at most 8 KV tiles, or a window of at most 4 tiles at S_q >= 4 below 96 units.
+    step37_swa b 128 (window 512, 128k keys) ran the backend at 5.8-6.1x FROST's time."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=128, h_q=64, h_kv=8, s_q=4, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True, window_left=512)
+    base.update(device_cc=(10, 7), device_sm_count=224, has_paged_kv=True, padded=True, page_size=16)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert place() == placement.LEAD  # step37_swa b 128
+    assert place(b=8, h_q=32) == placement.TRAIL  # 64 units, 4-tile window, 128k keys
+    assert place(b=1) == placement.TRAIL  # 8 units at S_q 4 with a 4-tile window: within the boards' gap
+    assert place(b=1, s_q=2) == placement.LEAD
+    assert place(b=8, h_q=32, window_left=2048) == placement.LEAD  # 16-tile window
+    assert place(b=8, h_q=32, s_kv=16384) == placement.LEAD  # short cache
+
+
+@pytest.mark.L0
 def test_sm107_dense_d256_decode_leads_from_32_planned_ctas():
     """Study sm107_dense_d256_q1_cta_v2_20261118: Rubin bf16 dense d256 GQA single-row decode leads when the decode tile's eager plan
     launches at least 32 CTAs (b x h_q / pack x split). FROST lost only unsplit launches under 32 CTAs; qwen3.5 b 1 over 8k-32k keys,

@@ -424,6 +424,10 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
 study's classes on it."""
 
 
+HAND_RULE_SIDES: FrozenSet[Tuple] = frozenset({("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False)})
+"""Class sides a placement hand rule answers while the twin keeps its table entry (sm107_d128_window_mtp_v4_20261118)."""
+
+
 def _answer(entry: Entry, facts) -> bool:
     if entry.direction in ("always", "never"):
         return entry.direction == "always"
@@ -747,9 +751,7 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "window", False, "gqa", True): Entry(
         "le", 5.5, "sm107_window_gaps_20261118", "q"
     ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False): Entry(
-        "le", 15.0, "sm107_window_gaps_20261118", "kv"
-    ),
+    # (128, 128) mtp paged window gqa on the tile: retired; the SM107 hand rule decides it (sm107_d128_window_mtp_v4_20261118).
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 33.293, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
