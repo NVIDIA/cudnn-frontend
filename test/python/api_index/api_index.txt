@@ -1594,6 +1594,8 @@ cudnn.ops.quantize_mok_weights
 cudnn.ops.ragged_grouped_gemm_backward
 cudnn.ops.ragged_grouped_gemm_forward
 cudnn.ops.rms_norm_forward_jax
+cudnn.ops.sdpa_backward_jax
+cudnn.ops.sdpa_forward_jax
 cudnn.ops.simplified_sparse_attention_forward
 cudnn.ops.simplified_sparse_attention_forward_jax
 cudnn.ops.simplified_sparse_attention_reserve

@@ -1120,3 +1120,13 @@ Stats-stride-override or batch-invariance claim.
 See the [SM107 support reference](../../python/cudnn/sdpa/frost/support/sm107.md)
 for the implementation boundaries and the
 [coverage report](../../test/python/determinism_goldens/README.md) for measured scope.
+
+### Experimental JAX SDPA route
+
+`cudnn.ops.sdpa_backward_jax(..., deterministic=True)` selects deterministic
+backend backward plans. The BF16 `(B=2, S=128, H=4, D=64)` case checks output,
+FP32 stats and dQ/dK/dV replay and isolated-batch equality for the explicit
+forward/backward calls on SM90 and SM100. This case has no bias. General batch
+invariance, dBias determinism, FP16 byte determinism, concurrency, golden hashes,
+and other GPUs (including SM103) remain unverified.
+This does not establish determinism for frontend kernel plans.

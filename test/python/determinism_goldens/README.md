@@ -7919,3 +7919,39 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+### JAX SDPA Python frontend route (2026-11-16)
+
+Suite: `sdpa/jax/test_sdpa_jax.py`. Test environment: SM100, cuDNN 9.27,
+CUDA 13.4, JAX source with jaxlib/CUDA plugin `0.12.1.dev20261116`.
+The paired suite uses identical inputs/cotangents with the frontend setting
+unset, `0`, and `1`, and compares with JAX's XLA reference. A separate BF16
+case compares raw output/gradient bytes across fresh allocations and B=1
+isolation. Golden hashes and concurrent-load stress are not yet qualified.
+
+Command from `test/python`, with the companion JAX checkout on `PYTHONPATH`:
+`python -m pytest sdpa/jax/test_sdpa_jax.py -m L0 -x -q`.
+
+Result: **22 passed**, no failures or skips (38.90 s). This includes 20
+paired numerical cases, one native-lowering case, and one replay/isolation
+case. Four companion JAX dispatch tests also passed.
+
+### Explicit JAX SDPA operations (2026-11-17)
+
+`cudnn.ops.sdpa_forward_jax` returns output and FP32 stats;
+`cudnn.ops.sdpa_backward_jax` consumes both and the fixed upstream gradient.
+The BF16 `(B=2, S=128, H=4, D=64)` test compares raw output, stats and dQ/dK/dV
+bytes across three fresh-allocation replays and each sequence isolated at B=1.
+Backward uses `deterministic=True`. There is no bias in this case; dBias,
+FP16 byte determinism, concurrent-load stress and golden hashes are unqualified.
+
+With the companion JAX and frontend source on `PYTHONPATH`, run from `test/python`:
+`python -m pytest sdpa/jax/test_sdpa_jax.py -q -ra`.
+
+On cuDNN 9.27/CUDA 13.4, the suite passed **29 tests** on SM100 (47.57 s)
+and SM90 (31.10 s), without failures or skips. This includes 22 dtype/feature
+cases comparing the explicit operations, all three environment settings and
+an XLA reference; one native-lowering check for each direction in one test;
+one replay/isolation test; four saved-tensor validation cases; and one missing
+FFI-header check. Stats remain FP32 between forward and backward. The native
+backward lowering has one FFI call, with no forward recomputation.
