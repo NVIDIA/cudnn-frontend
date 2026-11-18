@@ -1621,11 +1621,11 @@ else:
             )
 
     if args.sdpa_backend == "flash_attention_3":
-        import flash_attn_interface
+        from flash_attn_interface import flash_attn_func as fa3_func
 
         def flash_attention_3_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(
+            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
+            return fa3_func(
                 query,
                 key,
                 value,
@@ -1633,10 +1633,9 @@ else:
                 window_size=window_size,
                 deterministic=args.deterministic_bwd,
             )
-            return output
 
     if args.sdpa_backend == "flash_attention_4" or (not args.skip_ref):
-        import flash_attn.cute.interface as flash_attn_interface
+        from flash_attn.cute.interface import flash_attn_func as fa4_func
 
         # flash_attn_func's own default is num_splits=1 (never split KV); 0 engages
         # FA4's split-KV heuristic. Always pass the resolved value explicitly.
@@ -1654,7 +1653,7 @@ else:
                 deterministic=args.deterministic_bwd,
                 num_splits=fa4_num_splits,
             )
-            output, _ = flash_attn_interface.flash_attn_func(
+            output, _ = fa4_func(
                 query,
                 key,
                 value,
@@ -2186,16 +2185,13 @@ else:
         ) = postprocess_qkvo(query, key, value, output, args.sdpa_backend)
         if args.data_type not in ("fp8", "mxfp8") and not args.skip_ref and run_fwd:
             try:
-                output_ref = flash_attention_4_sdpa(query, key, value)
+                # postprocess_qkvo returns BHSD for every provider. FA4 accepts and returns BSHD.
+                ref_inputs = preprocess_qkv(query, key, value, "flash_attention_4")
+                output_ref = flash_attention_4_sdpa(*ref_inputs).transpose(1, 2)
                 if run_bwd:
-                    query.retain_grad()
-                    key.retain_grad()
-                    value.retain_grad()
-                    output_ref.backward(dOutput)
-
-                    torch.testing.assert_close(dQuery, query.grad, rtol=2e-2, atol=2e-2)
-                    torch.testing.assert_close(dKey, key.grad, rtol=2e-2, atol=2e-2)
-                    torch.testing.assert_close(dValue, value.grad, rtol=2e-2, atol=2e-2)
+                    ref_grads = torch.autograd.grad(output_ref, (query, key, value), dOutput)
+                    for actual, expected in zip((dQuery, dKey, dValue), ref_grads):
+                        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
                 torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
                 forward_diffs.append(torch.max(torch.abs(output.detach() - output_ref.detach())).item())

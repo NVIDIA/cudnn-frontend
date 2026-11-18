@@ -136,3 +136,40 @@ def test_benchmark_fits_one_workspace_across_iterations(profile_pass):
     result = subprocess.run([sys.executable, "-c", probe, str(script), profile_pass], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SINGLE_WORKSPACE_BENCHMARK_PASSED" in result.stdout
+
+
+@pytest.mark.parametrize("skip_ref", [False, True])
+def test_hopper_fa3_benchmark_runs_requested_provider(monkeypatch, capsys, skip_ref):
+    import runpy
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("requires Hopper for FlashAttention 3")
+    fa3 = pytest.importorskip("flash_attn_interface")
+    calls = []
+
+    def record(provider, fn):
+        def observed(q, k, v, **kwargs):
+            calls.append((provider, q.shape, k.shape))
+            return fn(q, k, v, **kwargs)
+
+        return observed
+
+    monkeypatch.setattr(fa3, "flash_attn_func", record("FA3", fa3.flash_attn_func))
+    if skip_ref:
+        monkeypatch.setitem(sys.modules, "flash_attn.cute.interface", None)
+    else:
+        fa4 = pytest.importorskip("flash_attn.cute.interface")
+        monkeypatch.setattr(fa4, "flash_attn_func", record("FA4", fa4.flash_attn_func))
+    script = _REPO_ROOT / "benchmark/attention_training/benchmark_single_sdpa.py"
+    monkeypatch.syspath_prepend(str(script.parent))
+    args = (
+        "--sdpa_backend flash_attention_3 --data_type bfloat16 --batch_size 1 --q_seqlen 128 --kv_seqlen 128 "
+        "--num_q_heads 4 --num_kv_heads 2 --head_dim 64 --profile_pass both --num_iterations 1 --fa4_num_splits 1"
+    ).split()
+    monkeypatch.setattr(sys, "argv", [str(script), *args] + (["--skip_ref"] if skip_ref else []))
+    runpy.run_path(str(script), run_name="__main__")
+    assert calls[0][0] == "FA3"
+    assert sum(provider == "FA4" for provider, _, _ in calls) == int(not skip_ref)
+    assert all(q == (1, 128, 4, 64) and k == (1, 128, 2, 64) for _, q, k in calls)
+    assert "Failed reference check" not in capsys.readouterr().out
