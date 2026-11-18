@@ -2446,13 +2446,15 @@ def _sm100_d128_pair_spec() -> EngineSpec:
 
 
 def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
+    """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or causal in either alignment, MHA or an integral head ratio."""
     from .d128_contract import validate_dense_bounds, validate_relay_launch
 
     if facts.thd or facts.padded:
         return "the SM90 backward chain serves dense graphs without padding masks"
-    if facts.bottom_right or facts.window_left is not None:
-        return "the SM90 backward chain serves unmasked or top-left causal attention"
+    if facts.bottom_right and facts.s_q > facts.s_kv:
+        return "unpadded bottom-right causal requires S_q <= S_kv"
+    if facts.window_left is not None:
+        return "the SM90 backward chain does not serve sliding windows"
     if facts.has_bias or facts.has_sink or facts.has_dropout:
         return "the SM90 backward chain serves graphs without bias, sinks or dropout"
     if facts.h_kv <= 0 or facts.h_q % facts.h_kv:
@@ -2483,6 +2485,7 @@ def _sm90_spec() -> EngineSpec:
             sm_hi=90,
             d=frozenset({64, 128}),
             causal=True,
+            bottom_right=True,
             deterministic=True,
             compact_bshd=True,
             gqa=True,
