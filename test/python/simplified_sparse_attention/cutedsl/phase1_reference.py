@@ -5,7 +5,7 @@
 
 import torch
 
-from cudnn.ops import dense_indexer_kl
+from cudnn.ops import dense_indexer_kl_forward
 from determinism_utils import assert_bitwise, snapshot
 
 COEFFICIENT = 0.17
@@ -72,7 +72,7 @@ def run(inputs, use_kf, lse, backward=True):
     metadata = [x.clone() for x in inputs[1]]
     before = snapshot(dict(enumerate((*tensors, *metadata, lse))))
     starts, ends, valid, denominator = metadata
-    loss = dense_indexer_kl(
+    loss = dense_indexer_kl_forward(
         *tensors,
         key_starts=starts,
         key_ends=ends,

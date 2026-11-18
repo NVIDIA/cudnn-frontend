@@ -2986,7 +2986,7 @@ def bsa_attn_bwd(
         layout: "bhsd" (default) or "bshd". Output gradients follow the same
             layout as the inputs.
         metadata: Optional prebuilt backward metadata from
-            ``block_sparse_attention_prepare_backward`` (SM90 blk64 only). It
+            ``block_sparse_attention_backward_metadata`` (SM90 blk64 only). It
             must have been built from these metadata tensors; the backward
             then skips the CSR and pairing kernels.
 
@@ -3241,7 +3241,7 @@ def _sm90_blk64_bwd_metadata(
     """Build the SM90 blk64 backward metadata: the bucketed K2Q CSR, the block_sizes view, the pairing decision and tensors.
 
     Everything here depends on the sparse metadata and the sequence lengths only. With ``run_pairing`` the paired-KV
-    metadata kernels run as well (``block_sparse_attention_prepare_backward``); the default backward passes False and
+    metadata kernels run as well (``block_sparse_attention_backward_metadata``); the default backward passes False and
     launches them after its workspace memset, where they ran before the metadata/compute split.
     """
     source = metadata_source(q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums)
@@ -3369,7 +3369,7 @@ def sm90_blk64_prepare_backward(
     seqlen_k: int,
     bucket_size_blocks: Optional[int] = None,
 ) -> BsaBackwardMetadata:
-    """``block_sparse_attention_prepare_backward``: build the SM90 blk64 backward metadata, pairing kernels included, on the current stream."""
+    """``block_sparse_attention_backward_metadata``: build the SM90 blk64 backward metadata, pairing kernels included, on the current stream."""
     return _sm90_blk64_bwd_metadata(
         q2k_block_index,
         block_sparse_num,
@@ -3398,7 +3398,7 @@ def _check_sm90_bwd_metadata(
 ) -> None:
     """Reject a prepared backward object that does not describe this call's metadata tensors, shape, bucket or device."""
     if not isinstance(meta, BsaBackwardMetadata):
-        raise TypeError(f"metadata must be a BsaBackwardMetadata from block_sparse_attention_prepare_backward, got {type(meta).__name__}")
+        raise TypeError(f"metadata must be a BsaBackwardMetadata from block_sparse_attention_backward_metadata, got {type(meta).__name__}")
     if meta.device != device:
         raise ValueError(f"the backward metadata was prepared on {meta.device}, q is on {device}")
     if (meta.batch_size, meta.num_heads, meta.seqlen_q, meta.seqlen_k) != (batch_size, num_heads, seqlen_q, seqlen_k):

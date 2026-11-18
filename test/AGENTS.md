@@ -43,6 +43,12 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+For Torch varlen providers, test each op's schema independently: forward and
+backward can select a backend while the out op is still Flash-only. The host
+`test_torch_provider_dispatch.py` matrix checks legacy, mixed and selected
+schemas, including removal. Keep public-selector rejection tests separate
+from direct registered-operator numerics, so upstream architecture/GQA/window
+restrictions do not erase FE forward/backward or synchronization coverage.
 When appending an SDPA adapter constructor argument, update every signature-tail
 pin, including the API-contract, score-stats, SM107 and bias-max suites. Search
 for the previous trailing parameter in `test/python/sdpa/frost`; a new feature's
@@ -103,6 +109,12 @@ body's barrier sites separately, including both ordinary and batch-pair work.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
+When an SDPA harness stores ragged offsets in scaled units, preserve the multiplier
+on backward inputs and gradient outputs too: Q/K/dQ/dK use d_qk, V/O/dO/dV use d_v,
+while Stats keeps its own element units. Check real descriptors before launching
+an old-code negative control; incorrect units can otherwise execute invalid offsets.
+`sdpa/graph/test_ragged_offset_multiplier.py` covers unequal widths, ordinary-offset
+controls, the FP8 execution call site, and declared token-stride gaps.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
 Columnwise F8_128x4 scale atoms span all B*H scale rows along their column
@@ -1665,3 +1677,25 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+When a shared SDPA harness offers a declared-total switch, inspect the actual
+backward node before planning as well as checking numerical outputs. Native
+backends may produce identical results without the totals, hiding a dropped
+executor keyword while a FROST THD row needs those values to plan.
+`test_fp8_training_declared_totals` exercises both switch states through the
+real executor and checks its backward metadata before backward planning can
+turn missing coverage into an unsupported skip.
+
+For Torch provider routing checks, record the actual native operator call and
+compare with overrides removed. A selected-backend log on stderr may not
+propagate to pytest's `caplog` under Torch's logging configuration; missing
+captured text does not establish a routing failure. The varlen explicit-KV
+length fallback test checks the cuDNN operator and forwarded length tensor.
+
+For a native SDPA candidate-compilation regression, test each offered backend
+candidate before testing the first-success and ALL build policies. A valid
+fallback can otherwise hide a first candidate that fails compilation. Preserve compilation
+errors, and check that retained alternatives execute against an independent
+reference. Include neighboring dense/prefill and backward controls rather than
+asserting a fixed engine order. Detector:
+`sdpa/frost/test_sdpa_native_decode_candidates.py` (#1084).

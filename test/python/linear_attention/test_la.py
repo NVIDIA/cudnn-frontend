@@ -22,7 +22,8 @@ import math
 import os
 import threading
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -3176,11 +3177,17 @@ def test_gate_domain_invalid_args_raise(backend, variant):
 
 
 # ---------------------------------------------------------------------------
-# Determinism (contract held by the FROST backend)
+# Determinism (contract held by FROST; checked on the cuTile fallback too)
+#
+# cuTile serves the same ops where FROST does not, so the same checks run on
+# it. A variant cuTile has no kernel for is waived; a cuTile failure here means
+# the fallback is not bitwise repeatable.
 # ---------------------------------------------------------------------------
 
+# The determinism tests run on every backend of the ``backend`` fixture (the cuTile and Hopper rows waive where they have
+# no plan).
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_fwd(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
@@ -3190,7 +3197,8 @@ def test_determinism_fwd(backend, variant):
         o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
         return o, fs
 
-    runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    with waive_unsupported(backend, variant):
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
     torch.cuda.synchronize()
     for out in runs[0]:
         assert torch.isfinite(out.float()).all(), f"{variant} fwd: non-finite output in run 0"
@@ -3199,7 +3207,6 @@ def test_determinism_fwd(backend, variant):
             assert_bitwise(f"{variant} fwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_bwd(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
@@ -3221,7 +3228,6 @@ def test_determinism_bwd(backend, variant):
                 assert_bitwise(f"{variant} bwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_multi_tile_fwd(backend, variant):
     """Multi-tile grid (B*H >> SM count) with an initial state is bitwise
@@ -3233,7 +3239,8 @@ def test_determinism_multi_tile_fwd(backend, variant):
         o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
         return o, fs
 
-    runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    with waive_unsupported(backend, variant):
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
     torch.cuda.synchronize()
     for out in runs[0]:
         assert torch.isfinite(out.float()).all(), f"{variant} multi-tile fwd: non-finite output in run 0"
@@ -3242,7 +3249,6 @@ def test_determinism_multi_tile_fwd(backend, variant):
             assert_bitwise(f"{variant} multi-tile fwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_multi_tile_bwd(backend, variant):
     case = make_case(variant, torch.bfloat16, B=8, T=192, H=64)
@@ -3264,6 +3270,230 @@ def test_determinism_multi_tile_bwd(backend, variant):
                 assert_bitwise(f"{variant} multi-tile bwd output {i} run {r}", b, a)
 
 
+@pytest.mark.parametrize("mode", ["log", "safe"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_determinism_bwd_all_grads(backend, variant, mode):
+    """Every differentiable input's gradient is bitwise repeatable, not only dq and dk.
+
+    The gate, beta, state and (safe-gate mode) a_log / dt_bias gradients reduce across chunks and heads, which is where
+    an unordered accumulation would show up."""
+    case, kw, _ = gate_mode_case(make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253]), mode, params="random")
+    state0 = (torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05).requires_grad_(True)
+    args = thd_tensors(case)
+    leaves = [tensor.requires_grad_(True) for tensor in args] + [state0]
+    names = [*LEAF_NAMES[variant], "initial_state"]
+    if mode == "safe":
+        leaves += [kw["a_log"].requires_grad_(True), kw["dt_bias"].requires_grad_(True)]
+        names += ["a_log", "dt_bias"]
+    with waive_unsupported(backend, variant):
+        o, fs = pinned_op(backend, variant)(*args, *op_tail(case), initial_state=state0, output_final_state=True, **kw)
+        seeds = [torch.randn_like(o), torch.randn_like(fs)]
+
+        def launch():
+            return torch.autograd.grad([o, fs], leaves, seeds, retain_graph=True, allow_unused=True)
+
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    torch.cuda.synchronize()
+    assert all(grad is not None for grad in runs[0][:3]), f"{variant} {mode}: dq / dk / dv missing"
+    for name, want in zip(names, runs[0]):
+        assert want is None or torch.isfinite(want.float()).all(), f"{variant} {mode} d{name}: non-finite gradient"
+    for r, grads in enumerate(runs[1:], start=1):
+        for name, got, want in zip(names, grads, runs[0]):
+            if want is None:
+                assert got is None, f"{variant} {mode} d{name} run {r}: gradient appeared"
+            else:
+                assert_bitwise(f"{variant} {mode} d{name} run {r}", got, want)
+
+
+class Picking:
+    """A stand-in for ``exhaustive_search`` that forces candidate ``index`` instead of timing the candidates.
+
+    The real tuner compiles and launches every candidate and drops the ones that fail, so a candidate the compiler
+    rejects (cuda-tile 1.4.0 on SM100 rejects occupancy 8 for ``recompute_w_u_fwd_kda_kernel``) can never become its
+    pick. The stand-in applies the same filter: it launches the forced candidate once and, if that raises, steps down to
+    the nearest lower candidate that runs; candidate 0 is the kernel's default and must run. ``forced`` records, per
+    kernel, the candidates that were in fact exercised and ``excluded`` the ones the compiler rejected, so a compile
+    exclusion is reported apart from a byte mismatch."""
+
+    def __init__(self, index):
+        self.index = index
+        self.forced = {}
+        self.excluded = set()
+        self.domain = {}  # kernel name -> number of candidates of its launch
+
+    @property
+    def covered(self):
+        """Whether every launch seen so far has a candidate at ``index``; False once ``index`` passes every domain."""
+        return any(size > self.index for size in self.domain.values())
+
+    def __call__(self, configs, stream, grid_fn, kernel, args_fn, hints_fn):
+        from cudnn.linear_attention.cutile.kernels import common
+
+        name = getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
+        self.domain[name] = len(configs)
+        for i in range(min(self.index, len(configs) - 1), -1, -1):
+            cfg = configs[i]
+            try:
+                hints = hints_fn(cfg)  # empty for the BV sweep, whose candidates differ in grid and args only
+                common.ct.launch(stream, grid_fn(cfg), kernel.replace_hints(**hints) if hints else kernel, args_fn(cfg))
+            except Exception as error:
+                assert i > 0, f"{name}: the default candidate {vars(cfg)} does not run: {error!r}"
+                self.excluded.add((name, tuple(sorted(vars(cfg).items()))))
+                continue
+            self.forced.setdefault(name, set()).add(i)
+            return SimpleNamespace(best=SimpleNamespace(config=cfg))
+        raise AssertionError(f"{name}: no candidate ran")  # unreachable: the default candidate asserts above
+
+
+class Failing:
+    """A stand-in for ``exhaustive_search`` that raises, so every launch takes the tuning-failure fallback."""
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError("autotune failed on purpose")
+
+
+@pytest.fixture
+def tune_cache():
+    """An empty in-process launch-hint cache before and after the test, so every round tunes (or is handed a pick)."""
+    from cudnn.linear_attention.cutile.kernels import common
+
+    common.launch_hint_cache.clear()
+    yield common.launch_hint_cache.clear
+    common.launch_hint_cache.clear()
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+def test_determinism_cutile_autotune_configs(backend, variant, tune_cache):
+    """Each autotune candidate repeats itself, and so does the tuning-failure fallback.
+
+    The pick is timing-based, so two runs can settle on different candidates, and candidates need not agree with each
+    other (the worker-warp count changes the summation tree of a kernel that reduces with ``ct.sum``). What a pinned
+    pick relies on is that every candidate replays its own bytes: force each candidate in turn instead of timing them
+    and run it twice. A run whose tuning raises or times out launches the first candidate's hints
+    (``autotuned_launch``), so the fallback round must replay too."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+    forced, excluded = {}, set()
+
+    def run_picking(pick):
+        tune_cache()
+        with patch.object(common, "exhaustive_search", pick), patch.object(kda, "exhaustive_search", pick):
+            outputs = stress_round(backend, variant, shape)
+        for name, indices in getattr(pick, "forced", {}).items():
+            forced.setdefault(name, set()).update(indices)
+        excluded.update(getattr(pick, "excluded", ()))
+        return outputs
+
+    def check(label, pick, want):
+        for name, a, b in zip(stress_names(variant), run_picking(pick), want):
+            assert_bitwise(f"{variant} autotune pick {label} repeat {name}", a, b)
+
+    with waive_unsupported(backend, variant):
+        first = run_picking(Picking(0))
+    check("0", Picking(0), first)
+    # every launch has its own domain (occupancy x worker warps, as its call site sweeps it): walk the indices until
+    # the largest domain is exhausted, so every executable candidate of every launch is forced at least once
+    index = 1
+    while True:
+        pick = Picking(index)
+        want = run_picking(pick)
+        if not pick.covered:
+            break
+        check(str(index), pick, want)
+        index += 1
+    check("fallback", Failing(), run_picking(Failing()))
+    domain = pick.domain
+    assert all(
+        len(forced[name]) + sum(k == name for k, _ in excluded) >= size for name, size in domain.items()
+    ), f"{variant}: not every candidate ran or was excluded: forced {forced}, excluded {sorted(excluded)}, domain {domain}"
+    # the comparison means something only if a candidate other than the default ran somewhere
+    assert any(indices - {0} for indices in forced.values()), f"{variant}: no autotune candidate beyond the default ran; excluded {sorted(excluded)}"
+    if excluded:
+        print(f"{variant}: the compiler rejected {sorted(excluded)}; the tuner never picks them, so they are not compared")
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", ["kda"])
+def test_determinism_cutile_kda_bv_candidates_agree(backend, variant, tune_cache):
+    """Every BV candidate of the KDA state kernel writes the same bytes, so its sweep needs no host pin.
+
+    ``kda.autotuned_launch_bv`` times the V-tile width BV of ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` outside
+    the host hooks, so two processes can settle on different widths. BV only partitions the V axis across CTAs (the K
+    axis is always reduced in fixed 64-wide blocks), so unlike the worker-warp count it must not change a single
+    summation: force each BV in turn, with every hooked launch held at its first candidate, and compare the bytes
+    against BV candidate 0, not only against a repeat of the same width."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+
+    def run_bv(index):
+        tune_cache()
+        pick = Picking(index)
+        with patch.object(common, "exhaustive_search", Picking(0)), patch.object(kda, "exhaustive_search", pick):
+            return pick, stress_round(backend, variant, shape)
+
+    with waive_unsupported(backend, variant):
+        first_pick, first = run_bv(0)
+    assert first_pick.domain, f"{variant}: no launch took the BV sweep"
+    index, forced = 1, set()
+    while True:
+        pick, outputs = run_bv(index)
+        if not pick.covered:
+            break
+        for name, a, b in zip(stress_names(variant), first, outputs):
+            assert_bitwise(f"{variant} BV candidate {index} against candidate 0: {name}", a, b)
+        forced.update(i for indices in pick.forced.values() for i in indices)
+        index += 1
+    assert forced - {0}, f"{variant}: no BV candidate beyond the default ran; excluded {sorted(pick.excluded)}"
+    print(f"{variant}: BV candidates {sorted(forced)} of {first_pick.domain} agree byte for byte")
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+def test_determinism_cutile_autotune_host_hooks(backend, variant, tune_cache):
+    """A host pins the pick: ``record_hint`` sees every timed winner, and under ``select_hints`` the search never runs
+    and the bytes are the chosen candidate's, so a host that records a table and pins from it replays across runs.
+
+    The hooks receive the kernel and the caller's shape key (no device in it), so a table keyed by kernel name and
+    shape matches on every rank."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+
+    def run(pick, kda_pick=None, **hooks):
+        """``pick`` stands in for the hinted search of ``autotuned_launch``; ``kda_pick`` for KDA's BV-width search
+        (``autotuned_launch_bv``), which the hooks do not cover because BV never changes the numerics."""
+        tune_cache()
+        with patch.multiple(common, exhaustive_search=pick, **hooks), patch.object(kda, "exhaustive_search", kda_pick or pick):
+            return stress_round(backend, variant, shape)
+
+    recorded = {}
+
+    def record(kernel, key, config):
+        assert all(isinstance(part, (int, str)) for part in key), f"{common.kernel_name(kernel)}: shape key {key!r}"
+        recorded[(common.kernel_name(kernel), key)] = vars(config)
+
+    with waive_unsupported(backend, variant):
+        run(Picking(0), record_hint=record)
+        # the host's own errors reach the caller instead of being taken for a tuning failure
+        with pytest.raises(RuntimeError, match="the host could not record"):
+            run(Picking(0), record_hint=Mock(side_effect=RuntimeError("the host could not record")))
+    assert recorded, f"{variant}: no timed winner was recorded"
+    assert all(config == vars(common.launch_hint_configs((1,))[0]) for config in recorded.values()), recorded
+
+    # pin every launch to its second candidate: the search must not run, and the bytes are candidate 1's
+    searched = Mock(side_effect=RuntimeError("the timed search ran under a host pick"))
+    second = lambda kernel, key, configs: configs[1]  # noqa: E731
+    pinned = run(searched, kda_pick=Picking(1), select_hints=second)
+    searched.assert_not_called()
+    for name, a, b in zip(stress_names(variant), pinned, run(searched, kda_pick=Picking(1), select_hints=second)):
+        assert_bitwise(f"{variant} host pick repeat {name}", a, b)
+    for name, a, b in zip(stress_names(variant), pinned, run(Picking(1))):
+        assert_bitwise(f"{variant} host pick vs forced candidate 1 {name}", a, b)
+
+
 # ---------------------------------------------------------------------------
 # Stress: repeated execution, and several live graphs, in one process
 # ---------------------------------------------------------------------------
@@ -3279,16 +3509,20 @@ def assert_stress_stable(backend, variant, shapes):
             if si not in ref:
                 ref[si] = [t.detach().clone() for t in got]
                 continue
-            for name, want, have in zip(("o", "final_state", "dq", "dk"), ref[si], got):
+            for name, want, have in zip(stress_names(variant), ref[si], got):
                 assert torch.equal(want, have), f"shape {si} round {rnd}: {name} drifted between executions"
 
 
+def stress_names(variant):
+    """Names of what :func:`stress_round` returns: the outputs, then one gradient per tensor input."""
+    return ("o", "final_state", *(f"d{leaf}" for leaf in LEAF_NAMES[variant]))
+
+
 def stress_round(backend, variant, shape):
-    """One fwd+bwd on freshly allocated operands; returns the outputs."""
+    """One fwd+bwd on freshly allocated operands; returns the outputs and every input's gradient."""
     case = make_case(variant, torch.bfloat16, **shape)
-    args = thd_tensors(case)
-    leaves = [args[0].requires_grad_(True), args[1].requires_grad_(True)]
-    o, fs = pinned_op(backend, variant)(*args, *op_tail(case), output_final_state=True)
+    leaves = [tensor.requires_grad_(True) for tensor in thd_tensors(case)]
+    o, fs = pinned_op(backend, variant)(*leaves, *op_tail(case), output_final_state=True)
     # ones rather than randn so the grad seed does not depend on global RNG ordering
     grads = torch.autograd.grad([o, fs], leaves, [torch.ones_like(o), torch.ones_like(fs)])
     torch.cuda.synchronize()
@@ -3303,7 +3537,6 @@ def test_replay_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES[:1])
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_multi_graph_stress(backend, variant):
     """Several distinct LA graphs live at once, executed round robin; every
@@ -3312,11 +3545,12 @@ def test_multi_graph_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_two_streams(backend, variant):
     """Two concurrent instances on separate streams; every repeat matches its
-    own single-stream baseline bitwise."""
+    own single-stream baseline bitwise. The serial baselines also warm the
+    cuTile launch-hint cache, so the concurrent repeats never tune."""
     case_a = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], seed=SEED)
     case_b = make_case(variant, torch.bfloat16, B=2, T=512, seed=SEED + 1)
     launch_a = lambda: run_fwd(backend, case_a, output_final_state=True)  # noqa: E731
@@ -3325,7 +3559,7 @@ def test_determinism_two_streams(backend, variant):
     # order the side streams behind the input generation (default stream)
     torch.cuda.synchronize()
 
-    with torch.cuda.stream(s1):
+    with waive_unsupported(backend, variant), torch.cuda.stream(s1):
         base_a = launch_a()
     torch.cuda.synchronize()
     with torch.cuda.stream(s2):
@@ -3342,11 +3576,12 @@ def test_determinism_two_streams(backend, variant):
                 assert torch.equal(bits(x), bits(y)), f"stream {label} output {i} differs on concurrent run {r}"
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("variant", ["kda", "mamba2"])
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_same_graph_two_streams(backend, variant, dtype):
-    """Two backwards of one variant on two streams stay bitwise stable under repeated overlap."""
+    """Two backwards of one variant on two streams stay bitwise stable under repeated overlap, for every variant
+    and both engines that serve it."""
     case_a = make_case(variant, dtype, T=512, seed=SEED)
     case_b = make_case(variant, dtype, T=512, seed=SEED + 1)
     leaves_a = [tensor.requires_grad_(True) for tensor in thd_tensors(case_a)]

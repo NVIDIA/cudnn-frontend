@@ -45,7 +45,7 @@ quantize decode step, also under `cudnn.attention_gate.frost`) and
 `SwigluFp4Decode` (the FP4 gate / up product with SwiGLU for decode rows, also
 under `cudnn.gemm`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
-`block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
+`block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
@@ -67,12 +67,12 @@ arbitrary user callbacks.
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
 | `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
-| `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
-| `dense_indexer_kl`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
-| `dense_indexer_kl`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
+| `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
@@ -95,7 +95,7 @@ arbitrary user callbacks.
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
 | `block_sparse_attention_forward` (blk64, `sparse_block_size=64`) | fprop | BF16 | Supported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
 | `block_sparse_attention_forward` (blk64, `sparse_block_size=64`) | fprop | FP16 | Supported | Unsupported (the SM100/SM103 blk64 forward serves BF16 only) | Unverified |
-| `block_sparse_attention_backward` (blk64, `sparse_block_size=64`; the default route and, on SM90, the `metadata=` route of `block_sparse_attention_prepare_backward`) | bprop | BF16 | Not guaranteed | Not guaranteed (cc 10.3 measured; cc 10.0 unverified; the prepared route is SM90-only) | Unverified |
+| `block_sparse_attention_backward` (blk64, `sparse_block_size=64`; the default route and, on SM90, the `metadata=` route of `block_sparse_attention_backward_metadata`) | bprop | BF16 | Not guaranteed | Not guaranteed (cc 10.3 measured; cc 10.0 unverified; the prepared route is SM90-only) | Unverified |
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | FROST SM90 three-WG D512 dense-Q split forward (standalone and fixed-body qualification; fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported for this owner | Unsupported for this owner |
@@ -145,6 +145,7 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in) | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -324,6 +325,22 @@ a row alone and inside a batch under the entry's own picks.
   it is not a hard workspace cap. The new H/X alias and sixteen-wave paths
   have not been requalified on SM103 or SM107; earlier architecture coverage
   remains recorded separately in the test report.
+- Linear attention cuTile engine (GDN, KDA): the launch autotune times
+  occupancy and worker-warp candidates, and the worker-warp count changes the
+  cross-warp summation trees of the kernels that reduce with `ct.sum`, so two
+  processes that time their own candidates can write different bytes. Every
+  candidate replays its own bytes, and a run whose tuning fails or times out
+  launches the first candidate's hints rather than the unhinted kernel. A host
+  that needs the same bytes on every rank and in every run pins the pick
+  through the hooks in `cutile/kernels/common.py`: `record_hint` is told each
+  timed winner, `select_hints` returns the candidate to run and skips the
+  timing (Megatron-LM's `megatron.core.tuning` records a table and pins from
+  it). The hooks are read only when a launch misses the in-process hint
+  cache, so a host installs them before the first launch or clears
+  `launch_hint_cache` when its policy changes; a failed or timed-out search
+  launches the first candidate and records nothing. The cuTile engine is not on this page's table: per-candidate replay and
+  the hooks are verified on cc 10.3 by `test_la.py`'s determinism tests, batch
+  invariance is not claimed.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
@@ -515,7 +532,7 @@ a row alone and inside a batch under the entry's own picks.
   the single-group route accumulate in a call-dependent order. dQ, dK and dV
   are therefore not repeatable on any route, as `bsa.md` documents for its FP32
   atomics; an empty query block's dQ is zero. One narrow, verified exception on
-  SM90: with prepared metadata (`block_sparse_attention_prepare_backward`,
+  SM90: with prepared metadata (`block_sparse_attention_backward_metadata`,
   SM90 only) the single-group, whole-block route builds its CSR once and its dK
   and dV replay bitwise while dQ still differs; this does not raise the row's
   status. GQA/MQA, head dimensions 64 and 96, BSHD, the blk128 paths, KPage and
@@ -546,6 +563,17 @@ duplicated and129-request batches, then mutate dO and a canonical scale
 atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
+
+The SM90 D64 / D128 half-precision backward chain (`sdpa_bwd_sm90`) owns dK and
+dV per key tile and reduces every query tile's dQ over its key tiles in index
+order through per-tile turn counters, so the deterministic flag and the default
+request run the same arithmetic. Repeatability: dQ / dK / dV bytes are compared
+across repeated executions with a poisoned workspace on causal and unmasked MHA
+and GQA graphs at D64 and D128, including grids beyond one CTA wave, and across
+CUDA Graph replays for causal GQA at D128. Batch invariance: the same bytes are
+compared across reordered and duplicated batches and against the sequence
+declared alone, in four cells: BF16 D128 causal GQA, FP16 D64 unmasked MHA,
+BF16 D64 causal MHA and FP16 D128 unmasked GQA.
 
 ## Split-combine zero-weight qualification
 

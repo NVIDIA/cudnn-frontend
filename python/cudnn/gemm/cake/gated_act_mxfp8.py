@@ -141,12 +141,12 @@ def _call(gated_input, grad_output, rowwise, colwise, stream):
     return TupleDict(zip(("row_output", "col_output", "row_scales", "col_scales"), outputs))
 
 
-def gated_act_mxfp8_forward(gated_input, *, rowwise=True, colwise=False, stream=None):
+def swiglu_quantize_forward(gated_input, *, rowwise=True, colwise=False, stream=None):
     """Quantize SwiGLU to E4M3 values and swizzled E8M0 scale bytes."""
     return _call(gated_input, None, rowwise, colwise, stream)
 
 
-def gated_act_mxfp8_backward(gated_input, grad_output, *, rowwise=True, colwise=False, stream=None):
+def swiglu_quantize_backward(gated_input, grad_output, *, rowwise=True, colwise=False, stream=None):
     """Quantize the SwiGLU gate/up gradients to MXFP8."""
     if grad_output is None:
         raise ValueError("grad_output is required")

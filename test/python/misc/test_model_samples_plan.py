@@ -267,7 +267,7 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().out
+        return module.main(arguments), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -299,7 +299,7 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
     assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
@@ -699,7 +699,7 @@ def _checked_run(sequences, step_defect=None, multiply_defect=None, band="declar
             return out
 
     class Multiply(torch_ref.Linear):
-        def __call__(self, qx, weight):
+        def __call__(self, qx, weight, site=""):  # the in-projection is handed its call site; a multiply over a copy ignores it
             product = super().__call__(qx, weight)
             return product if multiply_defect is None else multiply_defect(product, weight)
 
@@ -824,7 +824,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     capsys.readouterr()
     forced = StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
     ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
-    out = capsys.readouterr().out.splitlines()
+    out = capsys.readouterr().err.splitlines()
     assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
     first = (
         "[00] decoding: 3 prompt tokens through the decode step, then 5 new tokens and a traced pass; the report and the text follow, the text is not streamed"
@@ -837,7 +837,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     session.new_report()
     open_end = StopRule(text.eos_ids, max_new_tokens=4)
     ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
     assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 
@@ -936,6 +936,11 @@ def test_the_traced_pass_is_read_from_kernel_activity_records():
     assert "note                  GPU busy 83% of the period: the GPU work of this stack bounds this step, not the launch path; no floor" in report.text()
     assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in text
     assert "bytes per step        model 17.92 GB (weights 17.61 in their stored formats, state and cache 0.31); this stack moves 51.56 GB (2.88x)" in text
+    assert "this stack moves 51.56 GB (2.88x): bf16 copies of the weights (arithmetic, not a measurement)" in text, "every weight read as a copy"
+    kept = Report("qwen_dense", reduced=False)  # a stack with a block that multiplies on the stored format: those weights are read there
+    kept.bytes = {"weights": 17_610_000_000, "copies": 46_050_000_000, "stored": 5_200_000_000, "state": 310_000_000}
+    moves = "this stack moves 46.36 GB (2.59x): bf16 copies of the weights, and 5.20 GB of weights in their stored format (arithmetic, not a measurement)"
+    assert moves in kept.text()
     assert "first token           prefill route: decode step, 58 tokens x one step; not a time to first token of record" in text
     report.trace, report.trace_missing = None, "the profiler recorded no kernel activity on this GPU"
     assert "traced pass           not available: the profiler recorded no kernel activity on this GPU" in report.text()
@@ -1004,6 +1009,7 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     assert 51.2e9 < step["copies"] < 51.3e9 and 2.90 < step["copies"] / step["weights"] < 2.92, "the bf16 copies: 2 bytes per weight element"
     assert 0.30e9 < step["state"] < 0.36e9, "48 recurrent states read and written, 16 key/value caches read"
     assert model.bytes_per_step(4, 343)["state"] == 4 * step["state"] and model.bytes_per_step(4, 343)["copies"] - step["copies"] == 3 * 2 * 5120
+    assert step["stored"] == 0 and set(step) == {"weights", "copies", "stored", "state"}, "no weight of this stack is read on its stored format"
     need = model.memory_bytes(sequences=1, capacity=343)
     copies = model.copy_bytes()
     assert 50.0 * GIB < copies < 50.2 * GIB, "the bf16 copies incl. the embedding table"
