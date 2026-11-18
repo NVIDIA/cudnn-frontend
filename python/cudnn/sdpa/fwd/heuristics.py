@@ -2648,8 +2648,9 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
 
 
 def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
-    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice. S_q <= 16: the range its
-    study timed; longer padded chunks on the same tile keep the shared model."""
+    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice. S_q <= 16 and no window: the
+    range its study timed. A window caps the keys each row reads, but the rule counts the whole cache (gemma4's 1024-key window over
+    131k keys ran 1.35-1.94x slower at its split), so windowed and longer padded graphs keep the shared model."""
     return (
         caps.sm_hi == 80
         and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
@@ -2657,6 +2658,7 @@ def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> 
         and not facts.thd
         and facts.has_paged_kv
         and facts.s_q <= 16
+        and facts.window_left is None
         and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 64
     )
 

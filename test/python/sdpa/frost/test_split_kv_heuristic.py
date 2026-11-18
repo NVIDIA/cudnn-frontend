@@ -1482,24 +1482,26 @@ def test_sm80_d128_chunks_split_on_the_adapter_grid(b, h_q, h_kv, s_q, s_kv, spl
 
 
 @pytest.mark.parametrize(
-    "layout,b,h_q,h_kv,s_q,s_kv,split",
+    "layout,b,h_q,h_kv,s_q,s_kv,split,window",
     [
         # Paged short-d256 tile: >= 8 KV tiles per split, <= 16 waves. A100 80GB PCIe ms by split
         # (study sm80_d256_decode_split_cal_20261118; the shared model chose the first split listed):
-        ("paged", 8, 36, 4, 1, 131073, 32),  # 16: 3.14, 32: 2.71, 64: 2.76
-        ("paged", 4, 6, 1, 16, 32769, 64),  # 16: 0.285, 32: 0.305, 64: 0.272
-        ("paged", 64, 16, 1, 2, 16385, 16),  # 1: 1.55, 8: 0.825, 16: 0.740, 32: 0.781
-        ("paged", 64, 40, 4, 8, 1025, 2),  # 1: 0.411, 2: 0.410, 4: 0.444
+        ("paged", 8, 36, 4, 1, 131073, 32, None),  # 16: 3.14, 32: 2.71, 64: 2.76
+        ("paged", 4, 6, 1, 16, 32769, 64, None),  # 16: 0.285, 32: 0.305, 64: 0.272
+        ("paged", 64, 16, 1, 2, 16385, 16, None),  # 1: 1.55, 8: 0.825, 16: 0.740, 32: 0.781
+        ("paged", 64, 40, 4, 8, 1025, 2, None),  # 1: 0.411, 2: 0.410, 4: 0.444
         # One CTA of single-row decode splits to 128 (sm80_d256_split128_q1_20261118; of the backend: 64: 1.11, 128: 0.81).
-        ("paged", 1, 8, 1, 1, 131072, 128),
-        ("paged", 1, 8, 1, 4, 131072, 64),  # S_q 4 keeps the 64 cap
+        ("paged", 1, 8, 1, 1, 131072, 128, None),
+        ("paged", 1, 8, 1, 4, 131072, 64, None),  # S_q 4 keeps the 64 cap
         # Past the calibrated S_q 1-16 the shared model's choice stands.
-        ("paged", 4, 32, 2, 64, 32768, 2),
+        ("paged", 4, 32, 2, 64, 32768, 2, None),
+        # A window caps the keys each row reads; the rule would count the whole cache (gemma4: 1.35-1.94x slower), so it is outside.
+        ("paged", 1, 16, 8, 1, 131072, 8, 1024),
         # Dense d256 keeps the shared model's choice.
-        ("dense", 8, 40, 4, 1, 32768, 2),
+        ("dense", 8, 40, 4, 1, 32768, 2, None),
     ],
 )
-def test_sm80_paged_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, split):
+def test_sm80_paged_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, split, window):
     """SM80 paged d256 decode on the short tile takes a direct split rule; the wave model mis-split it both ways."""
     import cudnn
     from cudnn.sdpa import graph_analyzer as ga
@@ -1522,6 +1524,7 @@ def test_sm80_paged_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, spli
         has_paged_kv=paged,
         page_size=16 if paged else 0,
         padded=paged,
+        window_left=window,
         device_sm_count=108,
         device_cc=(8, 0),
     )
