@@ -136,10 +136,10 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
 def ragged_pieces(*, heads_out, num_sm, total_tokens):
     """Slot cap of the length-rule chain group a main plan without pieces carries for the gate of its first kernel to take
     (``common/tail.py``), 0 for no group: the slots that keep one sequence's ``heads_out`` tiles in one wave, at most
-    ``CHAIN_MAX_PIECES`` and what the batch's tokens fill at ``LENGTH_RULE_PIECE_TOKENS`` each.  The group cuts a sequence at
-    ``CHAIN_MIN_PIECES`` slots or more, so a plan whose wave holds fewer of one sequence carries none."""
-    pieces = min(int(num_sm) // max(1, int(heads_out)), CHAIN_MAX_PIECES, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS))
-    return pieces if pieces >= CHAIN_MIN_PIECES else 0
+    ``CHAIN_MAX_PIECES``.  The group cuts a sequence at ``CHAIN_MIN_PIECES`` slots or more, so a plan whose wave holds fewer of
+    one sequence, or whose tokens fill fewer at ``LENGTH_RULE_PIECE_TOKENS`` each, carries none."""
+    pieces = min(int(num_sm) // max(1, int(heads_out)), CHAIN_MAX_PIECES)
+    return pieces if min(pieces, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS)) >= CHAIN_MIN_PIECES else 0
 
 
 def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):

@@ -39,9 +39,9 @@ def _graph_owner(dims, cga, tile_n):
         return "sdpa_fwd_sm107_d256_swap_ab"
     if dims == (192, 128):
         return "sdpa_fwd_sm107_d192_multi_q"
-    if dims in ((64, 64), (128, 128)):
+    if all(0 < dim <= 128 and dim % 8 == 0 for dim in dims):
         return "sdpa_fwd_sm107_shared_single_q" if cga == 1 and tile_n == 128 else "sdpa_fwd_sm107_d128_multi_q"
-    return "sdpa_fwd_prefill_sm107"  # Non-native envelopes retain the old row.
+    return "sdpa_fwd_prefill_sm107"
 
 
 @pytest.mark.parametrize("case", GRAPH_CASES)

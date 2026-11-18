@@ -219,14 +219,25 @@ def test_build_fp8_fwd_cfg_detects_ragged_from_offset_inputs():
     assert cfg["seq_len_kv"] == [19, 17]
 
 
-def test_build_fp8_fwd_cfg_infers_paged_block_size():
-    cfg = sdpa_fp8_fwd.build_cfg("{}", _fp8_fwd_payload(paged=True), seed=123)
+@pytest.mark.parametrize("mxfp8", [False, True])
+@pytest.mark.parametrize("explicit_max, logged_lengths, expected_kv", [(None, [19, 17], 20), (None, None, 20), (19, [15, 11], 19)])
+def test_build_fp8_fwd_cfg_recovers_paged_extent(mxfp8, explicit_max, logged_lengths, expected_kv):
+    payload = _fp8_fwd_payload(paged=True, mxfp8=mxfp8)
+    node = payload["nodes"][0]
+    node["max_seq_len_kv"] = explicit_max
+    tensors = {t["uid"]: t for t in payload["tensors"]}
+    tensors[14]["pass_by_value"] = logged_lengths
+    # K has six page slots and V has five. The shared capacity is five four-token pages.
+    tensors[15].update(dim=[2, 1, 6, 1], stride=[6, 6, 1, 1])
+    cfg = operations.select_operation(payload).build_cfg("{}", payload, seed=123)
     assert cfg["is_paged"] is True
     assert cfg["block_size"] == 4
-    assert cfg["shape_k"] == (2, 2, 19, 64)
-    assert cfg["shape_v"] == (2, 2, 19, 32)
+    assert cfg["s_kv"] == expected_kv
+    assert cfg["shape_k"] == (2, 2, expected_kv, 64)
+    assert cfg["shape_v"] == (2, 2, expected_kv, 32)
     assert cfg["stride_k"] is None
     assert cfg["stride_v"] is None
+    assert cfg["seq_len_kv"] == (logged_lengths or [expected_kv] * 2)
 
 
 def test_build_mxfp8_fwd_cfg_extracts_mxfp8_fields():
@@ -307,3 +318,49 @@ def test_build_mxfp8_forward_command_preserves_mxfp8_fields():
     assert "'with_unfuse_fma': True" in command
     assert "'rescale_threshold': 4.0" in command
     assert "torch.bfloat16" in command
+
+
+@pytest.mark.parametrize(("mxfp8", "stats"), [(False, False), (False, True), (True, True)])
+def test_fp8_cumulative_sequence_lengths(mxfp8, stats):
+    payload = _fp8_fwd_payload(mxfp8=mxfp8, ragged=True)
+    payload["nodes"][0]["generate_stats"] = stats
+    if not stats:
+        payload["nodes"][0]["outputs"].pop("Stats", None)
+    inputs = payload["nodes"][0]["inputs"]
+    inputs.pop("SEQ_LEN_Q", None)
+    inputs.pop("SEQ_LEN_KV", None)
+    inputs.update(CU_SEQ_LEN_Q=51, CU_SEQ_LEN_KV=52)
+    payload["tensors"].extend([{"uid": 51, "pass_by_value": [0, 5, 8]}, {"uid": 52, "pass_by_value": [0, 17, 17]}])
+    cfg = sdpa_fp8_fwd.build_cfg("", payload)
+    metadata = sdpa_fp8_fwd.extract_seq_and_ragged(payload, seed=0)
+    assert cfg["is_cu_seq_len"] and cfg["is_padding"] and cfg["is_ragged"] and cfg["fwd_stats"] is stats
+    assert cfg["seq_len_q"] == metadata["seq_len_q"] == [5, 3]
+    assert cfg["seq_len_kv"] == metadata["seq_len_kv"] == [17, 0]
+    inputs["SEQ_LEN_KV"] = inputs.pop("CU_SEQ_LEN_KV")
+    with pytest.raises(NotImplementedError, match="both Q and KV"):
+        sdpa_fp8_fwd.build_cfg("", payload)
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_fp8_dense_cumulative_ports_exceed_replay_harness(mxfp8):
+    payload = _fp8_fwd_payload(mxfp8=mxfp8)
+    payload["nodes"][0]["inputs"].update(CU_SEQ_LEN_Q=51, CU_SEQ_LEN_KV=52)
+    with pytest.raises(NotImplementedError, match="ragged storage"):
+        sdpa_fp8_fwd.build_cfg("", payload)
+
+
+def test_mxfp8_ragged_statsless_exceeds_replay_harness():
+    payload = _fp8_fwd_payload(mxfp8=True, ragged=True)
+    payload["nodes"][0]["generate_stats"] = False
+    payload["nodes"][0]["outputs"].pop("Stats")
+    with pytest.raises(NotImplementedError, match="always generates Stats"):
+        sdpa_fp8_fwd.build_cfg("", payload)
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_fp8_dense_forward_replays_without_stats(mxfp8):
+    payload = _fp8_fwd_payload(mxfp8=mxfp8)
+    payload["nodes"][0]["generate_stats"] = False
+    payload["nodes"][0]["outputs"].pop("Stats")
+    cfg = sdpa_fp8_fwd.build_cfg("", payload)
+    assert cfg["fwd_stats"] is False

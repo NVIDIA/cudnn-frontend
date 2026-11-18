@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``block_sparse_attention_prepare_backward`` / ``block_sparse_attention_backward(metadata=...)`` on SM90 blk64.
+"""``block_sparse_attention_backward_metadata`` / ``block_sparse_attention_backward(metadata=...)`` on SM90 blk64.
 
 A prepared object must give the gradients of the default backward (within the FP32 reduce-add order noise), skip every
 metadata kernel, work on both the paired-KV and the regular SM90 path, in BHSD and BSHD, under CUDA graph capture and
@@ -93,7 +93,7 @@ def test_prepared_backward_matches_default_and_skips_metadata_kernels(monkeypatc
 
     # Two groups of 9 Q blocks in the paired case; one group (direct dK/dV stores) in the regular case.
     bucket = 9 if paired else None
-    prepared = bsa.block_sparse_attention_prepare_backward(
+    prepared = bsa.block_sparse_attention_backward_metadata(
         indices, width, sizes, counts, seqlen_q=q.shape[1 if layout == "bshd" else 2], seqlen_k=sizes.numel() * BLOCK, bucket_size_blocks=bucket
     )
     assert prepared.use_paired_kv == paired
@@ -130,7 +130,7 @@ def test_prepared_backward_rejects_stale_or_foreign_metadata(monkeypatch):
     q, k, v, do, indices, counts, sizes = _problem(batch, heads, nq, nk, width, seed=41)
     kwargs = dict(block_sparse_num=width, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=BLOCK)
     o, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
-    prepare = lambda **kw: bsa.block_sparse_attention_prepare_backward(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], **kw)
+    prepare = lambda **kw: bsa.block_sparse_attention_backward_metadata(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], **kw)
     backward = lambda meta, **kw: bsa.block_sparse_attention_backward(do, q, k, v, o, lse, indices, **{**kwargs, **kw}, metadata=meta)
     prepared = prepare()
     backward(prepared)
@@ -143,7 +143,7 @@ def test_prepared_backward_rejects_stale_or_foreign_metadata(monkeypatch):
     with pytest.raises(ValueError, match="different block_sizes"):
         backward(prepared, block_sizes=sizes.clone())
     # Fixed counts are a different pattern from the same index tensor; block_sparse_num is then part of the identity.
-    fixed = bsa.block_sparse_attention_prepare_backward(indices, width, sizes, None, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
+    fixed = bsa.block_sparse_attention_backward_metadata(indices, width, sizes, None, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
     with pytest.raises(ValueError, match="different block_sparse_num"):
         backward(fixed)
     with pytest.raises(ValueError, match="different block_sparse_num"):
@@ -187,11 +187,11 @@ def test_prepared_backward_rejects_stale_or_foreign_metadata(monkeypatch):
     with pytest.raises(NotImplementedError, match="exclusive"):
         bsa.block_sparse_attention_backward(do, q, k, v, o, lse, indices, width, sizes, counts, sparse_block_size=128, kpage=True, metadata=prepared)
     with pytest.raises(NotImplementedError, match="SM90 blk64"):
-        bsa.block_sparse_attention_prepare_backward(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], sparse_block_size=128)
+        bsa.block_sparse_attention_backward_metadata(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], sparse_block_size=128)
     with pytest.raises(ValueError, match="shape prefix"):
-        bsa.block_sparse_attention_prepare_backward(indices, width, sizes, counts, seqlen_q=q.shape[2] + BLOCK, seqlen_k=k.shape[2])
+        bsa.block_sparse_attention_backward_metadata(indices, width, sizes, counts, seqlen_q=q.shape[2] + BLOCK, seqlen_k=k.shape[2])
     with pytest.raises(ValueError, match="block_sparse_num must be in"):
-        bsa.block_sparse_attention_prepare_backward(indices, width + 1, sizes, None, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
+        bsa.block_sparse_attention_backward_metadata(indices, width + 1, sizes, None, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
     assert re.match(
         r"BsaBackwardMetadata\(batch_size=1, num_heads=2, seqlen_q=640, seqlen_k=1280, bucket_size_blocks=4, num_q_groups=3, path=paired", repr(prepared)
     )
@@ -209,13 +209,13 @@ def test_prepared_backward_does_not_sync_and_replays_in_a_graph(monkeypatch, pai
     kwargs = dict(block_sparse_num=width, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=BLOCK)
     o, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
     step = lambda meta: bsa.block_sparse_attention_backward(do, q, k, v, o, lse, indices, **kwargs, bucket_size_blocks=5, metadata=meta)
-    prepared = bsa.block_sparse_attention_prepare_backward(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], bucket_size_blocks=5)
+    prepared = bsa.block_sparse_attention_backward_metadata(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], bucket_size_blocks=5)
     assert prepared.use_paired_kv == paired and not prepared.direct_kv
     eager = step(prepared)
     torch.cuda.synchronize()
     with no_host_sync():
         # Warm (compiled) prepare and backward never read the device or block the host.
-        warm = bsa.block_sparse_attention_prepare_backward(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], bucket_size_blocks=5)
+        warm = bsa.block_sparse_attention_backward_metadata(indices, width, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2], bucket_size_blocks=5)
         step(warm)
         step(None)
     with cuda_graph() as graph:
@@ -242,7 +242,7 @@ def test_prepare_on_a_side_stream_orders_before_the_backward(monkeypatch):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        prepared = bsa.block_sparse_attention_prepare_backward(indices, 6, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
+        prepared = bsa.block_sparse_attention_backward_metadata(indices, 6, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
     torch.cuda.current_stream().wait_stream(side)
     grads = bsa.block_sparse_attention_backward(do, q, k, v, o, lse, indices, **kwargs, metadata=prepared)
     for got, expected in zip(grads, reference):
@@ -264,7 +264,7 @@ def test_prepared_metadata_built_on_a_side_stream_survives_its_release_after_the
     o, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
     reference = bsa.block_sparse_attention_backward(do, q, k, v, o, lse, indices, **kwargs)
     main, side = torch.cuda.current_stream(), torch.cuda.Stream()
-    prepare = lambda: bsa.block_sparse_attention_prepare_backward(indices, 6, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
+    prepare = lambda: bsa.block_sparse_attention_backward_metadata(indices, 6, sizes, counts, seqlen_q=q.shape[2], seqlen_k=k.shape[2])
     backward = lambda meta: bsa.block_sparse_attention_backward(do, q, k, v, o, lse, indices, **kwargs, metadata=meta)
     # Every kernel compiled and launched once outside the timed sequence (a first launch waits for the device to drain).
     with torch.cuda.stream(side):

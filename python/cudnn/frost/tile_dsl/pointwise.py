@@ -1537,3 +1537,66 @@ def nvfp4_block_scale_global(amax: cutlass.Float32, global_scale: cutlass.Float3
     if value != cutlass.Float32(0):
         encode_scale = rcp_approx_ftz(value * rcp_approx_ftz(global_scale))
     return byte, encode_scale
+
+
+# ---------------------------------------------------------------------------
+# Four single instructions a kernel NAMES instead of leaving them to a lowering.  Each helper is
+# ONE opaque statement: the DSL's optimizer can neither contract it with a neighbour nor replace
+# it by the routine one of its own math functions resolves to.  A kernel whose bytes follow a
+# reference chain spells that chain through these, instruction by instruction.  The three
+# approximate ones are EXPANDED BY THE ASSEMBLER into short hardware sequences: the statement
+# fixes the instruction, the assembler of the build fixes the result's last bits, so equality
+# with another build of the same chain is measured per target and per assembler, never read off
+# the text.  Every operand must be a traced register (a folded float immediate on an asm operand
+# ICEs libNVVM, :func:`opaque_f32_bits`).
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def div_full_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``div.full.f32`` -- the full-range APPROXIMATE fp32 division ``a / b``, as ONE opaque op.
+
+    NOT :func:`div_rn_f32` / :func:`rcp_div_rn` (``div.rn.f32``, the IEEE correctly rounded quotient) and not the
+    ``div.approx.f32`` inside :func:`silu_ex2_div_approx` (a reciprocal and a multiply, accurate for divisors of ordinary
+    magnitude only).  By the instruction's specification the result is within 2 units in the last place of the exact
+    quotient over the full range of operands; it does not take a rounding mode.  A chain that is DEFINED with this
+    instruction keeps its bits only with this spelling: the correctly rounded quotient differs from it in the last bit on
+    some operands, and a normalized or gated value then rounds to another 16-bit value on some elements."""
+    return inline_ptx("div.full.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])
+
+
+@cute.jit
+def rsqrt_approx_ftz_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``rsqrt.approx.ftz.f32`` -- the hardware's approximate fp32 reciprocal square root with flush-to-zero, as ONE
+    opaque op.
+
+    NOT ``cute.math.rsqrt``, which is ``rsqrt.approx.f32`` WITHOUT ``.ftz``: the two agree on every normal operand and
+    differ on a positive subnormal one -- ``.ftz`` reads it as ``+0`` and returns ``+inf``, the plain form returns a large
+    finite value.  By the instruction's specification the relative error is at most ``2^-22.9`` over the positive finite
+    range.  ``+0`` gives ``+inf``, ``-0`` gives ``-inf``, ``+inf`` gives ``+0``, a negative operand a NaN."""
+    return inline_ptx("rsqrt.approx.ftz.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def ex2_approx_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``ex2.approx.f32`` -- the hardware's approximate ``2^x`` WITHOUT flush-to-zero, as ONE opaque op.
+
+    NOT the ``ex2.approx.ftz.f32`` inside :func:`silu_ex2_div_approx`: here a result below the smallest normal fp32 is a
+    subnormal value, not a zero (``x`` below about -126), so the two differ exactly where the exponential underflows.  By
+    the instruction's specification the result is within 2 units in the last place of the correctly rounded ``2^x``.  A
+    zero of either sign gives 1, ``-inf`` gives ``+0``, ``+inf`` gives ``+inf``.  ``exp(v)`` in this convention is
+    ``ex2_approx_f32(v * fp32(log2 e))`` with the multiply as its own fp32 operation."""
+    return inline_ptx("ex2.approx.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def min_xorsign_abs_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``min.xorsign.abs.f32`` -- the magnitude ``min(|a|, |b|)`` with the sign ``sign(a) XOR sign(b)``, as ONE opaque op.
+
+    With a positive bound ``b`` this is the symmetric clamp of ``a`` to ``[-b, b]`` in one instruction: the sign of ``a`` is
+    kept, also on a zero, and an infinity becomes the bound of its sign.  With a negative ``b`` the result carries the
+    opposite sign of ``a``.  Exact: no rounding takes place.  NOT a clamp spelled as two compares or as ``min(max(a, -b),
+    b)``: the same value for every operand that is not a NaN, another instruction stream.  In front of a saturating convert
+    it changes no code; a kernel carries it when its stream follows a reference that clamps.  NaN operands are outside the
+    contract.  The instruction needs PTX ISA 7.2 and a target of compute capability 8.6 or newer."""
+    return inline_ptx("min.xorsign.abs.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])

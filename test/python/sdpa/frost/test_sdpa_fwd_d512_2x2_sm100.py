@@ -398,15 +398,21 @@ def _run_graph(q, k, v, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q
     # split_kv pinned to 1: the heuristics split small B*H causal graphs over KV, and the twin (correctly) keeps
     # split plans on the role-split kernel in phase 1 -- this file tests the 2x2 kernel, not the split heuristic.
     _dsl._select_engine(g, half_engine_names(_dsl._ARCH), pack_gqa=pack_gqa, split_kv=1)
-    if _SM in (100, 103) and (q.shape[-1], d_v) == (512, 512):
+    if _SM in (100, 103, 107) and (q.shape[-1], d_v) == (512, 512):
         # These are body-specific tests, including the nondefault role-split
         # control. Rebuild an explicit record; a standalone A/B switch must
         # never alter the implementation named by a graph plan.
         from cudnn.engines.manifest import family_for
-        from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import ROLE_SPLIT, TWO_BY_TWO
+
+        if _SM == 107:
+            from cudnn.sdpa.fwd.kernels.sm107.d512_half_contract import ROLE_SPLIT, TWO_BY_TWO
+        else:
+            from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import ROLE_SPLIT, TWO_BY_TWO
 
         name, tile = (TWO_BY_TWO, 64) if expect_template == _TEMPLATE else (ROLE_SPLIT, 128)
         _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        if _SM == 107:
+            knobs[cudnn.knob_type.TILE_CGA_M] = 4
         g.create_execution_plan(family_for(g).offered_ids()[name], {**knobs, cudnn.knob_type.TILE_M: tile})
         g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()

@@ -12,6 +12,7 @@ from operator import itemgetter
 
 
 import cudnn
+from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -677,8 +678,14 @@ class CompiledKda:
         if self.chain and self.chain_launch is not None:
             context_views = context.carve(self.context.carve) if self.has_context else ()
             merged = (*views, *workspace.carve(self.carve), *context_views, None)
-            self.chain_launch(
-                *self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *fold_buffers, merged[self.index_state_wave_counts]
+            cpp_launcher.launch(
+                self.chain_launch,
+                *self.chain_scalars,
+                *self.chain_buffers(merged),
+                self.stream_type(int(stream or 0)),
+                None,
+                *fold_buffers,
+                merged[self.index_state_wave_counts],
             )
             return
         q = views[self.index_q]

@@ -46,7 +46,7 @@ def test_engine_is_registered():
     assert c.dtypes == frozenset({cudnn.data_type.FP8_E4M3})
     assert c.out_dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert c.amax_dgrad and c.causal and c.deterministic and not c.gqa and not c.swa and not c.bottom_right and not c.thd
-    assert (c.sm_lo, c.sm_hi) == (100, 119)
+    assert (c.sm_lo, c.sm_hi) == (100, 109)
 
 
 def test_row_ranks_right_behind_the_half_row():
@@ -70,8 +70,8 @@ def test_row_admits_dense_d192_e4m3(monkeypatch, cc):
     [
         (dict(d=128, d_v=128), ""),
         (dict(d=256, d_v=256), ""),
-        (dict(cc=(12, 0)), "requires SM100-119"),
-        (dict(cc=(9, 0)), "requires SM100-119"),
+        (dict(cc=(12, 0)), "requires SM100-109"),
+        (dict(cc=(9, 0)), "requires SM100-109"),
         (dict(h=4, hkv=2), ""),
         (dict(left_bound=64), ""),
         (dict(bottom_right=True), ""),

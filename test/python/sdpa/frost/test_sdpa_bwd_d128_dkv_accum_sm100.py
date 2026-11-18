@@ -47,7 +47,7 @@ FORMS = ("bf16_partials", "fp32_reduce")
 _FP32 = {FIELD: "fp32_reduce"}
 _GEOMETRY = {"1cta": (4, 32, 4), "pair": (2, 8, 2)}  # the record geometries of the two chains' md5 pins
 # PTX census per chain: the fp32 form adds the 8 dK / dV reduce-add slices (4 -> 12), deletes the 4 bf16 tile stores, drops the fold entry
-# (5 -> 4 kernels); the store warp credits the ring after the dV slices' source reads (the dK staging's WAR edge: +4 arrives on the 1-CTA body's
+# (6 -> 4 compiled entries, still 5 -> 4 launches); the store warp credits the ring after the dV slices' source reads (the dK staging's WAR edge: +4 arrives on the 1-CTA body's
 # bootstrapped 4-slot ring; the pair's pre-armed ring is untouched); wait SITES: the 1-CTA epilogue's dK round waits the 4 slots where the bf16 form waited 2 (one per
 # tensor's half 0) -> 45 - 2 + 4 = 47, the pair adds ONE new row dvk_stage_empty (store -> epilogue, between its two rounds): +1 arrive / +1 wait (68 -> 69); the P7 bulk groups: per-slice commits (1-CTA 5 -> 13,
 # waits 5 -> 9), the pair's one commit per tensor (5 -> 6, waits 5 -> 6).  No local memory, no nanosleep under either form.
@@ -205,7 +205,7 @@ def test_dkv_accum_default_renderings_are_unchanged_and_bf16_partials_named_is_t
     token, variant, _path = _RECORDS[chain]
     assert_kernel_record(kernels_default, want, token=token, variant=variant, excluded=D128_THD_SHARED_KERNELS, what=f"{chain}: the DEFAULT rendering")
     assert md5_named == md5_default and census_named == census_default, f"{chain}: bf16_partials named must render the default bytes"
-    assert census_default["ENTRY_FOLD"] == 1 and census_default["ENTRIES"] == 5
+    assert census_default["ENTRY_FOLD"] == 2 and census_default["ENTRIES"] == 6
 
 
 @pytest.mark.parametrize("chain", ["1cta", "pair"])
@@ -220,7 +220,7 @@ def test_dkv_accum_fp32_renders_for_sm_100a_with_the_documented_census(tmp_path,
     for key, (want_default, want_fp32) in _EXPECTED_FP32_DELTA[chain].items():
         assert default[key] == want_default, f"{chain} default {key}: {default[key]} != {want_default}"
         assert fp32[key] == want_fp32, f"{chain} fp32_reduce {key}: {fp32[key]} != {want_fp32}"
-    assert fp32["ENTRY_FOLD"] == 0 and fp32["ENTRIES"] == 4 and default["ENTRIES"] == 5
+    assert fp32["ENTRY_FOLD"] == 0 and fp32["ENTRIES"] == 4 and default["ENTRY_FOLD"] == 2 and default["ENTRIES"] == 6
     assert fp32["LOCAL"] == 0 and fp32["NANOSLEEP"] == 0
 
 

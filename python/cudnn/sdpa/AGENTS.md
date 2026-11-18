@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Check contradictory mask attributes before normalizing legacy spellings. A
+causal flag can overwrite the explicit diagonal alignment and silently change
+non-square attention. Keep Python validation, shared analyzer facts and all six
+compiled SDPA builders consistent. `test_sdpa_causal_alignment.py` covers both
+directions, half/FP8/MXFP8, every architecture's candidate declarations and legal
+mask controls; architecture skips must not hide a host-side semantic regression.
+In synthetic device fixtures, replace both `_device_cc` and `_device_sm_count`;
+leaving either live still probes CUDA, even if Torch device helpers are mocked.
+
 An isolated implementation's thin host entry must not import the engine
 registry that imports it. Inject common lowering and knob construction from
 the registry. Keep historical-domain metadata with engine definitions so
@@ -1942,6 +1951,14 @@ valid. If a row restates an adapter's own body test on facts, test the two
 against each other. Detectors: `test_sdpa_bwd_explicit_engines.py` covers the
 partition, legal-tuple ranking, identities and
 `test_sm80_selector_is_the_adapters_d64_rule`.
+
+When deriving an architecture row with `replace(parent.capabilities)`, rebind
+its implementation selector and delegation to the new architecture's owners.
+Copying a fully delegated parent can make every child declaration decline even
+when its adapter supports the device. Reuse the pure body-selection predicate,
+map its results to the new fixed owner names, and retain the placement policy.
+The SM89 `test_default_plan_order` and `test_fixed_d64_owner_rebind_replay`
+checks detect this lost admission and exercise both retained bodies on-device.
 
 Moving a body into its implementation directory changes what a relative import
 resolves against (after #2617 moved the D256 MXFP8 bodies into

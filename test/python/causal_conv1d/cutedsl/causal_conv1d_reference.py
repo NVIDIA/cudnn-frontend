@@ -79,3 +79,34 @@ def causal_conv1d_update_reference(
         initial_state=state,
     )
     return output[:, 0], final_state
+
+
+def causal_conv1d_decode_reference(
+    x,
+    weight,
+    state,
+    state_indices=None,
+    bias=None,
+    activation=None,
+):
+    """Explicit FP32 output oracle plus exact state transition."""
+
+    rows = x.shape[0]
+    slots = torch.arange(rows, device=x.device, dtype=torch.long) if state_indices is None else state_indices.long()
+    valid = slots >= 0
+    output = torch.zeros_like(x)
+    expected_state = state.clone()
+    if valid.any():
+        valid_slots = slots[valid]
+        selected = state.index_select(0, valid_slots)
+        history = torch.cat((selected, x[valid].unsqueeze(-1)), dim=-1)
+        updated = history[..., -state.shape[-1] :]
+        window = history[..., -weight.shape[-1] :]
+        accumulator = (window.float() * weight.float().unsqueeze(0)).sum(dim=-1)
+        if bias is not None:
+            accumulator = accumulator + bias.float()
+        if activation in ("silu", "swish"):
+            accumulator = F.silu(accumulator)
+        output[valid] = accumulator.to(x.dtype)
+        expected_state.index_copy_(0, valid_slots, updated)
+    return output, expected_state

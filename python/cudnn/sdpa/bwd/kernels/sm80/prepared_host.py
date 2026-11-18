@@ -322,6 +322,8 @@ def host(
         d64_module._unpermute_host(dq_acc, dq, d, dtype, n_q, stream)
     else:
         mask = (MASK_CAUSAL if params.is_causal else MASK_NONE) | (MASK_SWA if params.has_swa else 0) | (MASK_PADDED if params.has_seq_kv_lens else 0)
+        from cudnn.sdpa.bwd.config_sm80 import resolved_levers
+
         module._bprop_host(
             q,
             k,
@@ -346,8 +348,7 @@ def host(
             params.tile_kv,
             params.tile_q,
             params.warps_per_sg,
-            params.qo_stages or (1 if params.d_qk >= 256 else 2),
-            params.d_qk <= 128 if params.dq_smem_coalesce is None else params.dq_smem_coalesce,
+            *resolved_levers(params),
             dtype,
             mask,
             swa_window,

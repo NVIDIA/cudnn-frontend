@@ -126,6 +126,21 @@ class TestQSA:
             assert_bitwise(run(pack([sample]), backward), expected[index], f"sparse sequence {index}")
 
     @pytest.mark.L0
+    @pytest.mark.parametrize(
+        "lengths, heads",
+        # From 32768 tokens 12 heads per KV head take the 64-key forward on SM107, which reads no tile modes.
+        [((4096,) * 4 + (640,), (12, 1)), ((10240,) + (4096,) * 5 + (2048,), (6, 1))],
+        ids=["fprop-q12-kv1-dense", "fprop-q6-kv1-dense-and-gathered"],
+    )
+    def test_long_packed_batch_invariance(self, lengths, heads):
+        """Past 16384 packed tokens a query tile still takes the dense or the gathered kernel by its own key span, so a
+        128-aligned sequence of more than 512 tokens keeps the forward bytes of its standalone call."""
+        samples = sequences(lengths, heads)
+        expected = split(assert_replays(lambda: run(pack(samples), False), repeats=4), samples)
+        for index, sample in enumerate(samples):
+            assert_bitwise(run(pack([sample]), False), expected[index], f"sequence {index} of {lengths}")
+
+    @pytest.mark.L0
     @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
     @pytest.mark.parametrize(
         "total",

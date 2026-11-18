@@ -27,6 +27,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
@@ -938,7 +939,8 @@ def run_uncut_forward(
 ) -> None:
     """Replay the uncut forward: one crossing into the DSL for the prologue and prefill launches.  The plan validated the
     contract at build, so nothing here raises."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(checkpoint_every_n_tokens),
         float(scale),
         int(work_items.shape[0]) if item_limit is None else int(item_limit),
