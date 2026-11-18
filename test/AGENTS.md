@@ -441,6 +441,12 @@ check that changing either the delta or a shared barrier still fails the test.
   independently for batch and heads, in graph admission and standalone checks;
   retain legal flat-grid controls and inspect auxiliary launches too.
   `sdpa/frost/test_sdpa_bwd_launch_grid.py` covers half backward on SM80/SM120.
+  Compare graph discovery against the standalone adapter at rounded-index,
+  physical-stride and FP32 scale boundaries too. A late standalone rejection
+  does not protect candidate generation. Metadata-only descriptors exercise
+  these boundaries without huge allocations; keep the adjacent legal values.
+  `sdpa/frost/test_sdpa_bwd_d512_quantized_bounds.py` covers both quantized
+  precisions and every supported output dtype on SM100/103/107.
 
 - Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
   for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward

@@ -4,6 +4,8 @@ Current D512 half backward batch/chunk limits are documented in [SM100/SM103](su
 
 Current nonpaged D256 split physical-origin support is documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
 
+Current D512 quantized backward declaration limits are documented in [SM100/SM103](support/sm100.md#per-tensor-fp8-and-mxfp8) and [SM107](support/sm107.md#mxfp8-backward).
+
 > **Historical reference; migration in progress.** Current support documentation
 > starts at [support/README.md](support/README.md), with a
 > [completed SM90 example](support/sm90.md) and a [template](support/TEMPLATE.md).
