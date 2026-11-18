@@ -61,10 +61,11 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert (
             mask in ("none", "window", "window_narrow", "causal_br", "causal_tl")
             and isinstance(sink, bool)
-            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split", "gqa_body")
+            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split", "gqa_body", "gqa_partial")
         )
         assert mask != "window_narrow" or (row, phase) == ("sdpa_bwd_sm80", "prefill_det"), key  # a row-local key
         assert group != "gqa_body" or (row, layout, phase in ("mtp", "prefill")) == ("sdpa_fwd_prefill_sm120", "paged", True), key
+        assert group != "gqa_partial" or (row, phase) in (("sdpa_fwd_prefill_sm107", "verify"), ("sdpa_fwd_prefill_sm90", "q1")), key
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -1496,6 +1497,36 @@ def test_sm107_paged_window_entries_follow_the_study():
 
 
 @pytest.mark.L0
+def test_sm107_padded_verify_keys_apart_and_d192x128_sink_window_entries_follow_the_study():
+    """Study sm107_d192x128_sink_verify_20261118 (Rubin): padded-Q GQA verify (S_q 5-16) keys `verify` and falls back to the prefill
+    entry while its own class has none; THD Q keeps `prefill`. Mimo d192 x 128 verify with a window and a sink leads from 2^2 parallel
+    tiles where the row packs the group whole; a group packed in part keys `gqa_partial` and leads up to 2^6.5 tiles."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def v(**over):
+        base = dict(b=128, h_q=128, h_kv=8, s_q=8, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7))
+        base.update(has_paged_kv=True, page_size=16, padded=True, window_left=127, has_sink=True)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm107_d192x128_sink_verify_20261118"
+    for kv in (131072, 131073):
+        assert pt.class_key(row, v(s_kv=kv))[4:9] == ("verify", "paged", "window", True, "gqa")
+        assert pt.lookup(row, v(s_kv=kv)) is True and pt.matched_entry(row, v(s_kv=kv)).study == study
+        assert pt.lookup(row, v(s_kv=kv, b=1, h_q=16, h_kv=1)) is False  # one parallel tile: under the floor
+        assert pt.class_key(row, v(s_kv=kv, h_q=48))[8] == "gqa_partial"  # group 6 packs 2
+        assert pt.lookup(row, v(s_kv=kv, h_q=48)) is False  # 1024 parallel tiles: past the partial-pack ceiling
+        assert pt.lookup(row, v(s_kv=kv, h_q=48, b=4)) is True
+    assert pt.class_key(row, v(thd=True, max_total_seq_len_q=128 * 8))[4] == "prefill"
+    # a verify graph whose own class has no entry answers from its prefill entry, packed whole or in part
+    for h_q, group in ((64, "gqa"), (48, "gqa_partial")):
+        d128 = v(d_qk=128, d_v=128, h_q=h_q, h_kv=8, window_left=None, has_sink=False)
+        assert pt.class_key(row, d128)[4] == "verify" and pt.class_key(row, d128)[8] == group
+        fallback = pt._class_entry(pt.class_key(row, d128, verify=False))
+        assert fallback is not None and pt.matched_entry(row, d128) is fallback
+
+
+@pytest.mark.L0
 def test_sm107_paged_d128_unpacked_mtp_entries_follow_the_study():
     """Study sm107_d128_paged_mtp_unpacked_20261118 (Rubin): paged d128 MTP over the full cache at GQA groups the row cannot pack whole
     leads below cost 2^36.7 on the KV tile and below 2^9.25 query rows off it."""
@@ -1585,7 +1616,9 @@ def test_d576_mla_prefill_follows_its_study(s_kv):
     for row, cc, layouts in (("sdpa_fwd_prefill_sm100", (10, 0), (False,)), ("sdpa_fwd_prefill_sm107", (10, 7), (False,))):
         for paged in layouts:
             for over in (dict(), dict(b=16, h_q=24, s_q=8)):
-                assert pt.class_key(row, chunk(cc, paged, **over))[4] == "prefill"
+                # Rubin's padded-Q GQA verify keys `verify` and answers from the prefill entry while its own class has none
+                verify = row == "sdpa_fwd_prefill_sm107" and over
+                assert pt.class_key(row, chunk(cc, paged, **over))[4] == ("verify" if verify else "prefill")
                 assert pt.lookup(row, chunk(cc, paged, **over)) is True, (row, paged, over)
                 assert pt.matched_entry(row, chunk(cc, paged, **over)).study == study
     assert getattr(pt.matched_entry("sdpa_fwd_prefill_sm107", chunk((10, 7), True)), "study", None) != study

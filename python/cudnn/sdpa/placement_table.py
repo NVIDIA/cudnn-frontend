@@ -204,6 +204,15 @@ def _sm90_partial_pack(row: str, facts) -> bool:
     return pack is not None and 1 < pack < facts.h_q // facts.h_kv
 
 
+def _sm107_verify_partial_pack(row: str, facts) -> bool:
+    """Rubin padded-Q spec-decode verify whose GQA group the row packs only in part (2 of 6 or 10 heads, 4 of 12 per tile): group 6 ran
+    1.04-1.09x the backend at b >= 16 where whole packs ran 0.20-0.66 (sm107_d192x128_sink_verify_20261118), so it keys apart."""
+    if row != "sdpa_fwd_prefill_sm107":
+        return False
+    pack = _row_pack_group(row, facts)
+    return pack is not None and pack < facts.h_q // facts.h_kv
+
+
 def _sm120_paged_body(row: str, facts) -> bool:
     """SM120 paged d128 MTP / short prefill that the decode tile declines (packed rows past 32) runs the prefill body, which leads
     only once enough query rows are in flight; the decode tile's group rule does not transfer (sm120_paged_d128_body_20261117).
@@ -267,9 +276,10 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         # No study has qualified this new class yet, so it falls back to the existing backend-first order.
         # This is row/part-local: GB10 and every other row keep their existing classification and studies.
         phase = "prefill_short_square"
-    elif verify and row in _VERIFY_ROWS and facts.s_q <= _VERIFY_MAX_S_Q and facts.h_q != facts.h_kv:
+    elif verify and facts.s_q <= _VERIFY_MAX_S_Q and facts.h_q != facts.h_kv and (row in _VERIFY_ROWS or (row == "sdpa_fwd_prefill_sm107" and not facts.thd)):
         # SM80 / SM90 GQA spec-decode verify rows run the packed split-KV decode tile, a different regime from the prefill bodies the
         # older prefill studies of these rows measured (sm80_dense_prefill_*: s_q 8-16 GQA there predates SM80 split-KV, #2399).
+        # Rubin's padded-Q verify likewise; its THD-Q verify rides the THD leg and keeps the prefill classes.
         phase = "verify"
     else:
         phase = "prefill"
@@ -313,6 +323,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "gqa_body"
     if group == "gqa" and _sm100_short_window_d192(row, facts):
         group = "gqa_short"
+    if group == "gqa" and phase == "verify" and _sm107_verify_partial_pack(row, facts):
+        group = "gqa_partial"
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
     # an on-tile study never answers.
     kv_off_tile = facts.s_kv % 128 != 0
@@ -694,6 +706,23 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
         "le", 9.246, "sm107_d128_paged_mtp_unpacked_20261118", "rows"
+    ),
+    # study sm107_d192x128_sink_verify_20261118 (Rubin, cuDNN 9.30.0.8; mimo swa spec-decode verify: the inference benchmark's paged
+    # generation graph, page 16, padded Q, S_q 5-16, window 128 / 512 + attention sink; 768 train cells at groups 6-16, b 1-128, KV 8k /
+    # 128k on and off the tile; 48 holdout cells at fresh head pairs and windows, scored once). Groups the row packs whole lead from 2^2
+    # parallel tiles (holdout 0.464 / 0.381): under it, 12-25 us b 1-2 graphs, the study's event timing and the nightly's profiler disagree
+    # past 10% (amendment 2). Partial packs (gqa_partial) lead up to 2^6.5 parallel tiles (0.681 / 0.711).
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", False): Entry(
+        "ge", 2.0, "sm107_d192x128_sink_verify_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", True): Entry(
+        "ge", 2.0, "sm107_d192x128_sink_verify_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "verify", "paged", "window", True, "gqa_partial", False): Entry(
+        "le", 6.5, "sm107_d192x128_sink_verify_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "verify", "paged", "window", True, "gqa_partial", True): Entry(
+        "le", 6.5, "sm107_d192x128_sink_verify_20261118", "tiles"
     ),
     # study sm107_window_gaps_20261118 (208-SM Rubin, cuDNN 9.30.0.8; the inference benchmark's windowed paged generation graph, page 16,
     # bottom-right causal; mean of 100 cold launches under 1 ms; 2914 train cells at GQA 2-16, S_q 1-1024, windows 512-4096 + a 288-cell
