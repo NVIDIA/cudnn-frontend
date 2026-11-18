@@ -1,5 +1,7 @@
 # FROST SDPA — legacy support tracker
 
+Current D512 half backward batch/chunk limits are documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
+
 Current nonpaged D256 split physical-origin support is documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
 
 > **Historical reference; migration in progress.** Current support documentation

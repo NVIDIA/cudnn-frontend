@@ -2144,6 +2144,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # The budget is charged on the token rows (`t_rows`), so equal
             # lengths get the dense plan's chunk (see _SM100_WS_THD_PAD_SLACK).
             self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group, t_rows=self._t_q_cap)
+        from .kernels.sm100.d512_half_contract import grid_head_chunk
+
+        # Stage 3 flattens batch and the active head chunk into grid.z, also
+        # on THD. Workspace padding/budget alone does not bound that product.
+        self._qh_chunk = grid_head_chunk(self.batch_size, self.h_q, self._qh_chunk)
         # Dense operands bind their declared TMA pitches. Packed operands keep
         # their existing compact token/head contract; neither path stages IO.
         self._prepared = None
@@ -2168,6 +2173,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         error = cutedsl_requirement_error("SdpaBwdDslSm100")
         if error:
             raise NotImplementedError(error)
+        from .kernels.sm100.d512_half_contract import launch_error
+
+        error = launch_error(self.batch_size)
+        self._value_error_if(error is not None, error)
         self._value_error_if(self.head_dim_qk != self.head_dim_v, f"SM100 bwd: d_qk must equal d_v; got {self.head_dim_qk} / {self.head_dim_v}")
         self._value_error_if(not (256 < self.head_dim_qk <= 512), f"SM100 bwd: d must be in (256, 512]; got {self.head_dim_qk}")
         self._value_error_if(
