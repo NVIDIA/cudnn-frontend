@@ -397,6 +397,15 @@ def setup_cudnn_auto(args, dtype):
     return setup_cudnn(args, dtype, auto=True)
 
 
+def _make_fp8_input(shape):
+    tensor = torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn)
+    # Long-context page pools can fit in FP8 but exceed memory during an
+    # all-at-once float initialization. Limit the temporary to 16M elements.
+    for chunk in tensor.view(-1).split(1 << 24):
+        chunk.copy_(torch.randn(chunk.numel(), device=chunk.device).mul_(0.1))
+    return tensor
+
+
 def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     """FP8 attention graph (q/k/v e4m3 with unit descales) for the fp8-KV axis."""
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
@@ -411,7 +420,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     q_lens = kv_lens = table = None
     if paged:
         q_lens, kv_lens = request_lens(args)
-        k_gpu, v_gpu, table = _paged_pool(args, kv_lens, lambda shape: (torch.randn(*shape, device="cuda") * 0.1).to(f8))
+        k_gpu, v_gpu, table = _paged_pool(args, kv_lens, _make_fp8_input)
     elif args.kind == "mla_absorbed":
         rec = (torch.randn(b, skv, hkv, dqk, device="cuda") * 0.1).to(f8).transpose(1, 2)
         k_gpu, v_gpu = rec, rec[..., :dvo]
