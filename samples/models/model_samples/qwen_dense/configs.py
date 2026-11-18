@@ -9,8 +9,10 @@ family with another width is not that row's, and the next row is asked.  The who
 reference chain or a multiply over a dequantised copy; ``band`` is the tie-out band of the row against the reference block
 (``model_samples.tie_out.BANDS``) and is never widened in place.  ``form`` is what the row's adapter passes to its entry: fields
 of the entry's own form, which the kernel check compares with the entry's answer.  A row whose entry a step calls in several
-forms names them by call site (``sites``; the call sites of this family's wiring: ``QwenDense.sites``).  A stack adds its
-rows here; it removes none.
+forms names them by call site (``sites``; the call sites of this family's wiring: ``QwenDense.sites``).  A row may serve
+some call sites of its block only: it names every other site without fields, and the calls there are served by the next
+row of the stack that serves the run -- the plan then prints the block once per call site.  A stack adds its rows here;
+it removes none.
 
 The stacks:
 
@@ -24,7 +26,15 @@ The stacks:
   area's GPU test runs.  Until ``native`` has such a row the two stacks are the same rows;
 * ``reference`` -- every block in plain PyTorch.
 
-``readme_table()`` renders the tables as the family README shows them; a host test keeps the two in agreement.
+A plan is resolved for a number of tokens per sequence.  One is the decode step.  More is the verify step of speculative
+decoding (``Session(tokens=T)``): the linear-attention block is then the fused verify entry's row of that count, and every
+other block is the row its own ranges give at ``sequences x T`` rows -- a row that does not hold the count falls to the
+next one, as at any other row count.  One block has rows for such a step alone: the out-projection, whose
+linear-attention call the target runs on the FP8 projection kernel in a verify step, in a split that follows the rows of
+the step (``VERIFY_OUT_ROWS``).
+
+``readme_table()`` renders the tables of the decode step as the family README shows them; a host test keeps the two in
+agreement.
 """
 
 from __future__ import annotations
@@ -64,11 +74,113 @@ PROJECTION_SITES = (
     ("full_attention.qkv", (("OUT_FEATURES", 14336), ("IN_FEATURES", 5120))),
 )
 
+#: the out-projection of a layer, by call site of the wiring: the layer's kind.  Both kinds multiply by a weight of one
+#: shape, 5120 x 6144.  In a step of several tokens per sequence the target runs the FP8 projection kernel for the
+#: linear-attention layers' call and a library multiply for the attention layers': a row of that kernel names the weight's
+#: shape at the first site and hands the second on to the next row of its stack (``None`` in place of the fields)
+OUT_PROJECTION_SITES = (
+    ("linear_attention.out", (("OUT_FEATURES", 5120), ("IN_FEATURES", 6144))),
+    ("full_attention.out", None),
+)
+
+#: the out-projection of a linear-attention layer in a step of several tokens per sequence, by the rows of the step
+#: (sequences x tokens): (GPU classes, first row count, last row count, K slices, weight tile, ring stages, token tile).
+#: The target chooses the split of this kernel by the row count on compute capability 10.0 -- two K slices and a ring of 11
+#: stages up to 8 rows, four slices and 7 stages from 9 to 16, and its library multiply from 17 -- and runs four slices at
+#: every row count from 2 to 32 on the other 10.x classes.  A split is a numerics attribute of the entry and fixed per
+#: entry instance, so each range is a row of its own, and the rows of two splits are two byte classes: the bytes of a
+#: step change where its rows cross from one range into the next, by design.  The token tile follows the row count in the
+#: target kernel and in the entry (the smallest of 8 / 16 / 32 that holds the rows); the entry takes it as a floor of its
+#: form, so a row names the tile of its range and the call log of a step shows it for the row count of each call
+VERIFY_OUT_ROWS = (
+    (("cc10.0",), 2, 8, 2, 64, 11, 8),
+    (("cc10.0",), 9, 16, 4, 64, 7, 16),
+    (("cc10.3", "cc10.7"), 2, 8, 4, 64, 7, 8),
+    (("cc10.3", "cc10.7"), 9, 16, 4, 64, 7, 16),
+    (("cc10.3", "cc10.7"), 17, 32, 4, 64, 7, 32),
+)
+
 #: the fused gate / up kernel of the MLP by row count: the target runs the narrowest of its four token tiles that holds the
 #: rows of a step, so the token tile is a field of the form and the block has one row per tile: (first row count, last
 #: row count, token tile).  A launch record does not show the tile -- the grid and the block are the same at all four,
 #: the shared memory at three -- so it is held on the objects and in the kernel's symbol
 GATE_UP_TILES = ((1, 8, 8), (9, 16, 16), (17, 32, 32), (33, 64, 64))
+
+#: the fused verify step of a linear-attention layer by tokens per sequence: the step shape is a compile-time fact of its
+#: kernel and a field of the form (``TOKENS``), so the block has one row per count: (tokens per sequence, last sequence
+#: count).  The target runs it up to 16 sequences, and up to 4 from six tokens per sequence; eight tokens is what every
+#: form of the entry holds on the classes it serves.  A step shape beyond these has no row: the plan declines it by name
+VERIFY_STEPS = tuple((tokens, 16 if tokens < 6 else 4) for tokens in range(2, 9))
+
+
+def _verify_out_rows(stack):
+    """The rows of the FP8 projection entry for the out-projection of a step of several tokens per sequence in ``stack``, one
+    per range of :data:`VERIFY_OUT_ROWS`: the linear-attention layers' call on the entry, the attention layers' call
+    handed on to the next row."""
+    return [
+        ProviderRow(
+            classes,
+            (1, None),
+            (2, None),  # a step of several tokens per sequence: at one token the target runs a library multiply for this block
+            "fe.fp8_projection_decode",
+            stack,
+            # every row of a class names the range of all of them, so a decline says what the entry serves there, not one range of it
+            serves=f"rows {first}-{last} of 2-{max(end for group, _, end, *_ in VERIFY_OUT_ROWS if group == classes)} of a step of several tokens per sequence, "
+            "the linear-attention layers' weight 5120 x 6144",
+            band="bf16_rounding",
+            # the class this geometry of the entry has run on (its determinism row: verified on compute capability 10.0,
+            # admitted and unverified on the other 10.x classes)
+            batch_invariant=tuple(c for c in classes if c == "cc10.0"),
+            # the target's kernel for this call, stated whole and never left to the entry's pick: the K slices and the ring
+            # depth of the row range, the weight tile of 64 rows, the token tile of the range, the weight stream issued
+            # ahead of the wait; launched as a dependent of its predecessor -- the fused verify step, which releases its
+            # successor at entry: this kernel starts under it, streams its weight and waits for it right before it reads the
+            # 8-bit codes -- and releasing its successor after its last weight issue.  The two fields the entry owns are
+            # at the values its byte comparison with the target's kernel ran for these two classes: 32 tensor-memory
+            # columns, released after the values read from them are consumed.  The launch before it must not write the
+            # weight or the scale: both are constants of the layer.  The launch after it reads its rows: the norm in
+            # front of the MLP carries the attribute and waits first (its row says so)
+            form=(
+                ("SPLIT_K", split),
+                ("MMA_M", tile),
+                ("STAGES", stages),
+                ("TOKEN_TILE", token_tile),
+                ("TMEM_COLS", 32),
+                ("PREWAIT_WEIGHTS", True),
+                ("HOLD_TMEM", True),
+                ("PDL", True),
+                ("PDL_RELEASE", True),
+            ),
+            rows=(first, last),
+            sites=OUT_PROJECTION_SITES,
+            # the layer widths the weight's shape follows from (the published model's).  A checkpoint of the family with
+            # another width keeps the block on the multiply over a copy below, and its run states no kernel identity
+            widths=(("hidden", 5120), ("la_value_heads", 48), ("la_head_dim", 128)),
+        )
+        for classes, first, last, split, tile, stages, token_tile in VERIFY_OUT_ROWS
+    ]
+
+
+def _verify_rows(stack, form, batch_invariant=()):
+    """The rows of the fused verify entry for ``stack``, one per tokens count of :data:`VERIFY_STEPS`, in the launch form
+    ``form`` (the two launch knobs; the row adds its ``TOKENS``)."""
+    return [
+        ProviderRow(
+            ("cc10.x", "cc12.x"),
+            (1, last),
+            (tokens, tokens),
+            "fe.gdn_verify_fused",
+            stack,
+            serves=f"{tokens} tokens per sequence of 2-8, sequences 1-{last}",
+            band="gdn_step",
+            # no class is listed: the entry states replay-identical bytes and no batch invariance between one sequence
+            # and several (its adapter carries the statement, and a run prints it)
+            batch_invariant=batch_invariant,
+            form=(*form, ("TOKENS", tokens)),
+        )
+        for tokens, last in VERIFY_STEPS
+    ]
+
 
 PROVIDERS = {
     "embedding": [ProviderRow(*ANY, "torch.index_select", EVERY, serves="any")],
@@ -172,9 +284,21 @@ PROVIDERS = {
             # not write this layer's state: in this stack that launch is the in-projection's, as in the target
             form=(("PDL", True), ("PDL_RELEASE", True)),
         ),
+        # a step of several tokens per sequence (the verify step of speculative decoding): the fused verify entry, in the
+        # launch form of the stack's decode row above -- launched without a wait and without an early release in the
+        # reference path; as a dependent of the in-projection that releases its successor at entry in the target's form
+        # (the launch before it must not write this layer's state, its history or the slot table: in these stacks it is
+        # the in-projection's, as in the target).  The reference chain below serves both kinds of step
+        *_verify_rows("fe-cublas", (("PDL", False), ("PDL_RELEASE", False))),
+        *_verify_rows(TARGET_STACKS, (("PDL", True), ("PDL_RELEASE", True))),
         ProviderRow(*ANY, "torch_ref.gdn_decode_step", "reference", serves="any", fallback="reference"),
     ],
     "projection.fp8.out": [
+        # a step of several tokens per sequence (the verify step of speculative decoding): the linear-attention layers'
+        # call on the FP8 projection entry, in the split of the step's rows; the attention layers' call is the next
+        # row's.  A step of one token per sequence, a step of more rows than the ranges hold, another class and another
+        # width are the multiply over a copy below, at both call sites
+        *_verify_out_rows(TARGET_STACKS),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 8-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
@@ -302,28 +426,31 @@ CHECKPOINT_LOGITS_BAND_UNITS = None
 
 def readme_table(calls: dict, stack: str = "fe-cublas", cc=(10, 0)) -> str:
     """The block table of the family README (markdown) for ``stack`` on compute capability ``cc``, with ``calls`` per step of
-    the full model: per block the first row of the stack that serves the class, with the form its entry is called in."""
+    the full model: per block the first row of the stack that serves the class in a step of one token per sequence -- the
+    decode step -- with the form its entry is called in."""
     from ..providers import ENTRY_NAMES
 
     lines = ["| block | calls per step (64 layers) | provider key | entry [form] |", "|---|---|---|---|"]
     for block, rows in PROVIDERS.items():
-        row = next(r for r in rows if stack in r.stacks and r.serves_class(cc))
-        forms = f" + one of {len(row.sites)} forms, by call site" if row.sites else ""
+        row = next(r for r in rows if stack in r.stacks and r.serves_class(cc) and r.tokens[0] <= 1)
+        forms = f" + one of {len(row.served)} forms, by call site" if row.sites else ""
         entry = ENTRY_NAMES[row.key] + form_text(row.form) + forms + (f", fallback: {row.fallback}" if row.fallback else "")
         lines.append(f"| {BLOCK_TITLES[block]} | {calls[block]} | `{row.key}` | {entry} |")
     return "\n".join(lines)
 
 
 def readme_sites(model, stack: str = "native", cc=(10, 0)) -> str:
-    """The call-site table of the family README (markdown): for every row of ``stack`` on ``cc`` that names call sites, the
-    form of each site and how many calls of a step of ``model`` are made there."""
+    """The call-site table of the family README (markdown): for every row of ``stack`` on ``cc`` that names call sites in a
+    step of one token per sequence, the form of each site and how many calls of a step of ``model`` are made there."""
     from collections import Counter
 
     calls = Counter(zip((block for block, _ in model.wiring()), model.sites()))
     lines = ["| block | call site | calls per step (64 layers) | form of the entry there |", "|---|---|---|---|"]
     for block, rows in PROVIDERS.items():
-        row = next(r for r in rows if stack in r.stacks and r.serves_class(cc))
+        row = next(r for r in rows if stack in r.stacks and r.serves_class(cc) and r.tokens[0] <= 1)
         for site, fields in row.sites:
+            if fields is None:  # a call site the row hands on to the next row: no form of this row there
+                continue
             lines.append(f"| {BLOCK_TITLES[block]} | `{site}` | {calls[(block, site)]} | {form_text(fields).strip()} |")
     return "\n".join(lines)
 

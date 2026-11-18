@@ -41,6 +41,12 @@ per site the further fields of the entry's form there), and the family names the
 instance of that form, and the call log says which instance served it.  A call served by the instance of a neighbouring
 form fails item 0 with its own sentence, although the kernel's name and launch shape may be the same.
 
+**A block whose calls several rows serve.**  A provider row may serve some call sites of its block and hand the others on
+to the next row (``ProviderRow.sites``: a site without fields); the plan then holds one part per call site
+(``Plan.at``, ``Plan.parts``).  Everything here that reads a row or a block of a call reads the part of that call's
+site: its census entries, its form, its entry's facts and its identity.  So a block can be an exact kernel at one call
+site and a fallback family at another, and both tables print one line per part, ``<block> at <call site>``.
+
 **A kernel name proves nothing about a form.**  A generated kernel symbol is the kernel's name followed by the text of its
 compile-time arguments, cut at a fixed length: two forms of one kernel can share a symbol, and they can share a launch shape
 too.  So the form is compared on the objects (item 0), never read out of a name; the name and the launch shape (item 5) show
@@ -61,6 +67,10 @@ has a seventh item:
 
 7. Every launch of a block call whose identity is ``target`` has the launch shape the census recorded for it on this GPU
    class, SM count and row count.
+
+A census holds one configuration per kind of step: ``plain`` for the decode step (one token per sequence) and ``verify``
+for the step that feeds several (:func:`configuration_of`); a section of the latter also names the tokens per sequence it
+was recorded with, and holds for no other count.
 
 and one more line: ``target census <configuration> / <class> (recorded <date>): EQUAL (<what was compared>)``, or
 ``NOT CLAIMED (<reasons>)``.  Either way the line says how many launches of a step were compared by launch shape -- as three
@@ -174,6 +184,7 @@ class Site:
 #: pattern in the same change: an unnamed kernel fails the kernel check by name.
 FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("gdn_decode_fused", re.compile(r"^cudnn_kernel_frost_gdn_decode_fused_")),
+    ("gdn_verify_fused", re.compile(r"^cudnn_kernel_frost_gdn_verify_fused_")),
     ("gate_quant", re.compile(r"^cudnn_kernel_frost_attention_gate_quant_")),
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
@@ -318,21 +329,40 @@ def call_sites(model) -> Tuple[str, ...]:
     return sites
 
 
+def _part(plan, block: str, site: str = "") -> tuple:
+    """``(row, block)`` of what serves the call of ``block`` at ``site`` in ``plan`` (``Plan.at``): the block's own row and
+    block, or -- where several rows serve its calls by call site -- those of that site."""
+    at = getattr(plan, "at", None)
+    return at(block, site) if callable(at) else (plan.rows[block], plan[block])
+
+
+def _parts(plan) -> list:
+    """``(label, block name, call site, row, block)`` of everything that serves ``plan`` (``Plan.parts``): one per block,
+    and one per call site of a block whose calls several rows serve."""
+    parts = getattr(plan, "parts", None)
+    return parts() if callable(parts) else [(name, name, "", plan.rows[name], block) for name, block in plan.items()]
+
+
 def expected(plan, model, rows: Optional[int] = None) -> List[Site]:
     """The block calls of one step in the model's wiring order (``model.wiring()``), each with its block's census entries, the
     provider row's form at that call site (``ProviderRow.site_form``) and -- for an entry that states its launch -- the entry's
-    facts there at ``rows`` (default: the plan's sequences x tokens).  An entry that declines to state them for a row count
+    facts there at ``rows`` (default: the plan's sequences x tokens).  The row and the block are those of the call's site
+    (``Plan.at``): where several rows serve the calls of a block, each call has the census entries of its own row.  An entry that declines to state them for a row count
     its row claims, or a call site the row has no form for, is recorded on the site (``wrong``): the check then fails,
     because the table is wrong."""
     rows = plan.sequences * plan.tokens if rows is None else rows
     stated: Dict[Tuple[str, str], Tuple[tuple, Optional[Facts], str]] = {}
     sites = []
     for (name, layer), at in zip(model.wiring(), call_sites(model)):
-        block = plan[name]
+        unserved = ""
+        try:
+            row, block = _part(plan, name, at)  # of this call's site, for a block whose calls several rows serve
+        except ValueError as error:  # a call site no row of the block names: the block as a whole, and the table is wrong
+            row, block, unserved = plan.rows[name], plan[name], str(error)
         if (name, at) not in stated:
-            form, facts, wrong = (), None, ""
+            form, facts, wrong = (), None, unserved
             try:
-                form = tuple(plan.rows[name].site_form(at))
+                form = () if wrong else tuple(row.site_form(at))
             except ValueError as error:
                 wrong = str(error)
             if not wrong and any(kernel.shape == "entry" for kernel in block.kernels):
@@ -606,6 +636,16 @@ FIRST_LAYER = "first_layer"
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
 
 
+#: the configurations of a census: the decode step, and the step of several tokens per sequence
+PLAIN, VERIFY = "plain", "verify"
+
+
+def configuration_of(plan) -> str:
+    """The configuration of a census that a plan is held against: ``plain`` for a plan of one token per sequence (the decode
+    step), ``verify`` for a plan of several (the verify step of speculative decoding)."""
+    return PLAIN if getattr(plan, "tokens", 1) == 1 else VERIFY
+
+
 class Identity(NamedTuple):
     """How one block call of a plan stands to the target kernel set: it launches the target's kernel in the target's form
     (``target``, of kind ``code`` or ``port``), a declared stand-in for it, a fallback row (``not yet``), another kernel or
@@ -679,6 +719,7 @@ class Claim:
     identities: List[Identity] = field(default_factory=list)  # one per call; empty where no section holds this run's row count
     absent: List[Tuple[str, str, str]] = field(default_factory=list)  # (block, kernel, kind) of the target that the plan has no block for
     reasons: List[str] = field(default_factory=list)  # why the class is not claimed; empty: it is
+    sites: List[str] = field(default_factory=list)  # the call site of every call of the wiring ("" for a block that names none)
 
     @property
     def known(self) -> bool:
@@ -698,10 +739,11 @@ class Claim:
         ``target`` or ``stand-in`` and whose launch the census records (item 7 of the kernel check)."""
         return {index: identity.launch for index, identity in enumerate(self.identities) if identity.relation in (TARGET, STAND_IN) and identity.launch}
 
-    def of(self, block: str) -> str:
-        """The identity column of a block: the identity of its calls (one for every block of a family so far); ``--`` for the
-        host path."""
-        mine = [identity for name, identity in zip(self.blocks, self.identities) if name == block]
+    def of(self, block: str, site: Optional[str] = None) -> str:
+        """The identity column of a block: the identity of its calls (of its calls at ``site``, for a part of a block whose
+        calls several rows serve); ``--`` for the host path."""
+        at = self.sites if len(self.sites) == len(self.blocks) else [""] * len(self.blocks)
+        mine = [identity for name, where, identity in zip(self.blocks, at, self.identities) if name == block and site in (None, where)]
         return "; ".join(dict.fromkeys("--" if identity.relation == HOST else identity.text() for identity in mine))
 
     def numbers(self) -> dict:
@@ -800,7 +842,8 @@ class Target:
     * ``layers``: which entry list of a section a layer kind of the model reads;
     * ``configurations``: per configuration and per ``ccMAJOR.MINOR/smCOUNT`` a section: ``claimed``, its ``basis``
       (``recorded`` or ``planned``), what was recorded, ``geometry`` -- the layer widths of the model it holds for, under
-      the names of the family's geometry -- and per row count the entries of a step as ``[block, kernel id, facts]``,
+      the names of the family's geometry -- ``tokens`` -- the tokens per sequence of the step it holds for, where that
+      is more than one -- and per row count the entries of a step as ``[block, kernel id, facts]``,
       before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
       ``launch`` = ``[grid, block, shared memory]``, ``at`` = further fields of the geometry that this one launch
       shape was recorded with, and ``form`` = the fields of the kernel's form the target passes at this call beyond the
@@ -855,6 +898,9 @@ class Target:
                     wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number)")
                 if section["claimed"] and not geometry:
                     wrong(f"{where}: claimed without the layer widths it holds for")
+                tokens = section.get("tokens", 1)
+                if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1 or (tokens == 1) != (configuration != VERIFY):
+                    wrong(f"{where}: tokens is the tokens per sequence of the section's step: more than one in {VERIFY}, one (or absent) elsewhere")
                 for rows, parts in section["rows"].items():
                     first = parts.get(FIRST_LAYER, {})
                     if not isinstance(first, dict) or not all(isinstance(facts, dict) and set(facts) <= set(ENTRY_FACTS) for facts in first.values()):
@@ -923,9 +969,10 @@ class Target:
         key = f"cc{plan.facts.cc[0]}.{plan.facts.cc[1]}/sm{plan.facts.sm_count}"
         sections = self.data["configurations"].get(configuration, {})
         section = sections.get(key)
-        claim = Claim(self.name, configuration, _class_text(key), rows, blocks=[block for block, _ in wiring])
+        claim = Claim(self.name, configuration, _class_text(key), rows, blocks=[block for block, _ in wiring], sites=list(call_sites(model)))
         reasons = [f"not the target set: {block} selected by --provider" for block in getattr(plan, "overridden", ())]
-        if any(plan.rows[block].fallback for block in dict.fromkeys(claim.blocks)):
+        called = set(claim.blocks)
+        if any(row.fallback for _, block, _, row, _ in _parts(plan) if block in called):
             reasons.append("fallback rows present")
         if section is None:
             have = ", ".join(_class_text(other) for other in sections) or "none"
@@ -934,13 +981,16 @@ class Target:
             claim.recorded_on, claim.basis, claim.claimed = str(section.get("recorded", {}).get("date", "")), section["basis"], section["claimed"]
             parts = section["rows"].get(str(rows))
             widths = _other_widths(section["geometry"], model.geometry)
+            tokens = getattr(plan, "tokens", 1)
             if widths:  # a model of the family with other layer widths: other grids, and where an entry picks by width other kernels
                 reasons.append(f"no recorded section for this model's widths on {claim.device}: {widths}")
+            elif section.get("tokens", 1) != tokens:  # a step of another tokens count per sequence: another kernel form, other launch shapes
+                reasons.append(f"no recorded section for {tokens} tokens per sequence on {claim.device}: recorded is {section.get('tokens', 1)}")
             elif parts is None:
                 have = [f"{count} row{'s' if count != '1' else ''}" for count in section["rows"]]
                 reasons.append(f"no recorded section for {rows} row{'s' if rows != 1 else ''} on {claim.device}: recorded is {' and '.join(have) or 'none'}")
             else:
-                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds), model.geometry, call_sites(model))
+                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds), model.geometry, claim.sites)
                 found = []  # per call, so that a block that is the target's at one call site and not at another is named
                 for block, identity in zip(claim.blocks, claim.identities):
                     if identity.relation == OTHER and block not in getattr(plan, "overridden", ()):
@@ -969,7 +1019,10 @@ class Target:
         disagreement of the two orders is a ``ValueError``."""
         position = 0
         for index, (block, _) in enumerate(wiring):
-            declared = tuple(plan[block].kernels)
+            try:
+                declared = tuple(_part(plan, block, sites[index] if index < len(sites) else "")[1].kernels)
+            except ValueError:  # a call site no row of the block names: said by the identity of the call, below
+                declared = tuple(plan[block].kernels)
             if declared and all(kernel.relation == "host" for kernel in declared):
                 claim.identities.append(Identity(HOST))
                 continue
@@ -990,8 +1043,12 @@ class Target:
             claim.absent.append((block, kernel_id, self.kind(kernel_id)))
 
     def _identity(self, plan, block: str, kernel_id: str, facts: Mapping, geometry=None, site: str = "") -> Identity:
-        meta, row, kind = self.data["kernels"][kernel_id], plan.rows[block], self.kind(kernel_id)
-        exact = [kernel for kernel in plan[block].kernels if kernel.relation == "exact"]
+        meta, kind = self.data["kernels"][kernel_id], self.kind(kernel_id)
+        try:
+            row, part = _part(plan, block, site)  # of this call's site, for a block whose calls several rows serve
+        except ValueError as error:  # the wiring calls the block at a site no row of it names
+            return Identity(OTHER, kernel_id, kind, str(error))
+        exact = [kernel for kernel in part.kernels if kernel.relation == "exact"]
         if not exact:
             return Identity(NOT_YET, kernel_id, kind, row.fallback or "no kernel of its own")
         if len(exact) != 1 or exact[0].id != kernel_id:
@@ -1131,8 +1188,11 @@ class Traced:
             return lines
         named = {site.block for site in self.sites if site.site and site.facts is not None}
         counts: Dict[str, Counter] = {}
-        for call in self.call_log[0]:
-            if call.block in named:
+        for index, call in enumerate(self.call_log[0]):
+            # the call's own place of the wiring, where the step made the wiring's calls: a call at a site that no entry
+            # serves (another row's site of a block several rows serve) has no instance to count
+            at = self.sites[index] if index < len(self.sites) and (self.sites[index].block, self.sites[index].layer) == (call.block, call.layer) else None
+            if call.block in named and (at is None or at.facts is not None):
                 counts.setdefault(call.block, Counter())[(call.instance, tuple(call.form))] += 1
         for block, by_instance in counts.items():
             parts = "; ".join(f"{count} x {instance or 'no entry instance'}{form_text(form)}" for (instance, form), count in by_instance.items())
@@ -1200,13 +1260,15 @@ def table(plan, claim: Optional[Claim] = None) -> str:
     """The kernel table, first part: planned.  Per block the census entries of its row -- which kernels a call launches and
     how the kernel check will judge them -- decided from the plan alone, before anything is loaded.  With the ``claim`` of a
     stack that declares a target kernel set, a last column says how each block stands to the target, and the lines under the
-    table how much of the target the plan launches."""
+    table how much of the target the plan launches.  A block whose calls several rows serve by call site has one line per
+    site, ``<block> at <call site>``, with the row, the entry and the whole form of that site."""
     stated = claim is not None and claim.known  # the identity column is printed where the census holds this run
     head = ("block", "calls", "provider", "entry [form]", "kernel", "launches", "checked") + (("identity",) if stated else ())
     lines = [head]
     exact = rows = chains = 0
-    for name, block in plan.items():
-        row, calls = plan.rows[name], plan.calls.get(name, "")
+    parts = _parts(plan)
+    for label, name, site, row, block in parts:
+        calls = plan.calls.get(label, "")
         kernels = tuple(block.kernels)
         launches, checked = "--", "nothing declared"
         if any(kernel.relation == "exact" for kernel in kernels):
@@ -1219,16 +1281,20 @@ def table(plan, claim: Optional[Claim] = None) -> str:
         elif kernels:
             chains += _total(calls)
             checked = "by family" + (f"; fallback: {row.fallback}" if row.fallback and claim is None else "")
-        forms = f" + one of {len(row.sites)} forms, by call site" if row.sites else ""
-        cells = (name, calls, block.provider, block.entry + form_text(row.form) + forms, ", ".join(kernel.id for kernel in kernels) or "--", launches, checked)
-        lines.append(cells + ((claim.of(name),) if stated else ()))
+        # a part of a block several rows serve is one call site: its form is printed whole.  A row that serves every call
+        # of its block in a form per call site prints the fields they share, and the sites under the table
+        forms = f" + one of {len(row.served)} forms, by call site" if row.sites and not site else ""
+        form = row.site_form(site) if site else row.form
+        cells = (label, calls, block.provider, block.entry + form_text(form) + forms, ", ".join(kernel.id for kernel in kernels) or "--", launches, checked)
+        lines.append(cells + ((claim.of(name, site or None),) if stated else ()))
     widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
     sms = f", {plan.facts.sm_count} SMs" if plan.facts.sm_count else ""
-    run = f"stack {plan.stack}, {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}, {plan.facts.class_text}{sms}"
+    several = plan.tokens_text() if hasattr(plan, "tokens_text") else ""
+    run = f"stack {plan.stack}, {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}{several}, {plan.facts.class_text}{sms}"
     text = [f"kernels, planned (decided before the load from {plan.source}; {run})"]
     text += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in lines]
-    for name in plan:  # a row whose entry is called in several forms: the form of every call site it names
-        text += [f"  {name} at {site}:{form_text(fields)}" for site, fields in plan.rows[name].sites]
+    for _, name, site, row, _ in parts:  # a row whose entry is called in several forms: the form of every call site it serves
+        text += [f"  {name} at {at}:{form_text(fields)}" for at, fields in row.sites if fields is not None and not site]
     text.append(
         f"  per step: {exact} launch{'es' if exact != 1 else ''} on {rows} exact row{'s' if rows != 1 else ''}, checked one by one in the wiring order; "
         f"the launches of {chains} fallback call{'s' if chains != 1 else ''} and of the host path are attributed by family"
@@ -1244,11 +1310,10 @@ def stated(plan, rows: Optional[int] = None) -> str:
     entry's own pick is its answer, not a choice of the table."""
     rows = plan.sequences * plan.tokens if rows is None else rows
     text = [f"kernels, as the entries state them (after the load; {rows} row{'s' if rows != 1 else ''}; never a row of the table)"]
-    for name, block in plan.items():
+    for _, name, at, row, block in _parts(plan):
         if not any(kernel.shape == "entry" for kernel in block.kernels):
             continue
-        row = plan.rows[name]
-        for site in [site for site, _ in row.sites] or [""]:  # an entry that is called in several forms states each one's launch
+        for site in [at] if at else list(row.served) or [""]:  # an entry that is called in several forms states each one's launch
             where = f"{name} at {site}" if site else name
             try:
                 facts = block.launch_facts(rows, site) if site else block.launch_facts(rows)

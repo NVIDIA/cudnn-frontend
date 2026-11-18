@@ -36,6 +36,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 
 from cudnn.frost.compiled_cache import compile_cached
@@ -623,7 +624,8 @@ def run_chain_forward(
 ) -> None:
     """Launch the compiled chain with the current buffers and stream."""
     buffers = locals()
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

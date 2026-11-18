@@ -1691,3 +1691,11 @@ compare with overrides removed. A selected-backend log on stderr may not
 propagate to pytest's `caplog` under Torch's logging configuration; missing
 captured text does not establish a routing failure. The varlen explicit-KV
 length fallback test checks the cuDNN operator and forwarded length tensor.
+
+For a native SDPA candidate-compilation regression, test each offered backend
+candidate before testing the first-success and ALL build policies. A valid
+fallback can otherwise hide a first candidate that fails compilation. Preserve compilation
+errors, and check that retained alternatives execute against an independent
+reference. Include neighboring dense/prefill and backward controls rather than
+asserting a fixed engine order. Detector:
+`sdpa/frost/test_sdpa_native_decode_candidates.py` (#1084).
