@@ -806,7 +806,7 @@ A session built with `draft_tokens=` feeds its prompt through decode steps and r
 
 The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDrafter.body`, `propose`, `draft`; the table
 `configs.DRAFTER_PROVIDERS`; the keys `torch_ref.pre_fc_norm_quantize`, `torch_ref.gate_row_quantize`,
-`torch_ref.silu_mul`, `torch_ref.quantize`, `torch.argmax+lookup`). No session runs it yet. What building it showed:
+`torch_ref.silu_mul`, `torch_ref.quantize`, `torch.argmax+lookup`). What building it showed:
 
 - A quantiser per row of a step is a third rule beside the loader's two, and it is pinned to its operation like them.
   The static scale of the model's activations multiplies by a reciprocal that is one number per operand, a constant
@@ -864,3 +864,60 @@ The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDraft
 - What a load keeps for today's blocks is said where the load is shown. The reference blocks multiply on bf16 copies
   that a kernel on the codes will not need; a default load makes them, the manifest's last line counts them, and the
   argument that leaves them out is named in the same sentence.
+
+## What the speculative step taught
+
+A session that is handed the drafter runs the whole step of speculative decoding (`Session(drafter=)`,
+`Session.speculate`: the drafter's passes, one verify step, one host read; `tie_out.speculative_checks` with
+`drafter cache` and `draft proposals`). What building it showed:
+
+- The cut of a step follows the one host read. The count a step keeps is decided on the host, after the read, and the
+  first pass of the drafter needs that count: so a step is passes, verify step, read, and the acceptance follows the
+  read. The first step of a run then has no verify step in front of it and its first pass runs at one row per
+  sequence; every text that states the rows of a first pass says which step it means.
+- What the drafter reads of the step before it is state, and it goes where the state goes. The final-norm rows, the
+  greedy ids, the kept count and the drafter's cache are reset, snapshotted and restored with the model's state; a
+  cache kept beside the state would have carried the first prompt set into the second, and nothing reads a stale
+  position as an error -- an unwritten or a stale position is read as what it holds.
+- For the same reason a step that would leave the cache behind is refused, not allowed: `verify` on a session with a
+  drafter would run the model's step without the passes in front of it, and the next first pass would then go on
+  from a position nothing wrote. The step with the caller's drafted tokens is `speculate(force=)`, where the drafter
+  runs all the same.
+- A check that calls the function it checks holds nothing. The second run of the passes never calls `draft`: it
+  writes the passes out at one row per call from its own books of kept tokens and rows. And because both runs call
+  the same blocks, its two lines hold what a step hands its passes -- rows, tokens, positions, the row a step goes
+  on from -- and no arithmetic; the text beside them says so.
+- Each of the two lines sees what the other cannot. A first pass one position off, a prompt position without its
+  pass, a drafted token where the kept one belongs and the rows of an older step fail `drafter cache`; the row
+  select at row 0 and a later pass on the wrong row, the wrong proposal or the wrong position leave the cache up to
+  the last kept position as it must be and fail `draft proposals` alone. Eight wrong passes, each in a loop that
+  still emits the plain session's ids, hold that split in a host test.
+- The window of a step is the session's. With `verify` the caller builds the window, so a loop that emits a drafted
+  token feeds it back and the token line fails; with `speculate` the window starts with the session's own greedy
+  token, the emitted token goes nowhere but the output, and no line of the comparison sees it: the run's ids
+  against the plain run's do.
+- A traced step is the step the loop runs. The window and the pair are a concatenation each, launched between the
+  passes and the model's step and behind it; a traced pass that replayed the recorded window through the verify step
+  alone would have held a step no loop runs. The traced step is `speculate`'s own code, fed the recorded drafted
+  tokens, and its one host read is the pair's.
+- An index into a wiring moves when the wiring grows in front. The census records launch shapes by the index of a
+  site of the model's wiring; with the passes' sites in front of them an index that is not shifted names a site of a
+  pass, where no exact launch stands, and the shape is then held against nothing -- silently. `Traced.first` shifts
+  it, and the host test holds a launch in another shape at the model's site with both of its sentences.
+- The comparison counts the launches of one kernel id; it does not place them. The embedding lookups of the passes
+  and of the model are one id, so a lookup more is named with the count of the step and the plan, in front of the
+  run that matches, and a lookup less is named at the first pass.
+- An arm that shifts an input is not an arm that takes it away -- again. On the checkpoint the loop kept 3.22 tokens
+  a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, with the two halves in
+  front of the first multiply exchanged 1.00; with a later pass one position off, 3.25. Acceptance does not see that
+  shift at all: the line that holds the positions of the later passes is `draft proposals`, on bytes and ids.
+- Working memory is stated as arithmetic on what a pass holds at a time, then measured. A reference multiply
+  accumulates a chunk of the weight in fp64; the allowance of a pass is twice the largest such chunk, 1.33 GiB at the
+  published widths -- not a share of what the drafter holds. On the checkpoint the run asked for about 43.3 GiB,
+  reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
+- The counts of a run live with its record. The comparison resets the session and puts its record back; the kept
+  counts of the acceptance lines are part of that record, so a report printed behind the comparison is still the
+  run's. Every step counts in full, the last one included, whose tokens behind an end token are not emitted.
+- No count of the launches of a pass is stated, in any text, while no census section holds a draft pass: the kernel
+  check attributes them, the run says "kernel identity of the drafter's passes: not stated", and a count of block
+  calls -- 18 a pass -- is the wiring's.

@@ -72,7 +72,10 @@ integer), the prompt (what every layer stands on behind it, byte for byte: both 
 rejected rows (a second replay with other tokens behind the kept ones leaves every kept row as it was) -- and ``bytes``,
 gated where a verify step is that many decode steps of one chain (the reference stack) and REPORTED elsewhere.  A
 comparison of greedy tokens alone does not see a position that is off by one or a kept row that read a rejected token
-where a model's token does not follow its state; those three lines are there for that.
+where a model's token does not follow its state; those three lines are there for that.  For a session with a drafter
+the comparison also writes the drafter's passes out a second time, at one row per call from books of its own, and holds
+the session's passes to them: ``drafter cache`` and ``draft proposals`` -- what a step hands its passes, not the
+arithmetic of a block, which both runs share.
 
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
@@ -805,7 +808,12 @@ def run_checks(
     under the block check of the verify plan; the reference sessions are built with the session's ``draft_tokens`` and
     replay the same run; ``replay`` and ``tokens`` cover the recorded prompt steps and the verify steps; the lines
     ``blocks`` and ``batch invariance`` are printed once per kind of step.  ``prompt_tokens`` is not read for such a
-    session: its prompt is the one it kept."""
+    session: its prompt is the one it kept.
+
+    **With a drafter** the replay runs the drafter's passes again -- over the prompt, and in front of every verify step,
+    which is fed the recorded window -- and ``replay`` holds the drafter's proposals of every recorded step beside the
+    ids and logits.  The reference sessions have no drafter: they are fed the recorded windows.  Under the kernel check
+    stands what a run can say about the kernels of the passes: nothing (``DRAFTER_KERNELS``)."""
     if kernels is None:
         kernels = session.check_kernels
     elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
@@ -817,6 +825,7 @@ def run_checks(
         steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
     accepted = list(main.accepted[:steps])  # per step the tokens behind the first that the run kept: 0 for a decode step
+    proposals = None if main.proposals is None else main.proposals[:steps].clone()  # of a session with a drafter: what it proposed
     # a session built with draft_tokens=: the prompt its verify steps stand on, whole, and what it recorded of the prompt's steps
     drafted = session.draft_tokens is not None
     prompt = session.prompt_record.prompt if drafted else None
@@ -876,6 +885,8 @@ def run_checks(
     finally:
         session.tap = None
     replay_ok = bytes_equal(session.record.logits[:steps], logits) and bytes_equal(session.record.outputs[:steps], ids)
+    if proposals is not None:  # ... and what the drafter proposed in front of every step
+        replay_ok = replay_ok and bytes_equal(session.record.proposals[:steps], proposals)
     if drafted:  # ... and the prompt's steps, which the verify steps stand on
         again = session.prompt_record
         replay_ok = replay_ok and bytes_equal(again.logits[:recorded], prompt_logits) and bytes_equal(again.outputs[:recorded], prompt_ids)
@@ -933,7 +944,8 @@ def run_checks(
         some = f", the first {judged_prompt} of them judged" if judged_prompt < fed else ""
         lines[0] = lines[0][:-1] + f"; behind a prompt of {fed} decode steps{some})"
         taps = [("the prompt's decode steps: ", prompt_tap), ("the verify steps: ", tap)]
-    lines.append(f"  replay            ids and logits byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
+    what = "ids and logits" if proposals is None else "ids, logits and the drafter's proposals"
+    lines.append(f"  replay            {what} byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     blocks_ok, judged = True, 0
     for what, each in taps:
         held, count, block_lines = _block_lines(each, session.reference_precision, what)
@@ -958,6 +970,8 @@ def run_checks(
             lines.append(
                 f"    the prompt's decode steps: {fed} replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
             )
+        if session.drafter is not None:
+            lines.append(f"    {DRAFTER_KERNELS}")
     session.reset(fresh=True)
     ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
     return Checks(lines, ok, judged, status, unobserved, cost)
@@ -1172,6 +1186,61 @@ def verify_checks(session: Session, decode: Session, stream: Optional[Stream] = 
     return Checks(lines, tokens_ok and state_ok, gated)
 
 
+#: what a run says of the kernels of a drafter's passes: they are attributed like every launch, and held to no census
+DRAFTER_KERNELS = (
+    "kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
+    "no section holds a draft pass)"
+)
+
+
+class _Shadow:
+    """The drafter's passes of a run written out a second time, for the two lines ``speculative_checks`` adds for a session
+    with a drafter.  It keeps a cache of its own and its own books: the kept tokens of the run in order -- the prompt, then
+    the tokens of the rows every step kept -- and, for every kept position, the model's final-norm row of it.  A position
+    gets its pass when the token that follows it is known: ``body`` at ONE row.  The passes of a step are then the head
+    on the last of those rows and, for every later draft, ``body`` on the row and the proposal of the pass before, one
+    position further, and the head.  It never calls the drafter's ``draft``: that function is what the lines hold.  Both
+    sides run the same blocks, so the lines hold which rows, tokens and positions a step's passes are handed -- not the
+    arithmetic of a block."""
+
+    def __init__(self, session: Session):
+        self.drafter, self.weights, self.call, self.passes = session.drafter, session.draft_weights, session._draft_call, session.draft_tokens
+        self.cache = session.drafter.state(session.sequences, session.capacity, session.device)
+        self.tokens: List[torch.Tensor] = []  # the kept token of every position, [sequences] each
+        self.rows: List[torch.Tensor] = []  # the model's final-norm row of every kept position, [sequences, hidden] each
+        self.done = 0  # the positions whose pass has run
+        self.last = None  # the output row of the last of them
+        self.cache_steps = self.proposal_steps = 0  # the steps whose cache / whose proposals were the session's
+
+    def keep(self, tokens: torch.Tensor, hidden: torch.Tensor) -> None:
+        """``tokens`` ``[sequences, n]`` were kept at the next ``n`` positions; ``hidden`` ``[sequences, n, hidden]`` are
+        the model's final-norm rows of the steps that fed them (copied: the model's next step may write its buffer)."""
+        for t in range(tokens.shape[1]):
+            self.tokens.append(tokens[:, t].clone())
+            self.rows.append(hidden[:, t].clone())
+
+    def step(self, first: torch.Tensor) -> torch.Tensor:
+        """The passes of the step whose window starts with ``first`` ``[sequences]``, the token that follows the last kept
+        position -> the proposals ``[sequences, passes]``."""
+        following = [*self.tokens[1:], first]
+        while self.done < len(self.rows):  # every kept position that has not had its pass: one row, the token that follows it
+            self.last = self.drafter.body(self.call, self.weights, self.cache, self.rows[self.done], following[self.done], self.done)
+            self.done += 1
+        row, drafts = self.last, [self.drafter.propose(self.call, self.weights, self.last)]
+        for index in range(1, self.passes):
+            row = self.drafter.body(self.call, self.weights, self.cache, row, drafts[-1], self.done - 1 + index, index)
+            drafts.append(self.drafter.propose(self.call, self.weights, row, index))
+        return torch.stack(drafts, dim=1)
+
+    def compare(self, session: Session, recorded: torch.Tensor, proposals: torch.Tensor) -> None:
+        """After the passes of a step on both sides: the session's cache up to the last kept position against this one's, and
+        the proposals the session's own run recorded for the step against this one's."""
+        mine, theirs = session.state.draft, self.cache
+        upto = self.done  # positions 0 .. Q - 1: what the first pass of the step and the prompt's passes wrote from the model's rows
+        self.cache_steps += int(bytes_equal((mine.k[:, :, :upto], mine.v[:, :, :upto]), (theirs.k[:, :, :upto], theirs.v[:, :, :upto])))
+        self.proposal_steps += int(torch.equal(recorded, proposals))
+
+
 def forced_drafts(following: Sequence[int], length: int, k: int, vocab: int, variant: int = 0) -> List[int]:
     """The ``k`` drafted tokens of a scheduled verify step, for a run that schedules how many tokens its steps keep.
     ``following`` are the tokens a plain run produced behind the token kept last.  The first ``length`` drafted tokens are
@@ -1229,6 +1298,18 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
       it): every step in front of the first near-tie among the compared rows kept its scheduled count, and every count
       from 0 to ``draft_tokens`` was kept at least once.
 
+    For a session with a drafter the first replay runs the drafter's passes as the session runs them, and a shadow run
+    beside it writes them out at one row per call from books of its own (:class:`_Shadow`).  Two more lines:
+
+    * **drafter cache** -- after the passes of every step, the session's drafter cache up to the last kept position is
+      the shadow's, byte for byte.  It sees the rows, tokens and positions of the first pass of a step and of the passes
+      over the prompt: a pass one position off, a prompt position without its pass, a drafted token where the kept one
+      belongs, the rows of an older step.  It does not see which row the step goes on from, nor the later passes.
+    * **draft proposals** -- the proposals the session's own run recorded for every step are the shadow's.  It sees the
+      row a step goes on from and what every later pass is handed.
+
+    Both sides call the same blocks: neither line is a check of a block's arithmetic.
+
     Both sessions are left reset; ``session`` keeps its records, so its traced pass and its own checks (``run_checks``)
     run on them afterwards -- a new prompt set starts with ``Session.reset``, as always.  The comparison is made once
     per run, on the session as its run left it: a session that stands behind no verify step and holds recorded ones was
@@ -1262,15 +1343,19 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     def held(state) -> list:
         return [tuple(t.clone() for t in layer) for layer in state.standing()]
 
-    # ---- the first replay, with the decode session beside it
+    # ---- the first replay, with the decode session beside it (and, with a drafter, the shadow of its passes)
     session.reset(fresh=True)
     decode.reset(fresh=True)
+    shadow = _Shadow(session) if session.drafter is not None else None
     prompt_steps = layers_alike = greedy_kept = greedy_all = as_ran = 0
     recorded = min(fed, ran_prompt.inputs.shape[0])  # the prompt steps whose ids and logits a run keeps
     last = None  # the greedy ids of the row the run kept last: what the next window starts with
     for t in range(fed):
         ids = prompt[:, t].contiguous()
+        session._fill(ids)  # with a drafter: its pass over the position in front, as ``prefill`` runs it
         mine, theirs = session._run(session.prefill_plan, 1, ids), decode._run(decode.plan, 1, ids)
+        if shadow is not None:
+            shadow.keep(ids[:, None], session.state.hidden[:, None])
         prompt_steps += int(bytes_equal(mine, theirs))  # the next ids and the logits of the step
         if t < min(recorded, ran_prompt.count):  # the step as the session's own run recorded it: the ids fed, the ids chosen, the logits
             as_ran += int(torch.equal(ids, ran_prompt.inputs[t]) and bytes_equal(mine, (ran_prompt.outputs[t], ran_prompt.logits[t])))
@@ -1284,8 +1369,13 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     stands, ordinals = [], []  # per step the token the state stands on with the count the step kept; per kept row (its number behind the prompt, its sequence)
     for j in range(steps):
         a = counts[j]
+        if shadow is not None:  # the passes of this step on both sides, then what they left and what the run recorded of them
+            session._draft()
+            shadow.compare(session, ran.proposals[j], shadow.step(windows[j][:, 0]))
         ids, logits = session._run(session.plan, T, windows[j].reshape(-1))
         session.state.accept(a)
+        if shadow is not None:  # the rows this step kept, each with its token
+            shadow.keep(windows[j][:, : a + 1], session.state.hidden.view(S, T, -1)[:, : a + 1])
         as_ran += int(bytes_equal((ids, logits), (ran.outputs[j], ran.logits[j])))
         stands.append((session.state.accepted, a))
         ordinals += [(expected - fed + t + 1, i) for i in range(S) for t in range(a + 1)]
@@ -1410,6 +1500,15 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
         f"state byte-identical to the first replay after {untouched} of {steps} steps"
     )
     lines.append(f"  rejected rows     {rejected_text}    {_verdict(rejected_ok) if replaced else 'REPORTED'}")
+    if shadow is not None:
+        lines.append(
+            f"  drafter cache     after the passes of {shadow.cache_steps} of {steps} steps the drafter's cache up to the last kept position is the "
+            f"bytes of the passes written out at one row per position    {_verdict(shadow.cache_steps == steps)}"
+        )
+        lines.append(
+            f"  draft proposals   the {session.draft_tokens} proposals the run recorded are those of the passes written out at one row, "
+            f"in {shadow.proposal_steps} of {steps} steps    {_verdict(shadow.proposal_steps == steps)}"
+        )
     if scheduled is not None:
         stop = next((index for index, tie in enumerate(near) if tie), steps)  # a near-tie ends what a schedule can say
         as_scheduled = sum(int(counts[j] == scheduled[j]) for j in range(stop))

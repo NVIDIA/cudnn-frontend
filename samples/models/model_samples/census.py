@@ -76,6 +76,11 @@ and one more line: ``target census <configuration> / <class> (recorded <date>): 
 ``NOT CLAIMED (<reasons>)``.  Either way the line says how many launches of a step were compared by launch shape -- as three
 numbers -- and how many by membership alone: ``EQUAL`` never stands for a comparison that was not made.
 
+A session with a drafter traces whole steps of speculative decoding: the sites of such a step are, for every draft
+pass, the drafter's wiring with the pass's number in the place of the layer (:func:`passes`), then the model's.  No
+section of a census holds a draft pass, so nothing is stated about the kernels of the passes: they are attributed like
+every launch, and the claim -- the verify plan's -- speaks about the model's sites, which begin at ``Traced.first``.
+
 This module imports nothing beyond the standard library.
 """
 
@@ -87,7 +92,7 @@ import os
 import re
 import statistics
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 RELATIONS = ("exact", "fallback", "host")
@@ -375,6 +380,14 @@ def expected(plan, model, rows: Optional[int] = None) -> List[Site]:
             stated[(name, at)] = (form, facts, wrong)
         sites.append(Site(name, layer, tuple(block.kernels), block.entry, *stated[(name, at)], at))
     return sites
+
+
+def passes(plan, drafter, count: int) -> List[Site]:
+    """The block calls of the ``count`` draft passes of an engine step, in the order a step makes them: the wiring of one
+    pass (:func:`expected` on the drafter's plan) once per pass, with the pass's number, from 0, in the place of the
+    layer.  The sites of an engine step are these and then the model's."""
+    one = expected(plan, drafter)
+    return [replace(site, layer=index) for index in range(count) for site in one]
 
 
 def form_text(form: Sequence[Tuple[str, object]]) -> str:
@@ -1087,16 +1100,24 @@ class Traced:
     differences: int = 0  # the lines judge() returned
     result: Optional[Comparison] = None
     claim: Optional[Claim] = None  # of a stack that declares a target kernel set: what this run can say about it
+    #: the index of the first site the claim speaks about: the sites in front of it are a drafter's passes, which no census holds
+    first: int = 0
 
     @classmethod
-    def of(cls, sites, call_log, records: Sequence[Launch], count: int, missing: str, rows: int, claim: Optional[Claim] = None) -> "Traced":
-        """From the launch records of a pass of ``count`` steps (``records`` empty: ``missing`` says why)."""
+    def of(cls, sites, call_log, records: Sequence[Launch], count: int, missing: str, rows: int, claim: Optional[Claim] = None, first: int = 0) -> "Traced":
+        """From the launch records of a pass of ``count`` steps (``records`` empty: ``missing`` says why).  ``first``: where
+        the model's sites begin among ``sites`` (behind the passes of a drafter)."""
         if not records:
-            return cls(sites, call_log, missing=missing or "the profiler recorded no kernel activity on this GPU", rows=rows, claim=claim)
+            return cls(sites, call_log, missing=missing or "the profiler recorded no kernel activity on this GPU", rows=rows, claim=claim, first=first)
         steps, _ = split_steps(records)
         if len(steps) != count:  # a block read the device inside a step: an undeclared copy, and no step can be told from the next
-            return cls(sites, call_log, undeclared=f"the records show {len(steps)} host reads for {count} traced steps", rows=rows, claim=claim)
-        return cls(sites, call_log, steps, rows=rows, claim=claim)
+            undeclared = f"the records show {len(steps)} host reads for {count} traced steps"
+            return cls(sites, call_log, undeclared=undeclared, rows=rows, claim=claim, first=first)
+        return cls(sites, call_log, steps, rows=rows, claim=claim, first=first)
+
+    def _recorded(self) -> Dict[int, tuple]:
+        """Site index -> the launch shape the claim's census recorded there, counted among this pass's own sites."""
+        return {} if self.claim is None else {index + self.first: shape for index, shape in self.claim.recorded.items()}
 
     def judge(self) -> Tuple[str, List[str]]:
         """Run the kernel check on this pass: ``(PASS | FAIL | NOT OBSERVED, the lines under the check's own line)``.  Where the
@@ -1114,7 +1135,7 @@ class Traced:
                 "without one log per traced step nothing shows which entry instance served a call"
             )
         if self.steps is not None:
-            recorded, name = (None, "") if self.claim is None else (self.claim.recorded, f"the {self.claim.name}")
+            recorded, name = (None, "") if self.claim is None else (self._recorded(), f"the {self.claim.name}")
             self.result = compare(self.steps, self.sites, self.call_log, recorded, name)
             lines += self.result.sentences()
             self.unobserved = self.result.unobserved
@@ -1146,7 +1167,7 @@ class Traced:
         """Per exact row what a step launched, and the kernels a library chose inside the fallback rows (printed, not gated)."""
         lines = []
         calls = Counter((site.block, site.site) for site in self.sites)
-        recorded = {} if self.claim is None else {self.sites[index].block: shape for index, shape in self.claim.recorded.items()}
+        recorded = {self.sites[index].block: shape for index, shape in self._recorded().items()}
         for site in {(site.block, site.site): site for site in self.sites}.values():
             for kernel in site.kernels:
                 if kernel.relation != "exact":
@@ -1232,7 +1253,7 @@ class Traced:
                     "layer": site.layer,
                     "site": site.site,
                     "entry": site.entry,
-                    "identity": self.claim.identities[index].text() if stated else "",
+                    "identity": self.claim.identities[index - self.first].text() if stated and index >= self.first else "",
                     "instance": call_at(index, site).instance,
                     "form": {name: value for name, value in site.form},
                     "served": {name: value for name, value in call_at(index, site).form},

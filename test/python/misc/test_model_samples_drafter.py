@@ -1721,10 +1721,12 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     # what there is, and what does not run it
     said = (
         "**What is here today is its loader and its draft pass on reference blocks, both reached from the library**",
-        "No script of this folder drafts yet, no session runs a draft pass, and `00_decode.py` neither reads the drafter nor has a flag for it.",
+        'A session that is handed the drafter runs its passes in front of every verify step (`Session.speculate`, in the section "The verify step").',
+        "No script of this folder drafts yet, and `00_decode.py` neither reads the drafter nor has a flag for it.",
         "The drafter has a draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`): "
         "every block of it is a reference chain in every stack, and its embedding lookup is PyTorch's gather.",
-        "No session runs a draft pass yet, and no script takes the list; the loader takes it as `draft_vocab=`.",
+        "A session that is handed the drafter runs its passes (`Session.speculate`, in the next section); no script takes the list yet: "
+        "the loader takes it as `draft_vocab=`.",
         "The drafter's blocks are held to their definitions and to each other at one row and at several, and their proposals are reported against "
         "the model's own tokens on a checkpoint; they are not compared with another implementation of the drafter in this repository "
         "(one second evaluation of its network was made by hand, outside this repository: it is among the runs below).",
@@ -1736,8 +1738,8 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "A draft step from Python, behind the call of the loader above (its `model`, `drafter` and `weights`):",
         "they read nothing of the checkpoint.",
         "every row of this table serves all of them, so one plan runs a pass over any number of rows.",
-        "The hidden rows are the caller's to supply: no method of a session hands them out yet.",
-        "No method of a session hands out the final-norm rows a pass reads.",
+        "Here the hidden rows are the caller's to supply; a session that is handed the drafter supplies its own -- the rows its model's last step "
+        'left -- and runs these passes in front of every verify step (`Session.speculate`, in the section "The verify step").',
         # the cache: what a row reads of it, and what a step is refused for (held by the test of a pass over several rows)
         "so a position in front that no pass wrote is read as those zeros and nothing refuses it: filling the cache over a prompt, "
         "one body pass per position, is the caller's.",
@@ -1749,24 +1751,28 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "its loader, and nothing else",
         "there is no draft step, no block and no provider row",
         "to the model's own tokens on a checkpoint;",  # the checkpoint run is reported: it holds nothing
+        "no session runs a draft pass",  # a session that is handed the drafter does
+        "hands them out yet",
     )
     assert [words for words in gone if words in section] == []
-    # ... and no sentence of another section says that nothing runs the drafter: no SESSION drafts
+    # ... and no sentence of another section says that nothing drafts: a session with a drafter does, and no SCRIPT does
     whole = " ".join(README.read_text().split())
     elsewhere = (
-        "No session drafts yet (the section above runs the drafter's pass from the library alone), so no script runs a verify step:",
-        "how many were kept; no session drafts yet.",
-        "**What is not here.** No session drafts, so nothing decides how many tokens to keep: the caller says it.",
+        "the step a session makes of it and the drafter's passes (**The speculative step**, below). No script runs either yet:",
+        "how many were kept; handed the drafter, the session drafts them itself (**The speculative step**, below).",
+        "**What is not here.** A script that drafts: the speculative step is reached from the library.",
+        "Without a drafter nothing decides how many tokens to keep: the caller says it.",
     )
     assert [sentence for sentence in elsewhere if sentence not in whole] == []
-    assert [words for words in ("othing drafts yet", "runs nothing)", "No drafter runs") if words in whole] == []
+    assert [words for words in ("othing drafts yet", "runs nothing)", "No drafter runs", "o session drafts", "o session runs") if words in whole] == []
     assert all(callable(getattr(QwenDenseDrafter, name)) for name in ("body", "propose", "draft", "state", "memory_bytes", "sites"))
     # ... from the table: every block a reference chain in every stack, but the lookup, which is the gather
     rows = {block: rows[0] for block, rows in configs.DRAFTER_PROVIDERS.items()}
     assert all(row.fallback.startswith("reference chain") and row.stacks == configs.EVERY for block, row in rows.items() if block != "draft.embedding")
     assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "target_stacks")
-    loop = (MODELS / "model_samples" / "loop.py").read_text()  # the sessions: none names a drafter, none hands out a hidden or a normed row
-    assert not any("Session" in name for name in dir(QwenDenseDrafter)) and re.findall("drafter|hidden|normed", loop) == []
+    # a session takes the drafter and hands its passes the rows of its own state; the drafter knows no session
+    loop = (MODELS / "model_samples" / "loop.py").read_text()
+    assert not any("Session" in name for name in dir(QwenDenseDrafter)) and "drafter=None," in loop and "state.hidden, state.greedy" in loop
 
     # the counts of a pass
     drafter = QwenDenseDrafter.seeded(QwenDense(), rows=65536)
@@ -1849,8 +1855,8 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     area = " ".join((MODELS / "README.md").read_text().split())
     assert (
         "the drafter's draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`: every block of it a "
-        "reference chain in every stack, its embedding lookup PyTorch's gather; no session runs a pass yet)"
-    ) in area
+        "reference chain in every stack, its embedding lookup PyTorch's gather)"
+    ) in area and "no session runs a pass" not in area
     assert "(`DRAFTER_PROVIDERS`: 18 block calls a pass, every block a reference chain but the embedding lookup;" in area
     guide = " ".join((MODELS / "AGENTS.md").read_text().split())
     assert (

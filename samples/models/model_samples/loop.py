@@ -36,7 +36,16 @@ plans: its own, the verify plan of ``k + 1`` tokens per sequence (``plan``), and
 prompt left and nothing is copied.  ``verify`` then feeds, per sequence, the token the run kept last and the ``k`` tokens
 its caller drafted behind it; the caller reads the greedy ids (``read``) and says how many drafted tokens it keeps
 (``accept``; ``sampling.accepted`` counts them by the greedy rule).  The method that is called selects the plan of a step,
-never the state and never a test at run time.  Nothing drafts here: the drafted tokens are the caller's.
+never the state and never a test at run time.  Without a drafter the drafted tokens are the caller's.
+
+Handed a drafter (``drafter=``; one sequence), such a session runs the whole step of speculative decoding:
+``speculate`` is the drafter's ``k`` passes, one verify step and the pair the caller reads -- the window that was
+verified and the greedy token after each of its tokens -- in one host read.  The passes read what the step before left
+on the state (``state.hidden``, ``state.greedy``, the kept count) and write the drafter's own cache (``state.draft``);
+every prompt step but the first begins with one pass of the drafter over the position in front of it, at one row, so
+the cache holds the prompt when the first step drafts.  The drafter has a plan of its own, at one row per sequence;
+its table stands under the session's two, its load takes the model's embedding table, its memory is in the one
+sentence.  ``speculate`` reads nothing and compares nothing: the count is the caller's (``accept``).
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -61,6 +70,12 @@ PREFILL_ROUTES = ("decode-step",)
 CHECKPOINT_ORDER = "the checkpoint's row order"
 #: the line between the two tables of a session built with ``draft_tokens=``: its verify steps' rows, then its prompt's
 PROMPT_ROWS = "the prompt of this session goes through decode steps, one per prompt token, on these rows:"
+#: the line above the drafter's table of a session with a drafter (``{calls}``: the block calls of one pass)
+DRAFTER_ROWS = (
+    "the drafter: {calls} block calls a pass; the first pass of a step behind a verify step runs at S x T rows, every other pass "
+    "and every pass over the prompt at S rows; every row of this table serves any row count"
+)
+ONE_SEQUENCE = "a session with a drafter serves one sequence: one request, as the drafter rows are for"
 
 
 class StopRule:
@@ -84,19 +99,27 @@ class StopRule:
 class Record:
     """The ids fed to, the logits of and the ids chosen by the first steps of a run, kept on the GPU for the checks: one
     row per row of a step (sequences x tokens per sequence).  ``accepted`` is the host's own list of how many tokens
-    behind the first each of those steps kept (0 for a decode step)."""
+    behind the first each of those steps kept (0 for a decode step).  ``proposals`` (a session with a drafter:
+    ``drafted`` = (sequences, drafted tokens)) holds per step the drafter's own proposals, whatever the step verified."""
 
-    def __init__(self, steps: int, rows: int, vocab: int, device):
+    def __init__(self, steps: int, rows: int, vocab: int, device, drafted: Optional[tuple] = None):
+        self.proposals = None if drafted is None else torch.zeros((steps, *drafted), dtype=torch.int32, device=device)
         self.inputs = torch.zeros((steps, rows), dtype=torch.int32, device=device)
         self.outputs = torch.zeros((steps, rows), dtype=torch.int32, device=device)
         self.logits = torch.zeros((steps, rows, vocab), dtype=torch.bfloat16, device=device)
         self.accepted: List[int] = []
         self.count = 0
+        #: of EVERY verify step of the run, recorded or not: the drafted tokens it kept, and how many steps verified drafted
+        #: tokens of the caller's in the place of a drafter's (``Session.speculate(force=)``) -- the report's acceptance lines
+        self.kept: List[int] = []
+        self.forced = 0
         #: the ids of a whole prompt ``[sequences, tokens]``, kept by a session that replays its prompt in front of its steps
         self.prompt: Optional[torch.Tensor] = None
 
-    def add(self, ids: torch.Tensor, logits: torch.Tensor, next_ids: torch.Tensor, accept: int = 0) -> None:
+    def add(self, ids: torch.Tensor, logits: torch.Tensor, next_ids: torch.Tensor, accept: int = 0, proposals: Optional[torch.Tensor] = None) -> None:
         if self.count < self.inputs.shape[0]:
+            if proposals is not None:
+                self.proposals[self.count].copy_(proposals)
             self.inputs[self.count].copy_(ids)
             self.outputs[self.count].copy_(next_ids)
             self.logits[self.count].copy_(logits)
@@ -126,6 +149,7 @@ class Session:
         on_demand=None,
         tokens: int = 1,
         draft_tokens: Optional[int] = None,
+        drafter=None,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
@@ -143,7 +167,9 @@ class Session:
         ``draft_tokens`` builds the session that feeds its prompt through decode steps and then runs verify steps behind
         it on the same state: the number of drafted tokens a step verifies behind the token it kept last, so a step
         feeds ``draft_tokens + 1`` tokens per sequence (``tokens`` is then that number and is left out here).  The
-        drafted tokens are the caller's."""
+        drafted tokens are the caller's -- or, with ``drafter`` (the checkpoint's drafter, or the seeded model's:
+        ``QwenDenseDrafter``), the drafter's: the session then runs its passes (``speculate``).  A drafter needs
+        ``draft_tokens`` and serves one sequence."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if on_demand is not None and (share is None or stack != REFERENCE):
@@ -169,9 +195,16 @@ class Session:
                     "then verify steps of draft_tokens + 1 tokens per sequence), not with both"
                 )
             tokens = draft_tokens + 1
+        if drafter is not None and draft_tokens is None:
+            raise ValueError("a drafter drafts the tokens a session's verify steps check: drafter= needs draft_tokens=, the number it drafts a step")
+        if drafter is not None and sequences != 1:
+            raise ValueError(f"{ONE_SEQUENCE}; got sequences={sequences}")
         self.model, self.text, self.sequences, self.stack, self.prefill_route = model, text, int(sequences), stack, prefill
         self.tokens = tokens  # per sequence, of a step of this session's plan
         self.draft_tokens = draft_tokens  # of a session that feeds its prompt through decode steps and verifies behind it; else None
+        self.drafter = drafter  # what drafts those tokens; None: the caller does
+        self.draft_plan: Optional[blocks.Plan] = None  # the drafter's plan, at one row per sequence
+        self.draft_weights = None
         self.device = torch.device(device)
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
@@ -189,7 +222,7 @@ class Session:
         self.prompt_record: Optional[Record] = None  # the prompt's decode steps of a session built with draft_tokens=
         self.tap = None  # tie_out's hook: tap(block name, layer, block, operands) -> the block's result
         self._followers: tuple = ()  # the sessions that will run on this one's weights, as ``plan_table`` was told
-        self._report = Report(model.name, reduced=bool(getattr(model, "reductions", ())), tokens=self.tokens, draft_tokens=draft_tokens)
+        self._report = self._new_report()
         self._calls = 0
         self._prefill_start = 0.0
         self._running: Optional[blocks.Plan] = None  # the plan of the step that is running, and its rows
@@ -206,9 +239,13 @@ class Session:
             self.plan = self._resolve(self.tokens)
         if self.draft_tokens is not None and self.prefill_plan is None:
             self.prefill_plan = self._resolve(1, state_tokens=self.tokens)
+        if self.drafter is not None and self.draft_plan is None:  # one plan, at one row per sequence; the overrides are the model's
+            self.draft_plan = self._resolve(1, self.drafter, {})
         return self.plan
 
-    def _resolve(self, tokens: int, **more) -> blocks.Plan:
+    def _resolve(self, tokens: int, model=None, overrides: Optional[dict] = None, **more) -> blocks.Plan:
+        """A plan of ``model`` (default: the session's model, with the session's overrides) at ``tokens`` tokens per sequence."""
+        model = self.model if model is None else model
         options = {
             "reference_precision": self.reference_precision,
             "device": str(self.device),
@@ -218,16 +255,16 @@ class Session:
         }
         facts = self.device if self.device.type == "cuda" else blocks.DeviceFacts((0, 0), "cpu")
         return blocks.plan(
-            self.model.provider_table,
-            self.model.regimes,
+            model.provider_table,
+            model.regimes,
             facts,
             self.sequences,
             tokens,
             self.stack,
-            self.overrides,
-            model=self.model,
+            self.overrides if overrides is None else overrides,
+            model=model,
             options=options,
-            source=self.model.table_source,
+            source=model.table_source,
         )
 
     def _kinds(self) -> list:
@@ -370,7 +407,10 @@ class Session:
 
         A session built with ``draft_tokens=`` prints the table of its verify steps, one line, and the table of the
         decode steps of its prompt; the memory sentence counts ONE state for it -- its prompt runs on the state of its
-        verify steps -- and, for a run that has such a session, names the kinds of step where it named sequence counts."""
+        verify steps -- and, for a run that has such a session, names the kinds of step where it named sequence counts.
+        A session with a drafter prints the drafter's table under one more line, and the sentence counts the drafter:
+        what its load holds besides the model's embedding table, its copies, its cache and its working memory
+        (``_drafter_bytes``)."""
         plan = self.resolve()
         for session in later:
             session.resolve()
@@ -386,6 +426,7 @@ class Session:
                 self.model.copy_bytes() if self._share is not None else 0
             )
             need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token()) for session in later)
+            need += sum(session._drafter_bytes() for session in (self, *later))
             # one state per session: a session that feeds its prompt through decode steps runs them on the state of its verify
             # steps, so it is counted once.  Nothing is added for its second plan either: what a first launch of the fused step
             # reserves outside the pool is reserved once in a process, and the sentence carries it once (``Plan.memory``)
@@ -398,21 +439,37 @@ class Session:
             checks = self.model.check_bytes(held["uncopied"]) if "uncopied" in held else 0
             sentence = "\n  " + plan.memory(need, what, checks)  # before anything is built on the GPU: this is where a run that does not fit ends
         for session in (self, *later):
-            for each in session._plans(own=True):
+            for each in session._first_used():
                 each.first_use()
         return self._tables() + sentence
+
+    def _first_used(self) -> list:
+        """The plans whose blocks make their first use for this session: its own and, where it has one, its drafter's."""
+        return [*self._plans(own=True), *([self.draft_plan] if self.draft_plan is not None else [])]
+
+    def _drafter_bytes(self) -> int:
+        """What a drafter adds to the need of a run, in bytes; 0 without one: what its load and its cache hold
+        (``memory_bytes``: the codes, the bf16 copies its reference blocks multiply on, the cache) and the working memory
+        of a pass on reference blocks (``working_bytes``)."""
+        if self.drafter is None:
+            return 0
+        return self.drafter.memory_bytes(self.sequences, self.capacity) + self.drafter.working_bytes()
 
     def _tables(self) -> str:
         """The served-by table of this session's step; for a session built with ``draft_tokens=`` the table of its verify
         steps, one line, and the table of the decode steps of its prompt."""
         table = self.resolve().table()
-        return table if self.prefill_plan is None else f"{table}\n{PROMPT_ROWS}\n{self.prefill_plan.table()}"
+        if self.prefill_plan is not None:
+            table = f"{table}\n{PROMPT_ROWS}\n{self.prefill_plan.table()}"
+        if self.draft_plan is not None:
+            table = f"{table}\n{DRAFTER_ROWS.format(calls=self.drafter.calls_per_pass())}\n{self.draft_plan.table()}"
+        return table
 
     def _kind(self) -> str:
         """This session in the memory sentence of a run that has two kinds of step."""
         sequences = f"{self.sequences} sequence{'s' if self.sequences > 1 else ''}"
         if self.draft_tokens is not None:
-            return f"a session of {sequences} x {self.tokens} tokens behind its prompt"
+            return f"a session of {sequences} x {self.tokens} tokens behind its prompt" + (" with its drafter" if self.drafter is not None else "")
         return f"a session of {sequences} x {self.tokens} tokens" if self.tokens > 1 else f"a plain session of {sequences}"
 
     # ------------------------------------------------------------------ load
@@ -421,7 +478,7 @@ class Session:
         # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
         # two row orders of one weight end here -- before an entry builds anything, before a byte is read
         layouts = self.stored_layouts() if self._share is None else {}
-        for each in self._plans(own=True):
+        for each in self._first_used():
             each.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
             torch.backends.cuda.matmul.fp32_precision = "ieee"
@@ -436,6 +493,14 @@ class Session:
             forms = {**self._kept(), **({"layouts": layouts} if layouts else {})}  # ... and the layouts asked above
             self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule, **forms)
         self._check_forms()
+        if self.drafter is not None:  # with the table the model loaded: the drafter holds no second copy of it
+            source = self if self._share is None else self._share
+            checkpoint = source.checkpoint
+            if getattr(checkpoint, "synthetic_weights", False):  # a seeded model: the drafter's tensors are drawn by name from the same seed
+                from .weights import Checkpoint
+
+                checkpoint = Checkpoint.synthetic(self.drafter, source.seed)
+            self.draft_weights = self.drafter.load(checkpoint, self.device, self.stages, embedding=self.weights.embedding)
         for each, tokens in self._kinds():  # every kind of step this session runs: each block's compile is a stage named with its rows
             for name, block in each.items():
                 if getattr(block, "compiles", False):
@@ -446,29 +511,31 @@ class Session:
         if self.prefill_plan is not None:  # one decode step of a prompt, on token 0 of the state the verify steps run on
             with self.stages.stage("warm-up, the prompt's decode step"):
                 self._run(self.prefill_plan, 1, torch.zeros(self.sequences, dtype=torch.int32, device=self.device))
-            self.reset(fresh=False)
+            if self.drafter is None:
+                self.reset(fresh=False)
         with self.stages.stage("warm-up"):
-            self._run(plan, self.tokens, torch.zeros(self.sequences * self.tokens, dtype=torch.int32, device=self.device))
+            if self.drafter is None:
+                self._run(plan, self.tokens, torch.zeros(self.sequences * self.tokens, dtype=torch.int32, device=self.device))
+            else:  # the step of such a session, behind that prompt step: the drafter's passes, the window, the verify step, the pair
+                self._calls = 0
+                self._engine(None, 0)
         self._report.calls_per_step = self._calls
         self.reset(fresh=True)
 
     def reset(self, fresh: bool = True) -> None:
         """Back to the start of a prompt set: zero state at position 0 and an empty record (both records of a session built
-        with ``draft_tokens=``: its prompt's and its verify steps'); ``fresh`` allocates them anew."""
+        with ``draft_tokens=``: its prompt's and its verify steps'); ``fresh`` allocates them anew.  What a drafter reads
+        of the step before it -- the final-norm rows, the greedy ids, the kept count -- and the drafter's cache are
+        part of the state and go with it: a second prompt set starts from nothing of the first."""
         if fresh or self.state is None:
             self.state = self._fresh_state()
-            self.record = Record(self.record_steps, self.sequences * self.tokens, self.model.geometry.vocab, self.device)
+            self.record = self._record(self.record_steps)
             self.prompt_record = self._prompt_record(self.record_steps)
         else:
-            self.state.position = 0
-            self.state.verify_steps = 0
-            if self.state.slots is not None:
-                self.state.slots.accept = 0
-            for layer in self.state.layers:
-                for t in layer.tensors():
-                    t.zero_()
-            self.record.count = 0
+            self.state.clear()
+            self.record.count = self.record.forced = 0
             self.record.accepted.clear()
+            self.record.kept.clear()
             if self.prompt_record is not None:
                 self.prompt_record.count, self.prompt_record.prompt = 0, None
         self._open = False
@@ -479,7 +546,15 @@ class Session:
     def _fresh_state(self) -> DecodeState:
         """A zero state at position 0 for this session's sequences and tokens per sequence, in allocations of its own."""
         shapes = self.model.state_shapes()
-        return DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens)
+        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens)
+        if self.drafter is not None:  # the drafter's own cache: as many positions as the model's
+            state.draft = self.drafter.state(self.sequences, self.capacity, self.device)
+        return state
+
+    def _record(self, steps: int) -> Record:
+        """An empty record of this session's steps; with a drafter it holds the proposals of every step too."""
+        drafted = None if self.drafter is None else (self.sequences, self.draft_tokens)
+        return Record(steps, self.sequences * self.tokens, self.model.geometry.vocab, self.device, drafted)
 
     def _prompt_record(self, steps: int) -> Optional[Record]:
         """An empty record of the prompt's decode steps, one row per sequence, for a session built with ``draft_tokens=``."""
@@ -500,29 +575,83 @@ class Session:
         """One step of ``plan`` at ``tokens`` tokens per sequence on the session's state: ``(next ids, logits)``.  The caller
         names the plan -- the method that was called decides the kind of step -- and the family's step is told the tokens
         only where they are not the state's own (the decode steps of a prompt on a state of several tokens)."""
-        if self.state.position + tokens > self.capacity:
-            raise ValueError(f"the session was built for {self.capacity} positions per sequence; build it with a larger capacity")
+        self._fits(tokens)
         self._running, self._rows = plan, self.sequences * tokens
         if tokens == self.state.tokens:
             return self.model.step(self._call, self.weights, self.state, ids)
         return self.model.step(self._call, self.weights, self.state, ids, tokens=tokens)
 
-    def _advance(self, ids: torch.Tensor, accept: Optional[int] = 0) -> torch.Tensor:
+    def _fits(self, tokens: int) -> None:
+        """A step of ``tokens`` tokens per sequence from where the state stands: a ``ValueError`` past the session's capacity."""
+        if self.state.position + tokens > self.capacity:
+            raise ValueError(f"the session was built for {self.capacity} positions per sequence; build it with a larger capacity")
+
+    def _advance(self, ids: torch.Tensor, accept: Optional[int] = 0, proposals: Optional[torch.Tensor] = None) -> torch.Tensor:
         """One step of this session's plan on the ids of its rows: the decode step, or -- at several tokens per sequence --
         the verify step, after which the state stands ``accept`` tokens behind the first (``None``: the count is told
-        later, ``accept``, and the record's entry stays open until then)."""
+        later, ``accept``, and the record's entry stays open until then).  With a drafter the step is behind the
+        drafter's passes: ``proposals`` are theirs, or -- left out, a replay of recorded ids -- the passes run here."""
+        if self.drafter is not None and proposals is None:
+            proposals = self._draft()
         next_ids, logits = self._run(self.plan, self.tokens, ids)
-        self.record.add(ids, logits, next_ids, accept)
+        self.record.add(ids, logits, next_ids, accept, proposals)
         if self.tokens > 1 and accept is not None:
             self.state.accept(accept)
         return next_ids
 
     def _feed(self, ids: torch.Tensor) -> torch.Tensor:
         """One decode step of the prompt of a session built with ``draft_tokens=``: a step of the decode plan on token 0 of
-        the state, recorded with the prompt."""
+        the state, recorded with the prompt; with a drafter, behind the drafter's pass over the position in front."""
+        self._fill(ids)
         next_ids, logits = self._run(self.prefill_plan, 1, ids)
         self.prompt_record.add(ids, logits, next_ids)
         return next_ids
+
+    # ------------------------------------------------------------------ the drafter's passes
+    def _draft_call(self, name: str, index: int, *operands):
+        """One block call of a draft pass, served by the drafter's plan; ``index`` is the pass, where a step has the layer.
+        Not handed to ``tap``: every block of the drafter is the reference chain, and the tap of a run's checks is built
+        on the model's plans."""
+        self._calls += 1
+        block = self.draft_plan[name]
+        out = block(*operands)
+        if self._call_log is not None:  # a traced step: at the rows of the call (a quantised operand follows a call at its row count)
+            if isinstance(operands[0], torch.Tensor):
+                self._rows = int(operands[0].shape[0])
+            self._call_log.append(census.Call(name, index, self._rows, *block.serving()))
+        return out
+
+    def _fill(self, ids: torch.Tensor) -> None:
+        """In front of a prompt step of a session with a drafter: one pass of the drafter (its body) over the position in
+        front of this one -- the final-norm row the step before left, and this step's token, which is the token that
+        follows it -- at one row per sequence.  The first prompt step has no position in front of it; the pass over the
+        last prompt position is the first pass of the first step, which needs the first new token."""
+        state = self.state
+        if self.drafter is not None and state.hidden is not None:
+            self.drafter.body(self._draft_call, self.draft_weights, state.draft, state.hidden, ids, state.position - 1)
+
+    def _draft(self) -> torch.Tensor:
+        """The drafter's passes of a step -> its proposals ``[sequences, draft_tokens]`` int32 on the device.  It is handed
+        what the step before left: every final-norm row of that step and the greedy id after each (one row behind the
+        prompt, ``tokens`` behind a verify step), the position of that step's first row, and how many drafted tokens the
+        run kept of it -- one host integer, the row the passes go on from."""
+        state, kept = self.state, self.state.accepted
+        if state.hidden is None:
+            raise ValueError("the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first (Session.prefill)")
+        return self.drafter.draft(
+            self._draft_call, self.draft_weights, state.draft, state.hidden, state.greedy, state.position - (kept + 1), kept, self.draft_tokens
+        )
+
+    def _engine(self, force: Optional[torch.Tensor], accept: Optional[int]) -> torch.Tensor:
+        """One step of speculative decoding: the drafter's passes; the window -- the greedy token the run kept last, then
+        the proposals (``force``: these drafted tokens in their place) --; the verify step on it; -> the pair ``[sequences,
+        2, tokens]`` of the window and the greedy id after each of its tokens.  The window and the pair are one
+        concatenation each; nothing is read."""
+        proposals = self._draft()
+        last = self.state.greedy.view(self.sequences, -1)[:, self.state.accepted : self.state.accepted + 1]  # a view by a host integer
+        window = torch.cat([last, proposals if force is None else force], dim=1)
+        next_ids = self._advance(window.reshape(-1), accept, proposals)
+        return torch.stack([window, next_ids.view(self.sequences, self.tokens)], dim=1)
 
     def _closed(self, what: str) -> None:
         """``what`` replays steps with their kept counts: a ``ValueError`` while the last verify step waits for its count."""
@@ -597,6 +726,11 @@ class Session:
         On a session built with ``tokens=`` the count is part of the step."""
         if self.tokens == 1:
             raise ValueError("Session.verify is the step of a session built for several tokens per sequence (tokens=); this session's step is Session.step")
+        if self.drafter is not None:
+            raise ValueError(
+                "the step of a session with a drafter is Session.speculate (force= verifies the caller's drafted tokens): "
+                "a verify step without the drafter's passes in front of it would leave the drafter's cache without its positions"
+            )
         if tuple(ids.shape) != (self.sequences, self.tokens):
             raise ValueError(
                 f"a verify step of this session takes ids [{self.sequences}, {self.tokens}] (sequences, tokens per sequence); got {tuple(ids.shape)}"
@@ -609,7 +743,41 @@ class Session:
         self._report.clock.mark_launch()
         next_ids = self._advance(ids.to(torch.int32).reshape(-1), accept).view(self.sequences, self.tokens)
         self._open = waits
+        if not waits:
+            self.record.kept.append(accept)
         return next_ids
+
+    def speculate(self, force: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """One step of speculative decoding on a session with a drafter -> ``[sequences, 2, tokens]`` int32 on the GPU:
+        ``[:, 0]`` the window that was verified -- the token the run kept last, then the drafted tokens -- and ``[:, 1]``
+        the greedy token after each of them.  In order: the drafter's ``draft_tokens`` passes (the first over the rows
+        of the step before, the others on the drafter's own row and proposal), the window, one verify step, the pair.
+
+        ``force`` ``[sequences, draft_tokens]`` int32 on the GPU: the drafted tokens to verify in the place of the
+        drafter's.  The drafter runs all the same, and its own proposals are in the record (``record.proposals``).
+
+        It reads nothing and compares nothing: the caller reads the pair (``read``: the ONE host read of the step),
+        counts the kept drafted tokens (``sampling.accepted``) and says so (``accept``); a second step before that is a
+        ``ValueError``.  So is a step in front of the prompt, and a session without a drafter: its caller builds the
+        window and calls ``verify``."""
+        if self.drafter is None:
+            raise ValueError(
+                "Session.speculate drafts the tokens of its step: it needs a drafter (drafter=); without one the caller builds the window and calls Session.verify"
+            )
+        if self._open:
+            raise ValueError("the step before this one has not been told how many of its tokens are kept (Session.accept)")
+        if force is not None and (tuple(force.shape) != (self.sequences, self.draft_tokens) or force.dtype != torch.int32):
+            raise ValueError(
+                f"force is the drafted tokens of the step, int32 [{self.sequences}, {self.draft_tokens}] (sequences, draft tokens); "
+                f"got {force.dtype} {tuple(force.shape)}"
+            )
+        if self.state.hidden is not None:  # (in front of the prompt the passes refuse the step by name)
+            self._fits(self.tokens)  # before the passes: a step past the capacity writes nothing, the drafter's cache included
+        self._report.clock.mark_launch()
+        pair = self._engine(force, None)
+        self._open = True
+        self.record.forced += force is not None
+        return pair
 
     def accept(self, count: int) -> None:
         """Say how many drafted tokens the verify step that has just run keeps: one whole number, 0 .. tokens - 1, for the
@@ -631,6 +799,7 @@ class Session:
             self.record.accepted[self.record.count - 1] = count
         self.state.accept(count)
         self._open = False
+        self.record.kept.append(count)
 
     def read(self, ids: torch.Tensor) -> List[int]:
         """The one host read of a step: the chosen ids, 4 bytes per sequence."""
@@ -654,13 +823,20 @@ class Session:
         On a session built with ``draft_tokens=`` the traced steps are its verify steps: the pass first replays the whole
         prompt from a zero state WITHOUT the profiler, up to the host read that ends a prompt, then the first ``steps``
         recorded verify steps with their kept counts under it.  The launch records are those of verify steps alone, held
-        against the verify plan; the kernels of the prompt's decode steps are not observed."""
+        against the verify plan; the kernels of the prompt's decode steps are not observed.
+
+        With a drafter a traced step is the step ``speculate`` runs, fed the recorded drafted tokens: the passes, the
+        window, the verify step and the pair, ended by the host read of the pair.  The sites of such a step are, for
+        every pass, the drafter's wiring with the pass's number in the place of the layer, then the model's; the claim
+        is the verify plan's and speaks about the model's sites (``census.Traced.first``).  The passes over the prompt
+        run in front of the window, untraced, with the prompt."""
         if self.on_demand is not None:  # the reference of a run's checks: its calls carry the copies it makes, which no step of a run does
             raise ValueError(
                 "a session that makes bf16 copies of its weights per call (on_demand) is the reference of a run's checks; its steps are not traced"
             )
         records = self.check_kernels if records is None else bool(records)
-        sites = census.expected(self.plan, self.model) if records else []
+        passes = census.passes(self.draft_plan, self.drafter, self.draft_tokens) if records and self.drafter is not None else []
+        sites = passes + census.expected(self.plan, self.model) if records else []
         claim = self.claim() if records else None
         self._closed("a traced pass")
         count = min(steps, self.record.count, self.record.inputs.shape[0])
@@ -669,13 +845,13 @@ class Session:
             if self.draft_tokens is not None:  # the prompt's decode steps are replayed in front of the pass, never traced
                 self._report.trace_missing = "needs a recorded verify step behind the prompt on a CUDA device"
             if records:
-                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens, claim=claim)
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens, claim=claim, first=len(passes))
             return
         inputs, accepted, calls = self.record.inputs[:count], list(self.record.accepted[:count]), self._calls
         kept = (self.state, self.record, self.prompt_record)
         prompt = None if self.prompt_record is None else self.prompt_record.prompt
         self.state = self._fresh_state()
-        self.record = Record(0, self.sequences * self.tokens, self.model.geometry.vocab, self.device)
+        self.record = self._record(0)
         self.prompt_record = self._prompt_record(0)
         call_log: List[list] = []
         launches: list = []
@@ -684,7 +860,10 @@ class Session:
             if records:
                 self._call_log = []
                 call_log.append(self._call_log)
-            self._advance(inputs[i], accepted[i]).tolist()
+            if self.drafter is None:
+                self._advance(inputs[i], accepted[i]).tolist()
+            else:  # the step as ``speculate`` runs it, on the recorded drafted tokens; the host read is the pair's
+                self._engine(inputs[i].view(self.sequences, self.tokens)[:, 1:], accepted[i]).tolist()
 
         try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
             if prompt is not None:  # the prompt of the traced steps, from the zero state: in front of the profiler, in no record of it
@@ -700,18 +879,32 @@ class Session:
         finally:
             (self.state, self.record, self.prompt_record), self._calls, self._call_log = kept, calls, None
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, claim)
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, claim, len(passes))
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
         calls = self._report.calls_per_step
-        self._report = Report(self.model.name, reduced=bool(getattr(self.model, "reductions", ())), tokens=self.tokens, draft_tokens=self.draft_tokens)
+        self._report = self._new_report()
         self._report.calls_per_step = calls
+
+    def _new_report(self) -> Report:
+        reduced = bool(getattr(self.model, "reductions", ()))
+        return Report(self.model.name, reduced=reduced, tokens=self.tokens, draft_tokens=self.draft_tokens, drafter=self.drafter is not None)
 
     def report(self) -> Report:
         """The report of this session's run.  The bytes of a step are the family's arithmetic for a decode step (one embedding
         row, one recurrent state and three history columns per sequence): a session of several tokens per sequence states
-        none, and its report says so, as it does of the first-token line and of the rate (``timing.Report``)."""
+        none, and its report says so, as it does of the first-token line and of the rate (``timing.Report``).  A session
+        with a drafter states the bytes of its step -- the verify step's arithmetic at its tokens per sequence and a draft
+        pass's, ``draft_tokens`` times -- and the counts its steps kept (``Report.kept``; ``Report.scheduled``: some step
+        verified drafted tokens of the caller's), as the record of the run has them."""
+        if self.drafter is not None and self.state is not None:
+            # the weights a block of the verify plan multiplies on the stored format are read there, not as a copy
+            stored = tuple(label for label, _, _, _, block in self.plan.parts() if getattr(block, "stored_weights", False))
+            read = {"stored": stored} if stored else {}
+            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position, tokens=self.tokens, **read)
+            self._report.pass_bytes = self.drafter.bytes_per_pass(self.state.position)
+            self._report.kept, self._report.scheduled = list(self.record.kept), bool(self.record.forced)
         if hasattr(self.model, "bytes_per_step") and self.state is not None and self.tokens == 1:
             # a block of this session's plan that multiplies on the stored format reads its weight there, not as a copy
             # (asked of a family's model only where the plan has such a block)

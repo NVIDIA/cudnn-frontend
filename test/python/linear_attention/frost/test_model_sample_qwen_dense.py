@@ -426,7 +426,7 @@ import torch
 sys.path.insert(0, {models!r})
 import model_samples
 from model_samples import census, loop, sampling, tie_out
-from model_samples.qwen_dense import QwenDense
+from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
 
 
 def say(text):
@@ -435,15 +435,18 @@ def say(text):
 
 drafted, new, tokens = {drafted}, 32, {drafted} + 1
 model = QwenDense.reduced()
+drafter = QwenDenseDrafter.seeded(model)
 text = model_samples.TextIO.synthetic(model.geometry.vocab)
 common = dict(stack="fe-entries", device="cuda:0", capacity=8 + new + 2 * drafted)
 plain = model_samples.Session(model, text, **common)
-session = model_samples.Session(model, text, draft_tokens=drafted, share=plain, **common)
+session = model_samples.Session(model, text, draft_tokens=drafted, share=plain, drafter=drafter, **common)
 try:
     say(plain.plan_table([session]))
     say(session.resolve().table())
     say(loop.PROMPT_ROWS)
     say(session.prefill_plan.table())
+    say(loop.DRAFTER_ROWS.format(calls=drafter.calls_per_pass()))
+    say(session.draft_plan.table())
     say(census.table(session.prefill_plan))
     say(census.table(session.plan, session.claim()))
 except NotImplementedError as error:
@@ -461,10 +464,10 @@ for _ in range(new + drafted - 1):
     stream += plain.read(ids)
 out = session.read(session.prefill(prompts))
 scheduled = []
-while len(out) < new:  # the loop is the caller's: a window, the step, the one host read, the count, the keep
+while len(out) < new:  # the loop is the caller's: the step, the one host read, the count, the keep; the drafted tokens are scheduled
     length = len(scheduled) % tokens
-    window = [out[-1], *tie_out.forced_drafts(stream[len(out):], length, drafted, model.geometry.vocab)]
-    (greedy,) = session.read(session.verify(torch.tensor([window], dtype=torch.int32, device="cuda:0")))
+    force = torch.tensor([tie_out.forced_drafts(stream[len(out):], length, drafted, model.geometry.vocab)], dtype=torch.int32, device="cuda:0")
+    ((window, greedy),) = session.read(session.speculate(force))
     kept = sampling.accepted(window, greedy)
     session.accept(kept)
     out += greedy[: kept + 1]
@@ -487,22 +490,30 @@ raise SystemExit(0 if passed else 1)
 
 
 @pytest.mark.L1
-def test_a_session_with_draft_tokens_verifies_behind_its_prompt_on_the_fe_entries_stack():
-    """One session for a prompt and the verify steps behind it, on real launches: one sequence, five drafted tokens.  The
-    prompt goes through decode steps on token 0 of the state of six tokens per sequence -- the decode entry on that
-    layout -- and the verify steps follow on the same state, the caller supplying drafted tokens that are scheduled to be
-    kept 0 to 5 in turn.  The output is the plain session's; the comparison with decode steps holds its lines; the traced
-    pass holds the verify steps alone behind the replayed prompt, and the kernel check holds them against the verify
-    plan.  In a fresh interpreter, with both streams held: a run of the helper layer writes nothing to standard output."""
-    key = "model sample qwen_dense session with draft tokens, 1 x 6 tokens, stack fe-entries"
-    out = _program(SPECULATIVE_PROGRAM, "[speculative]", key, "run of a session with draft tokens", drafted=5)
+def test_a_session_with_a_drafter_speculates_behind_its_prompt_on_the_fe_entries_stack():
+    """One session for a prompt and the steps of speculative decoding behind it, on real launches: one sequence, five
+    drafted tokens, the seeded drafter of the seeded model.  The prompt goes through decode steps on token 0 of the state
+    of six tokens per sequence -- the decode entry on that layout -- each but the first behind one pass of the drafter;
+    every step behind it is the drafter's five passes on reference blocks, one verify step and one host read, with the
+    verified drafted tokens scheduled to be kept 0 to 5 in turn (``speculate(force=)``).  The output is the plain
+    session's; the comparison with decode steps holds its lines, the drafter's two among them; the traced pass holds
+    whole steps behind the replayed prompt, and the kernel check holds them: the passes' gathers and chains, then the
+    verify plan.  In a fresh interpreter, with both streams held: a run of the helper layer writes nothing to standard
+    output."""
+    key = "model sample qwen_dense session with a drafter, 1 x 6 tokens, stack fe-entries"
+    out = _program(SPECULATIVE_PROGRAM, "[speculative]", key, "run of a session with a drafter", drafted=5)
     lines = out.splitlines()
+    assert (
+        "the drafter: 18 block calls a pass; the first pass of a step behind a verify step runs at S x T rows, every other pass "
+        "and every pass over the prompt at S rows; every row of this table serves any row count"
+    ) in lines
+    assert "with its drafter, one after the other" in out and "draft.token_choice" in out, "the memory sentence and the tables name the drafter"
     assert "the prompt of this session goes through decode steps, one per prompt token, on these rows:" in lines
     assert "stack fe-entries, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS 6]" in out
     assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the prompt's decode steps on the fused decode entry in the target's form"
     assert "[speculative] the 32 new tokens are the plain session's: True; kept [0, 1, 2, 3, 4, 5, 0, 1, 2, 3]" in lines
     assert "speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind a prompt of 8 tokens; " in out
-    for name in ("tokens", "position", "prompt", "recorded", "rejected rows", "acceptance"):
+    for name in ("tokens", "position", "prompt", "recorded", "rejected rows", "drafter cache", "draft proposals", "acceptance"):
         (line,) = [line for line in lines if line.startswith(f"  {name} ") and "greedy tokens equal to the reference stack's" not in line]
         assert line.endswith("    PASS"), line
     # what the comparison replayed is the run this program's loop ran: its recorded steps, and where it ended
@@ -516,12 +527,16 @@ def test_a_session_with_draft_tokens_verifies_behind_its_prompt_on_the_fe_entrie
         "checks (1 sequence x 6 tokens per sequence, 10 verify steps; tokens kept behind the first: 0, 1, 2, 3, 4, 5, 0, 1, 2, 3; behind a prompt of 8 decode steps)"
         in lines
     )
-    assert "byte-identical on a second run from a fresh state    PASS" in out
+    assert "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    PASS" in lines
     judged = [line for line in lines if line.startswith("  blocks  ")]
     assert len(judged) == 2 and all(line.endswith("    PASS") for line in judged), "the prompt's decode steps and the verify steps, each against the reference"
     steps = [line for line in lines if line.split()[:1] == ["linear_attention.step"] and "[band: gdn_step]" in line]
     assert len(steps) == 2 and all(line.endswith("[band: gdn_step]  PASS") and "conv history equal; null slot untouched" in line for line in steps)
-    assert any(line.startswith("rate                  not printed: the drafted tokens of these steps are their caller's") for line in lines)
+    assert "rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)" in lines
+    assert "acceptance            scheduled, not measured (reduction): 10 steps; kept 1: 2, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1" in lines
+    assert any(
+        line.startswith("first token ") and "each but the first behind one pass of the drafter over the position in front of it" in line for line in lines
+    )
     traced = [line for line in lines if line.startswith("traced pass (")]
     assert not traced or traced[0].endswith(" | behind the prompt's 8 decode steps, replayed untraced")
     if "kernel identity, as planned: " in out:  # a GPU the census has a section for: the verify plan's share of the target, with its split
@@ -533,6 +548,14 @@ def test_a_session_with_draft_tokens_verifies_behind_its_prompt_on_the_fe_entrie
         not observed
         or "    the prompt's decode steps: 8 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)" in lines
     )
+    assert (
+        not observed
+        or (
+            "    kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
+            "no section holds a draft pass)"
+        )
+        in lines
+    )
     frost_routing.measured(
-        "model sample qwen_dense session with draft tokens, 1 x 6 tokens: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
+        "model sample qwen_dense session with a drafter, 1 x 6 tokens: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
     )
