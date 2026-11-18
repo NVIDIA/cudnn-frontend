@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-only tests of the loader of a checkpoint's drafter (``samples/models/model_samples/qwen_dense/drafter.py``) and of the
-8-bit quantisation it applies when it loads (``weights.quantize_fp8_per_channel``).
+"""Host-only tests of a checkpoint's drafter (``samples/models/model_samples/qwen_dense/drafter.py``): its loader with the
+8-bit quantisation it applies when it loads (``weights.quantize_fp8_per_channel``), and its draft pass on reference blocks.
 
 * The quantisation, against the format definition: a quantiser written here from the E4M3 layout (a sign bit, four exponent
   bits with bias 7, three mantissa bits, subnormals, no infinity; nearest value, a tie to the even code, saturating), with
@@ -13,6 +13,15 @@
 * A checkpoint directory generated here, with a drafter: the manifest from the headers alone; the rows cut from the output
   head against the bytes of the shard file, read here by the header's offsets and not through the reader under test; the
   8-bit weights and the order of the parts of the merged ones; every drafter the loader declines, by name.
+
+* The draft pass.  Every block of it is a reference chain in every stack, so no tie-out judges it: each new function is
+  held here to a version written from its definition -- the quantiser of a row of a step (a scale per row, a
+  multiplication by the reciprocal of the scale), the joint quantiser of the two normed halves in front of the first
+  multiply, the gate with one rounding and SiLU x up with two, the token choice over listed rows.  A pass over several
+  rows is held to that many passes of one row, rows and cache byte for byte; what each pass of a step is handed, by a
+  recording stand-in for the blocks; and the model's stored forms and the drafter with its copies, loaded together from
+  a checkpoint generated here.  The blocks themselves, as a plan builds them, are held to the functions they stand
+  for, and what each declares about its operands is read through the tap of the tie-out, on each sequence alone.
 
 No real checkpoint, tokenizer or template file is committed.  No GPU, no weights."""
 
@@ -106,6 +115,52 @@ def _per_channel(rows) -> tuple:
     return codes, scales
 
 
+def _per_row(rows) -> tuple:
+    """``(codes, scales)`` of the rows of a step given as rows of numbers, each quantised at a scale of its own: per row
+    ``scale = fp32(largest magnitude / 448)``, not below ``fp32(1 / (448 * 512))``, and ``code = e4m3(fp32(value * fp32(1 /
+    scale)))``: the reciprocal of the scale and the product are fp32 operations."""
+    floor = _fp32(1.0 / (448.0 * 512.0))
+    codes, scales = [], []
+    for row in rows:
+        scale = max(_fp32(max(abs(value) for value in row) / 448.0), floor)
+        reciprocal = _fp32(1.0 / scale)
+        scales.append(scale)
+        codes.append([_code(_fp32(value * reciprocal)) for value in row])
+    return codes, scales
+
+
+def _bf16_scaled(value: float) -> tuple:
+    """``(significand, exponent)`` of a positive double with the significand scaled to [128, 256): bf16 has 8 bits of it."""
+    mantissa, exponent = math.frexp(value)
+    return mantissa * 256.0, exponent
+
+
+def _bf16(value: float) -> float:
+    """The nearest bf16 value of a double: a significand of 8 bits, a tie to the even one.  For values in the normal
+    range of the format (nothing here is subnormal or overflows)."""
+    if value == 0.0:
+        return value
+    scaled, exponent = _bf16_scaled(abs(value))
+    whole = math.floor(scaled)
+    rest = scaled - whole
+    whole += 1 if rest > 0.5 or (rest == 0.5 and whole % 2 == 1) else 0
+    return math.copysign(whole / 256.0 * 2.0**exponent, value)
+
+
+def _cast(value: float) -> float:
+    """A double as the reference blocks round it to bf16: through fp32, as PyTorch's cast of an fp64 tensor does."""
+    return _bf16(_fp32(value))
+
+
+def _clear_of_a_midpoint(value: float, relative: float = 2.0**-20) -> bool:
+    """Whether a relative error of up to ``relative`` cannot move the bf16 rounding of ``value``: its distance from the
+    midpoint of the two bf16 values around it is more than that error."""
+    if value == 0.0:
+        return True
+    scaled, _ = _bf16_scaled(abs(value))
+    return abs(scaled - math.floor(scaled) - 0.5) > 256.0 * relative
+
+
 def test_the_e4m3_values_of_this_file_are_the_formats():
     """The table the quantiser below rests on, against values that are stated, and against PyTorch's own decode of every
     code that is a number."""
@@ -115,6 +170,12 @@ def test_the_e4m3_values_of_this_file_are_the_formats():
     assert [decoded[byte] for byte in range(0x7F)] == VALUES and [decoded[byte] for byte in range(0x80, 0xFF)] == [-value for value in VALUES]
     assert math.isnan(decoded[0x7F]) and math.isnan(decoded[0xFF])
     assert [_code(v) for v in (21.0, 23.0, 449.0, -1e9, -0.0, 0.0, 2.0**-10, -(2.0**-10), 0.75 * 2.0**-9)] == [0x5A, 0x5C, 0x7E, 0xFE, 0x80, 0, 0, 0x80, 1]
+    # ... and the bf16 rounding of this file: stated values, and PyTorch's own cast of fp32 values (one rounding)
+    assert [_bf16(v) for v in (1.0, 1.00390625, 1.001953125, 1.005859375, -3.0078125, 0.1, 0.0)] == [1.0, 1.0, 1.0, 1.0078125, -3.0, 0.10009765625, 0.0]
+    generator = torch.Generator().manual_seed(3)
+    drawn = torch.cat([torch.randn(2048, generator=generator) * scale for scale in (1e-3, 1.0, 300.0)])
+    assert drawn.to(torch.bfloat16).double().tolist() == [_bf16(value) for value in drawn.double().tolist()]
+    assert _clear_of_a_midpoint(1.0) and not _clear_of_a_midpoint(1.00390625) and not _clear_of_a_midpoint(1.00390625 * (1 + 2.0**-21))
 
 
 def test_the_per_channel_8_bit_quantisation_against_the_format_definition():
@@ -274,10 +335,11 @@ def _readme_section() -> str:
 
 
 def _readme_blocks() -> tuple:
-    """The two fenced ``python`` blocks of the README's section on the drafter, as they are written there: the call of the
-    loader, then the recipe for a draft vocabulary."""
+    """The three fenced ``python`` blocks of the README's section on the drafter, as they are written there: the call of
+    the loader, the recipe for a draft vocabulary, and a draft step behind the loader's call."""
     blocks = re.findall(r"```python\n(.*?)```", _readme_section(), flags=re.S)
-    assert len(blocks) == 2 and "QwenDenseDrafter.describe(" in blocks[0] and "--dump-tokens" in blocks[1], "the call, then the recipe"
+    assert len(blocks) == 3 and "QwenDenseDrafter.describe(" in blocks[0] and "--dump-tokens" in blocks[1], "the call, then the recipe"
+    assert "drafter.draft(" in blocks[2] and "QwenDenseDrafter.describe(" not in blocks[2], "then a draft step, on what the call loaded"
     return tuple(blocks)
 
 
@@ -506,9 +568,10 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
     on_disk = sorted(key for key in disk.tensors if key.startswith(DRAFTER))
     assert on_disk == sorted(key for key, _, _ in manifest[:15]), "the list holds every tensor the checkpoint has under the drafter's prefix"
     text = drafter.manifest_text().splitlines()
-    assert text[0] == "drafter of checkpoint tiny-checkpoint (local): 15 tensors of its own under 'mtp.', 3 of the model's" and len(text) == 22
+    assert text[0] == "drafter of checkpoint tiny-checkpoint (local): 15 tensors of its own under 'mtp.', 3 of the model's" and len(text) == 23
     assert text[1].split() == ["tensor", "stored", "at", "load"] and text[2].split(None, 3)[:3] == ["mtp.pre_fc_norm_embedding.weight", "bf16", "[64]"]
     assert text[20] == "  " + drafter.vocabulary.text() and text[21].startswith("  loaded, besides the model's embedding table: 0.00 GiB (8-bit weights ")
+    assert text[22].startswith("  and the bf16 copies its reference blocks multiply on (a load keeps them unless told copies=False): 0.00 GiB (")
     assert str(tmp_path) not in drafter.manifest_text()
 
     # bound beside the model's list: the model's tensors as they were, the drafter's own added; twice changes nothing
@@ -523,7 +586,12 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
         Checkpoint, "load", lambda checkpoint, name, where, as_format="stored": (asked.append((name, where)), plain_load(checkpoint, name, where, as_format))[1]
     )
     weights = drafter.load(disk, device, stages)
-    assert list(stages.seconds) == ["read", "quantise", "merge"], "the load of a checkpoint: read, quantise, and merge where a weight has parts"
+    assert list(stages.seconds) == [
+        "read",
+        "quantise",
+        "merge",
+        "dequantise",
+    ], "the load of a checkpoint: read, quantise, merge where a weight has parts, and the copies"
     # the output head is read whole on the CPU, whatever the device is, and only its listed rows go to the device; every other tensor is read to the device
     assert [where for name, where in asked if name == "lm_head.weight"] == ["cpu"] and len(asked) == 18
     assert all(where is device for name, where in asked if name != "lm_head.weight")
@@ -593,7 +661,7 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
     from_memory = dataclasses.replace(seeded, vocabulary=drafter.vocabulary)
     drawn = Stages()
     memory = from_memory.load(Checkpoint.synthetic(from_memory, seed=5), "cpu", drawn)
-    assert list(drawn.seconds) == ["draw", "quantise", "merge"]
+    assert list(drawn.seconds) == ["draw", "quantise", "merge", "dequantise"]
     for name, _ in NORMS:
         assert torch.equal(getattr(memory, name), getattr(weights, name)), name
     for name, _ in MULTIPLIES:
@@ -617,6 +685,24 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
     # called as it is written there, with no table handed over, the load reads the model's table too: the section says so
     its_key = MODEL + "embed_tokens.weight"
     assert its_key in read and sorted(set(read)) == sorted(wanted) and _bytes(scope["weights"].embedding) == _raw(directory, its_key)[2]
+
+    # ... and the lines of the README that run a draft step, as they are written there, on what its call of the loader loaded
+    read.clear()
+    exec(compile(_readme_blocks()[2], "the README's draft step", "exec"), scope)
+    proposed, printed = scope["drafts"], capsys.readouterr().out
+    assert printed == f"{proposed.tolist()}\n" and read == [], "the proposals are printed, and no tensor of the checkpoint is read"
+    assert proposed.dtype == torch.int32 and tuple(proposed.shape) == (1, 5) and set(proposed.flatten().tolist()) <= set(ids)
+    assert tuple(scope["hidden"].shape) == (1, 64) and scope["blocks"].stack == "reference" and (scope["blocks"].sequences, scope["blocks"].tokens) == (1, 1)
+    written = scope["cache"].k.any(dim=-1).flatten().tolist()
+    assert written == [True] * 5 + [False] * 59, "one row at position 0 and four passes behind it: positions 0 to 4 of 64"
+    # the same step by its definition: the body on the row it is handed, the head, then each pass on its own row and proposal
+    again = drafter.state(1, 64, "cpu")
+    row = drafter.body(scope["call"], scope["weights"], again, scope["hidden"], scope["ids"], 0)
+    by_hand = [drafter.propose(scope["call"], scope["weights"], row)]
+    for index in range(1, 5):
+        row = drafter.body(scope["call"], scope["weights"], again, row, by_hand[-1], index, index)
+        by_hand.append(drafter.propose(scope["call"], scope["weights"], row, index))
+    assert torch.equal(torch.stack(by_hand, dim=1), proposed) and _bytes(again.k) == _bytes(scope["cache"].k)
     scope["checkpoint"].close()
 
 
@@ -809,9 +895,17 @@ def test_the_seeded_drafter_draws_its_tensors_and_its_list_from_a_seed():
     assert reduced.load_bytes() == {"weights": elements + 4 * rows, "norms": 2 * (5 * 5120 + 2 * 256), "head": 3880 * (2560 + 320 + 4)}
     full = QwenDenseDrafter.seeded(QwenDense(), rows=65536)
     assert full.load_bytes() == {"weights": 424931328, "norms": 52224, "head": 65536 * 2884} and full.manifest()[16].stored == "4-bit [248320, 5120]"
-    assert full.manifest_text().splitlines()[-1] == (
-        "  loaded, besides the model's embedding table: 0.57 GiB (8-bit weights 0.40, norm weights 0.00, head rows 0.18)"
+    copies_line = (
+        "  and the bf16 copies its reference blocks multiply on (a load keeps them unless told copies=False): 1.42 GiB "
+        "(of the five weights 0.79, of the head rows 0.62)"
     )
+    loaded_line = "  loaded, besides the model's embedding table: 0.57 GiB (8-bit weights 0.40, norm weights 0.00, head rows 0.18)"
+    assert full.manifest_text().splitlines()[-2:] == [loaded_line, copies_line]
+    assert full.copy_bytes() == {"weights": 2 * elements, "head": 2 * 65536 * 5120} and reduced.copy_bytes() == {
+        "weights": 2 * elements,
+        "head": 2 * 3880 * 5120,
+    }
+    assert full.memory_bytes(1, 2051) == sum(full.load_bytes().values()) + sum(full.copy_bytes().values()) + 2 * 4 * 2051 * 256 * 2
 
     # the manifest the family README prints for the published checkpoint is this rendering, for that checkpoint's names:
     # a host test cannot read the checkpoint, so it holds the README's block to the tensor list at the published widths
@@ -832,3 +926,951 @@ def test_the_seeded_drafter_draws_its_tensors_and_its_list_from_a_seed():
     table = f"{geometry.vocab:,} x {geometry.hidden:,} elements in bf16, {2 * geometry.vocab * geometry.hidden / 2.0**30:.2f} GiB"
     assert table == "248,320 x 5,120 elements in bf16, 2.37 GiB" and table in " ".join(section.split())
     assert "drafter.load(checkpoint, device, embedding=table)" in section
+
+
+# --------------------------------------------------------------------------- the draft pass: each function against its definition
+
+
+def test_the_row_quantiser_against_the_format_definition():
+    """``weights.quantize_fp8_per_row``, the quantiser of the rows of a step: scales and codes against a quantiser written
+    here from the format (``_per_row``).  Its rule is a third one beside the static scale and the weight's, and it is fixed
+    down to its operation: a multiplication by the fp32 reciprocal of the scale, where the weight's rule divides."""
+    from model_samples import weights
+    from model_samples.providers import FP8_ROW, ROW_QUANT, Quant, torch_ref
+    from model_samples.weights import ScaledTensor, quantize_fp8_per_channel, quantize_fp8_per_row
+
+    # Stated rows; every value is exact in bf16.  What each row holds:
+    #   0  a largest element of 13/16.  The quotients of elements 1 and 2 by the scale are, in fp32, the midpoints of two
+    #      codes (1.3125 and 2.625): the product with the reciprocal of the scale lands just above each and gives the code
+    #      above, where a division rounds to the even code below
+    #   1  all zero: the scale is the floor, the codes are 0
+    #   2  a largest element below 1/512: the scale stays at the floor
+    #   3  a largest element of 1.0234375: its product with the reciprocal of its own scale is above 448 in fp32 and
+    #      saturates at the largest code, never the code that is not a number; the other elements are far smaller
+    #   4  the largest element is negative and 256 times row 0's: its scale is 256 times row 0's
+    rows = [
+        [0.8125, 39.0 / 16384.0, 39.0 / 8192.0, -0.40625],
+        [0.0, 0.0, 0.0, 0.0],
+        [2.0**-10, -(2.0**-11), 2.0**-13, 0.0],
+        [1.0234375, -1.0234375, 2.0**-8, -0.0],
+        [-208.0, 0.8125, 39.0 / 64.0, 2.0**-20],
+    ]
+    x = torch.tensor(rows, dtype=torch.bfloat16)
+    assert x.double().tolist() == rows, "the stated values are bf16 values"
+    stored = quantize_fp8_per_row(x)
+    assert isinstance(stored, ScaledTensor) and stored.codes.dtype == torch.uint8 and tuple(stored.codes.shape) == (5, 4)
+    assert stored.scale.dtype == torch.float32 and tuple(stored.scale.shape) == (5,), "one fp32 scale per row of the step"
+    codes, scales = _per_row(rows)
+    assert stored.codes.tolist() == codes and stored.scale.tolist() == scales, "byte for byte the format's quantiser, and its scales bit for bit"
+    floor = _fp32(1.0 / (448.0 * 512.0))
+    assert scales == [_fp32(0.8125 / 448.0), floor, floor, _fp32(1.0234375 / 448.0), _fp32(208.0 / 448.0)] and weights.PER_ROW_FLOOR == 512
+    assert codes == [
+        [0x7E, 0x3B, 0x43, 0xF6],
+        [0, 0, 0, 0],
+        [0x76, 0xEE, 0x5E, 0],
+        [0x7E, 0xFE, 0x3E, 0x80],
+        [0xFE, 0x3E, 0x3B, 0],
+    ], "stated bytes"
+    # the operation: the same two elements under the weight's rule, which divides, are the codes below
+    scale = scales[0]
+    assert [_fp32(value / scale) for value in rows[0][1:3]] == [1.3125, 2.625], "the two quotients of row 0 are midpoints of two codes"
+    assert [_code(_fp32(value / scale)) for value in rows[0][1:3]] == [0x3A, 0x42] and quantize_fp8_per_channel(x).codes[0].tolist() == [0x7E, 0x3A, 0x42, 0xF6]
+    assert torch.equal(quantize_fp8_per_channel(x).scale, stored.scale), "the two rules share the scale and differ in the operation behind it"
+    # saturation: the largest element of row 3 times the reciprocal of its scale is above 448 in fp32
+    assert _fp32(1.0234375 * _fp32(1.0 / scales[3])) > 448.0 and 0x7F not in set(sum(codes, [])) and 0xFF not in set(sum(codes, []))
+    # a scale per row, not one per step: rows 0 and 4 have two magnitudes, and under the step's one scale row 0 would lose its codes
+    assert scales[4] == 256.0 * scales[0] and codes[4][1] == 0x3E and codes[0][0] == 0x7E, "0.8125 is the largest code in row 0 and the code of 1.75 in row 4"
+    one_scale = [[_code(_fp32(value * _fp32(1.0 / scales[4]))) for value in row] for row in rows]
+    assert (
+        one_scale[0] == [0x3E, 3, 5, 0xB6] and one_scale[0] != codes[0]
+    ), "under the scale of the step's largest row, row 0 is left with codes 256 times smaller"
+
+    # random rows of several magnitudes, among them one below the floor and one of zeros: every byte and every scale
+    generator = torch.Generator().manual_seed(17)
+    y = (torch.randn((40, 96), generator=generator) * torch.logspace(-3, 2, 40).unsqueeze(1)).to(torch.bfloat16)
+    y[5] = y[5] * 2.0**-9
+    y[7] = 0.0
+    y[9, 3] = -400.0  # the largest element of its row, negative
+    stored = quantize_fp8_per_row(y)
+    codes, scales = _per_row(y.double().tolist())
+    assert stored.codes.tolist() == codes and stored.scale.tolist() == scales
+    assert scales[5] == scales[7] == floor and int(stored.codes[9, 3]) == 0xFE and len(set(scales)) == 39
+    assert sum(1 for row in codes for byte in row if byte & 0x7F == 0x7E) >= 38, "every row above the floor reaches the largest code at its largest element"
+    divided = quantize_fp8_per_channel(y)  # the weight's rule on the same rows: the same scales, and the codes of ITS definition
+    assert torch.equal(divided.scale, stored.scale) and divided.codes.tolist() == _per_channel(y.double().tolist())[0]
+
+    # a row is quantised by itself: the rows of a step together, or one by one, in any order
+    for row in (0, 5, 7, 39):
+        alone = quantize_fp8_per_row(y[row : row + 1])
+        assert torch.equal(alone.codes, stored.codes[row : row + 1]) and torch.equal(alone.scale, stored.scale[row : row + 1]), row
+    flipped = quantize_fp8_per_row(y.flip(0))
+    assert torch.equal(flipped.codes, stored.codes.flip(0)) and torch.equal(flipped.scale, stored.scale.flip(0))
+    # rows in another dtype are rounded to bf16 first: the largest magnitude and the codes are those of the rounded values
+    wide = y.float() * (1.0 + 2.0**-12)
+    assert not torch.equal(wide.to(torch.bfloat16).float(), wide)
+    rounded = quantize_fp8_per_row(wide)
+    assert torch.equal(rounded.codes, quantize_fp8_per_row(wide.to(torch.bfloat16)).codes) and torch.equal(
+        rounded.scale, quantize_fp8_per_row(wide.to(torch.bfloat16)).scale
+    )
+    assert rounded.scale.tolist() == _per_row(wide.to(torch.bfloat16).double().tolist())[1]
+    for wrong in (torch.zeros(8, dtype=torch.bfloat16), torch.zeros((2, 3, 4), dtype=torch.bfloat16)):
+        with pytest.raises(ValueError, match=re.escape(f"the per-row 8-bit quantisation takes the rows of a step [rows, width]; got {list(wrong.shape)}")):
+            quantize_fp8_per_row(wrong)
+
+    # the format a block is handed for it: a Quant without a scale; a static format states one
+    assert ROW_QUANT == Quant(FP8_ROW) and ROW_QUANT.scale is None and FP8_ROW == "fp8_row"
+    through = torch_ref.quantize(y, ROW_QUANT)
+    assert torch.equal(through.codes, stored.codes) and torch.equal(through.scale, stored.scale)
+    sentence = 'a quantisation format with a static scale states it, and "fp8_row" forms its scale per call; '
+    for arguments, has in (
+        (("fp8",), '"fp8" states no scale'),
+        (("nvfp4", None), '"nvfp4" states no scale'),
+        (("fp8_row", 0.5), '"fp8_row" states the scale 0.5'),
+    ):
+        with pytest.raises(ValueError, match=f"^{re.escape(sentence + has)}$"):
+            Quant(*arguments)
+    assert Quant("fp8", 0.0).scale == 0.0 and Quant("nvfp4", 0.25) == Quant("nvfp4", 0.25)
+
+
+def test_the_joint_quantiser_of_the_two_normed_halves():
+    """The operand of the drafter's first multiply (``torch_ref.pre_fc_norm_quantize``): the embedding rows and the hidden
+    rows each normed with its own weight and rounded to bf16, the embedding half first, and ONE scale per row over both
+    halves.  Against the norm formula evaluated element by element and the row quantiser of this file."""
+    from model_samples.providers import ROW_QUANT, torch_ref
+
+    generator = torch.Generator().manual_seed(23)
+    rows, width, eps = 5, 24, 1.0e-6
+    embedding = (torch.randn((rows, width), generator=generator) * 0.05).to(torch.bfloat16)
+    hidden = (torch.randn((rows, width), generator=generator) * 3.0).to(torch.bfloat16)
+    weight_embedding = (torch.randn(width, generator=generator) * 0.02).to(torch.bfloat16)
+    weight_hidden = (torch.randn(width, generator=generator) * 0.02 + 2.0).to(torch.bfloat16)  # the hidden half three times the embedding half
+
+    def normed(values, weight):
+        """bf16(v * rsqrt(mean(v^2) + eps) * (1 + w)) of every row, element by element, in doubles."""
+        out = []
+        for row in values.double().tolist():
+            inverse = 1.0 / math.sqrt(sum(v * v for v in row) / len(row) + eps)
+            out.append([_cast(v * inverse * (1.0 + w)) for v, w in zip(row, weight.double().tolist())])
+        return out
+
+    first, second = normed(embedding, weight_embedding), normed(hidden, weight_hidden)
+    assert torch_ref.rms_norm(embedding, weight_embedding, eps, torch.float64).double().tolist() == first, "the norm of this file is the reference's"
+    assert torch_ref.rms_norm(hidden.float(), weight_hidden, eps, torch.float64).double().tolist() == second
+    codes, scales = _per_row([one + two for one, two in zip(first, second)])
+    stored = torch_ref.pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT, eps, torch.float64)
+    assert tuple(stored.codes.shape) == (rows, 2 * width) and tuple(stored.scale.shape) == (rows,)
+    assert stored.codes.tolist() == codes and stored.scale.tolist() == scales, "the embedding half first, one scale per row over both halves"
+    # one scale over both: it is the hidden half's largest magnitude here, and the embedding half quantised alone has another
+    largest = [max(abs(v) for v in row) for row in second]
+    assert scales == [_fp32(value / 448.0) for value in largest] and all(max(abs(v) for v in row) < 0.5 * big for row, big in zip(first, largest))
+    alone_codes, alone_scales = _per_row(first)
+    assert alone_scales != scales and [row[:width] for row in codes] != alone_codes, "a scale per half would give the embedding half other codes"
+    assert all(0x7E not in {byte & 0x7F for byte in row[:width]} for row in codes), "no element of the smaller half reaches the largest code"
+    # the halves exchanged: other bytes, whether the weights go with them or not
+    exchanged = torch_ref.pre_fc_norm_quantize(hidden, embedding, weight_hidden, weight_embedding, ROW_QUANT, eps, torch.float64)
+    assert torch.equal(exchanged.codes, torch.cat((stored.codes[:, width:], stored.codes[:, :width]), dim=1)) and not torch.equal(exchanged.codes, stored.codes)
+    crossed = torch_ref.pre_fc_norm_quantize(hidden, embedding, weight_embedding, weight_hidden, ROW_QUANT, eps, torch.float64)
+    assert not torch.equal(crossed.codes, stored.codes) and not torch.equal(crossed.codes, exchanged.codes)
+    # a row by itself; and without a quantisation the chain has nothing to hand on
+    alone = torch_ref.pre_fc_norm_quantize(embedding[2:3], hidden[2:3], weight_embedding, weight_hidden, ROW_QUANT, eps, torch.float64)
+    assert torch.equal(alone.codes, stored.codes[2:3]) and torch.equal(alone.scale, stored.scale[2:3])
+    assert torch_ref.pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, None, eps, torch.float64) is None
+
+
+def test_the_drafters_gate_and_silu_against_their_formulas():
+    """The gate of the drafter's attention output, ``bf16(o * sigmoid(gate))`` with ONE rounding
+    (``torch_ref.gate_row_quantize``), and ``bf16(bf16(SiLU(gate)) * up)`` with two (``torch_ref.silu_mul``), each against
+    its formula evaluated element by element in doubles.  An fp32 sigmoid is not the double's to the last bit, so an
+    element is judged where its value is clear of a bf16 rounding midpoint by more than that -- nearly all are.  And the
+    model's own chains are byte for byte what they were: ``gate_quantize`` rounds the sigmoid first, which is another
+    function, and ``silu_mul_quantize`` is ``silu_mul`` with its quantisation behind it."""
+    import torch.nn.functional as F
+
+    from model_samples.providers import ROW_QUANT, Quant, torch_ref
+    from model_samples.weights import quantize_fp8, quantize_nvfp4
+
+    bf16 = torch.bfloat16
+    generator = torch.Generator().manual_seed(29)
+    o = (torch.randn((6, 512), generator=generator) * 2.0).to(bf16)
+    gate = (torch.randn((6, 512), generator=generator) * 3.0).to(bf16)
+
+    # the gate: one rounding
+    gated = torch_ref.gate_row_quantize(o, gate, ROW_QUANT)
+    values = (
+        gated.codes.view(torch.float8_e4m3fn).double() * gated.scale.double().unsqueeze(1)
+    ).tolist()  # the codes back at their scale: only to know they are codes of it
+    assert tuple(gated.codes.shape) == (6, 512) and tuple(gated.scale.shape) == (6,) and all(len(row) == 512 for row in values)
+    judged, product = 0, []
+    for row_o, row_gate in zip(o.double().tolist(), gate.double().tolist()):
+        product.append([a * (1.0 / (1.0 + math.exp(-g))) for a, g in zip(row_o, row_gate)])
+    made = (o.float() * torch.sigmoid(gate.float())).to(bf16)  # the chain's two operations, as they are written in the block
+    for row, (row_made, row_product) in enumerate(zip(made.double().tolist(), product)):
+        for column, (got, exact) in enumerate(zip(row_made, row_product)):
+            if _clear_of_a_midpoint(exact):
+                judged += 1
+                assert got == _bf16(exact), (row, column)
+    assert judged == 6 * 512 - 2, "all but two elements are judged: those sit next to a rounding midpoint"
+    codes, scales = _per_row(made.double().tolist())
+    assert gated.codes.tolist() == codes and gated.scale.tolist() == scales, "and the rounded rows are quantised per row"
+    # a stated element: 1.2109375 * sigmoid(-1.625) = 0.19917.., which is bf16 0.19921875; with the sigmoid rounded to bf16
+    # first (0.1640625) the product is 0.19867.., which is bf16 0.1982421875 -- the model's chain, another function
+    a, g = torch.tensor([[1.2109375]], dtype=bf16), torch.tensor([[-1.625]], dtype=bf16)
+    exact = 1.2109375 / (1.0 + math.exp(1.625))
+    assert _clear_of_a_midpoint(exact) and _bf16(exact) == 0.19921875 and _bf16(1.2109375 * _bf16(1.0 / (1.0 + math.exp(1.625)))) == 0.1982421875
+    # (a row of one element shows its bf16 value in its scale: the element is the row's largest, and the scale is it / 448)
+    one_rounding, two_roundings = torch_ref.gate_row_quantize(a, g, ROW_QUANT), torch_ref.gate_quantize(a, g, ROW_QUANT)
+    assert one_rounding.scale.tolist() == [_fp32(0.19921875 / 448.0)] and two_roundings.scale.tolist() == [_fp32(0.1982421875 / 448.0)]
+    assert one_rounding.codes.tolist() == two_roundings.codes.tolist() == [[0x7E]]
+    # ... and that chain is what it was: the sigmoid rounded, then the product, then the static quantisation
+    scale = 8.0 / 448.0
+    was = quantize_fp8((o.float() * torch.sigmoid(gate.float()).to(bf16).float()).to(bf16), scale)
+    assert torch.equal(torch_ref.gate_quantize(o, gate, Quant("fp8", scale)).codes, was.codes)
+    differing = int(((o.float() * torch.sigmoid(gate.float()).to(bf16).float()).to(bf16) != made).sum())
+    assert 100 < differing < 2000, "the two functions differ on a share of the elements, by one bf16 unit"
+
+    # SiLU x up: two roundings
+    gate_up = torch.cat((gate, o), dim=1)  # the gate half, then the up half
+    act = torch_ref.silu_mul(gate_up)
+    assert act.dtype == bf16 and tuple(act.shape) == (6, 512)
+    judged = 0
+    for row, (row_gate, row_up, row_act) in enumerate(zip(gate.double().tolist(), o.double().tolist(), act.double().tolist())):
+        for column, (g, u, got) in enumerate(zip(row_gate, row_up, row_act)):
+            silu = g / (1.0 + math.exp(-g))
+            if _clear_of_a_midpoint(silu):
+                judged += 1
+                assert got == _bf16(_bf16(silu) * u), (row, column)  # the product of two bf16 values is exact in a double: rounded once
+    # 19 of 3,072 are not judged, one in 162, where values spread evenly would leave one in 2,048: a gate value on the bf16 grid
+    # repeats, and its SiLU with it
+    assert judged == 6 * 512 - 19
+    # the SiLU rounded before the product is the function: on some elements a single rounding of the product is another value
+    single = (F.silu(gate.float()) * o.float()).to(bf16)
+    assert 100 < int((single != act).sum()) < 2000
+    # the model's chain: byte for byte what it was, for both of its quantisations, and the first two operations are silu_mul
+    for quant, quantiser in ((Quant("nvfp4", 8.0 / 2688.0), quantize_nvfp4), (Quant("fp8", scale), quantize_fp8)):
+        was = quantiser((F.silu(gate_up[:, :512].float()).to(bf16).float() * gate_up[:, 512:].float()).to(bf16), quant.scale)
+        now = torch_ref.silu_mul_quantize(gate_up, quant)
+        assert all(torch.equal(a, b) for a, b in zip(now.tensors(), was.tensors())) and now.scale == was.scale
+    per_row = torch_ref.silu_mul_quantize(gate_up, ROW_QUANT)
+    assert per_row.codes.tolist() == _per_row(act.double().tolist())[0]
+
+
+def test_the_drafters_token_choice_takes_the_first_of_equal_columns_and_returns_its_id():
+    """``torch_ref.listed_argmax``: per row the column of the largest logit, the first of equal ones, and the token id of
+    that column -- on stated logits, and through the block of the key ``torch.argmax+lookup``."""
+    from model_samples import providers
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDenseDrafter, configs
+
+    logits = torch.tensor(
+        [
+            [1.0, 5.0, 5.0, -2.0, 5.0],  # three equal largest values: the first of them, column 1
+            [7.0, 7.0, 7.0, 7.0, 7.0],  # every column equal: column 0
+            [-1.0, -3.0, -1.0, -2.0, -9.0],  # negative values, two equal: column 0
+            [0.0, 0.5, 0.25, 0.5, 0.125],  # columns 1 and 3: column 1
+            [-4.0, -4.0, -4.0, -4.0, -3.5],  # the largest value in the last column
+        ],
+        dtype=torch.bfloat16,
+    )
+    ids = torch.tensor([11, 22, 33, 44, 55], dtype=torch.int32)  # ascending, as a draft vocabulary's are: the lowest column is the lowest id
+    chosen = torch_ref.listed_argmax(logits, ids)
+    assert chosen.tolist() == [22, 11, 11, 22, 55] and chosen.dtype == torch.int32 and tuple(chosen.shape) == (5,)
+    assert torch_ref.listed_argmax(logits[3:4], ids).tolist() == [22] and torch_ref.listed_argmax(logits.float(), ids).tolist() == [22, 11, 11, 22, 55]
+    assert torch_ref.listed_argmax(logits, torch.arange(5, dtype=torch.int32)).tolist() == [
+        1,
+        0,
+        0,
+        1,
+        4,
+    ], "the column itself is not the token: the id of the column is"
+    assert torch_ref.listed_argmax(logits.flip(1), ids).tolist() == [11, 11, 33, 22, 11], "the first of equal columns of the flipped rows"
+    # the block of the drafter's table: the same function, a reference chain, not the sample's host path
+    drafter = QwenDenseDrafter.seeded(_tiny_model(), seed=5)
+    row = configs.DRAFTER_PROVIDERS["draft.token_choice"][0]
+    block = providers.factories()[row.key](row, drafter, DeviceFacts((10, 0)), {})
+    assert (row.key, row.fallback, block.entry) == ("torch.argmax+lookup", "reference chain", "torch.argmax + the token id of the chosen row")
+    assert block(logits, ids).tolist() == [22, 11, 11, 22, 55] and [kernel.relation for kernel in block.kernels] == ["fallback"]
+
+
+# --------------------------------------------------------------------------- the draft pass: its structure
+
+
+def _drafter_on_the_cpu(seed: int = 5, stack: str = "reference"):
+    """``(drafter, weights, call, log)``: the seeded drafter of the tiny geometry loaded on the CPU with its copies, the
+    lookup of a plan of its provider table as a family's step takes it, and the ``(block, pass)`` of every call made."""
+    from model_samples import Checkpoint
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.qwen_dense import QwenDenseDrafter
+
+    drafter = QwenDenseDrafter.seeded(_tiny_model(), seed=seed)
+    weights = drafter.load(Checkpoint.synthetic(drafter, seed=seed), "cpu")
+    blocks = plan(drafter.provider_table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, stack, model=drafter, source=drafter.table_source)
+    log = []
+
+    def call(block, index, *operands):
+        log.append((block, index))
+        return blocks[block](*operands)
+
+    return drafter, weights, call, log
+
+
+def _step_rows(drafter, sequences: int, tokens: int, seed: int):
+    """Hidden rows ``[sequences x tokens, hidden]`` bf16 and ids ``[sequences x tokens]`` int32, drawn from ``seed``."""
+    generator = torch.Generator().manual_seed(seed)
+    hidden = (torch.randn((sequences * tokens, drafter.geometry.hidden), generator=generator) * 1.5).to(torch.bfloat16)
+    return hidden, torch.randint(0, drafter.geometry.vocab, (sequences * tokens,), generator=generator, dtype=torch.int32)
+
+
+def test_every_block_of_the_drafters_plan_is_the_function_it_stands_for(monkeypatch):
+    """The blocks of the drafter's plan, as ``plan`` builds them from ``DRAFTER_PROVIDERS``, each against the function it
+    stands for.  The tests above call the functions, the stand-in test below replaces the blocks, and a pass compared
+    with passes of itself moves with a defect: an error INSIDE a block's class -- operands exchanged, another function
+    called, an epsilon or an accumulation of its own -- is held here.  The blocks of the new keys on stated operands
+    whose roles cannot be exchanged without other bytes; then one body pass through the plan's blocks against the same
+    pass written out from the functions, rows and cache; then the head, block by block."""
+    from model_samples import weights as formats
+    from model_samples.providers import ROW_QUANT, AttentionParams, Quant, torch_ref
+
+    drafter, weights, call, _ = _drafter_on_the_cpu()
+    bf16, acc, eps, width = torch.bfloat16, torch.float64, drafter.norm_eps, drafter.geometry.hidden
+    generator = torch.Generator().manual_seed(41)
+
+    def same(got, want) -> bool:
+        """Two quantised operands of one kind with the same bytes and the same scale: a float, or one per row."""
+        if type(got) is not type(want) or type(got.scale) is not type(want.scale):
+            return False
+        scales = torch.equal(got.scale, want.scale) if isinstance(want.scale, torch.Tensor) else got.scale == want.scale
+        return scales and all(_bytes(a) == _bytes(b) for a, b in zip(got.tensors(), want.tensors()))
+
+    # the two norms in front of the first multiply: a small embedding half, a large hidden half, two weights
+    embedding = (torch.randn((5, width), generator=generator) * 0.05).to(bf16)
+    hidden = (torch.randn((5, width), generator=generator) * 3.0).to(bf16)
+    weight_embedding = (torch.randn(width, generator=generator) * 0.02).to(bf16)
+    weight_hidden = (torch.randn(width, generator=generator) * 0.02 + 2.0).to(bf16)
+    got = call("draft.pre_fc_norm", 0, embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT)
+    want = torch_ref.pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT, eps, acc)
+    assert same(got, want), "the embedding half first with its own weight, one scale over both, the model's epsilon"
+    others = (
+        torch_ref.pre_fc_norm_quantize(hidden, embedding, weight_hidden, weight_embedding, ROW_QUANT, eps, acc),  # the halves exchanged
+        torch_ref.pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT, 100.0 * eps, acc),  # another epsilon
+    )
+    assert not any(same(other, want) for other in others), "these operands tell each of them from the block"
+    # ... and the accumulation of the run, which rows of this size cannot tell from fp32 sums: what the block hands the function
+    handed = []
+    monkeypatch.setattr(torch_ref, "pre_fc_norm_quantize", lambda *arguments: handed.append(arguments[4:]))
+    call("draft.pre_fc_norm", 0, embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT)
+    monkeypatch.undo()
+    assert handed == [(ROW_QUANT, eps, torch.float64)], "its quantisation, the model's epsilon, fp64"
+
+    # the gate: attention rows, then the gate, one rounding -- with the stated element of the function's test, whose scale
+    # shows its bf16 value (0.19921875; the model's chain, which rounds the sigmoid first, gives 0.1982421875)
+    o = (torch.randn((6, 512), generator=generator) * 2.0).to(bf16)
+    gate = (torch.randn((6, 512), generator=generator) * 3.0).to(bf16)
+    got, want = call("draft.gate_quantize", 0, o, gate, ROW_QUANT), torch_ref.gate_row_quantize(o, gate, ROW_QUANT)
+    assert same(got, want) and not same(torch_ref.gate_row_quantize(gate, o, ROW_QUANT), want)
+    stated = call("draft.gate_quantize", 0, torch.tensor([[1.2109375]], dtype=bf16), torch.tensor([[-1.625]], dtype=bf16), ROW_QUANT)
+    assert stated.scale.tolist() == [_fp32(0.19921875 / 448.0)] and stated.codes.tolist() == [[0x7E]]
+
+    # SiLU x up: the gate half first, the SiLU rounded before the product
+    gate_up = torch.cat((gate, o), dim=1)
+    act, formula = call("draft.silu_mul", 0, gate_up), torch_ref.silu_mul(gate_up)
+    exchanged, unrounded = torch_ref.silu_mul(torch.cat((o, gate), dim=1)), (torch.nn.functional.silu(gate.float()) * o.float()).to(bf16)
+    assert _bytes(act) == _bytes(formula) and _bytes(exchanged) != _bytes(formula) and _bytes(unrounded) != _bytes(formula)
+
+    # the quantisation of a row: the format it is asked for, per row for the MLP's operand and 4-bit for the head's
+    per_row = call("draft.activation_quantize", 0, o, ROW_QUANT)
+    four_bit = call("draft.head.quantize", 0, hidden, Quant("nvfp4", 8.0 / 2688.0))
+    assert same(per_row, formats.quantize_fp8_per_row(o)) and same(four_bit, formats.quantize_nvfp4(hidden, 8.0 / 2688.0))
+    assert tuple(per_row.scale.shape) == (6,) and four_bit.scale == 8.0 / 2688.0, "a scale per row there, the head's static scale here"
+    assert isinstance(per_row, formats.ScaledTensor) and isinstance(four_bit, formats.BlockScaledTensor)
+
+    # one body pass through the plan's blocks = D0 .. D15 written out from the functions: two sequences, three rows each
+    sequences, tokens, position = 2, 3, 2
+    hidden, ids = _step_rows(drafter, sequences, tokens, seed=43)
+    through, written = drafter.state(sequences, 12, "cpu"), drafter.state(sequences, 12, "cpu")
+    rows = drafter.body(call, weights, through, hidden, ids, position)
+    g, copies = drafter.geometry, weights.copies
+    params = AttentionParams(g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim, g.rope_theta, weights.q_norm, weights.k_norm)
+    embedded = weights.embedding.index_select(0, ids)
+    q = torch_ref.pre_fc_norm_quantize(embedded, hidden, weights.pre_fc_norm_embedding, weights.pre_fc_norm_hidden, ROW_QUANT, eps, acc)
+    stream = torch_ref.linear(q, copies["fc"], acc)
+    q, _, residual = torch_ref.add_norm_quantize(stream, None, weights.input_norm, ROW_QUANT, eps, acc)
+    qh, gate = torch_ref.attention_prepare_tokens(torch_ref.linear(q, copies["qkv"], acc), written, position, tokens, params, eps, acc)
+    q = torch_ref.gate_row_quantize(torch_ref.attention_tokens(qh, written, position, tokens, acc), gate, ROW_QUANT)
+    q, _, residual = torch_ref.add_norm_quantize(torch_ref.linear(q, copies["o"], acc), residual, weights.post_norm, ROW_QUANT, eps, acc)
+    q = formats.quantize_fp8_per_row(torch_ref.silu_mul(torch_ref.linear(q, copies["gate_up"], acc)))
+    _, normed, _ = torch_ref.add_norm_quantize(torch_ref.linear(q, copies["down"], acc), residual, weights.final_norm, None, eps, acc)
+    assert _bytes(rows) == _bytes(normed), "the body through the plan's blocks is the pass written out from the functions"
+    assert _bytes(through.k) == _bytes(written.k) and _bytes(through.v) == _bytes(written.v) and bool(written.k[:, :, 2:5].any(dim=-1).all())
+
+    # the head, block by block: the operand in 4 bits at the head's static scale, the logits over the listed rows, the id
+    chosen = rows.unflatten(0, (sequences, tokens))[:, 1]
+    operand = formats.quantize_nvfp4(chosen, weights.head_quant.scale)
+    logits = torch_ref.linear(operand, copies["head"], acc)
+    got = call("draft.head.quantize", 0, chosen, weights.head_quant)
+    got_logits = call("draft.head", 0, got, copies["head"])
+    proposed = drafter.propose(call, weights, chosen)
+    assert same(got, operand) and _bytes(got_logits) == _bytes(logits) and tuple(logits.shape) == (sequences, len(drafter.vocabulary.ids))
+    assert proposed.tolist() == torch_ref.listed_argmax(logits, weights.head_ids).tolist()
+
+
+def test_every_block_of_a_pass_gives_a_sequence_alone_the_bytes_it_has_among_others():
+    """What a block of the drafter's plan declares about its operands -- which have one leading row per row of the step
+    (``per_row``) and which is state the call writes (``state_args``) -- read the way a checked run reads it.  The tap of
+    the tie-out runs every block of a step over several sequences once more on ONE sequence, its operands cut to that
+    sequence's rows by ``per_row`` (an 8-bit operand with a scale per row through ``ScaledTensor.rows``, the cache
+    through ``KvCache.rows``), and compares the bytes.  No session taps a draft pass yet: this test is what reads the
+    declarations, on a pass over two sequences of three rows, once for each sequence."""
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.tie_out import BlockTap
+
+    drafter, weights, plain, _ = _drafter_on_the_cpu()
+    declared = {
+        "draft.embedding": ((0,), ()),
+        "draft.pre_fc_norm": ((0, 1), ()),
+        "draft.projection": ((0,), ()),
+        "draft.norm_quantize": ((0, 1), ()),
+        "draft.attention.prepare": ((0, 1), (1,)),
+        "draft.attention.core": ((0, 1), ()),
+        "draft.gate_quantize": ((0, 1), ()),
+        "draft.silu_mul": ((0,), ()),
+        "draft.activation_quantize": ((0,), ()),
+        "draft.final_norm": ((0, 1), ()),
+        "draft.head.quantize": ((0,), ()),
+        "draft.head": ((0,), ()),
+        "draft.token_choice": ((0,), ()),
+    }
+    sequences, tokens, position = 2, 3, 2
+    facts, table, source = DeviceFacts((10, 0)), drafter.provider_table, drafter.table_source
+    body = plan(table, drafter.regimes, facts, sequences, tokens, "reference", model=drafter, source=source)
+    head = plan(table, drafter.regimes, facts, sequences, 1, "reference", model=drafter, source=source)  # the head runs on one row per sequence
+    assert {name: (tuple(block.per_row), tuple(block.state_args)) for name, block in body.items()} == declared
+    assert {name: (tuple(block.per_row), tuple(block.state_args)) for name, block in head.items()} == declared
+
+    hidden, ids = _step_rows(drafter, sequences, tokens, seed=47)
+    front = [_step_rows(drafter, sequences, 1, seed=200 + at) for at in range(position)]  # what stands in front: two positions
+    untapped = drafter.state(sequences, 12, "cpu")
+    for at, (row, token) in enumerate(front):
+        drafter.body(plain, weights, untapped, row, token, at)
+    rows = drafter.body(plain, weights, untapped, hidden, ids, position)
+    proposals = drafter.propose(plain, weights, rows.unflatten(0, (sequences, tokens))[:, 1])
+
+    taps = BlockTap(body, body), BlockTap(head, head)
+    for alone in range(sequences):  # the sequence the tap runs alone
+        cache = drafter.state(sequences, 12, "cpu")
+        for at, (row, token) in enumerate(front):
+            drafter.body(plain, weights, cache, row, token, at)
+        for tap in taps:
+            tap.step = alone
+        tapped = drafter.body(lambda block, index, *operands: taps[0](block, index, body[block], operands), weights, cache, hidden, ids, position)
+        kept = tapped.unflatten(0, (sequences, tokens))[:, 1]
+        chosen = drafter.propose(lambda block, index, *operands: taps[1](block, index, head[block], operands), weights, kept)
+        # the tap hands back what the blocks made over both sequences, and leaves the cache as they left it
+        assert _bytes(tapped) == _bytes(rows) and chosen.tolist() == proposals.tolist(), alone
+        assert _bytes(cache.k) == _bytes(untapped.k) and _bytes(cache.v) == _bytes(untapped.v), alone
+    stats = {**taps[0].stats, **taps[1].stats}
+    calls = drafter.calls()
+    assert sorted(stats) == sorted(declared) and sum(calls.values()) == 18
+    assert {name: of.batch_calls for name, of in stats.items()} == {name: sequences * calls[name] for name in declared}, "every call, once per sequence"
+    assert [name for name, of in stats.items() if of.batch_equal != of.batch_calls] == [], "a sequence alone: the bytes it has among the others"
+
+
+def test_a_pass_over_several_rows_is_that_many_passes_of_one_row():
+    """The body of a pass over ``T`` rows per sequence against ``T`` passes of one row at the positions of those rows: the
+    final-norm rows and the cache, byte for byte, at 2 and at 6 rows per sequence, for one sequence and for two.  The
+    first pass of a step runs over the rows of the verify step in front of it and every other pass at one row; a pass
+    over a prompt runs at one row per position: they must be one function of a position's own two inputs and of what
+    stands in front of it."""
+    from model_samples.state import KvCache
+
+    drafter, weights, call, log = _drafter_on_the_cpu()
+    prefix, capacity = 3, 12
+    for sequences in (1, 2):
+        for tokens in (2, 6):
+            at_once, one_by_one = drafter.state(sequences, capacity, "cpu"), drafter.state(sequences, capacity, "cpu")
+            assert isinstance(at_once, KvCache) and tuple(at_once.k.shape) == tuple(at_once.v.shape) == (sequences, 1, capacity, 8)
+            assert at_once.k.dtype == at_once.v.dtype == torch.bfloat16 and at_once.tokens == 1 and not at_once.k.any() and not at_once.v.any()
+            for position in range(prefix):  # what stands in front: three positions written by passes of one row, in both caches
+                hidden, ids = _step_rows(drafter, sequences, 1, seed=100 + position)
+                for cache in (at_once, one_by_one):
+                    drafter.body(call, weights, cache, hidden, ids, position)
+            before = at_once.k.clone()
+            hidden, ids = _step_rows(drafter, sequences, tokens, seed=7)
+            log.clear()
+            rows = drafter.body(call, weights, at_once, hidden, ids, prefix)
+            assert log == [(block, 0) for block, _ in drafter.wiring()[:15]] and tuple(rows.shape) == (sequences * tokens, 64) and rows.dtype == torch.bfloat16
+            by_token = hidden.unflatten(0, (sequences, tokens)), ids.unflatten(0, (sequences, tokens))
+            singles = [drafter.body(call, weights, one_by_one, by_token[0][:, t], by_token[1][:, t], prefix + t) for t in range(tokens)]
+            assert _bytes(rows) == _bytes(torch.stack(singles, dim=1).flatten(0, 1)), (sequences, tokens)
+            assert _bytes(at_once.k) == _bytes(one_by_one.k) and _bytes(at_once.v) == _bytes(one_by_one.v), (sequences, tokens)
+            # the pass wrote the positions of its rows and no other; the cache keeps no count of its own
+            written = slice(prefix, prefix + tokens)
+            assert torch.equal(at_once.k[:, :, :prefix], before[:, :, :prefix]) and not at_once.k[:, :, prefix + tokens :].any() and at_once.tokens == 1
+            assert bool(at_once.k[:, :, written].any(dim=-1).all()) and bool(at_once.v[:, :, written].any(dim=-1).all())
+            # a row reads what stands in front of it and nothing behind it
+            changed = hidden.clone()
+            changed[tokens - 1 :: tokens] += 1.0  # the last row of every sequence
+            again = drafter.body(call, weights, drafter.state(sequences, capacity, "cpu"), changed, ids, prefix).unflatten(0, (sequences, tokens))
+            empty = drafter.body(call, weights, drafter.state(sequences, capacity, "cpu"), hidden, ids, prefix).unflatten(0, (sequences, tokens))
+            assert _bytes(again[:, : tokens - 1]) == _bytes(empty[:, : tokens - 1]) and _bytes(again[:, tokens - 1]) != _bytes(empty[:, tokens - 1])
+            assert _bytes(empty) != _bytes(rows.unflatten(0, (sequences, tokens))), "the same rows behind an empty cache: other rows"
+            assert _bytes(empty[:, 0]) != _bytes(empty[:, 1]), "two positions, two rows"
+
+    # the head on one row per sequence: three calls, ids of the draft vocabulary, the same for a sequence alone
+    log.clear()
+    proposed = drafter.propose(call, weights, rows.unflatten(0, (2, 6))[:, 4])
+    assert log == [(block, 0) for block, _ in drafter.wiring()[15:]] and proposed.dtype == torch.int32 and tuple(proposed.shape) == (2,)
+    assert set(proposed.tolist()) <= set(drafter.vocabulary.ids)
+    alone = drafter.propose(call, weights, rows.unflatten(0, (2, 6))[1:, 4])
+    assert alone.tolist() == proposed.tolist()[1:]
+
+    # what a pass refuses, each with its sentence
+    cache = drafter.state(2, capacity, "cpu")
+    hidden, ids = _step_rows(drafter, 2, 3, seed=9)
+    refused = (
+        (dict(hidden=hidden[:5]), "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 5 hidden rows and 6 ids"),
+        (dict(ids=ids[:4]), "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 6 hidden rows and 4 ids"),
+        (
+            dict(hidden=hidden[:5], ids=ids[:5]),  # an id per row, and no whole number of rows per sequence
+            "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 5 hidden rows and 5 ids",
+        ),
+        (
+            dict(hidden=hidden[:1], ids=ids[:1]),
+            "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 1 hidden rows and 1 ids",
+        ),
+        (dict(position=10), "the drafter's cache was built for 12 positions per sequence; this pass writes 10 to 12"),
+        (dict(position=-1), "the drafter's cache was built for 12 positions per sequence; this pass writes -1 to 1"),
+    )
+    for changes, sentence in refused:
+        operands = dict(hidden=hidden, ids=ids, position=0)
+        operands.update(changes)
+        with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+            drafter.body(call, weights, cache, operands["hidden"], operands["ids"], operands["position"])
+    assert not cache.k.any(), "a refused pass wrote nothing"
+    at_the_end = drafter.body(call, weights, cache, hidden, ids, 9)
+    assert tuple(at_the_end.shape) == (6, 64) and bool(cache.k[:, :, 9:].any(dim=-1).all()), "the last three positions of the cache"
+    for sequences, positions in ((0, 4), (2, 0)):
+        with pytest.raises(
+            ValueError, match=f"^a drafter's cache needs at least one sequence and one position; got sequences={sequences}, capacity={positions}$"
+        ):
+            drafter.state(sequences, positions, "cpu")
+
+    # a step whose later passes would write past the cache is refused before its first pass: it wrote nothing
+    fresh = drafter.state(2, capacity, "cpu")
+    with pytest.raises(ValueError, match="^the drafter's cache was built for 12 positions per sequence; the passes of this step write up to position 12$"):
+        drafter.draft(call, weights, fresh, hidden, ids, 6, 2, 5)  # three rows at 6 to 8, the row at 8 kept: passes at 9, 10, 11 and 12
+    assert not fresh.k.any() and not fresh.v.any(), "a refused step wrote nothing"
+    # ... what the first pass itself would write past it is the pass's own refusal, also for a step of that one pass
+    with pytest.raises(ValueError, match="^the drafter's cache was built for 12 positions per sequence; this pass writes 10 to 12$"):
+        drafter.draft(call, weights, fresh, hidden, ids, 10, 2, 1)
+    assert not fresh.k.any(), "nor did that one"
+    fits = drafter.draft(call, weights, fresh, hidden, ids, 6, 2, 4)  # the last of the four passes writes position 11
+    assert tuple(fits.shape) == (2, 4) and bool(fresh.k[:, :, 6:].any(dim=-1).all()) and not fresh.k[:, :, :6].any()
+
+
+def test_the_passes_of_a_step_read_what_the_step_says():
+    """``QwenDenseDrafter.draft`` through a recording stand-in for the blocks, for every kept count 0 .. k at one sequence
+    and at two: pass 0 is the body on what the step hands over, and of its output the row ``kept`` of every sequence goes
+    to the head; pass ``j`` is handed the output row of pass ``j - 1``, the proposal of pass ``j - 1`` and the position
+    ``position + kept + j``.  And every block of a pass is handed what the table of the module says: the weight of its
+    call site, the residual stream where one is added, the quantisation of its operand."""
+    from types import SimpleNamespace
+
+    from model_samples.providers import ROW_QUANT, AttentionParams, Quant
+    from model_samples.qwen_dense import QwenDenseDrafter
+    from model_samples.qwen_dense.drafter import BODY, HEAD
+    from model_samples.state import KvCache
+
+    drafter = QwenDenseDrafter.seeded(_tiny_model(), seed=5)
+    plain = ("embedding", "pre_fc_norm_embedding", "pre_fc_norm_hidden", "input_norm", "q_norm", "k_norm", "post_norm", "final_norm", "head_ids")
+    copies = {name: SimpleNamespace(name=name) for name in ("fc", "qkv", "o", "gate_up", "down", "head")}
+    weights = SimpleNamespace(head_quant=Quant("nvfp4", 0.5), copies=copies, **{name: SimpleNamespace(name=name) for name in plain})
+    position, k = 4, 5
+    tokens = k + 1
+    sites = drafter.sites()
+    assert sites == tuple(site for _, site in (*BODY, *HEAD)) and [block for block, _ in drafter.wiring()] == [block for block, _ in (*BODY, *HEAD)]
+
+    def run(sequences, kept, passes=k):
+        """One ``draft`` on stand-in blocks: ``(drafts, calls, made)`` -- the calls as (block, pass, operands), and per
+        (block, pass, site) what the stand-in handed back."""
+        calls, made, rows = [], {}, [0]
+        cache = KvCache(torch.zeros((sequences, 1, 32, 2), dtype=torch.bfloat16), torch.zeros((sequences, 1, 32, 2), dtype=torch.bfloat16))
+
+        def call(block, index, *operands):
+            site = sites[len(calls) % len(sites)]  # of this call, by its place in the pass
+            calls.append((block, index, operands))
+            if block == "draft.embedding":
+                rows[0] = operands[0].shape[0]  # the rows of this pass: one per id
+            # (a block with several results hands them back as a list here: the pass unpacks either)
+            if block == "draft.final_norm":  # the output rows of the pass: row r of pass j holds 100 (j + 1) + r
+                rows_out = torch.arange(rows[0], dtype=torch.float32).unsqueeze(1).expand(rows[0], 4) + 100.0 * (index + 1)
+                out = [None, rows_out, "the stream behind the final norm"]
+            elif block == "draft.token_choice":
+                out = torch.full((sequences,), 1000 + index, dtype=torch.int32)
+            elif block == "draft.norm_quantize":
+                out = [f"codes of {site} in pass {index}", f"normed rows of {site}", f"the stream behind {site} in pass {index}"]
+            elif block == "draft.attention.prepare":
+                out = [f"q of pass {index}", f"gate of pass {index}"]
+            else:
+                out = f"{block} {site} of pass {index}".replace("  ", " ")
+            made[(block, index, site)] = out
+            return out
+
+        hidden = torch.arange(sequences * tokens, dtype=torch.float32).unsqueeze(1).expand(sequences * tokens, 4).to(torch.bfloat16)
+        ids = torch.arange(sequences * tokens, dtype=torch.int32) + 50
+        drafts = drafter.draft(call, weights, cache, hidden, ids, position, kept, passes)
+        return drafts, calls, made, (cache, hidden, ids)
+
+    for sequences in (1, 2):
+        for kept in range(tokens):
+            drafts, calls, made, (cache, hidden, ids) = run(sequences, kept)
+            assert drafts.dtype == torch.int32 and drafts.tolist() == [[1000 + j for j in range(k)]] * sequences, "one column per pass, in order"
+            assert [(block, index) for block, index, _ in calls] == [(block, index) for index in range(k) for block, _ in (*BODY, *HEAD)]
+            assert len(calls) == k * drafter.calls_per_pass() == k * 18
+            by_pass = [{(block, site): operands for (block, index, operands), (_, site) in zip(calls, (*BODY, *HEAD) * k) if index == j} for j in range(k)]
+            for j, of in enumerate(by_pass):
+                rows = sequences * tokens if j == 0 else sequences
+                at = position if j == 0 else position + kept + j
+                # what the pass is handed: the step's rows and ids, then the pass's own output row and its own last proposal
+                handed_ids, table = of[("draft.embedding", "")]
+                embedded, handed_hidden, norm_e, norm_h, quant = of[("draft.pre_fc_norm", "")]
+                assert table is weights.embedding and embedded == f"draft.embedding of pass {j}" and quant is ROW_QUANT
+                assert norm_e is weights.pre_fc_norm_embedding and norm_h is weights.pre_fc_norm_hidden
+                if j == 0:
+                    assert handed_ids is ids and handed_hidden is hidden
+                else:
+                    assert handed_ids is made[("draft.token_choice", j - 1, "")], "the proposal of the pass before"
+                    before = made[("draft.final_norm", j - 1, "")][1]
+                    if j == 1:  # of pass 0's rows, the row `kept` of every sequence: a view
+                        chosen = torch.tensor([[100.0 + sequence * tokens + kept] * 4 for sequence in range(sequences)])
+                        assert torch.equal(handed_hidden, chosen) and handed_hidden.untyped_storage().data_ptr() == before.untyped_storage().data_ptr()
+                    else:
+                        assert handed_hidden is before, "the output row of the pass before"
+                assert handed_ids.shape[0] == handed_hidden.shape[0] == rows
+                # the attention blocks: the drafter's cache as a view of this pass's rows per sequence, at the pass's position
+                qkv, view, where, params = of[("draft.attention.prepare", "")]
+                query, view_core, where_core = of[("draft.attention.core", "")]
+                assert view.k is cache.k and view.v is cache.v and view.tokens == rows // sequences and (where, where_core) == (at, at)
+                assert view_core.k is cache.k and view_core.tokens == view.tokens and query == f"q of pass {j}" and qkv == f"draft.projection qkv of pass {j}"
+                g = drafter.geometry
+                assert params == AttentionParams(g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim, g.rope_theta, weights.q_norm, weights.k_norm)
+                # every other block: its operand, the weight of its call site (handed over last, by name), the residual where one
+                # is added, its quantisation
+                stream = f"draft.projection fc of pass {j}"
+                assert of[("draft.projection", "fc")] == (f"draft.pre_fc_norm of pass {j}", copies["fc"], "fc")
+                assert of[("draft.norm_quantize", "input")] == (
+                    stream,
+                    None,
+                    weights.input_norm,
+                    ROW_QUANT,
+                    "input",
+                ), "the first multiply's rows ARE the stream: no add"
+                assert of[("draft.projection", "qkv")] == (f"codes of input in pass {j}", copies["qkv"], "qkv")
+                assert of[("draft.gate_quantize", "")] == (f"draft.attention.core of pass {j}", f"gate of pass {j}", ROW_QUANT)
+                assert of[("draft.projection", "o")] == (f"draft.gate_quantize of pass {j}", copies["o"], "o")
+                behind_input = f"the stream behind input in pass {j}"
+                assert of[("draft.norm_quantize", "mlp")] == (f"draft.projection o of pass {j}", behind_input, weights.post_norm, ROW_QUANT, "mlp")
+                assert of[("draft.projection", "gate_up")] == (f"codes of mlp in pass {j}", copies["gate_up"], "gate_up")
+                assert of[("draft.silu_mul", "")] == (f"draft.projection gate_up of pass {j}",)
+                assert of[("draft.activation_quantize", "")] == (f"draft.silu_mul of pass {j}", ROW_QUANT)
+                assert of[("draft.projection", "down")] == (f"draft.activation_quantize of pass {j}", copies["down"], "down")
+                assert of[("draft.final_norm", "")] == (f"draft.projection down of pass {j}", f"the stream behind mlp in pass {j}", weights.final_norm, None)
+                # the head: one row per sequence -- of pass 0 the row `kept`, of a later pass its one row -- at the head's own quantisation
+                head_rows, head_quant = of[("draft.head.quantize", "")]
+                out = made[("draft.final_norm", j, "")][1]
+                expected = out.unflatten(0, (sequences, tokens))[:, kept] if j == 0 else out
+                assert torch.equal(head_rows, expected) and tuple(head_rows.shape) == (sequences, 4) and head_quant is weights.head_quant
+                assert (
+                    head_rows.untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+                ), "a view of the pass's rows: nothing is copied for the row select"
+                assert of[("draft.head", "")] == (f"draft.head.quantize of pass {j}", copies["head"])
+                logits, listed = of[("draft.token_choice", "")]
+                assert logits == f"draft.head of pass {j}" and listed is weights.head_ids
+            assert not cache.k.any() and cache.tokens == 1, "the stand-ins wrote nothing, and the cache handed in keeps its own count"
+
+    # one pass: the body, the row select, the head; and a step behind one row per sequence (the first step of a run)
+    drafts, calls, _, _ = run(1, 3, passes=1)
+    assert drafts.tolist() == [[1000]] and len(calls) == 18
+    calls = []
+    cache = KvCache(torch.zeros((2, 1, 8, 2), dtype=torch.bfloat16), torch.zeros((2, 1, 8, 2), dtype=torch.bfloat16))
+
+    handed = {"draft.final_norm": [None, torch.zeros((2, 4)), None], "draft.norm_quantize": [None, None, None], "draft.attention.prepare": [None, None]}
+
+    def recorded(block, index, *operands):
+        calls.append((block, index, operands))
+        return handed.get(block, torch.zeros(2, dtype=torch.int32))
+
+    one_row = torch.zeros((2, 4), dtype=torch.bfloat16)
+    behind_one_row = drafter.draft(recorded, weights, cache, one_row, torch.zeros(2, dtype=torch.int32), 1, 0, 3)
+    assert tuple(behind_one_row.shape) == (2, 3)
+    assert [operands[2] for block, _, operands in calls if block == "draft.attention.prepare"] == [1, 2, 3], "one row per sequence: positions 1, 2, 3"
+    assert [operands[1].tokens for block, _, operands in calls if block == "draft.attention.core"] == [1, 1, 1]
+
+    # what a step refuses: a kept count that is no row of a sequence, no pass, and a load without its copies
+    for kept in (tokens, -1, True, 1.0, None):
+        with pytest.raises(ValueError, match=re.escape(f"a draft step continues from one of the 6 rows per sequence it is handed, 0 to 5; got kept={kept!r}")):
+            run(1, kept)
+    for passes in (0, -2, True, 2.0):
+        with pytest.raises(ValueError, match=re.escape(f"a draft step has at least one pass; got passes={passes!r}")):
+            run(1, 0, passes=passes)
+    weights.copies = None
+    sentence = (
+        "the reference blocks of a draft pass multiply on bf16 copies of the drafter's weights, and this load kept none: load the drafter with copies=True"
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+        run(1, 0)
+    with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+        drafter.propose(recorded, weights, one_row)
+    # fewer rows than sequences: there is no row to keep, and the first pass says what it takes
+    sentence = "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 1 hidden rows and 1 ids"
+    with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+        drafter.draft(recorded, weights, cache, one_row[:1], torch.zeros(1, dtype=torch.int32), 1, 0, 3)
+
+
+def test_the_models_stored_forms_and_the_drafter_loaded_together(tmp_path):
+    """One checkpoint on disk, generated here, with a drafter: the model loaded with the stored forms a plan of the stack
+    ``native`` asks for, then the drafter with the model's table handed over and with the copies its reference blocks
+    multiply on.  Each copy is the code values of the tensor the load keeps beside it; ``memory_bytes()`` is what is
+    held; the model's stored weights are the bytes of their load after the drafter's; and a pass runs on what was loaded."""
+    pytest.importorskip("safetensors")
+    from model_samples import Checkpoint
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+    from model_samples.qwen_dense.drafter import MULTIPLIES, NORMS
+    from model_samples.timing import Stages
+    from model_samples.weights import Dequantized, dequantize
+
+    tiny = _tiny_model()
+    directory = _write_checkpoint(tmp_path / "tiny-checkpoint", _disk_tensors(tiny, QwenDenseDrafter.seeded(tiny, seed=5), 5), _config(tiny.geometry))
+    (tmp_path / "ids.json").write_text(json.dumps(list(range(0, 272, 3))))
+    disk = Checkpoint.describe(str(directory))
+    model = QwenDense.describe(disk)
+    drafter = QwenDenseDrafter.describe(disk, model, draft_vocab=str(tmp_path / "ids.json"))
+    assert drafter.geometry.layer_kinds == ("full_attention",) and model.geometry.layer_kinds == ("linear_attention", "full_attention")
+    assert dataclasses.replace(drafter.geometry, layer_kinds=model.geometry.layer_kinds) == model.geometry, "the model's widths, one attention layer"
+
+    # the forms a native plan of the published widths keeps on compute capability 10.0: the weights its entries multiply on
+    native = plan(QwenDense.provider_table, QwenDense.regimes, DeviceFacts((10, 0)), 1, 1, "native", model=QwenDense.reduced())
+    kept = tuple(name for name, block in native.items() if block.stored_weights)
+    assert kept == ("projection.fp8.in", "mlp.gate_up")
+    loaded = model.load(disk, "cpu", Stages(), stored=kept, uncopied=kept)
+    assert loaded.stored == loaded.uncopied == kept and len(loaded.alone) == 4, "two layers, two weights each, on their stored format alone"
+
+    stages = Stages()
+    weights = drafter.load(disk, "cpu", stages, embedding=loaded.embedding)
+    assert list(stages.seconds) == ["read", "quantise", "merge", "dequantise"] and weights.embedding is loaded.embedding
+    assert sorted(weights.copies) == ["down", "fc", "gate_up", "head", "o", "qkv"]
+    values = torch.tensor([0.0 if byte & 0x7F == 0x7F else _e4m3_value(byte) for byte in range(256)], dtype=torch.float64)
+    for name, _ in MULTIPLIES:  # the copy of each weight: the values of ITS codes, exact in bf16, with its scales and the codes beside it
+        copy, stored = weights.copies[name], getattr(weights, name)
+        assert isinstance(copy, Dequantized) and copy.data.dtype == torch.bfloat16 and copy.stored is stored and copy.scale is stored.scale
+        assert torch.equal(copy.data.double(), values[stored.codes.long()]), name
+        assert copy.bf16() is copy.data
+    head = weights.copies["head"]
+    assert head.stored is weights.head and head.scale == weights.head.scale and tuple(head.data.shape) == (91, 64) and head.data.dtype == torch.bfloat16
+    assert torch.equal(
+        head.data, dequantize(weights.head).data
+    ), "the listed head rows as the multiply over a copy reads them (weights.dequantize has its own pin)"
+    assert not torch.equal(weights.copies["fc"].data[:48, :64], weights.copies["qkv"].data), "two weights, two copies"
+
+    # what is held, against the arithmetic on the tensor list
+    def held(tensors):
+        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    codes = held(tensor for name, _ in MULTIPLIES for tensor in (getattr(weights, name).codes, getattr(weights, name).scale))
+    norms = held(getattr(weights, name) for name, _ in NORMS)
+    rows = held((weights.head.codes, weights.head.block_scales, weights.head_ids))
+    assert drafter.load_bytes() == {"weights": codes, "norms": norms, "head": rows}
+    elements = 64 * 128 + 48 * 64 + 64 * 16 + 192 * 64 + 64 * 96  # the five weights of the tiny geometry
+    copied = {"weights": held(weights.copies[name].data for name, _ in MULTIPLIES), "head": held([head.data])}
+    assert drafter.copy_bytes() == copied == {"weights": 2 * elements, "head": 2 * 91 * 64}
+    cache = drafter.state(2, 40, "cpu")
+    assert held(cache.tensors()) == 2560, "keys and values, two sequences, one head, 40 positions of 8 elements, 2 bytes each"
+    assert drafter.memory_bytes(2, 40) == codes + norms + rows + sum(copied.values()) + 2560, "what the load holds, its copies and the cache: nothing else"
+    assert drafter.memory_bytes(2, 40, copies=False) == drafter.memory_bytes(2, 40) - sum(copied.values())
+    assert drafter.memory_bytes(1, 40) == drafter.memory_bytes(2, 40) - 1280 and drafter.memory_bytes(2, 20) == drafter.memory_bytes(2, 40) - 1280
+
+    # a pass on what was loaded: proposals from the listed ids; the model's stored weights are the bytes of their load
+    blocks = plan(drafter.provider_table, drafter.regimes, DeviceFacts((10, 0)), 2, 1, "native", model=drafter, source=drafter.table_source)
+    hidden, ids = _step_rows(drafter, 2, 3, seed=11)
+    drafts = drafter.draft(lambda block, index, *operands: blocks[block](*operands), weights, cache, hidden, ids, 5, 1, 4)
+    assert tuple(drafts.shape) == (2, 4) and drafts.dtype == torch.int32 and set(drafts.flatten().tolist()) <= set(range(0, 272, 3))
+    assert bool(cache.k[:, :, 5:10].any(dim=-1).all()) and not cache.k[:, :, :5].any() and not cache.k[:, :, 10:].any(), "positions 5 to 7, then 7 to 9"
+    assert all(weight.intact() for _, _, weight in loaded.alone) and all(weight.data is None for _, _, weight in loaded.alone)
+
+    # a load without the copies: the codes alone, no stage for them, and a pass names the argument
+    bare_stages = Stages()
+    bare = drafter.load(disk, "cpu", bare_stages, embedding=loaded.embedding, copies=False)
+    assert bare.copies is None and list(bare_stages.seconds) == ["read", "quantise", "merge"]
+    assert torch.equal(bare.fc.codes, weights.fc.codes) and torch.equal(bare.head.codes, weights.head.codes)
+    with pytest.raises(ValueError, match="load the drafter with copies=True$"):
+        drafter.body(lambda block, index, *operands: blocks[block](*operands), bare, cache, hidden, ids, 5)
+    disk.close()
+
+
+def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
+    """The sentences of the family README's section on the drafter that state a count, a figure or a behaviour of the
+    draft pass, each against the code: the calls of a pass, its call sites, the rule of the row quantiser, what a load
+    and its cache hold at the published widths, what serves the blocks and what does not run them yet.  The section
+    states no count of the launches of a pass.  And the sentences of the area README and of the guide."""
+    from model_samples import providers, weights
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter, configs
+    from model_samples.qwen_dense.drafter import BODY, HEAD
+
+    section = " ".join(_readme_section().split())
+    # what there is, and what does not run it
+    said = (
+        "**What is here today is its loader and its draft pass on reference blocks, both reached from the library**",
+        "No script of this folder drafts yet, no session runs a draft pass, and `00_decode.py` neither reads the drafter nor has a flag for it.",
+        "The drafter has a draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`): "
+        "every block of it is a reference chain in every stack, and its embedding lookup is PyTorch's gather.",
+        "No session runs a draft pass yet, and no script takes the list; the loader takes it as `draft_vocab=`.",
+        "The drafter's blocks are held to their definitions and to each other at one row and at several, and their proposals are reported against "
+        "the model's own tokens on a checkpoint; they are not compared with another implementation of the drafter in this repository "
+        "(one second evaluation of its network was made by hand, outside this repository: it is among the runs below).",
+        "*Against the model's tokens* (reported, no gate): the checkpoint run below, with the same pass run on wrong inputs beside it.",
+        "The blocks that call them are held one layer up: every block of the drafter's plan, as the plan builds it, against the function it stands for",
+        "and every block of a pass over two sequences gives, for each sequence, the bytes that sequence gives alone,",
+        "No kernel serves a block of the drafter and none has read these 8-bit weights: the kernel census holds the model's steps and no draft pass",
+        # how the pass is reached: the lines themselves are run where the README's call of the loader is run
+        "A draft step from Python, behind the call of the loader above (its `model`, `drafter` and `weights`):",
+        "they read nothing of the checkpoint.",
+        "every row of this table serves all of them, so one plan runs a pass over any number of rows.",
+        "The hidden rows are the caller's to supply: no method of a session hands them out yet.",
+        "No method of a session hands out the final-norm rows a pass reads.",
+        # the cache: what a row reads of it, and what a step is refused for (held by the test of a pass over several rows)
+        "so a position in front that no pass wrote is read as those zeros and nothing refuses it: filling the cache over a prompt, "
+        "one body pass per position, is the caller's.",
+        "A step whose passes would write past the cache is refused before its first pass.",
+    )
+    assert [sentence for sentence in said if sentence not in section] == []
+    gone = (
+        "nothing runs the loaded drafter",
+        "its loader, and nothing else",
+        "there is no draft step, no block and no provider row",
+        "to the model's own tokens on a checkpoint;",  # the checkpoint run is reported: it holds nothing
+    )
+    assert [words for words in gone if words in section] == []
+    # ... and no sentence of another section says that nothing runs the drafter: no SESSION drafts
+    whole = " ".join(README.read_text().split())
+    elsewhere = (
+        "No session drafts yet (the section above runs the drafter's pass from the library alone), so no script runs a verify step:",
+        "how many were kept; no session drafts yet.",
+        "**What is not here.** No session drafts, so nothing decides how many tokens to keep: the caller says it.",
+    )
+    assert [sentence for sentence in elsewhere if sentence not in whole] == []
+    assert [words for words in ("othing drafts yet", "runs nothing)", "No drafter runs") if words in whole] == []
+    assert all(callable(getattr(QwenDenseDrafter, name)) for name in ("body", "propose", "draft", "state", "memory_bytes", "sites"))
+    # ... from the table: every block a reference chain in every stack, but the lookup, which is the gather
+    rows = {block: rows[0] for block, rows in configs.DRAFTER_PROVIDERS.items()}
+    assert all(row.fallback.startswith("reference chain") and row.stacks == configs.EVERY for block, row in rows.items() if block != "draft.embedding")
+    assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "target_stacks")
+    loop = (MODELS / "model_samples" / "loop.py").read_text()  # the sessions: none names a drafter, none hands out a hidden or a normed row
+    assert not any("Session" in name for name in dir(QwenDenseDrafter)) and re.findall("drafter|hidden|normed", loop) == []
+
+    # the counts of a pass
+    drafter = QwenDenseDrafter.seeded(QwenDense(), rows=65536)
+    assert "One pass is 18 block calls. The body is 15 of them:" in section and "The head is 3 calls on one row per sequence:" in section
+    assert (drafter.calls_per_pass(), len(BODY), len(HEAD)) == (18, 15, 3)
+    assert "The multiply is called at five sites and the norm + quantise at two" in section
+    assert (
+        (drafter.calls()["draft.projection"], drafter.calls()["draft.norm_quantize"])
+        == (5, 2)
+        == (len(configs.DRAFT_PROJECTION_SITES), len(configs.DRAFT_NORM_SITES))
+    )
+    assert "Every row of this table serves every stack, every GPU class and any row count." in section, "held by the plan test, row by row"
+    assert "for every kept count 0 to 5" in section, "the stand-in test of the passes runs k = 5"
+    # the rule of the row quantiser, in the section's numbers
+    assert "divided by 448 and never below 1 / (448 x 512); a code is the element *multiplied by the reciprocal* of that scale" in section
+    assert (
+        "Where a quotient sits exactly between two codes the two rules can give two codes: the product then lands just above the midpoint and takes "
+        "the code above, where the division takes the even one. A host test holds a row with two such elements."
+    ) in section, "the stated row of the quantiser's test; at most midpoints the two rules give one code"
+    assert "where a quotient sits exactly between two codes the two can give different codes." in section, "the weights' rule, the same statement"
+    assert "the scale of the operand's row and the scale of the weight's row, the two multiplied in the accumulation type." in section
+    assert (weights.E4M3_MAX, weights.PER_ROW_FLOOR) == (448.0, 512) and callable(weights.quantize_fp8_per_row) and providers.FP8_ROW == "fp8_row"
+    # what a load and its cache hold at the published widths with 65,536 ids (the manifest's last line is held with the manifest)
+    copies = sum(drafter.copy_bytes().values()) / 2.0**30
+    assert f"{copies:.2f} GiB with 65,536 ids, the last line of the manifest. `copies=False` leaves them out." == (
+        "1.42 GiB with 65,536 ids, the last line of the manifest. `copies=False` leaves them out."
+    )
+    assert (
+        "which the reference blocks of the draft pass multiply on: 1.42 GiB with 65,536 ids, the last line of the manifest. `copies=False` leaves them out."
+        in section
+    )
+    held = f"{drafter.memory_bytes(1, 2051) / 2.0**30:.2f} GiB at the published widths with 65,536 ids, one sequence and 2,051 positions"
+    assert held.startswith("2.00 GiB") and held in section and "A pass on a load without its copies is an error that names `copies=True`." in section
+    # the order of the section: the loader, the recipe, the pass, what holds it, the runs, what is not here
+    anchors = (
+        "**It finds the drafter's tensors",
+        "**A recipe for the list.**",
+        "**The draft pass.**",
+        "| block | calls per pass | provider key | entry [form] |",
+        "| block | call site | what differs there |",
+        "**What holds the pass.**",
+        "**The runs behind this section**",
+        "**What is not here.**",
+    )
+    assert [section.find(anchor) for anchor in anchors] == sorted(section.find(anchor) for anchor in anchors) and all(anchor in section for anchor in anchors)
+    # the runs of the pass, as they were printed (a GPU class, a date, a list and its protocol beside every figure)
+    runs = section.split("**The runs of the draft pass**", 1)[1].split("**What is not here.**", 1)[0]
+    assert runs.startswith(" (2026-11-18; PyTorch 2.13.0; a GPU of compute capability 10.0, a 148-SM part shared with other users: correctness only,")
+    printed = (
+        "A pass over six rows of a sequence gave the rows and the cache of six passes of one row, byte for byte, at one sequence and at two.",
+        "`draft` with every kept count 0 to 5 behind six rows, and behind one row, gave the five proposals and the cache",
+        "by name: the embedding lookup is PyTorch's gather, and the id of the chosen row and the concatenations launch other PyTorch kernels than the gather.",
+        "A second run printed the same bytes.",
+        "(reported; no line of it is a gate of this sample)",
+        "70 new tokens each: the default prompt and two arithmetic word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens.",
+        "the 342 ids of six dump files, then the lowest ids; the default prompt is one of the three prompts behind those dumps, the other two are not.",
+        "The first proposal equals the model's next token at 167 of 207 positions (46, 56 and 65 of 69 by prompt), "
+        "the second at 128 of 204, the third at 94 of 201, the fourth at 70 of 198, the fifth at 54 of 195.",
+        "At 4 of the 207 positions the model's token is not in the list.",
+        "kept 2.37 drafted tokens a step on average over 195 positions: none at 37 of them, all five at 42.",
+        "exchanged, 0 of 207; the hidden row replaced by zeros, 8 of 207; the hidden row of the position before, 108 of 207; "
+        "the hidden row of the position after, 150 of 207.",
+        "gave the five proposals of the pass behind one row at 36 of 36 positions.",
+        "gave the pass's first proposal at 200 of 207 positions and the model's token at 166. It is not part of this repository.",
+        "With a cache of 194 positions the loaded drafter held 2,135,219,200 bytes, which is `memory_bytes(1, 194)`.",
+    )
+    assert [sentence for sentence in printed if sentence not in runs] == []
+    # ... the figures that are arithmetic are held as arithmetic: the positions of three runs of 70 new tokens, the kept counts, the bytes
+    prompts, new_tokens, by_prompt, by_kept = (58, 117, 78), 70, (46, 56, 65), (37, 40, 32, 28, 16, 42)
+    counted = tuple(len(prompts) * (new_tokens - j) for j in range(1, 6))  # draft j of a position needs j tokens of the run behind it
+    assert counted == (207, 204, 201, 198, 195) and sum(by_prompt) == 167 and sum(by_kept) == counted[4]
+    assert f"{sum(kept * positions for kept, positions in enumerate(by_kept)) / sum(by_kept):.2f}" == "2.37", "drafted tokens kept, 0 to 5, by positions"
+    assert drafter.memory_bytes(1, max(prompts) + new_tokens + 5 + 2) == 2135219200 and max(prompts) + new_tokens + 5 + 2 == 194
+    # no count of the launches of a pass, of any kind of them: the kernel census holds none, and the section states none
+    counted = r"(?:[\d,]+|one|two|three|four|five|six|no|none) (?:kernel |gather |copy )?(?:launch(?:es)?|gathers?|kernels?|cop(?:y|ies))"
+    assert re.findall(rf"\b{counted} (?:per|a|of a|of one|in a) (?:draft )?(?:pass|step|call)\b", section) == []
+    assert re.findall(r"[\d,]+ (?:kernel )?launch(?:es)?\b|\blaunch(?:es)? (?:of|per) (?:a|one|the) (?:draft )?pass\b", section) == []
+
+    # the area README and the guide
+    area = " ".join((MODELS / "README.md").read_text().split())
+    assert (
+        "the drafter's draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`: every block of it a "
+        "reference chain in every stack, its embedding lookup PyTorch's gather; no session runs a pass yet)"
+    ) in area
+    assert "(`DRAFTER_PROVIDERS`: 18 block calls a pass, every block a reference chain but the embedding lookup;" in area
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    assert (
+        "The list of provider keys is closed; it changes only together with a kernel, or with the reference chain of a block that a kernel is to serve."
+        in guide
+    )
+    assert "changes only together with a kernel, or with the reference chain of a block that a kernel is to serve" in " ".join(
+        (providers.__doc__ or "").split()
+    )
+    assert "\n## What building the drafter's pass taught\n" in (MODELS / "AGENTS.md").read_text()
+    assert "- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3." in guide
+    assert "that a comparison of tokens could hold" in guide and "with 2,048 rows the same quantiser failed on 954 scales" in guide
+    assert "Four things hold such a pass, and each sees what the others do not:" in guide and "(an error inside a function);" in guide
+    assert "(an error inside a block's class: operands exchanged, another function called, an epsilon of its own);" in guide
+    assert "eight made inside the classes of the new blocks passed every test." in guide, "the defects of the test above: what it is there for"
+    assert "multiplies by a reciprocal that is one number per operand, a constant of the checkpoint;" in guide
+    assert 'so "one in two thousand" was one in a hundred and sixty.' in guide, "the count is the gate / SiLU test's: 19 of 3,072"
+    assert (
+        "token at 167 of 207 positions. With the two halves in front of the first multiply exchanged it was 0, with the hidden row replaced by zeros 8" in guide
+    )
+    assert "and with the hidden row of the position before, 108:" in guide
+    for key in ("torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize", "torch.argmax+lookup"):
+        assert f"`{key}`" in guide and key in providers.KEYS, key

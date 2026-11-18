@@ -4,9 +4,9 @@
 """Providers of model blocks: adapters to cuDNN Frontend entries (``fe``), to library kernels (``library``) and the plain-PyTorch
 reference of every block (``torch_ref``).
 
-``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel.  The operand
-containers below are what the blocks of a family pass to each other.  Nothing here imports a provider module, PyTorch or
-cuDNN Frontend until :func:`factories` is called.
+``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel, or with the
+reference chain of a block that a kernel is to serve.  The operand containers below are what the blocks of a family pass to
+each other.  Nothing here imports a provider module, PyTorch or cuDNN Frontend until :func:`factories` is called.
 
 Every adapter declares its census entries (``kernels``, :class:`model_samples.census.Kernel`): the kernels one call launches.
 An adapter to an entry that states its launch also answers ``launch_facts(rows)`` and says what served its last call
@@ -41,10 +41,15 @@ ENTRY_NAMES: Dict[str, str] = {
     "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize",
     "torch.index_select": "torch.index_select",
     "torch.argmax": "torch.argmax",
+    "torch.argmax+lookup": "torch.argmax + the token id of the chosen row",
     "torch_ref.add_norm_quantize": "torch_ref.add_norm_quantize",
+    "torch_ref.pre_fc_norm_quantize": "torch_ref.pre_fc_norm_quantize",
     "torch_ref.attention_prepare": "torch_ref.attention_prepare",
     "torch_ref.attention": "torch_ref.attention",
     "torch_ref.gate_quantize": "torch_ref.gate_quantize",
+    "torch_ref.gate_row_quantize": "torch_ref.gate_row_quantize",
+    "torch_ref.silu_mul": "torch_ref.silu_mul",
+    "torch_ref.quantize": "torch_ref.quantize",
     "torch_ref.linear": "torch_ref.linear",
     "torch_ref.linear+torch_ref.silu_mul_quantize": "torch_ref.linear + torch_ref.silu_mul_quantize",
     "torch_ref.gdn_decode_step": "torch_ref.gdn_decode_step",
@@ -52,12 +57,28 @@ ENTRY_NAMES: Dict[str, str] = {
 KEYS: Tuple[str, ...] = tuple(ENTRY_NAMES)
 
 
+#: the format of a :class:`Quant` whose scale is formed per call: 8-bit codes with one scale per row of the call, each
+#: formed from its row (``weights.quantize_fp8_per_row``)
+FP8_ROW = "fp8_row"
+
+
 @dataclass(frozen=True)
 class Quant:
-    """How a block quantises its output for its consumer: ``"fp8"`` (static scale) or ``"nvfp4"`` (static global scale)."""
+    """How a block quantises its output for its consumer: ``"fp8"`` (static scale), ``"nvfp4"`` (static global scale) or
+    ``"fp8_row"`` (:data:`FP8_ROW`: 8-bit codes with one scale per row, formed from the rows of the call).  A static
+    format states its scale; the row format has none to state.  ``ValueError`` for either without what it stands for."""
 
     fmt: str
-    scale: float
+    scale: Optional[float] = None
+
+    def __post_init__(self):
+        if (self.scale is None) != (self.fmt == FP8_ROW):
+            has = "states no scale" if self.scale is None else f"states the scale {self.scale!r}"
+            raise ValueError(f'a quantisation format with a static scale states it, and "{FP8_ROW}" forms its scale per call; "{self.fmt}" {has}')
+
+
+#: the quantisation of an operand whose rows are each quantised at a scale of their own
+ROW_QUANT = Quant(FP8_ROW)
 
 
 @dataclass
@@ -188,10 +209,15 @@ def factories() -> Dict[str, Callable]:
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": library.CublasGateUp,
         "torch.index_select": torch_ref.Embedding,
         "torch.argmax": torch_ref.TokenChoice,
+        "torch.argmax+lookup": torch_ref.ListedTokenChoice,
         "torch_ref.add_norm_quantize": torch_ref.AddNormQuantize,
+        "torch_ref.pre_fc_norm_quantize": torch_ref.PreFcNormQuantize,
         "torch_ref.attention_prepare": torch_ref.AttentionPrepare,
         "torch_ref.attention": torch_ref.Attention,
         "torch_ref.gate_quantize": torch_ref.GateQuantize,
+        "torch_ref.gate_row_quantize": torch_ref.GateRowQuantize,
+        "torch_ref.silu_mul": torch_ref.SiluMul,
+        "torch_ref.quantize": torch_ref.Quantize,
         "torch_ref.linear": torch_ref.Linear,
         "torch_ref.linear+torch_ref.silu_mul_quantize": torch_ref.GateUp,
         "torch_ref.gdn_decode_step": torch_ref.GdnDecodeStep,

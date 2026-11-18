@@ -58,6 +58,145 @@ def test_tables_agree_with_the_family_readme():
     assert set(configs.PROVIDERS) == set(configs.BLOCK_TITLES) == set(QwenDense().calls())
 
 
+def test_the_drafters_plan_its_table_and_its_keys():
+    """The drafter of a checkpoint as a model of a plan: its provider table resolved on stated facts in every stack, for any
+    GPU class and any row count; every block a reference chain but the embedding lookup; the five provider keys its pass
+    added to the closed list; its call sites; and the two tables of the family README rendered from the data."""
+    from model_samples import providers
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter, configs
+    from model_samples.qwen_dense.drafter import BODY, HEAD, MULTIPLIES
+
+    drafter = QwenDenseDrafter.seeded(QwenDense.reduced())
+    table = configs.DRAFTER_PROVIDERS
+    assert drafter.provider_table is table and drafter.regimes is configs.REGIMES and drafter.table_source == "model_samples/qwen_dense/configs.py"
+    assert not hasattr(drafter, "target_stacks"), "the drafter declares no target kernel set: no census section holds a draft pass"
+    assert drafter.geometry.layer_kinds == ("full_attention",) and drafter.norm_eps == QwenDense().norm_eps == 1.0e-6
+
+    # one pass: 18 block calls, 15 of the body and 3 of the head; the multiply at five sites, the norm + quantise at two
+    wiring, sites = drafter.wiring(), drafter.sites()
+    assert len(wiring) == len(sites) == drafter.calls_per_pass() == len(BODY) + len(HEAD) == 18 and (len(BODY), len(HEAD)) == (15, 3)
+    assert wiring == tuple((block, 0) for block, _ in (*BODY, *HEAD)) and sites == tuple(site for _, site in (*BODY, *HEAD))
+    assert [block for block, _ in wiring] == [
+        "draft.embedding",
+        "draft.pre_fc_norm",
+        "draft.projection",
+        "draft.norm_quantize",
+        "draft.projection",
+        "draft.attention.prepare",
+        "draft.attention.core",
+        "draft.gate_quantize",
+        "draft.projection",
+        "draft.norm_quantize",
+        "draft.projection",
+        "draft.silu_mul",
+        "draft.activation_quantize",
+        "draft.projection",
+        "draft.final_norm",
+        "draft.head.quantize",
+        "draft.head",
+        "draft.token_choice",
+    ]
+    assert sites == ("", "", "fc", "input", "qkv", "", "", "", "o", "mlp", "gate_up", "", "", "down", "", "", "", "")
+    assert drafter.calls() == {block: (5 if block == "draft.projection" else 2 if block == "draft.norm_quantize" else 1) for block in table}
+    assert drafter.calls_text() == {block: str(count) for block, count in drafter.calls().items()} and sum(drafter.calls().values()) == 18
+    assert list(table) == list(dict.fromkeys(block for block, _ in wiring)) == list(configs.DRAFTER_BLOCK_TITLES), "one row per block, in the order of the pass"
+    assert len(table) == 13 and set(table).isdisjoint(configs.PROVIDERS) and set(configs.DRAFTER_BLOCK_TITLES).isdisjoint(configs.BLOCK_TITLES)
+
+    # the call sites are data: the five weights by the loader's names with their shapes at the published widths, the two norms
+    assert (
+        [site for site, _ in configs.DRAFT_PROJECTION_SITES]
+        == [name for name, _ in MULTIPLIES]
+        == [s for (b, _), s in zip(wiring, sites) if b == "draft.projection"]
+    )
+    assert [site for site, _ in configs.DRAFT_NORM_SITES] == ["input", "mlp"] == [s for (b, _), s in zip(wiring, sites) if b == "draft.norm_quantize"]
+    shapes = {spec.name[len("drafter.") : -len(".weight")]: spec.shape for spec in drafter.tensor_specs() if spec.name.startswith("drafter.")}
+    merged = {name: (sum(shapes[part][0] for part in parts), shapes[parts[0]][1]) for name, parts in MULTIPLIES}
+    assert {site: (dict(fields)["OUT_FEATURES"], dict(fields)["IN_FEATURES"]) for site, fields in configs.DRAFT_PROJECTION_SITES} == merged
+    assert merged == {"fc": (5120, 10240), "qkv": (14336, 5120), "o": (5120, 6144), "gate_up": (34816, 5120), "down": (5120, 17408)}
+    assert dict(configs.DRAFT_NORM_SITES) == {"input": (("ADD", False),), "mlp": (("ADD", True),)}
+
+    # every row: every stack, any GPU class, any row count; a reference chain but the gather, and no form named for a chain
+    chain = "reference chain"
+    for block, rows in table.items():
+        assert len(rows) == 1, block
+        row = rows[0]
+        assert row.stacks == ("fe-cublas", "reference", "native", "fe-entries") and row.classes == ("any",) and row.serves == "any" and row.band == "same"
+        assert all(row.serves_run(sequences, tokens) for sequences, tokens in ((1, 1), (1, 6), (1, 8), (4, 6), (64, 1), (1000, 100))), block
+        assert all(row.serves_class(cc) for cc in ((8, 0), (10, 0), (10, 3), (12, 1))) and row.serves_model(drafter) and row.serves_model(None)
+        assert (row.form, row.sites, row.widths) == ((), (), ()), "a reference chain is called in no form: the kernel check has nothing to hold one to"
+        assert row.fallback == (
+            "" if block == "draft.embedding" else chain + " over a plain cache of the drafter's own" if block == "draft.attention.core" else chain
+        )
+    keys = {block: rows[0].key for block, rows in table.items()}
+    assert keys == {
+        "draft.embedding": "torch.index_select",
+        "draft.pre_fc_norm": "torch_ref.pre_fc_norm_quantize",
+        "draft.projection": "torch_ref.linear",
+        "draft.norm_quantize": "torch_ref.add_norm_quantize",
+        "draft.attention.prepare": "torch_ref.attention_prepare",
+        "draft.attention.core": "torch_ref.attention",
+        "draft.gate_quantize": "torch_ref.gate_row_quantize",
+        "draft.silu_mul": "torch_ref.silu_mul",
+        "draft.activation_quantize": "torch_ref.quantize",
+        "draft.final_norm": "torch_ref.add_norm_quantize",
+        "draft.head.quantize": "torch_ref.quantize",
+        "draft.head": "torch_ref.linear",
+        "draft.token_choice": "torch.argmax+lookup",
+    }
+
+    # the five keys of the pass in the closed list, each with its factory; the list is the model's keys and these
+    new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
+    classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
+    assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 22 and set(providers.KEYS) == set(providers.factories())
+    used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
+    assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
+    assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
+
+    # a dry plan in every stack: the same rows, the same table but for the stack's name
+    tables = {}
+    for stack in ("fe-cublas", "native", "fe-entries", "reference"):
+        for cc, sequences, tokens in (((10, 0), 1, 1), ((12, 0), 4, 6), ((8, 0), 1, 1)):
+            resolved = plan(table, drafter.regimes, DeviceFacts(cc), sequences, tokens, stack, model=drafter, source=drafter.table_source)
+            assert {block: row.key for block, row in resolved.rows.items()} == keys and list(resolved) == list(table), (stack, cc)
+            assert all(block.provider == "PyTorch" and block.row is resolved.rows[name] for name, block in resolved.items())
+            assert [kernel.id for kernel in resolved["draft.embedding"].kernels] == ["embedding_gather"]
+            assert all(
+                [kernel.relation for kernel in block.kernels] in (["fallback"], ["fallback", "fallback"])
+                for name, block in resolved.items()
+                if name != "draft.embedding"
+            )
+        text = plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, stack, model=drafter, source=drafter.table_source).table().splitlines()
+        assert text[0] == f"served by (decided before the load from model_samples/qwen_dense/configs.py; stack {stack}, 1 sequence, cc 10.0)"
+        assert text[-2] == "  by provider: fallbacks 12 (PyTorch chains 12) | PyTorch 1" and len(text) == 1 + 1 + 13 + 2
+        tables[stack] = text[1:]
+    assert tables["fe-cublas"] == tables["native"] == tables["fe-entries"] == tables["reference"]
+    lines = {line.split()[0]: line for line in tables["native"][1:14]}
+    assert lines["draft.projection"].split()[1:4] == ["5", "PyTorch", "torch_ref.linear"] and lines["draft.norm_quantize"].split()[1] == "2"
+    assert lines["draft.attention.core"].endswith("fallback: reference chain over a plain cache of the drafter's own")
+    assert lines["draft.embedding"].split() == ["draft.embedding", "1", "PyTorch", "torch.index_select", "any", "none"]
+    with pytest.raises(ValueError, match="unknown stack 'fast'"):
+        plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, "fast", model=drafter)
+
+    # the family README: the drafter's block table and its call-site table are rendered from this data; the model's table is untouched
+    readme = (MODELS / "qwen_dense" / "README.md").read_text()
+    rendered = configs.readme_table(drafter.calls_text(), "native", table=table, titles=configs.DRAFTER_BLOCK_TITLES, per="pass")
+    assert rendered.splitlines()[0] == "| block | calls per pass | provider key | entry [form] |" and len(rendered.splitlines()) == 2 + 13
+    assert rendered in readme, "regenerate the drafter's block table of the README from configs.readme_table(.., table=configs.DRAFTER_PROVIDERS, ..)"
+    assert all(
+        rendered == configs.readme_table(drafter.calls_text(), stack, cc, table, configs.DRAFTER_BLOCK_TITLES, "pass")
+        for stack in configs.EVERY
+        for cc in ((10, 0), (12, 0))
+    )
+    assert configs.readme_draft_sites() in readme and len(configs.readme_draft_sites().splitlines()) == 2 + 5 + 2
+    assert configs.readme_table(QwenDense().calls_text()).splitlines()[0] == "| block | calls per step (64 layers) | provider key | entry [form] |"
+    assert configs.readme_table(QwenDense().calls_text()) == configs.readme_table(
+        QwenDense().calls_text(), table=configs.PROVIDERS, titles=configs.BLOCK_TITLES
+    )
+
+
 def test_call_counts_of_a_decode_step():
     from model_samples.qwen_dense import QwenDense
 
