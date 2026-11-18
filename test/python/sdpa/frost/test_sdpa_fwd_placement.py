@@ -1125,6 +1125,27 @@ def test_sm107_dense_d256_long_cache_chunks_lead_past_the_tile_cap(s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+@pytest.mark.parametrize("heads", [(64, 64), (128, 8)], ids=["mha", "gqa"])
+def test_sm107_dense_d192x128_long_cache_chunks_lead_past_the_tile_cap(s_kv, heads):
+    """Study sm107_dense_d192x128_long_cache_20261118: Rubin bf16 dense d192 x 128 causal chunks, MHA and GQA, lead from S_q 512 over a
+    32k cache (kimi_k2 / deepseek_v3 / mimo chunks over 64k-128k ran the backend at 2.0-2.4x); 256-query chunks and short caches keep the
+    hand rule's tile cap, and f16 was not measured."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=heads[0], h_kv=heads[1], s_q=1024, s_kv=s_kv, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7))
+    base.update(device_sm_count=224, has_paged_kv=False, padded=False, page_size=0)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert (placement.SM107_D192_LONG_CHUNK_MIN_S_Q, placement.SM107_D192_LONG_CHUNK_MIN_KV) == (512, 32768)
+    assert place() == placement.LEAD
+    assert place(s_q=512, s_kv=65536 + s_kv % 2) == placement.LEAD
+    assert place(s_q=256, b=4) == placement.TRAIL  # below S_q 512, past the tile cap
+    assert place(s_kv=16384 + s_kv % 2, b=4) == placement.TRAIL  # below the cache floor, past the tile cap
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(256, 256), (192, 128)])
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
