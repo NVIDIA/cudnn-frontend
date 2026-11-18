@@ -98,6 +98,22 @@ prefill kind) and `<config>_generation.webp` (subplots stacked by MTP width).
 Every expanded case owns an x slot whether or not it ran, so coverage gaps
 are visible. Architectures are reported in isolation, never merged.
 
+## Resuming a sweep
+
+Pass `--checkpoint` with a new path to write successful results as cases complete.
+After an interruption, add `--resume` to pick up from that checkpoint.
+
+```bash
+python -m benchmark.attention_inference.runner --config llama --backend cudnn --checkpoint llama.sqlite
+python -m benchmark.attention_inference.runner --config llama --backend cudnn --checkpoint llama.sqlite --resume
+```
+
+The checkpoint is a SQLite file and has its own path. The runner retries failed
+or interrupted cases and reuses successful cases with identical options. The final
+CSV and charts include the current selection in sweep order, with one row per
+case. Use the same GPU, benchmark source, software versions, and runtime settings
+when resuming. The runner reports a mismatch before reusing any results.
+
 ## Measurement notes
 
 - Timing is CUDA events around the steady-state call, median of

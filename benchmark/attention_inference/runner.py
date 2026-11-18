@@ -16,8 +16,10 @@ Usage:
 
 import argparse
 import itertools
+import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 from dataclasses import asdict
@@ -25,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+from .checkpoint import benchmark_environment as _benchmark_environment, checkpoint_case, open_checkpoint
 from .config_types import BenchmarkResult, InferenceBenchmarkConfig, ModelPreset, attn_mask
 
 logger = logging.getLogger(__name__)
@@ -103,6 +106,68 @@ def backend_supported(backend: str, model: ModelPreset, phase: str, cc: tuple) -
         # Shared-K=V MQA with equal dims (DeepSeek-V4) prefills as-is and runs.
         return "context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill)"
     return None
+
+
+def _case_command(case):
+    config, model = case["config"], case["model"]
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_single_attention.py")
+    cmd = [
+        sys.executable,
+        script,
+        "--phase",
+        case["phase"],
+        "--backend",
+        case["backend"],
+        "--batch_size",
+        str(case["batch_size"]),
+        "--q_tokens",
+        str(case["q_tokens"]),
+        "--kv_len",
+        str(case["kv_len"]),
+        "--num_q_heads",
+        str(model.num_q_heads),
+        "--num_kv_heads",
+        str(model.num_kv_heads),
+        "--head_dim_qk",
+        str(model.head_dim_qk),
+        "--head_dim_vo",
+        str(model.head_dim_vo),
+        "--kind",
+        model.kind,
+        "--page_size",
+        str(case.get("page_size", config.page_size)),
+        "--data_type",
+        case["data_type"],
+        "--kv_cache_dtype",
+        case["kv_cache_dtype"],
+        "--num_iterations",
+        str(config.num_iterations),
+        "--num_warmup_iterations",
+        str(config.num_warmup_iterations),
+        "--kv_layout",
+        case.get("kv_layout", "dense"),
+        "--kv_min_fill",
+        str(case.get("kv_min_fill", 1.0)),
+        "--q_min_fill",
+        str(case.get("q_min_fill", 1.0)),
+        "--cudnn_total_q",
+        config.cudnn_context_total_q,
+    ]
+    if case["phase"] == "context" and config.context_causal:
+        cmd.append("--causal")
+    if model.sliding_window_size:
+        cmd += ["--sliding_window_size", str(model.sliding_window_size)]
+    if model.sm_scale is not None:
+        cmd += ["--sm_scale", str(model.sm_scale)]
+    if model.has_sink:
+        cmd.append("--has_sink")
+    return cmd
+
+
+def _case_identity(case) -> str:
+    # The command captures every option the worker receives, including options
+    # absent from the CSV. The config and model identify the row labels.
+    return json.dumps([case["config"].name, asdict(case["model"]), _case_command(case)[2:]], sort_keys=True)
 
 
 class InferenceBenchmarkRunner:
@@ -216,57 +281,7 @@ class InferenceBenchmarkRunner:
         if skip:
             return BenchmarkResult(**base, time_ms=float("inf"), tflops=0.0, gbps=0.0, sol_pct=None, success=False, error_message=f"SKIPPED: {skip}")
 
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_single_attention.py")
-        cmd = [
-            sys.executable,
-            script,
-            "--phase",
-            case["phase"],
-            "--backend",
-            case["backend"],
-            "--batch_size",
-            str(case["batch_size"]),
-            "--q_tokens",
-            str(case["q_tokens"]),
-            "--kv_len",
-            str(case["kv_len"]),
-            "--num_q_heads",
-            str(model.num_q_heads),
-            "--num_kv_heads",
-            str(model.num_kv_heads),
-            "--head_dim_qk",
-            str(model.head_dim_qk),
-            "--head_dim_vo",
-            str(model.head_dim_vo),
-            "--kind",
-            model.kind,
-            "--page_size",
-            str(case.get("page_size", config.page_size)),
-            "--data_type",
-            case["data_type"],
-            "--kv_cache_dtype",
-            case["kv_cache_dtype"],
-            "--num_iterations",
-            str(config.num_iterations),
-            "--num_warmup_iterations",
-            str(config.num_warmup_iterations),
-            "--kv_layout",
-            case.get("kv_layout", "dense"),
-            "--kv_min_fill",
-            str(case.get("kv_min_fill", 1.0)),
-            "--q_min_fill",
-            str(case.get("q_min_fill", 1.0)),
-            "--cudnn_total_q",
-            config.cudnn_context_total_q,
-        ]
-        if case["phase"] == "context" and config.context_causal:
-            cmd.append("--causal")
-        if model.sliding_window_size:
-            cmd += ["--sliding_window_size", str(model.sliding_window_size)]
-        if model.sm_scale is not None:
-            cmd += ["--sm_scale", str(model.sm_scale)]
-        if model.has_sink:
-            cmd.append("--has_sink")
+        cmd = _case_command(case)
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
@@ -288,8 +303,9 @@ class InferenceBenchmarkRunner:
         except subprocess.TimeoutExpired:
             return BenchmarkResult(**base, time_ms=float("inf"), tflops=0.0, gbps=0.0, sol_pct=None, success=False, error_message="timeout")
 
-    def run_config(self, config, filter_backend=None, filter_model=None, filter_phase=None) -> List[BenchmarkResult]:
-        cc = _device_cc()
+    def run_config(self, config, filter_backend=None, filter_model=None, filter_phase=None, *, checkpoint=None, resume=False) -> List[BenchmarkResult]:
+        if resume and checkpoint is None:
+            raise ValueError("resume requires a checkpoint path")
         cases = list(self.expand_config(config))
         if filter_backend:
             cases = [c for c in cases if c["backend"] == filter_backend]
@@ -297,10 +313,20 @@ class InferenceBenchmarkRunner:
             cases = [c for c in cases if filter_model in c["model"].name]
         if filter_phase:
             cases = [c for c in cases if c["phase"] == filter_phase]
-        logger.info(f"Running {len(cases)} cases from config '{config.name}' (cc {cc[0]}.{cc[1]})")
+        if checkpoint is None or not cases:
+            return self._run_cases(config.name, [(None, case) for case in cases], _device_cc())
 
+        unique_cases = {}
+        for case in cases:
+            unique_cases.setdefault(_case_identity(case), case)
+        environment = _benchmark_environment()
+        with open_checkpoint(checkpoint, environment, resume) as db:
+            return self._run_cases(config.name, list(unique_cases.items()), tuple(environment["capability"]), db)
+
+    def _run_cases(self, config_name, cases, cc, checkpoint=None) -> List[BenchmarkResult]:
+        logger.info(f"Running {len(cases)} cases from config '{config_name}' (cc {cc[0]}.{cc[1]})")
         results = []
-        for i, case in enumerate(cases, 1):
+        for i, (key, case) in enumerate(cases, 1):
             m = case["model"]
             kvd = "" if case["kv_cache_dtype"] == case["data_type"] else f" | kv={case['kv_cache_dtype']}"
             pg = f" | page={case['page_size']}" if case["phase"] == "generation" and case["backend"] in PAGED_BACKENDS else ""
@@ -314,7 +340,12 @@ class InferenceBenchmarkRunner:
                 f"[{i}/{len(cases)}] {m.name} | {case['phase']} | b={case['batch_size']} "
                 f"q={case['q_tokens']} kv={case['kv_len']} | {case['backend']} | {case['data_type']}{kvd}{pg}"
             )
-            r = self.run_single(case, cc)
+            if checkpoint is None:
+                r = self.run_single(case, cc)
+            else:
+                r, reused = checkpoint_case(checkpoint, key, lambda: self.run_single(case, cc))
+                if reused:
+                    logger.info("  -> reused checkpoint")
             results.append(r)
             if r.success:
                 sol = f", {r.sol_pct:.0f}% mem-SOL" if r.sol_pct else ""
@@ -329,12 +360,14 @@ class InferenceBenchmarkRunner:
 
         return pd.DataFrame([asdict(r) for r in results])
 
-    def save_csv(self, results, config, output: Optional[Path] = None) -> Path:
+    def save_csv(self, results, config, output: Optional[Path] = None, *, checkpoint: Optional[Path] = None) -> Path:
         df = self.results_to_dataframe(results)
         if output is None:
             outdir = Path(config.output_dir)
             outdir.mkdir(parents=True, exist_ok=True)
             output = outdir / f"{config.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        if checkpoint is not None and Path(output).exists() and Path(output).samefile(checkpoint):
+            raise ValueError("--checkpoint and the CSV output must use different paths")
         df.to_csv(output, index=False)
         logger.info(f"Saved {len(df)} rows to {output}")
         return output
@@ -348,6 +381,8 @@ def main():
     parser.add_argument("--filter", dest="filter_model")
     parser.add_argument("--phase", dest="filter_phase", choices=["context", "generation"])
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--checkpoint", type=Path, help="save completed cases to a SQLite checkpoint")
+    parser.add_argument("--resume", action="store_true", help="reuse successful cases from an existing --checkpoint")
     parser.add_argument("--output-dir", type=Path, help="override config.output_dir (CSV + charts land here)")
     parser.add_argument("--no-chart", action="store_true")
     parser.add_argument("--list-configs", action="store_true")
@@ -362,6 +397,13 @@ def main():
         return
     if not args.config:
         parser.error("--config is required")
+
+    if args.resume and args.checkpoint is None:
+        parser.error("--resume requires --checkpoint")
+    if args.checkpoint is not None and args.output is not None:
+        same_file = args.checkpoint.exists() and args.output.exists() and args.output.samefile(args.checkpoint)
+        if args.checkpoint.resolve() == args.output.resolve() or same_file:
+            parser.error("--checkpoint and --output must use different paths")
 
     config = load_config(args.config)
     if args.output_dir:
@@ -391,11 +433,17 @@ def main():
             print(f"  [{i}] {c['model'].name} | {c['phase']} | b={c['batch_size']} q={c['q_tokens']} kv={c['kv_len']} | {c['backend']} | {c['data_type']}{pg}")
         return
 
-    results = runner.run_config(config, args.filter_backend, args.filter_model, args.filter_phase)
+    try:
+        results = runner.run_config(config, args.filter_backend, args.filter_model, args.filter_phase, checkpoint=args.checkpoint, resume=args.resume)
+        if results:
+            runner.save_csv(results, config, args.output, checkpoint=args.checkpoint)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        if args.checkpoint is None:
+            raise
+        parser.error(str(exc))
     if not results:
         print("No results", file=sys.stderr)
         sys.exit(1)
-    runner.save_csv(results, config, args.output)
 
     if not args.no_chart:
         try:
