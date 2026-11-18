@@ -123,9 +123,8 @@ def test_cost_proxy_is_byte_bound_for_decode_and_flop_bound_for_prefill():
 @pytest.mark.L0
 def test_kv_off_the_tile_is_its_own_class_with_its_own_entry():
     """S_kv off the 128-key tile is a separate class for dense and paged KV (an off-tile dense d256 decode was 11-13x slower on
-    FROST; off-tile paged d256 decode wins at lower cost than on-tile), and every measured on-tile class has a measured
-    off-tile twin, so an off-tile graph is never answered by an on-tile study nor dropped to the backend (review on #1957: an
-    off-tile paged D576 decode, B1 H_q16 S_kv 49151, lost its FROST split route)."""
+    FROST; off-tile paged d256 decode wins at lower cost than on-tile). Measured classes that cover both tile regimes
+    need paired entries (review on #1957: an off-tile paged D576 decode, B1 H_q16 S_kv 49151, lost its FROST split route)."""
     row = "sdpa_fwd_prefill_sm100"
     for kw in (dict(), dict(has_paged_kv=False, d_qk=256, d_v=256, h_q=16)):
         assert pt.class_key(row, _facts(s_kv=8191, **kw))[-1] is True
@@ -133,6 +132,10 @@ def test_kv_off_the_tile_is_its_own_class_with_its_own_entry():
     for key in pt.TABLE:
         if key[5].endswith("_bounded"):
             continue  # FlashInfer declares capacities on the tile (128, powers of two, 65536); an off-tile one keeps the hand rules
+        if key[0] == "sdpa_bwd_sm89_f16_d64":
+            # The dedicated Ada body requires a whole KV tile.
+            assert key[-1] is False, key
+            continue
         assert key[:-1] + (not key[-1],) in pt.TABLE, key
     assert pt.lookup(row, _facts(s_kv=49151, h_q=16, b=1)) is True
 

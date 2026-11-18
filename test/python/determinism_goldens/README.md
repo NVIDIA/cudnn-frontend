@@ -4,6 +4,24 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### FP16 causal convolution decode update
+
+`causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` exercises the
+public width-four inference API with identity and SiLU, compact three- and
+four-element state, and channel-last three-element state. It checks the output
+and in-place state against an independent FP32-compute reference and compares
+their bytes over eight launches with fresh state and output allocations and
+concurrent CUDA work. The stress cases use 33 rows and 1025 channels with padded
+input strides, an indexed padding row, and state slots outside the live batch.
+Batch checks replay one sequence alone, reorder the batch, replace neighbors,
+and duplicate the sequence into a distinct state slot. The six small golden
+cases use two rows and 17 channels, recording both outputs after the replay and
+reference checks. The operation is inference-only and has no backward.
+
+Replay, isolated batch checks, and all six goldens passed on GeForce RTX 4090
+(SM89), with PyTorch 2.12.1+cu130 and CuTe DSL 4.8.0. The goldens are in
+`c74756f44f441362/`.
+
 ### D256 nonpaged split physical origins (2026-11-16)
 
 `sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed
@@ -578,6 +596,7 @@ pytest core/test_determinism_utils.py
 | --- | --- | --- | --- |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
+| `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |

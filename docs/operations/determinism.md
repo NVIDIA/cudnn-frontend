@@ -62,6 +62,7 @@ arbitrary user callbacks.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
+| `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Unverified | Unverified | Unsupported |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
@@ -136,6 +137,9 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
+
+On SM89 (GeForce RTX 4090), the FP16 width-four `cudnn.ops.causal_conv1d_update`
+passed replay, batch-isolation, and golden checks for both output and state.
 
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;
