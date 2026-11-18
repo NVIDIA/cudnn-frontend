@@ -161,6 +161,31 @@ def seq_len(entry: Optional[dict]) -> list[int]:
     return flatten_pass_by_value(entry.get("pass_by_value"))
 
 
+def forward_seq_lengths(tensors: list, inputs: dict) -> tuple[list[int], list[int], Optional[str]]:
+    """Decode device length dumps into the per-request lengths the SDPA replay harness takes."""
+    lengths = []
+    cumulative_sides = []
+    for side in ("Q", "KV"):
+        regular = inputs.get(f"SEQ_LEN_{side}")
+        cumulative = inputs.get(f"CU_SEQ_LEN_{side}")
+        if cumulative is None:
+            lengths.append(seq_len(tensor_entry(tensors, regular)))
+            continue
+        if regular is not None:
+            raise ValueError(f"SDPA declares both SEQ_LEN_{side} and CU_SEQ_LEN_{side}")
+
+        prefix = seq_len(tensor_entry(tensors, cumulative))
+        per_request = [end - start for start, end in zip(prefix, prefix[1:])]
+        if prefix:
+            q_shape = shape(tensor_entry(tensors, inputs.get("Q")))
+            if prefix[0] != 0 or any(length < 0 for length in per_request) or (q_shape and len(per_request) != q_shape[0]):
+                raise ValueError(f"CU_SEQ_LEN_{side} replay requires B+1 nondecreasing offsets starting at zero")
+        lengths.append(per_request)
+        cumulative_sides.append(side.lower())
+    sides = "both" if len(cumulative_sides) == 2 else next(iter(cumulative_sides), None)
+    return lengths[0], lengths[1], sides
+
+
 def bool_from_inputs(inputs: dict, target: str) -> Optional[bool]:
     """Check if a target tensor is present in inputs dict."""
     if not inputs:
