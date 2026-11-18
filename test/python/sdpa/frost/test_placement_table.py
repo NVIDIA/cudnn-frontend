@@ -604,6 +604,7 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
     for over in leads:
         on_tile_d64_sink = over == dict(has_sink=True) and s_kv % 128 == 0
         expected = "sm80_paged_d64_ontile_pcie_20261118" if on_tile_d64_sink else study
+        expected = "sm80_paged_d64_swa_pcie_20261118" if "window_left" in over else expected
         assert pt.matched_entry(row, f(**over)).study == expected, over
         assert pt.lookup(row, f(**over)) is True, over
     small = dict(s_q=32, s_kv=1024 + s_kv % 2, max_total_seq_len_q=32)
@@ -613,6 +614,32 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
         on_tile_d256 = over["d_qk"] == 256 and s_kv % 128 == 0
         expected = "sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117"
         assert pt.matched_entry(row, f(**over)).study == expected, over
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [65536, 65537], ids=["on_tile", "off_tile"])
+@pytest.mark.parametrize("sink", [False, True], ids=["no_sink", "sink"])
+def test_sm80_paged_d64_window_prefill_follows_the_pcie_study(sink, s_kv):
+    """sm80_paged_d64_swa_pcie_20261118 (A100 80GB PCIe): paged THD-Q d64 sliding-window prefill leads from 256 query tokens per
+    request, with or without a sink: gpt-oss (128-key window, sink) and muse_spark (2048-key window) chunks of 512-1024 tokens ran
+    the backend at 1.2-1.95x FROST. Short chunks keep the backend; off the tile without a sink the floor is 2^6.5 parallel tiles."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=8, h_kv=1, s_q=512, s_kv=s_kv, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=512, has_sink=sink, window_left=127 if sink else 2047)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == "sm80_paged_d64_swa_pcie_20261118"
+    if sink or s_kv % 128 == 0:
+        for over in (dict(), dict(s_q=1024, max_total_seq_len_q=1024), dict(h_q=128, h_kv=16)):
+            assert pt.lookup(row, f(**over)) is True, over
+        assert pt.lookup(row, f(s_q=128, max_total_seq_len_q=128)) is False
+    else:  # no sink, off the tile: parallel tiles b * h_kv * ceil(s_q * G / 128) from 2^6.5
+        assert pt.lookup(row, f(h_q=128, h_kv=16)) is True  # 2^9
+        assert pt.lookup(row, f(s_q=128, max_total_seq_len_q=128, b=8, h_q=64, h_kv=8)) is True  # 2^9
+        assert pt.lookup(row, f()) is False  # 2^5
 
 
 @pytest.mark.L0

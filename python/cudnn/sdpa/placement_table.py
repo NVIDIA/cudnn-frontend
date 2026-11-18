@@ -1008,11 +1008,21 @@ TABLE: Dict[Tuple, Entry] = {
         "ge", 30.044, "sm80_paged_d64_ontile_pcie_20261118"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", True): Entry("ge", 27.047, "sm80_prefill_gaps_20261117"),
+    # study sm80_paged_d64_swa_pcie_20261118 (A100 80GB PCIe 300 W; paged THD-Q d64 sliding-window prefill, 80 train cells per class):
+    # with or without a sink, FROST leads from 256 query tokens per request (without a sink, off the tile, from 2^6.5 parallel tiles).
+    # Shorter chunks keep the backend (S_q <= 128: FROST 1.03-1.20). Holdout at fresh heads, scored once: 0.607 / 0.631 without a
+    # sink, 0.804 / 0.876 (worst 0.978) with one. Replaces the gaps study's sink `tiles` floors, which no lower threshold could fix.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "ge", 8.0, "sm80_paged_d64_swa_pcie_20261118", "q"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "ge", 6.5, "sm80_paged_d64_swa_pcie_20261118", "tiles"
+    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", False): Entry(
-        "ge", 7.792, "sm80_prefill_gaps_20261117", "tiles"
+        "ge", 8.0, "sm80_paged_d64_swa_pcie_20261118", "q"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", True): Entry(
-        "ge", 7.804, "sm80_prefill_gaps_20261117", "tiles"
+        "ge", 8.0, "sm80_paged_d64_swa_pcie_20261118", "q"
     ),
     # study sm80_paged_d192x192_v2_20261117 (A100, cuDNN 9.24.0.43, FE bb01aa882; paged THD-Q d192 x 192 causal prefill, e.g. step5 64/4):
     # fit on v1's train and holdout (sm80_paged_d192x192_20261117, whose on-tile floor lost 1.35x on short-cache squares), chunks S_q
