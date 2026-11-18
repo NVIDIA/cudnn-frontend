@@ -44,6 +44,7 @@ def test_engine_row_and_placement(monkeypatch):
         and caps.deterministic
         and caps.gqa
         and caps.causal
+        and caps.bottom_right
         and not caps.swa
         and not caps.thd
     )
@@ -67,18 +68,19 @@ def test_declaration_declines_grid_limits(b, hq, hkv):
         return SdpaGraphFacts(**{**base, **over})
 
     version = ("nvidia-cutlass-dsl", "4.8.0")
+    assert "S_q <= S_kv" in _sm90_declaration_mismatch(facts(bottom_right=True, s_q=3, s_kv=2), version)
     assert "65535" in _sm90_declaration_mismatch(facts(), version)
     assert _sm90_declaration_mismatch(facts(b=min(b, 65535), h_q=min(hq, 65535), h_kv=min(hkv, 65535)), version) is None
 
 
-def _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed=729):
+def _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed=729, bottom_right=False):
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def draw(s, h):
         return torch.randn(b, s, h, d, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
 
     q, k, v, do = draw(sq, hq), draw(sk, hkv), draw(sk, hkv), draw(sq, hq)
-    keep = _causal_keep(sq, sk, causal=True) if causal else None
+    keep = _causal_keep(sq, sk, bottom_right=bottom_right) if causal else None
     o64, lse, _, *expected = _reference64(q, k, v, do, keep, group=hq // hkv)
     tensors = dict(q=q, k=k, v=v, do=do, o=_bshd_empty(b, sq, hq, d, dt).copy_(o64), stats=lse.float().unsqueeze(-1).contiguous())
     tensors.update(
@@ -89,13 +91,23 @@ def _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed=729):
     return tensors, expected, keep
 
 
-def _case(dt, d, causal, b, hq, hkv, sq, sk, deterministic=True, seed=729):
+def _case(dt, d, causal, b, hq, hkv, sq, sk, deterministic=True, seed=729, bottom_right=False):
     """A dense graph pinned to the Hopper chain: its three launches, its workspace, the fp64 gate."""
     from cudnn.sdpa.bwd.d128_contract import relay_workspace_layout
 
-    tensors, expected, keep = _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed)
+    tensors, expected, keep = _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed, bottom_right)
     graph, refs, outputs = _build_graph(
-        b=b, hq=hq, hkv=hkv, sq=sq, skv=sk, d=d, dt=dt, use_causal_mask=causal, scale="default", use_deterministic_algorithm=deterministic
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        sq=sq,
+        skv=sk,
+        d=d,
+        dt=dt,
+        use_causal_mask=causal and not bottom_right,
+        use_causal_mask_bottom_right=bottom_right,
+        scale="default",
+        use_deterministic_algorithm=deterministic,
     )
     select_engine(graph, _ENGINE)
     graph.check_support()
@@ -160,9 +172,28 @@ def test_chain_matches_fp64(dt, d, causal, hq, hkv, sq, sk):
 
 
 @requires_hopper
+@pytest.mark.parametrize("dt", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "d,hq,hkv,sq,sk",
+    [(64, 4, 2, 65, 65), (128, 2, 2, 129, 192), (64, 8, 1, 193, 258), (128, 4, 2, 1, 513)],
+    ids=["square-control", "diagonal-before-q-tile", "diagonal-after-q-tile", "single-query-multiple-key-tiles"],
+)
+def test_bottom_right_matches_fp64(dt, d, hq, hkv, sq, sk):
+    _case(dt, d, True, 2, hq, hkv, sq, sk, bottom_right=True)
+
+
+@requires_hopper
+def test_bottom_right_and_top_left_at_the_same_geometry():
+    # Alternating the masks on identical descriptors also exercises compiled-plan reuse.
+    for causal, bottom_right in [(True, False), (True, True), (False, False), (True, True)]:
+        _case(torch.bfloat16, 64, causal, 1, 4, 2, 65, 194, bottom_right=bottom_right)
+
+
+@requires_hopper
+@pytest.mark.parametrize("bottom_right", [False, True], ids=["top-left", "bottom-right"])
 @pytest.mark.parametrize("deterministic", [True, False])
-def test_both_requests_take_the_chain_bitwise(deterministic):
-    case = _case(torch.bfloat16, 128, True, 2, 4, 2, 640, 640, deterministic=deterministic)
+def test_both_requests_take_the_chain_bitwise(deterministic, bottom_right):
+    case = _case(torch.bfloat16, 128, True, 2, 4, 2, 640, 833 if bottom_right else 640, deterministic=deterministic, bottom_right=bottom_right)
     expected_bits = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
@@ -193,13 +224,17 @@ def test_both_requests_take_the_chain_bitwise(deterministic):
 
 @requires_hopper
 @pytest.mark.parametrize(
-    "dt,d,causal,b,hq,hkv,sq,sk",
-    [(torch.bfloat16, 128, False, 2, 4, 4, 512, 4096), (torch.float16, 64, True, 3, 8, 4, 1536, 1536)],
-    ids=["d128-dense-256cta", "d64-causal-144cta"],
+    "dt,d,causal,b,hq,hkv,sq,sk,bottom_right",
+    [
+        (torch.bfloat16, 128, False, 2, 4, 4, 512, 4096, False),
+        (torch.float16, 64, True, 3, 8, 4, 1536, 1536, False),
+        (torch.bfloat16, 64, True, 2, 8, 4, 129, 2177, True),
+    ],
+    ids=["d128-dense-256cta", "d64-causal-144cta", "d64-bottom-right-gqa-144cta"],
 )
-def test_multiwave_grid_matches_fp64_and_repeats(dt, d, causal, b, hq, hkv, sq, sk):
+def test_multiwave_grid_matches_fp64_and_repeats(dt, d, causal, b, hq, hkv, sq, sk, bottom_right):
     assert (sk + 127) // 128 * hkv * b > torch.cuda.get_device_properties(0).multi_processor_count
-    case = _case(dt, d, causal, b, hq, hkv, sq, sk)
+    case = _case(dt, d, causal, b, hq, hkv, sq, sk, bottom_right=bottom_right)
     expected = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
     case.workspace.fill_(0x5A)
     for name in expected:
@@ -214,13 +249,20 @@ def test_multiwave_grid_matches_fp64_and_repeats(dt, d, causal, b, hq, hkv, sq, 
 
 @requires_hopper
 @pytest.mark.parametrize(
-    "dt,d,causal,hq,hkv",
-    [(torch.bfloat16, 128, True, 4, 2), (torch.float16, 64, False, 4, 4), (torch.bfloat16, 64, True, 4, 4), (torch.float16, 128, False, 4, 2)],
-    ids=["bf16-d128-causal-gqa", "fp16-d64-dense-mha", "bf16-d64-causal-mha", "fp16-d128-dense-gqa"],
+    "dt,d,causal,hq,hkv,bottom_right",
+    [
+        (torch.bfloat16, 128, True, 4, 2, False),
+        (torch.float16, 64, False, 4, 4, False),
+        (torch.bfloat16, 64, True, 4, 4, False),
+        (torch.float16, 128, False, 4, 2, False),
+        (torch.float16, 64, True, 4, 2, True),
+        (torch.bfloat16, 128, True, 4, 2, True),
+    ],
+    ids=["bf16-d128-causal-gqa", "fp16-d64-dense-mha", "bf16-d64-causal-mha", "fp16-d128-dense-gqa", "fp16-d64-bottom-right", "bf16-d128-bottom-right"],
 )
-def test_batch_invariance(dt, d, causal, hq, hkv):
-    b, sq, sk = 3, 320, 257
-    case = _case(dt, d, causal, b, hq, hkv, sq, sk)
+def test_batch_invariance(dt, d, causal, hq, hkv, bottom_right):
+    b, sq, sk = 3, 320, 449 if bottom_right else 257
+    case = _case(dt, d, causal, b, hq, hkv, sq, sk, bottom_right=bottom_right)
     inputs = {name: case.tensors[name].clone() for name in ("q", "k", "v", "o", "do", "stats")}
     grads = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
 
@@ -238,7 +280,17 @@ def test_batch_invariance(dt, d, causal, hq, hkv):
             assert torch.equal(bits(case.tensors[name]), bits(expected[order])), f"{name} depends on the batch order {order}"
     # the same sequence declared alone
     graph, refs, outputs = _build_graph(
-        b=1, hq=hq, hkv=hkv, sq=sq, skv=sk, d=d, dt=dt, use_causal_mask=causal, scale="default", use_deterministic_algorithm=True
+        b=1,
+        hq=hq,
+        hkv=hkv,
+        sq=sq,
+        skv=sk,
+        d=d,
+        dt=dt,
+        use_causal_mask=causal and not bottom_right,
+        use_causal_mask_bottom_right=bottom_right,
+        scale="default",
+        use_deterministic_algorithm=True,
     )
     select_engine(graph, _ENGINE)
     graph.check_support()
@@ -299,7 +351,7 @@ def _adapter(b, hq, hkv, s, d, **kw):
     "kw,token",
     [
         (dict(window_size_left=128), "sliding"),
-        (dict(causal_bottom_right=True, is_causal=True), "bottom-right"),
+        (dict(causal_bottom_right=True, is_causal=False), "bottom-right"),
         (dict(hkv=3), "integral head ratio"),
         (dict(d=256), "64 or 128"),
         (dict(scale_softmax=-0.125), "positive"),

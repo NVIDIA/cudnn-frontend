@@ -148,7 +148,7 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
-| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in) | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
+| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in), including bottom-right causal when `S_q <= S_kv` | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -590,7 +590,10 @@ and GQA graphs at D64 and D128, including grids beyond one CTA wave, and across
 CUDA Graph replays for causal GQA at D128. Batch invariance: the same bytes are
 compared across reordered and duplicated batches and against the sequence
 declared alone, in four cells: BF16 D128 causal GQA, FP16 D64 unmasked MHA,
-BF16 D64 causal MHA and FP16 D128 unmasked GQA.
+BF16 D64 causal MHA and FP16 D128 unmasked GQA. Rectangular bottom-right causal
+GQA also preserves all three gradients across the same batch changes at FP16 D64
+and BF16 D128. The D128 case passes changed-gradient CUDA Graph replay under
+both deterministic and default requests.
 
 ## Split-combine zero-weight qualification
 

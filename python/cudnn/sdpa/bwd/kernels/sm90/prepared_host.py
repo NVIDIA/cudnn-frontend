@@ -56,7 +56,7 @@ def host(
     scale: cutlass.Float32,
     geometry: cutlass.Constexpr,
     regions: cutlass.Constexpr,
-    causal: cutlass.Constexpr[bool],
+    diagonal_offset: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
     q = _view(q_ptr, geometry[0])
@@ -73,16 +73,16 @@ def host(
     delta = _scratch(payload, regions[1], cutlass.Float32)
     turns = _scratch(payload, regions[2], cutlass.Int32)
     delta_zero_turns_host(o, do, delta, dq_accum, turns, stream)
-    bprop_host(q, k, v, do, lse, delta, dq_accum, turns, dk, dv, scale, causal, stream)
+    bprop_host(q, k, v, do, lse, delta, dq_accum, turns, dk, dv, scale, diagonal_offset, stream)
     cast_dq_host(dq_accum, dq, q.element_type, stream)
 
 
-def compile_host(geometry, regions, dtype, causal, ratio=1):
+def compile_host(geometry, regions, dtype, diagonal_offset, ratio=1):
     """Compile from declarations only; addresses and scale remain runtime slots."""
     head_dim = geometry[0][0][3]
     if (head_dim, int(ratio)) != (HEAD_DIM, RATIO):
         module = load_template(__file__, (head_dim, int(ratio)), tag=f"sdpa_bwd_sm90_d{head_dim}_g{int(ratio)}_host")
-        return module.compile_host(geometry, regions, dtype, causal, ratio)
+        return module.compile_host(geometry, regions, dtype, diagonal_offset, ratio)
     _bind()
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
@@ -93,9 +93,9 @@ def compile_host(geometry, regions, dtype, causal, ratio=1):
         cutlass.Float32(1),
         geometry,
         regions,
-        bool(causal),
+        diagonal_offset,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi --gpu-arch sm_90a",
-        cache_key=repr(("sdpa_bwd_sm90_relay", ABI_VERSION, geometry, regions, str(dtype), bool(causal), HEAD_DIM, RATIO)),
+        cache_key=repr(("sdpa_bwd_sm90_relay", ABI_VERSION, geometry, regions, str(dtype), diagonal_offset, HEAD_DIM, RATIO)),
         symbol="frost_sdpa_bwd_sm90_prepared",
     )

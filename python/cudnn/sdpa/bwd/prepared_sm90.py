@@ -52,8 +52,11 @@ def compile_plan(api):
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     regions, required = relay_workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.
+    diagonal_offset = None
+    if api.is_causal:
+        diagonal_offset = api.s_k_max - api.s_q_max if api.causal_bottom_right else 0
     with torch.cuda.device(device):
-        entry = compile_host(tuple(geometry), regions, dtype, api.is_causal, api.h_q // api.h_kv)
+        entry = compile_host(tuple(geometry), regions, dtype, diagonal_offset, api.h_q // api.h_kv)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("sdpa_bwd_sm90 requires a positional tvm-ffi entry")
