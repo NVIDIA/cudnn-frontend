@@ -833,6 +833,15 @@ treatment at the caller boundary.**
   Exercise earlier supported versions in both default-planning and explicit
   replay tests, and do not version-skip their numerical detector. The SM90
   ragged-backward cases in `test_sdpa_bwd_backend_guard.py` cover this boundary.
+- **Configuration-specific backend defects need a plan guard.** Preserve the
+  same engine's valid knobs. Filter concrete enumeration records, check explicit
+  replay after the backend resolves missing knobs, and prevent an opaque
+  delegator or custom ranking from restoring the rejected configuration.
+  Check resolved records at planning/build time, without adding execute-time
+  validation or querying knobs for families without a guard. Detector:
+  `sdpa/frost/test_sdpa_fp8_backend_split_guard.py`, including raw-backend
+  numerical controls and an exact constant-V output oracle; correct Stats alone
+  do not establish a correct FP8 split output.
 - **Provider support is not graph invalidity.** A layout a FROST engine cannot
   run may still be valid for the backend. Preserve its graph facts and let the
   provider's matcher decline it; returning an empty `invalid` fact record can

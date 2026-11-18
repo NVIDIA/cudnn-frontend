@@ -469,6 +469,7 @@ cudnn.engines.EngineFamily
 cudnn.engines.EngineFamily.analyzer
 cudnn.engines.EngineFamily.backend_engine_guard
 cudnn.engines.EngineFamily.backend_guard
+cudnn.engines.EngineFamily.backend_plan_guard
 cudnn.engines.EngineFamily.heuristics
 cudnn.engines.EngineFamily.id_end
 cudnn.engines.EngineFamily.offered_ids
