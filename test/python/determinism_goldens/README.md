@@ -3605,7 +3605,56 @@ architectures.  A new set is owed with a stated reason when the rounding chain o
 
 GPU coverage: cc 10.0 (replay, batch invariance and goldens).  cc 10.3 and cc 10.7 have not been run on a device: the entry admits
 compute capability 10.x and the status page reads "SM103: Unverified" and, for SM107, "Unverified"; a run there skips the four golden
-cases (no set for its runtime) -- a coverage gap, not a pass.  cc 9.0 and cc 12.x are declined by type.
+cases (no set for its runtime) -- a coverage gap, not a pass.  cc 9.0 and cc 12.x are declined by type.  Every run below is one
+pytest run per command on one visible device, from `test/python`; `<suite>` = `row_quantize/frost/test_row_quantize_fp4_decode_determinism.py`,
+`<module>` = `row_quantize/frost/test_row_quantize_fp4_decode.py`.  The device is a shared development part: these are correctness runs,
+and no timing was taken.
+
+cc 10.0 record (2026-11-18 UTC): a cc 10.0 part with 148 SMs (the device reports the name `NVIDIA Graphics Device`; x86 host, Python
+3.10) with torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi
+0.1.13.post3 (the `runtime` block of the goldens in `c84dd9abaee769b4/`).  The set was recorded into a new directory
+(`CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -q -ra` -> 20 passed) after the functional module's device cases
+had passed on the same part; the four files were copied unchanged.  Strict check and the functional module, from a clean tree at the commit that adds
+the set: `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 20 passed, 0 skipped: `test_replay` 4,
+`test_replay_on_a_fresh_entry_and_fresh_operands` 1, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 2,
+`test_insertion_removal_and_reordering` 1, `test_duplicated_row_and_neighbour_isolation` 1, `test_inputs_are_unmodified` 1,
+`test_one_element_moves_one_block` 1, `test_the_row_ceiling_call` 1 (measured: the 1024-row call crossed a scheduling wave; one wave
+holds 888 thread blocks on 148 SMs; 7 rows compared alone), `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 4.
+`pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 127 passed, 1 skipped: the module 122 passed and 1
+skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices are required" -- one
+device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the symbol-prefix test 5
+passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 9 of 9 cells (one kernel
+per call; grid `(rows, 1, 1)`, block `(320, 1, 1)`, 0 B of shared memory).  The module's case behind a predecessor that released
+early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 8 of 8 launches of the step equal to the plain
+step, behind its positive control: a dependent without a wait read other bytes than the written ones in 4 of 4 eager launches and 4
+of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.  The reference cases
+report, per global scale, how many elements have a two-code bracket (the elements within the reciprocal bound of a rounding
+midpoint): between 0 and 72,804 of 6,333,440 per scale, and 100 of 4,372,480 on the enumerated code domain; no code was outside its
+bracket and every block scale was bitwise the definition's.  The helpers' cases of the same change
+(`pytest sdpa/frost/test_tile_dsl_rowwise.py sdpa/frost/test_tile_dsl_sf_layout.py -m L0 -q -ra`): 43 passed, 0 skipped.
+
+CUDA 12.9 compiler flavour on the same part and runtime (the CuTe DSL 4.8.0 install without its CUDA 13 toolchain libraries, so the
+DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL compatibility and is not a
+deployment that uses CUDA 12 throughout): the strict determinism command -> 20 passed, 0 skipped -- the four golden cases, the
+enumerated code domain among them, pass against the SAME set, whose runtime key does not name the compiler flavour, so the two
+flavours write the same bytes for those cases; the functional command -> 126 passed, 2 skipped (`test_rendering_pins_the_convention`
+for `sm_107a`: that compiler rejects the target, and the case skips with the entry's own decline; the two-device case); the helpers'
+cases 42 passed, 1 skipped (the `sm_107a` rendering).
+
+CuTe DSL 4.8.1 on the same part (the 4.8.1 wheels put first on the path of the same runtime).  Compiling with CUDA 13.4: the
+functional command -> 127 passed, 1 skipped (the two-device case); the determinism suite recording into a new directory -> 20 passed
+(the DSL version is part of the runtime key and no set is committed for that key).  That record holds the input and output hashes
+of the committed 4.8.0 set in 4 of 4 files; it is not committed.  With only the CUDA 12 toolchain libraries of 4.8.1 (`CUDA_VERSION`
+12.9): the functional command -> 126 passed, 2 skipped (the `sm_107a` rendering case and the two-device case); the determinism suite
+checked strictly against the 4.8.1 record of the other flavour -> 20 passed, 0 skipped.
+
+Cold compile on an x86 host (a cc 8.0 device: every device case skips; fake tensors).  The kernel's three renderings per target (the
+launch arms) under 4.8.1 are byte-identical cubins to 4.8.0's for `sm_100a`, `sm_103a`, `sm_107a` and `sm_120a` with the CUDA 13.4
+compiler (12 of 12) and for `sm_100a` / `sm_103a` with the CUDA 12.9 compiler (6 of 6); the three `sm_100a` cubins the device compiled
+under each of 4.8.0 / CUDA 13.4, 4.8.0 / CUDA 12.9 and 4.8.1 / CUDA 13.4 are those host renderings (9 of 9 by hash).
+`pytest <module> <suite> sdpa/frost/test_tile_dsl_rowwise.py sdpa/frost/test_tile_dsl_sf_layout.py
+sdpa/frost/test_tile_dsl_quant_helpers.py norm/frost core/frost/test_frost_kernel_name_prefix.py core/test_import_boundaries.py -m L0
+-q -ra` on that host under 4.8.0 with CUDA 13.4: 253 passed, 231 skipped (the device cases).
 
 ### QSA: 42 cases
 
