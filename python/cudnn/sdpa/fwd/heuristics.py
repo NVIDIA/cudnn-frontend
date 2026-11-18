@@ -2666,7 +2666,7 @@ def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> 
 def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
     """The largest power-of-two split <= 64 (128 for single-row decode on a one-CTA grid) with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles
     per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
-    kv_tiles = _ceil_div(facts.s_kv, tile_n or 32)
+    kv_tiles = _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m or 64))
     ctas = facts.b * (facts.h_q // pack_g) * _ceil_div(facts.s_q * pack_g, tile_m or 64)
     cap = 128 if facts.s_q == 1 and ctas == 1 else 64
     split = 1
@@ -2701,7 +2701,12 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
     ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
     if _sm80_chunk_split(caps, facts, tile_m):
         # One CTA per 128-row tile of packed rows (groups may straddle tiles), walking 64-key tiles.
-        return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, 128), facts.h_q // pack_g, _ceil_div(facts.s_kv, tile_n or _sm80_config.LLAMA_CFG.TILE_N), 1)
+        return _SplitKvLaunch(
+            _ceil_div(facts.s_q * pack_g, 128),
+            facts.h_q // pack_g,
+            _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, 128)),
+            1,
+        )
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=split_kv)
     if (
         _sm100_f16(caps, facts)

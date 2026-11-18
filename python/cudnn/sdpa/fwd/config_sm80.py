@@ -77,6 +77,17 @@ def default_tile_m(d_qk: int, d_v: int, s_q: int, thd: bool) -> int:
     return FLAVOR_CFGS[pick_flavor(d_qk, d_v)].TILE_M
 
 
+def default_tile_n(d_qk: int, d_v: int, s_q: int, thd: bool, tile_m: int) -> int:
+    """The KV tile the adapter runs when the graph requests none; the split-KV planner reads the same rule.
+
+    At D256 the 64-key double buffers still occupy 128 KiB. The short-d256 64-row Q tile pairs with 32-key buffers to reduce
+    that total to 64 KiB.
+    """
+    if not thd and d_qk == d_v == 256 and s_q <= 128 and tile_m == 64:
+        return 32
+    return FLAVOR_CFGS[pick_flavor(d_qk, d_v)].TILE_N
+
+
 def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[int]]:
     """Explicit graph tuning domain; this does not prescribe default tiles.
 
