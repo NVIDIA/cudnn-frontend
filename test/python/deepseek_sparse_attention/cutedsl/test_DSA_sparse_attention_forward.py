@@ -390,38 +390,52 @@ def test_DSA_sparse_attention_forward_executes_all_frozen_instances(num_heads, h
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("head_dim", [512, 576])
-def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_launches(head_dim):
-    """Carry the H64 rings, Q stage and O staging across the queries one CTA claims.
+@pytest.mark.parametrize(
+    "head_dim,indexer_topk",
+    [(512, 0), (576, 0), (512, 512)],
+    ids=["D512", "D576", "D512-indexer512"],
+)
+def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_launches(head_dim, indexer_topk):
+    """Carry the H64 rings, Q stage, O staging and per-query statistics across the queries one CTA claims.
 
-    Several queries per SM, with one- to four-tile lengths (including empty
-    rows), reach both the in-query and the end-of-query Q/O stage handoffs.
-    The batched launch must equal, byte for byte, launches small enough that
-    every CTA runs a single query, and must match the reference.
+    Several queries per SM, with lengths from empty to past the indexer prefix,
+    reach both the in-query and the end-of-query Q/O stage handoffs.  The
+    batched launch must equal, byte for byte, launches small enough that every
+    CTA runs a single query, and must match the reference.
     """
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100-family GPU required")
     try:
         from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_forward._tma_gather4 import TMA_GATHER4_AVAILABLE
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not TMA_GATHER4_AVAILABLE:
+        pytest.skip("The persistent schedule needs the gather4 bridge; this DSL runs one query per CTA")
 
     torch.manual_seed(179)
     device = torch.device("cuda")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     total_s_q = 4 * sm_count + 17
-    total_s_kv, num_heads, logical_topk = 301, 64, 256
+    num_heads = 64
+    if indexer_topk:
+        total_s_kv, logical_topk = 701, 576
+        length_values = [0, 1, 65, 448, 511, 512, 513, 576, 7]
+    else:
+        total_s_kv, logical_topk = 301, 256
+        length_values = [0, 1, 63, 64, 65, 128, 129, 192, 200, 256, 7]
     q = (torch.randn(total_s_q, num_heads, head_dim, device=device) / math.sqrt(head_dim)).to(torch.bfloat16)
     kv = (torch.randn(total_s_kv, head_dim, device=device) / math.sqrt(head_dim)).to(torch.bfloat16)
     topk_idxs = torch.randint(0, total_s_kv, (total_s_q, logical_topk), dtype=torch.int32, device=device)
     topk_idxs[:, 3] = -1
     topk_idxs[:, 70] = total_s_kv + 5
-    length_pattern = torch.tensor([0, 1, 63, 64, 65, 128, 129, 192, 200, 256, 7], dtype=torch.int32, device=device)
+    length_pattern = torch.tensor(length_values, dtype=torch.int32, device=device)
     topk_length = length_pattern.repeat((total_s_q + length_pattern.numel() - 1) // length_pattern.numel())[:total_s_q]
     topk_length = topk_length[torch.randperm(total_s_q, device=device)].contiguous()
     attn_sink = torch.linspace(-0.5, 0.5, num_heads, dtype=torch.float32, device=device)
     scale = 1.0 / math.sqrt(head_dim)
+    names = ("out", "max_logits", "lse", "lse_indexer") if indexer_topk else ("out", "max_logits", "lse")
 
     def run(rows):
         return DSA.sparse_attention_forward_wrapper(
@@ -431,6 +445,7 @@ def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_l
             attn_sink=attn_sink,
             topk_length=topk_length[rows],
             softmax_scale=scale,
+            indexer_topk=indexer_topk,
         )
 
     batched = run(slice(None))
@@ -440,21 +455,27 @@ def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_l
         rows = slice(begin, min(begin + chunk, total_s_q))
         isolated = run(rows)
         torch.cuda.synchronize()
-        for name in ("out", "max_logits", "lse"):
+        for name in names:
             assert torch.equal(batched[name][rows].view(torch.uint8), isolated[name].view(torch.uint8)), (name, begin)
 
-    ref_out, ref_max, ref_lse, _ = ref_sparse_attention_forward(
+    ref_out, ref_max, ref_lse, ref_lse_indexer = ref_sparse_attention_forward(
         q,
         kv,
         attn_sink,
         topk_idxs,
         topk_length=topk_length,
         softmax_scale=scale,
+        indexer_topk=indexer_topk,
         return_full=True,
     )
     torch.testing.assert_close(batched["out"].float(), ref_out.float(), atol=8e-4, rtol=3.01 / 128)
     torch.testing.assert_close(batched["max_logits"], ref_max, atol=1e-6, rtol=2.01 / 65536)
     torch.testing.assert_close(batched["lse"], ref_lse, atol=1e-6, rtol=2.01 / 65536)
+    if indexer_topk:
+        # The reference's +inf sentinel for rows shorter than the prefix is
+        # outside the forward contract; compare the rows that reach it.
+        full_prefix = topk_length >= indexer_topk
+        torch.testing.assert_close(batched["lse_indexer"][full_prefix], ref_lse_indexer[full_prefix], atol=1e-6, rtol=2.01 / 65536)
 
 
 @pytest.mark.L2

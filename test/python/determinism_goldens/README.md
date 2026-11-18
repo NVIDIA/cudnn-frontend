@@ -3801,6 +3801,31 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
 ```
 
+## SM100 H64 persistent sparse attention forward validation: 2026-11-18 (UTC)
+
+Change under test: the gather4 path of the SM100 H64 sparse attention forward
+kernel is persistent. CTAs claim queries through cluster launch control and
+run several queries each, so which CTA runs a query now depends on the launch;
+kernel outputs are unchanged. `TestDSA` is unchanged.
+`test_DSA_sparse_attention_forward.py` adds an L0 check that a persistent
+launch equals, byte for byte, launches in which every CTA runs one query (D512,
+D576, and D512 with `indexer_topk=512`). Source: this change on `develop`
+`07c1b377a`. Only the DSA suite was rerun.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| SM100 (cc 10.0, `NVIDIA Graphics Device`), 148 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver API `13010`, cuDNN `92700`, CuTe DSL `4.7.0a0` (development build), TVM FFI `0.1.13.post3`; key `86bcefdfad455cd7` | **94 passed, 2 failed, 5 skipped** in 188 s: five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+
+SM103 and SM107 were not run for this change.
+
+From `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -q -rs
+```
+
 ## SM100 H128 windowed sparse attention forward validation: 2026-11-11 (UTC)
 
 Change under test: `DSA.sparse_attention_forward_wrapper` accepts H128 D576,
