@@ -1654,19 +1654,15 @@ class SparseAttentionForwardSm100Head64:
             head_idx = (local_warp & Int32(1)) * Int32(self.WARP_SIZE) + lane_idx
             # The public M64N128 object models a non-WS accumulator fragment,
             # while mma.ws uses tmem_frg_ws_1sm. Load the two physical
-            # 32-column pieces directly with tmem_ld_32dp32bNx.
-            if const_expr(self.indexer_topk > 0):
-                # Put the warp-owned score half in r_left and the peer partial
-                # in r_right up front.  This keeps the exchange below
-                # straight-line instead of merging two 32-value SSA fragments
-                # at the local-warp role join.
-                owned_half = local_warp // Int32(2)
-                peer_half = owned_half ^ Int32(1)
-                left_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + owned_half * Int32(self.BLOCK_TOPK // 2))
-                right_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + peer_half * Int32(self.BLOCK_TOPK // 2))
-            else:
-                left_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET))
-                right_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET + 32))
+            # 32-column pieces directly with tmem_ld_32dp32bNx.  The
+            # warp-owned score half goes to r_left and the peer partial to
+            # r_right, chosen by the TMEM column, so the masking and exchange
+            # below are straight-line: selecting two 32-value fragments by
+            # the local warp would merge them element by element (SEL/FSEL).
+            owned_half = local_warp // Int32(2)
+            peer_half = owned_half ^ Int32(1)
+            left_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + owned_half * Int32(self.BLOCK_TOPK // 2))
+            right_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + peer_half * Int32(self.BLOCK_TOPK // 2))
             r_left = cute.make_rmem_tensor((self.BLOCK_TOPK // 2,), Float32)
             r_right = cute.make_rmem_tensor((self.BLOCK_TOPK // 2,), Float32)
             for elem in cutlass.range_constexpr(self.BLOCK_TOPK // 2):
@@ -1692,66 +1688,27 @@ class SparseAttentionForwardSm100Head64:
                 sValid_words_ptr,
                 cute.make_layout((self.BLOCK_TOPK // self.WARP_SIZE,), stride=(1,)),
             )
-            if const_expr(self.indexer_topk > 0):
-                valid_word = Uint32(sValid_words[owned_half])
-            else:
-                valid_word = Uint32(sValid_words[0 if local_warp < Int32(2) else 1])
+            valid_word = Uint32(sValid_words[owned_half])
             if const_expr(self.use_tma_gather4):
                 cute.arch.mbarrier_arrive(valid_free_mbar)
             for elem in cutlass.range_constexpr(self.BLOCK_TOPK // 2):
                 invalid = (valid_word & (Uint32(1) << elem)) == Uint32(0)
-                if const_expr(self.indexer_topk > 0):
-                    r_left[elem] = -Float32.inf if invalid else r_left[elem]
-                else:
-                    mask_left = invalid and local_warp < Int32(2)
-                    mask_right = invalid and local_warp >= Int32(2)
-                    r_left[elem] = -Float32.inf if mask_left else r_left[elem]
-                    r_right[elem] = -Float32.inf if mask_right else r_right[elem]
+                r_left[elem] = -Float32.inf if invalid else r_left[elem]
             half_layout = cute.make_layout((self.BLOCK_TOPK // 2,), stride=(1,))
-            r_left_linear = cute.make_tensor(r_left.iterator, half_layout)
             r_right_linear = cute.make_tensor(r_right.iterator, half_layout)
-            r_left_vectors = cute.flat_divide(r_left_linear, (4,))
             r_right_vectors = cute.flat_divide(r_right_linear, (4,))
             peer_warp = local_warp ^ Int32(2)
-            if const_expr(self.indexer_topk > 0):
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                    cute.autovec_copy(
-                        r_right_vectors[None, vector],
-                        sPExchange[peer_warp, vector, lane_idx, None],
-                    )
-            else:
-                if local_warp < Int32(2):
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            r_right_vectors[None, vector],
-                            sPExchange[peer_warp, vector, lane_idx, None],
-                        )
-                else:
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            r_left_vectors[None, vector],
-                            sPExchange[peer_warp, vector, lane_idx, None],
-                        )
+            for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
+                cute.autovec_copy(
+                    r_right_vectors[None, vector],
+                    sPExchange[peer_warp, vector, lane_idx, None],
+                )
             self.softmax_sync_barrier.arrive_and_wait()
-            if const_expr(self.indexer_topk > 0):
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                    cute.autovec_copy(
-                        sPExchange[local_warp, vector, lane_idx, None],
-                        r_right_vectors[None, vector],
-                    )
-            else:
-                if local_warp < Int32(2):
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            sPExchange[local_warp, vector, lane_idx, None],
-                            r_right_vectors[None, vector],
-                        )
-                else:
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            sPExchange[local_warp, vector, lane_idx, None],
-                            r_left_vectors[None, vector],
-                        )
+            for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
+                cute.autovec_copy(
+                    sPExchange[local_warp, vector, lane_idx, None],
+                    r_right_vectors[None, vector],
+                )
             self.softmax_sync_barrier.arrive_and_wait()
             for elem in cutlass.range_constexpr(0, self.BLOCK_TOPK // 2, 2):
                 r_left[elem], r_left[elem + 1] = cute.arch.add_packed_f32x2(
@@ -1814,18 +1771,13 @@ class SparseAttentionForwardSm100Head64:
             # uint128 P writes.  Keep the existing K_SW128 P operand layout.
             r_probability_vectors = cute.flat_divide(r_probability, (8,))
             s_weight_vectors = cute.flat_divide(sWeight[head_idx, None], (8,))
-            if local_warp < Int32(2):
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 8):
-                    cute.autovec_copy(
-                        r_probability_vectors[None, vector],
-                        s_weight_vectors[None, vector],
-                    )
-            else:
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 8):
-                    cute.autovec_copy(
-                        r_probability_vectors[None, vector],
-                        s_weight_vectors[None, vector + self.BLOCK_TOPK // 16],
-                    )
+            # Each warp stores its owned 32-token half of P.
+            half_vector_offset = (local_warp // Int32(2)) * Int32(self.BLOCK_TOPK // 16)
+            for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 8):
+                cute.autovec_copy(
+                    r_probability_vectors[None, vector],
+                    s_weight_vectors[None, half_vector_offset + Int32(vector)],
+                )
             # ``so_ready_mbar`` is initialized with 128 arrivals and every WG0
             # thread executes a generic-proxy fence before arriving below.  Its
             # completion therefore publishes the whole P tile to warp 8; an
