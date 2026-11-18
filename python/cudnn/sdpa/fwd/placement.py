@@ -594,6 +594,8 @@ SM107_D128_WHOLE_PACK_MIN_KV = 8192  # ... from this cache
 SM107_D128_WINDOW_MTP_MIN_KV = 65536  # Rubin d128 windowed MTP over a cache this long keeps the backend in two bands (module docstring):
 SM107_D128_WINDOW_MTP_UNITS_BAND = (32, 95)  # ... b x h_kv in this band with a window of at most 8 KV tiles,
 SM107_D128_WINDOW_MTP_NEAR_PARITY_TILES = 4  # ... or a window of at most this many tiles at S_q >= 4 below 96 units
+SM107_D128_WINDOW_UNPACKED_MAX_UNITS = 4  # Rubin d128 windowed MTP / verify the row does not pack whole leads at b x h_kv <= this ...
+SM107_D128_WINDOW_UNPACKED_MIN_TILES = 8  # ... with a window of at least this many KV tiles (module docstring)
 SM107_D256_DECODE_MIN_CTAS = 32  # Rubin bf16 dense d256 GQA single-row decode leads from this many planned CTAs (module docstring)
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
@@ -1100,6 +1102,14 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         lo, hi = SM107_D128_WINDOW_MTP_UNITS_BAND
         band = (lo <= units <= hi and tiles <= 8) or (tiles <= SM107_D128_WINDOW_MTP_NEAR_PARITY_TILES and facts.s_q >= 4 and units <= hi)
         return TRAIL if facts.s_kv >= SM107_D128_WINDOW_MTP_MIN_KV and band else LEAD
+    if key is not None and key[2:10] in (
+        ("bf16", (128, 128), "mtp", "paged", "window", False, "gqa_unpacked", False),
+        ("bf16", (128, 128), "verify", "paged", "window", False, "gqa_partial", False),
+    ):
+        # sm107_d128_window_unpacked_v2_20261118: few units over a wide window ran FROST 0.49-0.65 of the backend (ripple_swa-tp8:
+        # 10/1, b 1, window 1024); holdout 26 changed at 0.461, worst 0.941. Elsewhere the class keeps the hand rule.
+        if facts.b * facts.h_kv <= SM107_D128_WINDOW_UNPACKED_MAX_UNITS and -(-facts.window_left // 128) >= SM107_D128_WINDOW_UNPACKED_MIN_TILES:
+            return LEAD
     d256_decode = _sm107_dense_d256_decode_leads(caps, facts)
     if d256_decode is not None:
         return LEAD if d256_decode else TRAIL

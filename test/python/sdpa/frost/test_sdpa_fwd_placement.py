@@ -1168,6 +1168,23 @@ def test_sm107_dense_d128_whole_pack_chunks_lead_to_512_tiles(s_kv):
 
 
 @pytest.mark.L0
+def test_sm107_d128_window_unpacked_groups_lead_at_few_units_over_wide_windows():
+    """Study sm107_d128_window_unpacked_v2_20261118: Rubin bf16 paged d128 windowed MTP / verify whose group the row does not pack whole
+    leads at b x h_kv <= 4 with a window of at least 8 KV tiles (ripple_swa-tp8 10/1 b 1 window 1024 ran the backend at 1.73x)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=10, h_kv=1, s_q=4, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True, window_left=1024)
+    base.update(device_cc=(10, 7), device_sm_count=224, has_paged_kv=True, padded=True, page_size=16)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert (placement.SM107_D128_WINDOW_UNPACKED_MAX_UNITS, placement.SM107_D128_WINDOW_UNPACKED_MIN_TILES) == (4, 8)
+    assert place() == placement.LEAD  # ripple_swa-tp8 MTP
+    assert place(s_q=8) == placement.LEAD  # ... and verify
+    assert place(b=8) == placement.TRAIL  # 8 units
+    assert place(window_left=512) == placement.TRAIL  # 4-tile window
+
+
+@pytest.mark.L0
 def test_sm107_d128_window_mtp_leads_outside_two_long_cache_bands():
     """Study sm107_d128_window_mtp_v4_20261118: Rubin bf16 paged d128 windowed MTP on the tile leads, except over caches of 2^16 keys
     or more with 32-95 units and a window of at most 8 KV tiles, or a window of at most 4 tiles at S_q >= 4 below 96 units.
