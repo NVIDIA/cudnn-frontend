@@ -729,6 +729,8 @@ def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
 def _block_lines(tap: BlockTap, precision: str, what: str = "") -> Tuple[bool, int, List[str]]:
     """The ``blocks`` line of a checked pass and one line per judged block: ``(held, provider blocks judged, lines)``.
     ``what`` names the kind of step where a run has two (``"the prompt's decode steps: "``)."""
+    if what and not tap.stats:  # a run of two kinds of step, and no step of this kind ran under the check: nothing was judged
+        return True, 0, [f"  blocks            {what}no step of this kind was judged    REPORTED"]
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
     inside = sum(s.ok for s in judged.values())
@@ -749,6 +751,8 @@ def _block_lines(tap: BlockTap, precision: str, what: str = "") -> Tuple[bool, i
 def _batch_lines(tap: BlockTap, sequences: int, facts, what: str = "") -> Tuple[bool, List[str]]:
     """The ``batch invariance`` line of a checked pass of several sequences, and what an entry states beside it: ``(held,
     lines)``.  ``what`` names the kind of step where a run has two."""
+    if what and not tap.stats:  # as for the blocks: no step of this kind ran under the check
+        return True, [f"  batch invariance  {what}no step of this kind was judged    REPORTED"]
     cls = f"cc{facts.cc[0]}.{facts.cc[1]}"
     batch_ok, differs, gated = True, [], []
     for name, s in tap.stats.items():
@@ -948,6 +952,10 @@ def run_checks(
     if kernels:
         status, unobserved, kernel_lines = kernel_check(session)
         lines += kernel_lines
+        if drafted:  # the traced window holds the verify steps alone: what this check did not look at is said beside its verdict
+            lines.append(
+                f"    the prompt's decode steps: {fed} replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
+            )
     session.reset(fresh=True)
     ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
     return Checks(lines, ok, judged, status, unobserved, cost)
@@ -1199,10 +1207,16 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     * **kept state** -- after every verify step, what the session stands on against the decode session's state, by the
       rule of :func:`verify_checks` (gated in the linear-attention layers both runs fed the same rows).
     * **position** -- after the prompt and after every verify step the session's position is the decode session's and
-      the count of the prompt's tokens and the kept ones.  Integers: no rounding is involved, on any stack.
+      the count of the prompt's tokens and the kept ones, and its state stands on the token the step kept; and the
+      session's OWN run ended at that position on the token its last step kept (read before the first replay; held when
+      every step it ran is in its record).  Integers: no rounding is involved, on any stack.
     * **prompt** -- after the prompt, what every layer stands on (the attention caches included) and the logits and ids
       of every prompt step are the decode session's bytes.  Both ran the same decode rows at the same row count, on the
       same kernels: gated on every stack.
+    * **recorded** -- the ids and logits of every step the session recorded of its own run, the prompt's decode steps
+      and the verify steps, are the bytes of the first replay.  The replays here are driven by this comparison (the
+      family's step on the session's plans and state); this line and the own run's position hold that what they judge
+      is the run the session's own methods ran.  Two runs of the same kernels on the same rows: gated on every stack.
     * **bytes** -- the logits of every kept row and what every layer stands on after every verify step are the decode
       session's bytes.  Gated on the reference stack, where a verify step is that many decode steps of the same chain;
       REPORTED on a provider stack, where the two kinds of step launch other kernels for some blocks.
@@ -1214,21 +1228,30 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
       from 0 to ``draft_tokens`` was kept at least once.
 
     Both sessions are left reset; ``session`` keeps its records, so its traced pass and its own checks (``run_checks``)
-    run on them afterwards -- a new prompt set starts with ``Session.reset``, as always.  The comparison keeps what the
-    session stands on after every replayed step until the second replay has ended."""
+    run on them afterwards -- a new prompt set starts with ``Session.reset``, as always.  The comparison is made once
+    per run, on the session as its run left it: a session that stands behind no verify step and holds recorded ones was
+    reset since (by this comparison), and is a ``ValueError``.  The comparison keeps what the session stands on after
+    every replayed step until the second replay has ended."""
     if session.draft_tokens is None or decode.tokens != 1:
         raise ValueError("speculative_checks compares a session built with draft_tokens= with a session of one token per sequence")
     if decode.sequences != session.sequences or decode.weights is not session.weights or decode.weights is None:
         raise ValueError("speculative_checks compares two sessions of the same sequences on one load (share=), both loaded")
     session._closed("speculative_checks")
     S, T, vocab = session.sequences, session.tokens, session.model.geometry.vocab
-    kept_records = (session.record, session.prompt_record)
-    steps = min(session.record.count, session.record.inputs.shape[0])
+    ran, ran_prompt = session.record, session.prompt_record  # the session's own run: what it recorded of its steps
+    steps = min(ran.count, ran.inputs.shape[0])
     if steps < 1:
         raise ValueError("speculative_checks compares the verify steps a session recorded behind its prompt; this session recorded none")
+    # ... and where that run left the session, read before the first replay resets it: the position, the token it stands on
+    own_position, own_kept = session.state.position, session.state.accepted
+    if not session.state.verify_steps:
+        raise ValueError(
+            f"speculative_checks holds a session where its run left it; this session recorded {steps} verify step{'s' if steps > 1 else ''} and stands "
+            "behind none: it was reset since (the comparison leaves a session reset with its records, so it is made once per run)"
+        )
     windows = session.record.inputs[:steps].clone().view(steps, S, T)
     counts = list(session.record.accepted[:steps])
-    prompt = session.prompt_record.prompt
+    prompt = ran_prompt.prompt
     prompt = torch.zeros((S, 0), dtype=torch.int32, device=session.device) if prompt is None else prompt
     fed, layers = int(prompt.shape[1]), len(session.model.geometry.layer_kinds)
     if scheduled is not None and len(scheduled) != steps:
@@ -1240,12 +1263,15 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     # ---- the first replay, with the decode session beside it
     session.reset(fresh=True)
     decode.reset(fresh=True)
-    prompt_steps = layers_alike = greedy_kept = greedy_all = 0
+    prompt_steps = layers_alike = greedy_kept = greedy_all = as_ran = 0
+    recorded = min(fed, ran_prompt.inputs.shape[0])  # the prompt steps whose ids and logits a run keeps
     last = None  # the greedy ids of the row the run kept last: what the next window starts with
     for t in range(fed):
         ids = prompt[:, t].contiguous()
         mine, theirs = session._run(session.prefill_plan, 1, ids), decode._run(decode.plan, 1, ids)
         prompt_steps += int(bytes_equal(mine, theirs))  # the next ids and the logits of the step
+        if t < min(recorded, ran_prompt.count):  # the step as the session's own run recorded it: the ids fed, the ids chosen, the logits
+            as_ran += int(torch.equal(ids, ran_prompt.inputs[t]) and bytes_equal(mine, (ran_prompt.outputs[t], ran_prompt.logits[t])))
         last = mine[0]
     for mine, theirs in zip(session.state.standing(), decode.state.standing()):
         layers_alike += int(bytes_equal(mine, theirs))
@@ -1253,10 +1279,14 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     positions = [(session.state.position, decode.state.position, expected)]
     standing = _KeptState(session.model.geometry.layer_kinds)
     first, kept_logits, kept_ids, ref_logits, ref_ids, margins = [], [], [], [], [], []
+    stands, ordinals = [], []  # per step the token the state stands on with the count the step kept; per kept row (its number behind the prompt, its sequence)
     for j in range(steps):
         a = counts[j]
         ids, logits = session._run(session.plan, T, windows[j].reshape(-1))
         session.state.accept(a)
+        as_ran += int(bytes_equal((ids, logits), (ran.outputs[j], ran.logits[j])))
+        stands.append((session.state.accepted, a))
+        ordinals += [(expected - fed + t + 1, i) for i in range(S) for t in range(a + 1)]
         rows = logits.view(S, T, -1)[:, : a + 1].reshape(S * (a + 1), -1)  # the kept rows, sequence by sequence
         chosen = ids.view(S, T)[:, : a + 1].reshape(-1)
         # the greedy rule: the window starts with the greedy token kept last, and a kept drafted token is the greedy token in front of it
@@ -1305,8 +1335,10 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     a, r, ids_a, ids_r = torch.cat(kept_logits), torch.cat(ref_logits), torch.cat(kept_ids), torch.cat(ref_ids)
     tokens_ok, tokens_text = token_check(a, r, ids_a, ids_r, band_units)
     tokens_text = tokens_text.replace("equal to the reference;", "equal;")  # of this comparison: the decode steps, named in front
-    differs = (ids_a != ids_r).nonzero()
-    where = f"the first that differs is kept token {int(differs[0]) // S + 1}" if differs.numel() else "none differs"
+    # the kept rows of a step stand sequence by sequence: the first that differs is the one with the smallest number behind the prompt
+    differs = [ordinals[index] for index in (ids_a != ids_r).nonzero().flatten().tolist()]
+    token, sequence = min(differs, default=(0, 0))
+    where = f"the first that differs is kept token {token}" + (f" of sequence {sequence}" if S > 1 else "") if differs else "none differs"
     tokens_text = (
         f"{int((ids_a == ids_r).sum())} of {ids_a.numel()} kept tokens equal to those of the decode steps of the same tokens ({where}); "
         f"{greedy_kept} of {greedy_all} are the greedy token of the session's own step in front of them; " + tokens_text
@@ -1320,17 +1352,43 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     _, text, gated, state_verdict = standing.line(_first_layer_fed_alike(session, decode))
     lines.append(f"  kept state        {text}    {state_verdict}")
     astray = next((index for index, (mine, theirs, own) in enumerate(positions) if not mine == theirs == own), None)
-    position_ok = astray is None
-    position_text = f"after the prompt and after each of the {steps} steps the session stands at the decode steps' position: {fed} prompt tokens + the kept ones = {expected}"
-    if not position_ok:
+    off = next((index for index, (stood, kept) in enumerate(stands) if stood != kept), None)  # the state not on the token the step kept
+    whole = ran.count == steps  # every verify step the session ran is in its record: where its own run ended is then known
+    own_ok = not whole or (own_position, own_kept) == (expected, counts[-1])
+    position_ok = astray is None and off is None and own_ok
+    if astray is not None:
         mine, theirs, own = positions[astray]
         at = "after the prompt" if astray == 0 else f"after step {astray}"
         position_text = f"{at} the session stands at position {mine}, the decode steps at {theirs}; the prompt's tokens and the kept ones are {own}"
+    elif off is not None:
+        position_text = f"after step {off + 1} the state stands on token {stands[off][0]} of the step; the step kept {stands[off][1]} tokens behind the first"
+    elif not own_ok:
+        position_text = (
+            f"the session's own run ended at position {own_position} on token {own_kept} of its last step; the prompt's tokens and the kept ones "
+            f"are {expected}, and its last step kept {counts[-1]} tokens behind the first"
+        )
+    else:
+        ended = (
+            "the session's own run ended there"
+            if whole
+            else f"where the session's own run ended is not held (it ran {ran.count} verify steps and recorded {steps})"
+        )
+        position_text = (
+            f"after the prompt and after each of the {steps} steps the session stands at the decode steps' position, on the token the step kept: "
+            f"{fed} prompt tokens + the kept ones = {expected}; {ended}"
+        )
     lines.append(f"  position          {position_text}    {_verdict(position_ok)}")
     prompt_ok = prompt_steps == fed and layers_alike == layers
+    if fed:
+        lines.append(
+            f"  prompt            after the prompt, what the session stands on is the decode session's bytes in {layers_alike} of {layers} layers "
+            f"(states and caches); ids and logits of {prompt_steps} of {fed} prompt steps byte-equal    {_verdict(prompt_ok)}"
+        )
+    else:  # a line that compares nothing is not printed as a pass
+        lines.append("  prompt            no prompt was fed: the verify steps of this run began on a zero state    REPORTED")
     lines.append(
-        f"  prompt            after the prompt, what the session stands on is the decode session's bytes in {layers_alike} of {layers} layers "
-        f"(states and caches); ids and logits of {prompt_steps} of {fed} prompt steps byte-equal    {_verdict(prompt_ok)}"
+        f"  recorded          ids and logits of {as_ran} of {recorded + steps} steps the session recorded of its own run ({recorded} of its prompt, "
+        f"{steps} verify steps) are this replay's bytes    {_verdict(as_ran == recorded + steps)}"
     )
     rows_equal = sum(int(bytes_equal(mine[n], theirs[n])) for mine, theirs in zip(kept_logits, ref_logits) for n in range(mine.shape[0]))
     rows_all = sum(int(mine.shape[0]) for mine in kept_logits)
@@ -1364,7 +1422,7 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
         if getattr(block, "batch_note", ""):
             lines.append(f"    {name}: {block.batch_note}")
     session.reset(fresh=True)
-    session.record, session.prompt_record = kept_records
+    session.record, session.prompt_record = ran, ran_prompt
     decode.reset(fresh=True)
     # a line that fails fails the comparison: the verdict each line prints is the one that counts, a REPORTED line gates nothing
     return Checks(lines, not any(line.endswith(f"    {_verdict(False)}") for line in lines), gated)

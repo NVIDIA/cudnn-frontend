@@ -502,9 +502,12 @@ def test_a_session_with_draft_tokens_verifies_behind_its_prompt_on_the_fe_entrie
     assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the prompt's decode steps on the fused decode entry in the target's form"
     assert "[speculative] the 32 new tokens are the plain session's: True; kept [0, 1, 2, 3, 4, 5, 0, 1, 2, 3]" in lines
     assert "speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind a prompt of 8 tokens; " in out
-    for name in ("tokens", "position", "prompt", "rejected rows", "acceptance"):
+    for name in ("tokens", "position", "prompt", "recorded", "rejected rows", "acceptance"):
         (line,) = [line for line in lines if line.startswith(f"  {name} ") and "greedy tokens equal to the reference stack's" not in line]
         assert line.endswith("    PASS"), line
+    # what the comparison replayed is the run this program's loop ran: its recorded steps, and where it ended
+    assert "ids and logits of 18 of 18 steps the session recorded of its own run (8 of its prompt, 10 verify steps) are this replay's bytes" in out
+    assert "8 prompt tokens + the kept ones = 39; the session's own run ended there    PASS" in out
     kept = next(line for line in lines if line.startswith("  kept state  "))
     assert kept.endswith(("    PASS", "    REPORTED")), kept
     reported = next(line for line in lines if line.startswith("  bytes  "))
@@ -525,6 +528,11 @@ def test_a_session_with_draft_tokens_verifies_behind_its_prompt_on_the_fe_entrie
         reached = "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
         assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1" in out
     observed = [line for line in lines if line.startswith("  kernels  ")]
+    # the kernel check is of the verify steps: beside its verdict the run says that the prompt's decode steps were not observed
+    assert (
+        not observed
+        or "    the prompt's decode steps: 8 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)" in lines
+    )
     frost_routing.measured(
         "model sample qwen_dense session with draft tokens, 1 x 6 tokens: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
     )

@@ -778,56 +778,9 @@ reaches it through its own verify steps, `T` tokens at a time, keeping all of th
 **One session for a prompt and its verify steps.** A session built with `draft_tokens=k` does both: it feeds its prompt
 through decode steps and then runs verify steps of `k + 1` tokens on the same state. Its plan table shows both plans,
 and one memory sentence counts one state. The caller supplies the drafted tokens and says after the host read how many
-were kept; nothing drafts yet. Two sessions on one load still share weights, never a state.
-
-The prompt's decode steps work on token 0 of the state of `k + 1` tokens per sequence: its slots are the plain slots,
-its history the columns 0 to 2, its caches the same tensors, so the first verify step reads what the prompt left and
-nothing is copied. `Session.prefill` feeds the prompt through the decode plan; `Session.verify(ids)` runs a step of the
-verify plan and leaves its count open; the caller reads the greedy ids, counts the drafted tokens that equal the greedy
-token in front of them (`sampling.accepted`: for several sequences the smallest count of the set, the one count that is
-exactly greedy for every sequence) and says it with `Session.accept(count)`. A decode step behind a keep is not built:
-`Session.step` is refused on such a session, and so is a second prompt behind its first verify step.
-
-`tie_out.speculative_checks(session, decode)` holds such a run against decode steps of the same tokens, line by line.
-`tokens`: every kept row against the decode step of its position, by the family's logits band, and the greedy rule of
-the loop -- every window starts with the greedy token kept last, every kept drafted token is the greedy token in front
-of it. `kept state`: as for a verify session, above. `position`: the session stands where the decode steps stand, an
-integer. `prompt`: after the prompt, what every layer stands on and the logits of every prompt step are the decode
-session's bytes. `bytes`: so are the logits of every kept row and every layer after every step. `rejected rows`: a
-second replay with other tokens behind the kept ones leaves the kept rows and the standing state byte-identical.
-`acceptance`, for a scheduled run: every step kept the count it was scheduled to keep, and every count was kept.
-`position`, `prompt` and `rejected rows` cannot fail by rounding and are gated on every stack. `bytes` is gated on the
-stack `reference`, where a verify step is that many decode steps of one chain, and `REPORTED` on a provider stack,
-where the two kinds of step launch other kernels for some blocks. On a checkpoint, which declares no logits band,
-`tokens` is `REPORTED`: how many kept tokens equal the decode steps' and the first that differs. The session's own
-checks replay the whole recorded run from a zero state -- the prompt's decode steps under the block check of the
-decode plan, the verify steps under the block check of the verify plan -- and its traced pass replays the prompt in
-front of the profiler and holds the verify steps alone.
-
-What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only). The seeded two-layer model, one sequence,
-five drafted tokens, a prompt of 8 tokens, 32 new tokens through 10 verify steps whose drafted tokens were scheduled to
-be kept 0 to 5 in turn: on `native`, `fe-entries` and `fe-cublas` the 32 tokens were the plain session's; `tokens`
-passed with 31 of 31 kept tokens equal to the decode steps' and the logits within 1.00 bf16 unit, inside the band of 4;
-`kept state` was gated in the linear-attention layer; `position`, `prompt`, `rejected rows` and `acceptance` passed;
-`bytes` was reported (on `native` 0 of 31 kept rows were the decode steps' bytes); the launches and copies of every prompt step were those of a plain session's step in
-the same process; replay, the blocks of both kinds of step and the kernel check passed, on `native` and `fe-entries`
-with 13 of 20 launches of a verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend
-entries with byte-equal results). On `reference` every line passed, `bytes` included, and the run ended in `RAN`. One
-sequence of two and of eight tokens, four layers, and two sequences of six tokens (each with its own tokens, one count:
-the smallest) passed on `native` as well. In one process on `fe-entries`, ten wrong loops each failed the line that is
-there for them, and three of them -- the position moved by the kept count alone, another attention cache for the
-prompt, a row that attends over the whole window -- passed `tokens` and `kept state` while they failed `position`,
-`prompt` and `rejected rows`. The run of `native` asked for about 3.6 GiB, reserved 3.6 GiB and grew
-the device by 3.8 GiB.
-
-On the published checkpoint (`native`, one sequence of six tokens, the default prompt of 58 tokens through
-`prefill`, then 10 verify steps fed a plain run's 32 new tokens with scheduled counts): `position`, `prompt` and
-`rejected rows` passed; `kept state` was gated in 1 of 48 linear-attention layers; `tokens` was reported --
-30 of 31 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs
-kept token 13; replay, the blocks of both kinds of step and the kernel check passed, with 370 of 484 launches
-of a verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal
-results). The sentence asked for about 40.0 GiB, PyTorch reserved 38.9 GiB and the device grew by
-39.0 GiB, the GPU otherwise empty.
+were kept; nothing drafts yet. Two sessions on one load still share weights, never a state. How its prompt works on
+that state follows the layout (**The prompt on that state**, below); how such a run is checked, and what ran, follows
+the checks of a verify session (**The checks of a session that verifies behind its prompt**).
 
 **The state.** The recurrent state after EVERY token of a step is written to a slot of its own, so the next step can
 start from whichever token the run kept, with nothing copied. The slots are numbered token by token -- sequence `i`,
@@ -836,6 +789,18 @@ one token per sequence is this layout at `T = 1`. The conv history of a sequence
 slot: a step reads its three taps where the last step left them and writes the last two of them followed by its own
 `T` rows. Keeping `n` tokens moves one number on the host; the kernel reads it from a constant table. An attention
 layer inserts `T` positions per sequence, and token `t` attends up to its own.
+
+**The prompt on that state.** The decode steps of the prompt of a session built with `draft_tokens=k` work on token
+0 of its state of `k + 1` tokens per sequence: its slots are the plain slots, its history the columns 0 to 2, its
+caches the same tensors, so the first verify step reads what the prompt left and nothing is copied.
+`Session.prefill` feeds the prompt through the decode plan; `Session.verify(ids)` runs a step of the verify plan and
+leaves its count open; the caller reads the greedy ids, counts the drafted tokens that equal the greedy token in
+front of them (`sampling.accepted`: for several sequences the smallest count of the set, the one count that is
+exactly greedy for every sequence) and says it with `Session.accept(count)`. A decode step behind a keep is not
+built: `Session.step` is refused on such a session, and so is a second prompt behind its first verify step. The
+capacity holds a whole window wherever a step starts: a step at position `p` needs `p + k + 1` positions, so a run
+of a prompt and `n` new tokens is built with a capacity of `prompt + n + k - 1` -- its last step can start at the
+last new token but one -- and a step that does not fit is a `ValueError` that names the capacity.
 
 **Who serves it.** The block `linear_attention.step` is served by `fe.gdn_verify_fused`, `cudnn.GdnVerifyFused`: one
 launch per layer for all tokens of all sequences. The step shape is a compile-time fact of that kernel, so the table
@@ -970,6 +935,66 @@ part of this SM count, the verify entry takes another form than at one sequence 
 value head and sequence, each on an SM of its own, with 224,672 B of shared memory at six tokens and 231,744 B at
 eight, the largest step that form holds. These are the runs of one GPU class.
 
+**The checks of a session that verifies behind its prompt.** `tie_out.speculative_checks(session, decode)` holds a
+run of a session built with `draft_tokens=` against decode steps of the same tokens, line by line. It replays what
+the session recorded -- its prompt, the windows it verified, the counts it kept -- from a zero state, and feeds the
+decode session the kept tokens beside it. `tokens`: every kept row against the decode step of its position, by the
+family's logits band, and the greedy rule of the loop -- every window starts with the greedy token kept last, every
+kept drafted token is the greedy token in front of it. `kept state`: as for a verify session, above. `position`:
+after the prompt and after every step the session stands where the decode steps stand and on the token the step
+kept, and the session's own run ended there -- integers. `prompt`: after the prompt, what every layer stands on and
+the logits of every prompt step are the decode session's bytes. `recorded`: the ids and logits of every step the
+session recorded of its own run are the replay's bytes, so what the other lines judge is the run the session's own
+methods ran. `bytes`: the logits of every kept row and every layer after every step are the decode session's bytes.
+`rejected rows`: a second replay with other tokens behind the kept ones leaves the kept rows and the standing state
+byte-identical. `acceptance`, for a scheduled run -- one whose drafted tokens are built so that a correct step keeps
+a stated number of them (`tie_out.forced_drafts`): every step kept the count it was scheduled to keep, and every
+count was kept. `position`, `prompt`, `recorded` and `rejected rows` cannot fail by rounding and are gated on every
+stack. `bytes` is gated on the stack `reference`, where a verify step is that many decode steps of one chain, and
+`REPORTED` on a provider stack, where the two kinds of step launch other kernels for some blocks. On a checkpoint,
+which declares no logits band, `tokens` is `REPORTED`: how many kept tokens equal the decode steps' and the first
+that differs, with its sequence where there are several. The comparison is made once per run, on the session as its
+run left it, and leaves it reset with its records. The session's own checks then replay the whole recorded run from
+a zero state -- the prompt's decode steps under the block check of the decode plan, the verify steps under the block
+check of the verify plan -- and its traced pass replays the prompt in front of the profiler and holds the verify
+steps alone.
+
+What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only). The seeded two-layer model, one sequence,
+five drafted tokens, a prompt of 8 tokens, 32 new tokens through 10 verify steps whose drafted tokens were scheduled to
+be kept 0 to 5 in turn: on `native`, `fe-entries` and `fe-cublas` the 32 tokens were the plain session's; `tokens`
+passed with 31 of 31 kept tokens equal to the decode steps' and the logits within 1.00 bf16 unit, inside the band of 4;
+`kept state` was gated in the linear-attention layer; `position`, `prompt`, `recorded`, `rejected rows` and
+`acceptance` passed; `bytes` was reported (on `native` 0 of 31 kept rows were the decode steps' bytes); the launches
+and copies of every prompt step were those of a plain session's step in the same process; replay, the blocks of both
+kinds of step and the kernel check passed, on `native` and `fe-entries` with 13 of 20 launches of a verify step target
+kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results). On `reference` every
+line passed, `bytes` included, and the run ended in `RAN`. One sequence of two and of eight tokens, four layers, and
+two sequences of six tokens (each with its own tokens, one count: the smallest) passed on `native` as well, and so did
+the ends of the sequence range of such a session: four sequences of six tokens and 16 of two.
+
+In one process on `fe-entries`, fourteen wrong loops each failed the line that is there for them. Three of them -- the
+position moved by the kept count alone, another attention cache for the prompt, a row that attends over the whole
+window -- passed `tokens` and `kept state` while they failed `position`, `prompt` and `rejected rows`. Four are wrong in
+a method of the session itself, where the family's step is right -- `accept` does not tell the state which token was
+kept, `accept` moves the position by the kept count alone, a step that is given its count does the same, the prompt is
+fed to a state of its own -- so the comparison's replay held on `tokens`, `kept state`, `prompt` and `rejected rows`,
+and each failed `position` or `recorded`. The forgotten count also ran on `fe-cublas`, where the kept state of no
+layer was gated for it: `position` failed it there.
+
+The run of `native` asked for about 3.6 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB. At 16 sequences of two
+tokens the run asked for about 3.6 GiB, reserved 4.3 GiB and grew the device by 4.4 GiB: the comparison keeps what the
+session stands on after each step it replays -- 21 steps of 16 sequences in that run -- until its second replay has
+ended, and the memory sentence does not count that.
+
+On the published checkpoint (`native`, one sequence of six tokens, the default prompt of 58 tokens through
+`prefill`, then 10 verify steps fed a plain run's 32 new tokens with scheduled counts): `position`, `prompt`,
+`recorded` and `rejected rows` passed; `kept state` was gated in 1 of 48 linear-attention layers; `tokens` was reported --
+30 of 31 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs
+kept token 13; replay, the blocks of both kinds of step and the kernel check passed, with 370 of 484 launches
+of a verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal
+results). The sentence asked for about 40.0 GiB, PyTorch reserved 38.9 GiB and the device grew by
+39.0 GiB, the GPU otherwise empty.
+
 **Memory.** The memory sentence of a verify plan counts the state of its step shape -- a recurrent state per
 (sequence, token), `T + 2` history columns per sequence -- beside the flat working memory of every plan of the
 reduced models. Up to 32 rows of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence
@@ -1000,7 +1025,10 @@ and says of three lines that they are not stated -- the first-token line (nothin
 steps), the rate (a step is not one token), and the bytes of a step (the family's arithmetic is the decode step's:
 one embedding row, one recurrent state and three history columns per sequence). A session built with `draft_tokens=`
 states its first-token line and prints no rate -- its drafted tokens are its caller's -- and the bytes of a step of
-such a session are not stated either. The attention layers'
+such a session are not stated either. The kernel check and the coverage line of such a session are about its verify
+steps: the decode steps of its prompt are replayed in front of the traced window and their kernels are not observed,
+which the run says beside its kernel verdict; what they launch was compared with a plain session's step in the runs
+above, by the driver of those runs. The attention layers'
 out-projection, the attention blocks and the MLP's down multiply on their target kernels. A captured verify step. A verify step of more than eight tokens per
 sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
 has run on compute capability 10.0 only; every other class is uncovered, not passing -- the rows of the

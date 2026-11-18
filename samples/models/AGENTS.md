@@ -779,3 +779,24 @@ A session built with `draft_tokens=` feeds its prompt through decode steps and r
   is replayed in front of the profiler, and the report's line says so.
 - One count for several sequences is exactly greedy only if it is the smallest of the set. The helper that counts
   returns that one, and the method that takes the count says so.
+- A comparison that replays a run judges the replay. `speculative_checks` drives its replays through the family's
+  step on the session's plans and state, and its first version read the inputs of the run and nothing else of it: a
+  session whose own methods were wrong -- a count never told to the state, the position moved by the count alone,
+  the prompt fed to a state the verify steps never read -- passed every line, and where the defect sat in a method
+  the session's own checks replay through as well, it passed those too. Tie a replay to the run: the ids and logits
+  the run recorded, byte for byte against the replay (`recorded`), and where the run ended, as integers
+  (`position`). And put a control defect where a caller reaches the code -- in the session's methods -- not only
+  below the path the check itself takes.
+- Hold as an integer what is one. Which token the state stands on after a step was seen through the kept state
+  alone, a band that gates a layer only where both runs fed it the same rows: on a stack whose front rows state no
+  batch invariance a forgotten count failed nothing that was gated. The kept token is a number the state holds; it
+  is compared with the count the step kept, beside the position, on every stack.
+- A number counted over the rows of a step is not a token's number. The kept rows of a step stand sequence by
+  sequence, so the first row that differs is the first kept token that differs at one sequence only. A line that
+  names a token keeps the token's number and its sequence for every row it compares.
+- What a first launch reserves outside the pool is reserved once in a process. A second plan of one session adds no
+  second reserve to the memory sentence. The class with such a reserve was not the class of the gate, so the
+  sentence of that class is held by a host test on stated facts.
+- A check says what it looked at. The traced window of such a session holds its verify steps; the prompt's decode
+  steps launch a compiled form of their own that the kernel check never sees. The run says so beside the verdict, a
+  line that compares nothing is `REPORTED`, and a kind of step of which no step was judged is named as that.

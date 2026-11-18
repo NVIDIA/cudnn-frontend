@@ -1068,7 +1068,7 @@ def test_a_stored_form_the_load_did_not_keep_fails_a_verify_session_by_name():
     assert session.stored_weights() == whole and session.uncopied_weights() == ("projection.fp8.in", "mlp.gate_up"), "whichever of the two loads"
 
 
-def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_verify_step():
+def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_verify_step(monkeypatch):
     from model_samples import census
     from model_samples.qwen_dense import QwenDense
     from model_samples.state import DecodeState
@@ -1215,8 +1215,44 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         "share weights, never a state." in section
     )
     assert "One state for both kinds of step is not built" not in section and "no run here prefills a prompt" not in section
-    assert all(f"`{name}`" in section for name in ("tokens", "kept state", "position", "prompt", "bytes", "rejected rows", "acceptance"))
-    assert "`position`, `prompt` and `rejected rows` cannot fail by rounding and are gated on every stack." in section
+    assert all(f"`{name}`" in section for name in ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "acceptance"))
+    assert "`position`, `prompt`, `recorded` and `rejected rows` cannot fail by rounding and are gated on every stack." in section
+    # a reader meets a thing after what it rests on: the layout of the state in front of the prompt's token 0, the kept-state rule
+    # of a verify session in front of the line that says "as for a verify session, above"
+    order = [
+        "**One session for a prompt and its verify steps.**",
+        "**The state.**",
+        "**The prompt on that state.**",
+        "the state the verify run stands on is compared with the state of the decode steps of the kept tokens (`kept state`)",
+        "**The checks of a session that verifies behind its prompt.**",
+        "`kept state`: as for a verify session, above.",
+        "What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only).",
+        "On the published checkpoint (`native`, one sequence of six tokens, the default prompt of 58 tokens through `prefill`,",
+        "**Memory.**",
+    ]
+    assert [section.count(each) for each in order] == [1] * len(order) and sorted(order, key=section.index) == order
+    # the prompt's token 0, as the state hands it out: the plain slots, the history columns 0 to 2, the same cache tensors
+    from model_samples.state import KvCache, RecurrentSlots
+
+    pool = RecurrentSlots(torch.zeros((1 + 2 * 6, 1, 2, 2)), torch.arange(3 * 8 * 5, dtype=torch.float32).view(3, 8, 5), 6)
+    token0, cache = pool.first_token(), KvCache(torch.zeros((2, 4, 3)), torch.zeros((2, 4, 3)), 6)
+    assert tuple(token0.state.shape) == (3, 1, 2, 2) and torch.equal(token0.conv_storage, pool.conv_storage[:, 0:3]) and token0.conv_storage.shape[1] == 3
+    assert cache.first_token().k is cache.k and cache.first_token().v is cache.v
+    assert (
+        "work on token 0 of its state of `k + 1` tokens per sequence: its slots are the plain slots, its history the columns 0 to 2, its caches the same "
+        "tensors, so the first verify step reads what the prompt left and nothing is copied." in section
+    )
+    # the capacity of such a session, as the refusals test runs it: a prompt of 5, 9 new tokens and 5 drafted need 18 positions
+    assert "so a run of a prompt and `n` new tokens is built with a capacity of `prompt + n + k - 1`" in section and 5 + 9 + 5 - 1 == 18
+    assert "(`tie_out.forced_drafts`): every step kept the count it was scheduled to keep, and every count was kept." in section
+    assert "`recorded`: the ids and logits of every step the session recorded of its own run are the replay's bytes" in section
+    assert "The comparison is made once per run, on the session as its run left it, and leaves it reset with its records." in section
+    # the traced pass and the kernel check of such a session (the census module's test of the traced pass holds the behaviour)
+    assert "and its traced pass replays the prompt in front of the profiler and holds the verify steps alone." in section
+    assert (
+        "The kernel check and the coverage line of such a session are about its verify steps: the decode steps of its prompt are replayed in front of the "
+        "traced window and their kernels are not observed, which the run says beside its kernel verdict" in section
+    )
     assert (
         "`bytes` is gated on the stack `reference`, where a verify step is that many decode steps of one chain, and `REPORTED` on a provider stack" in section
     )
@@ -1250,9 +1286,55 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "The sentence asked for about 40.0 GiB, PyTorch reserved 38.9 GiB and the device grew by 39.0 GiB, the GPU otherwise empty." in section
     # ... and the figures of the runs, as the section states them beside the class they ran on
     assert "What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only)." in section
+    # the schedule of those runs is arithmetic: counts 0 to 5 in turn give 32 new tokens -- the prompt's first and 31 kept rows -- in 10 steps
+    counts = []
+    while 1 + sum(count + 1 for count in counts) < 32:
+        counts.append(len(counts) % 6)
+    assert (len(counts), sum(count + 1 for count in counts)) == (10, 31)
+    assert (
+        "The seeded two-layer model, one sequence, five drafted tokens, a prompt of 8 tokens, 32 new tokens through 10 verify steps whose drafted tokens "
+        "were scheduled to be kept 0 to 5 in turn: on `native`, `fe-entries` and `fe-cublas` the 32 tokens were the plain session's;" in section
+    )
     assert "`tokens` passed with 31 of 31 kept tokens equal to the decode steps' and the logits within 1.00 bf16 unit, inside the band of 4" in section
+    assert "`bytes` was reported (on `native` 0 of 31 kept rows were the decode steps' bytes)" in section
+    assert "On `reference` every line passed, `bytes` included, and the run ended in `RAN`." in section
+    assert (
+        "One sequence of two and of eight tokens, four layers, and two sequences of six tokens (each with its own tokens, one count: the smallest) "
+        "passed on `native` as well" in section
+    )
+    assert "passed on `native` as well, and so did the ends of the sequence range of such a session: four sequences of six tokens and 16 of two." in section
+    # the wrong loops of the device run, as the host test of the wrong loops has them: its twelve less the forgotten count on a stack
+    # that gates no first layer (the same loop, run on another stack there), plus three a host cannot show -- the decode view at
+    # other history columns, the prompt's record dropped from a replay, a second host read inside a traced step
+    assert len(WRONG_LOOPS) - 1 + 3 == 14 and len(OWN_METHODS) == 4
+    assert "In one process on `fe-entries`, fourteen wrong loops each failed the line that is there for them." in section
+    assert "Four are wrong in a method of the session itself, where the family's step is right" in section
+    assert "and each failed `position` or `recorded`." in section
+    assert "The forgotten count also ran on `fe-cublas`, where the kept state of no layer was gated for it: `position` failed it there." in section
+    # ... and what the run of 16 sequences of two tokens asked for: the sentence of its two sessions on stated facts, at its
+    # capacity (a prompt of 8, 32 new tokens, two windows of one drafted token)
+    from model_samples import Session, TextIO, blocks
+
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * 2**30)))
+    wide = QwenDense.reduced()
+    several = dict(sequences=16, stack="native", device="cuda:0", capacity=8 + 32 + 2)
+    first = Session(wide, TextIO.synthetic(wide.geometry.vocab), **several)
+    behind = Session(wide, TextIO.synthetic(wide.geometry.vocab), share=first, draft_tokens=1, **several)
+    sentence = first.plan_table([behind]).splitlines()[-1]
+    assert (
+        "this stack needs about 3.6 GiB on this GPU for a plain session of 16 sequences and a session of 16 sequences x 2 tokens behind its prompt, "
+        "one after the other" in sentence
+    )
+    assert (
+        "At 16 sequences of two tokens the run asked for about 3.6 GiB, reserved 4.3 GiB and grew the device by 4.4 GiB: the comparison keeps what the "
+        "session stands on after each step it replays -- 21 steps of 16 sequences in that run -- until its second replay has ended, and the memory "
+        "sentence does not count that." in section
+    )
     assert "30 of 31 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs kept token 13" in section
     assert "`kept state` was gated in 1 of 48 linear-attention layers" in section
+    assert (
+        "then 10 verify steps fed a plain run's 32 new tokens with scheduled counts): `position`, `prompt`, `recorded` and `rejected rows` passed;" in section
+    )
     assert (
         "A session can now feed a prompt through decode steps and verify behind it (`Session(draft_tokens=k)`), the caller supplying the drafted tokens; "
         "no script drafts yet." in " ".join(area.split())
@@ -1260,6 +1342,13 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert (
         "## What one session for a prompt and its verify steps taught" in guide and "A kernel on a view is another compiled form, under the same name." in guide
     )
+    lessons = " ".join(guide.split("## What one session for a prompt and its verify steps taught", 1)[1].split())
+    assert (
+        "three wrong loops -- the position moved by the kept count alone, the prompt's attention cache not the one the verify steps read, a row that "
+        "attends over the whole window -- kept every greedy token and stayed inside the logits band at the published widths" in lessons
+    )
+    assert "A comparison that replays a run judges the replay." in lessons and "Hold as an integer what is one." in lessons
+    assert "What a first launch reserves outside the pool is reserved once in a process." in lessons and "A check says what it looked at." in lessons
 
 
 # ----------------------------------------------------------------------------------------------- the out-projection of a verify step
@@ -1879,12 +1968,13 @@ def _speculative(sequences, drafted, new=24, prompt=5, **more):
     return plain, session, prompts, [list(column) for column in zip(*produced)]
 
 
-def _scheduled_loop(session, prompts, stream, new=24, keep=None, emit=None):
+def _scheduled_loop(session, prompts, stream, new=24, keep=None, emit=None, given=False):
     """The loop a caller writes around such a session: ``prefill``, then per step the window (the token kept last and the
     drafted tokens of :func:`tie_out.forced_drafts`, which a correct step keeps 0, 1, .., ``draft_tokens`` of in turn),
     ``verify``, the one host read, ``sampling.accepted``, ``accept``.  Returns ``(the new tokens of every sequence, the
     scheduled counts)``.  ``keep(windows, greedy, scheduled)`` and ``emit(window, greedy, kept)`` replace the two rules of
-    the loop for a test of a wrong one."""
+    the loop for a test of a wrong one; ``given`` hands the scheduled count to the step itself (``verify(ids, count)``),
+    as a run does that is fed another run's tokens."""
     from model_samples import sampling, tie_out
 
     drafted, vocab, sequences = session.draft_tokens, session.model.geometry.vocab, session.sequences
@@ -1893,9 +1983,12 @@ def _scheduled_loop(session, prompts, stream, new=24, keep=None, emit=None):
     while done < new:
         length = len(scheduled) % (drafted + 1)
         windows = [[out[i][-1], *tie_out.forced_drafts(stream[i][done:], length, drafted, vocab)] for i in range(sequences)]
-        greedy = session.read(session.verify(torch.tensor(windows, dtype=torch.int32)))
-        kept = sampling.accepted(windows, greedy) if keep is None else keep(windows, greedy, length)
-        session.accept(kept)
+        if given:
+            greedy, kept = session.read(session.verify(torch.tensor(windows, dtype=torch.int32), length)), length
+        else:
+            greedy = session.read(session.verify(torch.tensor(windows, dtype=torch.int32)))
+            kept = sampling.accepted(windows, greedy) if keep is None else keep(windows, greedy, length)
+            session.accept(kept)
         for i in range(sequences):
             out[i] += greedy[i][: kept + 1] if emit is None else emit(windows[i], greedy[i], kept)
         scheduled.append(length)
@@ -1904,7 +1997,8 @@ def _scheduled_loop(session, prompts, stream, new=24, keep=None, emit=None):
 
 
 def _line(checks, name):
-    return next(line for line in checks.lines if line.startswith(f"  {name} "))
+    """The line ``name`` of a comparison; nothing where it prints none."""
+    return next((line for line in checks.lines if line.startswith(f"  {name} ")), "")
 
 
 @pytest.mark.parametrize("sequences, drafted", [(1, 5), (2, 2), (1, 1)])
@@ -1921,7 +2015,7 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
     # two plans, resolved before the load: the session's own (its verify steps) and its prompt's
     assert (session.plan.tokens, session.plan.sequences, session.prefill_plan.tokens, session.prefill_plan.sequences) == (tokens, sequences, 1, sequences)
     assert session.resolve() is session.plan and session.plan is not session.prefill_plan
-    verify_table, line, decode_table = session._tables().partition(f"\n{loop.PROMPT_ROWS}\n")[::1]
+    verify_table, line, decode_table = session._tables().partition(f"\n{loop.PROMPT_ROWS}\n")
     assert line and verify_table == session.plan.table() and decode_table == session.prefill_plan.table()
     assert f"x {tokens} tokens per sequence" in verify_table.splitlines()[0] and "tokens per sequence" not in decode_table.splitlines()[0]
     printed = session.plan_table()
@@ -1956,8 +2050,17 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
         f"speculative against decode ({sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence, {len(scheduled)} engine steps "
         f"behind a prompt of 5 tokens; tokens kept behind the first: {kept}; 3 layers)"
     )
-    for name in ("tokens", "kept state", "position", "prompt", "bytes", "rejected rows", "acceptance"):
+    for name in ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "acceptance"):
         assert _line(checks, name).endswith("    PASS"), _line(checks, name)
+    # what the comparison replayed is the run the session ran: every step it recorded, and where its own run ended
+    ran = 5 + len(scheduled)
+    assert _line(checks, "recorded") == (
+        f"  recorded          ids and logits of {ran} of {ran} steps the session recorded of its own run (5 of its prompt, {len(scheduled)} verify steps) "
+        "are this replay's bytes    PASS"
+    )
+    assert _line(checks, "position").endswith(
+        f"on the token the step kept: 5 prompt tokens + the kept ones = {position}; the session's own run ended there    PASS"
+    )
     rows = sequences * sum(count + 1 for count in scheduled)
     assert (
         f"{rows} of {rows} kept tokens equal to those of the decode steps of the same tokens (none differs); {rows} of {rows} are the greedy token"
@@ -1971,6 +2074,9 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
     assert f"{len(scheduled)} of {len(scheduled)} steps kept the count they were scheduled to keep; every count from 0 to {drafted} was kept" in checks.text()
     # both sessions are left reset, and the session keeps its records: its own checks replay the WHOLE run from a zero state
     assert (session.state.position, plain.state.position, plain.record.count) == (0, 0, 0) and session.record is record and session.prompt_record is prompt
+    # ... so the comparison is made once per run: a second one would read where a reset session stands, not where the run ended
+    with pytest.raises(ValueError, match=f"holds a session where its run left it; this session recorded {len(scheduled)} verify steps and stands behind none"):
+        tie_out.speculative_checks(session, plain, scheduled)
     own = tie_out.run_checks(session, prompt_tokens=5)
     assert own.ok and own.lines[0] == (
         f"checks ({sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence, {len(scheduled)} verify steps; "
@@ -2000,16 +2106,31 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
         assert partly.ok, partly.text()
     session.reset(fresh=True)  # the comparison left the session its records: a new prompt set starts with a reset, as always
     # ... and a prompt whose first steps alone are judged is replayed whole all the same
-    out, scheduled = _scheduled_loop(session, prompts, stream, new)
+    _scheduled_loop(session, prompts, stream, new)
     some = tie_out.run_checks(session, prompt_tokens=5, max_steps=2, max_prompt_steps=3)
     assert (
         some.ok and some.lines[0].endswith("; behind a prompt of 5 decode steps, the first 3 of them judged)") and "the first 2 verify steps" in some.lines[0]
     )
+    # ... a prompt of which no step is judged says so: its line is no pass, and no sentence about a reference chain
+    _scheduled_loop(session, prompts, stream, new)
+    none = tie_out.run_checks(session, prompt_tokens=5, max_prompt_steps=0)
+    assert none.ok and none.lines[0].endswith("; behind a prompt of 5 decode steps, the first 0 of them judged)")
+    assert "  blocks            the prompt's decode steps: no step of this kind was judged    REPORTED" in none.lines
+    assert ("  batch invariance  the prompt's decode steps: no step of this kind was judged    REPORTED" in none.lines) == (sequences > 1)
     # the replay holds the prompt's recorded steps too: a recorded logit that is not what a second run gives fails it
-    out, scheduled = _scheduled_loop(session, prompts, stream, new)
+    _scheduled_loop(session, prompts, stream, new)
     session.prompt_record.logits[0, 0, 0] += 1
     moved = tie_out.run_checks(session, prompt_tokens=5)
     assert not moved.ok and moved.lines[1].endswith("byte-identical on a second run from a fresh state    FAIL")
+    # ... and so does the comparison with decode steps: a recorded step that is not what its replay gives fails ``recorded``, alone
+    _, scheduled = _scheduled_loop(session, prompts, stream, new)
+    session.prompt_record.inputs[0, 0] += 1  # an id fed, an id chosen, a logit: each in another recorded step
+    session.record.outputs[1, 0] += 1
+    session.record.logits[0, 0, 0] += 1
+    moved = tie_out.speculative_checks(session, plain, scheduled)
+    ran = 5 + len(scheduled)
+    assert not moved.ok and f"ids and logits of {ran - 3} of {ran} steps the session recorded of its own run" in _line(moved, "recorded")
+    assert [line.split()[0] for line in moved.lines if line.endswith("    FAIL")] == ["recorded"], moved.text()
     # a prompt fed in parts is one prompt: kept whole, and the state it leaves is the state of the prompt fed at once
     session.prefill(prompts)
     whole = [tuple(t.clone() for t in layer) for layer in session.state.standing()]
@@ -2018,6 +2139,77 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
     first = session.read(session.prefill([p[2:] for p in prompts]))
     assert tuple(session.prompt_record.prompt.shape) == (sequences, 5) and session.report().prompt_tokens == 5 and session.prompt_record.count == 5
     assert first == [row[0] for row in stream] and tie_out.bytes_equal(whole, session.state.standing())
+    # a session that verified with no prompt in front: the prompt line compares nothing and says so, as no pass
+    session.reset(fresh=True)
+    session.read(session.verify(torch.zeros((sequences, tokens), dtype=torch.int32), 0))
+    bare = tie_out.speculative_checks(session, plain)
+    assert bare.ok and _line(bare, "prompt") == "  prompt            no prompt was fed: the verify steps of this run began on a zero state    REPORTED"
+    assert _line(bare, "recorded").endswith("(0 of its prompt, 1 verify steps) are this replay's bytes    PASS")
+
+
+def test_a_run_longer_than_its_record_is_compared_on_what_it_recorded(monkeypatch):
+    """A session that records fewer steps than it runs (``record_steps=``): the comparison replays the recorded steps, holds
+    them against the run byte for byte, and says of the position that where the run ended is not held -- the counts of
+    the steps behind the record are not known.  What it holds after every replayed step it holds there too: the token
+    the state stands on."""
+    from model_samples import state, tie_out
+
+    plain, session, prompts, stream = _speculative(1, 5, record_steps=3)
+    _, scheduled = _scheduled_loop(session, prompts, stream)
+    assert (session.record.count, session.record.accepted, session.prompt_record.count) == (len(scheduled), scheduled[:3], 5) and len(scheduled) == 8
+    checks = tie_out.speculative_checks(session, plain)
+    assert checks.ok, checks.text()
+    assert _line(checks, "position").endswith(
+        "5 prompt tokens + the kept ones = 11; where the session's own run ended is not held (it ran 8 verify steps and recorded 3)    PASS"
+    )
+    assert "ids and logits of 6 of 6 steps the session recorded of its own run (3 of its prompt, 3 verify steps)" in _line(checks, "recorded")
+    assert "after the prompt, what the session stands on is the decode session's bytes in 3 of 3 layers (states and caches); ids and logits of 5 of 5" in (
+        _line(checks, "prompt")
+    ), "the prompt is kept whole and replayed whole, whatever of it was recorded"
+    # the kept count forgotten, in such a run: where the run ended is not held, and the token the state stands on after a step is
+    monkeypatch.setattr(state.DecodeState, "accept", lambda self, count: setattr(self, "position", self.position + count + 1))
+    session.reset(fresh=True)
+    _scheduled_loop(session, prompts, stream)
+    forgotten = _line(tie_out.speculative_checks(session, plain), "position")
+    assert forgotten.endswith("after step 2 the state stands on token 0 of the step; the step kept 1 tokens behind the first    FAIL"), forgotten
+
+
+@pytest.mark.parametrize(
+    "sequences, wrong, named",
+    [
+        (1, [(2, 0)], "kept token 2"),
+        (2, [(2, 1)], "kept token 2 of sequence 1"),
+        (2, [(3, 1)], "kept token 3 of sequence 1"),
+        (2, [(3, 0), (2, 1)], "kept token 2 of sequence 1"),
+    ],
+)
+def test_the_first_kept_token_that_differs_is_named_by_its_number_and_its_sequence(monkeypatch, sequences, wrong, named):
+    """The kept rows of a step stand sequence by sequence, so the first row that differs in that order is not the first
+    kept token that differs.  With counts 0, 1, 2, .. the decode session is made to choose another token at stated steps
+    behind the prompt (``wrong``: (the step, the sequence)); the line names the smallest kept token among them and, with
+    several sequences, whose it is."""
+    from model_samples import tie_out
+
+    plain, session, prompts, stream = _speculative(sequences, 2)
+    _, scheduled = _scheduled_loop(session, prompts, stream)
+    assert scheduled[:3] == [0, 1, 2]
+    run, behind = type(plain)._run, []
+
+    def other(self, plan, tokens, ids):
+        next_ids, logits = run(self, plan, tokens, ids)
+        if self is plain and self.state.position > 5:  # the decode session, behind the prompt: its nth step is kept token n
+            behind.append(len(behind) + 1)
+            for sequence in [sequence for step, sequence in wrong if step == behind[-1]]:
+                next_ids = next_ids.clone()
+                next_ids[sequence] = (next_ids[sequence] + 1) % 272
+        return next_ids, logits
+
+    monkeypatch.setattr(type(plain), "_run", other)
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    rows = sequences * sum(count + 1 for count in scheduled)
+    line = _line(checks, "tokens")
+    assert line.endswith("    FAIL") and f"{rows - len(wrong)} of {rows} kept tokens equal to those of the decode steps of the same tokens" in line
+    assert f"(the first that differs is {named});" in line, line
 
 
 WRONG_LOOPS = {
@@ -2031,7 +2223,52 @@ WRONG_LOOPS = {
     "a row attends over the whole window": ("rejected rows", "byte-identical to the first replay after 0 of 8 steps"),
     "the count taken from the schedule with one draft wrong": ("tokens", "16 of 26 are the greedy token of the session's own step in front of them"),
     "a drafted token emitted": ("tokens", "13 of 23 are the greedy token of the session's own step in front of them"),
+    # the kept count forgotten where no layer's rows gate the kept state (a stack whose front rows state no batch invariance): an integer sees it
+    "the kept count forgotten, the first layer not gated": (
+        "position",
+        "after step 2 the state stands on token 0 of the step; the step kept 1 tokens behind the first",
+    ),
+    # defects of the session's own methods: a replay through the family's step is right, what the session ran is not
+    "the session's accept does not tell the state which token it kept": (
+        "recorded",
+        f"ids and logits of 7 of {5 + 8} steps the session recorded of its own run (5 of its prompt, 8 verify steps)",
+    ),
+    "the session's accept moves the position by the kept count alone": (
+        "position",
+        "the session's own run ended at position 21 on token 1 of its last step; the prompt's tokens and the kept ones are 29",
+    ),
+    "the session feeds its prompt to a state of its own": (
+        "recorded",
+        f"ids and logits of 5 of {5 + 8} steps the session recorded of its own run (5 of its prompt, 8 verify steps)",
+    ),
+    "a step that is given its count moves the position by the kept count alone": (
+        "position",
+        "the session's own run ended at position 21 on token 1 of its last step; the prompt's tokens and the kept ones are 29",
+    ),
 }
+OWN_METHODS = [defect for defect in WRONG_LOOPS if "session" in defect or "given its count" in defect]
+
+
+def _apart(method, when=lambda self, *operands: True):
+    """``method`` of a session, made to run on a decode state of its own that the session's state never sees (the position
+    alone is carried over), for the calls ``when`` selects."""
+    from model_samples import state
+
+    states = {}
+
+    def wrong(self, *operands):
+        if not when(self, *operands):
+            return method(self, *operands)
+        own = self.state
+        fresh = state.DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), "cpu")
+        _, other = states.setdefault(id(own), (own, fresh))
+        self.state = other
+        try:
+            return method(self, *operands)
+        finally:
+            self.state, own.position = own, other.position
+
+    return wrong
 
 
 def _keep_what_the_schedule_says(windows, greedy, scheduled):
@@ -2046,34 +2283,51 @@ def _emit_the_drafted_token(window, greedy, kept):
 
 @pytest.mark.parametrize("defect", list(WRONG_LOOPS))
 def test_a_wrong_loop_fails_the_line_that_sees_it(monkeypatch, defect):
-    """Seven loops that are wrong in one thing, each on real sessions of the reference stack: the line that is there for
+    """Twelve loops that are wrong in one thing, each on real sessions of the reference stack: the line that is there for
     that thing ends in FAIL with its own sentence.  (On this tiny geometry the logits of a wrong state also leave the
-    band; that the token line does not see three of them at the published widths is shown on a device.)"""
+    band; that the token line does not see three of them at the published widths is shown on a device.)  Four of them
+    are wrong in a method of the session itself, where the family's step is right: the comparison's own replay holds on
+    every line, and the two lines that hold the session's own run -- its recorded steps, where it ended -- fail."""
     from model_samples import loop, state, tie_out
     from model_samples.providers import torch_ref
 
     failing, sentence = WRONG_LOOPS[defect]
     keep = emit = None
-    if defect == "the kept count forgotten":  # the position moves, the slot and the history columns stay those of token 0
+    given = False
+    if defect.startswith("the kept count forgotten"):  # the position moves, the slot and the history columns stay those of token 0
         monkeypatch.setattr(state.DecodeState, "accept", lambda self, count: setattr(self, "position", self.position + count + 1))
-        monkeypatch.setattr(tie_out, "_first_layer_fed_alike", lambda *sessions: True)  # as on a stack whose rows state it
+        if defect == "the kept count forgotten":
+            monkeypatch.setattr(tie_out, "_first_layer_fed_alike", lambda *sessions: True)  # as on a stack whose rows state it
     elif defect == "two states":  # the prompt's decode steps run on a state of their own: the verify steps start from zeros
-        run, apart = loop.Session._run, {}
+        monkeypatch.setattr(loop.Session, "_run", _apart(loop.Session._run, lambda self, plan, tokens, ids: self.draft_tokens is not None and tokens == 1))
+    elif defect == "the session feeds its prompt to a state of its own":  # the same, in the method the session's own prompt goes through
+        monkeypatch.setattr(loop.Session, "_feed", _apart(loop.Session._feed))
+    elif defect == "the session's accept does not tell the state which token it kept":
 
-        def wrong(self, plan, tokens, ids):
-            if self.draft_tokens is None or tokens != 1:
-                return run(self, plan, tokens, ids)
-            own = self.state
-            _, other = apart.setdefault(
-                id(own), (own, state.DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), "cpu"))
-            )
-            self.state = other
-            try:
-                return run(self, plan, tokens, ids)
-            finally:
-                self.state, own.position = own, other.position
+        def wrong(self, count):
+            self.record.accepted[self.record.count - 1] = count
+            self.state.position += count + 1
+            self._open = False
 
-        monkeypatch.setattr(loop.Session, "_run", wrong)
+        monkeypatch.setattr(loop.Session, "accept", wrong)
+    elif defect == "the session's accept moves the position by the kept count alone":
+        told = loop.Session.accept
+
+        def wrong(self, count):
+            told(self, count)
+            self.state.position -= 1
+
+        monkeypatch.setattr(loop.Session, "accept", wrong)
+    elif defect == "a step that is given its count moves the position by the kept count alone":
+        advance, given = loop.Session._advance, True
+
+        def wrong(self, ids, accept=0):
+            next_ids = advance(self, ids, accept)
+            if self.tokens > 1 and accept is not None:
+                self.state.position -= 1
+            return next_ids
+
+        monkeypatch.setattr(loop.Session, "_advance", wrong)
     elif defect == "the position moved by the kept count alone":
         accept = state.DecodeState.accept
 
@@ -2098,7 +2352,7 @@ def test_a_wrong_loop_fails_the_line_that_sees_it(monkeypatch, defect):
 
     plain, session, prompts, stream = _speculative(1, 5)
     try:
-        _, scheduled = _scheduled_loop(session, prompts, stream, keep=keep, emit=emit)
+        _, scheduled = _scheduled_loop(session, prompts, stream, keep=keep, emit=emit, given=given)
     except ValueError as error:  # a run that left the plain run's tokens has no schedule to follow to its end: what it recorded is compared
         assert "needs the tokens behind the kept one" in str(error) or "positions per sequence" in str(error), error
         session._open, scheduled = False, None
@@ -2108,7 +2362,17 @@ def test_a_wrong_loop_fails_the_line_that_sees_it(monkeypatch, defect):
     if defect.startswith("the count taken from the schedule"):  # every step kept one more than it was scheduled to, and none kept nothing
         acceptance = _line(checks, "acceptance")
         assert acceptance.endswith("    FAIL") and "1 of 6 steps kept the count they were scheduled to keep; never kept: 0" in acceptance, acceptance
-    if failing in ("position", "prompt", "rejected rows"):  # integers and bytes: the lines beside the token comparison, each for one thing
+    if defect in OWN_METHODS:  # the replay the comparison drives is right: what fails is the session's own run, and nothing else
+        failed = {line.split("  ")[1] for line in checks.lines if line.endswith("    FAIL")}
+        assert failing in failed and failed <= {"position", "recorded"}, f"{defect}: the lines of the session's own run alone fail\n{checks.text()}"
+        # the position its run ended at was right where the count alone was not told: the token it ended on is held beside it
+        untold = (
+            "the session's own run ended at position 29 on token 0 of its last step; the prompt's tokens and the kept ones are 29, and its last step kept 1"
+        )
+        assert (untold in _line(checks, "position")) == (defect == "the session's accept does not tell the state which token it kept"), checks.text()
+    elif defect.endswith("the first layer not gated"):  # the kept state gates no layer there and fails nothing: the integer is what holds the count
+        assert not _line(checks, "kept state").endswith("    FAIL") and "0 of 2 linear-attention layers were fed the same rows" in _line(checks, "kept state")
+    elif failing in ("position", "prompt", "rejected rows"):  # integers and bytes: the lines beside the token comparison, each for one thing
         others = {"position", "prompt", "rejected rows"} - {failing}
         assert all(_line(checks, name).endswith("    PASS") for name in others), f"{defect}: only its own line of the three fails\n{checks.text()}"
 
@@ -2184,6 +2448,20 @@ def test_what_a_session_with_draft_tokens_refuses():
     session.reset(fresh=False)
     assert not session._open and session.record.accepted == []
     session.verify(window, 0)
+    session.reset(fresh=False)
+    # a capacity below one step: a session built with tokens= says so at its load, by the capacity sentence
+    short = Session(model, text, stack="reference", device="cpu", capacity=4, tokens=6, share=plain)
+    with pytest.raises(ValueError, match="was built for 4 positions per sequence; build it with a larger capacity"):
+        short.load()
+    # the capacity holds a whole window wherever a step starts: a prompt of 5 and 9 new tokens with 5 drafted are 5 + 9 + 5 - 1 = 18
+    # positions -- the last step can start at the last new token but one, position 12 -- and a step from position 13 does not fit
+    session.read(session.prefill(prompts))
+    for kept in (5, 0):
+        session.verify(window, kept)
+    assert session.state.position == 5 + 9 - 2 == 12 and session.capacity == 5 + 9 + 5 - 1
+    session.verify(window, 0)
+    with pytest.raises(ValueError, match="was built for 18 positions per sequence; build it with a larger capacity"):
+        session.verify(window, 0)
     session.reset(fresh=False)
     # a decode step is a step of the prompt: on a state that stands behind a verify step it has no token 0 to work on
     state = DecodeState(model.geometry.layer_kinds, 1, 16, model.state_shapes(), "cpu", tokens=3)

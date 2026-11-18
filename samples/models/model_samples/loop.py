@@ -387,8 +387,8 @@ class Session:
             )
             need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token()) for session in later)
             # one state per session: a session that feeds its prompt through decode steps runs them on the state of its verify
-            # steps, so it is counted once; the kernel form of its prompt may reserve outside the pool as any first launch does
-            need += sum(session.prefill_plan.reserve_bytes() for session in (self, *later) if session.prefill_plan is not None)
+            # steps, so it is counted once.  Nothing is added for its second plan either: what a first launch of the fused step
+            # reserves outside the pool is reserved once in a process, and the sentence carries it once (``Plan.memory``)
             counts = [self.sequences, *(session.sequences for session in later)]
             what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
             if any(session.draft_tokens is not None for session in (self, *later)):  # a run with two kinds of step names them
@@ -652,8 +652,9 @@ class Session:
         none.
 
         On a session built with ``draft_tokens=`` the traced steps are its verify steps: the pass first replays the whole
-        prompt from a zero state WITHOUT the profiler, then the first ``steps`` recorded verify steps with their kept
-        counts under it.  The launch records are those of verify steps alone, held against the verify plan."""
+        prompt from a zero state WITHOUT the profiler, up to the host read that ends a prompt, then the first ``steps``
+        recorded verify steps with their kept counts under it.  The launch records are those of verify steps alone, held
+        against the verify plan; the kernels of the prompt's decode steps are not observed."""
         if self.on_demand is not None:  # the reference of a run's checks: its calls carry the copies it makes, which no step of a run does
             raise ValueError(
                 "a session that makes bf16 copies of its weights per call (on_demand) is the reference of a run's checks; its steps are not traced"
@@ -688,7 +689,10 @@ class Session:
         try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
             if prompt is not None:  # the prompt of the traced steps, from the zero state: in front of the profiler, in no record of it
                 for t in range(prompt.shape[1]):
-                    self._feed(prompt[:, t].contiguous())
+                    next_ids = self._feed(prompt[:, t].contiguous())
+                    # ... ended as the loop ends a prompt, by the host read of its last ids: none of its kernels is in flight when the window opens
+                    if t + 1 == prompt.shape[1]:
+                        next_ids.tolist()
             if records:
                 self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, records=launches)
             else:

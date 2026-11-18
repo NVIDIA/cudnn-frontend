@@ -1126,3 +1126,28 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     with pytest.raises(NotImplementedError) as declined:
         model_samples.Session(model, text, draft_tokens=5, **{**common, "sequences": 5}).plan_table()
     assert str(declined.value) == "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
+    # what the first launch of the fused step reserves outside the pool is reserved once in a process, so the sentence carries it
+    # once -- not once more for the second plan of such a session.  On a class that has such a reserve (compute capability
+    # 12.x) a run with such a session asks what a decode session and a verify session on one load ask, and a lone one what
+    # its forms and its one state need plus one reserve
+    from model_samples.providers import fe
+
+    monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
+    monkeypatch.setattr(fe, "_VERIFY_LAUNCHED", set())
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, 80 * GIB)))
+    reserve = model.first_launch_reserve["cc12.x"]
+    assert reserve == 3 * GIB
+
+    def asked(table):
+        return table.splitlines()[-1].split("needs about ")[1].split(" GiB on this GPU")[0]
+
+    lone = new(draft_tokens=5)
+    alone_table = lone.plan_table()
+    assert lone.plan.reserve_bytes() == lone.prefill_plan.reserve_bytes() == reserve, "each plan has a fused step that would make the first launch"
+    need = model.memory_bytes(1, 2051, **lone._kept(), tokens=6)
+    assert asked(alone_table) == f"{(need + reserve) / GIB:.1f}" != f"{(need + 2 * reserve) / GIB:.1f}", alone_table.splitlines()[-1]
+    decode, verify, plain = new(), new(tokens=6), new()
+    verify._share = decode
+    behind = model_samples.Session(model, text, share=plain, draft_tokens=5, **common)
+    with_prompt, two_sessions = plain.plan_table([behind]), decode.plan_table([verify])
+    assert asked(with_prompt) == asked(two_sessions), "one reserve and one more state in both runs"

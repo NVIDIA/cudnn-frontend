@@ -33,8 +33,9 @@ token (`Session(tokens=T)`, `Session.verify`; reached from the helper layer and 
 tokens). On compute capability 10.0, at one sequence of six tokens, five entries -- `cudnn.GdnVerifyFused` in place of
 the fused decode step, the other four the same, the 8-bit projection entry there for the out-projection of the
 linear-attention layers as well -- serve 369 of the 484 launches of a verify step, 48 the target's own compiled kernels +
-321 cuDNN Frontend entries with byte-equal results (with PyTorch's gather: 370 = 49 + 321). A session can now feed a prompt through decode steps and verify behind it
-(`Session(draft_tokens=k)`), the caller supplying the drafted tokens; no script drafts yet. The destination is a runnable
+321 cuDNN Frontend entries with byte-equal results (with PyTorch's gather: 370 = 49 + 321). A session can now feed a
+prompt through decode steps and verify behind it (`Session(draft_tokens=k)`), the caller supplying the drafted tokens;
+no script drafts yet. The destination is a runnable
 performance reference. Until a sample reaches it, its
 README says what the sample measures and what it does not, and no README here carries a performance table: numbers are
 published through the formal mode of the `benchmark/` folder.
@@ -133,7 +134,7 @@ and for a default run it imports nothing beyond cuDNN Frontend, PyTorch and the 
 | `loop.py` | `Session`: plan, load, prefill, step for a fixed set of sequences; at several tokens per sequence (`tokens=`) the verify step (`verify`); with `draft_tokens=` one session with two plans on one state -- its prompt through decode steps, verify steps behind it, the kept count told after the host read (`accept`); which forms of a weight the plans of a run read -- per call site, where two rows serve a block -- and in which layout a provider multiplies on it, asked of the family's loader before the first load; stop rules |
 | `sampling.py` | greedy token choice on the GPU; how many drafted tokens a verify step keeps by the greedy rule, from its host read (`accepted`: the smallest count of the set of sequences) |
 | `timing.py` | host timestamps, stage lines, the traced pass (GPU busy, idle, launches per step from kernel activity records; on request the launch records themselves), the report's text |
-| `tie_out.py` | bands, judged per output; the replay check, the per-block check of every provider block against the reference block or its twin, the token check, batch invariance; the reference's own copies of the weights a run keeps on their stored format alone, the check that their stored bytes are those of the load, and what the copies cost; the line of the kernel check; a session that verifies behind its prompt against decode steps of the same tokens (`speculative_checks`: tokens, kept state, position, prompt, bytes, rejected rows, acceptance) and the drafted tokens of a scheduled step (`forced_drafts`) |
+| `tie_out.py` | bands, judged per output; the replay check, the per-block check of every provider block against the reference block or its twin, the token check, batch invariance; the reference's own copies of the weights a run keeps on their stored format alone, the check that their stored bytes are those of the load, and what the copies cost; the line of the kernel check; a session that verifies behind its prompt against decode steps of the same tokens (`speculative_checks`: tokens, kept state, position, prompt, recorded, bytes, rejected rows, acceptance) and the drafted tokens of a scheduled step (`forced_drafts`) |
 | `<family>/` | what is specific to a model: geometry, layer order, block wiring, the provider table and the regime table as data; the census of its target kernel set (`kernel_census.json`); the loader of a checkpoint's drafter (`drafter.py`: its tensor list, the rows of the output head at a draft vocabulary's ids, its 8-bit weights) |
 
 What a user of a serving engine brings -- the request body of a chat client, the option names of a serving command line --
