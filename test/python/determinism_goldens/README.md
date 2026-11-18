@@ -4,6 +4,38 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM107 D256 decode register pressure (2026-11-17)
+
+The host compile check failed after
+[PR #2675](https://github.com/NVIDIA/cudnn-frontend/pull/2675), commit
+`f2810d269`. The added Int64 output slicing fixes wide-stride overflow but
+raises register pressure in the 64-column tile. With the same CuTe DSL 4.8.0
+compiler, the parent body has no spills; the changed body has 5 STL, 5 LDL,
+and 16 stack bytes. Four-column output groups restore zero spills while
+retaining the wide coordinates. Other tile widths keep their group size.
+
+An isolated Linux x86-64 container with cuDNN 9.25.1.1, CUDA 13.4.0,
+CuTe DSL 4.8.0, and CUDA `nvdisasm` compiled all six
+spill-probe forms in BF16 and FP16: **12 passed in 95.74 seconds**, zero skips,
+zero STL/LDL/stack bytes, 94–96 registers. This used source `c1a1caf2a` plus
+the fix. The isolated pytest harness retained the test's assertions and
+subprocess probe, loading the production kernel through `load_template`
+instead of the adapter import. No GPU kernels were launched. The SM100/SM107
+source-body comparison also passed with host-only imports.
+
+The L0 `test_decode_kernel_four_column_groups` now has eight cases: two head
+groups, split counts 1/2, and FP16/BF16. Each retains the independent reference
+and adds raw-byte O/Stats comparisons with fresh allocations, concurrent work,
+sequence removal/reordering/duplication, changed neighbors, and input-mutation
+checks. These runtime cases, the retained wide-physical-stride tests, and Rubin
+performance remain **unverified** because no SM107 GPU was available. Backward
+uses other kernels. No golden files were recorded or replaced.
+
+Compiler check command inside the isolated container:
+`python -m pytest /work/test_sm107_spill_probe.py -q -s`.
+Native qualification command from `test/python`:
+`pytest sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py -m L0 -k "four_column_groups or wide_tile_renderings"`.
+
 ### FP16 causal convolution decode update
 
 `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` exercises the
