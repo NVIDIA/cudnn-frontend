@@ -503,7 +503,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
-    "block_sparse_attention_prepare_backward": (".block_sparse_attention", "block_sparse_attention_prepare_backward"),
+    "block_sparse_attention_backward_metadata": (".block_sparse_attention", "block_sparse_attention_backward_metadata"),
     "kpage_prepare_layout": (".block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": (".block_sparse_attention", "KPageLayout"),
     "BsaBackwardMetadata": (".block_sparse_attention", "BsaBackwardMetadata"),

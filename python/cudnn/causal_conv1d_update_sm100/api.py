@@ -121,23 +121,23 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 
 
 class _CausalConv1dUpdatePlan(APIBase):
-    """Compile and execute BF16 K=4 causal-convolution decode.
+    """Compile and execute FP16 or BF16 K=4 causal-convolution decode.
 
     Every compute capability admitted by the decode architecture policy uses
     the same functional schedule.
 
     This inference-only API advances ``state`` in place and writes ``output``.
-    It deliberately supports one narrow contract:
+    All floating-point operands use the same dtype.
 
-    * ``x``: BF16 ``[N, D]`` with strides ``(ld, 1)``; compact rows admit any
+    * ``x``: ``[N, D]`` with strides ``(ld, 1)``; compact rows admit any
       ``D``, while padded rows require ``ld > D`` and ``ld % 8 == 0``
-    * ``output``: contiguous ``[N, D]`` BF16
-    * ``weight``: contiguous ``[D, 4]`` BF16
-    * ``state``: BF16 ``[S, D, L]`` with ``L`` in ``{3, 4}``, mutated in
+    * ``output``: contiguous ``[N, D]``
+    * ``weight``: contiguous ``[D, 4]``
+    * ``state``: ``[S, D, L]`` with ``L`` in ``{3, 4}``, mutated in
       place; compact storage is accepted for both lengths and the exact
       channel-last prefill handoff is accepted for ``L=3``
     * optional ``state_indices``: contiguous CUDA ``int32[N]``
-    * optional ``bias``: contiguous ``[D]`` BF16
+    * optional ``bias``: contiguous ``[D]``
     * ``activation``: compile-time ``"identity"`` or ``"silu"``
 
     Indexed slots must be ``-1`` or in ``[0, S)``.  ``-1`` marks a padding row
@@ -254,7 +254,7 @@ class _CausalConv1dUpdatePlan(APIBase):
         )
         self._value_error_if(
             x_row_stride > n_channels and x_row_stride % 8 != 0,
-            "Padded X rows must start at 16-byte-aligned BF16 addresses " f"(ld % 8 == 0), got D={n_channels}, ld={x_row_stride}",
+            "Padded X rows must start at 16-byte-aligned addresses " f"(ld % 8 == 0), got D={n_channels}, ld={x_row_stride}",
         )
         self._check_tensor_stride(
             self.weight_desc,
@@ -290,12 +290,13 @@ class _CausalConv1dUpdatePlan(APIBase):
                 extra_error_msg="State indices must be contiguous",
             )
 
-        self._check_dtype(self.x_desc, dtype=torch.bfloat16, name="X")
-        self._check_dtype(self.weight_desc, dtype=torch.bfloat16, name="Weight")
-        self._check_dtype(self.state_desc, dtype=torch.bfloat16, name="State")
-        self._check_dtype(self.output_desc, dtype=torch.bfloat16, name="Output")
+        self._check_dtype(self.x_desc, dtype=[torch.float16, torch.bfloat16], name="X")
+        dtype = self.x_desc.dtype
+        self._check_dtype(self.weight_desc, dtype=dtype, name="Weight")
+        self._check_dtype(self.state_desc, dtype=dtype, name="State")
+        self._check_dtype(self.output_desc, dtype=dtype, name="Output")
         if self.bias_desc is not None:
-            self._check_dtype(self.bias_desc, dtype=torch.bfloat16, name="Bias")
+            self._check_dtype(self.bias_desc, dtype=dtype, name="Bias")
         if self.state_indices_desc is not None:
             self._check_dtype(self.state_indices_desc, dtype=torch.int32, name="State indices")
 
@@ -498,6 +499,7 @@ def _cache_key(
     return (
         x_tensor.device.type,
         x_tensor.device.index,
+        x_tensor.dtype,
         tuple(x_tensor.shape),
         tuple(x_tensor.stride()),
         tuple(weight_tensor.shape),

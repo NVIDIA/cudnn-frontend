@@ -150,7 +150,7 @@ class BenchmarkResult:
         deterministic_bwd: Whether deterministic backward was used
         time_ms: Measured time of this pass in milliseconds
         tflops: Measured throughput of this pass in TFLOPS
-        max_diff: Maximum difference vs reference (if validated)
+        max_diff: Maximum absolute difference across checked tensors (NaN if validation was skipped or failed)
         num_iterations: Number of iterations run
         success: Whether the benchmark completed successfully
         error_message: Error message if benchmark failed

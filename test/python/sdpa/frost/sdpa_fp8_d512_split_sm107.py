@@ -62,7 +62,7 @@ def test_native_d512_split_nomask_optional(pack, dtype, stats, amax, monkeypatch
         sdpa_kwargs=dict(stats_use_log2=stats),
     )
     selected = g.plans[g._plan_index]
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=9, sched_policy=int(pack), cga=2))
+    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=9, sched_policy=int(pack), cga=4))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()

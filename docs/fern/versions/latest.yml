@@ -320,6 +320,9 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
+          - page: 'C++ launcher: repeated calls launched from C++'
+            path: ../../utilities/cpp_launcher.md
+            slug: cpp_launcher
   - section: Developer Guide
     slug: developer
     contents:

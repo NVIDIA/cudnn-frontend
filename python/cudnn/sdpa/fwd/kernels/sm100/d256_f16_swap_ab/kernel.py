@@ -826,21 +826,18 @@ def _softmax_warp_group(
     # writes the graph's actual d_v columns only (the tile is an envelope).
     oo = cutlass.make_array_view(o_tensor)
     D_V = cutlass.const_expr(o_tensor.shape[3])
-    # The epilogue runs in two 8-column halves: each half derives its columns' inverse sum / dead / live facts, then
-    # reads that half of O^T back (the x8 tcgen05.ld shape) and stores it.  The 16-wide per-column lists and the x16
-    # O^T readback together were what the 18-warp N_Q = 64 tile spilled at ptxas's 96-register cap; the halves keep
-    # the same arithmetic and the same stores (bitwise).  Each thread stores ONE LSE (the column its key lane names, lane == j), kept
-    # as a per-lane scalar with a liveness bit; the column's token / head are two integer ops on a warp-uniform row
-    # index, recomputed at each store site rather than carried in lists.
-    O_HALF = COLS // 2
+    # Four-column groups keep the 64-column tile within its 96-register cap
+    # with Int64 output indexing. Other tiles retain their existing group size.
+    # Each lane retains one LSE value; output arithmetic is unchanged.
+    O_CHUNK = 4 if N_Q == 64 else COLS // 2
     my_lse = ZERO
     my_lse_live = lane < cutlass.Int32(0)  # False
-    for h in cutlass.range_constexpr(2):
+    for h in cutlass.range_constexpr(COLS // O_CHUNK):
         inv_cols = []
         dead_cols = []
         live_cols = []
-        for jj in cutlass.range_constexpr(O_HALF):
-            j = h * O_HALF + jj
+        for jj in cutlass.range_constexpr(O_CHUNK):
+            j = h * O_CHUNK + jj
             jg = col0 + cutlass.Int32(j)  # the packed Q row this column is
             tok_j = tok0 + jg // G
             head_j = head_idx * G + (jg % G)
@@ -898,20 +895,22 @@ def _softmax_warp_group(
         for blk in cutlass.range_constexpr(O_BLOCKS):
             if cutlass.const_expr(blk * 128 < D_V):
                 d_idx = lane + cutlass.Int32(blk * 128)
-                o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(O_HALF)), cutlass.Float32)
+                o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(O_CHUNK)), cutlass.Float32)
                 if n_tiles > cutlass.Int32(0):
                     # Empty range: O^T TMEM was never written, so the load is skipped
                     # rather than multiplied by 0 (NaN * 0 is NaN).
                     o_vals = nvvm.tcgen05_ld(
-                        "32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk] + h * O_HALF) + col0, cutlass.Float32), num=O_HALF
+                        "32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk] + h * O_CHUNK) + col0, cutlass.Float32), num=O_CHUNK
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 if d_idx < cutlass.Int32(D_V):
-                    for jj in cutlass.range_constexpr(O_HALF):
-                        jg = col0 + cutlass.Int32(h * O_HALF + jj)
+                    for jj in cutlass.range_constexpr(O_CHUNK):
+                        jg = col0 + cutlass.Int32(h * O_CHUNK + jj)
                         val = _select_f32(dead_cols[jj], ZERO, cutlass.Float32(o_vals[jj]) * inv_cols[jj])
                         if live_cols[jj]:
-                            o_row = oo[o_batch, tok0 + jg // G, head_idx * G + (jg % G), :]
+                            # Array slicing uses each coordinate's width for its
+                            # stride product, even with an Int64 tensor layout.
+                            o_row = oo[cutlass.Int64(o_batch), cutlass.Int64(tok0 + jg // G), cutlass.Int64(head_idx * G + (jg % G)), :]
                             o_row[d_idx] = val.to(o_tensor.element_type)
 
     if cutlass.const_expr(lse_tensor is not None):

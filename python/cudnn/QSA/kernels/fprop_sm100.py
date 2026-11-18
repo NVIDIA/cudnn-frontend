@@ -478,9 +478,13 @@ def frost_qsa_fprop_sm100(
     mode,
     scale: F32,
     group_size: cutlass.Constexpr[int],
+    serial: cutlass.Constexpr[bool],
 ):
     if cutlass.const_expr(mode is None):
         _fprop_body(q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size)
+    elif cutlass.const_expr(not serial):
+        if mode[I64(cute.arch.block_idx()[0] // 128)] != 0:
+            _fprop_body(q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size)
     else:
         first_query = cute.arch.block_idx()[0] * 32
         if first_query < out.shape[0]:
@@ -516,7 +520,9 @@ frost_qsa_fprop_sm100.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale: F32, stream: cuda.CUstream, arch: cutlass.Constexpr[int]):
+def _fprop_host(
+    q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale: F32, stream: cuda.CUstream, arch: cutlass.Constexpr[int], serial=True
+):
     group_size = cutlass.const_expr(q.shape[1] // k.shape[1])
     q_desc = tmap.create_tensor_map_tiled(
         global_address=q.iterator.toint(),
@@ -567,18 +573,18 @@ def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, m
         from .fprop_sm107 import frost_qsa_fprop_sm107
 
         frost_qsa_fprop_sm107(
-            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale, group_size
+            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale, group_size, serial
         ).launch(
-            grid=(cute.ceil_div(q.shape[0], 8) if cutlass.const_expr(mode is not None) else q.shape[0], k.shape[1], 1),
+            grid=(cute.ceil_div(q.shape[0], 8) if cutlass.const_expr(mode is not None and serial) else q.shape[0], k.shape[1], 1),
             block=(THREADS, 1, 1),
             min_blocks_per_mp=1,
             stream=stream,
         )
     else:
         frost_qsa_fprop_sm100(
-            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale, group_size
+            q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, mode, scale, group_size, serial
         ).launch(
-            grid=(cute.ceil_div(q.shape[0], 32) if cutlass.const_expr(mode is not None) else q.shape[0], k.shape[1], 1),
+            grid=(cute.ceil_div(q.shape[0], 32) if cutlass.const_expr(mode is not None and serial) else q.shape[0], k.shape[1], 1),
             block=(THREADS, 1, 1),
             min_blocks_per_mp=1,
             stream=stream,

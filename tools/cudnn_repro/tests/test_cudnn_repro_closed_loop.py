@@ -85,6 +85,7 @@ def _target_tests():
                 *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test{i}]" for i in range(1, 11)),
                 *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_ragged_L0[test{i}]" for i in range(1, 11)),
                 *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test{i}]" for i in range(1, 6)),
+                *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mixed_seq_len_forms_L0[{side}]" for side in ("cu_q", "cu_kv_brcm")),
             ]
         )
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -94,7 +95,7 @@ def _target_test_id(target):
     return target.split("::", 1)[-1]
 
 
-def _assert_reproducer_json_matches_target(tmp_path, target):
+def _assert_reproducer_json_matches_target(tmp_path, target, *target_args):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required to generate SDPA logs")
@@ -112,6 +113,7 @@ def _assert_reproducer_json_matches_target(tmp_path, target):
         "-s",
         "-rA",
         target,
+        *target_args,
     ]
     env_first = env_base.copy()
     env_first["CUDNN_FRONTEND_LOG_FILE"] = str(log_a)
@@ -141,3 +143,27 @@ def _assert_reproducer_json_matches_target(tmp_path, target):
 @pytest.mark.parametrize("target", _target_tests(), ids=_target_test_id)
 def test_reproducer_json_matches(tmp_path, target):
     _assert_reproducer_json_matches_target(tmp_path, target)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_reproducer_json_matches_paged_fwd(tmp_path, dtype):
+    cfg = dict(
+        data_type=f"torch.{dtype}",
+        rng_data_seed=42,
+        is_infer=True,
+        is_paged=True,
+        is_padding=True,
+        batches=2,
+        h_q=4,
+        h_k=2,
+        h_v=2,
+        s_q=1,
+        s_kv=300,
+        d_qk=64,
+        d_v=64,
+        block_size=32,
+        seq_len_q=[1, 1],
+        seq_len_kv=[128, 267],
+        diag_align="cudnn.diagonal_alignment.BOTTOM_RIGHT",
+    )
+    _assert_reproducer_json_matches_target(tmp_path, "test/python/sdpa/graph/test_mhas_v2.py::test_repro", "--repro", repr(cfg))

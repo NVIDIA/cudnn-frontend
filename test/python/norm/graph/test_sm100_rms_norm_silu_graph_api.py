@@ -400,6 +400,17 @@ def test_fp8_full_sweep(C, num_tokens):
 
 
 # ============================================================
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9), reason="Requires SM89 (Ada)")
+@pytest.mark.parametrize("C,num_tokens", [(64, 32), (96, 1559), (96, 1560), (512, 6240)])
+@pytest.mark.parametrize("run", [_run_rmsnorm_silu_test, _run_fp8_rmsnorm_silu_test], ids=["bf16", "e4m3"])
+def test_ada_fallback_knobs(C, num_tokens, run):
+    """Check both sides of Ada's four-row fallback heuristic."""
+    result = run(C, num_tokens)
+    assert result["passed"], result
+
+
+# ============================================================
 # Test 4: NVFP4 output (representative problem sizes)
 # ============================================================
 

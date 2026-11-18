@@ -11,9 +11,9 @@ from cudnn._tupledict import TupleDict
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 from .cutedsl.backend import RowMetadata as SimplifiedSparseAttentionMetadata
-from .cutedsl.phase1 import dense_indexer_kl
+from .cutedsl.phase1 import dense_indexer_kl_forward
 
-__all__ = ["SimplifiedSparseAttentionMetadata", "dense_indexer_kl", "simplified_sparse_attention", "simplified_sparse_attention_reserve"]
+__all__ = ["SimplifiedSparseAttentionMetadata", "dense_indexer_kl_forward", "simplified_sparse_attention_forward", "simplified_sparse_attention_reserve"]
 
 
 def _check_runtime():
@@ -21,10 +21,10 @@ def _check_runtime():
     if error:
         raise ImportError(error)
     if torch.cuda.is_current_stream_capturing():
-        raise NotImplementedError("simplified_sparse_attention does not support external CUDA graph capture.")
+        raise NotImplementedError("simplified_sparse_attention_forward does not support external CUDA graph capture.")
 
 
-def simplified_sparse_attention(query, key, value, q_idx, k_idx, metadata, topk, *, loss_coeff=0.1, kv_ready_event=None):
+def simplified_sparse_attention_forward(query, key, value, q_idx, k_idx, metadata, topk, *, loss_coeff=0.1, kv_ready_event=None):
     """Return BF16 ``output`` and FP32 ``indexer_loss``, with PyTorch autograd.
 
     Q is [Tq, Hq, 256], K/V are [Tk, 1, 256], and indexer Q/K are

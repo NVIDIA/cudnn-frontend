@@ -136,7 +136,7 @@ def test_sm120_fused_host_refuses_other_bodies():
         lower(None, _sm120_facts(thd=True), None, lower_impl=_lower)
 
 
-@pytest.mark.parametrize("package,slot", [("sm120.fp8", 16), ("sm120.mxfp8", 17), ("sm100.d512_fp8", 14), ("sm100.d512_mxfp8", 15)])
+@pytest.mark.parametrize("package,slot", [("sm120.fp8", 16), ("sm120.mxfp8", 17), ("sm100.d512_fp8", 14), ("sm100.d512_mxfp8", 15), ("sm100.d128_mxfp8", 37)])
 def test_one_body_quantized_rows_name_their_body(package, slot):
     import importlib
     import pathlib
