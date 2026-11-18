@@ -119,7 +119,7 @@ class _QsaIndexedPlan(APIBase):
                 from cudnn.QSA import _backward as engine
 
                 self.impl = engine
-                self._compiled_kernel = engine.compile_kernels(self.engine_plan)
+                self._compiled_kernel = engine.compile_kernels(self.engine_plan, cutlass.BFloat16)
 
     def scratch_workspace_bytes(self):
         return self.workspace_bytes

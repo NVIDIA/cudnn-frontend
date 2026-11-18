@@ -21,7 +21,6 @@ from cutlass.experimental import primitives as prims
 from cudnn._device import device_info
 
 from .bprop_sm100 import (
-    BF16,
     D,
     DP_CM,
     DP_G,
@@ -111,6 +110,7 @@ def qsa_bwd_sparse_key_sm107_kernel(
     SK: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
+    DTYPE: cutlass.Constexpr,
 ):
     PB = _PbLayout(HKV, GH)
     n0 = g_active_count.iterator.raw_ptr().load()
@@ -255,8 +255,8 @@ def qsa_bwd_sparse_key_sm107_kernel(
     elif warp == 1:
         idesc = prims.Tcgen05InstrDesc.build(
             c_dtype=F32,
-            a_dtype=BF16,
-            b_dtype=BF16,
+            a_dtype=DTYPE,
+            b_dtype=DTYPE,
             n_dim=16,
             m_dim=128,
             a_major=1,
@@ -568,7 +568,7 @@ def _sparse_key_host(
         swizzle=cuda.TensorMapSwizzle.none,
     )
     qsa_bwd_sparse_key_sm107_kernel(
-        tma_q, tma_do, tma_rk, tma_rv, pair_records, key_slot_offsets, key_pair_counts, slot_queries, active_keys, active_count, KR, SK, HKV, GH
+        tma_q, tma_do, tma_rk, tma_rv, pair_records, key_slot_offsets, key_pair_counts, slot_queries, active_keys, active_count, KR, SK, HKV, GH, q.element_type
     ).launch(grid=(nctas, 1, 1), block=(PB_THREADS, 1, 1), stream=stream)
 
 
@@ -606,6 +606,10 @@ def qsa_bwd_dense_pair_sm107_kernel(
     DET: cutlass.Constexpr[int],
 ):
     HQ = GH * HKV
+    # A 16-bit value is nonfinite when its exponent field is all ones: BF16 is 1 sign + 8 exponent + 7 mantissa bits (0x7F80)
+    # and FP16 is 1 sign + 5 exponent + 10 mantissa bits (0x7C00).
+    DTYPE = g_k.element_type
+    EXP16 = I32(0x7F80 if cutlass.const_expr(DTYPE == cutlass.BFloat16) else 0x7C00)
     # the TMEM K^T only pays off with twelve-head tiles
     KT_TMEM = GH == GQ
     TM_NCOLS = DP_TM_COLS if KT_TMEM else 512
@@ -773,9 +777,9 @@ def qsa_bwd_dense_pair_sm107_kernel(
                         else:
                             _dense_rows_load(sbase + (DP_OFF_L + sl * DP_HS + s * DP_QSLAB) // 4, tma_qd, s, hk, g, b_lf.subview(sl), GH)
         elif warp == 1:
-            idesc_s = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=BF16, b_dtype=BF16, n_dim=DP_N, m_dim=128, a_major=0, b_major=0)
-            idesc_q = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=BF16, b_dtype=BF16, n_dim=DP_N, m_dim=128, a_major=0 if KT_TMEM else 1, b_major=1)
-            idesc_kv = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=BF16, b_dtype=BF16, n_dim=256, m_dim=128, a_major=0, b_major=1)
+            idesc_s = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=DTYPE, b_dtype=DTYPE, n_dim=DP_N, m_dim=128, a_major=0, b_major=0)
+            idesc_q = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=DTYPE, b_dtype=DTYPE, n_dim=DP_N, m_dim=128, a_major=0 if KT_TMEM else 1, b_major=1)
+            idesc_kv = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=DTYPE, b_dtype=DTYPE, n_dim=256, m_dim=128, a_major=0, b_major=1)
             SW128 = prims.Tcgen05SmemSwizzle.SWIZZLE_128B
             SWN = prims.Tcgen05SmemSwizzle.NONE
             d_kmn = _desc(sbase + DP_OFF_T // 4, DP_KSLAB, 1024, SW128)
@@ -804,7 +808,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
                                 prims.Tcgen05MMAKind.F16,
                                 prims.CTAGroup.CTA_1,
                                 t_sd,
-                                prims.make_tmem_ptr(tmem_raw + (DP_TM_A + ks * 8), BF16),
+                                prims.make_tmem_ptr(tmem_raw + (DP_TM_A + ks * 8), DTYPE),
                                 d_e.advance_start_address(qoff + (ks >> 2) * DP_QSLAB + (ks & 3) * 32),
                                 idesc_s,
                                 ks > 0,
@@ -827,7 +831,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
                                     prims.Tcgen05MMAKind.F16,
                                     prims.CTAGroup.CTA_1,
                                     t_kv,
-                                    prims.make_tmem_ptr(tmem_raw + DP_TM_PA[kk], BF16),
+                                    prims.make_tmem_ptr(tmem_raw + DP_TM_PA[kk], DTYPE),
                                     d_lmn.advance_start_address(qob + kk * 2048),
                                     idesc_kv,
                                     acc0 | (kk > 0),
@@ -846,14 +850,14 @@ def qsa_bwd_dense_pair_sm107_kernel(
                                     prims.Tcgen05MMAKind.F16,
                                     prims.CTAGroup.CTA_1,
                                     t_kv,
-                                    prims.make_tmem_ptr(tmem_raw + DP_TM_PA[kk], BF16),
+                                    prims.make_tmem_ptr(tmem_raw + DP_TM_PA[kk], DTYPE),
                                     d_lmn.advance_start_address(qob + kk * 2048),
                                     idesc_kv,
                                     acc0 | (kk > 0),
                                 )
                             for kk in cutlass.range_constexpr(8):
                                 if cutlass.const_expr(KT_TMEM):
-                                    a_q = prims.make_tmem_ptr(tmem_raw + (DP_TM_KT + kk * 8), BF16)
+                                    a_q = prims.make_tmem_ptr(tmem_raw + (DP_TM_KT + kk * 8), DTYPE)
                                 else:
                                     a_q = d_kmn.advance_start_address(kk * 2048)
                                 prims.tcgen05_mma(
@@ -885,7 +889,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
                         if prims.elect_sync():
                             for kk in cutlass.range_constexpr(8):
                                 if cutlass.const_expr(KT_TMEM):
-                                    a_q = prims.make_tmem_ptr(tmem_raw + (DP_TM_KT + kk * 8), BF16)
+                                    a_q = prims.make_tmem_ptr(tmem_raw + (DP_TM_KT + kk * 8), DTYPE)
                                 else:
                                     a_q = d_kmn.advance_start_address(kk * 2048)
                                 prims.tcgen05_mma(
@@ -993,7 +997,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
                             if valid:
                                 pj = e
                             ow.append(pj)
-                        pk = cutlass.Vector.from_elements(ow, F32).to(BF16).bitcast(I32)
+                        pk = cutlass.Vector.from_elements(ow, F32).to(DTYPE).bitcast(I32)
                         for u in cutlass.range_constexpr(GQ // 2):
                             opk.append(pk[u])
                     ovec = cutlass.Vector.from_elements(opk, I32)
@@ -1072,7 +1076,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
                         for hp in cutlass.range_constexpr(GQ // 2):
                             n0 = jj * GQ + 2 * hp
                             pw = pin[n0 // 8][(n0 % 8) // 2]
-                            pv = cutlass.Vector.from_elements([pw], I32).bitcast(BF16).to(F32)
+                            pv = cutlass.Vector.from_elements([pw], I32).bitcast(DTYPE).to(F32)
                             d0 = F32(0.0)
                             d1 = F32(0.0)
                             if pv[0] != 0.0:
@@ -1081,7 +1085,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
                                 d1 = pv[1] * dw[2 * hp + 1] * scale
                             dpk.append(d0)
                             dpk.append(d1)
-                    dvec = cutlass.Vector.from_elements(dpk, F32).to(BF16).bitcast(I32)
+                    dvec = cutlass.Vector.from_elements(dpk, F32).to(DTYPE).bitcast(I32)
                     if k >= 1:
                         kp = k - 1
                         _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
@@ -1138,10 +1142,10 @@ def qsa_bwd_dense_pair_sm107_kernel(
                 nbad = I32(0)
                 for e in cutlass.range_constexpr(4):
                     w = w4[e]
-                    if (w & I32(0x7F80)) == I32(0x7F80):
+                    if (w & EXP16) == EXP16:
                         w = w & I32(-65536)
                         nbad = nbad + 1
-                    if (w & I32(0x7F800000)) == I32(0x7F800000):
+                    if (w & (EXP16 << 16)) == (EXP16 << 16):
                         w = w & I32(0xFFFF)
                         nbad = nbad + 1
                     ws.append(w)

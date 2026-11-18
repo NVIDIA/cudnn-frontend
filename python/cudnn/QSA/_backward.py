@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 
+import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda_driver
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
@@ -25,7 +26,6 @@ from cudnn.frost.compiled_cache import compile_cached, template_key
 
 from .kernels import bprop_sm100
 from .kernels.bprop_sm100 import (
-    BF16,
     D,
     DENSE_QUERIES_MAX,
     DP_G,
@@ -294,7 +294,7 @@ def _fake(dtype, shape, sym, align=16):
 
 
 @lru_cache(maxsize=None)
-def _compile_args(hkv: int, gq: int, rubin: bool, det: int) -> dict:
+def _compile_args(dtype, hkv: int, gq: int, rubin: bool, det: int) -> dict:
     """Storage-free kernel signatures, reused across plans. The shared cache owns the CUDA objects."""
     HQ = gq * hkv
     key_host, dense_host = _sparse_key_host, _dpair_host
@@ -303,8 +303,8 @@ def _compile_args(hkv: int, gq: int, rubin: bool, det: int) -> dict:
 
         key_host, dense_host = bprop_sm107._sparse_key_host, bprop_sm107._dpair_host
     sym_t = cute.sym_int64()
-    f_q = _fake(BF16, (None, HQ, D), sym_t)
-    f_kv = _fake(BF16, (None, hkv, D), sym_t)
+    f_q = _fake(dtype, (None, HQ, D), sym_t)
+    f_kv = _fake(dtype, (None, hkv, D), sym_t)
     f_out = _fake(F32, (None, HQ, D), sym_t)
     f_lse = _fake(F32, (HQ, None), sym_t, align=4)
     f_delta = _fake(F32, (None, HQ), sym_t)
@@ -450,7 +450,7 @@ def _compile_args(hkv: int, gq: int, rubin: bool, det: int) -> dict:
     return {name: build() for name, build in builders.items()}
 
 
-def compile_kernels(plan: LaunchPlan) -> dict:
+def compile_kernels(plan: LaunchPlan, dtype) -> dict:
     """Compile the launch sequence of the plan's path through the device-aware compiled cache.
 
     Every extent is symbolic, so one set of artifacts serves all sequence lengths of a path on one architecture.
@@ -461,6 +461,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     else:
         names += ["dense", "fin_sparse" if plan.sum_sparse else "fin"]
     config = {
+        "dtype": dtype,
         "hkv": plan.hkv,
         "gq": plan.gq,
         "arch": plan.arch,
@@ -470,7 +471,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     key = template_key(globals(), config, "compile_kernels")
     # only the dense pair kernel has an ordered form
     dense_key = template_key(globals(), {**config, "deterministic": True}, "compile_kernels") if plan.deterministic else key
-    args = _compile_args(plan.hkv, plan.gq, plan.rubin, int(plan.deterministic))
+    args = _compile_args(dtype, plan.hkv, plan.gq, plan.rubin, int(plan.deterministic))
     options = f"--enable-tvm-ffi --gpu-arch=sm_{plan.arch}a"
     return {
         name: compile_cached(*args[name], cache_key=dense_key if name.startswith("dense") else key, symbol=f"qsa_backward_{name}", options=options)
@@ -681,7 +682,7 @@ def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, blo
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
     # the sequences come from tok_base on the device. There are at most as many as blocks.
     plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, deterministic=deterministic)
-    fns = compile_kernels(plan)
+    fns = compile_kernels(plan, {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[q.dtype])
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
     scratch = plan.carve(WorkspaceCarver(workspace, plan.workspace_bytes(), "qsa_backward"))
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)

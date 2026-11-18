@@ -136,9 +136,9 @@ all sequences. All tensors must be contiguous and on the same CUDA device.
 | `out` | `[T, Hq, 256]` | Same as `q` | Attention output |
 | `out_fp32` | `[T, Hq, 256]` | FP32 | Output before its cast to the input type; save for backward |
 | `lse` | `[Hq, T]` | FP32 | Natural-log softmax normalizer; save for backward |
-| `grad_out` | `[T, Hq, 256]` | BF16 | Upstream output gradient |
-| `dq` | Same as `q` | BF16 | Query gradient |
-| `dk`, `dv` | Same as `k`, `v` | BF16 | Key/value gradients, summed over query heads |
+| `grad_out` | `[T, Hq, 256]` | Same as `q` | Upstream output gradient |
+| `dq` | Same as `q` | Same as `q` | Query gradient |
+| `dk`, `dv` | Same as `k`, `v` | Same as `q` | Key/value gradients, summed over query heads |
 
 Q/K/V, `grad_out`, and `out_fp32` must be 16-byte aligned. FP32 LSE and int32
 metadata must be 4-byte aligned. The implementation rejects unsupported layouts
@@ -168,15 +168,15 @@ then cast output to the input type. Empty rows produce zero output and negative-
 
 Backward compacts the current selection, computes
 `delta = sum(grad_out * out_fp32, dim=-1)`, reconstructs probabilities from QK
-and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
+and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use the input type.
 K/V gradient contributions from all query heads are summed. Without
 `deterministic=True`, floating-point reductions of the dense prefix can change
 low bits between runs. The dense prefix of each sequence
 runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
-on chip; the remaining queries write bf16 P / dS records that a key-major pass
+on chip; the remaining queries write P / dS records in the input type that a key-major pass
 sums per block, so no per-pair floating-point atomics are issued. dS reaches
-the dQ MMAs rounded to BF16. The dense prefix forms it from a P that one CTA
-sends the other in BF16, the remaining queries from an FP32 P. A nonfinite
+the dQ MMAs rounded to the input type. The dense prefix forms it from a P that one CTA
+sends the other in the input type, the remaining queries from an FP32 P. A nonfinite
 K / V value of a masked token adds exact zeros. One of a selected token poisons
 the queries that select it and that block's dK / dV, nothing else. A nonfinite
 Q or dO value is not contained: it can also reach the dQ of neighboring sparse
@@ -206,7 +206,7 @@ full score or probability matrices.
 | Forward | Dense or gathered QK, online softmax, PV | `out`, `out_fp32`, `lse` |
 | Backward | Preparation | FP32 `delta`; cleared gradient accumulators |
 | Backward | Gather, probability reconstruction, gradient products | FP32 dQ/dK/dV accumulators |
-| Backward | Final cast | BF16 `dq`, `dk`, `dv` |
+| Backward | Final cast | `dq`, `dk`, `dv` in the input type |
 
 The selection bitmap must include any desired causal tail. The implementation
 does not add a tail automatically. The forward does not truncate the selection
@@ -226,7 +226,7 @@ and a plan without a sparse path carries two more FP32 dK / dV accumulators.
 
 ## Support and execution
 
-Supported geometry is BF16 or FP16 (the backward BF16 only), head dimension 256, head counts 24Q/2KV, 12Q/1KV or
+Supported geometry is BF16 or FP16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
 6Q/1KV (the full model and its two- and four-way tensor-parallel shards, the KV
 head replicated at four-way), and `block_size=4`. `T > 0`, `NB > 0`, and `T * Hq * 256 <= INT32_MAX` are required.
 `scale` is a finite host scalar, normally `1 / sqrt(256)`.
