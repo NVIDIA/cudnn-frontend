@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CuTeDSL imports shared by kernels supporting both 4.6.2 and newer wheels.
+"""CuTeDSL names from their current modules, with fallbacks for older wheels.
 
-Prefer the owning modules introduced in 4.8. The old utility exports warn on
-every access in newer wheels, but remain necessary on the supported 4.6.2 floor.
-This module is imported by kernel modules only, never by the package entry point.
+Imported by kernel modules only to keep the package entry point lazy.
 """
+
+try:
+    from cutlass import AddressSpace
+except ImportError:
+    from cutlass.cute import AddressSpace
 
 try:
     from cutlass.tensor_utils import LayoutEnum
