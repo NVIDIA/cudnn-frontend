@@ -809,7 +809,8 @@ The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDraft
 `torch_ref.silu_mul`, `torch_ref.quantize`, `torch.argmax+lookup`). No session runs it yet. What building it showed:
 
 - A quantiser per row of a step is a third rule beside the loader's two, and it is pinned to its operation like them.
-  The static scale of the model's activations multiplies by a reciprocal that is one number per layer; the loader's
+  The static scale of the model's activations multiplies by a reciprocal that is one number per operand, a constant
+  of the checkpoint; the loader's
   weights divide by a scale per row; the rows of a drafter's step multiply by the reciprocal of a scale formed from
   the row itself. The stated row that tells the division from the reciprocal for the weights tells them apart here
   too, in the other direction: two elements whose quotient is the midpoint of two codes take the code above. Name the
@@ -823,13 +824,20 @@ The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDraft
   same quantiser failed on 954 scales. Run a check against the defect it is for before believing it.
 - A block that is the reference chain is judged by nothing, so its structure is held where it is made. The block check
   compares a provider with the reference; a row whose provider IS the reference has no line, in any stack, and the
-  proposals of seeded weights mean nothing that a comparison of tokens could hold. Three things hold such a pass,
+  proposals of seeded weights mean nothing that a comparison of tokens could hold. Four things hold such a pass,
   and each sees what the others do not: every function against a version written from its definition in the
-  test (an error inside a block); a pass over several rows against that many passes of one row, byte for byte (rows
-  that read each other, a scale shared across a step, a cache position written twice or not at all); and a recording
-  stand-in for the blocks, which is handed what each pass of a step reads -- the row the step kept, the pass's own
-  last output and proposal, its position (an error between the blocks, which passes every numeric test with seeded
-  weights because every row is as good as the next).
+  test (an error inside a function); every block of the plan, as the plan builds it, against the function it stands
+  for, and one pass through the plan's blocks against the pass written out from the functions (an error inside a
+  block's class: operands exchanged, another function called, an epsilon of its own); a pass over several rows
+  against that many passes of one row, byte for byte (rows that read each other, a scale shared across a step, a
+  cache position written twice or not at all); and a recording stand-in for the blocks, which is handed what each
+  pass of a step reads -- the row the step kept, the pass's own last output and proposal, its position (an error
+  between the blocks, which passes every numeric test with seeded weights because every row is as good as the next).
+- A defect is put into every layer a call goes through. The first one-line defects of this pass were made in the
+  functions, the table and the pass, and the tests held them; eight made inside the classes of the new blocks
+  passed every test. The function tests call the functions, the stand-in replaces the blocks, and a pass compared
+  with passes of itself moves with the defect. What a block declares about its operands for a sequence run alone
+  was read by no test either: a block that no check taps yet is run through the tap in a test.
 - A value that a function hands on only in quantised form can still be read. The gate with one rounding and the
   model's gate with two differ by one bf16 unit and give the same 8-bit code on almost every element; a row of ONE
   element has that element as its largest, so its scale states its bf16 value exactly.

@@ -67,9 +67,9 @@ pass, *operands)`` runs one block, as a family's step takes it; the pass, counte
 over the layer.
 
 Every block of a pass is a reference chain in every stack, so nothing judges it against another implementation of
-itself: each function is held to its definition by a host test, and a pass over several rows to passes of one row.
-The reference blocks multiply on bf16 copies of the five weights and of the listed head rows, which a load keeps beside
-the codes (``load(copies=True)``).
+itself: each function is held to its definition by a host test, each block to its function, and a pass over several
+rows to passes of one row.  The reference blocks multiply on bf16 copies of the five weights and of the listed head
+rows, which a load keeps beside the codes (``load(copies=True)``).
 """
 
 from __future__ import annotations
@@ -233,8 +233,10 @@ class DrafterWeights:
 
 @dataclass
 class QwenDenseDrafter:
-    """The drafter of one model: its tensor list, its draft vocabulary and its load.  ``describe`` makes it from a described
-    checkpoint, ``seeded`` for the reduced seeded model."""
+    """The drafter of one model: its tensor list, its draft vocabulary and its load; its draft pass on reference blocks
+    (``state``, ``body``, ``propose``, ``draft``) and what a plan asks of a model (``provider_table``, ``regimes``,
+    ``wiring()``, ``sites()``).  ``describe`` makes it from a described checkpoint, ``seeded`` for the reduced seeded
+    model."""
 
     geometry: Geometry  # the model's widths; its one layer is an attention layer
     vocabulary: DraftVocab
@@ -351,6 +353,9 @@ class QwenDenseDrafter:
         *operands)`` runs one block; ``index`` is the pass this is, counted from 0, which ``call`` is handed in the
         place a step hands over the layer.  Nothing is read from the device.
 
+        The attention of a row reads every position of its sequence from 0 to its own.  A position in front that no
+        pass wrote holds the zeros the cache starts with and is read as that: nothing refuses it.
+
         The attention blocks are handed the cache as a view of their own (``KvCache(k, v, rows / sequences)``): how many
         positions a pass inserts is the pass's, not a property of the cache.  ``ValueError`` for rows that are not a
         whole number per sequence, for ids that are not one per row, and for a pass that would write past the cache."""
@@ -405,13 +410,20 @@ class QwenDenseDrafter:
         + kept + j``, then ``propose``.  The rows of pass 0 behind ``kept`` write cache positions that the later passes
         and the first pass of the next step write again before a row reads them.
 
-        ``ValueError`` for a ``kept`` that is not a row of a sequence, and for no pass."""
-        sequences = cache.k.shape[0]
-        tokens = hidden.shape[0] // sequences
+        ``ValueError`` for a ``kept`` that is not a row of a sequence, for no pass, and for a step whose later passes
+        would write past the cache: that one before the first pass runs, so a refused step wrote nothing.  What
+        ``body`` refuses of the first pass is refused here as it is there."""
+        sequences, capacity = cache.k.shape[0], cache.k.shape[2]
+        tokens = hidden.shape[0] // sequences  # fewer rows than sequences: none to keep, and the first pass says what it takes
         if isinstance(kept, bool) or not isinstance(kept, int) or not 0 <= kept < max(tokens, 1):
             raise ValueError(f"a draft step continues from one of the {tokens} rows per sequence it is handed, 0 to {tokens - 1}; got kept={kept!r}")
         if isinstance(passes, bool) or not isinstance(passes, int) or passes < 1:
             raise ValueError(f"a draft step has at least one pass; got passes={passes!r}")
+        if passes > 1 and position + kept + passes > capacity:
+            raise ValueError(
+                f"the drafter's cache was built for {capacity} positions per sequence; the passes of this step write up to position "
+                f"{position + kept + passes - 1}"
+            )
         row = self.body(call, weights, cache, hidden, ids, position).unflatten(0, (sequences, tokens))[:, kept]
         drafts = [self.propose(call, weights, row)]
         for index in range(1, passes):

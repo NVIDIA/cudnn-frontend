@@ -85,10 +85,11 @@ def linear(qx, weight: Dequantized, acc, columns_per_chunk: int = 8192) -> torch
     out = torch.empty((xa.shape[0], copy.shape[0]), dtype=acc, device=xa.device)
     for a in range(0, copy.shape[0], columns_per_chunk):
         out[:, a : a + columns_per_chunk] = xa @ copy[a : a + columns_per_chunk].to(acc).T
-    if isinstance(x.scale, torch.Tensor):  # one scale per row of the operand, beside the weight's own
+    if isinstance(x.scale, torch.Tensor) and x.scale.dim() == 1 and x.scale.shape[0] == xa.shape[0]:
+        # one scale per row of the operand, beside the weight's own: the two are multiplied in ``acc``, like the sums they scale
         per_weight = weight.scale.to(acc) if isinstance(weight.scale, torch.Tensor) else float(weight.scale)
         scale = x.scale.to(acc).unsqueeze(1) * per_weight
-    else:
+    else:  # one scale for every row of the operand: a float, or a tensor of one element
         scale = weight.scale.to(acc) * x.scale if isinstance(weight.scale, torch.Tensor) else float(weight.scale) * float(x.scale)
     return (out * scale).to(BF16)
 

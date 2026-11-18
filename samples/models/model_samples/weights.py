@@ -489,7 +489,8 @@ def quantize_fp8_per_row(x: torch.Tensor) -> ScaledTensor:
 
     Three fp32 operations, none formed in a wider type and rounded.  This is NOT the rule of a weight quantised per
     channel (:func:`quantize_fp8_per_channel`), which divides every element by the scale: where a quotient is the
-    midpoint of two codes the two rules give two codes.  A row is quantised by itself: the rows of a step, quantised
+    midpoint of two codes the two rules can give two codes (the product then lands just above the midpoint and takes
+    the code above, where the division takes the even one).  A row is quantised by itself: the rows of a step, quantised
     together or one by one, give the same bytes.  Nothing is read from the device.  Returns a :class:`ScaledTensor`
     whose ``scale`` is the fp32 tensor ``[rows]``.  ``ValueError`` for a tensor that is not ``[rows, width]``."""
     if x.dim() != 2:

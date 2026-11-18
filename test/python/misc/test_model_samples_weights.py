@@ -195,8 +195,20 @@ def test_a_multiply_with_a_scale_per_row_of_both_operands():
     assert not torch.equal(product, by_hand(lambda i: 1.0, lambda j: ws[j])) and not torch.equal(product, by_hand(lambda i: xs[i], lambda j: 1.0))
     assert not torch.equal(product, by_hand(lambda i: xs[0], lambda j: ws[j])), "one scale for the step is not the scale of its rows"
     # a weight with ONE scale under an operand with a scale per row
-    one = weights.Dequantized(copy.data, 0.125)
-    assert torch.equal(torch_ref.linear(operand, one, torch.float64), by_hand(lambda i: xs[i], lambda j: 0.125))
+    one = weights.Dequantized(copy.data, 0.3)
+    assert torch.equal(torch_ref.linear(operand, one, torch.float64), by_hand(lambda i: xs[i], lambda j: 0.3))
+    # ... and the two scales are multiplied in the accumulation dtype, not in the fp32 of the operand's scale: a stated
+    # element.  One code of value 1 on either side, the row's scale 3 and a weight's one scale just above a third of
+    # 1.00390625, the midpoint of the bf16 values 1 and 1.0078125.  The product in doubles is above the midpoint; the fp32
+    # product IS the midpoint, which rounds to the even value below -- what a run with fp32 accumulation gives
+    third = float.fromhex("0x1.56aaace666666p-2")
+    code = torch.tensor([[0x38]], dtype=torch.uint8)
+    stated = weights.ScaledTensor(code, torch.tensor([3.0]))
+    ones = weights.Dequantized(torch.ones((1, 1), dtype=bf16), third)
+    in_doubles, in_fp32 = 3.0 * third, float(torch.tensor(3.0) * third)
+    assert _e4m3(code).tolist() == [[1.0]] and in_doubles > 1.00390625 and in_fp32 == 1.00390625
+    wide, narrow = torch_ref.linear(stated, ones, torch.float64), torch_ref.linear(stated, ones, torch.float32)
+    assert wide.tolist() == [[1.0078125]] and narrow.tolist() == [[1.0]]
     # the fp32 accumulation of a run that asks for it: the same sums (exact at this width) and scales, one bf16 unit at most apart
     single = torch_ref.linear(operand, copy, torch.float32)
     unit = torch.pow(2.0, torch.floor(torch.log2(product.float().abs())) - 7)
@@ -243,6 +255,13 @@ def test_the_models_multiply_and_quantisers_are_byte_for_byte_what_they_were():
     four, direct = torch_ref.quantize(rows, static4), weights.quantize_nvfp4(rows, static4.scale)
     assert torch.equal(four.codes, direct.codes) and torch.equal(four.block_scales, direct.block_scales) and four.scale == direct.scale
     assert torch_ref.quantize(rows, None) is None
+    # an operand whose ONE scale is a tensor of no dimension is the model's kind too: the multiply it was, not a scale per row
+    eight = weights.quantize_fp8(rows, 8.0 / 448.0)
+    held = weights.ScaledTensor(eight.codes, torch.tensor(8.0 / 448.0))
+    summed = weights.dequantize(eight).data.double() @ data.double().T
+    under_one, under_rows = (torch_ref.linear(held, weights.Dequantized(data, scale), torch.float64) for scale in (0.25, per_row))
+    was_one, was_rows = (summed * (0.25 * float(held.scale))).to(bf16), (summed * (per_row.double() * held.scale)).to(bf16)
+    assert torch.equal(under_one, was_one) and torch.equal(under_rows, was_rows)
     with pytest.raises(ValueError, match="^unknown quantisation format 'fp16'$"):
         torch_ref.quantize(rows, Quant("fp16", 1.0))
     normed = torch_ref.add_norm_quantize(rows, rows.flip(0), data[0], static8, 1.0e-6, torch.float64)

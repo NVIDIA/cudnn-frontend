@@ -671,7 +671,7 @@ rule is per row:
   fp32. It is never below 1 / (448 x 512), so a row of zeros has a scale too;
 - a code is the element divided by that scale, rounded to the nearest value of the format, to the even code on a tie,
   and saturating at +-448. The division is a division in fp32, not a multiplication by the reciprocal of the scale:
-  where a quotient sits exactly between two codes the two give different codes.
+  where a quotient sits exactly between two codes the two can give different codes.
 
 A row is quantised by itself, so the weights that feed one multiply are concatenated first: query (with its gate half),
 key and value; gate and up. A multiply over these codes applies the scale of each row to its result. The rule is fixed
@@ -732,10 +732,11 @@ Every 8-bit operand of a pass is quantised per row of the step, at a scale forme
 (`weights.quantize_fp8_per_row`): the scale is the row's largest magnitude, taken over its bf16 values, divided by 448
 and never below 1 / (448 x 512); a code is the element *multiplied by the reciprocal* of that scale; the division, the
 reciprocal and the product are fp32 operations. This is a third rule beside the static scale of the model's
-activations and the division of the weights above: where a quotient sits exactly between two codes it gives the code
-above and the division the even one, and a host test holds a row with two such elements. A multiply then applies, to
-each element of its result, the scale of the operand's row and the scale of the weight's row. The first norm block
-quantises its two halves as one row, so both share one scale.
+activations and the division of the weights above. Where a quotient sits exactly between two codes the two rules can
+give two codes: the product then lands just above the midpoint and takes the code above, where the division takes
+the even one. A host test holds a row with two such elements. A multiply then applies, to each element of its
+result, the scale of the operand's row and the scale of the weight's row, the two multiplied in the accumulation
+type. The first norm block quantises its two halves as one row, so both share one scale.
 
 `draft` is the passes of one step of speculative decoding. The first pass runs over the rows it is handed: per
 sequence the final-norm rows of the model's last step and, for each, the token that follows it -- one row per token of
@@ -743,6 +744,38 @@ a verify step, or one row behind a prompt. Of its output the row of the last kep
 host integer. Every later pass runs at one row per sequence, on the pass's own output row and its own last proposal,
 one position further. A pass writes the keys and values of its rows into the drafter's cache at their positions and
 is told where they stand; it writes nothing of the model.
+
+A draft step from Python, behind the call of the loader above (its `model`, `drafter` and `weights`):
+
+```python
+import torch
+from model_samples.blocks import DeviceFacts, plan
+
+# the blocks of the drafter's table.  Stated facts of a GPU class serve on the CPU; on a GPU, hand over the device
+table, source = drafter.provider_table, drafter.table_source
+blocks = plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, "reference", model=drafter, source=source)
+
+
+def call(block, index, *operands):  # one block of pass `index`
+    return blocks[block](*operands)
+
+
+cache = drafter.state(1, 64, "cpu")  # the drafter's own cache: one sequence, up to 64 positions
+hidden = torch.zeros((1, model.geometry.hidden), dtype=torch.bfloat16)  # [rows, hidden]: final-norm rows of the model
+ids = torch.tensor([198], dtype=torch.int32)  # [rows]: the token that follows each of those rows
+drafts = drafter.draft(call, weights, cache, hidden, ids, 0, 0, 5)  # position 0, row 0 kept, five passes
+print(drafts.tolist())  # [sequences, passes]: the proposed token ids
+```
+
+These lines share the load of the call above -- the drafter's weights with their copies, and the model's embedding
+table -- and the cache they make; they read nothing of the checkpoint. `plan` resolves the drafter's table as it
+resolves a model's, for a GPU class, a number of sequences, the tokens per sequence and a stack; every row of this
+table serves all of them, so one plan runs a pass over any number of rows. `call(block, pass, *operands)` runs one
+block, as a family's step calls its blocks, with the pass, counted from 0, where a step has the layer. `hidden` and
+`ids` are the rows of the step, sequence by sequence: per row the model's final-norm row -- the row its output head
+reads -- and the token that follows it. `position` is where the first row of every sequence stands, `kept` the row
+of a sequence the step goes on from (0 behind one row), and `passes` the number of tokens to propose. The hidden
+rows are the caller's to supply: no method of a session hands them out yet.
 
 | block | calls per pass | provider key | entry [form] |
 |---|---|---|---|
@@ -776,25 +809,35 @@ the kernels that are to serve these blocks (`configs.DRAFT_PROJECTION_SITES`, `c
 | (residual add +) RMSNorm + quantise per row | `mlp` | the branch is added to the residual stream first |
 
 `drafter.state(sequences, capacity, device)` is the cache: keys and values per position, zero at the start of a
-prompt set, with no position of its own. With the copies and that cache, `drafter.memory_bytes(sequences, capacity)`
+prompt set, with no position of its own. The attention of a row reads every position of its sequence from 0 to its
+own, so a position in front that no pass wrote is read as those zeros and nothing refuses it: filling the cache over
+a prompt, one body pass per position, is the caller's. A step whose passes would write past the cache is refused
+before its first pass. With the copies and that cache, `drafter.memory_bytes(sequences, capacity)`
 is what a loaded drafter holds on the device besides the model's embedding table: 2.00 GiB at the published widths
 with 65,536 ids, one sequence and 2,051 positions. A pass on a load without its copies is an error that names
 `copies=True`.
 
 **What holds the pass.** Every block of it is its own reference chain, so the tie-out of a run judges none of them.
-The drafter's blocks are held to their definitions, to each other at one row and at several, and to the model's own
-tokens on a checkpoint; they are not compared with another implementation of the drafter in this repository.
+The drafter's blocks are held to their definitions and to each other at one row and at several, and their proposals
+are reported against the model's own tokens on a checkpoint; they are not compared with another implementation of
+the drafter in this repository (one second evaluation of its network was made by hand, outside this repository:
+it is among the runs below).
 
 - *To their definitions* (host tests, `test/python/misc/test_model_samples_drafter.py` and
   `test_model_samples_weights.py`): the row quantiser and the joint quantiser of the two normed halves against a
   quantiser written in the test from the 8-bit format, scales and codes; the gate with its one rounding and SiLU x up
   with its two against their formulas, element by element; the multiply with a scale per row of both operands
-  against a loop over the code values; the token choice on stated logits with equal columns.
+  against a loop over the code values; the token choice on stated logits with equal columns. Those are the
+  functions. The blocks that call them are held one layer up: every block of the drafter's plan, as the plan builds
+  it, against the function it stands for on stated operands, and one body pass through the plan's blocks against
+  the same pass written out from the functions, rows and cache, then the head block by block.
 - *To each other*: a pass over 2 and over 6 rows of a sequence gives the rows and the cache of that many passes of
-  one row, byte for byte, at one sequence and at two; and a recording stand-in for the blocks shows what every pass of
+  one row, byte for byte, at one sequence and at two; a recording stand-in for the blocks shows what every pass of
   a step is handed, for every kept count 0 to 5: the row of the last kept token, then the pass's own output row, its
-  own last proposal and the next position.
-- *To the model's tokens*: the checkpoint run below, with the same pass run on wrong inputs beside it.
+  own last proposal and the next position; and every block of a pass over two sequences gives, for each sequence,
+  the bytes that sequence gives alone, its operands cut to the rows the block says it has per row of the step.
+- *Against the model's tokens* (reported, no gate): the checkpoint run below, with the same pass run on wrong inputs
+  beside it.
 
 **The runs behind this section** (2026-11-17; PyTorch 2.13.0, safetensors 0.8.0; the published checkpoint, manifest
 hash `95049016a247`). On the CPU, without a GPU:
@@ -824,16 +867,17 @@ with other users: correctness only, by hand, with drivers that are not part of t
 and the cache of six passes of one row, byte for byte, at one sequence and at two. `draft` with every kept count 0 to
 5 behind six rows, and behind one row, gave the five proposals and the cache of the same passes made one row at a
 time. The row quantiser gave, for a stated tensor, the codes and the scales the CPU gives. Every kernel of those
-calls is PyTorch's or cuBLAS's, by name: one gather per pass, the embedding lookup, and none for the id of the chosen
-row or for a concatenation. A second run printed the same bytes.
+calls is PyTorch's or cuBLAS's, by name: the embedding lookup is PyTorch's gather, and the id of the chosen row and
+the concatenations launch other PyTorch kernels than the gather. A second run printed the same bytes.
 
 *The published checkpoint, against the model's own tokens* (reported; no line of it is a gate of this sample). The
 model decoded three prompts greedily on the stack `native`, 70 new tokens each: the default prompt and two arithmetic
-word problems, 58, 117 and 78 prompt tokens. The drafter then ran over each of them teacher-forced: one body pass per
-prompt position fills its cache, and from the last prompt position on every position is one draft step of five passes
-behind one row, handed the model's final-norm row of that position and the token the model chose there. The list is
-the one the recipe above made in the runs of 2026-11-17: the 342 ids of six dump files, then the lowest ids; the
-default prompt is one of the three prompts behind those dumps, the other two are not.
+word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens. The drafter then ran over each
+of them teacher-forced: one body pass per prompt position fills its cache, and from the last prompt position on every
+position is one draft step of five passes behind one row, handed the model's final-norm row of that position and the
+token the model chose there. The list is the one the recipe above made in the runs of 2026-11-17: the 342 ids of six
+dump files, then the lowest ids; the default prompt is one of the three prompts behind those dumps, the other two are
+not.
 
 - The first proposal equals the model's next token at 167 of 207 positions (46, 56 and 65 of 69 by prompt), the
   second at 128 of 204, the third at 94 of 201, the fourth at 70 of 198, the fifth at 54 of 195. At 4 of the 207
@@ -853,8 +897,9 @@ default prompt is one of the three prompts behind those dumps, the other two are
 **What is not here.** The drafter has a draft pass on reference blocks, reached from the library
 (`QwenDenseDrafter.body`, `propose`, `draft`): every block of it is a reference chain in every stack, and its embedding
 lookup is PyTorch's gather. No session runs a draft pass yet, and no script takes the list; the loader takes it as
-`draft_vocab=`. No kernel serves a block of the drafter and none has read these 8-bit weights: the kernel census
-holds the model's steps and no draft pass, so nothing here says which kernels a pass has in the target kernel set.
+`draft_vocab=`. No method of a session hands out the final-norm rows a pass reads. No kernel serves a block of the
+drafter and none has read these 8-bit weights: the kernel census holds the model's steps and no draft pass, so
+nothing here says which kernels a pass has in the target kernel set.
 The loader and the pass have run on the CPU and on one GPU class, compute capability 10.0; a class they have not
 run on is uncovered, not passing. And the 8-bit weights are held to the rule above, not to the weights another
 implementation makes of the same checkpoint: no such comparison is part of this repository.
@@ -864,9 +909,9 @@ implementation makes of the same checkpoint: no such comparison is part of this 
 Speculative decoding drafts a few tokens ahead and lets the model check them in one step: every sequence is fed the
 token it kept last and the tokens drafted behind it -- `T` tokens per sequence at once -- and the step returns, for
 each of them, the greedy token that follows it. A run keeps the drafted tokens up to the first one the model would
-not have chosen, and goes on from there. This section is that step, the model's side of speculative decoding. Nothing
-drafts yet (the section above loads the drafter and runs nothing), so no script runs a verify step: it is reached
-from the helper layer, and the caller names the tokens it is fed and how many of them are kept.
+not have chosen, and goes on from there. This section is that step, the model's side of speculative decoding. No
+session drafts yet (the section above runs the drafter's pass from the library alone), so no script runs a verify
+step: it is reached from the helper layer, and the caller names the tokens it is fed and how many of them are kept.
 
 ```python
 decode = Session(model, text, sequences=1, stack="native")                          # one token per sequence: the decode step
@@ -894,7 +939,7 @@ reaches it through its own verify steps, `T` tokens at a time, keeping all of th
 **One session for a prompt and its verify steps.** A session built with `draft_tokens=k` does both: it feeds its prompt
 through decode steps and then runs verify steps of `k + 1` tokens on the same state. Its plan table shows both plans,
 and one memory sentence counts one state. The caller supplies the drafted tokens and says after the host read how many
-were kept; nothing drafts yet. Two sessions on one load still share weights, never a state. How its prompt works on
+were kept; no session drafts yet. Two sessions on one load still share weights, never a state. How its prompt works on
 that state follows the layout (**The prompt on that state**, below); how such a run is checked, and what ran, follows
 the checks of a verify session (**The checks of a session that verifies behind its prompt**).
 
@@ -1132,7 +1177,7 @@ than two and more, so the last bits of its output may differ by design (`docs/op
 only"). The rows therefore gate no batch invariance on this block; a run with more than one sequence prints whether
 the bytes were equal and, beside it, this statement.
 
-**What is not here.** No drafter runs, so nothing decides how many tokens to keep: the caller says it. One count
+**What is not here.** No session drafts, so nothing decides how many tokens to keep: the caller says it. One count
 per step for all sequences: a step that keeps another number of tokens per sequence needs a position per sequence
 in the attention blocks, which is not built. A decode step behind a keep: a session built with `draft_tokens=`
 feeds decode steps for its prompt alone, in front of its first verify step. The report of a verify session

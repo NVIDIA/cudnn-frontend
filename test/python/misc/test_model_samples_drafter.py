@@ -20,7 +20,8 @@
   multiply, the gate with one rounding and SiLU x up with two, the token choice over listed rows.  A pass over several
   rows is held to that many passes of one row, rows and cache byte for byte; what each pass of a step is handed, by a
   recording stand-in for the blocks; and the model's stored forms and the drafter with its copies, loaded together from
-  a checkpoint generated here.
+  a checkpoint generated here.  The blocks themselves, as a plan builds them, are held to the functions they stand
+  for, and what each declares about its operands is read through the tap of the tie-out, on each sequence alone.
 
 No real checkpoint, tokenizer or template file is committed.  No GPU, no weights."""
 
@@ -334,10 +335,11 @@ def _readme_section() -> str:
 
 
 def _readme_blocks() -> tuple:
-    """The two fenced ``python`` blocks of the README's section on the drafter, as they are written there: the call of the
-    loader, then the recipe for a draft vocabulary."""
+    """The three fenced ``python`` blocks of the README's section on the drafter, as they are written there: the call of
+    the loader, the recipe for a draft vocabulary, and a draft step behind the loader's call."""
     blocks = re.findall(r"```python\n(.*?)```", _readme_section(), flags=re.S)
-    assert len(blocks) == 2 and "QwenDenseDrafter.describe(" in blocks[0] and "--dump-tokens" in blocks[1], "the call, then the recipe"
+    assert len(blocks) == 3 and "QwenDenseDrafter.describe(" in blocks[0] and "--dump-tokens" in blocks[1], "the call, then the recipe"
+    assert "drafter.draft(" in blocks[2] and "QwenDenseDrafter.describe(" not in blocks[2], "then a draft step, on what the call loaded"
     return tuple(blocks)
 
 
@@ -683,6 +685,24 @@ def test_a_drafter_on_disk_its_manifest_its_head_rows_and_its_8_bit_weights(tmp_
     # called as it is written there, with no table handed over, the load reads the model's table too: the section says so
     its_key = MODEL + "embed_tokens.weight"
     assert its_key in read and sorted(set(read)) == sorted(wanted) and _bytes(scope["weights"].embedding) == _raw(directory, its_key)[2]
+
+    # ... and the lines of the README that run a draft step, as they are written there, on what its call of the loader loaded
+    read.clear()
+    exec(compile(_readme_blocks()[2], "the README's draft step", "exec"), scope)
+    proposed, printed = scope["drafts"], capsys.readouterr().out
+    assert printed == f"{proposed.tolist()}\n" and read == [], "the proposals are printed, and no tensor of the checkpoint is read"
+    assert proposed.dtype == torch.int32 and tuple(proposed.shape) == (1, 5) and set(proposed.flatten().tolist()) <= set(ids)
+    assert tuple(scope["hidden"].shape) == (1, 64) and scope["blocks"].stack == "reference" and (scope["blocks"].sequences, scope["blocks"].tokens) == (1, 1)
+    written = scope["cache"].k.any(dim=-1).flatten().tolist()
+    assert written == [True] * 5 + [False] * 59, "one row at position 0 and four passes behind it: positions 0 to 4 of 64"
+    # the same step by its definition: the body on the row it is handed, the head, then each pass on its own row and proposal
+    again = drafter.state(1, 64, "cpu")
+    row = drafter.body(scope["call"], scope["weights"], again, scope["hidden"], scope["ids"], 0)
+    by_hand = [drafter.propose(scope["call"], scope["weights"], row)]
+    for index in range(1, 5):
+        row = drafter.body(scope["call"], scope["weights"], again, row, by_hand[-1], index, index)
+        by_hand.append(drafter.propose(scope["call"], scope["weights"], row, index))
+    assert torch.equal(torch.stack(by_hand, dim=1), proposed) and _bytes(again.k) == _bytes(scope["cache"].k)
     scope["checkpoint"].close()
 
 
@@ -1201,6 +1221,160 @@ def _step_rows(drafter, sequences: int, tokens: int, seed: int):
     return hidden, torch.randint(0, drafter.geometry.vocab, (sequences * tokens,), generator=generator, dtype=torch.int32)
 
 
+def test_every_block_of_the_drafters_plan_is_the_function_it_stands_for(monkeypatch):
+    """The blocks of the drafter's plan, as ``plan`` builds them from ``DRAFTER_PROVIDERS``, each against the function it
+    stands for.  The tests above call the functions, the stand-in test below replaces the blocks, and a pass compared
+    with passes of itself moves with a defect: an error INSIDE a block's class -- operands exchanged, another function
+    called, an epsilon or an accumulation of its own -- is held here.  The blocks of the new keys on stated operands
+    whose roles cannot be exchanged without other bytes; then one body pass through the plan's blocks against the same
+    pass written out from the functions, rows and cache; then the head, block by block."""
+    from model_samples import weights as formats
+    from model_samples.providers import ROW_QUANT, AttentionParams, Quant, torch_ref
+
+    drafter, weights, call, _ = _drafter_on_the_cpu()
+    bf16, acc, eps, width = torch.bfloat16, torch.float64, drafter.norm_eps, drafter.geometry.hidden
+    generator = torch.Generator().manual_seed(41)
+
+    def same(got, want) -> bool:
+        """Two quantised operands of one kind with the same bytes and the same scale: a float, or one per row."""
+        if type(got) is not type(want) or type(got.scale) is not type(want.scale):
+            return False
+        scales = torch.equal(got.scale, want.scale) if isinstance(want.scale, torch.Tensor) else got.scale == want.scale
+        return scales and all(_bytes(a) == _bytes(b) for a, b in zip(got.tensors(), want.tensors()))
+
+    # the two norms in front of the first multiply: a small embedding half, a large hidden half, two weights
+    embedding = (torch.randn((5, width), generator=generator) * 0.05).to(bf16)
+    hidden = (torch.randn((5, width), generator=generator) * 3.0).to(bf16)
+    weight_embedding = (torch.randn(width, generator=generator) * 0.02).to(bf16)
+    weight_hidden = (torch.randn(width, generator=generator) * 0.02 + 2.0).to(bf16)
+    got = call("draft.pre_fc_norm", 0, embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT)
+    want = torch_ref.pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT, eps, acc)
+    assert same(got, want), "the embedding half first with its own weight, one scale over both, the model's epsilon"
+    others = (
+        torch_ref.pre_fc_norm_quantize(hidden, embedding, weight_hidden, weight_embedding, ROW_QUANT, eps, acc),  # the halves exchanged
+        torch_ref.pre_fc_norm_quantize(embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT, 100.0 * eps, acc),  # another epsilon
+    )
+    assert not any(same(other, want) for other in others), "these operands tell each of them from the block"
+    # ... and the accumulation of the run, which rows of this size cannot tell from fp32 sums: what the block hands the function
+    handed = []
+    monkeypatch.setattr(torch_ref, "pre_fc_norm_quantize", lambda *arguments: handed.append(arguments[4:]))
+    call("draft.pre_fc_norm", 0, embedding, hidden, weight_embedding, weight_hidden, ROW_QUANT)
+    monkeypatch.undo()
+    assert handed == [(ROW_QUANT, eps, torch.float64)], "its quantisation, the model's epsilon, fp64"
+
+    # the gate: attention rows, then the gate, one rounding -- with the stated element of the function's test, whose scale
+    # shows its bf16 value (0.19921875; the model's chain, which rounds the sigmoid first, gives 0.1982421875)
+    o = (torch.randn((6, 512), generator=generator) * 2.0).to(bf16)
+    gate = (torch.randn((6, 512), generator=generator) * 3.0).to(bf16)
+    got, want = call("draft.gate_quantize", 0, o, gate, ROW_QUANT), torch_ref.gate_row_quantize(o, gate, ROW_QUANT)
+    assert same(got, want) and not same(torch_ref.gate_row_quantize(gate, o, ROW_QUANT), want)
+    stated = call("draft.gate_quantize", 0, torch.tensor([[1.2109375]], dtype=bf16), torch.tensor([[-1.625]], dtype=bf16), ROW_QUANT)
+    assert stated.scale.tolist() == [_fp32(0.19921875 / 448.0)] and stated.codes.tolist() == [[0x7E]]
+
+    # SiLU x up: the gate half first, the SiLU rounded before the product
+    gate_up = torch.cat((gate, o), dim=1)
+    act, formula = call("draft.silu_mul", 0, gate_up), torch_ref.silu_mul(gate_up)
+    exchanged, unrounded = torch_ref.silu_mul(torch.cat((o, gate), dim=1)), (torch.nn.functional.silu(gate.float()) * o.float()).to(bf16)
+    assert _bytes(act) == _bytes(formula) and _bytes(exchanged) != _bytes(formula) and _bytes(unrounded) != _bytes(formula)
+
+    # the quantisation of a row: the format it is asked for, per row for the MLP's operand and 4-bit for the head's
+    per_row = call("draft.activation_quantize", 0, o, ROW_QUANT)
+    four_bit = call("draft.head.quantize", 0, hidden, Quant("nvfp4", 8.0 / 2688.0))
+    assert same(per_row, formats.quantize_fp8_per_row(o)) and same(four_bit, formats.quantize_nvfp4(hidden, 8.0 / 2688.0))
+    assert tuple(per_row.scale.shape) == (6,) and four_bit.scale == 8.0 / 2688.0, "a scale per row there, the head's static scale here"
+    assert isinstance(per_row, formats.ScaledTensor) and isinstance(four_bit, formats.BlockScaledTensor)
+
+    # one body pass through the plan's blocks = D0 .. D15 written out from the functions: two sequences, three rows each
+    sequences, tokens, position = 2, 3, 2
+    hidden, ids = _step_rows(drafter, sequences, tokens, seed=43)
+    through, written = drafter.state(sequences, 12, "cpu"), drafter.state(sequences, 12, "cpu")
+    rows = drafter.body(call, weights, through, hidden, ids, position)
+    g, copies = drafter.geometry, weights.copies
+    params = AttentionParams(g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim, g.rope_theta, weights.q_norm, weights.k_norm)
+    embedded = weights.embedding.index_select(0, ids)
+    q = torch_ref.pre_fc_norm_quantize(embedded, hidden, weights.pre_fc_norm_embedding, weights.pre_fc_norm_hidden, ROW_QUANT, eps, acc)
+    stream = torch_ref.linear(q, copies["fc"], acc)
+    q, _, residual = torch_ref.add_norm_quantize(stream, None, weights.input_norm, ROW_QUANT, eps, acc)
+    qh, gate = torch_ref.attention_prepare_tokens(torch_ref.linear(q, copies["qkv"], acc), written, position, tokens, params, eps, acc)
+    q = torch_ref.gate_row_quantize(torch_ref.attention_tokens(qh, written, position, tokens, acc), gate, ROW_QUANT)
+    q, _, residual = torch_ref.add_norm_quantize(torch_ref.linear(q, copies["o"], acc), residual, weights.post_norm, ROW_QUANT, eps, acc)
+    q = formats.quantize_fp8_per_row(torch_ref.silu_mul(torch_ref.linear(q, copies["gate_up"], acc)))
+    _, normed, _ = torch_ref.add_norm_quantize(torch_ref.linear(q, copies["down"], acc), residual, weights.final_norm, None, eps, acc)
+    assert _bytes(rows) == _bytes(normed), "the body through the plan's blocks is the pass written out from the functions"
+    assert _bytes(through.k) == _bytes(written.k) and _bytes(through.v) == _bytes(written.v) and bool(written.k[:, :, 2:5].any(dim=-1).all())
+
+    # the head, block by block: the operand in 4 bits at the head's static scale, the logits over the listed rows, the id
+    chosen = rows.unflatten(0, (sequences, tokens))[:, 1]
+    operand = formats.quantize_nvfp4(chosen, weights.head_quant.scale)
+    logits = torch_ref.linear(operand, copies["head"], acc)
+    got = call("draft.head.quantize", 0, chosen, weights.head_quant)
+    got_logits = call("draft.head", 0, got, copies["head"])
+    proposed = drafter.propose(call, weights, chosen)
+    assert same(got, operand) and _bytes(got_logits) == _bytes(logits) and tuple(logits.shape) == (sequences, len(drafter.vocabulary.ids))
+    assert proposed.tolist() == torch_ref.listed_argmax(logits, weights.head_ids).tolist()
+
+
+def test_every_block_of_a_pass_gives_a_sequence_alone_the_bytes_it_has_among_others():
+    """What a block of the drafter's plan declares about its operands -- which have one leading row per row of the step
+    (``per_row``) and which is state the call writes (``state_args``) -- read the way a checked run reads it.  The tap of
+    the tie-out runs every block of a step over several sequences once more on ONE sequence, its operands cut to that
+    sequence's rows by ``per_row`` (an 8-bit operand with a scale per row through ``ScaledTensor.rows``, the cache
+    through ``KvCache.rows``), and compares the bytes.  No session taps a draft pass yet: this test is what reads the
+    declarations, on a pass over two sequences of three rows, once for each sequence."""
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.tie_out import BlockTap
+
+    drafter, weights, plain, _ = _drafter_on_the_cpu()
+    declared = {
+        "draft.embedding": ((0,), ()),
+        "draft.pre_fc_norm": ((0, 1), ()),
+        "draft.projection": ((0,), ()),
+        "draft.norm_quantize": ((0, 1), ()),
+        "draft.attention.prepare": ((0, 1), (1,)),
+        "draft.attention.core": ((0, 1), ()),
+        "draft.gate_quantize": ((0, 1), ()),
+        "draft.silu_mul": ((0,), ()),
+        "draft.activation_quantize": ((0,), ()),
+        "draft.final_norm": ((0, 1), ()),
+        "draft.head.quantize": ((0,), ()),
+        "draft.head": ((0,), ()),
+        "draft.token_choice": ((0,), ()),
+    }
+    sequences, tokens, position = 2, 3, 2
+    facts, table, source = DeviceFacts((10, 0)), drafter.provider_table, drafter.table_source
+    body = plan(table, drafter.regimes, facts, sequences, tokens, "reference", model=drafter, source=source)
+    head = plan(table, drafter.regimes, facts, sequences, 1, "reference", model=drafter, source=source)  # the head runs on one row per sequence
+    assert {name: (tuple(block.per_row), tuple(block.state_args)) for name, block in body.items()} == declared
+    assert {name: (tuple(block.per_row), tuple(block.state_args)) for name, block in head.items()} == declared
+
+    hidden, ids = _step_rows(drafter, sequences, tokens, seed=47)
+    front = [_step_rows(drafter, sequences, 1, seed=200 + at) for at in range(position)]  # what stands in front: two positions
+    untapped = drafter.state(sequences, 12, "cpu")
+    for at, (row, token) in enumerate(front):
+        drafter.body(plain, weights, untapped, row, token, at)
+    rows = drafter.body(plain, weights, untapped, hidden, ids, position)
+    proposals = drafter.propose(plain, weights, rows.unflatten(0, (sequences, tokens))[:, 1])
+
+    taps = BlockTap(body, body), BlockTap(head, head)
+    for alone in range(sequences):  # the sequence the tap runs alone
+        cache = drafter.state(sequences, 12, "cpu")
+        for at, (row, token) in enumerate(front):
+            drafter.body(plain, weights, cache, row, token, at)
+        for tap in taps:
+            tap.step = alone
+        tapped = drafter.body(lambda block, index, *operands: taps[0](block, index, body[block], operands), weights, cache, hidden, ids, position)
+        kept = tapped.unflatten(0, (sequences, tokens))[:, 1]
+        chosen = drafter.propose(lambda block, index, *operands: taps[1](block, index, head[block], operands), weights, kept)
+        # the tap hands back what the blocks made over both sequences, and leaves the cache as they left it
+        assert _bytes(tapped) == _bytes(rows) and chosen.tolist() == proposals.tolist(), alone
+        assert _bytes(cache.k) == _bytes(untapped.k) and _bytes(cache.v) == _bytes(untapped.v), alone
+    stats = {**taps[0].stats, **taps[1].stats}
+    calls = drafter.calls()
+    assert sorted(stats) == sorted(declared) and sum(calls.values()) == 18
+    assert {name: of.batch_calls for name, of in stats.items()} == {name: sequences * calls[name] for name in declared}, "every call, once per sequence"
+    assert [name for name, of in stats.items() if of.batch_equal != of.batch_calls] == [], "a sequence alone: the bytes it has among the others"
+
+
 def test_a_pass_over_several_rows_is_that_many_passes_of_one_row():
     """The body of a pass over ``T`` rows per sequence against ``T`` passes of one row at the positions of those rows: the
     final-norm rows and the cache, byte for byte, at 2 and at 6 rows per sequence, for one sequence and for two.  The
@@ -1275,8 +1449,23 @@ def test_a_pass_over_several_rows_is_that_many_passes_of_one_row():
     assert not cache.k.any(), "a refused pass wrote nothing"
     at_the_end = drafter.body(call, weights, cache, hidden, ids, 9)
     assert tuple(at_the_end.shape) == (6, 64) and bool(cache.k[:, :, 9:].any(dim=-1).all()), "the last three positions of the cache"
-    with pytest.raises(ValueError, match="^a drafter's cache needs at least one sequence and one position; got sequences=0, capacity=4$"):
-        drafter.state(0, 4, "cpu")
+    for sequences, positions in ((0, 4), (2, 0)):
+        with pytest.raises(
+            ValueError, match=f"^a drafter's cache needs at least one sequence and one position; got sequences={sequences}, capacity={positions}$"
+        ):
+            drafter.state(sequences, positions, "cpu")
+
+    # a step whose later passes would write past the cache is refused before its first pass: it wrote nothing
+    fresh = drafter.state(2, capacity, "cpu")
+    with pytest.raises(ValueError, match="^the drafter's cache was built for 12 positions per sequence; the passes of this step write up to position 12$"):
+        drafter.draft(call, weights, fresh, hidden, ids, 6, 2, 5)  # three rows at 6 to 8, the row at 8 kept: passes at 9, 10, 11 and 12
+    assert not fresh.k.any() and not fresh.v.any(), "a refused step wrote nothing"
+    # ... what the first pass itself would write past it is the pass's own refusal, also for a step of that one pass
+    with pytest.raises(ValueError, match="^the drafter's cache was built for 12 positions per sequence; this pass writes 10 to 12$"):
+        drafter.draft(call, weights, fresh, hidden, ids, 10, 2, 1)
+    assert not fresh.k.any(), "nor did that one"
+    fits = drafter.draft(call, weights, fresh, hidden, ids, 6, 2, 4)  # the last of the four passes writes position 11
+    assert tuple(fits.shape) == (2, 4) and bool(fresh.k[:, :, 6:].any(dim=-1).all()) and not fresh.k[:, :, :6].any()
 
 
 def test_the_passes_of_a_step_read_what_the_step_says():
@@ -1432,6 +1621,10 @@ def test_the_passes_of_a_step_read_what_the_step_says():
         run(1, 0)
     with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
         drafter.propose(recorded, weights, one_row)
+    # fewer rows than sequences: there is no row to keep, and the first pass says what it takes
+    sentence = "a draft pass takes a whole number of rows per sequence of its cache (2) and one id per row; got 1 hidden rows and 1 ids"
+    with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+        drafter.draft(recorded, weights, cache, one_row[:1], torch.zeros(1, dtype=torch.int32), 1, 0, 3)
 
 
 def test_the_models_stored_forms_and_the_drafter_loaded_together(tmp_path):
@@ -1532,19 +1725,48 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "The drafter has a draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`): "
         "every block of it is a reference chain in every stack, and its embedding lookup is PyTorch's gather.",
         "No session runs a draft pass yet, and no script takes the list; the loader takes it as `draft_vocab=`.",
-        "The drafter's blocks are held to their definitions, to each other at one row and at several, and to the model's own tokens on a checkpoint; "
-        "they are not compared with another implementation of the drafter in this repository.",
+        "The drafter's blocks are held to their definitions and to each other at one row and at several, and their proposals are reported against "
+        "the model's own tokens on a checkpoint; they are not compared with another implementation of the drafter in this repository "
+        "(one second evaluation of its network was made by hand, outside this repository: it is among the runs below).",
+        "*Against the model's tokens* (reported, no gate): the checkpoint run below, with the same pass run on wrong inputs beside it.",
+        "The blocks that call them are held one layer up: every block of the drafter's plan, as the plan builds it, against the function it stands for",
+        "and every block of a pass over two sequences gives, for each sequence, the bytes that sequence gives alone,",
         "No kernel serves a block of the drafter and none has read these 8-bit weights: the kernel census holds the model's steps and no draft pass",
+        # how the pass is reached: the lines themselves are run where the README's call of the loader is run
+        "A draft step from Python, behind the call of the loader above (its `model`, `drafter` and `weights`):",
+        "they read nothing of the checkpoint.",
+        "every row of this table serves all of them, so one plan runs a pass over any number of rows.",
+        "The hidden rows are the caller's to supply: no method of a session hands them out yet.",
+        "No method of a session hands out the final-norm rows a pass reads.",
+        # the cache: what a row reads of it, and what a step is refused for (held by the test of a pass over several rows)
+        "so a position in front that no pass wrote is read as those zeros and nothing refuses it: filling the cache over a prompt, "
+        "one body pass per position, is the caller's.",
+        "A step whose passes would write past the cache is refused before its first pass.",
     )
     assert [sentence for sentence in said if sentence not in section] == []
-    gone = ("nothing runs the loaded drafter", "its loader, and nothing else", "there is no draft step, no block and no provider row")
+    gone = (
+        "nothing runs the loaded drafter",
+        "its loader, and nothing else",
+        "there is no draft step, no block and no provider row",
+        "to the model's own tokens on a checkpoint;",  # the checkpoint run is reported: it holds nothing
+    )
     assert [words for words in gone if words in section] == []
+    # ... and no sentence of another section says that nothing runs the drafter: no SESSION drafts
+    whole = " ".join(README.read_text().split())
+    elsewhere = (
+        "No session drafts yet (the section above runs the drafter's pass from the library alone), so no script runs a verify step:",
+        "how many were kept; no session drafts yet.",
+        "**What is not here.** No session drafts, so nothing decides how many tokens to keep: the caller says it.",
+    )
+    assert [sentence for sentence in elsewhere if sentence not in whole] == []
+    assert [words for words in ("othing drafts yet", "runs nothing)", "No drafter runs") if words in whole] == []
     assert all(callable(getattr(QwenDenseDrafter, name)) for name in ("body", "propose", "draft", "state", "memory_bytes", "sites"))
     # ... from the table: every block a reference chain in every stack, but the lookup, which is the gather
     rows = {block: rows[0] for block, rows in configs.DRAFTER_PROVIDERS.items()}
     assert all(row.fallback.startswith("reference chain") and row.stacks == configs.EVERY for block, row in rows.items() if block != "draft.embedding")
     assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "target_stacks")
-    assert not any("Session" in name for name in dir(QwenDenseDrafter)) and "drafter" not in (MODELS / "model_samples" / "loop.py").read_text()
+    loop = (MODELS / "model_samples" / "loop.py").read_text()  # the sessions: none names a drafter, none hands out a hidden or a normed row
+    assert not any("Session" in name for name in dir(QwenDenseDrafter)) and re.findall("drafter|hidden|normed", loop) == []
 
     # the counts of a pass
     drafter = QwenDenseDrafter.seeded(QwenDense(), rows=65536)
@@ -1560,6 +1782,12 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     assert "for every kept count 0 to 5" in section, "the stand-in test of the passes runs k = 5"
     # the rule of the row quantiser, in the section's numbers
     assert "divided by 448 and never below 1 / (448 x 512); a code is the element *multiplied by the reciprocal* of that scale" in section
+    assert (
+        "Where a quotient sits exactly between two codes the two rules can give two codes: the product then lands just above the midpoint and takes "
+        "the code above, where the division takes the even one. A host test holds a row with two such elements."
+    ) in section, "the stated row of the quantiser's test; at most midpoints the two rules give one code"
+    assert "where a quotient sits exactly between two codes the two can give different codes." in section, "the weights' rule, the same statement"
+    assert "the scale of the operand's row and the scale of the weight's row, the two multiplied in the accumulation type." in section
     assert (weights.E4M3_MAX, weights.PER_ROW_FLOOR) == (448.0, 512) and callable(weights.quantize_fp8_per_row) and providers.FP8_ROW == "fp8_row"
     # what a load and its cache hold at the published widths with 65,536 ids (the manifest's last line is held with the manifest)
     copies = sum(drafter.copy_bytes().values()) / 2.0**30
@@ -1590,10 +1818,10 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     printed = (
         "A pass over six rows of a sequence gave the rows and the cache of six passes of one row, byte for byte, at one sequence and at two.",
         "`draft` with every kept count 0 to 5 behind six rows, and behind one row, gave the five proposals and the cache",
-        "one gather per pass, the embedding lookup, and none for the id of the chosen row or for a concatenation.",
+        "by name: the embedding lookup is PyTorch's gather, and the id of the chosen row and the concatenations launch other PyTorch kernels than the gather.",
         "A second run printed the same bytes.",
         "(reported; no line of it is a gate of this sample)",
-        "70 new tokens each: the default prompt and two arithmetic word problems, 58, 117 and 78 prompt tokens.",
+        "70 new tokens each: the default prompt and two arithmetic word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens.",
         "the 342 ids of six dump files, then the lowest ids; the default prompt is one of the three prompts behind those dumps, the other two are not.",
         "The first proposal equals the model's next token at 167 of 207 positions (46, 56 and 65 of 69 by prompt), "
         "the second at 128 of 204, the third at 94 of 201, the fourth at 70 of 198, the fifth at 54 of 195.",
@@ -1612,7 +1840,9 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     assert counted == (207, 204, 201, 198, 195) and sum(by_prompt) == 167 and sum(by_kept) == counted[4]
     assert f"{sum(kept * positions for kept, positions in enumerate(by_kept)) / sum(by_kept):.2f}" == "2.37", "drafted tokens kept, 0 to 5, by positions"
     assert drafter.memory_bytes(1, max(prompts) + new_tokens + 5 + 2) == 2135219200 and max(prompts) + new_tokens + 5 + 2 == 194
-    # no count of the launches of a pass: the kernel census holds none, and the section states none
+    # no count of the launches of a pass, of any kind of them: the kernel census holds none, and the section states none
+    counted = r"(?:[\d,]+|one|two|three|four|five|six|no|none) (?:kernel |gather |copy )?(?:launch(?:es)?|gathers?|kernels?|cop(?:y|ies))"
+    assert re.findall(rf"\b{counted} (?:per|a|of a|of one|in a) (?:draft )?(?:pass|step|call)\b", section) == []
     assert re.findall(r"[\d,]+ (?:kernel )?launch(?:es)?\b|\blaunch(?:es)? (?:of|per) (?:a|one|the) (?:draft )?pass\b", section) == []
 
     # the area README and the guide
@@ -1621,7 +1851,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "the drafter's draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`: every block of it a "
         "reference chain in every stack, its embedding lookup PyTorch's gather; no session runs a pass yet)"
     ) in area
-    assert "(`DRAFTER_PROVIDERS`: 18 block calls a pass, every block a reference chain;" in area
+    assert "(`DRAFTER_PROVIDERS`: 18 block calls a pass, every block a reference chain but the embedding lookup;" in area
     guide = " ".join((MODELS / "AGENTS.md").read_text().split())
     assert (
         "The list of provider keys is closed; it changes only together with a kernel, or with the reference chain of a block that a kernel is to serve."
@@ -1633,6 +1863,10 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     assert "\n## What building the drafter's pass taught\n" in (MODELS / "AGENTS.md").read_text()
     assert "- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3." in guide
     assert "that a comparison of tokens could hold" in guide and "with 2,048 rows the same quantiser failed on 954 scales" in guide
+    assert "Four things hold such a pass, and each sees what the others do not:" in guide and "(an error inside a function);" in guide
+    assert "(an error inside a block's class: operands exchanged, another function called, an epsilon of its own);" in guide
+    assert "eight made inside the classes of the new blocks passed every test." in guide, "the defects of the test above: what it is there for"
+    assert "multiplies by a reciprocal that is one number per operand, a constant of the checkpoint;" in guide
     assert 'so "one in two thousand" was one in a hundred and sixty.' in guide, "the count is the gate / SiLU test's: 19 of 3,072"
     assert (
         "token at 167 of 207 positions. With the two halves in front of the first multiply exchanged it was 0, with the hidden row replaced by zeros 8" in guide
