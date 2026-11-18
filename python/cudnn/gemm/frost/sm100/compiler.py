@@ -67,6 +67,7 @@ from ..fusion_ir import (
     gemm_index,
     is_gemm_source,
     segmented_row_scale_capacity_rows,
+    wide_quant,
 )
 from ..recipe import (
     CONST,
@@ -1747,9 +1748,30 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
         live_scales = all_scales if promo_scales_ahead else 2 * promo_mi_count
         promo_in_registers = promo_cols <= _GENERAL_BS_REG_SUM_MAX_COLS and held + live_scales <= promo_regs
 
+    # A wide quantize (FP8 block-128 output) is drained in two sweeps of the tile, whose block must be the tile's.
+    wq = wide_quant(chain)
+    wq_lanes = wq is not None and wq.axis == 1
+    if wq is not None:
+        _check_wide_quant_supported(chain, cfg)
+        if cta_group != 1 or cfg.mma_size_m != 1:
+            raise NotImplementedError(
+                f"a wide block quantize runs on 1-CTA tiles of one MMA row block; config {cfg.name!r} has cta_group={cta_group}, mma_size_m={cfg.mma_size_m}"
+            )
+        if cfg.split_k_slices != 1 or cfg.cluster_k_reduce:
+            raise NotImplementedError("a wide block quantize does not split K")
+        tile_block = cta_m if wq_lanes else epi_cols_per_mma_m
+        if tile_block != wq.block_size:
+            raise NotImplementedError(
+                f"a wide block quantize needs a tile of exactly one block along the quantized axis: config {cfg.name!r} has {tile_block} "
+                f"{'rows' if wq_lanes else 'columns'} per tile for block_size={wq.block_size}"
+            )
+
     # SMEM: the A/B rings of the block-scale template, without scale-factor rings.
     use_tma_store_epi = _use_tma_store_epi(chain, cfg)
     epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else _combine_smem_bytes(chain, cfg)
+    if wq_lanes:
+        # The four epilogue warps' maxima of every tile column (fp32), in two buffers.
+        epi_reserved += align_up(2 * 4 * 4 * epi_cols_per_mma_m, 1024)
     ab_reserved = epi_reserved + _cluster_split_k_smem_bytes(chain, cfg)
     ring_stage_bytes = [cta_m * k_bytes, (cta_n // cta_group) * k_bytes]
     fixed_reserve = tmpl.smem_fixed_reserve
@@ -1786,7 +1808,25 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
         roots = _roots(stages)
     _check_block_scale_desc_roots(cfg, stages, roots)
 
+    # Two GEMMs of a gated activation, as two passes of every tile: the first pass waits in its main accumulator
+    # stage for the second (kernel_registry.general_glu_pair).
+    from ..kernel_registry import general_glu_pair
+
+    glu_pair = general_glu_pair(chain)
+    if glu_pair:
+        if cta_group != 1:
+            raise NotImplementedError(f"general block scale pairs two GEMMs on 1-CTA MMA tiles; config {cfg.name!r} pairs CTAs")
+        if acc_stages != 2:
+            raise NotImplementedError(
+                f"general block scale {cfg.name!r}: two paired GEMMs need a main accumulator stage each, but {acc_cols} columns leave {acc_stages}"
+            )
+        if cfg.split_k_slices != 1 or cfg.cluster_k_reduce:
+            raise NotImplementedError("general block scale does not split K under a paired gated activation")
+
     return dict(
+        glu_pair=glu_pair,
+        wide_quant=wq is not None,
+        wide_quant_lanes=wq_lanes,
         cta_k=cta_k,
         inst_k=inst_k,
         num_k_insts=cta_k // inst_k,
@@ -1840,6 +1880,7 @@ def _render_general_block_scale_tile_constants(cfg: TileConfig, chain: FusionCha
     chunk = plan["promo_chunk_cols"]
     mma_acc = "cutlass.Int32" if mm.a_dtype == "int8" else "cutlass.Float32"
     promo_regs, epi_regs = plan["promo_regs"], plan["epi_regs"]
+    glu_pair, swapped = plan["glu_pair"], isinstance(chain.moe, MoeSwapAbSpec)
     gather_lines = []
     if tmpl.async_gather:
         side = "b" if isinstance(chain.moe, MoeSwapAbSpec) else "a"
@@ -1878,13 +1919,26 @@ def _render_general_block_scale_tile_constants(cfg: TileConfig, chain: FusionCha
         "use_acc_overlap = False",
         f"acc_stage_stride = {acc_cols}",
         "acc_overlap_subtiles = 0",
-        "num_gemms = 1",
-        "num_a_operands = 1",
-        "num_b_operands = 1",
+        # The MMA and promotion warps run ONE GEMM per tile pass (mma_num_gemms). Under glu_pair every tile runs twice,
+        # the second weight operand first (one SMEM ring, two tensor maps), and the epilogue drains the two main
+        # accumulator stages together as num_gemms = 2 GEMMs: GEMM g sits acc_gemm_stride * g columns from the stage of
+        # the pass being drained (the first GEMM's), so the second GEMM is one stage back.
+        f"num_gemms = {2 if glu_pair else 1}",
+        "mma_num_gemms = 1",
+        f"num_a_operands = {2 if glu_pair and swapped else 1}",
+        f"num_b_operands = {2 if glu_pair and not swapped else 1}",
+        "num_a_rings = 1",
+        "num_b_rings = 1",
         "gemm_a_idx = (0,)",
         "gemm_b_idx = (0,)",
         f"acc_region_cols = {acc_cols}",
-        f"acc_gemm_stride = {acc_stages * acc_cols}",
+        f"acc_gemm_stride = {-acc_cols if glu_pair else acc_stages * acc_cols}",
+        f"glu_pair = {glu_pair}",
+        f"glu_passes = {2 if glu_pair else 1}",
+        # A wide quantize block (fusion_ir.wide_quant) is the tile's columns of a row, or -- wide_quant_lanes -- its lanes
+        # of a column, which the four epilogue warps share.
+        f"wide_quant = {plan['wide_quant']}",
+        f"wide_quant_lanes = {plan['wide_quant_lanes']}",
         f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}",
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
         f"multicast_a = {cfg.multicast_a}",
@@ -2217,6 +2271,13 @@ def _render_block_scale_template(
         src = _resolve_blocks(src, "SPLITK_ONLY", splitk)
     elif splitk:
         raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
+    # A wide quantize drains a tile in two sweeps of its own, in place of the shared drain region (general templates).
+    wide = wide_quant(chain) is not None
+    if "@@WIDE_QUANT_ONLY:BEGIN@@" in src:
+        src = _resolve_blocks(src, "WIDE_QUANT_ONLY", wide)
+        src = _resolve_blocks(src, "SHARED_DRAIN_ONLY", not wide)
+    elif wide:
+        raise NotImplementedError(f"template {tmpl.file} has no wide block quantize drain")
     # Under split-K `snippets` is kernel 1's partials store; kernel 2 renders the graph's epilogue.
     plumb = _splitk_reduce_snippets(chain, config) if splitk else snippets
 
@@ -2404,6 +2465,11 @@ def _render_block_scale_template(
         )
     if "@@INJECT_STG_VEC_BINDINGS@@" in src:
         replacements["INJECT_STG_VEC_BINDINGS"] = stg_vec_bindings
+    for marker, text in (("INJECT_WQ_VALUES", snippets.wq_values), ("INJECT_WQ_SCALE", snippets.wq_scale), ("INJECT_WQ_STORE", snippets.wq_store)):
+        if f"@@{marker}@@" in src:
+            replacements[marker] = text
+        elif wide_quant(chain) is not None:
+            raise RuntimeError(f"block-scale template {tmpl.file} missing marker @@{marker}@@")
     if "@@INJECT_KERNEL_TMA_C_PARAMS@@" in src:
         replacements.update(_tma_c_plumbing(chain, tma_slots, splitk=splitk))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
@@ -2436,6 +2502,11 @@ def _render_block_scale_template(
 
     if "@@INJECT_SWAP_COMBINE_LAUNCH@@" in src:
         replacements["INJECT_SWAP_COMBINE_LAUNCH"] = "min_blocks_per_mp=1," if _use_swap_bulk_combine(chain, config) else ""
+    if wide:
+        # The shared drain's hooks went with it: the wide-quantize drain has its own (INJECT_WQ_*).
+        for marker in ("INJECT_AUX_VIEWS", "INJECT_EPILOGUE"):
+            if f"@@{marker}@@" not in src:
+                replacements.pop(marker, None)
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
@@ -2932,7 +3003,7 @@ def _store_modes(
 ) -> tuple[str, ...]:
     """One store mode per output, in `chain.outputs` slot order."""
     outs = chain.outputs
-    if _FORCE_STG_EPI:
+    if _FORCE_STG_EPI or wide_quant(chain) is not None:
         return ("stg",) * len(outs)
     # For splitK, reduce kernel always use STG
     if cfg.workspace_split_k:
@@ -2961,6 +3032,43 @@ def _use_tma_store_epi(
     return "tma" in _store_modes(chain, cfg)
 
 
+_WIDE_QUANT_BLOCK = 128
+
+
+def _check_wide_quant_supported(chain: FusionChain, config: TileConfig) -> None:
+    """Gate a wide quantize (:func:`~..fusion_ir.wide_quant`): an fp32 scale per block of 128 output columns of a row.
+
+    Only the general block-scale templates drain a tile in the two sweeps it needs, and only for a chain whose one
+    output is the quantized data (plus its scale), without auxiliary inputs: the first sweep evaluates every lane
+    and column of the tile, valid or not."""
+    quant = wide_quant(chain)
+    if not _is_general_block_scale(chain):
+        raise NotImplementedError("an fp32 block quantize scale (FP8 block-128 output) is produced by the general block-scale templates only")
+    if len(chain.quants) != 1 or len(chain.output_specs) != 1 or chain.output_specs[0].quant_idx != 0 or chain.reductions:
+        raise NotImplementedError("a wide block quantize must be the graph's only output (its data and its scale)")
+    if chain.aux_tensors:
+        raise NotImplementedError("a wide block quantize does not take auxiliary epilogue inputs")
+    if quant.block_size != _WIDE_QUANT_BLOCK:
+        raise NotImplementedError(f"an fp32 block quantize scale covers {_WIDE_QUANT_BLOCK} values; got block_size={quant.block_size}")
+    if chain.output_specs[0].dtype != "fp8_e4m3":
+        raise NotImplementedError(f"a wide block quantize produces FP8 E4M3 data; got {chain.output_specs[0].dtype}")
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    # The graph quantizes along its output columns: the kernel frame's N, or its M (the lanes) once swapped.
+    if (quant.axis == 1) != swapped:
+        raise NotImplementedError("a wide block quantize runs along the output columns (the last axis)")
+    if chain.has_moe and chain.moe.mode not in ("none", "gather"):
+        raise NotImplementedError(f"a wide block quantize runs under MoE NONE or GATHER; the graph uses {chain.moe.mode.upper()}")
+    if config.workspace_split_k or config.cluster_k_reduce:
+        raise NotImplementedError("a wide block quantize does not split K")
+    expected = (
+        (chain.matmul.batch, chain.matmul.M // quant.block_size, chain.matmul.N)
+        if swapped
+        else (chain.matmul.batch, chain.matmul.M, chain.matmul.N // quant.block_size)
+    )
+    if quant.scale_dim is not None and tuple(quant.scale_dim) != expected:
+        raise NotImplementedError(f"block_scale_quantize requires scale_dim={expected}; got {quant.scale_dim}")
+
+
 def _check_block_quant_supported(
     chain: FusionChain,
     vec_bytes_epi: int,
@@ -2970,6 +3078,10 @@ def _check_block_quant_supported(
         return
     if chain.has_mainloop_fusion:
         raise NotImplementedError("block_scale_quantize epilogue is not supported with mainloop fusion")
+    if wide_quant(chain) is not None:
+        # One block per tile, quantized in two sweeps: none of the per-vector block rules below apply.
+        _check_wide_quant_supported(chain, config)
+        return
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes
     cols_per_acc_stage = _epi_tile_cols(config)
@@ -3838,4 +3950,6 @@ def _jit_moe_block_scale(
         + len([m for m in store_modes if m == "tma"]),
         store_modes=store_modes,
         use_tma_store=use_tma,
+        # The general grouped templates open their scheduler counter themselves (_sched_open).
+        sched_epoch=_is_general_block_scale(chain),
     )

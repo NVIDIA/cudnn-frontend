@@ -457,6 +457,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         scale = node.outputs["scale"]
         block_size = node.params.get("block_size")
         if isinstance(block_size, (list, tuple)):
+            # [1, b] spells a block of b along the row, as block_scale_dequantize does.
+            if len(block_size) == 2 and int(block_size[0]) == 1:
+                block_size = block_size[1:]
             if len(block_size) != 1:
                 raise NotImplementedError(f"block_scale_quantize expects a scalar block_size in cudnn.gemm.frost; got {block_size!r}")
             block_size_i = int(block_size[0])

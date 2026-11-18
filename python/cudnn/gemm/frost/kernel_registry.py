@@ -249,6 +249,32 @@ def general_block_scale_mma_inst_k(dtype: str) -> int:
     return 32 // DTYPE_BYTES[dtype]
 
 
+def general_glu_pair(chain: FusionChain) -> bool:
+    """The graph is a gated activation over two GEMMs that a general template runs as two passes of every tile.
+
+    The two GEMMs share the token operand and differ in the weight. A general template keeps its single partial /
+    main accumulator pipeline and runs ONE plain MMA per pass: the scheduler hands every tile out twice, the weight
+    loader and the promotion warps take the second weight (and its scales) on the first pass and the first weight on
+    the second, and the epilogue leaves the first pass in its accumulator stage until the second fills the next one,
+    then drains both: lane ``i``, column ``j`` of one stage pairs with lane ``i``, column ``j`` of the other."""
+    return chain.has_block_scale and chain.is_multi_gemm and general_glu_pair_reject(chain) is None
+
+
+def general_glu_pair_reject(chain: FusionChain) -> str | None:
+    """Why a multi-GEMM graph cannot run as two passes per tile of a general template, or ``None``."""
+    if chain.num_gemms != 2:
+        return f"general block scale pairs exactly two GEMMs; the graph has {chain.num_gemms}"
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    tokens, weights = (chain.num_b_operands, chain.num_a_operands) if swapped else (chain.num_a_operands, chain.num_b_operands)
+    if tokens != 1 or weights != 2:
+        return f"general block scale pairs two GEMMs that share the token operand and differ in the weight; the graph has {tokens} token and {weights} weight operands"
+    if (chain.matmul.a_major if swapped else chain.matmul.b_major) != "k":
+        return "general block scale pairs two GEMMs over K-major weights only"
+    if chain.has_moe and chain.moe.mode not in ("none", "gather"):
+        return f"general block scale pairs two GEMMs under MoE NONE or GATHER; the graph uses {chain.moe.mode.upper()}"
+    return None
+
+
 def general_block_scale_reject(chain: FusionChain) -> str | None:
     """Why the general block-scale template cannot apply ``chain``'s scales, or ``None``.
 
@@ -260,7 +286,9 @@ def general_block_scale_reject(chain: FusionChain) -> str | None:
     if mm.accum_dtype != "fp32":
         return f"general block scale accumulates in fp32; the matmul computes in {mm.accum_dtype}"
     if chain.is_multi_gemm:
-        return f"general block scale runs one GEMM; the graph has {chain.num_gemms}"
+        reason = general_glu_pair_reject(chain)
+        if reason is not None:
+            return reason
     inst_k = general_block_scale_mma_inst_k(mm.a_dtype)
     # A grouped matmul's weight is one matrix per expert, and so is its scale tensor; its tokens are one matrix.
     a_batch, b_batch = mm.a_batch, mm.b_batch
@@ -986,7 +1014,8 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.GENERAL_BLOCK_SCALE_MATMUL,
         # Two warpgroups of promotion warps after the block-scale template's eight.
         warps_per_cta=16,
-        supports_multi_gemm=False,
+        # Two GEMMs of a gated activation only, as two passes of every tile (general_glu_pair).
+        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_moe_grouped_matmul_fwd.py",
@@ -1014,7 +1043,8 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE,
         # Two warpgroups of promotion warps after the grouped template's eight.
         warps_per_cta=16,
-        supports_multi_gemm=False,
+        # Two GEMMs of a gated activation only, as two passes of every tile (general_glu_pair).
+        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_general_moe_grouped_block_scale_matmul_fwd_gather_mode.py",
@@ -1022,7 +1052,8 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # The source template's twenty: its eight scale-factor copy / pack warps become the promotion warps.
         warps_per_cta=20,
         smem_fixed_reserve=4096,
-        supports_multi_gemm=False,
+        # Two GEMMs of a gated activation only, as two passes of every tile (general_glu_pair).
+        supports_multi_gemm=True,
         async_gather=True,
     ),
     _mm(
@@ -1049,7 +1080,8 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         smem_fixed_reserve=4096,
         graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB,
         warps_per_cta=16,
-        supports_multi_gemm=False,
+        # Two GEMMs of a gated activation only, as two passes of every tile (general_glu_pair).
+        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
@@ -1061,7 +1093,8 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.GENERAL_MOE_BLOCK_SCALE_SWAP_AB,
         warps_per_cta=20,
         smem_fixed_reserve=4096,
-        supports_multi_gemm=False,
+        # Two GEMMs of a gated activation only, as two passes of every tile (general_glu_pair).
+        supports_multi_gemm=True,
         async_gather=True,
     ),
     _mm(

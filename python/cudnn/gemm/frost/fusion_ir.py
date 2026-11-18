@@ -490,14 +490,28 @@ class BlockQuantizeSpec:
             raise NotImplementedError(f"block quantize supports the N axis (-1/2) or the M axis (1) in " f"cudnn.gemm.frost; got axis={self.axis}")
         if self.transpose and self.axis != 1:
             raise ValueError("block quantize transpose=True requires the M axis (axis=1)")
-        if self.scale_dtype not in ("fp8_e8m0", "fp8_e4m3", "fp8_e5m3"):
-            raise ValueError(f"block quantize scale dtype {self.scale_dtype!r} is not supported; " "expected fp8_e8m0, fp8_e4m3 or fp8_e5m3")
+        if self.scale_dtype not in ("fp8_e8m0", "fp8_e4m3", "fp8_e5m3", "fp32"):
+            raise ValueError(f"block quantize scale dtype {self.scale_dtype!r} is not supported; " "expected fp8_e8m0, fp8_e4m3, fp8_e5m3 or fp32")
+        if self.scale_dtype == "fp32" and (self.scale_reorder is not None or self.grouped_by_moe):
+            raise ValueError("an fp32 block quantize scale is one linear scale per block in logical order: no scale reordering, no MoE grouping")
         if self.scale_reorder not in (None, "F8_128x4"):
             raise ValueError(f"block quantize scale reordering {self.scale_reorder!r} is not supported; " "expected None or F8_128x4")
         if self.compute_dtype != "fp32":
             raise ValueError(f"block quantize compute_dtype {self.compute_dtype!r} is not supported; " "expected fp32")
         if self.grouped_by_moe and self.scale_reorder != "F8_128x4":
             raise ValueError("grouped block quantize requires F8_128x4 scale reordering")
+
+
+def wide_quant(chain: "FusionChain") -> "BlockQuantizeSpec | None":
+    """The chain's wide quantizer, or ``None``.
+
+    A quantizer whose scale is a linear fp32 per block (FP8 block-128: 128 values of an output row share one scale)
+    is "wide": its block is larger than an epilogue vector, so the block's maximum is not known when a vector leaves
+    the accumulator. The general block-scale templates quantize such a block in two sweeps of the tile."""
+    for quant in chain.quants:
+        if quant.scale_dtype == "fp32":
+            return quant
+    return None
 
 
 @dataclass(frozen=True)

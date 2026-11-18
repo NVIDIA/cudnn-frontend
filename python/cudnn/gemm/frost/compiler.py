@@ -9,6 +9,7 @@ import functools
 import hashlib
 import importlib
 import importlib.util
+import itertools
 import logging
 import os
 import re
@@ -948,6 +949,18 @@ class _CompiledRuntime:
                 raise ValueError(reason)
 
 
+_SCHED_EPOCHS = itertools.count(1)
+
+
+def _next_sched_epoch() -> int:
+    """A launch epoch no earlier launch of this process used: a positive 31-bit value, never 0.
+
+    A grouped kernel that takes one (``sched_epoch``) keeps its scheduler counter as ``epoch << 32 | tiles claimed``
+    and starts the count over when the word it finds carries another epoch, so the counter in the (scratch)
+    workspace needs no clearing between launches."""
+    return next(_SCHED_EPOCHS) % 0x7FFFFFFF + 1
+
+
 def _k_pad_launchable_for(plan, m: int, n: int) -> Callable:
     """The plan's kernel for kernel-frame extents ``(m, n)``. A plan whose quantized outputs can end an F8_128x4 scale
     row inside a quad holds a second kernel that zeroes those K padding slots (``k_pad_axes``: ``(col_quant, block_size)``
@@ -974,6 +987,9 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     _desc_slots_per_cta: int = 0
     store_modes: tuple = ()
     use_tma_store: bool = False
+    # The kernel starts its scheduler counter from a launch epoch (the last element of the problem tuple) instead
+    # of a counter-clearing kernel ahead of the launch.
+    sched_epoch: bool = False
 
     @property
     def workspace_bytes(self) -> int:
@@ -1003,6 +1019,8 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
 
     def _launch_moe(self, problem, offsets, workspace, operands, outputs, aux, stream, token_index, token_ks, top_k_scores):
         """Assemble and launch the grouped GEMM arguments."""
+        if self.sched_epoch:
+            problem = (*problem, _next_sched_epoch())
         return _k_pad_launchable_for(self, int(problem[0]), int(problem[1]))(
             problem,
             offsets,
