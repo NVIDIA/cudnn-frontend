@@ -1168,6 +1168,30 @@ def test_sm107_dense_d128_whole_pack_chunks_lead_to_512_tiles(s_kv):
 
 
 @pytest.mark.L0
+def test_sm107_dense_d256_decode_leads_from_32_planned_ctas():
+    """Study sm107_dense_d256_q1_cta_v2_20261118: Rubin bf16 dense d256 GQA single-row decode leads when the decode tile's eager plan
+    launches at least 32 CTAs (b x h_q / pack x split). FROST lost only unsplit launches under 32 CTAs; qwen3.5 b 1 over 8k-32k keys,
+    split 64-128, ran 0.55-0.75 of the backend that the retired cost entry chose."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=8, h_kv=1, s_q=1, s_kv=8192, d_qk=256, d_v=256, causal=False, bottom_right=False, device_cc=(10, 7))
+    base.update(device_sm_count=224, has_paged_kv=False, padded=False, page_size=0)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert placement.SM107_D256_DECODE_MIN_CTAS == 32
+    assert place() == placement.LEAD  # split 64
+    assert place(s_kv=32768) == placement.LEAD
+    assert place(b=4, s_kv=2048) == placement.TRAIL  # unsplit, 4 CTAs
+    assert place(b=32, s_kv=2048) == placement.LEAD  # unsplit, 32 CTAs
+    assert place(b=31, s_kv=2048) == placement.TRAIL
+    assert place(b=32, s_kv=2049) == placement.LEAD  # off the tile dense KV runs unsplit
+    assert place(b=16, s_kv=2049) == placement.TRAIL
+    assert place(s_kv=8193) == placement.TRAIL  # one CTA
+    assert place(b=2, s_kv=2048, cuda_graph_replay=True) == placement.TRAIL  # the captured split (16) was not timed
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL  # f16 is not in the class
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(256, 256), (192, 128)])
 @pytest.mark.parametrize("s_q", [5, 8, 16])
 def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
@@ -1256,7 +1280,7 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, s_q=2, causal=True, bottom_right=True)) == placement.LEAD  # the MTP rows (table)
         # a window leaves the shard: study sm107_window_gaps_20261118 (table) leads windowed paged d256 decode
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, window_left=128, causal=True, bottom_right=True)) == placement.LEAD
-        # dense K/V leaves the shard: study sm107_decode_q1_20261112 (table) leads this cell
+        # dense K/V leaves the shard: the dense d256 decode arm leads this cell (64 planned CTAs)
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, has_paged_kv=False, page_size=0, padded=False)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64)) == placement.LEAD  # group 32 inside its band (64 units x 8k)
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64, dtype=cudnn.data_type.HALF)) == placement.LEAD  # its f16 twin

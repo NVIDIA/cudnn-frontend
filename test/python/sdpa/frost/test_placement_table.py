@@ -1589,9 +1589,9 @@ def test_sm107_paged_mla_single_row_decode_follows_the_q1_study(d, h_kv):
 
 
 @pytest.mark.L0
-def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
-    """Study sm107_decode_q1_20261112: dense d256 s_q == 1 leads past a cost threshold on the KV tile and a tile-count threshold off
-    it; small launches keep the backend. d128 single-row decode has no entry (its holdout moved no cell)."""
+def test_sm107_dense_d256_single_row_decode_entries_are_retired():
+    """Study sm107_decode_q1_20261112's dense d256 s_q == 1 entries are retired: the class follows FROST's planned CTA count, which
+    the SM107 hand rule reads (sm107_dense_d256_q1_cta_v2_20261118). Its paged d512 / D576 entries stay."""
     row = "sdpa_fwd_prefill_sm107"
 
     def q1(**over):
@@ -1599,12 +1599,10 @@ def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
         base.update(over)
         return _facts(**base)
 
-    for s_kv in (131072, 131071):
-        assert pt.lookup(row, q1(s_kv=s_kv)) is True
-        assert pt.matched_entry(row, q1(s_kv=s_kv)).study == "sm107_decode_q1_20261112"
-    assert pt.lookup(row, q1(b=1, s_kv=2048)) is False
-    assert pt.lookup(row, q1(b=1, h_q=8, h_kv=1, s_kv=2049)) is False
-    assert getattr(pt.matched_entry(row, q1(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_decode_q1_20261112"
+    for s_kv in (131072, 131071, 2048, 2049):
+        assert pt.class_key(row, q1(s_kv=s_kv))[2:9] == ("bf16", (256, 256), "q1", "dense", "none", False, "gqa")
+        assert pt.lookup(row, q1(s_kv=s_kv)) is None
+    assert pt.matched_entry(row, q1(d_qk=512, d_v=512, h_q=64, h_kv=1, has_paged_kv=True, padded=True, page_size=64)).study == "sm107_decode_q1_20261112"
 
 
 @pytest.mark.L0

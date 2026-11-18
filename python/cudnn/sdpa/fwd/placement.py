@@ -532,6 +532,12 @@ Rubin bf16 dense d128 GQA causal chunks whose group the row packs whole lead up 
 (``SM107_D128_WHOLE_PACK_*``; study sm107_dense_d128_longkv_v2_20261118, cuDNN 9.30.0.8: changed train cells 0.822, worst 1.027;
 holdout scored once 0.930 / 0.918, worst 0.993). Groups the row runs unpacked (3, 5, 6, 7) lost up to 2.0x past the 256-tile cap
 (sm107_dense_d128_longkv_20261117) and keep it.
+Rubin bf16 dense d256 GQA single-row decode on the decode tile leads when its planned launch has at least
+``SM107_D256_DECODE_MIN_CTAS`` CTAs: b x h_q / pack x the planned split (study sm107_dense_d256_q1_cta_v2_20261118, cuDNN 9.30.0.8).
+FROST lost (1.04-1.66) only on unsplit launches of fewer than 32 CTAs (8-16 KV tiles, b x h_kv < 32); split launches over long
+caches ran 0.35-0.85 of the backend and unsplit launches of 32 CTAs or more 0.51-0.93; holdout scored once 0.795 / 0.926 on / off
+the tile (worst 1.092). It replaces sm107_decode_q1_20261112's d256 entries, whose cost threshold ran the backend on qwen3.5 b 1
+decode over 8k-32k keys at 1.5-2.1x FROST's time.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
 pack, so the lead is the unpacked FROST plan; it leads the backend when the declaration admits no chunk over a longer
 cache (equal Q and KV extents and, with packed totals declared, equal totals), the declared cache holds at least 4096
@@ -585,6 +591,7 @@ SM107_D192_LONG_CHUNK_MIN_KV = 32768  # Rubin bf16 d192 x 128 causal chunks lead
 SM107_D192_LONG_CHUNK_MIN_S_Q = 512  # ... from the study's smallest winning S_q (256 lost up to 1.49x)
 SM107_D128_WHOLE_PACK_MAX_Q_TILES = 512  # Rubin bf16 d128 GQA chunks the row packs whole lead up to this many tiles (module docstring)
 SM107_D128_WHOLE_PACK_MIN_KV = 8192  # ... from this cache
+SM107_D256_DECODE_MIN_CTAS = 32  # Rubin bf16 dense d256 GQA single-row decode leads from this many planned CTAs (module docstring)
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
 NONPAGED_D256_THD_MIN_Q = 256  # nonpaged d256 THD lead: query tokens per request
@@ -1029,6 +1036,24 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     return False
 
 
+def _sm107_dense_d256_decode_leads(caps: Capabilities, facts) -> Optional[bool]:
+    """Whether the Rubin row leads a bf16 dense d256 GQA single-row decode on its decode tile (module docstring), None outside that
+    class: the graphs sm107_decode_q1_20261112's retired d256 entries answered (``placement_table.class_key`` (256, 256) ``q1``
+    dense, no mask, no sink, ``gqa``, on and off the tile). The split is the planner's leading one for an eager caller, the plan the
+    study timed, so a CUDA-graph replay hint (whose captured split can be larger) does not move the verdict."""
+    from cudnn.sdpa import placement_table
+    from .heuristics import _split_points
+
+    key = placement_table.class_key("sdpa_fwd_prefill_sm107", facts)
+    if key is None or key[2:9] != ("bf16", (256, 256), "q1", "dense", "none", False, "gqa"):
+        return None
+    group = facts.h_q // facts.h_kv
+    if not d256_decode_tile_selected(caps, facts, group):
+        return None
+    split = _split_points(caps, replace(facts, cuda_graph_replay=False), None, None, None, pack_g=group)[0]
+    return facts.b * (facts.h_q // group) * split >= SM107_D256_DECODE_MIN_CTAS
+
+
 def _sm107_paged_gqa_prefill(facts) -> bool:
     """Rubin paged bf16 d128 GQA prefill, page 16, head-major in-page K (module docstring): GQA 4 / 8 / 16 bottom-right
     chunks on exact or bounded (``shape_overrides``) declarations, and on full causal squares."""
@@ -1063,6 +1088,9 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
 
     if facts.device_cc != (10, 7):
         return TRAIL
+    d256_decode = _sm107_dense_d256_decode_leads(caps, facts)
+    if d256_decode is not None:
+        return LEAD if d256_decode else TRAIL
     # Dense d128 half decode / verify with an attention sink (issue #1472): the legs that lower onto the shared SM100 bodies
     # (engines.rubin_dense_d128_shared_leg -- dense, the (128, 128) flavor incl. the d64 envelope, no pre-folded scale),
     # packed over a measured GQA group, so the default plan is the packed decode tile (S_q x G <= 128) or the packed cga2

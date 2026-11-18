@@ -48,9 +48,10 @@ _DTYPES = {"bf16": cudnn.data_type.BFLOAT16, "f16": cudnn.data_type.HALF}
 def _facts_inference(c, s):
     """Inference harness: q tokens per request, dense or paged KV, head pair and mask (case fields, else the study default).
     ``mask`` "none" is a non-causal context; any other value is the harness's causal band, bottom-right (a square reads the
-    same from either corner)."""
+    same from either corner). A single-row decode carries no band unless windowed, as the harness builds it: its bottom-right
+    band would cover the KV tail and admit a split the executed graph cannot take off the tile."""
     paged = c.get("layout", s.get("layout", "dense")) == "paged"
-    causal = c.get("mask", "causal") != "none"
+    causal = c.get("mask", "causal") != "none" and (c["q"] > 1 or c.get("window") is not None)
     return SdpaGraphFacts(
         b=c["b"],
         h_q=c["hq"],
