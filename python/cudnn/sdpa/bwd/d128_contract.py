@@ -9,6 +9,7 @@ import struct
 ACCUMULATION = "accumulation"
 RECOMPUTE = "recompute"
 PAIR = "pair"
+RELAY = "relay"
 WORKSPACE_ALIGNMENT = 256
 WORKSPACE_SLACK = WORKSPACE_ALIGNMENT - 16
 ABI_VERSION = 3
@@ -178,6 +179,33 @@ def pair_workspace_layout(batch, heads, sq, split=1, heads_kv=0, skv=0, d=0):
     if total > 2**63 - 1:
         raise ValueError("dense d128 workspace exceeds the signed pointer range")
     return tuple(regions), total
+
+
+def validate_relay_launch(batch, heads):
+    """The relay chain's launches place the batch and the query heads on grid.y / grid.z."""
+    if batch > 65535 or heads > 65535:
+        raise ValueError("relay chain batch and query-head counts must be at most 65535")
+
+
+def relay_workspace_layout(batch, heads, sq, d):
+    """The ordered-relay chain's scratch: the fp32 dQ accumulator and delta rows over the 128-row-rounded S_q, then one
+    int32 turn counter per (batch, query head, 64-row query tile) and one key-tile ticket per (batch, query head)."""
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)) or d not in (64, 128):
+        raise ValueError("relay workspace dimensions must be positive integers with a head dimension of 64 or 128")
+    rounded = (sq + 127) // 128 * 128
+    slots = rounded // 64 + 1  # one turn counter per 64-row query tile, then the head's key-tile ticket
+    dq_bytes = 4 * batch * rounded * heads * d
+    delta_bytes = 4 * batch * heads * rounded
+    turn_bytes = 4 * batch * heads * slots
+    regions = (
+        (0, (batch, rounded, heads, d), (rounded * heads * d, heads * d, d, 1)),
+        (dq_bytes, (batch, heads, rounded), (heads * rounded, rounded, 1)),
+        (dq_bytes + delta_bytes, (batch, heads, slots), (heads * slots, slots, 1)),
+    )
+    total = dq_bytes + delta_bytes + turn_bytes + WORKSPACE_SLACK
+    if total > 2**63 - 1:
+        raise ValueError("relay workspace exceeds the signed pointer range")
+    return regions, total
 
 
 def validate_launch(pointers, spans, workspace, workspace_bytes, scale):

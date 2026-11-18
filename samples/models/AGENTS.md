@@ -149,7 +149,12 @@ does not hold is printed as not known and ignored, so a new name for one of them
     by its place in the wiring, not by its block and layer: a block can be called twice in a layer. A site name
     belongs to one block (an adapter finds the sites of its row in the wiring by name), and what differs between the
     sites of a row may be the operand's shape as well as the kernel's form: an entry that is one weight shape per
-    instance has the shape of each site in its row.
+    instance has the shape of each site in its row. A row may also serve some call sites of its block only: it names
+    each other site without fields, which hands the calls there on to the next row of the stack that serves the run.
+    The plan then holds one part per call site under the block's name (`blocks.BySite`; `Plan.at`, `Plan.parts`), and
+    whatever reads a row or a block of a call -- the census entries, the form, the identity, the band, the batch
+    invariance statement, the form of the weight a load keeps -- reads the part of that call's site. A site a row
+    does not name at all stays a wrong table.
 16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
     target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
@@ -644,3 +649,94 @@ holds each.
   stored tensor as it is -- was not, and ended after the read in the sentence of a session that was not planned
   with the run, although it was. What a load keeps is one row order per weight, whoever asks for it: every reader of
   the stored form has an owner in that comparison, and both orders of the two plans are a case each.
+
+## What the verify step taught
+
+The verify step feeds several tokens per sequence in one launch sequence (`Session(tokens=T)`, `Session.verify`, the
+key `fe.gdn_verify_fused`). What building it showed:
+
+- A step shape is a field of the form. The fused verify kernel is compiled per tokens count, and its name is cut in
+  front of that count and of its launch knobs: two kernels of two counts share a symbol and a grid, and differ in the
+  shared memory of a thread block. So the row names `TOKENS`, one row per count; the adapter holds the slot table of
+  every call to it; and the call log states the form for the step shape of the table that call handed the entry
+  (`_served_stated`). An entry whose launch facts take a step shape says which shape a row count stands for
+  (`EntryBlock._step_of`): that is the plan's question. The call log's is another one -- what was this call handed --
+  and the first version answered it with the plan's: it asked the instance for the row's own tokens and logged the
+  echo, so with the adapter's guard taken away a table of two sequences x three tokens was logged as `TOKENS 6`. A
+  field of a form that is an argument of the question says nothing as the answer: read it from the operands.
+- A band stated for one token per call is applied token by token, not loosened. The band of the fused step tolerates a
+  rounding that falls on the other side of a midpoint as an event, seen once, because the reference starts every
+  call from the kernel's state. A reference that runs the `T` tokens of a verify step on its own state sees such an
+  event at every later token of the step, and a cell of one token over nine steps fails a share that a cell of the
+  decode step passes over 32. The fix is in what is compared, never in the numbers: the reference starts every token
+  from the state the kernel wrote for the token before it (`gdn_verify_step(anchor=)`), and a cell is one value head
+  of one sequence over the tokens of its steps -- one block of the launch grid, as the band says.
+- The layout of one token per sequence is the layout of several at `T = 1`. Slots numbered token by token keep token 0
+  of a sequence in its plain slot and its history in that slot; one state class then serves both kinds of step, and a
+  plan of one token per sequence builds the tensors it built before. Check that with the shapes, in a host test.
+- Keeping tokens launches nothing. How many tokens a step kept is one number on the host; the kernel's operand is a
+  row of a constant table built with the state. A copy or a fill between two steps would be the first record of the
+  next step, where the kernel check declares nothing.
+- An operand of a kernel starts 16-byte aligned, and a row of a table need not. The slot table of one sequence out of
+  several (the batch-invariance check runs a sequence alone) is handed over in tensors of its own, and the rows of the
+  kept-count table are padded to four elements.
+- A decline names the row of the step that was asked for. A verify step no row holds was first declined in the words
+  of the decode entry, the block's first row ("serves rows 1-65,535"). A plan of several tokens per sequence is
+  declined by the block's row for that tokens count, else by the last of its rows for such steps.
+- A census section holds for the step it was recorded with: the tokens per sequence beside the row count, the widths
+  and the class. Six rows are one sequence of six tokens and two of three; only the first is the recorded step.
+- Two runs that feed a block other rows cannot be compared on that block's state. The verify run against the decode
+  run gates the recurrent state where both were fed the same rows (the history taps say so) and prints it elsewhere;
+  what holds in every layer is the block check, teacher-forced. A line that gated nothing is `REPORTED`.
+- A row is run in every form its entry takes inside the row's range, not only at the range's ends. The verify entry
+  picks its form by the sequences and the SM count: on a 148-SM part two thread blocks per value head at one
+  sequence, one thread block per SM at two and three, two per SM from four. The first runs were at 1, 4 and 16
+  sequences and never launched the middle form, whose shared memory at eight tokens is 704 B below the part's limit.
+  Ask the entry's launch facts for every step shape a row claims, group them by form, and run one of each.
+- A session of another kind of step does not inherit the report of the first kind. The report of a verify session
+  printed the decode step's bytes per step, a prefill route of 0 tokens and a rate that counted steps as tokens.
+  Until a line is taught the new step, the report says that it is not stated, and a host test holds the sentence.
+- Two sessions on one load share weights, never a state. Say so beside the snippet that builds them: a reader who
+  prefills a prompt in one and steps the other gets the tokens after an empty context, and no error.
+
+## What the out-projection of a verify step taught
+
+The target serves one block of the wiring with two kernels in a verify step: the out-projection of a linear-attention
+layer is the 8-bit projection kernel, the out-projection of an attention layer a library multiply, and both multiply by
+a weight of one shape (rows of `fe.fp8_projection_decode` in the block `projection.fp8.out`, for steps of several tokens
+per sequence alone). What building it showed:
+
+- A block is not always one row. Splitting the block in two moves lines of every plan of one token per sequence -- a
+  table row, the by-provider line, the coverage line -- for a difference only a verify step has. The call sites
+  carry it instead: the row of the entry names the site it serves and hands the other on, and a plan prints the
+  block once per call site only where two rows serve it. A plan of the decode step is the text it was; hold that
+  with a run of both trees, line by line.
+- What a row hands on is data, never the adapter's choice. An adapter that served one site and called the fallback
+  chain itself at the other would be one row with two kinds of census entry, which the kernel check cannot judge: an
+  exact kernel at one call and a family at the next. The plan resolves the next row; the adapter is never built or
+  called at a site its row hands on.
+- A split is a row range. The target chooses the K slices of the projection kernel by the rows of a step, and the
+  entry fixes them per instance (another split is another byte class), so each range is a row and an entry instance
+  of its own, selected by `rows`. The bytes of the block change where a step's rows cross from one range into the
+  next; say so beside the rows, and gate batch invariance inside a range only.
+- A field that follows the call is named, or the call log cannot show it. The projection adapter already asked the
+  serving instance with the rows of the operand it was handed, but a form without a field that follows the rows
+  logs the same text at every row count. The rows of this block name the token tile of their range, and the entry
+  takes it as a floor: an instance handed the rows of another range states another tile, and item 0 names it.
+- The forms of a weight follow the call sites. One block, two rows: the linear-attention layers' weights are read on
+  their stored codes, the attention layers' as copies. A load is asked per call site (`<block> at <call site>`
+  beside the block names), so a verify plan alone holds no copy of the first and no codes of the second, and a
+  decode session on the same load, which reads every out-projection as a copy, has its copies. Test the loader
+  with each plan alone and with both, and the check that names a missing form with a load made for the other.
+- A decline of a weight's form is asked per weight. The projection adapter declined a load that keeps a scale per
+  merged part for every row of its entry; the out-projection's weight is one stored tensor with one scale under
+  every merge rule. The family says which weights a rule gives a scale per row (`scale_per_row`), per call site.
+- Two sessions of one load that serve a block with two kernels are not byte-equal behind it. Up to the last row
+  count of the entry's rows the verify session rounds the out-projection once and the decode session twice: their
+  logits differ by a bf16 unit and an attention layer behind caches other bytes, printed and not gated. From the
+  first row count on the fallback row both multiply over a copy: the bytes met again at three and four sequences
+  and stayed within half a bf16 unit at nine and 16 sequences of two tokens (a library multiply is another kernel at
+  another row count). Run both sides of that boundary, and say which lines of the comparison are reported there.
+  And state a comparison for the step shapes where it gated: a sentence that begins "at every step shape that ran"
+  is read as a gate on all of them, also on those whose line was `REPORTED`. The memory sentence likewise: "within a
+  tenth of a GiB" is a statement about every run, and one step shape reserved half a GiB less than it asked for.

@@ -14,6 +14,20 @@ The entry compiles once per (rows, operand strides) per process; ``compile`` bui
 kernel compiled and launched.  That first launch is measured: on some GPU classes it reserves device memory outside PyTorch's
 allocator (``first_launch``), which the plan's memory sentence allows for per class before anything is loaded.
 
+``fe.gdn_verify_fused`` calls ``cudnn.GdnVerifyFused``, the fused VERIFY step of the same layer (the same page): one launch
+per layer and step for ``T`` tokens per sequence at once, the recurrent state after every token written to a slot of its
+own.  The step shape is the entry's compile-time fact, so the row names the tokens per sequence as a field of the form
+(``TOKENS``) beside the two launch knobs, one row per count; the adapter passes the knobs to the entry and holds the slot
+table of every call to the row's ``TOKENS`` (a table of another count is a ``ValueError``: the wiring hands the block a
+step its row does not name), and the call log states the form for the step shape of the table the call handed the entry,
+never for the row's.  It is handed the step's slot table (``state.TokenSlots``: the slot of every (sequence,
+token), the first row of every sequence, the tokens the last step kept) and the pools in the layout of
+``state.RecurrentSlots`` at that many tokens.  The output is a buffer of the call's own.  The entry's facts take the step
+shape ``(sequences, tokens)``; the name of its kernel carries neither the launch knobs nor the tokens (they sit behind
+the cut of the symbol), so the form on the objects is what shows them.  Its determinism row says that one sequence alone
+is not byte-equal to the same sequence among several (``batch_note``): a run prints it, and gates no batch invariance
+on this row.
+
 ``fe.attention_gate_quant_decode`` calls ``cudnn.AttentionGateQuantDecode``, the output gate of an attention layer fused with
 the static 8-bit quantisation of the out-projection's input (``docs/operations/attention/gate_quant_decode.md``): one launch
 per attention layer and step.  One compiled kernel serves every row count and layer.  The adapter hands the entry an output
@@ -37,7 +51,13 @@ rounds once, so the adapter names its twin: the norm at the kernel's rounding po
 ``fe.fp8_projection_decode`` calls ``cudnn.Fp8ProjectionDecode``, the multiply of an 8-bit activation by an 8-bit weight on
 the stored codes of both (``docs/operations/gemm_fusions/fp8_projection_decode.md``): one launch per call.  An entry is one
 weight shape at one split, and the in-projection of a layer has another shape in each kind of layer: the row names the
-shape per call site, and the adapter holds one entry instance per site.  The row's form is the whole kernel -- the split,
+shape per call site, and the adapter holds one entry instance per site.  A row of it may serve one call site of its
+block and hand the other on (the out-projection of a step of several tokens per sequence: the linear-attention layers'
+call is this entry's, the attention layers' the next row's): the adapter then builds and serves the sites its row
+serves, and is never called at the other.  The split is fixed per entry instance and the token tile follows the row
+count, so a block whose kernel changes its split with the rows of a step has one row per range, each an adapter and an
+entry of its own; a row that names the token tile passes it as the entry's floor, which is the tile of every row count
+in its range.  The row's form is the whole kernel -- the split,
 the weight tile, the ring depth, the tensor-memory columns and their release, the launch knobs -- and the adapter passes
 it as given, so the entry never runs on its own pick.  The weight is the merged codes the loader kept for this block
 (``weights.Dequantized.stored``; ``stored_weights`` asks the loader for them, and where no other block of the run reads
@@ -98,7 +118,7 @@ from __future__ import annotations
 import re
 
 from ..census import Facts, Kernel
-from ..state import RecurrentSlots
+from ..state import RecurrentSlots, TokenSlots
 from ..weights import BLOCK, TILE_COLUMNS, TILE_ROWS, BlockScaledTensor, InterleavedBlockScaledTensor, ScaledTensor, TiledBlockScaledTensor, tile_scales
 from . import BlockBase, GdnParams, split_qkvz
 
@@ -109,6 +129,9 @@ SOURCE_FILES = (
     "linear_attention/frost/kernel/gdn_decode_fused_config.py",
     "linear_attention/frost/kernel/gdn_decode_fused_f16.py",
     "linear_attention/frost/kernel/gdn_geometry.py",
+    "linear_attention/frost/gdn_verify_fused.py",
+    "linear_attention/frost/kernel/gdn_verify_fused_config.py",
+    "linear_attention/frost/kernel/gdn_verify_fused_f16.py",
     "frost/launch_facts.py",
     "attention_gate/frost/gate_quant_decode.py",
     "attention_gate/frost/kernel/gate_quant_decode_config.py",
@@ -125,6 +148,10 @@ SOURCE_FILES = (
 )
 #: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
 FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+#: the field of the form of ``cudnn.GdnVerifyFused`` that is the step's shape and no constructor argument: the tokens per
+#: sequence.  A row of that entry names it (the entry compiles one kernel per count, and the kernel's name does not say
+#: which); the adapter holds every call's slot table to it
+VERIFY_TOKENS = "TOKENS"
 #: the fields of the form of ``cudnn.AttentionGateQuantDecode`` a provider row may name: ``THREADS`` goes into the entry's
 #: config (``cfg=Cfg(THREADS=...)``), ``PDL_RELEASE`` is its launch knob ``pdl_release=``
 GATE_FORM_FIELDS = ("THREADS", "PDL_RELEASE")
@@ -172,6 +199,8 @@ def serves_floor(installed: str, floor: tuple) -> bool:
 _ENTRIES: dict = {}
 #: rows -> device bytes the first launch of that form took outside PyTorch's allocator in this process, as measured
 _FIRST_LAUNCH: dict = {}
+#: the (sequences, tokens) step shapes of the fused verify step that were launched in this process
+_VERIFY_LAUNCHED: set = set()
 
 
 def _outside_pool(device, launch) -> int:
@@ -195,7 +224,7 @@ class EntryBlock(BlockBase):
     compiles = True
     name = ""  # the entry, as ``cudnn`` exports it
     what = ""  # what the entry is, for the sentence of an older package
-    _served = None  # (entry instance, rows) of the last call
+    _served = None  # (entry instance, rows) of the last call -- in place of ``rows`` the step shape, where an entry's form follows one
     _answer = None  # (entry instance, rows, what ``serving`` says of them): asked of an instance once, not once per call
 
     def _cudnn(self):
@@ -237,13 +266,18 @@ class EntryBlock(BlockBase):
         if not hasattr(entry, "launch_shape_for"):
             return
         try:
-            entry.launch_shape_for(rows)
+            entry.launch_shape_for(*self._step_of(rows))
         except (ValueError, NotImplementedError) as error:
             cc = self.facts.cc
             raise ValueError(
                 f"the provider table is wrong: the row of {self.row.key} claims this run ({rows} row{'s' if rows != 1 else ''} on compute "
                 f"capability {cc[0]}.{cc[1]}), and {self.entry} declines it: {error}"
             ) from None
+
+    def _step_of(self, rows: int) -> tuple:
+        """What the entry's launch facts are asked with for a run of ``rows`` rows: the row count.  An adapter whose entry
+        states its launch per step shape says which shape that is."""
+        return (rows,)
 
     #: the device types on which the plan makes the entry's first use: a kernel can be built for a CUDA device only (a host
     #: test names its own device here to run the step on a stand-in entry)
@@ -262,16 +296,21 @@ class EntryBlock(BlockBase):
         return not cutedsl_runtime_available(tuple(self.facts.cc))
 
     def _sites(self) -> tuple:
-        """The call sites of the row that the model's wiring has (every site of the row for a model that names none): the
+        """The call sites the row serves that the model's wiring has (every such site for a model that names none): the
         forms a run builds.  A row without sites is called in its one form."""
         named = getattr(self.model, "sites", None)
         called = set(named()) if callable(named) else None
-        return tuple(site for site, _ in self.row.sites if called is None or site in called) if self.row.sites else ("",)
+        return tuple(site for site in self.row.served if called is None or site in called) if self.row.sites else ("",)
+
+    def _named(self) -> list:
+        """The call sites the row serves (``ProviderRow.served``: not those it hands on to the next row), or the one
+        unnamed site of a row that names none: every form the table states for this adapter."""
+        return list(self.row.served) or [""]
 
     def _stated(self, entry, rows: int) -> dict:
         """The form an entry instance states for ``rows``, as the row's fields are looked up in it: the entry's own
         ``form_for``.  An adapter whose row names fields the entry states one level down says where."""
-        return entry.form_for(rows)
+        return entry.form_for(*self._step_of(rows))
 
     def _declined(self, error, what: str) -> str:
         """The sentence for a typed decline of the entry at ``what``: the installation's where this adapter can name an unmet
@@ -306,21 +345,28 @@ class EntryBlock(BlockBase):
     def serving(self):
         """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
         its kind in this process: one per device, geometry and form) and the fields of the row's form as THAT instance states
-        them for the call's row count (its ``form_for``).  Read from the object that was called, never from the row: an entry
-        built without the row's knobs, or a call served from another instance, shows here.  Before the first call nothing
-        has served and nothing was passed."""
+        them for the call's row count (its ``form_for``; for the call's step shape, where its form follows one).  Read from
+        the object that was called, never from the row: an entry built without the row's knobs, or a call served from
+        another instance, shows here.  Before the first call nothing has served and nothing was passed."""
         if self._served is None:
             return self.entry, ()
         entry, rows = self._served
         if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
             place = next((n for n, built in enumerate((e for e in _ENTRIES.values() if type(e) is type(entry)), 1) if built is entry), 0)
             try:
-                stated = self._stated(entry, rows)
+                stated = self._served_stated(entry, rows)
             except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
                 stated = {}
             form = tuple((name, stated[name]) for name, _ in self._served_form() if name in stated)
             self._answer = (entry, rows, (f"{self.entry} #{place}" if place else self.entry, form))
         return self._answer[2]
+
+    def _served_stated(self, entry, call) -> dict:
+        """The form the instance that served the last call states for THAT call, as the call log reads it: asked with what
+        ``__call__`` kept of the call beside the instance (``_served``) -- its row count.  An adapter whose entry states its
+        form per step shape keeps the shape of the operands it handed the entry and asks with that: what the log then
+        shows is the call, whatever the row says."""
+        return self._stated(entry, call)
 
     def _served_form(self) -> tuple:
         """The fields the call log reads from the instance that served the last call: those of the row's form.  An adapter
@@ -332,7 +378,8 @@ class EntryBlock(BlockBase):
         data and its launch shape.  The entry's typed declines pass through: a row that claims a row count the entry does not
         serve is a wrong table."""
         entry = self._build(self.options.get("device", "cuda"))
-        return Facts(tuple(entry.kernel_symbols_for(rows)), self._stated(entry, rows), tuple(entry.launch_shape_for(rows)))
+        step = self._step_of(rows)
+        return Facts(tuple(entry.kernel_symbols_for(*step)), self._stated(entry, rows), tuple(entry.launch_shape_for(*step)))
 
 
 class GdnDecodeFusedBlock(EntryBlock):
@@ -440,6 +487,170 @@ class GdnDecodeFusedBlock(EntryBlock):
         except NotImplementedError as error:
             raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands of this step: {error}") from error
         return ScaledTensor(qout.view(torch.uint8).view(x.shape[0], -1), params.out_scale_value)
+
+
+class GdnVerifyFusedBlock(EntryBlock):
+    """``cudnn.GdnVerifyFused``: the fused linear-attention step for ``T`` tokens per sequence in one launch per layer -- the
+    conv, the recurrence and the gated norm of every token in turn, the state after token ``t`` written to the slot of
+    (sequence, ``t``), the conv history shifted by the step's rows; in the form the row names, ``TOKENS`` included."""
+
+    name = "GdnVerifyFused"
+    what = "the fused linear-attention verify step"
+    kernels = (Kernel("gdn_verify_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per layer and step
+    per_row = (0, 1, 2, 3)
+    state_args = (5,)
+    batch_note = (
+        "cudnn.GdnVerifyFused states replay-identical bytes and no batch invariance between one sequence and several: one sequence takes "
+        "another association of the gated norm's sum than two and more, so the last bits of its output differ by design "
+        '(docs/operations/determinism.md: "Replay only")'
+    )
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass, or a form that does not
+        name the tokens per sequence, is a wrong table."""
+        unknown = [name for name, _ in self.row.form if name not in FORM_ARGUMENTS and name != VERIFY_TOKENS]
+        if unknown or VERIFY_TOKENS not in dict(self.row.form):
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {VERIFY_TOKENS}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(FORM_ARGUMENTS)} to cudnn.GdnVerifyFused "
+                f"and holds every step to the row's {VERIFY_TOKENS}, the tokens per sequence"
+            )
+        return {FORM_ARGUMENTS[name]: value for name, value in self.row.form if name in FORM_ARGUMENTS}
+
+    def _tokens(self) -> int:
+        return int(dict(self.row.form)[VERIFY_TOKENS])
+
+    def _step_of(self, rows: int) -> tuple:
+        """The step shape the entry's facts take: ``(sequences, tokens)`` of a run of ``rows`` rows at the row's tokens."""
+        return (rows // self._tokens(), self._tokens())
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if tokens != self._tokens():  # the row's tokens range selected a run its form does not name
+            raise ValueError(
+                f"the provider table is wrong: the row of {self.row.key} says {VERIFY_TOKENS} {self._tokens()} and was selected for a run of {tokens} tokens per sequence"
+            )
+        if self.facts.total_bytes and "device" in self.options:
+            # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP; once it is built, a step
+            # shape it does not serve is a wrong table.  Its first use follows the memory sentence (``first_use``)
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)
+
+    def reserve_bytes(self) -> int:
+        """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
+        class, until a fused step was launched in this process."""
+        if _FIRST_LAUNCH or _VERIFY_LAUNCHED:
+            return 0
+        reserve = getattr(self.model, "first_launch_reserve", {})
+        return int(reserve.get(f"cc{self.facts.cc[0]}.x", 0))
+
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
+        import torch
+
+        g = self.model.geometry
+        device = torch.device(device)
+        key = ("gdn_verify_fused", str(device), g.la_key_heads, g.la_value_heads, g.hidden, self.model.norm_eps, tuple(self.row.form))
+        if key not in _ENTRIES:
+            cudnn = self._cudnn()
+            from cudnn.linear_attention.frost import GdnGeometry
+
+            geometry = GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden)
+            _ENTRIES[key] = cudnn.GdnVerifyFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
+        return _ENTRIES[key]
+
+    def _scratch(self, sequences: int, tokens: int):
+        import torch
+
+        g = self.model.geometry
+        device = torch.device(self.options.get("device", "cuda"))
+        rows, D, NV = sequences * tokens, g.la_head_dim, g.la_value_heads
+        qkv = (2 * g.la_key_heads + NV) * D
+        bf16 = dict(dtype=torch.bfloat16, device=device)
+        x, z = split_qkvz(torch.zeros((rows, qkv + NV * D), **bf16), qkv, NV, D)
+        slots = RecurrentSlots(
+            torch.zeros((rows + 1, NV, D, D), dtype=torch.float32, device=device),
+            torch.zeros((sequences + 1, g.la_conv_width - 2 + tokens, qkv), **bf16),
+            tokens,
+        )
+        params = GdnParams(
+            g.la_key_heads,
+            NV,
+            D,
+            torch.zeros((qkv, g.la_conv_width), **bf16),
+            torch.zeros(NV, dtype=torch.float32, device=device),
+            torch.zeros(NV, **bf16),
+            torch.ones(D, **bf16),
+            torch.zeros((2 * NV, g.hidden), **bf16),
+            torch.ones(1, dtype=torch.float32, device=device),
+            1.0,
+        )
+        table = TokenSlots.build(sequences, tokens, device)
+        return self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), table, params, slots)
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(*operands)  # the first launch of the compiled kernel, before the first step
+            _VERIFY_LAUNCHED.add((sequences, tokens))
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    @staticmethod
+    def _operands(x, z, hidden, table, p, slots):
+        """The entry's positional operands: ``(qkv, z, hidden, ba_weight, A_log, dt_bias, ssm_state, state_indices, cu_seqlens,
+        num_accepted_tokens, norm_weight, out_scale, conv_state, conv_weight)``."""
+        return (
+            x,
+            z,
+            hidden,
+            p.ba_weight,
+            p.a_log,
+            p.dt_bias,
+            slots.state,
+            table.indices,
+            table.cu_seqlens,
+            table.accepted,
+            p.norm_weight,
+            p.out_scale,
+            slots.conv,
+            p.conv_weight,
+        )
+
+    def _served_stated(self, entry, call) -> dict:
+        """The form the instance states for the step shape of the slot table the last call handed it (``_served``): the
+        ``TOKENS`` of the call log is the tokens per sequence of that table -- read from the call, where the row's own
+        field asked back would say nothing about it."""
+        return entry.form_for(*call)
+
+    def _held(self, table) -> None:
+        """A call's slot table against the row, before anything is launched: the table of a step of several tokens per
+        sequence, at the row's ``TOKENS``.  Anything else is a ``ValueError``: the wiring hands the block a step its row
+        does not name."""
+        if not isinstance(table, TokenSlots):
+            raise ValueError(
+                f"cudnn.GdnVerifyFused takes the slot table of a step of several tokens per sequence; this block is handed {type(table).__name__}: "
+                "the session's state was built for one token per sequence"
+            )
+        if table.tokens != self._tokens():
+            raise ValueError(
+                f"provider row {self.row.key}: its form says {VERIFY_TOKENS} {self._tokens()}; the step hands it a slot table of {table.tokens} tokens per sequence"
+            )
+
+    def __call__(self, x, z, hidden, table, params, slots):
+        import torch
+
+        self._held(table)
+        entry, rows = self._build(x.device), int(x.shape[0])
+        # what the call log of a traced step reads back (``serving``): the instance, and the step shape of the slot table it is
+        # handed with this call -- its ``state_indices`` operand, [sequences, tokens] -- not the row's
+        self._served = (entry, tuple(int(n) for n in table.indices.shape))
+        out = torch.empty((rows, params.value_heads, params.head_dim), dtype=torch.float8_e4m3fn, device=x.device)  # this call's own
+        try:
+            entry(*self._operands(x, z, hidden, table, params, slots), out)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.GdnVerifyFused declined the operands of this step: {error}") from error
+        return ScaledTensor(out.view(torch.uint8).view(rows, -1), params.out_scale_value)
 
 
 class AttentionGateQuantDecodeBlock(EntryBlock):
@@ -584,7 +795,7 @@ class AddNormQuantDecodeBlock(EntryBlock):
 
     def check_support(self, sequences: int, tokens: int) -> None:
         self._check_package()
-        for site in [site for site, _ in self.row.sites] or [""]:
+        for site in self._named():
             self._arguments(site)
         if self.facts.total_bytes and "device" in self.options:
             for site in self._sites():  # the first use, where the entry gates the toolchain, follows the memory sentence
@@ -656,7 +867,7 @@ class AddNormQuantDecodeBlock(EntryBlock):
 
         if self._twin is None:
             self._twin = torch_ref.AddNormQuantizeBracket(reference.row, self.model, self.facts, self.options)
-            self._twin.forms = {site: dict(self.row.site_form(site)) for site in [site for site, _ in self.row.sites] or [""]}
+            self._twin.forms = {site: dict(self.row.site_form(site)) for site in self._named()}
         return self._twin
 
     def first_use(self, sequences: int, tokens: int) -> None:
@@ -781,10 +992,14 @@ class Fp8ProjectionDecodeBlock(EntryBlock):
 
     def check_support(self, sequences: int, tokens: int) -> None:
         self._check_package()
-        for site in [site for site, _ in self.row.sites] or [""]:
+        for site in self._named():
             self._arguments(site)
         rule = self.options.get("merge_rule", "largest_scale")
-        if rule != "largest_scale":  # the entry reads ONE scale element per call: a weight merged with a scale per row is not its operand
+        # the entry reads ONE scale element per call: a weight merged with a scale per row is not its operand.  Which weights
+        # a merge rule gives one scale per row is the family's to say, per call site (``scale_per_row``): a weight that is
+        # one stored tensor has one scale under every rule.  A family that does not say is asked for the default rule
+        per_row = getattr(self.model, "scale_per_row", None)
+        if rule != "largest_scale" and (not callable(per_row) or any(per_row(site, rule) for site in self._named())):
             raise NotImplementedError(
                 f"cudnn.Fp8ProjectionDecode takes one scale per weight; the merge rule {rule!r} keeps one per weight row: load with the merge "
                 f'rule "largest_scale", or select another declared row of the block with --provider'

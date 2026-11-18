@@ -33,6 +33,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 
 from ..common import expand, gate_bwd, head_reduce, l2norm
@@ -1251,7 +1252,8 @@ def run_chain_backward(
     """Replay the chain backward: one crossing into the DSL for its launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
     cu_stream = cuda.CUstream(int(stream))
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

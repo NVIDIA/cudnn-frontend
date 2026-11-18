@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from ..census import Kernel
 from ..sampling import greedy
+from ..state import RecurrentSlots, TokenSlots
 from ..weights import BLOCK, E4M3_MAX, BlockScaledTensor, Dequantized, ScaledTensor, _e2m1, _e4m3, _e4m3_values, dequantize, quantize_fp8, quantize_nvfp4
 from . import PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
 
@@ -117,6 +118,22 @@ def attention(q: torch.Tensor, cache, position: int, acc) -> torch.Tensor:
     qg = q.to(acc).view(rows, HK, H // HK, D)
     p = torch.softmax(torch.einsum("bhgd,bhtd->bhgt", qg, k) * D**-0.5, dim=-1)
     return torch.einsum("bhgt,bhtd->bhgd", p, v).reshape(rows, H * D).to(BF16)
+
+
+def attention_prepare_tokens(qkv: torch.Tensor, cache, position: int, tokens: int, p, eps: float, acc):
+    """:func:`attention_prepare` for a step of ``tokens`` tokens per sequence, whose rows are sequence by sequence: token ``t``
+    of every sequence is prepared and inserted at ``position + t``, one call per token -- the arithmetic of ``tokens``
+    decode steps at their own shapes.  Returns ``(q, gate)`` in the step's row order."""
+    rows = qkv.unflatten(0, (-1, tokens))
+    parts = [attention_prepare(rows[:, t], cache, position + t, p, eps, acc) for t in range(tokens)]
+    return tuple(torch.stack([part[output] for part in parts], dim=1).flatten(0, 1) for output in (0, 1))
+
+
+def attention_tokens(q: torch.Tensor, cache, position: int, tokens: int, acc) -> torch.Tensor:
+    """:func:`attention` for a step of ``tokens`` tokens per sequence: token ``t`` of every sequence attends to the cached
+    keys and values up to ``position + t`` (its own included, the later tokens' not), one call per token."""
+    rows = q.unflatten(0, (-1, tokens))
+    return torch.stack([attention(rows[:, t], cache, position + t, acc) for t in range(tokens)], dim=1).flatten(0, 1)
 
 
 def gate_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
@@ -330,6 +347,39 @@ def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> Scaled
     return ScaledTensor(codes.reshape(rows, NV * D), p.out_scale_value)
 
 
+def gdn_verify_step(x, z, hidden, table: TokenSlots, p, slots, eps: float, acc, anchor=None) -> ScaledTensor:
+    """One verify step of a gated delta-rule linear-attention layer: ``tokens`` decode steps (:func:`gdn_decode_step`) per
+    sequence in one call, on rows that are sequence by sequence, each token's state kept in a slot of its own.  A sequence
+    starts from the slot of the token the last step kept (``table.accept``) and from the three history columns that
+    token left; the state after token ``t`` is written to the slot of (sequence, ``t``), and the history becomes ``[the
+    last two taps, x of token 0, .., x of token T - 1]``.  So the state a step leaves for token ``t`` is the state of
+    ``t + 1`` decode steps, and a run that keeps ``t`` tokens behind the first goes on from exactly that.  Returns the
+    8-bit output ``[rows, V * D]`` in the step's row order.
+
+    ``anchor`` is for the check of a kernel that makes this step in one launch: the state pool as that kernel left it.
+    Every token after the first then starts from the state the KERNEL wrote for the token before it, so each token is
+    one decode step compared on its own -- the comparison the decode step's band is stated for, in which a rounding
+    that falls on the other side of a midpoint is seen at the token where it happens and not again at every later one."""
+    sequences, tokens = table.sequences, table.tokens
+    slot, kept = table.indices.long(), table.accept
+    home = slot[:, 0]  # a sequence's history lives in its plain slot
+    taps = slots.conv_storage.shape[1] - tokens + 1
+    work = RecurrentSlots(torch.zeros_like(slots.state[: sequences + 1]), torch.zeros_like(slots.conv_storage[: sequences + 1, :taps]))
+    work.state[1:] = slots.state[slot[:, kept]]
+    work.conv_storage[1:] = slots.conv_storage[home, kept : kept + taps]
+    last = work.conv_storage[1:, 1:].clone()  # the taps that stay in front of the step's own rows
+    ids = torch.arange(1, sequences + 1, dtype=torch.int32, device=x.device)
+    xs, zs, hs = (rows.unflatten(0, (sequences, tokens)) for rows in (x, z, hidden))
+    codes = []
+    for t in range(tokens):
+        if anchor is not None and t:
+            work.state[1:] = anchor[slot[:, t - 1]]
+        codes.append(gdn_decode_step(xs[:, t], zs[:, t], hs[:, t], ids, p, work, eps, acc).codes)
+        slots.state[slot[:, t]] = work.state[1:]
+    slots.conv_storage[home] = torch.cat((last, xs), dim=1)
+    return ScaledTensor(torch.stack(codes, dim=1).flatten(0, 1), p.out_scale_value)
+
+
 class _Reference(BlockBase):
     """A block served by this module.  ``eps`` is the model's norm epsilon; ``acc`` the accumulation dtype of the run.  Its
     census entry is the family of PyTorch's own kernels; a chain that multiplies (``matmul``, ``einsum``) adds cuBLAS's."""
@@ -453,6 +503,9 @@ class AttentionPrepare(_Reference):
     state_args = (1,)
 
     def __call__(self, qkv, cache, position, params):
+        tokens = getattr(cache, "tokens", 1)  # of the steps that write this cache: a step of several inserts that many positions
+        if tokens > 1:
+            return attention_prepare_tokens(qkv, cache, position, tokens, params, self.eps, self.acc)
         return attention_prepare(qkv, cache, position, params, self.eps, self.acc)
 
 
@@ -461,6 +514,9 @@ class Attention(_Reference):
     per_row = (0, 1)
 
     def __call__(self, q, cache, position):
+        tokens = getattr(cache, "tokens", 1)
+        if tokens > 1:
+            return attention_tokens(q, cache, position, tokens, self.acc)
         return attention(q, cache, position, self.acc)
 
 
@@ -496,5 +552,17 @@ class GdnDecodeStep(_Reference):
     per_row = (0, 1, 2, 3)
     state_args = (5,)
 
+    tokens = 1  # per sequence, of the last call: a check names the state slots of a step of several by token and sequence
+    #: set by the block check for ONE call, where this block is compared with a kernel: what that kernel's call left in
+    #: the state the call updates (per state operand its tensors).  A step of several tokens then follows the kernel
+    #: token by token (``gdn_verify_step(anchor=)``).  ``None`` everywhere else: the reference stack runs its own chain
+    anchor = None
+
     def __call__(self, x, z, hidden, slot_ids, params, slots):
+        anchor, self.anchor = self.anchor, None
+        if isinstance(slot_ids, TokenSlots):  # a step of several tokens per sequence hands its slot table over: the verify step
+            self.tokens = slot_ids.tokens
+            pool = None if anchor is None else anchor[0][0]  # of the one state operand, its recurrent states
+            return gdn_verify_step(x, z, hidden, slot_ids, params, slots, self.eps, self.acc, pool)
+        self.tokens = 1
         return gdn_decode_step(x, z, hidden, slot_ids, params, slots, self.eps, self.acc)

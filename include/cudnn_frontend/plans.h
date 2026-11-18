@@ -309,6 +309,8 @@ create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
 
 namespace graph {
 class Execution_plan_list {
+    friend struct KernelCacheTestAccess;
+
     std::string operation_tag;
 
     std::vector<bool> barred_indices;
