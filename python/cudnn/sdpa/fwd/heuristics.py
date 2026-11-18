@@ -288,6 +288,8 @@ _SM80_SPLIT_KV_COMBINE_COST = 0.02
 # directions, so it takes a direct rule (_sm80_paged_d256_split_choice): the largest power-of-two split that keeps >= 8 KV tiles
 # per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced split 1.388 -> 1.038 on
 # 60 train cells, 1.338 -> 1.033 on 30 holdout cells, no cell slower than today's choice. Dense d256 keeps the shared model.
+# Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128: 0.790 of split 64 on 18 fresh cells, none slower
+# (sm80_d256_split128_q1_20261118); at S_q 4 it was not always faster (sm80_d256_split128_base1_20261118: 1.101).
 _SM80_PAGED_D256_SPLIT_MIN_KV_TILES = 8
 _SM80_PAGED_D256_SPLIT_MAX_WAVES = 16
 _SM80_SPLIT_PARTIAL_O_MAX_ELEMS = 1 << 31  # SM80 split-KV faults once the partial-O buffer reaches 2^31 elements
@@ -2658,13 +2660,14 @@ def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> 
 
 
 def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
-    """The largest power-of-two split <= 64 with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES
-    waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
+    """The largest power-of-two split <= 64 (128 for single-row decode on a one-CTA grid) with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles
+    per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 32)
     ctas = facts.b * (facts.h_q // pack_g) * _ceil_div(facts.s_q * pack_g, tile_m or 64)
+    cap = 128 if facts.s_q == 1 and ctas == 1 else 64
     split = 1
     while (
-        split < 64
+        split < cap
         and kv_tiles // (2 * split) >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES
         and ctas * 2 * split <= _SM80_PAGED_D256_SPLIT_MAX_WAVES * sm_count
         and 2 * split * facts.b * facts.s_q * facts.h_q * facts.d_v < _SM80_SPLIT_PARTIAL_O_MAX_ELEMS
