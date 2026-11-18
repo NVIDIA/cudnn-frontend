@@ -1692,6 +1692,9 @@ def _check_block_quant_supported(
     """Gate a block_scale_quantize epilogue (sm100 #1090 semantics, swap-AB aware)."""
     if not chain.quants:
         return
+    if any(q.scale_dtype == "fp32" for q in chain.quants):
+        # A wide quantize (fusion_ir.wide_quant) needs the two-sweep drain of the sm100 general block-scale templates.
+        raise NotImplementedError("an fp32 block quantize scale (FP8 block-128 output) is produced by the sm100 general block-scale templates only")
     _check_block_quant_semantics(chain)
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes

@@ -29,6 +29,12 @@ class EpilogueSnippets:
     tap_constants: list[str] = field(default_factory=list)
     mainloop_transform_a: str = "pass"
     mainloop_transform_b: str = "pass"
+    # The wide quantize (fusion_ir.wide_quant) of the general block-scale templates, in three hook-site snippets: the
+    # values of one epilogue vector (first sweep), a row's scale once its maximum is known, and the quantize and
+    # store of one reloaded vector (second sweep).
+    wq_values: str = "pass"
+    wq_scale: str = "pass"
+    wq_store: str = "pass"
 
 
 def _aux_ptr_var(name: str) -> str:

@@ -186,12 +186,64 @@ def _operand_aux_rule(ref, chain: FusionChain) -> OperandAuxRule | None:
     return OperandAuxRule(ref.dim, dtype, domains, ref.name)
 
 
+_TORCH_SCALE_DTYPE = {
+    "fp32": "float32",
+    "bf16": "bfloat16",
+    "fp16": "float16",
+    "fp8_e4m3": "float8_e4m3fn",
+    "fp8_e5m2": "float8_e5m2",
+    "fp8_e8m0": "float8_e8m0fnu",
+    "int8": "int8",
+    "int32": "int32",
+}
+
+
+@dataclass(frozen=True)
+class LinearScaleRule:
+    """A plain strided scale tensor the general block-scale kernel indexes itself.
+
+    The kernel reads ``scale[l, mn // block_mn, k // block_k]`` for A and ``scale[l, k // block_k, mn // block_mn]``
+    for B (``mn`` is M for A and N for B) with the call's own strides, so any layout of the right shape, dtype and element alignment works."""
+
+    block_mn: int
+    block_k: int
+    dtype: str
+    batch: int  # 1 when the compiled kernel broadcasts one scale plane over every batch
+
+    def reject(self, buffer, is_a: bool, mn: int, k: int) -> "str | None":
+        shape = tuple(int(s) for s in buffer.shape)
+        mn_blocks, k_blocks = -(-mn // self.block_mn), -(-k // self.block_k)
+        expected = (self.batch, mn_blocks, k_blocks) if is_a else (self.batch, k_blocks, mn_blocks)
+        if shape != expected:
+            return f"expected shape {expected} for {self.block_mn}x{self.block_k} blocks, got {shape}"
+        if dtype_name(buffer) != _TORCH_SCALE_DTYPE[self.dtype]:
+            return f"expected dtype {_TORCH_SCALE_DTYPE[self.dtype]}, got {dtype_name(buffer)}"
+        checked_layout(buffer.shape, buffer.stride())
+        if int(buffer.data_ptr()) % buffer.element_size():
+            return f"pointer 0x{int(buffer.data_ptr()):x} is not aligned to its {buffer.element_size()}-byte elements"
+        return None
+
+
 @dataclass(frozen=True)
 class ScaleFactor:
     index: int
     role: str
     is_a: bool
     operand_at: int  # the A or B operand this one scales, as an index into inputs
+    linear: "LinearScaleRule | None" = None  # None: a packed F8_128x4 blob read through TMA
+
+
+def linear_scale_rules(chain: FusionChain) -> "tuple[LinearScaleRule | None, LinearScaleRule | None]":
+    """The (A, B) scale rules of a general block-scale chain; ``None`` for an unscaled side."""
+    bs = chain.block_scale
+    rules = []
+    for block, dtype, dim, k_axis in ((bs.a_scale_block, bs.sf_dtype_a, bs.sfa_dim, 2), (bs.b_scale_block, bs.sf_dtype_b, bs.sfb_dim, 1)):
+        if block is None:
+            rules.append(None)
+            continue
+        mn_axis = 3 - k_axis
+        rules.append(LinearScaleRule(block_mn=block[mn_axis], block_k=block[k_axis], dtype=dtype, batch=int(dim[0])))
+    return rules[0], rules[1]
 
 
 def _batch_shape(shape, prefix):
@@ -366,7 +418,8 @@ def _output_shape_reject(recipe: GemmRecipe, operands, mnk) -> "str | None":
 def _align_reject(recipe: GemmRecipe, operands) -> "str | None":
     """Every buffer's alignment must meet the width its role's access uses."""
     bad = []
-    for item in recipe.inputs + recipe.sf:
+    # A linear scale tensor is read one element at a time; its rule checks element alignment.
+    for item in recipe.inputs + tuple(s for s in recipe.sf if s.linear is None):
         ptr = int(operands[item.index].data_ptr())
         align = _pow2_floor(ptr)
         if align < 16:
@@ -413,8 +466,14 @@ def _sf_blob_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
     m, n, k = mnk
     k4 = ((k // recipe.block_size) + 3) // 4
     bad = []
+    linear_bad = []
     for sf in recipe.sf:
         v = operands[sf.index]
+        if sf.linear is not None:
+            reason = sf.linear.reject(v, sf.is_a, m if sf.is_a else n, k)
+            if reason is not None:
+                linear_bad.append(f"{sf.role}: {reason}")
+            continue
         if len(v.shape) != 3:
             bad.append(f"{sf.role}: expected a rank-3 buffer, got shape={tuple(v.shape)}")
             continue
@@ -431,6 +490,8 @@ def _sf_blob_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
             bad.append(
                 f"{sf.role} is {have}B but the kernel reads {required}B ({required // 512} atoms of 128 rows x 4 SF-K) — was it produced by to_blocked()?"
             )
+    if linear_bad:
+        return "block-scale scale tensors must match the graph's blocks: " + "; ".join(linear_bad)
     if bad:
         return "block-scale F8_128x4 scale factors must be a packed blob: " + "; ".join(bad)
     return None
@@ -641,9 +702,12 @@ def build(compiled) -> GemmRecipe:
         for i, (t, ref) in enumerate(zip(binding.aux, chain.aux_tensors))
     )
     na = len(binding.a_operands)
+    rule_a = rule_b = None
+    if compiled.block_scale and not chain.has_moe and chain.block_scale.linear_scales:
+        rule_a, rule_b = linear_scale_rules(chain)
     sf = tuple(
-        [ScaleFactor(index=order[id(t)], role=f"SFA[{i}]", is_a=True, operand_at=i) for i, t in enumerate(binding.sfa_operands)]
-        + [ScaleFactor(index=order[id(t)], role=f"SFB[{j}]", is_a=False, operand_at=na + j) for j, t in enumerate(binding.sfb_operands)]
+        [ScaleFactor(index=order[id(t)], role=f"SFA[{i}]", is_a=True, operand_at=i, linear=rule_a) for i, t in enumerate(binding.sfa_operands)]
+        + [ScaleFactor(index=order[id(t)], role=f"SFB[{j}]", is_a=False, operand_at=na + j, linear=rule_b) for j, t in enumerate(binding.sfb_operands)]
     )
 
     roles = [f"bound tensor {i}" for i in range(len(binding.bound_tensors()))]

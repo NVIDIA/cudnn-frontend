@@ -210,7 +210,9 @@ def _output_align_reqs(chain: FusionChain, tma_slots: "frozenset[int]", vec_byte
     reqs = []
     for i, out in enumerate(chain.outputs):
         eb = DTYPE_BYTES[out.dtype]
-        if out.is_reduction or out.is_quant_scale:
+        if out.is_quant_scale and out.dtype == "fp32":
+            reqs.append(eb)  # one aligned fp32 store per block (the wide quantize)
+        elif out.is_reduction or out.is_quant_scale:
             reqs.append(1)
         elif chain.output_specs[i].major == "m":
             reqs.append(16 if i in tma_slots else eb)

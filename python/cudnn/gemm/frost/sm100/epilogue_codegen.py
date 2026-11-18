@@ -43,6 +43,7 @@ from ..fusion_ir import (
     TensorRef,
     gemm_index,
     is_gemm_source,
+    wide_quant,
 )
 
 _aux_codegen = _AuxCodegen(wide_offsets=False)
@@ -536,6 +537,94 @@ def _emit_block_quant(
     return _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
 
 
+_F32_MAX = "cutlass.Float32(3.402823466e38)"
+
+
+def _emit_wide_quant(
+    chain: FusionChain,
+    quant: BlockQuantizeSpec,
+    quant_idx: int,
+    spec,
+    out_idx: int,
+    source_var: str,
+    tap_idx: int,
+    scale_tap_idx: int,
+    vsize: int,
+    row_pred: str,
+    batch_index_expr: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """The three snippets of a wide quantize (:func:`~..fusion_ir.wide_quant`): ``(values, scale, store)``.
+
+    The general templates drain a wide-quantized tile in two sweeps. ``values`` runs once per epilogue vector of the
+    first sweep: it binds ``wq_src`` (the fp32 values, which the template writes back over the accumulator) and
+    folds their magnitudes into the block maxima. ``scale`` runs once per thread between the sweeps. ``store`` runs
+    once per vector ``wq_val`` reloaded in the second sweep: it scales, converts and stores it.
+
+    A block along the tile's columns (the kernel frame's N) is one thread's, so its maximum is a running scalar
+    ``wq_amax`` and ``scale`` stores the row's scale. A block along the lanes (the kernel frame's M: the swapped
+    grouped kernels, whose lanes are the output columns) spans the four epilogue warps: ``values`` reduces every
+    column over the warp and leaves each warp's maxima in ``wq_colmax`` (this drain's buffer ``wq_buf`` of two); after
+    the template's barrier, ``store`` combines the four, and warp 0 stores the scales. Every maximum a lane loads
+    reaches a global store of that drain (the scale, or the data it scales) before the lane arrives at the next
+    drain's barrier, behind which the buffer is rewritten. Either way the scale is ``amax / max(output dtype)`` as a
+    linear fp32, and a block of zeros stores scale 0 and data 0 (the reciprocal is clamped to the largest float)."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    bs = quant.block_size
+    out_max = _quant_output_max(spec.dtype)
+    l_term = "" if batch_index_expr == "0" else f"{batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
+    qv = f"_quant_data_{out_idx}"
+    values = [f"wq_src = ({source_var}).to(cutlass.Float32)"]
+    scale: list[str] = []
+    store: list[str] = []
+    if quant.axis != 1:
+        values += [
+            f"_wq_abs = cute.math.absf(cute.TensorSSA(wq_src.ir_value(), ({vsize}, 1), cutlass.Float32))",
+            "wq_amax = cute.math.max(wq_amax, _wq_abs[None, 0].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))",
+        ]
+        scale += [
+            f"_wq_sf = wq_amax * cute.arch.rcp_approx({out_max})",
+            f"wq_inv = cute.math.min(cute.arch.rcp_approx(_wq_sf), {_F32_MAX})",
+            # The tile's columns are one block of the row; a cluster's tile past N stores nothing.
+            f"if ({row_pred}) & (coord_n_c + {bs} <= N):",
+            f"    (gC_tap_{scale_tap_idx}_ptr + {l_term}row * quant_scale_stride_m_{quant_idx} + (coord_n_c // {bs}) * quant_scale_stride_n_{quant_idx}).store(_wq_sf, alignment=4)",
+        ]
+        store.append(f"_wq_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)")
+        for e in range(0, vsize, 2):
+            store.append(f'_wq_out[{e}], _wq_out[{e + 1}] = cute.arch.mul_packed_f32x2((wq_val[{e}], wq_val[{e + 1}]), (wq_inv, wq_inv), rnd="rn", ftz=False)')
+    else:
+        # Lane l of a warp keeps (and later combines) the maximum of tile column wq_col + l.
+        values.append("_wq_mine = cutlass.Float32(0.0)")
+        for c in range(vsize):
+            values += [f'_wq_a{c} = cute.arch.warp_redux_sync(wq_src[{c}], "fmax", abs=True)', f"if lane == {c}:", f"    _wq_mine = _wq_a{c}"]
+        values += [f"if lane < {vsize}:", "    (wq_colmax.subview(wq_buf + warp_idx * epi_cols_per_mma_m + wq_col + lane)).store(_wq_mine)"]
+        store += ["_wq_m = cutlass.Float32(0.0)", f"if lane < {vsize}:", "    _wq_m = (wq_colmax.subview(wq_buf + wq_col + lane)).load()"]
+        store += [f"    _wq_m = cute.math.max(_wq_m, (wq_colmax.subview(wq_buf + {w} * epi_cols_per_mma_m + wq_col + lane)).load())" for w in range(1, 4)]
+        store += [f"_wq_sfm = _wq_m * cute.arch.rcp_approx({out_max})", f"_wq_inv = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
+        store += [f"_wq_inv[{c}] = cute.math.min(cute.arch.rcp_approx(cute.arch.shuffle_sync(_wq_sfm, cutlass.Int32({c}))), {_F32_MAX})" for c in range(vsize)]
+        store.append(f"_wq_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)")
+        for e in range(0, vsize, 2):
+            store.append(
+                f"_wq_out[{e}], _wq_out[{e + 1}] = cute.arch.mul_packed_f32x2("
+                f'(wq_val[{e}], wq_val[{e + 1}]), (_wq_inv[{e}], _wq_inv[{e + 1}]), rnd="rn", ftz=False)'
+            )
+    store.append(f"{qv} = (_wq_out.load().to_vector()).to({DTYPE_TO_CUTLASS[spec.dtype]})")
+    col_bound = "group_end" if swapped else "N"
+    if spec.major == "m":
+        store += _emit_mmajor_scatter(tap_idx, out_idx, qv, spec.dtype, chain.matmul.batch, vsize, row_pred=row_pred, converted=True, col_bound=col_bound)
+    else:
+        offset_expr = _dense_store_offset(out_idx, False, chain.matmul.batch)
+        store += _emit_tap_store(
+            tap_idx, qv, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=row_pred, converted=True, col_bound=col_bound
+        )
+    if quant.axis == 1:
+        # One scale per (block of lanes, tile column): warp 0's lane l stores column col_j + l's.
+        store += [
+            f"if (warp_idx == 0) & (lane < {vsize}) & (col_j + lane < {col_bound}):",
+            f"    (gC_tap_{scale_tap_idx}_ptr + {l_term}(row // {bs}) * quant_scale_stride_m_{quant_idx} + (col_j + lane) * quant_scale_stride_n_{quant_idx}).store(_wq_sfm, alignment=4)",
+        ]
+    return values, scale, store
+
+
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
     """Declare a materialized output's symbolic shape."""
     if chain is not None and chain.has_moe and chain.moe.mode == "combine":
@@ -645,6 +734,24 @@ def generate(
                 source_uses[specs[oi].source_ref],
             )
         )
+    wq = wide_quant(chain)
+    wq_values = wq_scale = wq_store = "pass"
+    if wq is not None:
+        # The general templates drain a wide-quantized tile in a branch of their own (two sweeps): the shared
+        # per-vector body is not rendered. compiler._check_wide_quant_supported has vetted the chain.
+        (si,) = output_order
+        spec = specs[si]
+        row_pred = f"row < {row_bound}"
+        if packed_lanes:
+            row_pred = f"row_active & ({row_pred})"
+        values, scale, store = _emit_wide_quant(
+            chain, wq, spec.quant_idx, spec, si, _parent_value(spec.source_ref), _tap_of[si], _scale_tap_idx(spec.quant_idx), vsize, row_pred, quant_batch_expr
+        )
+        wq_values = "\n".join(body_lines + values)
+        wq_scale = "\n".join(scale) or "pass"
+        wq_store = "\n".join(store)
+        body_lines = ["pass"]
+        output_order = []
     k_pad_lines: list[str] = []
     for si in output_order:
         spec = specs[si]
@@ -784,4 +891,7 @@ def generate(
         tap_compile_pass=tap_compile_pass,
         tap_ptr_binds=tap_ptr_binds,
         tap_constants=tap_constants,
+        wq_values=wq_values,
+        wq_scale=wq_scale,
+        wq_store=wq_store,
     )

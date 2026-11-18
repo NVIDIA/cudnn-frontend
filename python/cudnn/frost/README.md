@@ -990,6 +990,152 @@ independent root model; source comments link this section instead of repeating
 the encoding details.
 
 
+## SM100 general block scale
+
+The block-scaled MMA kinds read only 1x16 / 1x32 scale factors in the swizzled
+F8_128x4 layout. A non-MoE block-scale graph whose real scale tensors are all
+linear (reorder NONE) classifies as `GraphType.GENERAL_BLOCK_SCALE_MATMUL` and
+renders `sm100_general_block_scale_matmul.py`, which applies the scales to the
+accumulator instead. Examples are DeepSeek FP8 with 1x128 activation and
+128x128 weight scales, per-tensor or per-channel scales, and any scale dtype.
+F8_128x4 graphs keep the native templates.
+
+The template is `sm100_block_scale_matmul.py` with the scale-factor path and
+the MMA replaced; the A/B loads, the scheduler and the epilogue are unchanged.
+The epilogue parity test holds the drain to the block-scale group.
+
+- **Promotion window.** Every scale is constant over `promotion_k`, the gcd of
+  the scaled sides' K blocks. It must be a multiple of the 32-byte MMA
+  instruction's K: 32 elements for 8-bit data, 16 for 16-bit data. A window may
+  lie inside one K tile or span several. A split-K range also closes a window,
+  and each split then scales its own part of the block, which is the same sum.
+- **MMA warp.** It issues the plain `tcgen05.mma` per window into a partial TMEM
+  accumulator. Each window starts with `enable_input_d = False` and ends with a
+  `tcgen05.commit` to `partial_full`.
+- **Promotion warps (8..15).** Two warpgroups. A thread owns one TMEM lane (a
+  row, as an epilogue thread does) and its warpgroup's half of the accumulator
+  columns, so a window costs a warp half of the TMEM reads and of the
+  arithmetic: the promotion of a window has to finish within the MMA of the
+  next one, or it holds the MMA back. Each thread takes the window's scales,
+  waits for the partial and `tcgen05.ld`s it in 32-column chunks.
+- **Running sum.** When a thread's share is at most 64 columns and needs at
+  most 8 scale products per window, the sum stays in its registers: a window is
+  one `tcgen05.ld` per chunk and `fma.rn.f32x2` per column pair
+  (`sum += partial * scale_a[row] * scale_b[col]`), and the thread stores the
+  sum to the main accumulator once, after the tile's last window. Otherwise
+  (a 256-column tile, a 256-row CTA, a B scale per column) the sum stays in the
+  main accumulator: every window also loads the main and stores `main +
+  partial * scale`, the first window of a tile overwriting. Either way the
+  thread releases the partial after the window and arrives on `acc_full` after
+  the tile's last one.
+- **Registers.** The launch passes `min_blocks_per_mp=1`. Without it the
+  assembler cannot tell the register count at entry, ignores `setmaxnreg`, and
+  holds every warp to the entry count (128 for 512 threads): the running sum
+  then fails to assemble or spills to the stack, which is about 40x slower.
+  `cuobjdump -sass` of the cubin (`CUTE_DSL_KEEP=cubin`) shows no `LDL` / `STL`
+  when it fits.
+- **TMEM budget.** TMEM holds main stages for the epilogue plus partial stages:
+  two main stages when four accumulators fit, else one, and up to four partial
+  stages in what is left. A 128-column accumulator runs (2, 2); a 256-column
+  one runs (1, 1), so its MMA and promotion alternate.
+- **Scale loads.** The next window's global scale loads are issued while the
+  current window is promoted. One B scale is loaded per run of
+  `gcd(block_n, columns per thread)` columns, since a thread's columns start at
+  a multiple of their count.
+- **Scale reads.** The promotion warps index each scale tensor through its own
+  strides, so any layout of shape `[1 or L, ceil(rows / block), ceil(cols /
+  block)]` works.
+- **Partial last block.** Rows, columns and whole windows past M, N or K read
+  no scale and are scaled by zero.
+- **Gates.** `kernel_registry.general_block_scale_reject` holds the data pairs
+  and scale dtypes. uint8 scales are excluded because the DSL widens a loaded
+  `Uint8` scalar as signed. `sm100/compiler.py::_general_block_scale_plan`
+  rejects swapAB, a 64-byte MMA K, multi-GEMM and `cta_tile_k_bytes != 128`.
+  Coverage lives in `gemm/frost/test_general_block_scale_matmul.py`.
+
+### Grouped (MoE) general block scale
+
+A grouped block-scale graph with linear scales classifies as
+`GraphType.GENERAL_MOE_BLOCK_SCALE` (or `..._SWAP_AB` under a `MoeSwapAbSpec`
+plan) and renders one of four templates, each the native grouped template of
+the same name with the scale-factor path and the MMA replaced as above:
+
+| Template | Source | Warps |
+|---|---|---|
+| `sm100_general_moe_grouped_block_scale_matmul_fwd.py` | `..._moe_grouped_block_scale_matmul_fwd.py` | 16 |
+| `..._fwd_swap_ab.py` | `..._fwd_swap_ab.py` | 16 |
+| `..._fwd_gather_mode.py` | `..._fwd_gather_mode.py` | 20 |
+| `..._fwd_gather_mode_swap_ab.py` | `..._fwd_gather_mode_swap_ab.py` | 20 |
+
+A GATHER graph whose only scale is a native-dtype token scale keeps the native
+template (its packed token-SF layout); every other linear-scale grouped graph
+takes a general one.
+
+- **Scale tensors.** They arrive in operand kernel order: the token side as
+  `(rows, k, l)`, the weight side as `(n, k, l)` with one batch entry per
+  expert, read at the tile's expert. GATHER reads the token scale of a row
+  through `token_index`, as it reads the row. The launcher checks each bound
+  scale buffer against `[1 or L, ceil(rows / block), ceil(K / block)]` of its
+  operand (`compiler.py::_general_moe_scale_reject`).
+- **Promotion warps.** The plain templates add warps 8..15, as the dense one.
+  The async GATHER templates keep their 20 warps: the SF-copy and SF-pack
+  warps (8..11, 16..19) have no scale factors to move and become the two
+  promotion warpgroups; warps 12..15 still copy tokens. The scheduler ring
+  counts the promotion warps among its consumers, since they need the tile's
+  expert and group bounds.
+- **Column scales.** A scale that is the same for every lane of a tile -- the
+  weight scale along the columns, and under swapAB the token scale of each
+  column -- is not loaded by every thread.
+  - *Few column runs per thread (at most 8).* Each lane loads one slot of a
+    (column run, window) grid, several windows per load, and the warp
+    distributes it with `shfl.sync`. A grid period is loaded one period ahead
+    of its use, and a thread shuffles all of its runs out while it waits for
+    the MMA.
+  - *Many runs (`promo_scale_table`: a swapped tile of 32 token columns or
+    more).* One warp of each promotion warpgroup loads the window's runs
+    (lane = run, a window ahead) and writes them to a shared-memory table,
+    one per (warpgroup, partial stage), after the partial is full -- which is
+    when no warp reads the stage's previous table any more. It then arrives
+    on the table's barrier; the group's other warps wait on it and read the
+    scales in 16-byte loads as they fold column pairs. Shuffles and per-thread
+    global loads cost a 128-column tile about a fifth of its time.
+  - Under swapAB the weight scale is uniform over a thread's rows as well (a
+    128-row MMA block lies in one scale block), so the loader multiplies it
+    into the grid slot or table entry and a column costs no multiply.
+  A scale that differs per lane (the token scale of a row, unswapped) is
+  loaded by its lane, one window ahead.
+- **Register budget.** `sm100/compiler.py::_general_block_scale_plan` sizes
+  the promotion warps from what the CTA has left. The GATHER pool is 640
+  threads at the 96-register entry count. The control warpgroup lowers itself
+  to 48 (`gather_ctl_reg_count`; at the sources' 64 the promotion warps of a
+  2-CTA plan spilled to the stack), the token-copy warps keep their source's
+  96 / 112 / 128, the epilogue takes 112 and the promotion warps the rest
+  (112 typically). A thread loads 32 accumulator columns at a time when that
+  fits next to its running sum and 16 otherwise. Check a new configuration
+  with `cuobjdump -sass`: the count the plan promises must be free in the
+  pool, or `setmaxnreg` waits forever.
+- **A/B stages.** A grouped template streams every expert's weights from
+  global memory once, so a tile's time is the load time. When the graph's K
+  spans 32 K tiles or more the plan keeps at most 8 stages: deeper rings were
+  slower on B200 (see `_GENERAL_BS_MOE_MAX_AB_STAGES`).
+- **Tiles.** The token side of a swapped plan is the MMA N, any multiple of
+  16 up to 128 token columns per tile. The fastest tile is the narrowest one
+  that takes an expert's routed rows in one pass over its weights: 16 or 32
+  columns for a few rows per expert, 80 or 96 for 65 to 96, and the unswapped
+  128x128 tile for a few hundred. A 2-CTA unswapped plan needs more than 128
+  rows per expert to pay for its second CTA.
+- **Modes and fusions.** NONE and GATHER select the templates above; SCATTER
+  and COMBINE, a ReLU epilogue, fp32 output and N-major weights run through
+  the plain and swapped templates unchanged from their sources.
+- **Not served.** Multi-GEMM chains (the dual gate / up SwiGLU GEMM among
+  them), token tiles of 8 columns (an M=128 MMA needs N % 16 == 0), and what
+  the dense plan rejects (a 64-byte MMA K, `cta_tile_k_bytes != 128`,
+  `mma_tile_m != 128`).
+  Coverage lives in
+  `gemm/frost/test_general_moe_grouped_block_scale_matmul_fwd.py`; the
+  epilogue parity test holds the drain of each to its source's group.
+
+
 ## Releasing a shared-memory stage: `tile_dsl.consume`
 
 A consumer that read a stage with ordinary shared-memory loads returns it

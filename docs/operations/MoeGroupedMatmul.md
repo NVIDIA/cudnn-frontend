@@ -122,6 +122,48 @@ in both orientations and for ordinary and block-scaled inputs.
 Output rows and row-wise epilogue auxiliaries use routed order.
 The existing dtype, layout, alignment, and fusion support gates still apply.
 
+### FROST linear-scale operands: gated FC1 and FP8 block-128 output
+
+Operands whose scales are linear tensors run on the SM100 `frost_gemm` general
+block-scale kernels: for example DeepSeek FP8, E4M3 data with one FP32 scale
+per 128 K values of a token row (`block_size=[1,128]`) and one per 128x128
+weight block (`block_size=[128,128]`). They serve NONE, GATHER, SCATTER and
+COMBINE in both orientations, and the dense `matmul` of the same operands.
+Two fusions let FC1 produce FC2's input in one kernel, under NONE and GATHER
+(and for the dense `matmul`):
+
+- **Gated pair.** Two grouped matmuls that share the token operand, the
+  offsets and the indices and differ in the weight, joined by a pointwise
+  epilogue such as `mul(swish(gate), up)` (SwiGLU). The kernel runs every tile
+  twice, once per weight, and the epilogue reads both results together. The
+  weights are K-major. The tile config is a 1-CTA MMA tile of at most 128
+  accumulator columns (two accumulator stages); split-K is not supported.
+- **FP8 block-128 output.** `block_scale_quantize(block_size=128)` whose scale
+  output is `FLOAT`: E4M3 data `[1,R,N]` and one FP32 scale per 128
+  output columns of a row, `[1,R,N/128]`, with
+  `scale = max(abs(block)) / 448` and
+  `data = round(value / scale)`. `block_size=[1,128]` is accepted as the same
+  block. A block of zeros stores scale 0 and data 0. `N` is a multiple of 128
+  and the scale tensor is 4-byte aligned, unreordered. It must be the graph's
+  only output, without auxiliary epilogue inputs. Token-by-weight tiles are
+  128 columns wide; weight-by-token (`SWAP_AB=1`) tiles take any token width.
+  Rows past the final offset are not written, in the data or in the scales.
+
+```python
+gate = graph.moe_grouped_matmul(token, gate_weight, first_token_offset, token_index=token_index, mode=cudnn.moe_grouped_matmul_mode.GATHER)
+up = graph.moe_grouped_matmul(token, up_weight, first_token_offset, token_index=token_index, mode=cudnn.moe_grouped_matmul_mode.GATHER)
+hidden = graph.mul(a=graph.swish(input=gate), b=up)
+data, scale = graph.block_scale_quantize(input=hidden, block_size=128)
+data.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+scale.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+```
+
+`token`, `gate_weight` and `up_weight` above are `block_scale_dequantize`
+results over the FP8 operands and their FP32 scales. The two weights may be
+views of one `[E, 2N, K]` buffer: declare each with the buffer's expert
+stride. The quantized data and its scales are exactly the token operand and
+`[1,128]` scale of a following FC2 graph.
+
 ### FROST SCATTER support
 
 FROST supports SCATTER for ordinary and block-scaled MoE on SM100 and SM120,

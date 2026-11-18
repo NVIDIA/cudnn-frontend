@@ -1073,6 +1073,9 @@ the selector and its repair loop to cover this boundary.
 
 Loaded integer vectors can infer `Int8` while retaining no signedness metadata.
 Set the declared integer dtype on the vector wrapper before widening to INT32.
+A scalar `Uint8` loaded through a typed pointer also widens as signed in CuTeDSL 4.8.1:
+`.to(cutlass.Float32)` turns 172 into -84. The general block-scale gate excludes uint8
+scales for this reason.
 CuTeDSL 4.8.0's unary integer vector negation can also crash when building its
 zero constant; subtract from a typed zero vector. Keep each graph node's compute dtype.
 `gemm/frost/test_matmul_mainloop_fusion.py::test_mainloop_int8_identity_preserves_signed_arithmetic`
