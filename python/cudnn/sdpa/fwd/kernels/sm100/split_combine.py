@@ -3464,3 +3464,76 @@ def compile_ptr(
         # default arm, so every existing entry's call is what it was
         **({"quant_rounding": QUANT_ROUNDING_STAGED} if out_rounding == COMBINE_OUT_ROUNDING_STAGED else {}),
     )
+
+
+# ---------------------------------------------------------------------------------------------------
+# The lean group as a CALLABLE: the in-launch reduction of a split tile (kept below every kernel of this module, so the separate
+# pass's own source positions do not move).
+# ---------------------------------------------------------------------------------------------------
+
+
+@cute.jit
+def _store_half_quad(o_out: cute.Tensor, o_batch, o_tok, head, d0, v0, v1, v2, v3):
+    """The lean path's half store of one lane's four columns ``d0 .. d0 + 3`` of the final row ``(o_batch, o_tok, head)``, for
+    :func:`lean_fold_quad`: PACKED -- two ``cvt.rn`` pairs and one 64-bit store -- where the output is 8-byte addressable (base
+    ``& 7 == 0``, D stride 1, the (B, S, H) strides multiples of 4 elements); the element store otherwise, so a strided output keeps
+    its layout.  The same two paths, under the same condition, as the lean store of ``_combine_kernel``."""
+    out_base = o_out.iterator.toint()
+    _st_strides = cutlass.Int64(o_out.stride[0]) | cutlass.Int64(o_out.stride[1]) | cutlass.Int64(o_out.stride[2])
+    st_ok = (
+        ((out_base & cutlass.Int64(7)) == cutlass.Int64(0))
+        & (cutlass.Int64(o_out.stride[3]) == cutlass.Int64(1))
+        & ((_st_strides & cutlass.Int64(3)) == cutlass.Int64(0))
+    )
+    if st_ok:
+        _cvt = "bf16x2" if cutlass.const_expr(o_out.element_type == cutlass.BFloat16) else "f16x2"
+        p01, p23 = nvvm.inline_ptx(
+            f"cvt.rn.{_cvt}.f32 $0, $3, $2;\ncvt.rn.{_cvt}.f32 $1, $5, $4;",
+            write_only_types=[cutlass.Int32, cutlass.Int32],
+            read_only_args=[v0, v1, v2, v3],
+        )
+        o_idx = cute.crd2idx((o_batch, o_tok, head, d0), o_out.layout)
+        st_global_v2(out_base + cutlass.Int64(o_idx) * 2, (p01, p23), cutlass.Int32)
+    else:
+        oo = cutlass.make_array_view(o_out)
+        vals = (v0, v1, v2, v3)
+        for i in cutlass.range_constexpr(4):
+            # Index all modes: ArrayView's row slice is a pointer and drops the final mode's stride.
+            oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+
+
+def lean_fold_quad(o_partial, lse_partial, o_out, n_batch, n_splits, batch, q_row, head, d0):
+    """The lean group's reduction of ONE lane's quad -- columns ``d0 .. d0 + 3`` of the final row ``(batch, q_row, head)`` -- for a
+    kernel that reduces its own split partials inside its launch (the split decode tile under ``CLUSTER_K_REDUCE``).
+
+    It runs what the lean path of ``_combine_kernel`` runs for at most ``G_LEAN_SMALL`` splits, operation for operation:
+    :func:`_lean_accumulate` at ``G_LEAN_SMALL`` over the split-major fp32 partials (every load first; the weights in split order
+    from +0), the reciprocal of the floored denominator, the dead-row SELECT, the four products and the half store of
+    :func:`_store_half_quad`.  A caller that publishes its partials before calling it therefore stores the bytes the separate pass
+    would store from the same slab; the decode suite compares the two forms byte for byte, so an edit to either sequence is an edit to
+    both.  ``n_splits`` is a Python int in ``2 .. G_LEAN_SMALL`` (a trace-time constant: the slots past it fold away, and each adds an
+    exact zero in the separate pass).  The partial slab must be 16-byte aligned and ``d_v`` a multiple of 4 -- the lean path's own
+    conditions, which the separate pass checks at run time and the caller's plan guarantees here.  No sink, natural-log Stats.
+
+    Returns ``(all_dead, den, m_safe)`` for :func:`lean_fold_stats`; every quad of a row returns the same three values."""
+    if not 2 <= int(n_splits) <= G_LEAN_SMALL:
+        raise ValueError(f"lean_fold_quad reduces 2 .. {G_LEAN_SMALL} splits; got {n_splits}")
+    zero = cutlass.Float32(0.0)
+    lse_base = lse_partial.iterator.toint() + cutlass.Int64(cute.crd2idx((batch, head, q_row), lse_partial.layout)) * 4
+    lse_step = cutlass.Int64(lse_partial.stride[0]) * cutlass.Int64(n_batch) * 4
+    o_step = cutlass.Int64(o_partial.stride[0]) * cutlass.Int64(n_batch) * 4
+    o_row_base = o_partial.iterator.toint() + cutlass.Int64(cute.crd2idx((batch, q_row, head, d0), o_partial.layout)) * 4
+    all_dead, den, acc0, acc1, acc2, acc3, m_safe = _lean_accumulate(
+        G_LEAN_SMALL, lse_base, lse_step, o_row_base, o_step, cutlass.Int32(int(n_splits) - 1), cutlass.Int32(int(n_splits)), None
+    )
+    inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+    inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
+    _store_half_quad(o_out, batch, q_row, head, d0, acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
+    return all_dead, den, m_safe
+
+
+def lean_fold_stats(all_dead, den, m_safe):
+    """The natural-log Stats of a row :func:`lean_fold_quad` reduced: ``m + log(sum)``, ``-inf`` on a row whose every split is dead
+    (the floor of the log argument never reaches the output) -- the recombined LSE of ``_combine_kernel``."""
+    lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
+    return cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))

@@ -905,3 +905,24 @@ def test_explicit_d256_body_does_not_reselect_for_query_extent(q_tile, expect, p
     # N16/N32 remain explicit even where default policy chooses lookahead.
     # The helper checks O/Stats, changed-input CUDA Graph replay and no D2H.
     _run_graph(B=2, H=4, KH=4, s_q=33, lens=[257, 130], d=d, page=page, dtype=dtype, expect=expect, explicit_q_tile=q_tile)
+
+
+@pytest.mark.L0
+class TestClusterReduce:
+    """The split tile's in-launch reduction (CLUSTER_K_REDUCE), collected from this architecture entry."""
+
+    import sdpa_decode_cluster_reduce_sm100 as _checks
+
+    test_reduction_matches_reference_and_two_launch_bytes = staticmethod(_checks.test_reduction_matches_reference_and_two_launch_bytes)
+    test_byte_identity_element_budget = staticmethod(_checks.test_byte_identity_element_budget)
+    test_two_chunks_commute = staticmethod(_checks.test_two_chunks_commute)
+    test_stale_partials_are_never_read = staticmethod(_checks.test_stale_partials_are_never_read)
+    test_batch_invariance = staticmethod(_checks.test_batch_invariance)
+    test_replay_capture_and_golden = staticmethod(_checks.test_replay_capture_and_golden)
+    test_warm_refill_stress = staticmethod(_checks.test_warm_refill_stress)
+    test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split = staticmethod(
+        _checks.test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split
+    )
+    test_explicit_record_outside_the_form_is_declined = staticmethod(_checks.test_explicit_record_outside_the_form_is_declined)
+    test_standalone_request_outside_the_form_is_declined = staticmethod(_checks.test_standalone_request_outside_the_form_is_declined)
+    test_python_frame_refuses_an_unaligned_workspace = staticmethod(_checks.test_python_frame_refuses_an_unaligned_workspace)
