@@ -72,8 +72,9 @@ class CuteMoKConfig:
     ``comm_tile_shape`` (BF16 forward and backward only, a compiled variant): rows x columns of one
     communication tile, ``(32, 512)`` (default) or ``(16, 1024)`` (a tuple or the contract's
     ``CommTileShape``), or ``"auto"``: 16 x 1024 when the routed hidden size is a multiple of 1024,
-    otherwise 32 x 512 (chosen from the hidden size alone, a model parameter).  Each row of a tile is one
-    TMA bulk copy of ``columns * 2`` bytes: 1 KiB at 32 x 512, 2 KiB at 16 x 1024, the same 32 KiB slot.
+    otherwise 32 x 512 (chosen from the hidden size alone, a model parameter).  A communication warp moves one
+    32 KiB tile at a time; each row is one TMA bulk copy of ``columns * 2`` bytes: 1 KiB at 32 x 512, 2 KiB at
+    16 x 1024.
     It changes only how the communication CTAs move bytes; the results are bit-identical.  Part of the
     executor cache key; MXFP8 routed weights (their stream has its own fixed tile) take 32 x 512 under
     ``"auto"`` and refuse any other value.

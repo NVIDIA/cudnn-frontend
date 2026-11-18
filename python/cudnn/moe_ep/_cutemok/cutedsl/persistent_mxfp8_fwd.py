@@ -77,12 +77,12 @@ Y_DONE_ROW_BLOCK: Final = 128
 
 
 _CODEGEN_EPOCH: Final = (
-    "mxfp8-fwd-ab6-acc1-sf6-tmem-slots-dsl48" "-v5-comm-stream-32x256-warps7-buffers2-groups4-warpquant-swiglu-split-quant-fusedfc1-bf16gateup"
+    "mxfp8-fwd-ab6-acc1-sf6-tmem-slots-dsl48" "-v5-comm-stream-32x256-warps7-buffers2-groups4-warpquant-swiglu-split-quant-fusedfc1-bf16gateup-commoneloop"
 )
 _ABI_EPOCH: Final = "persistent-mxfp8-eleven-output-five-counter-stream-head-bf16-gate-up-v5"
 # gate_up_context="mxfp8": the e4m3 / scale Gate / Up context (the thirteen-output kernel).
 _CODEGEN_EPOCH_E4M3_CONTEXT: Final = (
-    "mxfp8-fwd-ab6-acc1-sf6-tmem-slots-dsl48" "-v5-comm-stream-32x256-warps7-buffers2-groups4-warpquant-swiglu-split-quant-fusedfc1"
+    "mxfp8-fwd-ab6-acc1-sf6-tmem-slots-dsl48" "-v5-comm-stream-32x256-warps7-buffers2-groups4-warpquant-swiglu-split-quant-fusedfc1-commoneloop"
 )
 _ABI_EPOCH_E4M3_CONTEXT: Final = "persistent-mxfp8-thirteen-output-five-counter-stream-head-v4"
 # The routed Gate / Up context precision (CuteMoKConfig.gate_up_context): "mxfp8" (default) keeps

@@ -80,7 +80,9 @@ REQUIRED_CUDA_MAJOR = 13
 ROUTED_DTYPE = "bfloat16"
 # Executor cache identity: compiled code only; geometry, strides, schedule
 # contents and clamp values are per-call runtime arguments.
-_CODEGEN_EPOCH = "bwd-runtime-geometry-dsl48-v2-epsize-runtime-smalltuple-commworkerinterleave-taskdecode-swiglupeek-onegeometry-commtileshape-commwarpslot"
+_CODEGEN_EPOCH = (
+    "bwd-runtime-geometry-dsl48-v2-epsize-runtime-smalltuple-commworkerinterleave-taskdecode-swiglupeek-onegeometry-commtileshape-commwarpslot-commoneloop"
+)
 
 _EXECUTOR_CACHE: dict[tuple[int, int, "PersistentBf16BwdPlan"], object] = {}
 _EXECUTOR_CACHE_DEVICES: set[int] = set()

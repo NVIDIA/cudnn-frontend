@@ -59,13 +59,13 @@ CLC_RESPONSE_BYTES = 16
 
 @dataclasses.dataclass(frozen=True)
 class CommTileShape:
-    """Rows x BF16 columns of one communication tile of the dynamic task stream (forward and backward): the
-    compile-time parameter of the communication CTAs, one kernel variant per shape.  A tile fills one
-    shared-memory slot; lane ``r`` of a warp owns row ``r`` and moves its row chunk of one column block with one
-    bulk copy (the lanes past ``rows`` move nothing).  Everything else is derived here (host and CPU model) or,
-    over runtime sizes, by the helpers of ``_dynamic_task_stream`` that take the shape: the slot layout, the bytes
-    of one copy, the tile rows of a minibatch / macrobatch (the tasks of the stream), the column blocks of a row,
-    and the arrivals the compute side waits for (one per tile)."""
+    """Rows x BF16 columns of one communication tile of the BF16 task stream (``CuteMoKConfig.comm_tile_shape``):
+    the compile-time parameter of the BF16 megakernels' communication CTAs, one kernel variant per shape.  A tile fills
+    a communication warp's 32 KiB buffer of the shared stream (``_comm_stream``); lane ``r < rows`` moves row ``r`` of
+    a column block with one bulk copy of ``row_chunk_bytes`` (1 KiB at 32 x 512, 2 KiB at 16 x 1024).  One arrival per
+    tile.  Everything else is derived here (host and CPU model) or, over runtime sizes, by the stream modules: the
+    tile rows of a minibatch (the stream's tasks), the column blocks of a row and the arrivals the compute side waits
+    for."""
 
     rows: int
     columns: int

@@ -115,7 +115,7 @@ from ._persistent_bf16_fwd_mega import (
     _storage_member_bytes,
     routed_weight_view,
 )
-from . import _bwd_dynamic_task_stream, _dynamic_task_stream, _swapab_fwd
+from . import _bwd_dynamic_task_stream, _swapab_fwd
 from ._bwd_device_helpers import (
     named_barrier_sync_unaligned,
     _mbar_spin_wait,
@@ -184,7 +184,7 @@ assert DYNAMIC_SHARED_MEMORY_BYTES <= 232448  # SM103 opt-in dynamic shared-memo
 
 assert (GEMM_A_BYTES, GEMM_B_BYTES, GEMM_D_BYTES) == (98304, 98304, 24576)
 assert GEMM_ARENA_BYTES == 221184 == _CONTRACT_GEMM_ARENA_BYTES
-assert _bwd_dynamic_task_stream.ARENA_BYTES <= REUSABLE_ARENA_BYTES  # the communication slots alias the arena
+assert _bwd_dynamic_task_stream.ARENA_BYTES <= REUSABLE_ARENA_BYTES  # the communication buffers alias the arena
 assert (MLP_LOAD_STAGES, MLP_ACC_STAGES) == (6, 2)
 assert PAIRED_GATE_UP_STAGES * 2 == MLP_LOAD_STAGES
 assert PAIRED_GATE_UP_TRANSACTION_BYTES == 3 * 128 * MLP_TILE_K * 2 * 2
@@ -303,7 +303,7 @@ class _PersistentBwdSharedStorage:
     gemm_acc_mbarriers: cute.struct.MemRange[cutlass.Int64, 2 * MLP_ACC_STAGES]
     tmem_dealloc_mbarrier: cutlass.Int64
     tmem_holding_buffer: cutlass.Int32
-    # Communication CTAs: one transaction barrier per warp slot.
+    # Communication CTAs: one transaction barrier per stream buffer (one per warp: its 32 KiB buffer).
     comm_mbarriers: cute.struct.MemRange[cutlass.Int64, _bwd_dynamic_task_stream.MBARRIERS]
     # Compute CTAs: paired Gate/Up replay pipeline (AB stages) and its accumulator stage.
     paired_gate_up_mbarriers: cute.struct.MemRange[cutlass.Int64, 2 * PAIRED_GATE_UP_STAGES + 2 * PAIRED_ACC_STAGES]
@@ -1054,9 +1054,9 @@ class _PersistentBf16BwdMega:
         recompute_forward_context: bool = False,
         comm_tile_shape: CommTileShape = DEFAULT_COMM_TILE_SHAPE,
     ) -> None:
-        # The communication tile shape (contract CommTileShape): the one compile-time parameter of the
-        # communication CTAs, like the compute tile sizes.  It lays out their slots and selects the lanes that copy
-        # and the bytes of one copy; the tile counts derived from it use the runtime sizes.
+        # The communication tile shape (contract CommTileShape, CuteMoKConfig.comm_tile_shape): the one compile-time
+        # parameter of the communication CTAs, like the compute tile sizes.  A communication warp moves one tile at a
+        # time through its 32 KiB buffer; the tile counts derived from it use the runtime sizes.
         if comm_tile_shape not in COMM_TILE_SHAPES:
             raise ValueError(f"comm_tile_shape must be one of {COMM_TILE_SHAPES}")
         self.comm_tile_shape = comm_tile_shape
@@ -2168,13 +2168,11 @@ class _PersistentBf16BwdMega:
 
     @cute.jit
     def _comm_tiles(self, runtime: tuple, generation: Int32) -> Int32:
-        """Communication tiles of one generation per direction (rows / tile rows x column blocks): the
-        count of d_y_routed_ready, replayed_x_routed_ready and reverse_dispatch_done for it."""
+        """Communication tiles of one generation per direction (rows / tile rows x column blocks): the count of
+        d_y_routed_ready, replayed_x_routed_ready and reverse_dispatch_done for it."""
         minibatch_size = runtime[_RT_MINIBATCH_SIZE]
         rows = cutlass.min(Int32(minibatch_size), runtime[_RT_NUM_TOKENS] - generation * Int32(minibatch_size))
-        return _dynamic_task_stream.row_tiles(self.comm_tile_shape, rows) * _dynamic_task_stream.column_blocks(
-            self.comm_tile_shape, runtime[_RT_ROUTED_HIDDEN_SIZE]
-        )
+        return _bwd_dynamic_task_stream.comm_blocks(rows, runtime[_RT_ROUTED_HIDDEN_SIZE], self.comm_tile_shape)
 
     @cute.jit
     def _run_comm_prefix(
@@ -2206,41 +2204,38 @@ class _PersistentBf16BwdMega:
         num_comm_sms: Int32,
     ) -> None:
         """Communication CTAs: the backward dynamic task stream prefix (_bwd_dynamic_task_stream)."""
-        args = _bwd_dynamic_task_stream.BwdCommArgs(
-            x_peer_table=x_peer_table,
-            d_y_peer_table=d_y_peer_table,
-            d_x_peer_table=d_x_peer_table,
-            router_peer_table=router_peer_table,
-            d_router_peer_table=d_router_peer_table,
-            schedule_peer_rank=schedule_peer_rank,
-            schedule_peer_token_idx=schedule_peer_token_idx,
-            x_routed=x_routed,
-            d_y_routed=d_y_routed,
-            d_x_routed=d_x_routed,
-            router_weights=router_weights,
-            d_router_partials=d_router_partials,
-            minibatch_expert_offsets=minibatch_expert_offsets,
-            d_y_routed_ready=d_y_routed_ready,
-            d_x_routed_ready=d_x_routed_ready,
-            replayed_x_routed_ready=replayed_x_routed_ready,
-            routed_buffers_done=routed_buffers_done,
-            wgrad_read_consumed=wgrad_read_consumed,
-            reverse_dispatch_done=runtime[_RT_REVERSE_DISPATCH_DONE],
-            num_tokens=num_tokens,
-            macrobatch_size=runtime[_RT_MACROBATCH_SIZE],
-            minibatch_size=runtime[_RT_MINIBATCH_SIZE],
-            mpm=runtime[_RT_MINIBATCHES_PER_MACROBATCH],
-            hidden_size=runtime[_RT_ROUTED_HIDDEN_SIZE],
-            topk=runtime[_RT_TOPK],
-            s_tiles=runtime[_RT_S_TILES],
-            slot_reuse_required=runtime[_RT_ROUTED_BUFFERS_DONE_REQUIRED],
-            wgrad_tiles=runtime[_RT_ROUTED_WGRAD_TILES],
-            ep_size=runtime[_RT_EP_SIZE],
-            has_tail=self.has_tail,
-            recompute_forward_context=self.recompute_forward_context,
+        Bo = _bwd_dynamic_task_stream.StreamOperand
+        operands = [None] * Bo.COUNT  # the stream hooks' operands, by position
+        operands[Bo.X_PEER_TABLE] = x_peer_table
+        operands[Bo.D_Y_PEER_TABLE] = d_y_peer_table
+        operands[Bo.D_X_PEER_TABLE] = d_x_peer_table
+        operands[Bo.ROUTER_PEER_TABLE] = router_peer_table
+        operands[Bo.D_ROUTER_PEER_TABLE] = d_router_peer_table
+        operands[Bo.X_ROUTED] = x_routed
+        operands[Bo.D_Y_ROUTED] = d_y_routed
+        operands[Bo.D_X_ROUTED] = d_x_routed
+        operands[Bo.ROUTER_WEIGHTS] = router_weights
+        operands[Bo.D_ROUTER_PARTIALS] = d_router_partials
+        operands[Bo.MINIBATCH_EXPERT_OFFSETS] = minibatch_expert_offsets
+        operands[Bo.D_Y_ROUTED_READY] = d_y_routed_ready
+        operands[Bo.D_X_ROUTED_READY] = d_x_routed_ready
+        operands[Bo.REPLAYED_X_ROUTED_READY] = replayed_x_routed_ready
+        operands[Bo.ROUTED_BUFFERS_DONE] = routed_buffers_done
+        operands[Bo.WGRAD_READ_CONSUMED] = wgrad_read_consumed
+        operands[Bo.REVERSE_DISPATCH_DONE] = runtime[_RT_REVERSE_DISPATCH_DONE]
+        operands[Bo.NUM_TOKENS] = num_tokens
+        operands[Bo.MACROBATCH_SIZE] = runtime[_RT_MACROBATCH_SIZE]
+        operands[Bo.MINIBATCH_SIZE] = runtime[_RT_MINIBATCH_SIZE]
+        operands[Bo.MPM] = runtime[_RT_MINIBATCHES_PER_MACROBATCH]
+        operands[Bo.HIDDEN_SIZE] = runtime[_RT_ROUTED_HIDDEN_SIZE]
+        operands[Bo.TOPK] = runtime[_RT_TOPK]
+        operands[Bo.S_TILES] = runtime[_RT_S_TILES]
+        operands[Bo.SLOT_REUSE_REQUIRED] = runtime[_RT_ROUTED_BUFFERS_DONE_REQUIRED]
+        operands[Bo.WGRAD_TILES] = runtime[_RT_ROUTED_WGRAD_TILES]
+        operands[Bo.EP_RANKS] = runtime[_RT_EP_SIZE]
+        _bwd_dynamic_task_stream.BackwardStream(self.has_tail, self.recompute_forward_context, self.comm_tile_shape).run(
+            operands, schedule_peer_rank, schedule_peer_token_idx, arena, comm_mbarriers, cluster_index * Int32(CLUSTER_SIZE) + cta_rank, num_comm_sms
         )
-        comm_slots = _dynamic_task_stream.CommSlots(mbarriers=comm_mbarriers, arena=arena, shape=self.comm_tile_shape)
-        _bwd_dynamic_task_stream.run_comm_prefix(args, comm_slots, cluster_index * Int32(CLUSTER_SIZE) + cta_rank, num_comm_sms)
 
     @cute.jit
     def _wait_gemm_inputs(

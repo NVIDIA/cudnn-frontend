@@ -4,11 +4,14 @@
 # Derived from Mixture-of-Kittens (https://github.com/cursor/mixture-of-kittens, commit 22fc95ae);
 # ported to CuTe DSL and modified by NVIDIA.
 
-"""Forward communication prefix: the dynamic task stream of X pulls (dispatch) and Y pushes (combine).
+"""Forward communication: the BF16 forward's hooks on the communication task stream (``_comm_stream.run_stream``).
 
-Private device module of ``_persistent_bf16_fwd_mega``.  The warp slots and the primitives are shared with
-the backward (``_dynamic_task_stream``; read its docstring first); this module supplies the forward stream, the
-task description and the load / store addresses (``_prepare``).
+Private device module of ``_persistent_bf16_fwd_mega``.  The loop, the per-warp buffers and the arrivals are the
+shared stream's (``_comm_stream``; read its docstring first); this module supplies what a block is: the task order,
+what a block waits for, where it is loaded from, what is done with it once it landed and which counter it arrives
+on.  A block is one communication tile of the kernel's ``comm_tile_shape`` (contract CommTileShape) in the warp's
+one 32 KiB buffer, each row one bulk copy of 1 KiB (32 x 512) or 2 KiB (16 x 1024).  A task is one tile row of one
+macrobatch, claimed STREAM_GROUP_BLOCKS column blocks at a time.
 
 The stream (``_stream_task``: task number -> (direction, macrobatch, tile row)), in dependency order:
     pulls of the last macrobatch (processed first; nothing to wait for)
@@ -24,70 +27,57 @@ the ring for the backward.
 With the combine in the routed Down epilogue (``epilogue_combine``) the stream keeps its pulls only, in the same order
 (``_pull_stream_task``): the epilogue stores every finished row into the source rank's combine buffer itself.
 
-Protocol (warp w of the COMM_WARPS of a communication CTA; it owns slot w and holds one tile at a time):
-    task = w x comm SMs + CTA                      # the first task is dealt statically
-    while task < tasks:
-        direction, macro, row = _stream_task(task)
-        if not ready(task):                        # routed Down of the minibatch it depends on
-            flush arrive; wait
-        for col_block in 0 .. col_blocks-1:
-            prepare(row, col_block)                # every read of the tile, while the previous store is in flight
-            wait slot w read; load(-> slot w); count (deferred); issue store(slot w)
-        task = atomic_add(head, 1) + COMM_WARPS x comm SMs     # the next number, while the store is in flight
-    flush arrive
+A block:
+    pull  wait  routed Down of the previous macrobatch on the same X-ring rows (none for the last macrobatch)
+          load  the peer's X row (route / topk) per lane, a padding row zero-filled (``_comm_stream.pull_row``)
+          then  bulk-store the rows into the local X ring; arrive on x_routed_ready[minibatch]
+    push  wait  routed Down of this minibatch (y_routed_ready)
+          load  the local Y row per lane (``_comm_stream.load_local_row``)
+          then  bulk-store the rows into the source rank's combine buffer; arrive on y_routed_done[128-row
+                block] (none for macrobatch 0: nobody overwrites its Y rows)
 
 * The head is the word after y_routed_done's 128-row blocks (zero at launch).
-* Arrivals are batched per arrive unit (pull: minibatch; push: 128-row block, the granularity of
-  y_routed_done): the count is released when the unit of the finished tile changes; a pull count after
-  the warp's writes are complete, a push count after its stores have read the slot (y_routed_done gates
-  the reuse of the local Y rows, which the load already read; the peers read the combine after the kernel).
+* What the compute side waits for: one arrival per block, x_routed_ready[minibatch] = block rows of the
+  minibatch x ``column_blocks``, y_routed_done[128-row block] = its block rows x ``column_blocks``
+  (CommTileShape.row_tiles / column_blocks).
 * A task that is not ready stays with the warp that took it: every task depends only on tasks with
   smaller numbers (and on the compute of those), so the smallest unfinished task is always ready.
 
 Every size, count, index and expected count is a runtime value.
 """
 
-import dataclasses
+import enum
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Int32, Int64
 
-from . import _dynamic_task_stream as comm
+from . import _comm_stream
+from ._comm_stream import (
+    STREAM_GROUP_BLOCKS,
+    STREAM_PULL,
+    STREAM_WARP_BYTES,
+    STREAM_WARPS,
+    _divide_u32,
+    _reciprocal_u32,
+)
 from ._fwd_device_helpers import _ceil_div_i32, _peer_address
-from .persistent_bf16_fwd_contract import CLUSTER_SIZE, COMM_TILE_SHAPES, MLP_TILE_COLUMNS, MLP_TILE_ROWS
+from .persistent_bf16_fwd_contract import CLUSTER_SIZE, MLP_TILE_COLUMNS, MLP_TILE_ROWS
 
-PULL = comm.PULL
-PUSH = comm.PUSH
-DONE_BLOCK_ROWS = MLP_TILE_ROWS // CLUSTER_SIZE  # y_routed_done granularity (128 rows)
-assert all(DONE_BLOCK_ROWS % shape.rows == 0 for shape in COMM_TILE_SHAPES)  # a tile counts toward one block
+PULL = STREAM_PULL
+PUSH = _comm_stream.STREAM_PUSH
+DONE_BLOCK_ROWS = MLP_TILE_ROWS // CLUSTER_SIZE  # y_routed_done granularity (128 rows); a block counts toward one
 
-# Interface read by the mega kernel: shared memory of the communication CTA.  The tile shape
-# (``CommSlots.shape``, compile time) also sizes the readiness counts the compute CTAs wait for: one arrival
-# per tile (``comm.row_tiles`` x ``comm.column_blocks``).
-ARENA_BYTES = comm.ARENA_BYTES
-MBARRIERS = comm.MBARRIERS
+# Interface read by the mega kernel: shared memory of the communication CTA (the buffers alias the compute arena).
+ARENA_BYTES = STREAM_WARPS * STREAM_WARP_BYTES
+MBARRIERS = STREAM_WARPS  # one per warp: its one buffer (``block_shape`` buffers = 1)
 
 
-@dataclasses.dataclass(frozen=True)
-class FwdCommArgs:
-    """Global tensors and runtime scalars of the forward prefix (built by the mega kernel)."""
-
-    x_peer_table: cute.Tensor  # X base address of every rank (pull source)
-    combine_peer_table: cute.Tensor  # combine-buffer base address of every rank (push destination)
-    schedule_peer_rank: cute.Tensor  # per routed row: source rank, -1 for a padding row
-    schedule_peer_token_idx: cute.Tensor  # per routed row: route index on the source rank
-    x_routed: cute.Tensor  # local X ring (pull destination)
-    y_routed: cute.Tensor  # local Y ring (push source)
-    x_routed_ready: cute.Tensor  # [minibatch] pulled tiles (Gate/Up waits)
-    y_routed_ready: cute.Tensor  # [minibatch] routed Down tiles (push waits)
-    y_routed_done: cute.Tensor  # [128-row block] pushed tiles (next macrobatch's Down waits)
-    num_tokens: Int32
-    macrobatch_size: Int32
-    minibatch_size: Int32
-    hidden_size: Int32
-    topk: Int32
-    has_tail: bool = False  # compile time: H has a 128-wide tail, one more Down tile per row block
+@cute.jit
+def column_blocks(hidden_size: Int32, columns: cutlass.Constexpr) -> Int32:
+    """Column blocks of one row (``columns`` the tile shape's, compile time): the blocks of a task (the last may be
+    short), and per block row the arrivals a readiness counter gets."""
+    return _ceil_div_i32(hidden_size, Int32(columns))
 
 
 # ---------------------------------------------------------------- shapes (all runtime)
@@ -115,119 +105,62 @@ def _down_tiles(minibatch: Int32, num_tokens: Int32, minibatch_size: Int32, hidd
 
 @cute.jit
 def _wait_target(
-    direction: Int32, macro: Int32, row_start: Int32, last_macro: Int32, num_tokens: Int32, macrobatch_size: Int32, minibatch_size: Int32
+    direction: Int32, macro: Int32, mini: Int32, row_start: Int32, last_macro: Int32, num_tokens: Int32, macrobatch_size: Int32, minibatches_per_macro: Int32
 ) -> Int32:
-    """Minibatch whose y_routed_ready the segment waits for, or -1 (no dependency).
-    PULL: routed Down of the previous macrobatch consumed these X-ring rows (none for the last
-    macrobatch, or when the previous macrobatch had no such rows).  PUSH: routed Down of this
+    """Minibatch whose y_routed_ready a block of minibatch ``mini`` of ``macro`` (first row ``row_start`` inside the
+    macrobatch) waits for, or -1 (no dependency).  PULL: routed Down of the previous macrobatch consumed these X-ring
+    rows (none for the last macrobatch, or when the previous macrobatch had no such rows).  PUSH: routed Down of this
     macrobatch produced these Y rows."""
     minibatch = Int32(-1)
     if direction == Int32(PULL):
         if macro < last_macro:
             previous = macro + Int32(1)
             if row_start < _macro_rows(previous, num_tokens, macrobatch_size):
-                minibatch = (previous * Int32(macrobatch_size) + row_start) // Int32(minibatch_size)
+                minibatch = previous * minibatches_per_macro + mini
     else:
-        minibatch = (macro * Int32(macrobatch_size) + row_start) // Int32(minibatch_size)
+        minibatch = macro * minibatches_per_macro + mini
     return minibatch
 
 
 @cute.jit
-def _arrive_unit(direction: Int32, macro: Int32, row_start: Int32, macrobatch_size: Int32, minibatch_size: Int32) -> Int32:
-    """Counter index a finished tile counts toward, or -1 (nobody waits).  PULL: x_routed_ready[minibatch]
-    (Gate/Up waits for the minibatch's tiles).  PUSH: y_routed_done[128-row block] (the next
+def _arrive_unit(direction: Int32, macro: Int32, row_start: Int32, macrobatch_size: Int32, minibatch_size: Int32, reciprocal_minibatch: Int32) -> Int32:
+    """Counter index a finished block counts toward, or -1 (nobody waits).  PULL: x_routed_ready[minibatch]
+    (Gate/Up waits for the minibatch's blocks).  PUSH: y_routed_done[128-row block] (the next
     macrobatch's Down reuses the Y rows; nothing to signal for the last-processed macrobatch)."""
     unit = Int32(-1)
     if direction == Int32(PULL):
-        unit = (macro * Int32(macrobatch_size) + row_start) // Int32(minibatch_size)
+        unit = _divide_u32(macro * Int32(macrobatch_size) + row_start, minibatch_size, reciprocal_minibatch)
     else:
         if macro > Int32(0):
             unit = (macro * Int32(macrobatch_size) + row_start) // Int32(DONE_BLOCK_ROWS)
     return unit
 
 
-# ---------------------------------------------------------------- arrive address
+# ---------------------------------------------------------------- the stream order
+#
+# ``geometry`` (``ForwardStream.run`` builds it once): (last_macro, last_tiles, full_tiles, mini_tiles,
+# last_minibatches, full_minibatches, reciprocal_mini_tiles, reciprocal_full_tiles, reciprocal_2f, reciprocal_2mini)
+# -- the block rows (tiles of the order) of the last / every other macrobatch and of a minibatch, the minibatches of the last / every
+# other macrobatch, and the ``_reciprocal_u32`` of mini_tiles, full_tiles, 2 x full_tiles and 2 x mini_tiles (no
+# division per task).
 
 
 @cute.jit
-def _arrive_address(args: FwdCommArgs, direction: Int32, macro: Int32, row: Int32) -> Int64:
-    """Counter word a finished tile counts toward (0: nobody waits): PULL x_routed_ready[unit],
-    PUSH y_routed_done[unit] (``_arrive_unit``)."""
-    unit = _arrive_unit(direction, macro, row, args.macrobatch_size, args.minibatch_size)
-    address = Int64(0)
-    if direction == Int32(PULL):
-        address = comm.counter_address(args.x_routed_ready, unit)
-    else:
-        address = comm.counter_address(args.y_routed_done, unit)
-    return address
-
-
-# ---------------------------------------------------------------- prepare (lanes)
-
-
-@cute.jit
-def _prepare(args: FwdCommArgs, slots: comm.CommSlots, direction: Int32, macro: Int32, row: Int32, col_block: Int32) -> comm.TileCopy:
-    """This lane's copy of the tile (row ``row`` of ``macro``, column block ``col_block``), every read of its load
-    and store done here, while the warp's previous store is in flight.  PULL: from the peer X row (the route's
-    token) into the local X ring (an unrouted row is zeroed); PUSH: from the local Y row to the peer combine
-    buffer (an unrouted row moves nothing).  The lanes past the tile's rows move nothing."""
-    lane_idx = Int32(cute.arch.lane_idx())
-    row_bytes = slots.tile_bytes(args.hidden_size, col_block)
-    column = Int64(col_block) * Int64(slots.shape.row_chunk_bytes)
-    schedule_row = macro * args.macrobatch_size + row + lane_idx
-    peer_rank = slots.lane_entry(args.schedule_peer_rank, schedule_row, lane_idx)
-    routed = Int32(cute.arch.popc(cute.arch.vote_ballot_sync(peer_rank >= Int32(0))))
-    ring_row = Int64(row + lane_idx) * Int64(args.hidden_size) * Int64(2) + column
-    source = Int64(0)
-    destination = Int64(0)
-    zero = Int32(0)
-    wait_writes = Int32(0)  # PUSH: y_routed_done gates the reuse of the local Y rows
-    if direction == Int32(PULL):
-        wait_writes = Int32(1)  # Gate/Up reads the x_routed rows
-        if slots.owns_row(lane_idx) != Int32(0):
-            destination = args.x_routed.iterator.toint() + ring_row
-            if peer_rank >= Int32(0):
-                route_index = args.schedule_peer_token_idx[schedule_row]
-                source = _peer_address(args.x_peer_table, peer_rank) + Int64(route_index // args.topk) * Int64(args.hidden_size) * Int64(2) + column
-            else:
-                zero = Int32(1)
-    else:
-        if peer_rank >= Int32(0):
-            route_index = args.schedule_peer_token_idx[schedule_row]
-            source = args.y_routed.iterator.toint() + ring_row
-            destination = _peer_address(args.combine_peer_table, peer_rank) + Int64(route_index) * Int64(args.hidden_size) * Int64(2) + column
-    return comm.TileCopy(
-        source=source,
-        destination=destination,
-        zero=zero,
-        row_bytes=row_bytes,
-        tx_bytes=routed * row_bytes,
-        side_address=Int64(0),
-        side_value=Float32(0.0),
-        arrive=_arrive_address(args, direction, macro, row),
-        wait_writes=wait_writes,
-    )
-
-
-# ---------------------------------------------------------------- the stream
-
-
-@cute.jit
-def _reverse_tile(position: Int32, count: Int32, mini_tiles: Int32) -> Int32:
-    """Tile row at ``position`` of a macrobatch of ``count`` tile rows taken minibatch by minibatch from the last
-    (possibly short) one to the first, tile rows in order inside a minibatch (the compute takes the minibatches in
-    this order)."""
-    minibatches = (count + mini_tiles - Int32(1)) // mini_tiles
+def _reverse_tile(position: Int32, count: Int32, minibatches: Int32, mini_tiles: Int32, reciprocal_mini_tiles: Int32) -> Int32:
+    """Tile row at ``position`` of a macrobatch of ``count`` tile rows (``minibatches`` minibatches) taken minibatch by
+    minibatch from the last (possibly short) one to the first, tile rows in order inside a minibatch (the compute
+    takes the minibatches in this order)."""
     first = count - (minibatches - Int32(1)) * mini_tiles  # tile rows of the last minibatch, taken first
     tile = (minibatches - Int32(1)) * mini_tiles + position
     if position >= first:
         k = position - first
-        tile = (minibatches - Int32(2) - k // mini_tiles) * mini_tiles + k % mini_tiles
+        q = _divide_u32(k, mini_tiles, reciprocal_mini_tiles)
+        tile = (minibatches - Int32(2) - q) * mini_tiles + (k - q * mini_tiles)
     return tile
 
 
 @cute.jit
-def _stream_task(index: Int32, last_macro: Int32, last_tiles: Int32, full_tiles: Int32, mini_tiles: Int32) -> tuple[Int32, Int32, Int32]:
+def _stream_task(index: Int32, geometry: tuple) -> tuple[Int32, Int32, Int32]:
     """(direction, macrobatch, tile row) of task ``index`` of the stream (module docstring): all pulls of the last
     macrobatch (``last_tiles`` tile rows, every other macrobatch ``full_tiles``); then for each macrobatch
     m = last .. 1: the pulls of m - 1 on the ring positions (minibatches) m never used, then minibatch by minibatch
@@ -235,30 +168,33 @@ def _stream_task(index: Int32, last_macro: Int32, last_tiles: Int32, full_tiles:
     of j), alternating tile row by tile row; then the pushes of macrobatch 0.  Inside a macrobatch the minibatches
     go from the last to the first (``_reverse_tile``), as the compute takes them.
     2 x (last_tiles + last_macro x full_tiles) tasks."""
+    last_macro, last_tiles, full_tiles, mini_tiles, last_minibatches, full_minibatches, reciprocal_mini_tiles, _, reciprocal_2f, reciprocal_2mini = geometry
     direction = Int32(PULL)
     macro = last_macro
-    tile = _reverse_tile(index, last_tiles, mini_tiles)
+    tile = _reverse_tile(index, last_tiles, last_minibatches, mini_tiles, reciprocal_mini_tiles)
     if index >= last_tiles:
         j = index - last_tiles
         m = last_macro
         count = last_tiles  # tile rows of m (whose pushes this block moves)
+        minibatches = last_minibatches
         if j >= last_tiles + full_tiles:
             j2 = j - last_tiles - full_tiles
-            block = j2 // (Int32(2) * full_tiles)
+            block = _divide_u32(j2, Int32(2) * full_tiles, reciprocal_2f)
             m = last_macro - Int32(1) - block
             count = full_tiles
+            minibatches = full_minibatches
             j = j2 - block * Int32(2) * full_tiles
         direction = Int32(PUSH)
         macro = m
-        tile = _reverse_tile(j, count, mini_tiles)
+        tile = _reverse_tile(j, count, minibatches, mini_tiles, reciprocal_mini_tiles)
         if m > Int32(0):
-            minibatches = (count + mini_tiles - Int32(1)) // mini_tiles
             first = count - (minibatches - Int32(1)) * mini_tiles  # tile rows of m's last minibatch
             unused = full_tiles - minibatches * mini_tiles  # tile rows of m - 1 on ring positions m never used
             if j < unused:
                 direction = Int32(PULL)
                 macro = m - Int32(1)
-                tile = (full_tiles // mini_tiles - Int32(1) - j // mini_tiles) * mini_tiles + j % mini_tiles
+                q = _divide_u32(j, mini_tiles, reciprocal_mini_tiles)
+                tile = (full_minibatches - Int32(1) - q) * mini_tiles + (j - q * mini_tiles)
             else:
                 # step k: the pushes of m's minibatch (minibatches - 1 - k) (step 0: its short last one), then
                 # mini_tiles pulls of m - 1 on the same ring position
@@ -269,8 +205,9 @@ def _stream_task(index: Int32, last_macro: Int32, last_tiles: Int32, full_tiles:
                 push_base = Int32(0)
                 if jj >= first + mini_tiles:
                     k = jj - first - mini_tiles
-                    step = Int32(1) + k // (Int32(2) * mini_tiles)
-                    position = k % (Int32(2) * mini_tiles)
+                    q = _divide_u32(k, Int32(2) * mini_tiles, reciprocal_2mini)
+                    step = Int32(1) + q
+                    position = k - q * (Int32(2) * mini_tiles)
                     pushes = mini_tiles
                     push_base = first + (step - Int32(1)) * mini_tiles
                 # inside the step pushes and pulls alternate tile row by tile row (push, pull, push, ...), the remaining
@@ -278,11 +215,11 @@ def _stream_task(index: Int32, last_macro: Int32, last_tiles: Int32, full_tiles:
                 pull_row = position - pushes
                 is_push = Int32(0)
                 if position < Int32(2) * pushes:
-                    pull_row = position // Int32(2)
-                    if position % Int32(2) == Int32(0):
+                    pull_row = position >> Int32(1)
+                    if (position & Int32(1)) == Int32(0):
                         is_push = Int32(1)
                 if is_push == Int32(1):
-                    tile = _reverse_tile(push_base + position // Int32(2), count, mini_tiles)
+                    tile = _reverse_tile(push_base + (position >> Int32(1)), count, minibatches, mini_tiles, reciprocal_mini_tiles)
                 else:
                     direction = Int32(PULL)
                     macro = m - Int32(1)
@@ -291,82 +228,309 @@ def _stream_task(index: Int32, last_macro: Int32, last_tiles: Int32, full_tiles:
 
 
 @cute.jit
-def _pull_stream_task(index: Int32, last_macro: Int32, last_tiles: Int32, full_tiles: Int32, mini_tiles: Int32) -> tuple[Int32, Int32, Int32]:
+def _pull_stream_task(index: Int32, geometry: tuple) -> tuple[Int32, Int32, Int32]:
     """The pulls of ``_stream_task`` alone, in its order (``epilogue_combine``): the pulls of the last macrobatch,
     then those of every earlier macrobatch, each from the last minibatch to the first; the ring positions a short
     last macrobatch never used come first, as in the full stream.  last_tiles + last_macro x full_tiles tasks."""
+    (
+        last_macro,
+        last_tiles,
+        full_tiles,
+        mini_tiles,
+        last_minibatches,
+        full_minibatches,
+        reciprocal_mini_tiles,
+        reciprocal_full_tiles,
+        reciprocal_2f,
+        reciprocal_2mini,
+    ) = geometry
     macro = last_macro
-    tile = _reverse_tile(index, last_tiles, mini_tiles)
+    tile = _reverse_tile(index, last_tiles, last_minibatches, mini_tiles, reciprocal_mini_tiles)
     if index >= last_tiles:
         k = index - last_tiles
-        macro = last_macro - Int32(1) - k // full_tiles
-        tile = _reverse_tile(k % full_tiles, full_tiles, mini_tiles)
+        q = _divide_u32(k, full_tiles, reciprocal_full_tiles)
+        macro = last_macro - Int32(1) - q
+        tile = _reverse_tile(k - q * full_tiles, full_tiles, full_minibatches, mini_tiles, reciprocal_mini_tiles)
     return Int32(PULL), macro, tile
 
 
-@cute.jit
-def _wait_index(args: FwdCommArgs, direction: Int32, macro: Int32, row: Int32, last_macro: Int32) -> Int32:
-    """y_routed_ready index the task of row ``row`` of ``macro`` waits for, or -1 (``_wait_target`` of its
-    minibatch)."""
-    row_start = row // args.minibatch_size * args.minibatch_size
-    return _wait_target(direction, macro, row_start, last_macro, args.num_tokens, args.macrobatch_size, args.minibatch_size)
+class _Fo(enum.IntEnum):
+    """Positions in the hooks' operand list (``ForwardStream.run`` builds it, ``_comm_stream.run_stream`` hands it to
+    every hook)."""
+
+    X_PEER_TABLE = 0
+    COMBINE_PEER_TABLE = 1
+    X_ROUTED = 2
+    Y_ROUTED = 3
+    X_ROUTED_READY = 4
+    Y_ROUTED_READY = 5
+    Y_ROUTED_DONE = 6
+    LAST_MACRO = 7
+    GEOMETRY = 8  # the stream order's tuple (``_stream_task``)
+    NUM_TOKENS = 9
+    HIDDEN_SIZE = 10
+    TOPK = 11
+    MACROBATCH_SIZE = 12
+    MINIBATCH_SIZE = 13
+    MINIBATCHES_PER_MACRO = 14
+    RECIPROCAL_MINIBATCH = 15
+    RECIPROCAL_TOPK = 16
+    COUNT = 17
 
 
-@cute.jit
-def run_comm_prefix(args: FwdCommArgs, slots: comm.CommSlots, comm_cta: Int32, num_comm_sms: Int32, epilogue_combine: cutlass.Constexpr = False) -> None:
-    """The dynamic task stream (module docstring): each of the COMM_WARPS warps takes its first task statically
-    (warp x comm SMs + CTA) and every later one with an atomic add on the head, so a warp that finishes early takes
-    more; a warp waits for a taken task that is not ready, then moves its tiles one at a time through its own
-    slot.  ``epilogue_combine`` (compile time): the routed Down epilogue pushes the combine, the stream moves its
-    pulls only."""
-    comm.init(slots)
+class ForwardStream:
+    """The BF16 forward's hooks on ``_comm_stream.run_stream`` (module docstring).  ``has_tail`` (a 128-wide H tail),
+    ``epilogue_combine`` (the routed Down epilogue pushes the combine, the stream moves its pulls only) and
+    ``comm_tile_shape`` (the contract's CommTileShape: a block is one tile, ``block_rows`` x ``block_columns``)
+    are the kernel's compile-time parameters."""
 
-    num_tokens = args.num_tokens
-    macrobatch_size = args.macrobatch_size
-    last_macro = _ceil_div_i32(num_tokens, macrobatch_size) - Int32(1)
-    last_tiles = comm.row_tiles(slots.shape, _macro_rows(last_macro, num_tokens, macrobatch_size))
-    full_tiles = comm.row_tiles(slots.shape, macrobatch_size)
-    mini_tiles = comm.row_tiles(slots.shape, args.minibatch_size)
-    if last_macro == Int32(0):
-        mini_tiles = full_tiles  # one macrobatch: minibatches in order (_reverse_tile is then the identity)
-    if cutlass.const_expr(epilogue_combine):
-        tasks = last_tiles + last_macro * full_tiles
-    else:
-        tasks = Int32(2) * (last_tiles + last_macro * full_tiles)
-    col_blocks = comm.column_blocks(slots.shape, args.hidden_size)
-    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-    warps_total = Int32(comm.COMM_WARPS) * num_comm_sms
-    head_address = comm.counter_address(args.y_routed_done, args.y_routed_done.shape[0] - Int32(1))
-    slot_phase = Int32(0)  # the phase of the warp's slot mbarrier
-    batch = comm.no_arrivals()  # finished tiles not yet arrived
-    if warp_idx < Int32(comm.COMM_WARPS):
-        task = warp_idx * num_comm_sms + comm_cta
-        while task < tasks:
-            if cutlass.const_expr(epilogue_combine):
-                direction, macro, tile_row = _pull_stream_task(task, last_macro, last_tiles, full_tiles, mini_tiles)
-            else:
-                direction, macro, tile_row = _stream_task(task, last_macro, last_tiles, full_tiles, mini_tiles)
-            row = tile_row * Int32(slots.shape.rows)
-            target = _wait_index(args, direction, macro, row, last_macro)
+    def __init__(self, has_tail: bool, epilogue_combine: bool, comm_tile_shape):
+        self.has_tail = bool(has_tail)
+        self.epilogue_combine = bool(epilogue_combine)
+        self.block_rows = comm_tile_shape.rows
+        self.block_columns = comm_tile_shape.columns
+        self._stream_block = _comm_stream.block_shape(self.block_rows, self.block_columns, 1)  # one tile per warp
+        assert MBARRIERS == STREAM_WARPS * self._stream_block[2]  # one barrier per buffer
+        assert self.block_rows <= _comm_stream.WARP_LANES and DONE_BLOCK_ROWS % self.block_rows == 0
+
+    _run_stream = _comm_stream.run_stream
+
+    @cute.jit
+    def _stream_decode(self, operands: list, task: Int32) -> tuple[Int32, Int32, Int32]:
+        """Decode hook: stream task -> (direction, macrobatch, block row), ``_stream_task`` (``_pull_stream_task``
+        with ``epilogue_combine``)."""
+        if cutlass.const_expr(self.epilogue_combine):
+            return _pull_stream_task(task, operands[_Fo.GEOMETRY])
+        return _stream_task(task, operands[_Fo.GEOMETRY])
+
+    @cute.jit
+    def _stream_schedule_row(self, operands: list, macro: Int32, row: Int32) -> Int32:
+        """Schedule-row hook: the schedule index of row ``row`` of macrobatch ``macro``."""
+        return macro * Int32(operands[_Fo.MACROBATCH_SIZE]) + row
+
+    @cute.jit
+    def _stream_ready_lane0(self, operands: list, direction: Int32, macro: Int32, row: Int32) -> Int32:
+        """Readiness hook, lane 0's answer whether the block waits for nothing more (the other lanes return 1):
+        y_routed_ready of ``_wait_target``'s minibatch holds every routed Down tile of it (``_down_tiles``)."""
+        ready = Int32(1)
+        if cute.arch.lane_idx() == Int32(0):
+            num_tokens = operands[_Fo.NUM_TOKENS]
+            minibatch_size = operands[_Fo.MINIBATCH_SIZE]
+            mini = _divide_u32(row, minibatch_size, operands[_Fo.RECIPROCAL_MINIBATCH])  # minibatch inside the macrobatch
+            target = _wait_target(
+                direction,
+                macro,
+                mini,
+                mini * minibatch_size,
+                operands[_Fo.LAST_MACRO],
+                num_tokens,
+                operands[_Fo.MACROBATCH_SIZE],
+                operands[_Fo.MINIBATCHES_PER_MACRO],
+            )
             if target >= Int32(0):
-                required = _down_tiles(target, args.num_tokens, args.minibatch_size, args.hidden_size, args.has_tail)
-                if comm.reached(args.y_routed_ready, target, required) == Int32(0):
-                    # not ready: arrive what we finished, then wait
-                    batch = batch.flush()
-                    comm.wait(args.y_routed_ready, target, required)
-            for col_block in cutlass.range(col_blocks):
-                # every read of the tile while the previous store is in flight, then the load at once
-                copy = _prepare(args, slots, direction, macro, row, col_block)
-                comm.wait_slot_read()  # the previous tile's stores have read slot w
-                batch = comm.move(slots, copy, warp_idx, slot_phase, batch)
-                slot_phase = slot_phase ^ Int32(1)
-            # the next task of the stream after the statically dealt first ones (the last stores are in flight)
-            taken = Int32(0)
-            if cute.arch.lane_idx() == Int32(0):
-                head = cute.make_ptr(Int32, head_address, cute.AddressSpace.gmem, assumed_align=4)
-                taken = cute.arch.atomic_add(head, Int32(1), sem="relaxed", scope="gpu")
-            task = cute.arch.shuffle_sync(taken, 0) + warps_total
-        batch.flush()
-    # in-flight stores (the last ones of every warp, and those of tiles nobody waits for) complete before the CTA exits
-    cute.arch.cp_async_bulk_wait_group(0)
-    cute.arch.sync_threads()
+                required = _down_tiles(target, num_tokens, minibatch_size, operands[_Fo.HIDDEN_SIZE], self.has_tail)
+                y_routed_ready = operands[_Fo.Y_ROUTED_READY]
+                if cute.arch.load(y_routed_ready.iterator + target, Int32, sem="acquire", scope="gpu") < required:
+                    ready = Int32(0)
+        return ready
+
+    @cute.jit
+    def _stream_issue(
+        self,
+        operands: list,
+        direction: Int32,
+        row: Int32,
+        column_tile: Int32,
+        buffer: cute.Pointer,
+        mbarrier: cute.Pointer,
+        lane: Int32,
+        peer: Int32,
+        route: Int32,
+    ) -> None:
+        """Issue hook: a block into ``buffer`` on ``mbarrier`` with the lane's schedule entries (``peer``, ``route``
+        of the block's row ``lane``) already read: a pull of the peer's X row ``route / topk``, a push's read of
+        the local Y row ``row + lane``."""
+        hidden_size = operands[_Fo.HIDDEN_SIZE]
+        # The addresses first: the peer-table read and the division overlap the previous block's stores, which may
+        # still be reading the buffer (a lane past the block's rows has peer -1 and reads nothing).
+        peer_buffer = Int64(0)  # a padding lane's (peer -1) is never read
+        source_row = Int32(0)
+        if direction == Int32(PULL):
+            if peer >= Int32(0):
+                peer_buffer = _peer_address(operands[_Fo.X_PEER_TABLE], peer)
+                source_row = _divide_u32(route, operands[_Fo.TOPK], operands[_Fo.RECIPROCAL_TOPK])
+        # The buffer's previous block: its stores must have read it (the wait left open by _stream_process).
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
+        if lane < Int32(self.block_rows):
+            if direction == Int32(PULL):
+                _comm_stream.pull_row(buffer, mbarrier, lane, column_tile, peer, source_row, hidden_size, peer_buffer, self.has_tail, self.block_columns)
+            else:
+                _comm_stream.load_local_row(
+                    buffer, mbarrier, lane, operands[_Fo.Y_ROUTED].iterator.toint(), row, column_tile, peer, hidden_size, self.has_tail, self.block_columns
+                )
+        else:
+            cute.arch.mbarrier_arrive(mbarrier)  # a lane past the block's rows: no row, the barrier counts every lane
+
+    @cute.jit
+    def _stream_arrival(self, operands: list, direction: Int32, macro: Int32, row: Int32) -> Int64:
+        """Arrival-word hook: the counter a processed block arrives on (``_arrive_unit``), 0 for none."""
+        unit = _arrive_unit(direction, macro, row, operands[_Fo.MACROBATCH_SIZE], operands[_Fo.MINIBATCH_SIZE], operands[_Fo.RECIPROCAL_MINIBATCH])
+        address = Int64(0)
+        if unit >= Int32(0):
+            if direction == Int32(PULL):
+                address = (operands[_Fo.X_ROUTED_READY].iterator + unit).toint()
+            else:
+                address = (operands[_Fo.Y_ROUTED_DONE].iterator + unit).toint()
+        return address
+
+    @cute.jit
+    def _stream_process(
+        self,
+        operands: list,
+        direction: Int32,
+        macro: Int32,
+        row: Int32,
+        column: Int32,
+        buffer: cute.Pointer,
+        lane: Int32,
+        schedule_peer_rank: cute.Tensor,
+        schedule_peer_token_idx: cute.Tensor,
+    ) -> None:
+        """Process hook, the block's bytes landed in ``buffer``: a pull block's rows (a padding row zero) go to the
+        local X ring row ``row + lane`` (the writes completed by ``_stream_drain`` before the arrival is released); a
+        push block's rows go to the source ranks' combine buffers.  The stores are not waited for here: the next
+        issue into this buffer waits for their read (``_stream_issue``), a pull's arrival for their writes
+        (``_stream_drain``)."""
+        hidden_size = operands[_Fo.HIDDEN_SIZE]
+        if lane < Int32(self.block_rows):  # a lane past the block's rows stores nothing
+            if direction == Int32(PULL):
+                x_routed = operands[_Fo.X_ROUTED]
+                _comm_stream.store_row(
+                    buffer,
+                    lane,
+                    x_routed.iterator.toint() + Int64(row + lane) * Int64(hidden_size) * Int64(2),
+                    column,
+                    hidden_size,
+                    self.has_tail,
+                    self.block_columns,
+                )
+            else:
+                schedule_row = self._stream_schedule_row(operands, macro, row) + lane
+                peer = schedule_peer_rank[schedule_row]
+                if peer >= Int32(0):
+                    route = schedule_peer_token_idx[schedule_row]
+                    _comm_stream.store_row(
+                        buffer,
+                        lane,
+                        _peer_address(operands[_Fo.COMBINE_PEER_TABLE], peer) + Int64(route) * Int64(hidden_size) * Int64(2),
+                        column,
+                        hidden_size,
+                        self.has_tail,
+                        self.block_columns,
+                    )
+        cute.arch.cp_async_bulk_commit_group()
+
+    @cute.jit
+    def _stream_drain(self, operands: list, direction: Int32) -> None:
+        """Drain hook, before the pending arrivals of ``direction`` are released.  Pulls: complete this lane's bulk
+        stores (the X-ring rows counted on x_routed_ready are read by the Gate/Up TMA loads once it is released); one
+        wait per release, so the stores of a minibatch's blocks overlap.  Pushes: nothing -- y_routed_done frees Y
+        rows the block's load already read; the peers read the combine buffer after the kernel."""
+        if direction == Int32(PULL):
+            cute.arch.cp_async_bulk_wait_group(0)
+
+    @cute.jit
+    def run(
+        self,
+        x_peer_table: cute.Tensor,
+        combine_peer_table: cute.Tensor,
+        schedule_peer_rank: cute.Tensor,
+        schedule_peer_token_idx: cute.Tensor,
+        x_routed: cute.Tensor,
+        y_routed: cute.Tensor,
+        x_routed_ready: cute.Tensor,
+        y_routed_ready: cute.Tensor,
+        y_routed_done: cute.Tensor,
+        arena: cute.Pointer,
+        mbarriers: cute.Pointer,
+        num_tokens: Int32,
+        macrobatch_size: Int32,
+        minibatch_size: Int32,
+        hidden_size: Int32,
+        topk: Int32,
+        comm_cta: Int32,
+        num_comm_sms: Int32,
+    ) -> None:
+        """The communication CTA's forward: the stream buffers' barriers, then the task stream over every
+        macrobatch (``_comm_stream.run_stream`` with this class's hooks; ``x_routed`` / ``y_routed`` are the X / Y
+        rings, ``hidden_size`` their width)."""
+        thread = cute.arch.thread_idx()[0]
+        if thread == Int32(0):
+            for barrier in cutlass.range_constexpr(MBARRIERS):
+                cute.arch.mbarrier_init(mbarriers + Int32(barrier), _comm_stream.WARP_LANES)  # one arrival per lane
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+        last_macro = _ceil_div_i32(num_tokens, macrobatch_size) - Int32(1)
+        # Block-row tiles: num_tokens and the macrobatch are multiples of the block rows (the schedule pads every expert to
+        # 256 rows, the minibatch is a multiple of 256).
+        last_tiles = _macro_rows(last_macro, num_tokens, macrobatch_size) // Int32(self.block_rows)
+        full_tiles = macrobatch_size // Int32(self.block_rows)
+        mini_tiles = minibatch_size // Int32(self.block_rows)
+        if last_macro == Int32(0):
+            mini_tiles = full_tiles  # one macrobatch: minibatches in order (_reverse_tile is then the identity)
+        # The stream order's geometry, its divisions done once here (none per task).
+        reciprocal_mini_tiles = _reciprocal_u32(mini_tiles)
+        geometry = (
+            last_macro,
+            last_tiles,
+            full_tiles,
+            mini_tiles,
+            _ceil_div_i32(last_tiles, mini_tiles),
+            full_tiles // mini_tiles,
+            reciprocal_mini_tiles,
+            _reciprocal_u32(full_tiles),
+            _reciprocal_u32(Int32(2) * full_tiles),
+            _reciprocal_u32(Int32(2) * mini_tiles),
+        )
+        tasks = last_tiles + last_macro * full_tiles
+        if cutlass.const_expr(not self.epilogue_combine):
+            tasks = Int32(2) * tasks
+        blocks_per_row = column_blocks(hidden_size, self.block_columns)
+        group_blocks = Int32(STREAM_GROUP_BLOCKS)
+        groups = _ceil_div_i32(blocks_per_row, group_blocks)  # the stream is numbered per group of column blocks
+        head = cute.make_ptr(Int32, (y_routed_done.iterator + (y_routed_done.shape[0] - Int32(1))).toint(), cute.AddressSpace.gmem, assumed_align=4)
+        operands = [None] * _Fo.COUNT  # the hooks' operands, by position
+        operands[_Fo.X_PEER_TABLE] = x_peer_table
+        operands[_Fo.COMBINE_PEER_TABLE] = combine_peer_table
+        operands[_Fo.X_ROUTED] = x_routed
+        operands[_Fo.Y_ROUTED] = y_routed
+        operands[_Fo.X_ROUTED_READY] = x_routed_ready
+        operands[_Fo.Y_ROUTED_READY] = y_routed_ready
+        operands[_Fo.Y_ROUTED_DONE] = y_routed_done
+        operands[_Fo.LAST_MACRO] = last_macro
+        operands[_Fo.GEOMETRY] = geometry
+        operands[_Fo.NUM_TOKENS] = num_tokens
+        operands[_Fo.HIDDEN_SIZE] = hidden_size
+        operands[_Fo.TOPK] = topk
+        operands[_Fo.MACROBATCH_SIZE] = macrobatch_size
+        operands[_Fo.MINIBATCH_SIZE] = minibatch_size
+        operands[_Fo.MINIBATCHES_PER_MACRO] = macrobatch_size // minibatch_size
+        operands[_Fo.RECIPROCAL_MINIBATCH] = _reciprocal_u32(minibatch_size)
+        operands[_Fo.RECIPROCAL_TOPK] = _reciprocal_u32(topk)
+        assert all(operand is not None for operand in operands)
+        self._run_stream(
+            operands,
+            schedule_peer_rank,
+            schedule_peer_token_idx,
+            head,
+            arena,
+            mbarriers,
+            tasks * groups,
+            groups,
+            _reciprocal_u32(groups),
+            _reciprocal_u32(group_blocks),
+            blocks_per_row,
+            comm_cta,
+            num_comm_sms,
+            Int32(0),
+        )

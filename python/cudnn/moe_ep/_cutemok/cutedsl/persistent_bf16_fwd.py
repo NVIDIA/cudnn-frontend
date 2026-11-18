@@ -77,7 +77,7 @@ Y_DONE_ROW_BLOCK: Final = 128
 # plans below hold the loop-invariant arguments, and state buffers and streams
 # are fresh per call.
 _CODEGEN_EPOCH: Final = (
-    "runtime-geometry-linear-expert-dsl48-v2-epsize-runtime-clc-drain-lane0-geomparams-backoff-taskdecode-commworkerinterleave-swapab-stm2-epicombine-tail-clip-role-elif-pfentry-commtileshape-commwarpslot"
+    "runtime-geometry-linear-expert-dsl48-v2-epsize-runtime-clc-drain-lane0-geomparams-backoff-taskdecode-commworkerinterleave-swapab-stm2-epicombine-tail-clip-role-elif-pfentry-commtileshape-commwarpslot-commoneloop"
 )
 _ABI_EPOCH: Final = "persistent-bf16-nine-output-five-counter-v1"
 

@@ -96,7 +96,7 @@ from .persistent_bf16_fwd_contract import (
     TaskDecode,
     WARPS_PER_CTA,
 )
-from . import _dynamic_task_stream, _fwd_dynamic_task_stream, _swapab_fwd
+from . import _comm_stream, _fwd_dynamic_task_stream, _swapab_fwd
 from ._arch import COMPILE_OPTIONS
 from ._host_common import peer_address_table, row_major_view
 from ._bwd_device_helpers import _mbar_backoff_wait, named_barrier_sync_unaligned
@@ -145,11 +145,12 @@ TASK_INFO_WORDS = 16  # 64 B per stage, 16-byte aligned
 TASK_INFO_CONSUMER_WARPS = WARPS_PER_CTA - 1
 assert len(TASK_INFO_FIELDS) == len(set(TASK_INFO_FIELDS)) <= TASK_INFO_WORDS
 _TI = {name: index for index, name in enumerate(TASK_INFO_FIELDS)}
-# Communication CTAs run the dynamic task stream prefix (_fwd_dynamic_task_stream); its warp slots alias the
+# Communication CTAs run the task stream (_fwd_dynamic_task_stream on _comm_stream); its per-warp buffers alias the
 # compute CTAs' GEMM arena.
 GEMM_ARENA_BYTES = GEMM_A_BYTES + GEMM_B_BYTES + GEMM_D_BYTES
 REUSABLE_ARENA_BYTES = max(_fwd_dynamic_task_stream.ARENA_BYTES, GEMM_ARENA_BYTES)
 assert REUSABLE_ARENA_BYTES == 229376
+assert _comm_stream.STREAM_WARPS < WARPS_PER_CTA  # the stream's warps and one more of the communication CTA
 # The task->expert decode method (TaskDecode) is a compile-time attribute of the
 # kernel; EXPERT_TABLE_CAP (contract) is the shared-memory prefix capacity of
 # SMEM_BINARY (one entry per expert) and SMEM_GROUP (one entry per expert group).
@@ -227,7 +228,8 @@ class _PersistentSharedStorage:
     tmem_dealloc_mbarrier: cutlass.Int64
     tmem_holding_buffer: cutlass.Int32
 
-    # Communication CTAs: one transaction barrier per warp slot.  The slots alias the arena.
+    # Communication CTAs: one transaction barrier per stream buffer (one per warp: its 32 KiB buffer).  The
+    # buffers alias the arena.
     comm_mbarriers: cute.struct.MemRange[cutlass.Int64, _fwd_dynamic_task_stream.MBARRIERS]
     # expert_cu_end[g] = routed row blocks (MLP_TILE_ROWS each) of local experts
     # 0 .. min((g + 1) * stride, E) - 1: inclusive prefix over groups of stride experts
@@ -760,9 +762,9 @@ class _PersistentBf16FwdMega:
         has_tail: bool = False,
         comm_tile_shape: CommTileShape = DEFAULT_COMM_TILE_SHAPE,
     ) -> None:
-        # The communication tile shape (contract CommTileShape): the one compile-time parameter of the
-        # communication CTAs, like the compute tile sizes.  It lays out their slots and selects the lanes that copy
-        # and the bytes of one copy; every count derived from it (tile rows per minibatch, column blocks per row,
+        # The communication tile shape (contract CommTileShape, CuteMoKConfig.comm_tile_shape): the one compile-time
+        # parameter of the communication CTAs, like the compute tile sizes.  A communication warp moves one tile at a
+        # time through its 32 KiB buffer; every count derived from it (tile rows per minibatch, column blocks per row,
         # the arrivals the compute CTAs wait for) is computed from the runtime sizes.
         if comm_tile_shape not in COMM_TILE_SHAPES:
             raise ValueError(f"comm_tile_shape must be one of {COMM_TILE_SHAPES}")
@@ -899,7 +901,7 @@ class _PersistentBf16FwdMega:
         shared_column_blocks = _ceil_div_i32(shared_hidden_size, Int32(MLP_TILE_COLUMNS))
         routed_k_tiles = routed_hidden_size // Int32(_GATE_TILE_K)
         routed_column_blocks = _ceil_div_i32(routed_hidden_size, Int32(MLP_TILE_COLUMNS))
-        routed_comm_tile_columns = _dynamic_task_stream.column_blocks(self.comm_tile_shape, routed_hidden_size)
+        routed_comm_tile_columns = _fwd_dynamic_task_stream.column_blocks(routed_hidden_size, self.comm_tile_shape.columns)
         comm_clusters = num_comm_sms // CLUSTER_SIZE
         capacity_minibatches = _ceil_div_i32(schedule_capacity, minibatch_size)
         capacity_clusters = comm_clusters + shared_tasks + capacity_minibatches * minibatch_tasks
@@ -1832,30 +1834,25 @@ class _PersistentBf16FwdMega:
         s_expert_cu_end = cute.make_tensor(storage.expert_cu_end.data_ptr(), cute.make_layout(EXPERT_TABLE_CAP))
         expert_stride, expert_groups = _build_expert_cu_end(tokens_per_expert, s_expert_cu_end, self.task_decode, thread)
         if cluster_index < Int32(comm_clusters):
-            comm_args = _fwd_dynamic_task_stream.FwdCommArgs(
-                x_peer_table=x_peer_table,
-                combine_peer_table=combine_peer_table,
-                schedule_peer_rank=schedule_peer_rank,
-                schedule_peer_token_idx=schedule_peer_token_idx,
-                x_routed=x_routed,
-                y_routed=y_routed,
-                x_routed_ready=x_routed_ready,
-                y_routed_ready=y_routed_ready,
-                y_routed_done=y_routed_done,
-                num_tokens=num_tokens,
-                macrobatch_size=Int32(macrobatch_size),
-                minibatch_size=Int32(minibatch_size),
-                hidden_size=Int32(x_routed.shape[1]),
-                topk=Int32(topk),
-                has_tail=self.has_tail,
-            )
-            comm_slots = _dynamic_task_stream.CommSlots(mbarriers=comm_mbarriers, arena=comm_arena, shape=self.comm_tile_shape)
-            _fwd_dynamic_task_stream.run_comm_prefix(
-                comm_args,
-                comm_slots,
+            _fwd_dynamic_task_stream.ForwardStream(self.has_tail, self.epilogue_combine, self.comm_tile_shape).run(
+                x_peer_table,
+                combine_peer_table,
+                schedule_peer_rank,
+                schedule_peer_token_idx,
+                x_routed,
+                y_routed,
+                x_routed_ready,
+                y_routed_ready,
+                y_routed_done,
+                comm_arena,
+                comm_mbarriers,
+                num_tokens,
+                Int32(macrobatch_size),
+                Int32(minibatch_size),
+                Int32(x_routed.shape[1]),
+                Int32(topk),
                 cluster_index * Int32(CLUSTER_SIZE) + cta_rank,
                 Int32(num_comm_sms),
-                self.epilogue_combine,
             )
 
         # No staged early return: the sentinel role WARPS_PER_CTA matches none of the

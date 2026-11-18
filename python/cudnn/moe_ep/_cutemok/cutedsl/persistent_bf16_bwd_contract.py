@@ -73,9 +73,9 @@ MLP_EPILOGUE_PIECES = 8
 MLP_BF16_D_TILES = 3
 SWIGLU_TILE_M = 128
 SWIGLU_TILE_N = 128
-# The communication tile of the dynamic task stream (``_bwd_dynamic_task_stream``) is the forward contract's
-# CommTileShape (``BwdGeometry.comm_tile_shape``; compile time).  Every communication readiness count
-# (d_y_routed_ready, replayed_x_routed_ready, reverse_dispatch_done) is per tile of that shape.
+# The communication task stream (``_bwd_dynamic_task_stream`` on ``_comm_stream``) moves the tiles of the forward
+# contract's CommTileShape (``BwdGeometry.comm_tile_shape``; compile time).  Every communication readiness count
+# (d_y_routed_ready, replayed_x_routed_ready, reverse_dispatch_done) is one arrival per tile.
 CLC_DEPTH = 1
 CLC_DRAIN_DEPTH = 8
 REUSABLE_ARENA_BYTES = 229_376

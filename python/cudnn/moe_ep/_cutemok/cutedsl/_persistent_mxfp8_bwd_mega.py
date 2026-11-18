@@ -78,6 +78,7 @@ from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 
 from ._compat.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
+from . import _comm_stream
 from . import _mxfp8_bwd_swiglu as swiglu_bwd
 from . import _mxfp8_gemm_base as gemm
 from . import routed_descriptors as routed_descriptors_pkg
@@ -125,7 +126,7 @@ from ._mxfp8_fwd_base import DYNAMIC_SHARED_MEMORY_BYTES
 from ._mxfp8_quant import _load_shared_v4, _store_shared_v4_words, cvt_bf16x2
 from ._persistent_bf16_bwd_mega import _epilog_gmem_copy_fn, _padded_segment_valid_end
 from ._persistent_bf16_fwd_mega import _build_expert_cu_end, _routed_expert_tile_i32
-from ._persistent_mxfp8_fwd_mega import (
+from ._comm_stream import (
     STREAM_BUFFERS,
     STREAM_COLUMNS,
     STREAM_GROUP_BLOCKS,
@@ -134,13 +135,11 @@ from ._persistent_mxfp8_fwd_mega import (
     STREAM_ROWS,
     STREAM_WARP_BYTES,
     STREAM_WARPS,
-    _counter_arrive_release_gpu,
     _divide_u32,
     _fence_proxy_async_global,
-    _PersistentMxfp8FwdMega,
     _reciprocal_u32,
-    _stream_row_bytes,
 )
+from ._persistent_mxfp8_fwd_mega import _counter_arrive_release_gpu, _PersistentMxfp8FwdMega
 from ._tma_1d import tma_load_1d_raw, tma_store_1d_raw
 from .mxfp8_contract import ROUTED_SWIGLU as FWD_ROUTED_SWIGLU_KIND
 from .persistent_bf16_fwd_contract import EXPERT_TABLE_CAP, MLP_TILE_ROWS, TaskDecode
@@ -896,11 +895,12 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
 
     # The forward's routed SwiGLU stage, reused by the replay.
     _swiglu_stage = _PersistentMxfp8FwdMega._swiglu_stage
-    # All of the backward's communication runs on the forward's stream loop (``_run_stream``, called per macrobatch
-    # by ``_backward_stream``) with this class's hooks (_stream_decode / _stream_schedule_row / _stream_ready_lane0
+    # All of the backward's communication runs on the forward's stream loop (``_run_stream``, called once by
+    # ``_backward_stream``, its one stream covering every macrobatch) with this class's hooks (_stream_decode / _stream_schedule_row / _stream_ready_lane0
     # / _stream_issue / _stream_arrival / _stream_process; a third queue, STREAM_PULL_X), and reuses the forward's
     # pull of one block row per lane and per-warp quantization of a pulled block.
-    _run_stream = _PersistentMxfp8FwdMega._run_stream
+    _run_stream = _comm_stream.run_stream
+    _stream_block = _comm_stream.block_shape(STREAM_ROWS, STREAM_COLUMNS, 2)  # the quantization's 32 x 256 blocks
     _stream_pull = _PersistentMxfp8FwdMega._stream_pull
     _stream_quantize = _PersistentMxfp8FwdMega._stream_quantize
     # The transposed pass's store addresses in the form the backward is faster with (the forward's class comment).
@@ -1051,14 +1051,7 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         arrives with no bytes."""
         hidden_size = operands[_Bs.HIDDEN_SIZE]
         if queue == Int32(STREAM_PUSH):
-            chunk_bytes = _stream_row_bytes(hidden_size, column_tile, self.has_tail)
-            if peer >= Int32(0):
-                d_x_routed = operands[_Bs.D_X_ROUTED]
-                source = d_x_routed.iterator.toint() + Int64(row + lane) * Int64(hidden_size) * Int64(2) + Int64(column_tile) * Int64(STREAM_COLUMNS * 2)
-                cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, chunk_bytes)
-                tma_load_1d_raw(buffer + lane * Int32(STREAM_COLUMNS * 2), source, mbarrier, chunk_bytes)
-            else:
-                cute.arch.mbarrier_arrive(mbarrier)
+            _comm_stream.load_local_row(buffer, mbarrier, lane, operands[_Bs.D_X_ROUTED].iterator.toint(), row, column_tile, peer, hidden_size, self.has_tail)
         else:
             peer_buffer = Int64(0)  # a padding lane's (peer -1) is never read
             if peer >= Int32(0):
@@ -1090,6 +1083,12 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
         return address
 
     @cute.jit
+    def _stream_drain(self, operands: list, queue: Int32) -> None:
+        """``_run_stream``'s drain hook, before pending arrivals are released: nothing to complete (a pull block's
+        quantized output is plain stores, fenced by the loop; a push block's buffer was read before it was counted)."""
+        pass
+
+    @cute.jit
     def _stream_process(
         self,
         operands: list,
@@ -1115,11 +1114,14 @@ class _PersistentMxfp8BwdMega(_Mxfp8BwdBase):
             peer = schedule_peer_rank[schedule_row]
             if peer >= Int32(0):
                 route = schedule_peer_token_idx[schedule_row]
-                chunk_bytes = _stream_row_bytes(hidden_size, column, self.has_tail)
-                destination = (
-                    _peer_address(operands[_Bs.D_X_PEER_TABLE], peer) + Int64(route) * Int64(hidden_size) * Int64(2) + Int64(column) * Int64(STREAM_COLUMNS * 2)
+                _comm_stream.store_row(
+                    buffer,
+                    lane,
+                    _peer_address(operands[_Bs.D_X_PEER_TABLE], peer) + Int64(route) * Int64(hidden_size) * Int64(2),
+                    column,
+                    hidden_size,
+                    self.has_tail,
                 )
-                tma_store_1d_raw(destination, buffer + lane * Int32(STREAM_COLUMNS * 2), chunk_bytes)
                 if column == Int32(0):
                     d_router_partials = operands[_Bs.D_ROUTER_PARTIALS]
                     d_router = Float32(0.0)

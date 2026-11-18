@@ -77,7 +77,7 @@ _CODEGEN_EPOCH: Final = (
     "mxfp8-bwd-ab6-acc1-sf6-tmem-slots-dsl48"
     "-v7-stream-all-macrobatches-32x256-warps7-buffers2-groups4-dy-warpquant"
     "-tma-desc-gmem-wgrad-valid-end-swiglu-split-quant-bf16gateup-wgrad-segment-order"
-    "-ring-slots-one-stream-segment-wgrad"
+    "-ring-slots-one-stream-segment-wgrad-commoneloop"
 )
 _ABI_EPOCH: Final = "persistent-mxfp8-bwd-eighteen-output-twelve-counter-four-metadata-one-stream-head" "-tensormaps-bf16-gate-up-context-v9"
 # The backward of a gate_up_context="mxfp8" forward (the e4m3 / scale Gate / Up context).
@@ -85,7 +85,7 @@ _CODEGEN_EPOCH_E4M3_CONTEXT: Final = (
     "mxfp8-bwd-ab6-acc1-sf6-tmem-slots-dsl48"
     "-v7-stream-all-macrobatches-32x256-warps7-buffers2-groups4-dy-warpquant"
     "-tma-desc-gmem-wgrad-valid-end-swiglu-split-quant-wgrad-segment-order"
-    "-ring-slots-one-stream-segment-wgrad"
+    "-ring-slots-one-stream-segment-wgrad-commoneloop"
 )
 _ABI_EPOCH_E4M3_CONTEXT: Final = "persistent-mxfp8-bwd-eighteen-output-twelve-counter-four-metadata" "-one-stream-head-tensormaps-v8"
 

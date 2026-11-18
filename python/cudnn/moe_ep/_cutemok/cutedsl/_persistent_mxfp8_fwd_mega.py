@@ -94,7 +94,22 @@ from . import _mxfp8_gemm_base as gemm
 from . import _persistent_mxfp8_fwd_gemm as mxgemm
 
 from . import routed_descriptors as routed_descriptors_pkg
-from ._bwd_device_helpers import _nanosleep_compat
+from . import _comm_stream
+from ._comm_stream import (
+    STREAM_BUFFERS,
+    STREAM_COLUMNS,
+    STREAM_GROUP_BLOCKS,
+    STREAM_MBARRIERS,
+    STREAM_PULL,
+    STREAM_PUSH,
+    STREAM_ROW_BYTES,
+    STREAM_ROWS,
+    STREAM_WARP_BYTES,
+    STREAM_WARPS,
+    _divide_u32,
+    _red_release_add_gpu,
+    _reciprocal_u32,
+)
 from ._fwd_device_helpers import _swizzled_mlp_tile_coord_i32
 from ._arch import COMPILE_OPTIONS
 from ._host_common import TAIL_WIDTH, row_major_view
@@ -124,7 +139,6 @@ from ._mxfp8_quant import (
     _ldmatrix_x4_trans,
     _load_shared_v4,
     _shuffle_xor,
-    _store_shared_v4_words,
     cvt_e8m0_scale_byte,
     quantize_tile,
 )
@@ -135,7 +149,7 @@ from ._persistent_bf16_fwd_mega import (
     _routed_tables_or_placeholder,
 )
 from ._persistent_mxfp8_fwd_gemm import _Mxfp8Gemm
-from ._tma_1d import tma_load_1d_raw, tma_store_1d_raw
+from ._tma_1d import tma_store_1d_raw
 from .mxfp8_contract import (
     CLUSTER_SIZE,
     MLP_TILE_COLUMNS,
@@ -157,27 +171,10 @@ QUANT_SF_TILE_BYTES = mxgemm.SF_TILE_BYTES
 SHARED_GATE, SHARED_UP, SHARED_SWIGLU, SHARED_DOWN = range(4)
 ROUTED_GATE_UP, ROUTED_DOWN = range(4, 6)
 FC1_TILE_COLUMNS = QUANT_TILE  # Hidden columns per fused FC1 task: one 128 x 128 quantization tile per CTA
-# The forward's communication task stream (``_forward_stream``).  The comm CTA's warps 0 .. STREAM_WARPS - 1 each
-# own STREAM_WARP_BYTES of the arena: STREAM_BUFFERS buffers of STREAM_ROWS x STREAM_COLUMNS BF16 (16 KiB each), one
-# mbarrier per buffer (STREAM_ROWS arrivals per phase: one per pulled row) in the storage struct.  A block is
-# STREAM_ROWS rows x STREAM_COLUMNS columns of one macrobatch; a claim takes STREAM_GROUP_BLOCKS consecutive column
-# blocks of one 32-row tile row (one atomic per group, the group's schedule entries and readiness read once).  The
-# quantization of a pulled block writes its normal and transposed e4m3 and both scale layouts straight to global
-# memory (``_stream_quantize``: STREAM_ROW_TILES_PER_SCALE_TILE 32-row tiles share one 128-row scale tile).
-STREAM_ROWS = 32
-STREAM_COLUMNS = 256  # a hidden that is a multiple of 256 fills every block; a 128-wide H tail (the has_tail
-#                       variant) leaves the last column block half full (_stream_row_bytes, _stream_quantize)
-STREAM_BUFFERS = 2
-STREAM_GROUP_BLOCKS = 4
-STREAM_WARPS = 7
 STREAM_ROW_TILES_PER_SCALE_TILE = QUANT_TILE // STREAM_ROWS
-STREAM_ROW_BYTES = DISPATCH_ROW_CHUNK_BYTES  # 1 KiB: a 32-row slot of 1 KiB rows holds the two 16 KiB buffers
-STREAM_WARP_BYTES = STREAM_ROWS * STREAM_ROW_BYTES
-STREAM_MBARRIERS = STREAM_WARPS * STREAM_BUFFERS
-STREAM_PULL, STREAM_PUSH = 0, 1  # a block's queue: a dispatch pull or a combine push
-POLL_SLEEP_NS = 64  # between two readiness polls of a block whose producer has not finished (nanosleep)
 # y_routed_done arrivals per 128-row block and column block: a push block covers STREAM_ROWS rows x STREAM_COLUMNS
 # columns, so a 128-row x 256-column block sees Y_DONE_ROW_TILES of them (the routed Down waits for all).
+assert STREAM_ROW_BYTES == DISPATCH_ROW_CHUNK_BYTES  # the dispatch row chunk is a stream buffer row pair
 Y_DONE_ROW_TILES = MLP_TILE_ROWS // CLUSTER_SIZE // STREAM_ROWS
 Y_DONE_COLUMNS = STREAM_COLUMNS
 assert STREAM_BUFFERS * STREAM_ROWS * STREAM_COLUMNS * 2 == STREAM_WARP_BYTES
@@ -188,62 +185,6 @@ assert (MLP_TILE_ROWS // CLUSTER_SIZE) % STREAM_ROWS == 0  # a 128-row block is 
 # whole quantization tiles.  Checked here, when the module is loaded, so another block geometry fails before
 # any kernel is compiled; the host admits only H that are whole TAIL_WIDTH halves (_host_common.has_tail).
 assert TAIL_WIDTH == 128 and STREAM_COLUMNS == 2 * TAIL_WIDTH and TAIL_WIDTH % QUANT_TILE == 0
-
-
-@dsl_user_op
-def _fence_proxy_async_global(*, loc=None, ip=None) -> None:
-    """``fence.proxy.async.global``: order this thread's generic-proxy global stores before async-proxy
-    reads of the same bytes.  The quantizing threads store e4m3 rows and scale bytes to global memory by plain
-    stores and the GEMMs load them by TMA (tensor loads, async proxy): each thread fences, the warp (the
-    backward's pipeline: the block) syncs, then one thread releases the counter."""
-    llvm.inline_asm(None, [], "fence.proxy.async.global;", "~{memory}", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _red_release_add_gpu(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [Int64(address).ir_value(loc=loc, ip=ip), Int32(value).ir_value(loc=loc, ip=ip)],
-        "red.release.gpu.global.add.s32 [$0], $1;",
-        "l,r,~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _mul_hi_u32(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
-    """``mul.hi.u32``."""
-    return Int32(
-        llvm.inline_asm(
-            cutlass.cutlass_dsl.T.i32(),
-            [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
-            "mul.hi.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            asm_dialect=0,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@cute.jit
-def _reciprocal_u32(divisor: Int32) -> Int32:
-    """floor((2^32 - 1) / divisor) as a u32 bit pattern: one division, computed once per warp."""
-    return Int32(Int64(0xFFFFFFFF) // Int64(divisor))
-
-
-@cute.jit
-def _divide_u32(n: Int32, divisor: Int32, reciprocal: Int32) -> Int32:
-    """n / divisor for 0 <= n < 2^31 without a division: ``mul.hi`` by the reciprocal is the quotient or one
-    less (the stream decodes its block numbers with these instead of a runtime division per block)."""
-    q = _mul_hi_u32(n, reciprocal)
-    if n - q * divisor >= divisor:
-        q = q + Int32(1)
-    return q
 
 
 @dsl_user_op
@@ -459,19 +400,6 @@ def _fc1_half_offset(column: Int32, cta_rank: Int32) -> Int32:
     its own Gate / Up operand as half ``cta_rank`` of the 256-row tile ``c // 2``:
     ``256 (c // 2) + 128 r + offset = 128 c``."""
     return Int32(FC1_TILE_COLUMNS) * ((column & Int32(1)) - cta_rank)
-
-
-@cute.jit
-def _stream_row_bytes(hidden_size: Int32, column_tile: Int32, has_tail: cutlass.Constexpr = False) -> Int32:
-    """Bytes of one row of the stream's column block ``column_tile``: STREAM_COLUMNS BF16 columns, or with a
-    128-wide H tail (``has_tail``, compile time) TAIL_WIDTH columns in the last block -- a bulk copy of the
-    whole block would run into the next row.  A choice between the two constants, made once per row copy."""
-    if cutlass.const_expr(has_tail):
-        row_bytes = Int32(STREAM_COLUMNS * 2)
-        if (column_tile + Int32(1)) * Int32(STREAM_COLUMNS) > hidden_size:
-            row_bytes = Int32(TAIL_WIDTH * 2)
-        return row_bytes
-    return Int32(STREAM_COLUMNS * 2)
 
 
 @cute.jit
@@ -710,24 +638,10 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
         hidden_size: Int32,
         peer_buffer: Int64,
     ) -> None:
-        """Lane ``lane`` pulls row ``lane`` of a STREAM_ROWS x STREAM_COLUMNS block into ``buffer`` (rows
-        STREAM_COLUMNS x 2 B apart) on ``mbarrier`` (STREAM_ROWS arrivals per phase): one bulk copy of row
-        ``source_row`` (the schedule's route index divided by topk, by the caller) of the peer's buffer at
-        ``peer_buffer`` (the caller's peer-table read; unused for a padding row), or for a padding row 16 B zero
-        stores starting at chunk ``lane`` (the lanes' stores spread over the row's bank groups) fenced against a
-        later bulk copy into the row.  The backward's stream pulls dY and the replayed x through this as well."""
-        chunk_bytes = _stream_row_bytes(hidden_size, column_tile, self.has_tail)
-        row_address = buffer + lane * Int32(STREAM_COLUMNS * 2)
-        if peer_rank >= Int32(0):
-            source = peer_buffer + Int64(source_row) * Int64(hidden_size) * Int64(2) + Int64(column_tile) * Int64(STREAM_COLUMNS * 2)
-            cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, chunk_bytes)
-            tma_load_1d_raw(row_address, source, mbarrier, chunk_bytes)
-        else:
-            for step in cutlass.range_constexpr(STREAM_COLUMNS * 2 // 16):
-                chunk = (Int32(step) + lane) & Int32(STREAM_COLUMNS * 2 // 16 - 1)
-                _store_shared_v4_words(row_address.toint() + chunk * Int32(16), [Uint32(0)] * 4)
-            cute.arch.fence_view_async_shared()
-            cute.arch.mbarrier_arrive(mbarrier)
+        """One row of a pull block (``_comm_stream.pull_row`` with this kernel's ``has_tail``): row ``source_row`` of
+        the peer's buffer at ``peer_buffer``, or zeros for a padding row.  The backward's stream pulls dY and the
+        replayed x through this as well."""
+        _comm_stream.pull_row(buffer, mbarrier, lane, column_tile, peer_rank, source_row, hidden_size, peer_buffer, self.has_tail)
 
     @cute.jit
     def _stream_quantize(
@@ -814,14 +728,7 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
                 buffer, mbarrier, lane, column_tile, peer, _divide_u32(route, operands[_Fs.TOPK], operands[_Fs.RECIPROCAL_TOPK]), hidden_size, peer_buffer
             )
         else:
-            chunk_bytes = _stream_row_bytes(hidden_size, column_tile, self.has_tail)
-            if peer >= Int32(0):
-                y_routed = operands[_Fs.Y_ROUTED]
-                source = y_routed.iterator.toint() + Int64(row + lane) * Int64(hidden_size) * Int64(2) + Int64(column_tile) * Int64(STREAM_COLUMNS * 2)
-                cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, chunk_bytes)
-                tma_load_1d_raw(buffer + lane * Int32(STREAM_COLUMNS * 2), source, mbarrier, chunk_bytes)
-            else:
-                cute.arch.mbarrier_arrive(mbarrier)
+            _comm_stream.load_local_row(buffer, mbarrier, lane, operands[_Fs.Y_ROUTED].iterator.toint(), row, column_tile, peer, hidden_size, self.has_tail)
 
     @cute.jit
     def _stream_ready_lane0(self, operands: list, queue: Int32, macro: Int32, row: Int32) -> Int32:
@@ -878,6 +785,12 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
                     operands[_Fs.Y_ROUTED_DONE].iterator + self._stream_schedule_row(operands, macro, row) // Int32(MLP_TILE_ROWS // CLUSTER_SIZE)
                 ).toint()
         return address
+
+    @cute.jit
+    def _stream_drain(self, operands: list, queue: Int32) -> None:
+        """``_run_stream``'s drain hook, before pending arrivals are released: nothing to complete (a pull block's
+        quantized output is plain stores, fenced by the loop; a push block's buffer was read before it was counted)."""
+        pass
 
     @cute.jit
     def _stream_process(
@@ -937,178 +850,20 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
             peer = schedule_peer_rank[schedule_row]
             if peer >= Int32(0):
                 route = schedule_peer_token_idx[schedule_row]
-                chunk_bytes = _stream_row_bytes(hidden_size, column, self.has_tail)
-                destination = (
-                    Int64(operands[_Fs.COMBINE_PEER_TABLE][peer]) + Int64(route) * Int64(hidden_size) * Int64(2) + Int64(column) * Int64(STREAM_COLUMNS * 2)
+                _comm_stream.store_row(
+                    buffer,
+                    lane,
+                    Int64(operands[_Fs.COMBINE_PEER_TABLE][peer]) + Int64(route) * Int64(hidden_size) * Int64(2),
+                    column,
+                    hidden_size,
+                    self.has_tail,
                 )
-                tma_store_1d_raw(destination, buffer + lane * Int32(STREAM_COLUMNS * 2), chunk_bytes)
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0, read=True)
 
-    @cute.jit
-    def _run_stream(
-        self,
-        operands: list,
-        schedule_peer_rank: cute.Tensor,
-        schedule_peer_token_idx: cute.Tensor,
-        head: cute.Pointer,
-        arena: cute.Pointer,
-        stream_mbarriers: cute.Pointer,
-        blocks: Int32,
-        groups: Int32,
-        reciprocal_groups: Int32,
-        reciprocal_group: Int32,
-        column_blocks: Int32,
-        comm_cta: Int32,
-        num_comm_sms: Int32,
-        phase_bits: Int32,
-    ) -> Int32:
-        """The communication task stream's loop, shared by the forward (``_forward_stream``) and the backward
-        (``_backward_stream``): warps 0 .. STREAM_WARPS - 1 of every comm CTA (warp 7 idles) work through
-        ``blocks`` blocks of STREAM_ROWS rows x STREAM_COLUMNS columns, numbered per group of STREAM_GROUP_BLOCKS
-        consecutive column blocks of one stream task (group ``g`` is column blocks ``STREAM_GROUP_BLOCKS x (g %
-        groups)`` .. of task ``g / groups``).  Warp ``w`` takes group ``w x num_comm_sms + comm_cta`` first, then
-        its group's next column block (same rows, already ready), else ``atomic_add(head) + warps_total`` (``head``
-        zero at launch).  Each block goes through one of the warp's two 16 KiB buffers: the next block is issued
-        into the other buffer before the current one is processed when its producer is done, otherwise after it
-        (the pending arrivals released first, so a waiting warp never holds back anything).  Arrivals are batched:
-        the warp keeps one pending counter address and releases the count when the next block's address differs
-        (``red.release.gpu``).  ``phase_bits`` carries the warp's buffer-barrier phases in and out (the backward
-        calls this once, its one stream covering every macrobatch).
-
-        What a block is comes from the caller's hooks, which read their operands from ``operands`` (a list whose
-        layout the caller owns): ``_stream_decode`` (task -> queue, macrobatch, 32-row tile), ``_stream_ready_lane0``
-        (lane 0's answer whether the block's producer is done), ``_stream_issue`` (the block into a buffer with
-        the lane's schedule entries read here), ``_stream_arrival`` (the counter word the processed block arrives
-        on, 0 for none), ``_stream_process`` (the block's bytes, landed) and ``_stream_schedule_row`` (the
-        schedule index of the block's first row; the lane's entries are those of that row plus ``lane``).  The
-        backward's hooks turn ``macro`` and ``row`` into the schedule row (``_stream_schedule_row``).  ``reciprocal_groups`` /
-        ``reciprocal_group`` are the caller's ``_reciprocal_u32`` of ``groups`` / STREAM_GROUP_BLOCKS (the per-block
-        divisors; no division per block)."""
-        thread = cute.arch.thread_idx()[0]
-        warp = thread >> Int32(5)
-        lane = thread & Int32(31)
-        group_blocks = Int32(STREAM_GROUP_BLOCKS)
-        warps_total = Int32(STREAM_WARPS) * num_comm_sms
-        buffer_bytes = Int32(STREAM_COLUMNS * 2 * STREAM_ROWS)
-        new_phase_bits = phase_bits
-        if warp < Int32(STREAM_WARPS):
-            warp_base = arena + warp * Int32(STREAM_WARP_BYTES)
-            mbar_base = stream_mbarriers + warp * Int32(STREAM_BUFFERS)
-            current = Int32(0)
-            pending = Int32(0)
-            pending_address = Int64(0)
-            # The current block.
-            block = warp * num_comm_sms + comm_cta
-            queue = Int32(STREAM_PULL)
-            macro = Int32(0)
-            row = Int32(0)
-            column = Int32(0)
-            # The next block: number, decode, the lane's schedule entries, lane 0's readiness.
-            n_block = Int32(blocks)
-            n_queue = Int32(STREAM_PULL)
-            n_macro = Int32(0)
-            n_row = Int32(0)
-            n_column = Int32(0)
-            n_peer = Int32(-1)
-            n_route = Int32(-1)
-            n_ready = Int32(1)
-            if block < blocks:
-                stream_task = _divide_u32(block, groups, reciprocal_groups)
-                column = (block - stream_task * groups) * group_blocks
-                queue, macro, tile = self._stream_decode(operands, stream_task)
-                row = tile * Int32(STREAM_ROWS)
-                ready = cute.arch.shuffle_sync(self._stream_ready_lane0(operands, queue, macro, row), 0)
-                while ready == Int32(0):
-                    _nanosleep_compat(POLL_SLEEP_NS)
-                    ready = cute.arch.shuffle_sync(self._stream_ready_lane0(operands, queue, macro, row), 0)
-                schedule_row = self._stream_schedule_row(operands, macro, row) + lane
-                cute.arch.sync_warp()  # lane 0's acquire poll orders the lanes' reads, as on the steady-state paths
-                self._stream_issue(
-                    operands, queue, row, column, warp_base, mbar_base, lane, schedule_peer_rank[schedule_row], schedule_peer_token_idx[schedule_row]
-                )
-            while block < blocks:
-                # The group's next column block (same rows, already ready), else a new group by the atomic.
-                group_end = cutlass.min((_divide_u32(column, group_blocks, reciprocal_group) + Int32(1)) * group_blocks, column_blocks)
-                if column + Int32(1) < group_end:
-                    n_block = block
-                    n_column = column + Int32(1)
-                    n_queue = queue
-                    n_macro = macro
-                    n_row = row
-                    n_row_index = self._stream_schedule_row(operands, macro, row) + lane
-                    n_peer = schedule_peer_rank[n_row_index]
-                    n_route = schedule_peer_token_idx[n_row_index]
-                    n_ready = Int32(1)
-                else:
-                    taken = Int32(0)
-                    if lane == Int32(0):
-                        taken = cute.arch.atomic_add(head, Int32(1), sem="relaxed", scope="gpu")
-                    n_block = cute.arch.shuffle_sync(taken, 0) + warps_total
-                    if n_block < blocks:
-                        n_task = _divide_u32(n_block, groups, reciprocal_groups)
-                        n_column = (n_block - n_task * groups) * group_blocks
-                        n_queue, n_macro, n_tile = self._stream_decode(operands, n_task)
-                        n_row = n_tile * Int32(STREAM_ROWS)
-                        n_row_index = self._stream_schedule_row(operands, n_macro, n_row) + lane
-                        n_peer = schedule_peer_rank[n_row_index]
-                        n_route = schedule_peer_token_idx[n_row_index]
-                        n_ready = self._stream_ready_lane0(operands, n_queue, n_macro, n_row)
-                next_ready = Int32(0)
-                if n_block < blocks:
-                    next_ready = cute.arch.shuffle_sync(n_ready, 0)
-                other = Int32(1) - current
-                if next_ready == Int32(1):
-                    cute.arch.sync_warp()
-                    self._stream_issue(operands, n_queue, n_row, n_column, warp_base + other * buffer_bytes, mbar_base + other, lane, n_peer, n_route)
-                # Process the current block; a change of arrival word releases the pending arrivals first.
-                buffer = warp_base + current * buffer_bytes
-                address = self._stream_arrival(operands, queue, macro, row)
-                if pending > Int32(0):
-                    if address != pending_address:
-                        _fence_proxy_async_global()
-                        cute.arch.sync_warp()
-                        if lane == Int32(0):
-                            _red_release_add_gpu(pending_address, pending)
-                        pending = Int32(0)
-                if address != Int64(0):
-                    pending_address = address
-                    pending = pending + Int32(1)
-                cute.arch.mbarrier_wait(mbar_base + current, (new_phase_bits >> current) & Int32(1))
-                new_phase_bits = new_phase_bits ^ (Int32(1) << current)
-                self._stream_process(operands, queue, macro, row, column, buffer, lane, schedule_peer_rank, schedule_peer_token_idx)
-                if n_block < blocks:
-                    if next_ready == Int32(0):
-                        if pending > Int32(0):
-                            _fence_proxy_async_global()
-                            cute.arch.sync_warp()
-                            if lane == Int32(0):
-                                _red_release_add_gpu(pending_address, pending)
-                            pending = Int32(0)
-                        next_ready = cute.arch.shuffle_sync(self._stream_ready_lane0(operands, n_queue, n_macro, n_row), 0)
-                        while next_ready == Int32(0):
-                            _nanosleep_compat(POLL_SLEEP_NS)
-                            next_ready = cute.arch.shuffle_sync(self._stream_ready_lane0(operands, n_queue, n_macro, n_row), 0)
-                        cute.arch.sync_warp()
-                        self._stream_issue(operands, n_queue, n_row, n_column, warp_base + other * buffer_bytes, mbar_base + other, lane, n_peer, n_route)
-                current = other
-                block = n_block
-                queue = n_queue
-                macro = n_macro
-                row = n_row
-                column = n_column
-            if pending > Int32(0):
-                _fence_proxy_async_global()
-                cute.arch.sync_warp()
-                if lane == Int32(0):
-                    _red_release_add_gpu(pending_address, pending)
-        # Every warp has released its pending arrivals (above) before the CTA goes on (the backward's thread 0 waits
-        # for arrivals this CTA's own pushes count towards).  The buffers' reuse needs no CTA barrier (each warp's
-        # two buffers are its own, and a push block's bulk stores have read theirs before the block is counted);
-        # the full wait only keeps the pushes' writes from outliving the kernel.
-        cute.arch.cp_async_bulk_wait_group(0)
-        cute.arch.sync_threads()
-        return new_phase_bits
+    # The task stream's loop (``_comm_stream.run_stream``), with this class's hooks.
+    _run_stream = _comm_stream.run_stream
+    _stream_block = _comm_stream.block_shape(STREAM_ROWS, STREAM_COLUMNS, 2)  # the quantization's 32 x 256 blocks
 
     @cute.jit
     def _forward_stream(
