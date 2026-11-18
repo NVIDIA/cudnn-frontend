@@ -60,15 +60,19 @@ class FrostNormFwdEngine(BaseEngine):
     def _decline_reason(self, graph, knobs) -> Optional[str]:
         from cudnn.norm.fprop.engines import analyze_for, mismatch
 
-        from cudnn.frost.buffers import cutedsl_primitives_error, cutedsl_requirement_error
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_compiler_requirement_error, cutedsl_primitives_error, cutedsl_requirement_error
+
+        from cudnn.norm._lazy import NORM_CUTEDSL_MIN_VERSION
 
         # Rule 7: decline at CHECK time, not when lowering imports the kernels.
-        error = cutedsl_requirement_error(self.name)
+        error = cutedsl_requirement_error(self.name, floor=NORM_CUTEDSL_MIN_VERSION)
         if error is not None:
             return error
         facts = analyze_for(graph)
         if facts is None:
             return "graph is not a single norm node this engine serves"
+        if facts.invalid:
+            return facts.invalid
         if facts.scale_t is None:
             # A norm with no affine at all is legal upstream: the normalization axes
             # come from the MEAN / INV_VARIANCE dims instead of from scale's. These
@@ -77,7 +81,7 @@ class FrostNormFwdEngine(BaseEngine):
             # a unit gamma would allocate inside execute (Rule 1). Let an engine that
             # serves it natively have the graph.
             return "a norm without a scale input is not served"
-        if not facts.uniform_dtype and not facts.extended_affine:
+        if not facts.uniform_dtype and not facts.extended_affine and not facts.quantize_nodes:
             # These kernels read scale/bias/DY at the I/O dtype; a mixed-precision
             # graph would be read wrong rather than merely be slow.
             return "scale/bias/DY must share the input dtype; mixed-precision parameters are not supported"
@@ -87,7 +91,7 @@ class FrostNormFwdEngine(BaseEngine):
             return reason
         # Last, because it imports the DSL (~1 s): only reached when the engine
         # would otherwise accept, where lowering is about to import it anyway.
-        return cutedsl_primitives_error(self.name)
+        return cutedsl_arch_requirement_error(facts.device_cc) or cutedsl_compiler_requirement_error(facts.device_cc) or cutedsl_primitives_error(self.name)
 
     def check_support(self, graph) -> None:
         reason = self._decline_reason(graph, None)

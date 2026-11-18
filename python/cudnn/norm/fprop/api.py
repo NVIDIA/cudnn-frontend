@@ -239,6 +239,8 @@ def norm_fprop(
     """
     import torch
 
+    if x.is_cuda and x.device.index != torch.cuda.current_device():
+        raise ValueError("cudnn.norm: make the input CUDA device current before calling the direct norm API")
     variant = _as_variant(variant)
     # BN/IN/GN have dedicated channels-last kernels, so preserve NHWC inputs
     # instead of paying a transpose in ``.contiguous()``. The output keeps the
@@ -402,7 +404,7 @@ def norm_fprop(
             return _deliver(y, sm, sr, out_y, out_mean, out_rstd)
 
         # --- NCHW: split-K over the (n, c) rows, each of S contiguous elements ---
-        if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
+        if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb, training=training) is not None:
             x3d = x.reshape(spec.N, spec.C, spec.S)
             o3d = w_y.reshape(spec.N, spec.C, spec.S) if w_y is not None else None
             y3, sm, sr = batchnorm_nchw_sm100.forward(

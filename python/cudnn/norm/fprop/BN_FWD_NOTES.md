@@ -278,7 +278,9 @@ so packed-bf16 columns are not expressible, and pass2 wants fp32 anyway).
 **Three traps, all of which cost real time:**
 
 1. **`offset=` is only legal for `SHAPE_16X32BX2`.** For `SHAPE_32X32B` build a separate
-   pointer per column with `make_tmem_ptr_from_warp_row_col(base, warp % 4, col, Float32)`.
+   pointer per column with `make_tmem_ptr(base + (((warp % 4) * 32) << 16) + col, Float32)`.
+   Preserve the allocation's starting column; the warp/column helper expects that
+   column to be included explicitly in its column argument.
 2. **`tcgen05_ld/st` are warp-ALIGNED -- every lane must participate.** Guarding them with
    the per-pixel bound `if rk < r1` diverges whenever `TPP < 32` (C=64 -> TPP=8, four `tp`
    values per warp) and **HANGS the kernel**. Clamp the row and run the TMEM op

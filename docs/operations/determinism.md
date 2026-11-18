@@ -56,6 +56,10 @@ arbitrary user callbacks.
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
+| FROST `layernorm` / `rmsnorm` with `adaptive=True` | fprop (Y and statistics), bprop DX | FP16, BF16, FP32 I/O; FP32 statistics | Unverified | SM100: Supported (tested row-kernel configurations); SM103: Unverified | Unverified |
+| FROST `instancenorm` with `adaptive=True` | fprop; bprop DX, DScale, DBias | FP16, BF16, FP32 I/O; FP32 statistics and parameter gradients | Unverified | SM100: Supported (tested row-kernel configurations); SM103: Unverified | Unverified |
+| FROST adaptive LN/RMSNorm parameter gradients | bprop DScale, DBias | FP32 | Not guaranteed | Not guaranteed | Not guaranteed |
+| FROST adaptive LN/RMSNorm followed by `block_scale_quantize` | MXFP8 fprop/bprop; NVFP4 fprop inference | BF16 input; FP32 staging; E4M3/E5M2 + E8M0, or E2M1 + E4M3 | Unsupported | SM100: Supported (tested configurations); SM103: Unverified | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -275,6 +279,17 @@ a row alone and inside a batch under the entry's own picks.
   saved C for BF16 and FP16 C/D. The clamped path's approximate `tanh` is not
   bitwise equal to a host `tanh`. Other activations and SM107 are not covered
   by this row.
+- FROST adaptive norms: the graph selects `norm_fprop_sm100` or
+  `norm_bprop_sm100`. The row-kernel checks cover zero-centered gamma on/off,
+  tail widths and multiple scheduling waves, with fixed upstream gradients
+  and loss scale during batch changes. LN/RMSNorm parameter gradients use
+  floating-point atomics and have no bitwise guarantee. AdaIN checks all
+  parameter gradients. Block-scale checks compare both payload and scale
+  bytes; MXFP8 covers paired row/column output, while NVFP4 covers row-only
+  inference. Ordinary warp, pipelined and cluster norms, GroupNorm, and
+  BatchNorm are not qualified for determinism by this suite. SM107 execution
+  requires a DSL with `sm_107a` and its CUDA 13.4+ compiler. Its expanded
+  determinism qualification remains unverified.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed

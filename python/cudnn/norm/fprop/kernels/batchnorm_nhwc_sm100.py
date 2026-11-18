@@ -27,11 +27,13 @@ See ``cudnn/norm/fprop/BN_FWD_NOTES.md`` for the measurements behind the knobs.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.utils import (
     ws_bytes,
@@ -58,12 +60,7 @@ _SM_COUNT = None
 
 
 def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    return _SM_COUNT if _SM_COUNT is not None else sm_count()
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +226,9 @@ def _bn_nhwc_kernel(
                     dz = fs[e] - kshift[e]
                     s[e] = s[e] + dz
                     sq[e] = sq[e] + dz * dz
-            tp_kt = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warp % 4, wcol + kt * CPP, cutlass.Float32)
+            # Preserve the allocation's starting column. The warp/column helper
+            # expects an absolute column, not the relative offset used here.
+            tp_kt = nvvm.make_tmem_ptr(tptr[0] + (((warp % 4) * 32) << 16) + wcol + kt * CPP, cutlass.Float32)
             nvvm.tcgen05_st(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tp_kt, cutlass.Vector.from_elements(tuple(fs), cutlass.Float32))
         nvvm.tcgen05_wait(nvvm.Tcgen05Wait.STORE)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -380,7 +379,7 @@ def _bn_nhwc_kernel(
         wcol = (warp // 4) * (KT * CPP)
         for kt in cutlass.range_constexpr(KT):
             rk = r0 + tp + (KC + KS + kt) * PPL
-            tp_kt = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warp % 4, wcol + kt * CPP, cutlass.Float32)
+            tp_kt = nvvm.make_tmem_ptr(tptr[0] + (((warp % 4) * 32) << 16) + wcol + kt * CPP, cutlass.Float32)
             # Unconditional (warp-aligned); only the global store is predicated.
             tvout = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tp_kt, num=CPP)
             if rk < r1:
@@ -463,6 +462,7 @@ def _bn_nhwc_host(
     update_running: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    cooperative: cutlass.Constexpr,
     stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
@@ -497,7 +497,7 @@ def _bn_nhwc_host(
         eps,
         has_beta,
         update_running,
-    ).launch(stream=stream, grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=cooperative, min_blocks_per_mp=mbpm)
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +686,7 @@ def forward(
         nblk = max(1, min(_nsm() * 4 // max(1, cblks), (M + PPL - 1) // PPL))
         ce = (C, V, TPP, PPL, BT, cblks, nblk, it_ty, et, float(eps), has_beta)
         # dyn() specializes strides 0 and 1; larger strides are dynamic.
-        key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
+        key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce + (device_key(),)
         args = (dyn(x2d), dyn(y2d), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(M))
         fn = _KCACHE.get(key)
         if fn is None:
@@ -713,10 +713,11 @@ def forward(
     key_head = (params.io_dtype, C, KC, KS)
     key_tail = (CPC, has_beta, update_running, mbpm)
 
-    okey = key_head + key_tail + (M,)
+    okey = key_head + key_tail + (M,) + (device_key(),)
     occ0 = _OCC.get(okey, 2 if mbpm != 1 else 1)
     can2 = smem_bytes * 2 <= smem_budget(224 * 1024)
     for occ in ([2, 1] if (occ0 == 2 and can2) else [1]):
+        mparts = _mparts(M, PPL, cblks, occ)
         KT_occ = min(KT, _tmem_cap(BT, V, occ))
         smem_bytes = _smem_bytes(BT, V, CPC, KS, eb)
         if KT_occ > 0:
@@ -724,10 +725,9 @@ def forward(
             # 3rd co-resident CTA can exhaust the SM's 512 TMEM columns and its
             # tcgen05_alloc leaves a garbage base address.
             smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
-        ce = ce_head + (KT_occ, _UR) + ce_tail[:-2] + (smem_bytes, mbpm)
-        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
+        ce = ce_head + (KT_occ, _UR) + ce_tail[:-2] + (smem_bytes, mbpm, mparts > 1)
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce + (device_key(),)
         fn = _KCACHE.get(key)
-        mparts = _mparts(M, PPL, cblks, occ)
         # Partials [cblks, 2, mparts, C_tile]; every slot is written, so no zeroing.
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cblks * mparts * TPP * V * 2, torch.float32, x2d.device)

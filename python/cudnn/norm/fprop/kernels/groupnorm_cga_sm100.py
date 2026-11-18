@@ -33,11 +33,13 @@ within the row, not the slice-local one.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm._common_sm100 import shifted_stats
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
@@ -321,7 +323,7 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None, out_y=None, out_
     # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
     # change epsilon without rebuilding the graph (it is a pass-by-value operand),
     # and a key without it silently replays the kernel compiled for the old value.
-    key = (params.io_dtype,) + ce
+    key = (params.io_dtype,) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

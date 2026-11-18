@@ -35,11 +35,13 @@ See ``cudnn/norm/fprop/BN_FWD_NOTES.md``.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
@@ -56,12 +58,7 @@ _SM_COUNT = None
 
 
 def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    return _SM_COUNT if _SM_COUNT is not None else sm_count()
 
 
 def flat_cfg(C: int, N: int, S: int, elem_bytes: int, occ: int = 1, BT: int = _BT):
@@ -536,7 +533,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
     # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
     # change epsilon without rebuilding the graph (it is a pass-by-value operand),
     # and a key without it silently replays the kernel compiled for the old value.
-    key = (params.io_dtype,) + ce
+    key = (params.io_dtype,) + ce + (device_key(),)
 
     pbuf = torch.empty(pparts * mparts * 2 * CPB, dtype=torch.float32, device=x3d.device)
     ret = torch.zeros(2, dtype=torch.int32, device=x3d.device)

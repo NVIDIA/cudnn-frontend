@@ -227,8 +227,15 @@ pytest test/python/norm/graph/test_frost_norm_affine.py
 
 ## Environment
 
-Requires Blackwell (SM100 or SM103; Hopper SM90 through the opt-in `norm_*_sm90` rows), a CUDA 13-capable driver, and a CUTLASS DSL build
->= 4.7.0 that exports `cutlass.experimental.primitives` (every public wheel does). The norm entry points
+The graph engines serve Blackwell SM100/SM103 and Rubin SM107 through the
+`norm_*_sm100` engine names. Hopper SM90 uses the opt-in `norm_*_sm90` engines.
+SM107 also serves norm block scaling: MXFP8 forward/backward and NVFP4 inference.
+
+Requires a CUDA 13-capable driver and a CUTLASS DSL build >= 4.8.0 that exports
+`cutlass.experimental.primitives` and `cutlass.memory`. SM107 additionally requires a DSL build whose
+`Arch` contains `sm_107a` (public DSL 4.8.0 or newer), bound to its CUDA 13.4+
+compiler (`nvidia-cutlass-dsl[cu13]`). The CUDA 12.9 compiler flavor is declined
+before JIT, even when the DSL recognizes SM107. The norm entry points
 reject builds without this module, and `norm_fprop` / `norm_bprop` raise `NotImplementedError` on a GPU older than SM90
 (use the graph API there; the cuDNN backend serves it). Check the active environment before running:
 
@@ -279,5 +286,44 @@ shines for tiled/tensor-core loads, less so for flat reduction rows.
 - [ ] Graph-path e2e validation on a built cuDNN frontend; runtime epsilon/momentum plumbing.
 - [ ] Perf: warp-per-row / multi-row CTAs for small D (main gap); block-size autotune.
 - [ ] BatchNorm staging/vectorization (currently scalar global, strided cross-batch).
-- [ ] Welford (numerically stable) reduction for very large M; lower precisions (fp8/fp4/mx).
-```
+- [ ] Welford (numerically stable) reduction for very large M; lower precision norm arithmetic.
+
+## Block-scale graph output
+
+Norm block scaling uses torch tensors for graph operands and workspace. MXFP8
+payloads and scales accept their declared float8 dtype or uint8 storage with the
+same logical shape and element strides. Byte outputs may start at any byte offset;
+the norm intermediate uses the aligned CUDA uint8 workspace reported by the plan.
+Singleton strides do not affect addressing. NVFP4 payload storage is packed uint8.
+
+Block-scale plans follow preferred backend candidates until comparative performance
+is qualified; fallback backend candidates may follow FROST.
+They remain available for explicit selection and graphs the backend declines.
+The shared compiled-object cache records the bound CUDA compiler and any forced
+`CUTE_DSL_ARCH`. If an internal build cannot identify its compiler, it retains
+in-process reuse but does not persist objects across processes.
+
+The virtual norm output's declared dtype determines the precision passed to
+quantization. Set `intermediate_data_type=cudnn.data_type.FLOAT` on the graph
+and keep Y (or backward DX) virtual to preserve FP32. FP16/BF16 inputs do not
+force a low-precision intermediate. An explicit FP16/BF16 dtype on that virtual
+tensor requests rounding before quantization; FROST honors that declaration.
+
+The persistent backend norm source uses the same declared-dtype contract. On
+cuDNN 93000, a finite forward LayerNorm probe with zero gamma isolated conversion
+order: FROST and backend engine 3 matched the declared-dtype oracle, including
+the discriminating FP16/BF16 E4M3 cases. Backend engine 1 instead matched the unrounded FP32
+oracle in the low-precision cases. With an FP32 intermediate, every tested
+backend/FROST plan matched payload and scale bytes for E4M3, E5M2 and NVFP4.
+Backend engine 4 did not compile the tested FP16/BF16 NVFP4 intermediates.
+This controlled probe does not establish byte parity for arbitrary norm
+reductions. The default-FP32 graph regression tests check both routes against
+an independent quantizer reference.
+
+Nonfinite inputs also differed in the earlier first-plan probe on that runtime:
+in the tested Inf-containing blocks, backend engine 1 emitted maximum-finite
+payload codes where FROST emitted
+NaN or signed zero. The scale bytes agreed in those tests. These differences
+are not covered by a byte-parity guarantee. Backward backend parity and
+comparative performance still need qualification; no numerical tolerance was
+relaxed to hide these differences.

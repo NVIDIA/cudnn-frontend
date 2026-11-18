@@ -439,6 +439,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={"norm_fprop_sm100": EngineSlot(0), "norm_fprop_sm90": EngineSlot(1, opt_in=True)},
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
         validator=("cudnn.norm.affine", "validate_graph"),
+        heuristics=("cudnn.norm.heuristics", "propose"),
     ),
     EngineFamily(
         FROST_NORM_BWD_ID_BASE,
@@ -448,6 +449,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={"norm_bprop_sm100": EngineSlot(0), "norm_bprop_sm90": EngineSlot(1, opt_in=True)},
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
         validator=("cudnn.norm.affine", "validate_graph"),
+        heuristics=("cudnn.norm.heuristics", "propose"),
     ),
 )
 

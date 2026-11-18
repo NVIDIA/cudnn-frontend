@@ -27,8 +27,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def _sm100_family():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("the SM100 norm kernels need compute capability 10.0 or 10.3")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the SM100 norm kernels need compute capability 10.0, 10.3, or 10.7")
 
 
 def _artifacts():

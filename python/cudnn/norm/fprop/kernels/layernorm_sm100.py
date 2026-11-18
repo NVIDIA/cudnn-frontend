@@ -19,10 +19,12 @@ Also serves RMSNorm via ``has_mean=False`` (see :mod:`rmsnorm_sm100`).
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_TO_CUTLASS
 from cudnn.norm.strided import fake_strided_vector
@@ -215,7 +217,7 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params, out_y=None, out_mean=No
     rstd = torch.empty(spec.R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
 
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta)
-    key = (params.io_dtype,) + ce
+    key = (params.io_dtype,) + ce + (device_key(),)
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():

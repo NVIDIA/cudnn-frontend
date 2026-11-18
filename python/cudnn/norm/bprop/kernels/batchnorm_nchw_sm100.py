@@ -26,11 +26,13 @@ registers once, so the normalize is a pure streaming pass.
 
 from __future__ import annotations
 
+from cudnn.norm.utils import device_key, sm_count
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.memory import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nchw_sm100 import nchw_cfg
@@ -45,12 +47,7 @@ _SM_COUNT = None
 
 
 def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    return _SM_COUNT if _SM_COUNT is not None else sm_count()
 
 
 @cute.jit
@@ -496,7 +493,7 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     xf, df, gf = x3d.reshape(-1), dy3d.reshape(-1), dx.reshape(-1)
     count = float(N * S)
 
-    okey = (params.io_dtype, C, S, N, has_beta)
+    okey = (params.io_dtype, C, S, N, has_beta) + (device_key(),)
     occ0 = _OCC.get(okey, 2)
     for occ in ([2, 1] if occ0 == 2 else [1]):
         mparts = max(1, min(occ * _nsm() // max(1, cparts), N))
@@ -506,7 +503,7 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         mbpm = 2 if occ == 2 else 0
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, cparts, it_ty, et, count, has_beta, smem_bytes, mbpm)
         # dyn() specializes strides 0 and 1; larger strides are dynamic.
-        key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce + (device_key(),)
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cparts * 2 * mparts * CT, torch.float32, x3d.device)
         ret = ws_zeros(ws, cparts, torch.int32, x3d.device)

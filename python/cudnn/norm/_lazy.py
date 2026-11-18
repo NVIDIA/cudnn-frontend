@@ -19,6 +19,9 @@ This module must therefore stay free of CuTe DSL imports itself.
 
 from typing import Any
 
+# Norm kernels import cutlass.memory, which the public 4.7 wheel does not ship.
+NORM_CUTEDSL_MIN_VERSION = (4, 8, 0)
+
 
 def dsl_unavailable(what: str):
     """Why the CuTe DSL cannot serve ``what``, or None when it can.
@@ -29,7 +32,7 @@ def dsl_unavailable(what: str):
     """
     from cudnn.frost.buffers import cutedsl_primitives_error, cutedsl_requirement_error
 
-    return cutedsl_requirement_error(what) or cutedsl_primitives_error(what)
+    return cutedsl_requirement_error(what, floor=NORM_CUTEDSL_MIN_VERSION) or cutedsl_primitives_error(what)
 
 
 def lazy_exports(package: str, exports: dict, namespace: dict):

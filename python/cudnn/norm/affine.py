@@ -35,7 +35,7 @@ def _roles(f):
     return dict(dy=f.dy_t, x=f.x_t, gamma=f.scale_t, mean=f.mean_t if f.has_mean else None, rstd=f.inv_var_t, dx=f.dx_t, dgamma=f.dscale_t, dbeta=f.dbias_t)
 
 
-def mismatch(f):
+def mismatch(f, *, staged_output=False):
     """Check declarations before importing or compiling kernels."""
     if f.compute_dtype not in (None, cudnn.data_type.FLOAT):
         return "adaptive/zero-centered norm requires fp32 computation"
@@ -77,7 +77,7 @@ def mismatch(f):
     if f.phase == "bprop" and f.has_mean and roles["mean"] is None:
         return "centered normalization backward requires saved mean"
     for name in required:
-        if roles[name] is None or roles[name].get_is_virtual():
+        if roles[name] is None or (roles[name].get_is_virtual() and not (staged_output and name in ("y", "dx"))):
             return f"{name} must be a bound tensor"
     for name, t in roles.items():
         if t is None:
@@ -87,7 +87,7 @@ def mismatch(f):
             return f"unsupported {name} dtype"
         if name in ("mean", "rstd", "dgamma", "dbeta") and dtype != torch.float32:
             return f"{name} must be fp32"
-        if name in ("y", "dx", "dy") and dtype != f.dtype:
+        if name in (("dy",) if staged_output else ("y", "dx", "dy")) and dtype != f.dtype:
             return f"{name} dtype must match X"
         if not _dense(t) or prod(t.get_dim()) != expected[name]:
             return f"{name} must have dense row-major storage with {expected[name]} elements; got {t.get_dim()}, strides {t.get_stride()}"
@@ -127,7 +127,14 @@ def validate_graph(graph):
     from .graph_analyzer import analyze, _norm_node
 
     f = analyze(graph)
-    if f is None or f.invalid or not f.extended_affine or mismatch(f) is not None:
+    if f is None or f.invalid:
+        return False
+    if f.quantize_nodes:
+        from .block_scale import mismatch as block_scale_mismatch
+
+        if block_scale_mismatch(f) is not None:
+            return False
+    elif not f.extended_affine or mismatch(f) is not None:
         return False
     if f.phase == "fprop":
         phase = _norm_node(graph).params.get("norm_forward_phase")
@@ -136,7 +143,7 @@ def validate_graph(graph):
     return True
 
 
-def lower(f):
+def lower(f, *, staged_output=False):
     from cutlass.cute.runtime import from_dlpack, make_fake_tensor
     import cutlass
     import cutlass.cute as cute
@@ -146,14 +153,14 @@ def lower(f):
     from .dtypes import DTYPE_TO_CUTLASS, torch_dtype_to_str
     from .utils import cur_stream, fake_stream
 
-    reason = mismatch(f)
+    reason = mismatch(f, staged_output=staged_output)
     if reason:
         raise NotImplementedError(reason)
     d = prod(f.normalized_shape)
     r = prod(f.x_shape) // d
     roles = _roles(f)
     if f.phase == "fprop":
-        roles = {name: t if t is not None and not t.get_is_virtual() else None for name, t in roles.items()}
+        roles = {name: t if t is not None and (not t.get_is_virtual() or (staged_output and name == "y")) else None for name, t in roles.items()}
     device = torch.cuda.current_device()
     params = TemplateParams(variant=f.variant, io_dtype=torch_dtype_to_str(f.dtype), has_beta=f.has_beta)
     cfg = make_cfg(params, d, staged_rows=1 if f.phase == "fprop" else 2)

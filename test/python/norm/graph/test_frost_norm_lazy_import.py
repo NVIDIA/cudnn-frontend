@@ -143,3 +143,33 @@ def test_public_wheel_layout_is_served():
     )
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip().splitlines()[-1] == "SERVED", out.stdout[-2000:]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", ["fprop", "bprop"])
+def test_norm_dsl47_declines_before_kernel_import(phase):
+    code = f"""
+import sys
+import cudnn.frost.buffers as buffers
+buffers.cutedsl_state = lambda: (True, ("nvidia-cutlass-dsl", "4.7.0"))
+import cudnn.norm
+try:
+    getattr(cudnn.norm, "norm_{phase}")
+except ImportError as exc:
+    assert "4.7.0" in str(exc) and "4.8.0" in str(exc), str(exc)
+else:
+    raise AssertionError("4.7 unexpectedly admitted")
+from cudnn.norm.{phase}.engine import FrostNorm{'Fwd' if phase == 'fprop' else 'Bwd'}Engine
+from cudnn.norm.{phase}.engines import ENGINE_SPECS
+engine = FrostNorm{'Fwd' if phase == 'fprop' else 'Bwd'}Engine(ENGINE_SPECS[0], 21000)
+try:
+    engine.check_support(object())
+except NotImplementedError as exc:
+    assert "4.7.0" in str(exc) and "4.8.0" in str(exc), str(exc)
+else:
+    raise AssertionError("graph admitted DSL 4.7")
+assert not any("norm.{phase}.kernels." in key for key in sys.modules)
+assert not any(key == "cutlass" or key.startswith("cutlass.") for key in sys.modules)
+"""
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, out.stderr

@@ -148,7 +148,10 @@ def _encode_graph(graph: "pygraph") -> Dict[str, Any]:
         "next_uid": graph._next_uid,
         "reserved_uids": sorted(graph._reserved_uids),
         "node_count": dict(graph._node_count),
-        "tensors": [{f: _encode(getattr(t, f), f"tensor {t.name!r}.{f}") for f in _tensor_fields()} for t in graph._tensor_by_uid.values()],
+        "tensors": [
+            {f: _encode(t.get_data_type() if f == "data_type" else getattr(t, f), f"tensor {t.name!r}.{f}") for f in _tensor_fields()}
+            for t in graph._tensor_by_uid.values()
+        ],
         "nodes": [
             {
                 "name": n.name,

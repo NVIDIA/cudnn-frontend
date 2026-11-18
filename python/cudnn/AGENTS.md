@@ -459,6 +459,9 @@ DSL satisfies your kernel.**
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
   `cudnn._jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
   the JAX dependency group and runtime guard enforce this higher floor.
+  `cutlass.memory` (`SmemAllocator` and shared-memory capacity queries used by
+  `cudnn.norm`) → 4.8.0; gate through `norm._lazy.NORM_CUTEDSL_MIN_VERSION`
+  before importing norm kernels. The public 4.7.0 wheel has no `cutlass.memory`.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
   `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode

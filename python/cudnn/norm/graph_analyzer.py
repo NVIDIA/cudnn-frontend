@@ -107,6 +107,7 @@ class NormGraphFacts:
     zero_centered_gamma: bool = False
     scale_add_dtype: Any = None
     scale_one_t: Any = None
+    quantize_nodes: tuple = ()
 
     @property
     def extended_affine(self):
@@ -163,7 +164,7 @@ def _norm_node(graph: "cudnn.pygraph") -> Optional[Any]:
     except Exception:  # noqa: BLE001 — non-IR graph objects
         return None
     norms = [node for node in nodes if _node_variant(node) is not None]
-    if len(norms) != 1 or len(nodes) > 2:
+    if len(norms) != 1 or len(nodes) > 4:
         return None
     return norms[0]
 
@@ -374,7 +375,14 @@ def _analyze(graph: "cudnn.pygraph") -> Optional[NormGraphFacts]:
     facts = _extract_facts(node)
     if facts.invalid or len(graph.nodes) == 1:
         return facts
-    add = next(n for n in graph.nodes if n is not node)
+    quantizers = tuple(n for n in graph.nodes if _node_type_name(n) == "BLOCK_SCALE_QUANTIZE")
+    others = [n for n in graph.nodes if n is not node and n not in quantizers]
+    facts = replace(facts, quantize_nodes=quantizers)
+    if not others:
+        return facts
+    if len(others) != 1:
+        return None
+    add = others[0]
     mode = getattr(add, "params", {}).get("mode")
     if _node_type_name(add) != "POINTWISE" or str(getattr(mode, "name", mode)).lower() != "add":
         return None

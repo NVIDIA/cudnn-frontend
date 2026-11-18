@@ -7802,3 +7802,153 @@ CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
   pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
 ```
+
+## FROST norm SM107 enablement — 2026-11-13
+
+The graph engines now admit cc 10.7 through `norm_fprop_sm100` and
+`norm_bprop_sm100`. Norm requires public DSL 4.8.0+, including
+`cutlass.experimental.primitives` and `cutlass.memory`; SM107 also requires
+`Arch.sm_107a` and a bound CUDA compiler >=13.4. Both graph support checks and
+standalone entry points decline unsupported environments before compilation.
+
+`norm/graph/test_frost_norm_determinism.py` adds 88 L0 cases:
+
+- 72 adaptive LN, RMSNorm and InstanceNorm cases: both directions; FP16,
+  BF16 and FP32; zero-centered gamma on/off; `(3,5,33)` and `(3,1025,96)`.
+- 10 adaptive LN/RMSNorm block-scale cases: MXFP8 E4M3/E5M2 forward/backward,
+  paired row/column output, and NVFP4 row-only inference. Inputs are BF16,
+  staging is FP32, zero-centered gamma is enabled, and shape is `(3,1024,96)`.
+- Six FP32 golden cases, one per norm and direction. The names include the
+  bound CUDA compiler version to separate compiler flavors.
+
+Each replay uses fresh poisoned output buffers and concurrent GPU work.
+The suite checks independent PyTorch references, input preservation, batch
+isolation, reordering, duplication, and changed neighbors. It keeps DY and
+the mean-MSE loss scale fixed after rebatching. LN/RMSNorm backward compares
+DX bitwise; its atomic DScale/DBias reductions have no bitwise guarantee and
+retain separate numerical checks in `test_frost_norm_affine.py`. AdaIN
+checks all outputs and gradients. Quantized payload and scale comparisons
+use exact bytes. Ordinary warp, pipeline, cluster, GroupNorm and BatchNorm
+paths are outside this determinism claim.
+
+Measured on SM100 (148 SMs): Torch 2.14.1+cu130, CUDA driver API 13.3,
+cuDNN 93000, DSL 4.8.0 with CUDA 13.4 compiler, TVM FFI 0.1.12. The active
+import was this task worktree's `python/cudnn/__init__.py`, based on
+`da02c4edbed57a1a013d7a50eab5137fe702133f` plus the task diff.
+The combined run passed **113/113**, with no skips: 88 determinism cases,
+23 support/device guard cases, and two layout suites. One layout case
+contains the full dtype/shape matrix, including CGA and large-row coverage.
+The warning concerns a 256-iteration static loop's compile time.
+
+Historical recording command for the 113-case snapshot (native cu13 DSL
+environment). Use the final comparison command below for normal checks:
+
+```bash
+PYTHONPATH="$PWD/python:$PWD/test/python" \
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUDNN_DETERMINISM_RECORD=/tmp/frost-sm107-20261113/current-goldens-sm100 \
+python -m pytest -q test/python/norm/graph/test_frost_norm_engines.py \
+  test/python/norm/cutedsl/test_norm_device_floor.py \
+  test/python/norm/graph/test_frost_norm_determinism.py \
+  test/python/norm/cutedsl/test_frost_norm_layout.py -m 'L0 or L1'
+```
+
+Recording was into a fresh directory after replay and reference checks.
+The six records were inspected and checked again with recording unset and
+`CUDNN_DETERMINISM_GOLDENS` pointing at that directory: **6/6 passed**.
+The added records are under `c1762a9c1883f659/`; they are new baselines, not
+replacements for previous output hashes.
+
+The earlier native SM107 run (ComputeLab job 5911006, 108 SMs, driver 620.71,
+DSL 4.8.0 / CUDA 13.4, forced `sm_107a`) passed **381/385**. Every numerical
+case passed. Two failures were mock-fixture errors, subsequently corrected;
+two were the existing block-scale graph-serialization dtype failures. That
+run predates the compiler guard, workspace-size correction and expanded
+suite, so it does not qualify the final delta or SM107 determinism.
+The follow-up launch was explicitly approved, but automatic approval review
+timed out before execution, including for a smaller job. SM107 expanded
+qualification, SM103 execution, a second Rubin SM count, and performance
+remain unverified. No tolerance was relaxed.
+
+
+The final affected-source run passed **43/43**, with no skips, after adding
+the real DSL floor, NCHW BatchNorm geometry bounds, a CGA workspace regression,
+and RMS tiled boundary widths 3840 and 1920. This run used the same SM100
+runtime and `-m 'L0 or L1'` over `test_frost_norm_engines.py`,
+`test_frost_norm_lazy_import.py`, `test_norm_device_floor.py` and
+`test_frost_norm_layout.py`. The earlier 113-case run and the six strict
+golden comparisons are retained as separate evidence.
+
+The installed public DSL 4.7.0 wheel also passed four rejection probes:
+forward/backward standalone API imports and graph support checks all named
+the required 4.8.0 version before loading a DSL or norm kernel module. A
+4.7.0 import had previously failed inside `cutlass.memory`; the new norm
+floor makes that failure actionable. The CUDA 12.9/13.3 compiler refusals
+are covered by controlled tests; their physical SM107 lane did not launch.
+
+An attempted NHWC BatchNorm guard reached the generic NCHW fallback and
+failed layout preservation despite passing numerical checks. That attempt
+was removed. The NCHW fix remains: shapes that would leave a partial plane
+unwritten use the existing generic NCHW kernel, with FP16/BF16/FP32 numerical
+and layout checks. The inherited NHWC cooperative-grid limit is still open.
+
+
+Final combined validation on the final source passed **131/131**, with
+**0 failures and 0 skips**, in 200.26 seconds. This includes all 88 determinism
+cases, the six checked-in golden comparisons, the dependency guards and the
+full layout matrix. The runtime is the SM100 environment above. This closes
+the final review's evidence-record finding; it adds no native SM107 result.
+
+For normal comparison, from the active worktree root with the cu13 DSL and
+cuDNN 93000 library environment selected:
+
+```bash
+unset CUDNN_DETERMINISM_RECORD
+PYTHONPATH="$PWD/python:$PWD/test/python" \
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/test/python/determinism_goldens" \
+python -m pytest -q test/python/norm/graph/test_frost_norm_engines.py \
+  test/python/norm/graph/test_frost_norm_lazy_import.py \
+  test/python/norm/cutedsl/test_norm_device_floor.py \
+  test/python/norm/cutedsl/test_frost_norm_layout.py \
+  test/python/norm/graph/test_frost_norm_determinism.py -m 'L0 or L1'
+```
+
+The NCHW bounds also affect existing SM100 shapes whose cooperative tile
+count exceeds `2 * SMs`, including inference shapes because the geometry
+helper is shared. Their numerical fallback is checked; its performance is
+unmeasured. The fixed geometry was replayed on host from the original and
+final functions: C=32768 at 108 SMs changes from an incomplete two-plane
+write to a clean decline; the served 148-SM control is unchanged.
+
+
+## FROST norm review-fix validation — 2026-11-16
+
+The applied review fixes passed **822/822** affected regression
+cases, with **0 failures and 0 skips**, on the same 148-SM SM100 runtime described
+above (driver 610.11, cuDNN 93000, public DSL 4.8.0 / CUDA 13.4, Torch
+2.14.1+cu130). This includes all 88 norm determinism cases and six strict
+golden comparisons, 425 block-scale cases, ordinary norm graph/workspace tests,
+and the expanded forward/backward layout matrix. Golden recording was unset;
+the checked-in golden files and numerical tolerances were unchanged.
+
+The wide NHWC BatchNorm case `(2,2008,2,2)` exposed dropped TMEM allocation
+column bits. Original/corrected comparisons used the same inputs: the original
+addresses failed that shape in FP32/FP16/BF16, while corrected addresses passed
+all 24 diagnostic cases. A forced-cooperative control passed 18 cases and rejected
+six launches as too large; those six are not numerical passes.
+
+The first expanded run was 818/820. A test incorrectly required two-CTA NCHW
+TMEM occupancy, and an invalid adaptive graph received a misleading missing-scale
+diagnostic. The final tests record the NCHW occupancy actually exercised (one),
+retain its numerical and layout checks, and verify analyzer errors in both norm
+directions. A forced fallback also checked the real driver shared-memory query.
+All 54 focused follow-up cases and repository pre-commit hooks passed. Two later
+test-only reporting/compatibility refinements passed their affected tests again
+(2/2, no warnings); production sources are unchanged from the 822-case run.
+
+The previous NHWC cooperative-grid and serialization findings are resolved on
+SM100. NCHW inference no longer applies the training-only geometry bounds; wide
+inference tests passed. These results add no native SM107/SM103, mixed-device,
+NCHW TMEM-sharing or performance qualification. The existing determinism support
+rows remain unchanged.
