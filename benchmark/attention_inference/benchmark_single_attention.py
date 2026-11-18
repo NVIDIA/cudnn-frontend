@@ -42,15 +42,18 @@ import math
 import os
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from statistics import median
 from typing import Optional, Tuple
 
 import torch
 
-try:
-    from .config_types import attn_mask
-except ImportError:  # run as a script
-    from config_types import attn_mask
+if not __package__ or __package__ == "attention_inference":
+    # The sweep runner launches this file by path, possibly outside the repository.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmark.attention_inference.config_types import attn_mask
+from benchmark.attention_training.flops import count_causal_nonmasked_elems
 
 # GPU-name substring -> peak DRAM bandwidth in GB/s, for % SOL reporting.
 # Override with CUDNN_BENCH_PEAK_BW_GBPS.
@@ -81,12 +84,10 @@ def get_peak_bw_gbps() -> Optional[float]:
     return None
 
 
-def attention_flops(batch, q_tokens, kv_len, num_q_heads, d_qk, d_vo, causal_prefill) -> float:
-    """2*B*H*Sq*Skv*(d_qk+d_vo), halved for square causal prefill."""
-    f = 2.0 * batch * num_q_heads * q_tokens * kv_len * (d_qk + d_vo)
-    if causal_prefill and q_tokens == kv_len:
-        f *= 0.5
-    return f
+def attention_flops(batch, q_tokens, kv_len, num_q_heads, d_qk, d_vo, mask, sliding_window) -> float:
+    """QK and PV FLOPs over the pairs admitted by the benchmark's attention mask."""
+    pairs = q_tokens * kv_len if mask == "no_mask" else count_causal_nonmasked_elems(q_tokens, kv_len, mask, sliding_window or None)
+    return 2.0 * batch * num_q_heads * pairs * (d_qk + d_vo)
 
 
 def attention_bytes(batch, q_tokens, kv_len, num_q_heads, num_kv_heads, d_qk, d_vo, kv_shared, sliding_window, kv_elt_size=2, qo_elt_size=2) -> float:
@@ -553,6 +554,11 @@ def _paged_kv_layout(kv_lens, page_size, device="cuda"):
     return total, indptr, indices, last_page_len, table.to(device)
 
 
+def _window_left(width):
+    """FlashInfer, FA4 and b12x take an inclusive left distance. The preset's width includes the current key."""
+    return width - 1 if width else -1
+
+
 def setup_flashinfer(args, dtype, fi_backend=None):
     import flashinfer
 
@@ -584,7 +590,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
             dqk,
             head_dim_vo=dvo,
             causal=args.causal,
-            window_left=args.sliding_window_size if args.sliding_window_size else -1,
+            window_left=_window_left(args.sliding_window_size),
             sm_scale=args.sm_scale,
             q_data_type=dtype,
             kv_data_type=dtype,
@@ -645,7 +651,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
         # trtllm layout: (pages, 2, num_kv_heads, page_size, head_dim)
         kv_trt = (torch.randn(total, 2, hkv, args.page_size, dqk, device="cuda") * 0.1).to(kv_dtype)
         seq_lens = kv_lens.to(device="cuda", dtype=torch.int32)
-        wl = args.sliding_window_size - 1 if args.sliding_window_size else -1
+        wl = _window_left(args.sliding_window_size)
 
         def fn():
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -674,7 +680,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
             hkv,
             dqk,
             args.page_size,
-            window_left=args.sliding_window_size if args.sliding_window_size else -1,
+            window_left=_window_left(args.sliding_window_size),
             sm_scale=args.sm_scale,
             q_data_type=dtype,
             kv_data_type=kv_dtype,
@@ -699,7 +705,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
         dqk,
         args.page_size,
         causal=True,
-        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        window_left=_window_left(args.sliding_window_size),
         sm_scale=args.sm_scale,
         q_data_type=dtype,
         kv_data_type=kv_dtype,
@@ -727,7 +733,7 @@ def _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace):
     qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(q_lens, 0)]).to(torch.int32)
     kw = dict(
         causal=args.causal,
-        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        window_left=_window_left(args.sliding_window_size),
         sm_scale=args.sm_scale,
         q_data_type=dtype,
         kv_data_type=dtype,
@@ -775,7 +781,7 @@ def setup_b12x(args, dtype):
         k_gpu = torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
         v_gpu = torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
         causal = args.causal if args.phase == "context" else sq > 1
-        window = (args.sliding_window_size, 0) if args.sliding_window_size else None
+        window = (_window_left(args.sliding_window_size), 0) if args.sliding_window_size else None
         sink = torch.randn(hq, device="cuda", dtype=torch.float32) if args.has_sink else None
         kplan = varlen.create_plan_batched(q_gpu, k_gpu, v_gpu, causal=causal, window_size=window, attention_sink_bias=sink)
         splan = varlen.plan_batched(kplan)
@@ -948,7 +954,7 @@ def setup_flash_attention_4(args, dtype):
     k_gpu = torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
     v_gpu = torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
     causal = args.causal if args.phase == "context" else sq > 1
-    window = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
+    window = (_window_left(args.sliding_window_size), 0) if args.sliding_window_size else (-1, -1)
 
     detail = "fa4"
     kwargs = dict(causal=causal, window_size=window, softmax_scale=args.sm_scale)
@@ -1077,9 +1083,10 @@ def main():
             ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
 
     # FLOPs and bytes per request, at each request's own lengths.
+    mask = attn_mask(args.phase, args.causal, args.q_tokens, args.kv_len, args.sliding_window_size)
     flops = byts = 0.0
     for q_len, kv_len in zip(*(t.tolist() for t in request_lens(args))):
-        flops += attention_flops(1, q_len, kv_len, args.num_q_heads, args.head_dim_qk, args.head_dim_vo, causal_prefill=args.causal and args.phase == "context")
+        flops += attention_flops(1, q_len, kv_len, args.num_q_heads, args.head_dim_qk, args.head_dim_vo, mask, args.sliding_window_size)
         byts += attention_bytes(
             1,
             q_len,

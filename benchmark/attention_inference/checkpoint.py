@@ -122,7 +122,10 @@ def benchmark_environment():
         "cudnn": _cudnn_environment(),
         "packages": packages,
         "env": _digest(env),
-        "benchmark": {name: _file_digest(directory / name) for name in ("runner.py", "checkpoint.py", "config_types.py", "benchmark_single_attention.py")},
+        "benchmark": {
+            name: _file_digest(directory / name)
+            for name in ("runner.py", "checkpoint.py", "config_types.py", "benchmark_single_attention.py", "../attention_training/flops.py")
+        },
     }
 
 

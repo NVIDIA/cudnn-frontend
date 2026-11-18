@@ -116,6 +116,9 @@ when resuming. The runner reports a mismatch before reusing any results.
 
 ## Measurement notes
 
+- TFLOPS counts the QK and PV multiplies over each request's unmasked query/key pairs.
+  Causal chunks and multi-token decode use bottom-right alignment. A causal window
+  of width W includes at most W keys per query, including the diagonal.
 - The default timing is the median of `num_iterations` profiler samples,
   each summing the matched CUDA kernel durations after an L2 flush. Setup and
   warmup happen outside the timed region.
