@@ -53,6 +53,7 @@ import inspect
 import json
 import logging
 import os
+import struct
 import sys
 import threading
 import types
@@ -560,7 +561,7 @@ class _Capture:
             where, offset = place(int(v))
             return {"int": int(v)} if where is None else {"where": where, "offset": offset, "as": "int"}
         if isinstance(v, Real):
-            return {"float": float(v)}
+            return {"float": float_bits(v)}
         if isinstance(v, tvm_ffi.Tensor) or hasattr(cls, "__tvm_ffi_object__"):
             obj = v if isinstance(v, tvm_ffi.Tensor) else v.__tvm_ffi_object__()
             if not isinstance(obj, tvm_ffi.Tensor):
@@ -577,7 +578,7 @@ class _Capture:
         if hasattr(cls, "__tvm_ffi_int__"):
             return {"int": int(v.__tvm_ffi_int__())}
         if hasattr(cls, "__tvm_ffi_float__"):
-            return {"float": float(v.__tvm_ffi_float__())}
+            return {"float": float_bits(v.__tvm_ffi_float__())}
         raise _Decline(f"a kernel argument {cls.__name__}")
 
     def tensor(self, t, place):
@@ -813,6 +814,11 @@ def _builder(template):
         return lambda values, buffers: pick(buffers)
     parts = [_builder(v) for v in template[1]]
     return lambda values, buffers: kind([build(values, buffers) for build in parts])
+
+
+def float_bits(v):
+    """A float as its IEEE-754 double bits: JSON has no infinity or NaN."""
+    return struct.unpack("q", struct.pack("d", v))[0]
 
 
 def _dense_stride(shape):

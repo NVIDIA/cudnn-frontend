@@ -116,6 +116,33 @@ def test_a_kernel_with_many_arguments_is_recorded():
     assert type(recording).__name__ == "_Recording"
 
 
+def test_float_arguments_are_replayed_bit_for_bit():
+    """A kernel's float arguments reach a replay with their bits, the infinities and NaN that JSON cannot carry included."""
+    import math
+    import struct
+
+    import tvm_ffi
+
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    values = (math.inf, -math.inf, math.nan, -0.0, 0.1, 5e-324)
+    bits = [struct.pack("d", v) for v in values]
+    seen = []
+    sink = tvm_ffi.convert(lambda *got: seen.append([struct.pack("d", v) for v in got]))
+
+    @cpp_launched
+    def api(x):
+        launch(sink, *values)
+        return x
+
+    x = torch.zeros(8, device="cuda")
+    for _ in range(4):
+        assert api(x) is x
+    assert seen == [bits] * 4
+    (recording,) = api.recordings.values()
+    assert type(recording).__name__ == "_Recording"
+
+
 def test_a_recorded_function_called_inside_a_recording_runs_its_python():
     """A function with a recording of its own, called while another call is recorded, runs its Python: a replay's launches
     are made in C++, where the outer recording would not see them."""
