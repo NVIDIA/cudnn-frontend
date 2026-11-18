@@ -1,25 +1,19 @@
 ---
 title: "Installing the cuDNN Python Frontend"
 ---
-You can install the cuDNN Python frontend from `pip` wheel or from source. After installing the cuDNN Python frontend, you can run the `pytest` command to verify the installation.
-
-Installing the Python Frontend from `pip` Wheel
+You can install the cuDNN Python frontend from a wheel or build it from source. Both options require a compatible [cuDNN backend](/cudnn/installation/backend).
 
 ## Installing the Python Frontend from `pip` Wheel
 
-Download the `pip` wheel corresponding to your Python installation.
+Run pip with the Python interpreter you want to use:
 
-```
-pip install nvidia_cudnn_frontend
+```bash
+python -m pip install nvidia-cudnn-frontend
 ```
 
 ## Installing the Python Frontend from Source
 
-The minimum Python version needed is 3.6. The Python binding compilation requires a development package, which can be installed by running the following command:
-
-```
-apt-get install python-dev
-```
+Building the Python bindings requires Python 3.10 or later, a C++17 compiler, the CUDA Toolkit, and cuDNN backend development files. Install the development headers for the Python interpreter you use to build, such as `python3-dev` for the system Python on Debian or Ubuntu.
 
 1. If you require a custom installation path for the CUDA Toolkit or cuDNN software, set environment variables as follows:
 
@@ -28,26 +22,20 @@ apt-get install python-dev
     | CUDA Toolkit | `CUDAToolkit_ROOT` |
     | cuDNN | `CUDNN_PATH` |
 
-    If you don’t set these environment variables, the command for downloading the frontend Python API gets the CUDA Toolkit and cuDNN from the default system paths.
+    If these variables are unset, the build uses the standard CUDA Toolkit and cuDNN search paths.
 
-2. Download the frontend Python API from the [NVIDIA cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend.git) project on GitHub.
+2. Build and install the frontend from the GitHub repository:
 
-   ```
-   pip install git+https://github.com/NVIDIA/cudnn-frontend.git
+   ```bash
+   python -m pip install git+https://github.com/NVIDIA/cudnn-frontend.git
    ```
 
 ## Verifying the Python Frontend Installation
 
-To test whether your installation was successful, run the following command:
+Import `cudnn` and query both versions with the interpreter you used for installation:
 
-```
-pytest test/python_fe
+```bash
+python -c "import cudnn; print(cudnn.__version__, cudnn.backend_version())"
 ```
 
-## Including the Python Frontend Library
-
-To include the Python frontend library, run:
-
-```
-import cudnn
-```
+To run GPU tests from a source checkout, see [Running tests](https://github.com/NVIDIA/cudnn-frontend/blob/develop/CONTRIBUTING.md#running-tests).
