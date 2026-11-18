@@ -554,6 +554,11 @@ def _paged_kv_layout(kv_lens, page_size, device="cuda"):
     return total, indptr, indices, last_page_len, table.to(device)
 
 
+def _window_left(width):
+    """FlashInfer, FA4 and b12x take an inclusive left distance. The preset's width includes the current key."""
+    return width - 1 if width else -1
+
+
 def setup_flashinfer(args, dtype, fi_backend=None):
     import flashinfer
 
@@ -585,7 +590,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
             dqk,
             head_dim_vo=dvo,
             causal=args.causal,
-            window_left=args.sliding_window_size if args.sliding_window_size else -1,
+            window_left=_window_left(args.sliding_window_size),
             sm_scale=args.sm_scale,
             q_data_type=dtype,
             kv_data_type=dtype,
@@ -646,7 +651,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
         # trtllm layout: (pages, 2, num_kv_heads, page_size, head_dim)
         kv_trt = (torch.randn(total, 2, hkv, args.page_size, dqk, device="cuda") * 0.1).to(kv_dtype)
         seq_lens = kv_lens.to(device="cuda", dtype=torch.int32)
-        wl = args.sliding_window_size - 1 if args.sliding_window_size else -1
+        wl = _window_left(args.sliding_window_size)
 
         def fn():
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -675,7 +680,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
             hkv,
             dqk,
             args.page_size,
-            window_left=args.sliding_window_size if args.sliding_window_size else -1,
+            window_left=_window_left(args.sliding_window_size),
             sm_scale=args.sm_scale,
             q_data_type=dtype,
             kv_data_type=kv_dtype,
@@ -700,7 +705,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
         dqk,
         args.page_size,
         causal=True,
-        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        window_left=_window_left(args.sliding_window_size),
         sm_scale=args.sm_scale,
         q_data_type=dtype,
         kv_data_type=kv_dtype,
@@ -728,7 +733,7 @@ def _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace):
     qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(q_lens, 0)]).to(torch.int32)
     kw = dict(
         causal=args.causal,
-        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        window_left=_window_left(args.sliding_window_size),
         sm_scale=args.sm_scale,
         q_data_type=dtype,
         kv_data_type=dtype,
@@ -776,7 +781,7 @@ def setup_b12x(args, dtype):
         k_gpu = torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
         v_gpu = torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
         causal = args.causal if args.phase == "context" else sq > 1
-        window = (args.sliding_window_size, 0) if args.sliding_window_size else None
+        window = (_window_left(args.sliding_window_size), 0) if args.sliding_window_size else None
         sink = torch.randn(hq, device="cuda", dtype=torch.float32) if args.has_sink else None
         kplan = varlen.create_plan_batched(q_gpu, k_gpu, v_gpu, causal=causal, window_size=window, attention_sink_bias=sink)
         splan = varlen.plan_batched(kplan)
@@ -949,7 +954,7 @@ def setup_flash_attention_4(args, dtype):
     k_gpu = torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
     v_gpu = torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
     causal = args.causal if args.phase == "context" else sq > 1
-    window = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
+    window = (_window_left(args.sliding_window_size), 0) if args.sliding_window_size else (-1, -1)
 
     detail = "fa4"
     kwargs = dict(causal=causal, window_size=window, softmax_scale=args.sm_scale)
