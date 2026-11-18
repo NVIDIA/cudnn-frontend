@@ -7875,6 +7875,93 @@ preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
 
+## Shared backward delta grid boundaries (2026-11-16)
+
+`sdpa/frost/test_sdpa_bwd_dot_grid_determinism.py` directly exercises the shared
+backward delta helper. Its contract is FP32 `rowsum(O * dO)`, optionally scaled
+by the two device descales, plus any declared dQ accumulator/relay zeroing.
+It has no forward operation and does not produce final attention gradients.
+These results do not establish full-chain batch invariance or expand graph
+engine eligibility.
+
+The suite checks complete delta outputs against an independent FP64 formula,
+zero/sentinel tails, fresh bindings, eight executions with concurrent work,
+changed-input CUDA Graph replay, and a sequence alone, reordered and duplicated.
+Dense FP16/BF16/E4M3 cases include batch/head 65535 and 65536 and a live second
+query tile. Half THD cases include empty sequences, independent poisoned O/dO
+origins, compact output packing and a live second query tile. The optional
+accumulator and relay regions must both be cleared.
+
+Runtime: PyTorch 2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 with CUDA 13.4
+compiler. Every process verified its isolated checkout import.
+
+| Device / scope | Passed | Skipped | Interpretation |
+|---|---:|---:|---|
+| A100 / SM80, native L0 suite | 23 | 6 | FP8 conversion unavailable on SM80; those cases are unverified here |
+| A100 / SM80, large-index L1 detector | 1 | 0 | Delta crosses the signed Int32 element boundary; owned prefix/tail canaries survive |
+| L40S / SM89, native L0 suite | 29 | 0 | Portable helper execution, not an SM89 SDPA engine claim |
+| P2021 / SM100, native L0 suite | 29 | 0 | Native shared helper at all new boundaries, with strict goldens |
+| P2021 / SM100, existing integration controls | 14 | 0 | Five physical-stride helper cases plus nine D512 THD graph/standalone numerical, rebind/replay and deterministic-repeat cases; regular-sized complete chains |
+| Host contract and cross-compilation, run on L40S | 14 | 1 | SM80 FP8 conversion skipped; half/FP8 compiled for SM89/90/100/103/107/120; no native claim for those other targets |
+
+Before the fix, the original helper at `68853830a1b520f91dd77220acfe44b1579a9379`
+failed the initial 21-case L40S matrix **11 failed / 10 passed**, all failures
+being CUDA launch-configuration rejection above 65535. The same A100 FP16
+subset had **2 failed / 2 passed**. Keeping the flat launch while restoring
+only the Int32 delta multiplication makes the large-index detector fail on
+untouched live output rows; widening that multiplication passes. Its whole
+wrapped-address interval belongs to the test's prefix allocation. This L1
+case requires 28 GiB free and remains outside the smoke suite.
+
+Fourteen new small goldens were recorded only after the reference/replay checks,
+then compared with recording disabled. No previous golden was replaced.
+FP16/BF16 delta output hashes agree on both tested devices; FP8 includes its
+explicit descale product. The new records are in runtime directories
+`a29ca37b88513cb6` (A100), `98a9396f557b5d7c` (L40S) and
+`3bada6ccd1cb05e1` (SM100). The SM100 combined packet was 43 passed / 46
+L1 cases deselected; those deselections are not additional hardware coverage.
+
+Commands from `test/python`, with the stated GPU visible and source import
+verified:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest sdpa/frost/test_sdpa_bwd_dot_grid_determinism.py -m L0
+pytest sdpa/frost/test_sdpa_bwd_dot_grid_contract.py -m L0
+pytest sdpa/frost/test_sdpa_bwd_dot_large_index.py -m L1
+```
+
+Native SM103/107/120 execution at the new boundary and full SDPA-chain
+qualification at that boundary are pending. Existing API support rows retain
+their prior limits; the SM100 integration controls above cover regular shapes.
+
+### Parallel-memory follow-up (2026-11-16)
+
+The large live query-tail and THD head-boundary fixtures now use D32 storage;
+batch/head/query extents, complete comparisons, retained old dO, eight repeats,
+and changed-input capture are preserved. Ordinary dense grid boundaries and
+THD batch boundaries still use D64. The large accumulator uses D32 with an
+additional D64 small control. The L1 address-span detector and production
+helpers are unchanged; small golden inputs and outputs are unchanged.
+
+With the same runtime listed above and a 2-GiB Torch allocator limit per
+worker, the final L40S suite passes all 30 cases. On SM100, four workers run
+the native suite, five existing stride controls and the host/compiler suite:
+49 pass and one SM80-FP8 compile case skips. Reserving unrelated memory leaves
+16 GiB for the entire process group, including contexts/compiler allocations;
+the sampled group peak is 9.14 GiB. Four additional synchronized THD rebind
+runs hold their largest live inputs together and all pass, with a sampled
+group peak of 9.35 GiB. Both runs stay below 1.880 GiB allocated / 1.917 GiB
+reserved per worker. Sampling is not an exact instantaneous peak measurement.
+
+The pre-follow-up D64 query-tail fixture fails its initial input allocation
+under the same 2-GiB cap. Original-helper RED controls must run in separate
+processes: retained failed-test tracebacks otherwise exhaust that cap and
+mask later launch failures. Ten isolated L40S controls against the exact
+original helper produce seven invalid-launch failures (FP16/BF16/FP8 dense,
+half THD and accumulator initialization) and three legal-boundary passes,
+without OOM. These bounded SM100/L40S results do not establish
+native SM120 qualification or change the API support status above.
 
 ## Shared THD backward fold grid boundaries (2026-11-16)
 
@@ -8069,3 +8156,46 @@ an XLA reference; one native-lowering check for each direction in one test;
 one replay/isolation test; four saved-tensor validation cases; and one missing
 FFI-header check. Stats remain FP32 between forward and backward. The native
 backward lowering has one FFI call, with no forward recomputation.
+
+
+### Shared backward delta: native SM120 memory qualification — 2026-11-17
+
+The unchanged shared-helper source at `54b464d2bd233db1535caec4628fae6decf9456f`
+was run on an actual RTX 5080 (SM120, 84 SMs, 16-GB device), with Torch
+2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 and its CUDA 13.4 compiler.
+The frozen checkout and every runtime dependency were hash-checked; imports
+resolved to that checkout. No unrelated memory reservation simulated a smaller
+GPU. Each pytest worker had a 2-GiB Torch allocator limit.
+
+- Four workers: **49 passed, 1 skipped**, including all **30 native** delta
+  cases, five stride controls and the host/compiler suite. The only skip is
+  the existing SM80-FP8 compiler case; no native SM120 case skipped.
+- Four synchronized replicas of the largest THD rebind case: **4 passed**.
+  All four workers reached the live-storage barrier while retaining their
+  old and fresh inputs.
+- A separate process with recording disabled and strict golden checking:
+  **6 passed, 0 skipped**. Five small golden records cover dense FP16/BF16/FP8
+  and THD FP16/BF16; the sixth case is the small accumulator control.
+
+The sampled device-memory increments were 8.54 GiB for the four-worker
+suite and 9.26 GiB for synchronized replicas. Maximum measured per-worker
+Torch allocation/reservation was 1.880/1.916 GiB. These samples do not establish
+an instantaneous device peak. The run completed normally. An earlier runner
+attempt stopped before pytest because two helper plugins were not staged;
+that failure is retained separately and contributes no qualification.
+
+The five records under `45e8f430a9d818a2/` were recorded only after reference,
+replay and batch checks, then compared strictly in the separate process.
+Their input/output records also match the existing runtime-specific records
+where present. Only the runtime fingerprint differs. Re-run the strict small
+selection on the matching environment with:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest sdpa/frost/test_sdpa_bwd_dot_grid_determinism.py -m L0 -k small -q
+```
+
+This closes the native SM120 qualification gap for these direct-helper cases.
+It does not qualify full attention chains at the launch boundary, native
+SM103/SM107 boundary cases, or a new public API support row. Current-head
+review and integration CI remain separate from this bounded packet.

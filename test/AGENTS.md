@@ -324,6 +324,18 @@ into the baseline tree when a new regression must run against old production cod
   temporary `.pyc` files, so `copytree` can enumerate a file that disappears
   before it is copied (the causal-conv1d import-contract probe hit this in CI).
 
+- Large-grid regressions must budget their verification tensors as well as kernel inputs. Whole-input `.float()` conversions, gathered copies, and `count_nonzero` reductions can allocate multi-GiB temporaries; four individually passing xdist workers can then exhaust a 16-GiB GPU and retain failed-test tensors in tracebacks. Keep the original boundary shapes, compare every element in bounded chunks, and stage fresh bindings while keeping the old changed-input buffer alive through replay. Qualify the repaired test under a per-process allocator cap that makes the old test fail, then under the CI worker count. `test_sdpa_bwd_dot_grid_determinism.py` exercises this pattern.
+
+  A four-worker run on a larger GPU does not establish the smaller CI memory
+  budget. Reserve unrelated device memory to bound the entire process group,
+  including compiler/context allocations, and hold the largest live fixtures
+  concurrently. When launch geometry is independent of contraction width,
+  reduce only that width in the expensive cases; preserve batch/head/query
+  boundaries, wider legal controls and a RED run against the original helper.
+  Keep true large-index detectors at their original address spans. The delta
+  suite retains D64 grid controls while using D32 for its large live query tail,
+  THD head boundary and accumulator; its L1 index detector is unchanged.
+
 - `PYTORCH_CUDA_ALLOC_CONF` is set at the very top, **before any torch import** (torch reads it once at CUDA-allocator init). Don't move it, and don't import torch in a plugin that loads earlier.
 - `import transformer_engine` happens (in try/except) **before** `import cudnn` — TE and cuDNN conflict if loaded in the other order. Preserve this ordering.
 - Crash isolation (`# Crash isolation` block in `conftest.py`): `pytest_cmdline_main` injects `-n1 --max-worker-restart=100000`, so a segfault, a poisoned CUDA context, or a hang kills only one xdist worker, which the controller replaces before continuing. After every test `pytest_runtest_logfinish` probes the context with `torch.cuda.synchronize()`; a per-test `faulthandler.dump_traceback_later(exit=True)` deadline (`CUDNN_TEST_TIMEOUT`, default 1500 s, `0` disables) covers the probe too. It is faulthandler's C watchdog, not a Python thread or `SIGALRM`, because a hung CUDA driver call holds the GIL and parks the main thread. Not injected under `-n<N>`, `-s`, `--pdb`, `--collect-only`, or `CUDNN_TEST_NO_ISOLATION=1`; without a worker to restart, a dead context stops the run via `pytest.exit` and a hang still hard-exits. Killing a worker does **not** stop a kernel it left running -- the driver keeps that context until the kernel ends, and the next worker can block behind it.
@@ -810,6 +822,14 @@ can still compile a prepared artifact inside the adapter and fail at execution.
 K/V page-table strides; `test_fp8_paged_distinct_table_strides_prepared`
 checks both routes numerically with the tensor compiler forbidden, changed
 allocations and CUDA Graph replay.
+
+Audit auxiliary launches as well as the main kernel when fixing grid bounds.
+A persistent or chunked main pass can still launch a full-batch/head delta
+preprocess. Cover half and scaled FP8, packed and independent-origin THD,
+and every scratch initialization in that launch. The shared delta grid suite
+checks both sides of 65535; its large-index L1 sibling surrounds the output
+with owned storage so an Int32 offset wrap corrupts a canary, not another
+allocation. Compile-only target checks remain separate from native evidence.
 
 For descriptor stride products, inspect the traced multiplication intermediates,
 not just the final cast or Python annotation. MXFP8 V scales use a separate
