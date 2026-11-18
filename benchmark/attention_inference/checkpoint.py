@@ -35,18 +35,19 @@ def _driver_version():
     if smi:
         try:
             output = subprocess.check_output([smi, "--query-gpu=driver_version", "--format=csv,noheader"], text=True, timeout=10)
-            if output.strip():
-                return output.splitlines()[0].strip()
         except (OSError, subprocess.SubprocessError):
-            pass
+            # An unavailable nvidia-smi is equivalent to an empty version result.
+            output = ""
+        if output.strip():
+            return output.splitlines()[0].strip()
     try:
         from cuda.bindings import driver
 
         status, version = driver.cuDriverGetVersion()
         if int(status) == 0:
             return version
-    except ImportError:
-        pass
+    except ImportError as exc:
+        raise ValueError("Cannot identify the CUDA driver for checkpointing") from exc
     raise ValueError("Cannot identify the CUDA driver for checkpointing")
 
 
@@ -104,7 +105,7 @@ def benchmark_environment():
         try:
             packages[dist] = metadata.version(dist)
         except metadata.PackageNotFoundError:
-            pass
+            continue
     prefixes = ("CUDA_", "CUDNN_", "CUTE_", "CUTLASS_", "FLASH_ATTN_", "FLASH_MLA_", "FLASHINFER_", "B12X_", "NVIDIA_", "TORCH_")
     env = {
         key: value
