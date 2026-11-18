@@ -33,6 +33,7 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
 _OFFERED = {
     "sdpa_bwd_sm120": 20600,
     "sdpa_bwd_sm80": 20601,
+    "sdpa_bwd_sm90": 20634,
     "sdpa_bwd_sm100": 20602,
     "sdpa_bwd_sm100_d512_role_split": 20626,
     "sdpa_bwd_sm100_d512_2x2": 20627,
@@ -372,6 +373,49 @@ def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatc
     assert order(padded=True) == trails  # runtime lengths
     assert order(seq_q_trim=True) == trails
     assert order(causal=False, s_q=512, s_kv=1024)[0] == "frost"  # the GB10 studies are not square-only
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+def test_sm89_fixed_d64_leads_only_for_measured_square_class(monkeypatch, dtype):
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.sdpa import placement_table
+    from cudnn.sdpa.bwd import heuristics
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    fixed = _OFFERED["sdpa_bwd_sm89_f16_d64"]
+    generic = _OFFERED["sdpa_bwd_sm89"]
+    offer = {name: _OFFERED[name] for name in ("sdpa_bwd_sm89_f16_d64", "sdpa_bwd_sm89")}
+    base = dict(d_qk=64, d_v=64, dtype=dtype, causal=False, device_cc=(8, 9))
+
+    def order(**overrides):
+        return heuristics.propose("A", _facts(**{**base, **overrides}), offer)
+
+    short_dtype = "f16" if dtype == cudnn.data_type.HALF else "bf16"
+    study = placement_table.matched_entry("sdpa_bwd_sm89_f16_d64", _facts(**base))
+    assert study.study == f"sm89_bwd_d64_4090_{short_dtype}_20261118"
+    assert placement_table.class_key("sdpa_bwd_sm89_f16_d64", _facts(**base, s_q=192, s_kv=192)) is None
+    for length in (128, 768, 2048):
+        assert order(s_q=length, s_kv=length)[0].engine_id == fixed
+    for overrides in (
+        dict(s_q=128, s_kv=256),
+        dict(s_q=256, s_kv=128),
+        dict(s_q=192, s_kv=192),
+        dict(s_q=2176, s_kv=2176),
+        dict(b=5),
+        dict(h_q=3, h_kv=3),
+        dict(h_q=17, h_kv=17),
+        dict(causal=True),
+        dict(padded=True),
+        dict(deterministic=True),
+        dict(h_kv=4),
+        dict(d_qk=128, d_v=128),
+    ):
+        assert is_backend_block(order(**overrides)[0]), overrides
+
+    # A placement entry for the fixed body must not lift the generic owner.
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(generic, None)])
+    assert is_backend_block(order()[0])
 
 
 def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):

@@ -586,7 +586,7 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     sample, directory = _sample_on_stated_facts(tmp_path, monkeypatch, free)
     arguments = ["--model", str(directory), "--prompt", "why is the sky blue ?", "--prompt", "why ?", "--sequences", "1,2"]
     code = sample.main(arguments)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert code == 0 and str(tmp_path) not in out, out
     assert out.splitlines()[0].startswith("[00] qwen_dense decode | checkpoint tiny-checkpoint (local): 2 shards, ") and "manifest hash" in out
     skip = (
@@ -596,12 +596,12 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     free[0] = 8 * 1024**3
     with pytest.raises(AssertionError, match="reached a load"):
         sample.main(arguments)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GiB are free" in out and "SKIP" not in out
     assert "stack fe-cublas, 1 sequence, cc 10.0" in out and "[00] tokenizer and chat template of checkpoint tiny-checkpoint" in out
     monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
     code = sample.main(arguments)
-    last = capsys.readouterr().out.splitlines()[-1]
+    last = capsys.readouterr().err.splitlines()[-1]
     assert (
         code == 0
         and last.startswith("[00] SKIP a checkpoint is read through the safetensors package")
@@ -625,7 +625,7 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
 
     def last(arguments):
         code = sample.main(arguments)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert str(tmp_path) not in out and "served by" not in out, out
         return code, out.splitlines()[-1]
 

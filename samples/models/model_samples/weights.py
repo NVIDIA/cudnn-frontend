@@ -21,12 +21,28 @@ Two more containers carry what a kernel on the stored formats hands to a block t
 consumer's operand has.  :func:`dequantize` reads both, so the gather out of the layout and the quantisation are launched by
 the block that consumes the operand, never by the one that produced it.
 
-A weight that a block multiplies on its stored format is kept beside its bf16 copy (``Dequantized.stored``): the merged
-8-bit codes with their one scale, as the loader had them before it dequantised them.  The copy stays, because the reference
-block and every fallback row read it; a family's memory sentence counts both.
+A weight is held in the forms the blocks of a run read it in (:class:`Dequantized`): its bf16 copy where a block reads
+one, and its stored form where a block multiplies on that -- the merged 8-bit codes with their one scale, or the packed
+4-bit codes with their block scales and their global scale, as the loader had them before it dequantised them.  A weight
+that every block of the run reads on its stored format has no copy.  The reference blocks of a run's checks read copies:
+for such a weight their copy is made for one call and dropped after it (:class:`OnDemand`), which also counts what
+that costs.  A family's memory sentence counts what is held and the largest copy made that way.  Such a copy is made
+from the bytes the weight's own block multiplies on, so it is a reference only while no block has written into them:
+the loader takes a checksum of every weight it keeps that way (:func:`stored_checksum`), and the checks of a run
+compare it before their first pass and after their last (``Dequantized.intact``).
+
+A kernel may read its weight in a layout of its own.  The fused gate / up kernel of an MLP reads the merged weight with
+its rows in tiles of gate rows and up rows and its block scales in the 128 x 4 layout
+(:class:`InterleavedBlockScaledTensor`): the same bytes in another order, built once per weight at load by the
+provider that multiplies on it.  A load then holds that ONE tensor, never the checkpoint's order beside it, and
+:func:`dequantize` gives its bf16 copy back in the checkpoint's row order, which is what every reader of a copy reads.
 
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
+
+A weight that a checkpoint stores in bf16 can be brought to 8 bits when it is loaded, with one scale per row -- per output
+channel of the multiply (:func:`quantize_fp8_per_channel`).  That rule is fixed down to its division, because the codes are
+what a kernel on them reads: a host test pins it against the format definition.
 
 ``Checkpoint.synthetic`` draws every tensor on the CPU generator from a seed and the tensor's name, so a tensor's values depend
 on neither the device nor the load order.
@@ -52,9 +68,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import struct
+import sys
+import time
 import zlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Union
@@ -71,7 +90,8 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 @dataclass
 class ScaledTensor:
     """8-bit E4M3 codes with a scale: ``value = code * scale``.  ``codes`` holds the code bytes (``uint8``; view them as
-    ``torch.float8_e4m3fn`` for a kernel); ``scale`` is a float, or a 1-D tensor with one scale per row of a merged weight."""
+    ``torch.float8_e4m3fn`` for a kernel); ``scale`` is a float, or a 1-D fp32 tensor with one scale per row: of a merged
+    weight whose parts kept their scales, or of a weight quantised per channel."""
 
     codes: torch.Tensor
     scale: Union[float, torch.Tensor]
@@ -168,6 +188,56 @@ class TiledBlockScaledTensor:
         return self.row_major().tensors()
 
 
+def tile_scales(block_scales: torch.Tensor) -> torch.Tensor:
+    """Row-major block scales ``[rows, blocks]`` in the 128 x 4 layout (:func:`tile_scale_index`): a buffer of whole bands
+    of 128 rows and whole tiles of 4 scale columns, ``[ceil(rows / 128) * 128, ceil(blocks / 4) * 4]``, zero where no row
+    lives.  Whole bands of whole tiles are a permutation of dimensions; anything else is one scatter.  Either way the
+    launches are those of the block that needs the layout."""
+    rows, blocks = block_scales.shape
+    if rows % TILE_ROWS == 0 and blocks % TILE_COLUMNS == 0:
+        lines = TILE_ROWS // TILE_LINE_ROWS
+        bands = block_scales.reshape(rows // TILE_ROWS, lines, TILE_LINE_ROWS, blocks // TILE_COLUMNS, TILE_COLUMNS)
+        return bands.permute(0, 3, 2, 1, 4).reshape(rows, blocks).contiguous()
+    shape = (-(-rows // TILE_ROWS) * TILE_ROWS, -(-blocks // TILE_COLUMNS) * TILE_COLUMNS)
+    tiled = torch.zeros(shape, dtype=block_scales.dtype, device=block_scales.device)
+    tiled.view(-1)[tile_scale_index(rows, blocks, block_scales.device)] = block_scales
+    return tiled
+
+
+def untile_scales(tiled: torch.Tensor, rows: int, blocks: int) -> torch.Tensor:
+    """The inverse of :func:`tile_scales` for the first ``rows`` rows: ``[rows, blocks]`` row-major block scales out of a
+    buffer in the 128 x 4 layout."""
+    if rows % TILE_ROWS == 0 and blocks % TILE_COLUMNS == 0 and tiled.numel() == rows * blocks:
+        lines = TILE_ROWS // TILE_LINE_ROWS
+        bands = tiled.reshape(rows // TILE_ROWS, blocks // TILE_COLUMNS, TILE_LINE_ROWS, lines, TILE_COLUMNS)
+        return bands.permute(0, 3, 2, 1, 4).reshape(rows, blocks)
+    return tiled.reshape(-1)[tile_scale_index(rows, blocks, tiled.device)]
+
+
+@dataclass
+class InterleavedBlockScaledTensor:
+    """The merged gate / up weight of an MLP in the layout a fused gate / up kernel multiplies on: packed E2M1 codes
+    ``[2 x intermediate, in / 2]`` whose rows come in tiles of ``tile`` gate rows followed by the ``tile`` up rows of the
+    same channels (the checkpoint has every gate row first, then every up row), the E4M3 block scales of those rows as
+    code bytes in the 128 x 4 layout (:func:`tile_scales`) and the global scale of :class:`BlockScaledTensor`.  The same
+    bytes as the merged weight, in another order: a provider that multiplies on this layout builds it once per weight at
+    load (its entry's own helper), and a load that keeps it keeps no other form of the stored weight.  A reader of a
+    bf16 copy gets one in the CHECKPOINT's row order (:func:`dequantize`)."""
+
+    codes: torch.Tensor
+    tiled_scales: torch.Tensor
+    scale: float
+    tile: int = 64
+
+    @property
+    def shape(self):
+        return (*self.codes.shape[:-1], self.codes.shape[-1] * 2)
+
+    def tensors(self):
+        """What the block multiplies on, as it holds it: the bytes a checksum of this weight reads."""
+        return (self.codes, self.tiled_scales)
+
+
 @dataclass
 class Unquantized:
     """bf16 rows on their way to a block that reads a quantised operand, with the quantisation that operand has (``fmt``:
@@ -202,13 +272,116 @@ class Unquantized:
 
 @dataclass
 class Dequantized:
-    """A bf16 copy of code values (exact) and the scale a multiply applies to its result (a float or one scale per row).
-    ``stored`` is the stored tensor the copy was made from, kept where a block of the plan multiplies on the stored format
-    (a family's loader decides it from the plan); ``None`` everywhere else."""
+    """A weight as a multiply is handed it, in the forms the plans of a run read: ``data`` is the bf16 copy of its code
+    values (exact), ``scale`` the scale a multiply applies to its result (a float or one scale per row), ``stored`` the
+    stored tensor the copy is made from (a :class:`ScaledTensor`, a :class:`BlockScaledTensor`, or that weight in the
+    layout its provider multiplies on: an :class:`InterleavedBlockScaledTensor`).  A family's loader
+    decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies on the stored
+    format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
+    loader of a weight it keeps on its stored format alone (:func:`stored_checksum`): what its stored bytes were at the
+    load, for the checks of the run to hold them to (``intact``)."""
 
-    data: torch.Tensor
+    data: Optional[torch.Tensor]
     scale: Union[float, torch.Tensor]
     stored: Optional[object] = None
+    checksum: Optional[tuple] = None
+
+    def __post_init__(self):
+        if self.data is None and self.stored is None:
+            raise ValueError("a weight is held as a bf16 copy, on its stored format, or as both; this one as neither")
+
+    def intact(self) -> bool:
+        """Whether the stored tensor holds the bytes it held at the load: its checksum taken again equals the loader's.
+        ``True`` for a weight the loader took none of (one that has its bf16 copy: its reference does not read the stored
+        bytes).  Reads the device: for a load and for the checks of a run, never inside a step."""
+        return self.checksum is None or stored_checksum(self.stored) == self.checksum
+
+    def bf16(self) -> torch.Tensor:
+        """The bf16 copy, for a multiply that reads one.  ``ValueError`` where the load kept the stored format alone: no
+        block of the plans it was made for reads a copy of this weight."""
+        if self.data is None:
+            raise ValueError(
+                "this multiply reads a bf16 copy of its weight, and the load kept that weight on its stored format alone: the weights of "
+                "this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+            )
+        return self.data
+
+
+def _word_sums(tensor: torch.Tensor) -> torch.Tensor:
+    """Three 64-bit sums over the bytes of one tensor, each row read as little-endian 64-bit words (a last word that is
+    not whole is filled with zeros): all words, the row sums weighted by the row, the column sums weighted by the column.
+    Each wraps at 64 bits.  A function of the bytes and the row length alone, however the tensor lies in its storage."""
+    tensor = tensor.contiguous()
+    tensor = tensor.reshape(tensor.shape[0], -1) if tensor.dim() > 1 else tensor.reshape(-1, 1)
+    per_word = 8 // tensor.element_size() if 8 % tensor.element_size() == 0 else 0
+    if sys.byteorder == "little" and per_word and tensor.shape[1] % per_word == 0 and tensor.storage_offset() % per_word == 0:
+        words = tensor.view(torch.int64)  # rows of whole words that start on a word of the storage (every weight of the published widths): no copy
+    else:  # any other tensor: the same words, put together byte by byte
+        raw = tensor.view(torch.uint8)
+        raw = torch.nn.functional.pad(raw, (0, -raw.shape[1] % 8))
+        shifts = torch.arange(0, 64, 8, dtype=torch.int64, device=raw.device)
+        words = (raw.reshape(raw.shape[0], -1, 8).to(torch.int64) << shifts).sum(-1)
+    rows, columns = words.sum(1), words.sum(0)
+
+    def weighted(sums):
+        return (sums * torch.arange(1, sums.numel() + 1, dtype=torch.int64, device=sums.device)).sum()
+
+    return torch.stack((rows.sum(), weighted(rows), weighted(columns)))
+
+
+def stored_checksum(stored) -> tuple:
+    """A checksum of a stored weight (a :class:`ScaledTensor`, a :class:`BlockScaledTensor` or an
+    :class:`InterleavedBlockScaledTensor`: the tensors as the weight's block multiplies on them): three 64-bit sums per
+    tensor of it -- the codes, the block scales, a scale per row -- over its bytes read as 64-bit words: all of them,
+    the row sums weighted by the row and the column sums weighted by the column; and a scale that is one float, as it
+    is.  One changed byte moves the first sum; bytes exchanged between two rows, or along a row, move the others.
+
+    The loader takes it of every weight it keeps on its stored format alone, and the checks of a run take it again
+    (``Dequantized.intact``): the reference of such a weight is a copy made from these bytes, which a block that writes
+    into its weight would change for both sides.  It costs three reductions per tensor and one host read per weight, at
+    a load and in the checks, never in a step; it makes no copy of a tensor whose rows are whole 64-bit words."""
+    scale = stored.scale
+    per_row = isinstance(scale, torch.Tensor)
+    sums = torch.cat([_word_sums(tensor) for tensor in (*stored.tensors(), *((scale,) if per_row else ()))]).tolist()
+    return (*sums, *(() if per_row else (float(scale),)))
+
+
+class OnDemand:
+    """The bf16 copies a reader makes for itself of the weights a run keeps on their stored format alone -- the reference
+    blocks of the checks read copies, and no block of the run's plans does -- and what they cost.
+
+    ``operands(operands)`` returns the operands of one block call with, in place of every weight among them that has no
+    copy, a handle that has one, made now from the stored form.  The handle is the caller's for that call and is dropped
+    with it, so one such copy exists at a time and the weights of the session are never changed.  The copy is exact
+    (:func:`dequantize`): bit for bit the copy a load would have kept, as long as the stored bytes are those of the
+    load -- which is not this object's to know: the checks that use it compare the loader's checksum of every such
+    weight before and after (``Dequantized.intact``).
+
+    Counted over the life of the object: ``copies`` made, their ``bytes`` in all, the ``largest`` one (what is held at a
+    time) and the ``seconds`` they took, the device synchronised at both ends of each -- a reader of this kind is a check,
+    never a timed step."""
+
+    def __init__(self):
+        self.copies = self.bytes = self.largest = 0
+        self.seconds = 0.0
+
+    def operands(self, operands: tuple) -> tuple:
+        if not any(isinstance(o, Dequantized) and o.data is None for o in operands):
+            return operands
+        return tuple(self._with_copy(o) if isinstance(o, Dequantized) and o.data is None else o for o in operands)
+
+    def _with_copy(self, weight: Dequantized) -> Dequantized:
+        device = weight.stored.codes.device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        copy = dequantize(weight.stored).data
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self.seconds += time.perf_counter() - start
+        size = copy.numel() * copy.element_size()
+        self.copies, self.bytes, self.largest = self.copies + 1, self.bytes + size, max(self.largest, size)
+        return Dequantized(copy, weight.scale, weight.stored)
 
 
 def _e4m3(x: torch.Tensor) -> torch.Tensor:
@@ -256,6 +429,40 @@ def quantize_fp8(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) -> S
     return ScaledTensor(codes, float(scale))
 
 
+#: a row of a weight quantised per channel never gets a smaller scale than ``1 / (448 * PER_CHANNEL_FLOOR)``: a row whose
+#: largest magnitude is below ``1 / PER_CHANNEL_FLOOR``, an all-zero row among them, keeps that scale
+PER_CHANNEL_FLOOR = 512
+
+
+def quantize_fp8_per_channel(x: torch.Tensor, rows_per_chunk: int = 2048) -> ScaledTensor:
+    """8-bit quantisation of a weight ``[out, in]`` with one scale per row, that is per output channel of its multiply:
+
+    * ``scale = max|row| / 448``, a division in fp32, and never below ``1 / (448 * 512)`` formed in fp32: a row whose
+      largest magnitude is below 1/512 keeps that scale, so an all-zero row has a scale and the codes 0;
+    * ``code = e4m3(row / scale)``: a division in fp32 again -- not a multiplication by the reciprocal of the scale, which
+      puts a quotient that sits on the midpoint of two codes on the other side on some elements --, saturating at +-448,
+      round to nearest even.
+
+    A row is quantised by itself, so the weights that feed one multiply can be concatenated before or after.  Returns a
+    :class:`ScaledTensor` whose ``scale`` is the fp32 tensor ``[out]``.  ``ValueError`` for a tensor that is not ``[out,
+    in]`` and for a row that holds a value that is not finite: nothing is quantised then."""
+    if x.dim() != 2:
+        raise ValueError(f"the per-channel 8-bit quantisation takes a weight [out, in]; got {list(x.shape)}")
+    top = torch.tensor(E4M3_MAX, dtype=torch.float32, device=x.device)
+    floor = torch.tensor(1.0, dtype=torch.float32, device=x.device) / (top * PER_CHANNEL_FLOOR)
+    codes = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
+    scale = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
+    for where, part in _row_chunks(x, rows_per_chunk):
+        rows = part.float()
+        largest = rows.abs().amax(dim=1)
+        if not bool(torch.isfinite(largest).all()):
+            row = (where.start or 0) + int((~torch.isfinite(largest)).nonzero()[0])
+            raise ValueError(f"row {row} of the weight holds a value that is not finite: nothing is quantised")
+        scale[where] = torch.maximum(largest / top, floor)
+        codes[where] = _e4m3(rows / scale[where].unsqueeze(1))
+    return ScaledTensor(codes, scale)
+
+
 def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) -> BlockScaledTensor:
     """4-bit quantisation with a static global scale: per block of 16, ``block_scale = e4m3(max|x| / 6 / scale)`` and
     ``code = e2m1(x / (block_scale * scale))``; an all-zero block has block scale 0 and codes 0."""
@@ -279,7 +486,9 @@ def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
     """The code values of a stored tensor as a bf16 copy, without the outer scale (exact: see the module docstring), and that
     scale.  A plain tensor is returned as it is with scale 1.  An operand a kernel on the stored formats handed over is
     brought to the stored form first, here, by the block that reads it: bf16 rows without codes are quantised
-    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`)."""
+    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`).  A merged
+    gate / up weight kept in a fused kernel's layout (:class:`InterleavedBlockScaledTensor`) gives its copy in the
+    checkpoint's row order."""
     if isinstance(t, Unquantized):
         t = t.quantized()
     if isinstance(t, TiledBlockScaledTensor):
@@ -291,12 +500,39 @@ def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
         lead = t.codes.shape[0] if t.codes.dim() > 1 else 1
         codes, blocks, flat = t.codes.reshape(lead, -1), t.block_scales.reshape(lead, -1), out.view(lead, -1)
         for a in range(0, lead, rows_per_chunk):  # chunked: the nibble lookup needs an index tensor
-            c = codes[a : a + rows_per_chunk]
-            values = torch.stack((_e2m1_values(c & 0xF), _e2m1_values(c >> 4)), dim=-1).flatten(-2)
-            scales = _e4m3_values(blocks[a : a + rows_per_chunk]).repeat_interleave(BLOCK, dim=-1)
-            flat[a : a + rows_per_chunk] = (values * scales).to(torch.bfloat16)
+            flat[a : a + rows_per_chunk] = _block_values(codes[a : a + rows_per_chunk], blocks[a : a + rows_per_chunk])
         return Dequantized(out, t.scale)
+    if isinstance(t, InterleavedBlockScaledTensor):
+        return Dequantized(_interleaved_values(t, rows_per_chunk), t.scale)
     return Dequantized(t, 1.0)
+
+
+def _block_values(codes: torch.Tensor, block_scales: torch.Tensor) -> torch.Tensor:
+    """The code values of packed 4-bit rows (two codes per byte, the low nibble first) times the scale of their block of 16,
+    as bf16: exact."""
+    values = torch.stack((_e2m1_values(codes & 0xF), _e2m1_values(codes >> 4)), dim=-1).flatten(-2)
+    return (values * _e4m3_values(block_scales).repeat_interleave(BLOCK, dim=-1)).to(torch.bfloat16)
+
+
+def _interleaved_values(t: InterleavedBlockScaledTensor, rows_per_chunk: int) -> torch.Tensor:
+    """The bf16 copy of a merged gate / up weight kept in a fused kernel's layout, in the CHECKPOINT's row order (every
+    gate row, then every up row): what a block that reads a copy reads, bit for bit the copy of the merged weight.
+    Chunk by chunk over whole tiles -- a tile's gate rows and its up rows go to their two places -- so the weight is
+    never held in a second packed form beside the copy."""
+    n, half, tile = t.codes.shape[0], t.codes.shape[0] // 2, t.tile
+    blocks = t.codes.shape[1] * 2 // BLOCK
+    out = torch.empty((n, t.codes.shape[1] * 2), dtype=torch.bfloat16, device=t.codes.device)
+    whole = n % TILE_ROWS == 0 and blocks % TILE_COLUMNS == 0  # whole bands of whole scale tiles: a chunk's scales are a slice
+    scales = None if whole else untile_scales(t.tiled_scales, n, blocks)
+    unit = math.lcm(2 * tile, TILE_ROWS)  # rows of a chunk: whole weight tiles and whole scale bands
+    step = max(rows_per_chunk // unit, 1) * unit
+    for a in range(0, n, step):
+        b = min(a + step, n)
+        rows = untile_scales(t.tiled_scales[a:b], b - a, blocks) if whole else scales[a:b]
+        values = _block_values(t.codes[a:b], rows).view((b - a) // (2 * tile), 2, tile, -1)
+        out[a // 2 : b // 2] = values[:, 0].reshape((b - a) // 2, -1)
+        out[half + a // 2 : half + b // 2] = values[:, 1].reshape((b - a) // 2, -1)
+    return out
 
 
 def merge_scaled(parts: Sequence[ScaledTensor], rule: str = "largest_scale") -> ScaledTensor:
@@ -370,6 +606,8 @@ class DiskTensor:
 #: what a described checkpoint may hold for each format of a family's tensor list: header dtype of the tensor itself
 _DISK_DTYPE = {"bf16": "BF16", "fp32": "F32", "fp8": "F8_E4M3", "nvfp4": "U8", "scalar": "F32"}
 REQUIREMENTS = "samples/models/requirements.txt"
+#: what ``Checkpoint.bind`` says a family reads, unless the family says it in its own words
+MODEL_BUILD = "it reads the build with 8-bit projections and a 4-bit MLP and output head"
 
 
 def read_header(path: str) -> tuple:
@@ -507,10 +745,13 @@ class Checkpoint:
         total = sum(self.files.values())
         return f"{self.label}: {len(self.files)} shards, {len(self.tensors):,} tensors, {total / 1e9:.1f} GB, manifest hash {self.manifest_hash}"
 
-    def bind(self, specs: Iterable[TensorSpec], keys: Mapping[str, str]) -> None:
+    def bind(self, specs: Iterable[TensorSpec], keys: Mapping[str, str], reads: str = MODEL_BUILD) -> None:
         """Attach a family's tensor list to a described checkpoint.  ``keys`` maps each spec's name to the checkpoint's own
         tensor name.  Every tensor must be there in the storage format and shape of its spec; the first that is not raises
-        ``NotImplementedError`` naming it: the checkpoint is not one this family reads."""
+        ``NotImplementedError`` naming it: the checkpoint is not one this family reads (``reads``: the sentence that says
+        what it does read).  A second list of the same checkpoint -- its drafter's -- is bound beside the first; a name
+        both lists hold must stand for the same tensor in the same format and shape, or the lists are wrong: a
+        ``ValueError``.  Nothing is bound unless the whole list fits."""
 
         def need(key, dtype, shape, what):
             found = self.tensors.get(key)
@@ -519,8 +760,7 @@ class Checkpoint:
             if found.dtype != dtype or (shape is not None and tuple(found.shape) != tuple(shape)):
                 wanted = f"{dtype} {list(shape)}" if shape is not None else dtype
                 raise NotImplementedError(
-                    f"{self.label}: tensor {key!r} is {found.dtype} {list(found.shape)} where this sample reads {wanted} ({what}): "
-                    "it reads the build with 8-bit projections and a 4-bit MLP and output head"
+                    f"{self.label}: tensor {key!r} is {found.dtype} {list(found.shape)} where this sample reads {wanted} ({what}): {reads}"
                 )
 
         bound, names = {}, {}
@@ -538,7 +778,13 @@ class Checkpoint:
             else:
                 need(key, _DISK_DTYPE[spec.fmt], spec.shape, "a plain tensor")
             bound[spec.name], names[spec.name] = spec, key
-        self.specs, self._keys = bound, names
+        for name, spec in bound.items():
+            if name in self.specs and (self.specs[name] != spec or self._keys[name] != names[name]):
+                raise ValueError(
+                    f"tensor {name!r} is bound to this checkpoint as another tensor already: "
+                    "two tensor lists of one checkpoint share a name only for the same tensor"
+                )
+        self.specs, self._keys = {**self.specs, **bound}, {**self._keys, **names}
 
     def _read(self, key: str) -> torch.Tensor:
         """One tensor of a described checkpoint on the CPU, through ``safetensors`` (memory-mapped shard, no pickle)."""

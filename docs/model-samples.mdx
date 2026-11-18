@@ -30,12 +30,15 @@ To run a checkpoint from local disk, install the sample-only packages, fetch the
 ```bash
 pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors; brings the hf command
 hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
-python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-tokens 256
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt
 ```
 
-`--messages FILE` takes chat messages as JSON, with tool schemas and options of the checkpoint's chat template; `--dump-tokens FILE` writes the prompt ids and the produced ids. The [family README](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/models/qwen_dense/README.md) lists every flag, the checkpoint and package versions the sample was last run with, and the disk and GPU memory it needs.
+`--messages FILE` takes chat messages as JSON, with tool schemas and options of the checkpoint's chat template, or the whole request body a chat client sends (`--messages -` reads it from standard input): the fields a sample reads are read, a field that would change the output is refused by name, and `--max-tokens` and `--max-model-len` mean what they mean in a serving engine. Token choice is always greedy. The generated text goes to standard output as it is generated; every other line of a run goes to standard error, so the text can be piped. `--dump-tokens FILE` writes the prompt ids and the produced ids. The [family README](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/models/qwen_dense/README.md) lists every flag, the checkpoint and package versions the sample was last run with, and the disk and GPU memory it needs.
 
 ## What a Run Prints
+
+On standard error, in this order (standard output carries the generated text of a checkpoint run and nothing else):
 
 - **Header**: the model or the checkpoint (directory name, shards, size, a manifest hash), the GPU, the stack, the versions, and whether `cudnn` is an editable checkout or a wheel.
 - **Served by**: per block, the calls per step, the provider (cuDNN Frontend, cuBLAS or PyTorch), the entry and the rows it serves, then the memory the run needs against what is free. It is decided and printed before anything is loaded.

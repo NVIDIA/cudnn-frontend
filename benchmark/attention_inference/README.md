@@ -98,12 +98,31 @@ prefill kind) and `<config>_generation.webp` (subplots stacked by MTP width).
 Every expanded case owns an x slot whether or not it ran, so coverage gaps
 are visible. Architectures are reported in isolation, never merged.
 
+## Resuming a sweep
+
+Pass `--checkpoint` with a new path to write successful results as cases complete.
+After an interruption, add `--resume` to pick up from that checkpoint.
+
+```bash
+python -m benchmark.attention_inference.runner --config llama --backend cudnn --checkpoint llama.sqlite
+python -m benchmark.attention_inference.runner --config llama --backend cudnn --checkpoint llama.sqlite --resume
+```
+
+The checkpoint is a SQLite file and has its own path. The runner retries failed
+or interrupted cases and reuses successful cases with identical options. The final
+CSV and charts include the current selection in sweep order, with one row per
+case. Use the same GPU, benchmark source, software versions, and runtime settings
+when resuming. The runner reports a mismatch before reusing any results.
+
 ## Measurement notes
 
-- Timing is CUDA events around the steady-state call, median of
-  `num_iterations`, after warmup. All host-side planning (graph build,
-  workspace, page tables) happens **outside** the timed region: this measures
-  per-step device cost.
+- The default timing is the median of `num_iterations` profiler samples,
+  each summing the matched CUDA kernel durations after an L2 flush. Setup and
+  warmup happen outside the timed region.
+- On the single-case script, `--graph_replay N` captures `N` cuDNN executions
+  in one CUDA graph and uses CUDA events to report median time per execution
+  during warm replay. Results are tagged `[graph-replay xN]`. Compare runs
+  using the same timing mode.
 - Peak-bandwidth table for % SOL lives in `benchmark_single_attention.py`
   (`PEAK_BW_GBPS`); override with `CUDNN_BENCH_PEAK_BW_GBPS=<GB/s>`.
 - fp8 KV on the cudnn paths runs the fp8 attention graph (q/k/v e4m3, unit

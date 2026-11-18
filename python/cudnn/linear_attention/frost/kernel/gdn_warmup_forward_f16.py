@@ -32,6 +32,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common import l2norm, split_k
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
@@ -1022,7 +1023,8 @@ def run_warmup_forward(
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.n_tiles if item_limit is None else int(item_limit),

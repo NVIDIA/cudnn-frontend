@@ -33,6 +33,10 @@ step.  Per step:
   one.  GPU busy and idle are parts of the traced step, which the profiler stretches, so the line prints the period
   under the profiler first and host-exposed last, with what it is taken against.
 
+A session whose step feeds several tokens per sequence (a verify step) reports its step timings and its traced pass, and
+says of three lines that they are not stated: nothing was prefilled through its steps, a step is not one token (how many
+of its tokens a run keeps is the caller's), and the bytes of a step are a family's arithmetic for the decode step.
+
 The **note** under the report says what bounds a step from that share: the launch path where host-exposed time is the
 larger part of the period, the GPU work of the stack where GPU busy is.  Without a traced pass it says that it was not
 measured.
@@ -253,8 +257,15 @@ class Report:
     """What a run prints after its loop: the text path, the first-token line with its route, the step timings, the traced
     pass and the bytes of a step."""
 
-    def __init__(self, tag: str, reduced: bool):
-        self.tag, self.reduced = tag, reduced
+    def __init__(self, tag: str, reduced: bool, tokens: int = 1, draft_tokens: Optional[int] = None):
+        """``tokens``: the tokens per sequence a step of the session feeds.  At more than one its steps are verify steps:
+        the first-token line, the rate and the bytes of a step are a decode step's and are not stated.
+
+        ``draft_tokens``: the drafted tokens of a step of a session that feeds its prompt through decode steps and verifies
+        behind it (``Session(draft_tokens=)``).  Its prompt is prefilled, so the first-token line is a decode session's;
+        its rate is not printed, because the drafted tokens of its steps are its caller's; the bytes of a step stay not
+        stated; and the traced-pass line says that the prompt was replayed in front of the traced steps."""
+        self.tag, self.reduced, self.tokens, self.draft_tokens = tag, reduced, tokens, draft_tokens
         self.text_path: Dict[str, float] = {}
         self.prompt_tokens = 0
         self.prefill_route = "decode step"
@@ -285,10 +296,15 @@ class Report:
                 f"text path             {render_text} | {tokenize_text} | ids to GPU {tp.get('to_device', 0.0) * 1e3:.3f} ms | "
                 f"text out {tp.get('text_out', 0.0) * 1e6:.2f} us per token"
             )
-        lines.append(
-            f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one step; "
-            f"not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
-        )
+        several = self.tokens > 1  # verify steps: nothing was prefilled through them, and a step is not one token
+        behind_prompt = self.draft_tokens is not None  # ... unless the session fed its prompt through decode steps in front of them
+        if several and not behind_prompt:
+            lines.append(f"first token           not stated: a session of {self.tokens} tokens per sequence prefills nothing (its steps are verify steps)")
+        else:
+            lines.append(
+                f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one step; "
+                f"not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
+            )
         s = self.clock.summary()
         if s is not None:
             lines.append(
@@ -306,11 +322,19 @@ class Report:
             lines.append(  # the traced period first: GPU busy and idle are parts of the traced step, host-exposed is not
                 f"traced pass ({t.steps})      {prefix}period under the profiler {t.period:.3f} ms{stretch} | GPU busy {t.busy:.3f} ms | "
                 f"idle inside the traced step {t.idle:.3f} ms | {t.kernels} kernel launches + {t.copies} copies per step | "
-                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy" + (f" ({share:.0%} of it)" if share is not None else "")
+                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy"
+                + (f" ({share:.0%} of it)" if share is not None else "")
+                + (f" | behind the prompt's {self.prompt_tokens} decode steps, replayed untraced" if behind_prompt else "")
             )
         elif self.trace_missing:
             lines.append(f"traced pass           not available: {self.trace_missing}")
-        if self.reduced:
+        if behind_prompt:  # no drafter runs: what a step keeps follows the tokens its caller drafted
+            lines.append(f"rate                  not printed: the drafted tokens of these steps are their caller's ({self.tokens} tokens per sequence a step)")
+        elif several:  # how many tokens a verify step keeps is its caller's: steps per second would not be tokens per second
+            lines.append(
+                f"rate                  not printed for verify steps ({self.tokens} tokens per sequence a step; how many of them a run keeps is its caller's)"
+            )
+        elif self.reduced:
             lines.append("rate                  not printed for a reduced model")
         elif s is None:
             lines.append("rate                  not printed below three decode steps")
@@ -318,7 +342,9 @@ class Report:
             wall = self.clock.ids[-1] - self.clock.launch[0]
             produced = len(self.clock.ids)
             lines.append(f"rate                  {produced / wall:.1f} tokens per second per sequence = {produced} tokens / {wall:.3f} s of the decode loop")
-        if self.bytes:
+        if several:  # the family's arithmetic is a decode step's: one embedding row, one state slot, three history columns per sequence
+            lines.append("bytes per step        not stated for a verify step (the arithmetic of a step is the decode step's)")
+        elif self.bytes:
             gb = 1e9
             weights, state = self.bytes["weights"], self.bytes["state"]
             model, moved = weights + state, self.bytes["copies"] + state

@@ -62,6 +62,7 @@ arbitrary user callbacks.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
+| `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Unverified | Unverified | Unsupported |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
@@ -137,6 +138,9 @@ arbitrary user callbacks.
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 
+On SM89 (GeForce RTX 4090), the FP16 width-four `cudnn.ops.causal_conv1d_update`
+passed replay, batch-isolation, and golden checks for both output and state.
+
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;
 this alone does not guarantee batch invariance across all legal configurations.
@@ -144,6 +148,7 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in) | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -323,6 +328,22 @@ a row alone and inside a batch under the entry's own picks.
   it is not a hard workspace cap. The new H/X alias and sixteen-wave paths
   have not been requalified on SM103 or SM107; earlier architecture coverage
   remains recorded separately in the test report.
+- Linear attention cuTile engine (GDN, KDA): the launch autotune times
+  occupancy and worker-warp candidates, and the worker-warp count changes the
+  cross-warp summation trees of the kernels that reduce with `ct.sum`, so two
+  processes that time their own candidates can write different bytes. Every
+  candidate replays its own bytes, and a run whose tuning fails or times out
+  launches the first candidate's hints rather than the unhinted kernel. A host
+  that needs the same bytes on every rank and in every run pins the pick
+  through the hooks in `cutile/kernels/common.py`: `record_hint` is told each
+  timed winner, `select_hints` returns the candidate to run and skips the
+  timing (Megatron-LM's `megatron.core.tuning` records a table and pins from
+  it). The hooks are read only when a launch misses the in-process hint
+  cache, so a host installs them before the first launch or clears
+  `launch_hint_cache` when its policy changes; a failed or timed-out search
+  launches the first candidate and records nothing. The cuTile engine is not on this page's table: per-candidate replay and
+  the hooks are verified on cc 10.3 by `test_la.py`'s determinism tests, batch
+  invariance is not claimed.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
@@ -438,6 +459,20 @@ a row alone and inside a batch under the entry's own picks.
   conflict-rank storage, which accept duplicate indices: BF16 H128 two-CTA
   plans and generic plans for which `deterministic_dkv_mode` selects records
   or the chain relay.
+- On SM90, the default `deterministic_dkv_mode='records'` uses four
+  conflict-rank planes and fixed-order plane-zero overflow tickets. A resident
+  128-CTA wave pipelines independent dKV column groups; the two-launch schedule
+  uses one ticket per row. An explicit `deterministic_relay_cluster_size`
+  selects the shard relay instead. H20-3e BF16 H64/D512 and D576 high-conflict
+  replay/reference and H96/D576 changed-input CUDA Graph replay are verified.
+  The AIStudio H200 allocation additionally verifies the one-wave schedule with
+  the same high-conflict and changed-input CUDA Graph cases. Every phase is a
+  cooperative launch with at most one CTA per SM; smaller SM90 devices use
+  additional ordered power-of-two phases. Cross-wave dKV remains batch
+  dependent, so the SM90 BF16 status stays **Replay only**.
+  Duplicate active indices within one query remain outside the SM90
+  deterministic contract. FP16 and other SM90 head-count/dimension combinations
+  are unverified for this new records path.
 - On SM100/SM103, `deterministic_dkv_mode` selects the sparse attention
   backward dKV storage: `'records'` (default; conflict-rank storage where it
   fits the shard, relay or private-plane layout, that layout elsewhere),
@@ -545,6 +580,17 @@ duplicated and129-request batches, then mutate dO and a canonical scale
 atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
+
+The SM90 D64 / D128 half-precision backward chain (`sdpa_bwd_sm90`) owns dK and
+dV per key tile and reduces every query tile's dQ over its key tiles in index
+order through per-tile turn counters, so the deterministic flag and the default
+request run the same arithmetic. Repeatability: dQ / dK / dV bytes are compared
+across repeated executions with a poisoned workspace on causal and unmasked MHA
+and GQA graphs at D64 and D128, including grids beyond one CTA wave, and across
+CUDA Graph replays for causal GQA at D128. Batch invariance: the same bytes are
+compared across reordered and duplicated batches and against the sequence
+declared alone, in four cells: BF16 D128 causal GQA, FP16 D64 unmasked MHA,
+BF16 D64 causal MHA and FP16 D128 unmasked GQA.
 
 ## Split-combine zero-weight qualification
 

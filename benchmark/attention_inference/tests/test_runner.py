@@ -7,6 +7,8 @@ from dataclasses import replace
 import subprocess
 import importlib.util
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -144,6 +146,60 @@ class PageSizeTest(unittest.TestCase):
         swa = replace(QWEN35.models[0], sliding_window_size=128)
         cases = list(self.runner.expand_config(replace(QWEN35, models=[swa], backends=["b12x"], context_seqlens=[], context_chunked_shapes=[])))
         self.assertEqual({c["kv_layout"] for c in cases}, {"dense"})
+
+
+class CheckpointTest(unittest.TestCase):
+    def test_interrupted_sweep_resumes_only_unfinished_cases_in_order(self):
+        runner = InferenceBenchmarkRunner()
+        config = InferenceBenchmarkConfig(
+            "resume",
+            models=[ModelPreset("gqa", num_q_heads=8, num_kv_heads=2)],
+            context_seqlens=[128, 128, 256, 512],
+        )
+        ok = subprocess.CompletedProcess([], 0, stdout="RESULT,1,2,3,,test-device,cudnn plan=x\n")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="failed to initialize")
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sweep.sqlite"
+            with (
+                patch("benchmark.attention_inference.runner._benchmark_environment", return_value={"device": "first", "capability": [8, 9]}),
+                patch("benchmark.attention_inference.runner.subprocess.run", side_effect=[ok, failed, KeyboardInterrupt]) as run,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_config(config, checkpoint=checkpoint)
+                self.assertEqual([call.args[0][call.args[0].index("--q_tokens") + 1] for call in run.call_args_list], ["128", "256", "512"])
+                run.side_effect = [ok, failed]
+                run.reset_mock()
+                results = runner.run_config(config, checkpoint=checkpoint, resume=True)
+                self.assertEqual([call.args[0][call.args[0].index("--q_tokens") + 1] for call in run.call_args_list], ["256", "512"])
+                self.assertEqual([(r.q_tokens, r.success) for r in results], [(128, True), (256, True), (512, False)])
+                self.assertEqual(results[-1].error_message, "failed to initialize")
+
+                run.side_effect = [ok, ok, ok]
+                run.reset_mock()
+                runner.run_config(replace(config, num_warmup_iterations=7), checkpoint=checkpoint, resume=True)
+                self.assertEqual(run.call_count, 3)
+
+            with (
+                patch("benchmark.attention_inference.runner._benchmark_environment", return_value={"device": "changed", "capability": [8, 9]}),
+                patch("benchmark.attention_inference.runner.subprocess.run") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "environment differs"):
+                    runner.run_config(config, checkpoint=checkpoint, resume=True)
+                run.assert_not_called()
+
+    def test_checkpoint_requires_explicit_resume_and_preserves_existing_files(self):
+        runner = InferenceBenchmarkRunner()
+        config = InferenceBenchmarkConfig("resume", [ModelPreset("gqa", 8, 2)], context_seqlens=[128])
+        with TemporaryDirectory() as directory, patch("benchmark.attention_inference.runner._benchmark_environment", return_value={"capability": [8, 9]}):
+            checkpoint = Path(directory) / "sweep.sqlite"
+            with self.assertRaisesRegex(ValueError, "Checkpoint does not exist"):
+                runner.run_config(config, checkpoint=checkpoint, resume=True)
+            self.assertFalse(checkpoint.exists())
+
+            checkpoint.write_text("existing data")
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                runner.run_config(config, checkpoint=checkpoint)
+            self.assertEqual(checkpoint.read_text(), "existing data")
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "request_lens builds torch tensors")

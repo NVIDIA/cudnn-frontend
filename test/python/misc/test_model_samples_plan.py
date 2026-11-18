@@ -267,7 +267,7 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().out
+        return module.main(arguments), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -299,7 +299,7 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
     assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
@@ -824,7 +824,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     capsys.readouterr()
     forced = StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
     ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
-    out = capsys.readouterr().out.splitlines()
+    out = capsys.readouterr().err.splitlines()
     assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
     first = (
         "[00] decoding: 3 prompt tokens through the decode step, then 5 new tokens and a traced pass; the report and the text follow, the text is not streamed"
@@ -837,7 +837,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     session.new_report()
     open_end = StopRule(text.eos_ids, max_new_tokens=4)
     ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
     assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 
@@ -1048,3 +1048,105 @@ def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_refer
     assert bounded.record.inputs.shape[0] == 5 and bounded.record.logits.shape[0] == 5, "a long run keeps the ids and logits of its first steps only"
     bounded.prefill([text.encode("abcdefg")])
     assert bounded.record.count == 7 and tie_out.run_checks(bounded, prompt_tokens=7).lines[0] == "checks (1 sequence, the first 5 steps: 5 prompt + 0 decode)"
+
+
+def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_state(monkeypatch):
+    """A session built with ``draft_tokens=`` has a verify plan and a decode plan, on ONE state.  On stated facts (compute
+    capability 10.0, 148 SMs, stack ``native``, the published geometry): its load keeps the forms both plans read -- as a
+    run of a decode session and a verify session does -- and the memory sentence counts one state of ``draft_tokens + 1``
+    tokens per sequence, where two sessions count two."""
+    from model_samples import Session, TextIO, blocks, loop
+    from model_samples.qwen_dense import QwenDense
+
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * GIB)))
+    model = QwenDense()
+    text = TextIO.synthetic(model.geometry.vocab)
+    common = dict(sequences=1, stack="native", device="cuda:0", capacity=2051)
+
+    def new(**more):
+        return Session(model, text, **common, **more)
+
+    session = new(draft_tokens=5)
+    table = session.plan_table()
+    assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
+    numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 49, 321)
+    stored = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
+    alone = ("projection.fp8.in", "mlp.gate_up")
+    assert session.stored_weights() == stored and session.uncopied_weights() == alone
+    # the same forms as a decode session and a verify session on one load: the linear-attention out-projections in both forms
+    decode, verify = new(), new(tokens=6)
+    verify._share = decode
+    two = decode.plan_table([verify])
+    assert set(decode.stored_weights()) == set(stored) and set(decode.uncopied_weights()) == set(alone)
+    assert (
+        new(tokens=6).uncopied_weights() == stored
+    ), "a verify plan alone keeps no copy of that weight; with a prompt in front of it the decode plan reads one"
+    # the tables: the verify steps' rows, one line, the prompt's rows, then ONE memory sentence
+    head, line, rest = table.partition(f"\n{loop.PROMPT_ROWS}\n")
+    assert line and head == session.plan.table() and rest.startswith(session.prefill_plan.table() + "\n  this stack needs about ")
+    assert "stack native, 1 sequence x 6 tokens per sequence, cc 10.0" in head.splitlines()[0] and "stack native, 1 sequence, cc 10.0" in rest.splitlines()[0]
+    assert "cudnn.GdnVerifyFused" in head and "cudnn.GdnDecodeFused" not in head and "cudnn.GdnDecodeFused" in rest
+    need = model.memory_bytes(1, 2051, stored=stored, uncopied=alone, tokens=6)
+    checks = model.check_bytes(alone)
+    sentence = (
+        f"this stack needs about {need / GIB:.1f} GiB on this GPU for a session of 1 sequence x 6 tokens behind its prompt, "
+        f"{checks / GIB:.2f} GiB of it for the checks"
+    )
+    assert table.count("this stack needs about") == 1 and sentence in table, table.splitlines()[-1]
+    # one state: two sessions count the decode session's state of one token beside the verify session's
+    both = model.memory_bytes(1, 2051, stored=stored, uncopied=alone) + model.state_bytes(1, 2051, tokens=6)
+    assert both - need == model.state_bytes(1, 2051) and f"needs about {both / GIB:.1f} GiB on this GPU for 1 and 1 sequences, one count after the other" in two
+    # a run of a plain session and such a session names the kinds of step; a run without one keeps its words
+    plain = new()
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
+    run = plain.plan_table([behind])
+    assert plain.stored_weights() == decode.stored_weights() and plain.uncopied_weights() == decode.uncopied_weights()
+    assert (
+        f"needs about {both / GIB:.1f} GiB on this GPU for a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt, one after the other"
+        in run
+    )
+    assert loop.PROMPT_ROWS not in run, "the first session's table; a later session prints its own"
+    four = Session(model, text, share=plain, **{**common, "sequences": 4})
+    counts = new().plan_table([four])
+    assert "for 1 and 4 sequences, one count after the other" in counts
+    # an override selects its row in both plans; a key whose rows do not serve one of the two kinds of step declines there
+    chain = new(draft_tokens=5, overrides={"linear_attention.step": "torch_ref.gdn_decode_step"})
+    chain.resolve()
+    assert chain.plan.rows["linear_attention.step"].key == chain.prefill_plan.rows["linear_attention.step"].key == "torch_ref.gdn_decode_step"
+    with pytest.raises(NotImplementedError, match="cudnn.GdnDecodeFused serves .*; this run has 1 sequences x 6 tokens per sequence"):
+        new(draft_tokens=5, overrides={"linear_attention.step": "fe.gdn_decode_fused"}).resolve()
+    with pytest.raises(NotImplementedError, match="cudnn.GdnVerifyFused serves .*; this run has 1 sequences x 1 tokens per sequence"):
+        new(draft_tokens=5, overrides={"linear_attention.step": "fe.gdn_verify_fused"}).resolve()
+    # a count no verify row of the stack holds is declined by that row's sentence, before anything is loaded
+    with pytest.raises(NotImplementedError) as declined:
+        new(draft_tokens=8).plan_table()
+    assert str(declined.value) == "cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per sequence"
+    with pytest.raises(NotImplementedError) as declined:
+        Session(model, text, draft_tokens=5, **{**common, "sequences": 5}).plan_table()
+    assert str(declined.value) == "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
+    # what the first launch of the fused step reserves outside the pool is reserved once in a process, so the sentence carries it
+    # once -- not once more for the second plan of such a session.  On a class that has such a reserve (compute capability
+    # 12.x) a run with such a session asks what a decode session and a verify session on one load ask, and a lone one what
+    # its forms and its one state need plus one reserve
+    from model_samples.providers import fe
+
+    monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
+    monkeypatch.setattr(fe, "_VERIFY_LAUNCHED", set())
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, 80 * GIB)))
+    reserve = model.first_launch_reserve["cc12.x"]
+    assert reserve == 3 * GIB
+
+    def asked(table):
+        return table.splitlines()[-1].split("needs about ")[1].split(" GiB on this GPU")[0]
+
+    lone = new(draft_tokens=5)
+    alone_table = lone.plan_table()
+    assert lone.plan.reserve_bytes() == lone.prefill_plan.reserve_bytes() == reserve, "each plan has a fused step that would make the first launch"
+    need = model.memory_bytes(1, 2051, **lone._kept(), tokens=6)
+    assert asked(alone_table) == f"{(need + reserve) / GIB:.1f}" != f"{(need + 2 * reserve) / GIB:.1f}", alone_table.splitlines()[-1]
+    decode, verify, plain = new(), new(tokens=6), new()
+    verify._share = decode
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
+    with_prompt, two_sessions = plain.plan_table([behind]), decode.plan_table([verify])
+    assert asked(with_prompt) == asked(two_sessions), "one reserve and one more state in both runs"

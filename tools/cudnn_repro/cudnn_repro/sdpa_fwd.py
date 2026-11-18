@@ -10,6 +10,26 @@ from typing import Optional
 from . import utils
 
 
+def _paged_kv_length(node: dict, tensors: list, page_table_uids: tuple, block_size: int) -> int:
+    """Recover the logical KV extent using the graph's inference order."""
+    max_seq_len_kv = utils.parse_optional_int(node.get("max_seq_len_kv"))
+    if max_seq_len_kv is not None:
+        return max_seq_len_kv
+
+    inputs = node.get("inputs", {})
+    bias_uid = inputs.get("Bias", inputs.get("BIAS"))
+    rng_dump_uid = node.get("outputs", {}).get("RNG_DUMP")
+    for uid in (bias_uid, rng_dump_uid):
+        shape = utils.shape(utils.tensor_entry(tensors, uid))
+        if shape and len(shape) == 4:
+            return shape[3]
+
+    table_shapes = [utils.shape(utils.tensor_entry(tensors, uid)) for uid in page_table_uids]
+    if any(not shape or len(shape) != 4 or shape[2] <= 0 for shape in table_shapes):
+        raise ValueError("Cannot infer the paged SDPA KV length without page-table dimensions")
+    return min(shape[2] for shape in table_shapes) * block_size
+
+
 def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     """Build test configuration from JSON payload."""
     utils.validate_payload_version(payload)
@@ -26,6 +46,9 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     tensors = payload.get("tensors", [])
     inputs = node.get("inputs", {})
     outputs = node.get("outputs", {})
+    page_table_k_uid = inputs.get("Page_table_K", inputs.get("PAGED_ATTENTION_K_TABLE"))
+    page_table_v_uid = inputs.get("Page_table_V", inputs.get("PAGED_ATTENTION_V_TABLE"))
+    is_paged = page_table_k_uid is not None or page_table_v_uid is not None
 
     q_entry = utils.tensor_entry(tensors, inputs.get("Q"))
     k_entry = utils.tensor_entry(tensors, inputs.get("K"))
@@ -45,11 +68,8 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     stride_v = utils.stride(v_entry)
     stride_o = utils.stride(o_entry)
 
-    # Convert K from KT [B,H,D,S] to BHSD [B,H,S,D] when detected by strides.
-    if shape_k and stride_k and len(shape_k) == 4 and len(stride_k) == 4:
-        if int(stride_k[2]) == 1 and int(stride_k[3]) != 1:
-            shape_k = (shape_k[0], shape_k[1], shape_k[3], shape_k[2])
-            stride_k = (stride_k[0], stride_k[1], stride_k[3], stride_k[2])
+    if not is_paged:
+        shape_k, stride_k = utils.normalize_k_layout(shape_k, stride_k)
 
     seq_len_q = utils.seq_len(seq_q_entry)
     seq_len_kv = utils.seq_len(seq_kv_entry)
@@ -63,6 +83,25 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     h_k = shape_k[1] if shape_k and len(shape_k) > 1 else (shape_v[1] if shape_v and len(shape_v) > 1 else None)
     h_v = shape_v[1] if shape_v and len(shape_v) > 1 else None
 
+    block_size = None
+    if is_paged:
+        if (
+            page_table_k_uid is None
+            or page_table_v_uid is None
+            or not shape_k
+            or not shape_v
+            or len(shape_k) != 4
+            or len(shape_v) != 4
+            or not 0 < shape_k[2] == shape_v[2]
+        ):
+            raise ValueError("Paged SDPA replay requires K and V caches with a shared page size")
+        block_size = shape_k[2]
+        s_kv = _paged_kv_length(node, tensors, (page_table_k_uid, page_table_v_uid), block_size)
+        # The runner builds page pools from logical BHSD tensors.
+        shape_k = (batches, h_k, s_kv, d_qk)
+        shape_v = (batches, h_v, s_kv, d_v)
+        stride_k = stride_v = None
+
     diag_align_map = {"TOP_LEFT": 0, "BOTTOM_RIGHT": 1}
     diag_align = diag_align_map.get(node.get("diagonal_alignment", "TOP_LEFT"), 0)
 
@@ -74,8 +113,8 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["rng_data_seed"] = seed if seed is not None else utils.sha1_seed(raw_line)
     cfg["is_alibi"] = node.get("alibi_mask")
     cfg["is_infer"] = not node.get("generate_stats", False)
-    cfg["is_paged"] = any("PAGED_ATTENTION" in key for key in inputs)
-    cfg["is_bias"] = utils.bool_from_inputs(inputs, "BIAS")
+    cfg["is_paged"] = is_paged
+    cfg["is_bias"] = (is_paged and "Bias" in inputs) or utils.bool_from_inputs(inputs, "BIAS")
     cfg["is_block_mask"] = utils.bool_from_inputs(inputs, "BLOCK_MASK")
     cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
     cfg["is_ragged"] = is_ragged
@@ -109,7 +148,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["h_q"] = h_q
     cfg["h_k"] = h_k
     cfg["h_v"] = h_v
-    cfg["block_size"] = None
+    cfg["block_size"] = block_size
     cfg["shape_q"] = shape_q
     cfg["stride_q"] = stride_q
     cfg["shape_k"] = shape_k

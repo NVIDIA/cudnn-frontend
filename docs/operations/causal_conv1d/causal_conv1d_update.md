@@ -23,10 +23,11 @@ acc[n, d] = sum_j history[-W + j] * weight[d, j] + bias[d]
 output[n, d] = activation(acc[n, d])
 ```
 
-The bias is zero when omitted. `activation=None` and `"identity"` return the
-accumulator directly; `"silu"` and `"swish"` select the same fused SiLU
-specialization. Identity and SiLU compile as separate kernels, so the unused
-activation work is absent from the identity path.
+The convolution, bias addition, and optional SiLU use FP32. The output is
+converted to the input dtype. The bias is zero when omitted.
+`activation=None` and `"identity"` select the identity epilogue.
+`"silu"` and `"swish"` select the same fused SiLU specialization.
+Identity and SiLU compile as separate kernels.
 
 When `conv_state_indices` is omitted, row `n` selects slot `n`. When it is
 present, `s = conv_state_indices[n]`. A value of `-1` denotes a padding row:
@@ -80,22 +81,22 @@ autograd inputs are rejected.
 
 The fourth and fifth positional arguments remain `bias` and `activation`.
 State-routing metadata is keyword-only. The first call for a supported device,
-shape, optional-input signature, and activation performs JIT compilation.
+dtype, shape, optional-input signature, and activation performs JIT compilation.
 Warm the exact signature before latency measurement or CUDA Graph capture.
 
 ## Semantic tensor contract
 
-- `x`: BF16 `[N, D]` for one decode token, with strides `(ld, 1)`; compact
+- `x`: FP16 or BF16 `[N, D]` for one decode token, with strides `(ld, 1)`; compact
   `ld == D` accepts every `D`, while padded `ld > D` requires `ld % 8 == 0`
   so every row starts at a 16-byte-aligned address
-- `weight`: `[D, W]`
-- `conv_state`: `[S, D, L]`, updated in place, with `L >= W - 1`; compact
+- `weight`: `[D, W]` with the dtype of `x`
+- `conv_state`: `[S, D, L]` with the dtype of `x`, updated in place, with `L >= W - 1`; compact
   storage is accepted, and an `L=3` state returned by
   `cudnn.ops.causal_conv1d` is accepted without copying
-- `bias`: optional `[D]`
+- `bias`: optional `[D]` with the dtype of `x`
 - `cache_seqlens`: reserved compatibility keyword; currently must be `None`
 - `conv_state_indices`: optional int32 `[N]` state-slot selection; `-1` is padding
-- output: `[N, D]`
+- output: `[N, D]` with the dtype of `x`
 
 A future multi-token extension can admit `x[N, D, Tstep]` without changing
 the state or weight meanings. The current public implementation rejects 3D
@@ -107,19 +108,19 @@ the state or weight meanings. The current public implementation rejects 3D
   12.0, and 12.1; the portable one-row schedule is used on every admitted
   target
 - performance-characterized GPU: B200 SM100
-- `x`: BF16 `[N, D]` with strides `(ld, 1)`; compact `ld == D` accepts every
+- `x`: FP16 or BF16 `[N, D]` with strides `(ld, 1)`; compact `ld == D` accepts every
   channel count, and padded `ld > D` requires `ld % 8 == 0`
-- `weight`: contiguous BF16 `[D, 4]`
-- `conv_state`: BF16 `[S, D, L]` with `L` equal to 3 or 4, updated in place;
+- `weight`: contiguous `[D, 4]` with the dtype of `x`
+- `conv_state`: `[S, D, L]` with the dtype of `x` and `L` equal to 3 or 4, updated in place;
   compact storage is accepted for both lengths, and `L=3` additionally accepts
   the channel-last `(3 * D, 1, D)` stride returned by full-sequence prefill
-- `bias`: optional contiguous BF16 `[D]`
+- `bias`: optional contiguous `[D]` with the dtype of `x`
 - `cache_seqlens`: must be `None` or omitted
 - `conv_state_indices`: optional contiguous CUDA int32 `[N]`
-- output: contiguous BF16 `[N, D]`
+- output: contiguous `[N, D]` with the dtype of `x`
 - activation: identity or SiLU
 - autograd: unsupported
-- pointer alignment: 16 bytes for BF16 tensors and 4 bytes for indices
+- pointer alignment: 16 bytes for FP16 and BF16 tensors and 4 bytes for indices
 
 The native kernel requires CUTLASS DSL 4.7 or newer for the inline-PTX
 integration it imports. The package-wide `cutedsl` extra keeps its broader
@@ -127,10 +128,11 @@ integration it imports. The package-wide `cutedsl` extra keeps its broader
 sufficient for this operation. The optional FLA 0.5.2 adapter treats the
 resulting `ImportError` as a typed decline and executes FLA's original path.
 
-Runtime correctness was validated on A100 SM80, L40S SM89, H200 SM90, B200
+BF16 runtime correctness was validated on A100 SM80, L40S SM89, H200 SM90, B200
 SM100, an SM103 board, and RTX 5080 SM120. SM86, SM87, SM110,
 and SM121 have compile-only validation. The SM110 path is functional support,
-not a training-performance claim.
+not a training-performance claim. FP16 runtime correctness and deterministic
+state updates were validated on GeForce RTX 4090 SM89.
 
 For width four, `L=3` is the standard `W - 1` final state handed off by
 prefill; it uses a functionally correct stride-aware scalar state-access
