@@ -195,10 +195,11 @@ def _sm100_short_window_d192(row: str, facts) -> bool:
 
 
 def _sm90_partial_pack(row: str, facts) -> bool:
-    """SM90 dense d256 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile):
-    each packed CTA still re-reads K/V G / pack times. On H100 it ran 1.35-1.40x the backend where full packs ran 0.87-0.95
-    at b >= 8 (sm90_dense_d256_q1_h100_20261118), so it keys apart. Scoped to the measured class."""
-    if row != "sdpa_fwd_prefill_sm90" or (facts.d_qk, facts.d_v) != (256, 256) or facts.s_q != 1 or facts.thd or facts.has_paged_kv:
+    """SM90 d256 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile): each
+    packed CTA still re-reads K/V G / pack times. On H100 it ran 1.35-1.40x the backend where full packs ran 0.87-0.95 at b >= 8
+    (sm90_dense_d256_q1_h100_20261118), so it keys apart; paged likewise (qwen36_27b 24/4 on the h200 nightly: 2.3-2.4x,
+    sm90_paged_decode_gaps_20261118). Scoped to the measured classes."""
+    if row != "sdpa_fwd_prefill_sm90" or (facts.d_qk, facts.d_v) != (256, 256) or facts.s_q != 1 or facts.thd:
         return False
     pack = _decode_pack_group(row, facts)
     return pack is not None and 1 < pack < facts.h_q // facts.h_kv
@@ -1799,6 +1800,53 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "dense", "window", True, "gqa", True): Entry(
         "ge", 4.404, "sm90_d192x128_dense_sink_verify_v2_20261118", "tiles"
+    ),
+    # study sm90_paged_decode_gaps_20261118 (H100 NVL 400 W, cuDNN 9.30.0.8; 1380 train cells, 100 holdout cells at fresh head pairs
+    # and windows scored once): the h200 nightly's new paged generation models. Windowed d128 MTP leads always and verify from 2^9.2
+    # query rows (step37 / ripple / laguna; holdout 0.32-0.48); d192 x 192 MTP / verify leads always, full cache or windowed, except
+    # windowed MTP under 2^1.5 parallel tiles on the KV tile (step5; holdout 0.12-0.36). d256 single-row decode the row packs only in
+    # part (gqa_partial) keeps the backend (qwen36_27b 24/4; holdout 0.380 / 0.426).
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry(
+        "ge", 9.246, "sm90_paged_decode_gaps_20261118", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
+        "ge", 9.246, "sm90_paged_decode_gaps_20261118", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", False): Entry(
+        "ge", 1.5, "sm90_paged_decode_gaps_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "verify", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "verify", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa_partial", False): Entry(
+        "never", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa_partial", True): Entry(
+        "never", None, "sm90_paged_decode_gaps_20261118"
     ),
     # study sm90_d64_sink_mtp_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 813 + 318 off-tile train cells, 60 holdout cells at
     # fresh head pairs scored once): gpt-oss paged d64 MTP with a sink, which the row runs unpacked. Full cache leads up to 2^4.5 parallel

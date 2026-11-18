@@ -1812,7 +1812,7 @@ def test_sm90_decode_gaps_follow_their_study(s_kv):
 def test_sm90_dense_d256_single_row_decode_keys_partial_packs_apart(s_kv):
     """Study sm90_dense_d256_q1_fullpack_h100_20261118 (H100): whole-group packs lead once the decode carries enough work (FROST 0.81-0.83
     of the backend on the holdout); a group the row packs only in part keys `gqa_partial` (1.35-1.40x on H100) and keeps the backend,
-    as does an unpacked one. The partial key is scoped to the measured class: dense d256 single-row decode on SM90."""
+    as does an unpacked one. The partial key is scoped to the measured classes: dense and paged d256 single-row decode on SM90."""
     row = "sdpa_fwd_prefill_sm90"
 
     def q1(**over):
@@ -1829,7 +1829,34 @@ def test_sm90_dense_d256_single_row_decode_keys_partial_packs_apart(s_kv):
     assert pt.class_key(row, q1(h_q=24, h_kv=4))[8] == "gqa_partial"  # G6 packs 2
     assert pt.lookup(row, q1(h_q=24, h_kv=4)) is None
     assert pt.class_key(row, q1(h_q=12, h_kv=4))[8] == "gqa_unpacked"  # G3
-    assert pt.class_key(row, q1(h_q=24, h_kv=4, has_paged_kv=True, page_size=16, padded=True))[8] == "gqa"  # paged: not measured, keeps its class
+    paged = q1(h_q=24, h_kv=4, has_paged_kv=True, page_size=16, padded=True)
+    assert pt.class_key(row, paged)[8] == "gqa_partial"  # paged too (sm90_paged_decode_gaps_20261118)
+    assert pt.lookup(row, paged) is False and pt.matched_entry(row, paged).study == "sm90_paged_decode_gaps_20261118"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm90_paged_decode_gap_entries_follow_the_study(s_kv):
+    """Study sm90_paged_decode_gaps_20261118 (H100 NVL): the h200 nightly's paged generation models. Windowed d128 MTP leads always and
+    verify from 2^9.2 query rows; d192 x 192 MTP / verify leads, full cache or windowed (windowed MTP on the KV tile from 2^1.5 tiles)."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def g(**over):
+        base = dict(b=128, h_q=64, h_kv=8, s_q=4, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=(9, 0), has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm90_paged_decode_gaps_20261118"
+    for s_q in (4, 8):
+        assert pt.lookup(row, g(s_q=s_q)) is True and pt.matched_entry(row, g(s_q=s_q)).study == study  # step37_swa b 128
+    assert pt.lookup(row, g(b=1)) is True  # MTP: always
+    assert pt.lookup(row, g(s_q=8, b=1, h_q=16, h_kv=2)) is False  # verify: 2^7 query rows, under the floor
+    step5 = dict(d_qk=192, d_v=192, h_q=64, h_kv=4)
+    for s_q in (4, 8):
+        assert pt.lookup(row, g(**step5, s_q=s_q, window_left=None)) is True  # step5_full
+        assert pt.lookup(row, g(**step5, s_q=s_q)) is True  # step5_swa
+    assert pt.lookup(row, g(**{**step5, "b": 1, "h_q": 16, "h_kv": 1})) is (s_kv % 128 != 0)  # windowed MTP: one tile leads only off the KV tile
 
 
 @pytest.mark.L0
