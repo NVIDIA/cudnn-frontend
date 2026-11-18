@@ -219,14 +219,25 @@ def test_build_fp8_fwd_cfg_detects_ragged_from_offset_inputs():
     assert cfg["seq_len_kv"] == [19, 17]
 
 
-def test_build_fp8_fwd_cfg_infers_paged_block_size():
-    cfg = sdpa_fp8_fwd.build_cfg("{}", _fp8_fwd_payload(paged=True), seed=123)
+@pytest.mark.parametrize("mxfp8", [False, True])
+@pytest.mark.parametrize("explicit_max, logged_lengths, expected_kv", [(None, [19, 17], 20), (None, None, 20), (19, [15, 11], 19)])
+def test_build_fp8_fwd_cfg_recovers_paged_extent(mxfp8, explicit_max, logged_lengths, expected_kv):
+    payload = _fp8_fwd_payload(paged=True, mxfp8=mxfp8)
+    node = payload["nodes"][0]
+    node["max_seq_len_kv"] = explicit_max
+    tensors = {t["uid"]: t for t in payload["tensors"]}
+    tensors[14]["pass_by_value"] = logged_lengths
+    # K has six page slots and V has five. The shared capacity is five four-token pages.
+    tensors[15].update(dim=[2, 1, 6, 1], stride=[6, 6, 1, 1])
+    cfg = operations.select_operation(payload).build_cfg("{}", payload, seed=123)
     assert cfg["is_paged"] is True
     assert cfg["block_size"] == 4
-    assert cfg["shape_k"] == (2, 2, 19, 64)
-    assert cfg["shape_v"] == (2, 2, 19, 32)
+    assert cfg["s_kv"] == expected_kv
+    assert cfg["shape_k"] == (2, 2, expected_kv, 64)
+    assert cfg["shape_v"] == (2, 2, expected_kv, 32)
     assert cfg["stride_k"] is None
     assert cfg["stride_v"] is None
+    assert cfg["seq_len_kv"] == (logged_lengths or [expected_kv] * 2)
 
 
 def test_build_mxfp8_fwd_cfg_extracts_mxfp8_fields():

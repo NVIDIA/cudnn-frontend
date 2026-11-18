@@ -32,7 +32,6 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     v_entry = utils.tensor_entry(tensors, inputs.get("V"))
     o_entry = utils.tensor_entry(tensors, outputs.get("O"))
     stats_entry = utils.tensor_entry(tensors, outputs.get("Stats"))
-    page_table_k_entry = utils.tensor_entry(tensors, inputs.get("Page_table_K"))
 
     shape_q = utils.shape(q_entry)
     shape_k = utils.shape(k_entry)
@@ -45,11 +44,13 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     stride_v = utils.stride(v_entry)
     stride_o = utils.stride(o_entry)
     stride_stats = utils.stride(stats_entry)
-    shape_k, stride_k = utils.normalize_k_layout(shape_k, stride_k)
+    paged_geometry = utils.paged_kv_geometry(node, tensors, shape_k, shape_v)
+    is_paged = paged_geometry is not None
+    if not is_paged:
+        shape_k, stride_k = utils.normalize_k_layout(shape_k, stride_k)
 
     seq_len_q, seq_len_kv, cu_sides = utils.forward_seq_lengths(tensors, inputs)
 
-    is_paged = any(label.startswith("Page_table_") or "PAGED_ATTENTION" in label for label in inputs)
     batches = shape_q[0] if shape_q else None
     h_q = shape_q[1] if shape_q else None
     s_q = shape_q[2] if shape_q else None
@@ -57,10 +58,10 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     d_v = shape_o[3] if shape_o else (shape_v[3] if shape_v else None)
     h_k = shape_k[1] if shape_k else (shape_v[1] if shape_v else None)
     h_v = shape_v[1] if shape_v else None
-    s_kv = utils.parse_optional_int(node.get("max_seq_len_kv")) if is_paged else None
-    if s_kv is None and is_paged and seq_len_kv:
-        s_kv = max(seq_len_kv)
-    if s_kv is None:
+    if is_paged:
+        block_size, s_kv = paged_geometry
+    else:
+        block_size = None
         s_kv = shape_v[2] if shape_v else (shape_k[2] if shape_k else None)
 
     logical_shape_k = (batches, h_k, s_kv, d_qk) if None not in (batches, h_k, s_kv, d_qk) else shape_k
@@ -70,10 +71,6 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     diag_align = diag_align_map.get(node.get("diagonal_alignment", "TOP_LEFT"), 0)
     dropout_prob = utils.parse_hex_float(node.get("dropout_probability")) or 0.0
     is_ragged = utils.is_ragged_payload(inputs, (q_entry, k_entry, v_entry, o_entry), payload)
-
-    block_size = (shape_k[2] if shape_k and len(shape_k) > 2 else None) if is_paged else None
-    if block_size is None and is_paged:
-        block_size = utils.infer_block_size(page_table_k_entry, seq_len_kv, k_entry)
 
     cfg = OrderedDict()
     cfg["data_type"] = utils.torch_dtype(payload.get("context", {}).get("io_data_type"))

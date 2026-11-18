@@ -219,6 +219,36 @@ def is_ragged_payload(inputs: dict, entries: tuple[Optional[dict], ...], payload
     return any(entry is not None and entry.get("name") in ragged_tensor_names for entry in entries)
 
 
+def paged_kv_geometry(node: dict, tensors: list, shape_k: Optional[tuple], shape_v: Optional[tuple]) -> Optional[Tuple[int, int]]:
+    """Return (page size, logical KV extent) for a paged SDPA forward graph."""
+    inputs = node.get("inputs", {})
+    page_table_uids = (
+        inputs.get("Page_table_K", inputs.get("PAGED_ATTENTION_K_TABLE")),
+        inputs.get("Page_table_V", inputs.get("PAGED_ATTENTION_V_TABLE")),
+    )
+    if page_table_uids == (None, None):
+        return None
+    if None in page_table_uids or not shape_k or not shape_v or len(shape_k) != 4 or len(shape_v) != 4 or not 0 < shape_k[2] == shape_v[2]:
+        raise ValueError("Paged SDPA replay requires K and V caches with a shared page size")
+    block_size = shape_k[2]
+
+    max_seq_len_kv = parse_optional_int(node.get("max_seq_len_kv"))
+    if max_seq_len_kv is not None:
+        return block_size, max_seq_len_kv
+
+    bias_uid = inputs.get("Bias", inputs.get("BIAS"))
+    rng_dump_uid = node.get("outputs", {}).get("RNG_DUMP")
+    for uid in (bias_uid, rng_dump_uid):
+        dims = shape(tensor_entry(tensors, uid))
+        if dims and len(dims) == 4:
+            return block_size, dims[3]
+
+    table_shapes = [shape(tensor_entry(tensors, uid)) for uid in page_table_uids]
+    if any(not dims or len(dims) != 4 or dims[2] <= 0 for dims in table_shapes):
+        raise ValueError("Cannot infer the paged SDPA KV length without page-table dimensions")
+    return block_size, min(dims[2] for dims in table_shapes) * block_size
+
+
 def infer_block_size(page_table_entry: Optional[dict], seq_len_kv: list[int], k_entry: Optional[dict]) -> Optional[int]:
     """Infer paged-attention block size from serialized tensors."""
     if page_table_entry is None or k_entry is None:
