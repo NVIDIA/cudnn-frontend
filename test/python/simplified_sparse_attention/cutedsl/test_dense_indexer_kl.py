@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from cudnn.ops import dense_indexer_kl
+from cudnn.ops import dense_indexer_kl_forward
 from phase1_reference import check_reference, reference, run, sample
 from test_simplified_sparse_attention import supported_gpu
 
@@ -48,17 +48,17 @@ def test_invalid_arguments(name, value, match):
     tensors, kwargs = arguments()
     kwargs[name] = value
     with pytest.raises(ValueError, match=match):
-        dense_indexer_kl(*tensors, **kwargs)
+        dense_indexer_kl_forward(*tensors, **kwargs)
 
 
 def test_cpu_reference_and_sbhd_layout():
     tensors, kwargs = arguments()
     tensors = [x.requires_grad_() for x in tensors]
-    loss = dense_indexer_kl(*tensors, **kwargs, query_chunk_size=2, key_chunk_size=7)
+    loss = dense_indexer_kl_forward(*tensors, **kwargs, query_chunk_size=2, key_chunk_size=7)
     expected, _ = reference((tensors, tuple(kwargs[n] for n in ("key_starts", "key_ends", "query_valid", "loss_denominator"))))
     torch.testing.assert_close(loss.float(), expected["loss"], rtol=1e-6, atol=1e-8)
     sbhd = [tensors[0][:, None], tensors[1][:, None], tensors[2][:, None, None], tensors[3][:, None, None]]
-    torch.testing.assert_close(dense_indexer_kl(*sbhd, **kwargs), loss)
+    torch.testing.assert_close(dense_indexer_kl_forward(*sbhd, **kwargs), loss)
 
 
 def test_old_dsl_declines_before_kernel_import(monkeypatch):
@@ -68,7 +68,7 @@ def test_old_dsl_declines_before_kernel_import(monkeypatch):
 
     def too_old(name, *, floor):
         floors.append(floor)
-        return "dense_indexer_kl requires CuTe DSL >=4.8.0; installed 4.7.1"
+        return "dense_indexer_kl_forward requires CuTe DSL >=4.8.0; installed 4.7.1"
 
     monkeypatch.setattr(phase1, "cutedsl_requirement_error", too_old)
     monkeypatch.setattr(phase1, "_KF_KERNEL", None)
@@ -91,7 +91,7 @@ def test_capture_declines_before_launch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(phase1, "_canonicalize_inputs", lambda *args: pytest.fail("Processed inputs during capture"))
     with pytest.raises(NotImplementedError, match="external CUDA graph capture"):
-        dense_indexer_kl(*tensors, **kwargs)
+        dense_indexer_kl_forward(*tensors, **kwargs)
 
 
 @pytest.mark.usefixtures("supported_gpu")
@@ -123,7 +123,7 @@ def test_fused_contract_before_import(monkeypatch, case, match):
         tensors[0] = tensors[0][:, :8]
     monkeypatch.setattr(phase1, "_phase1_kf_kernel_module", lambda: pytest.fail("Imported a kernel for invalid inputs"))
     with pytest.raises((ValueError, NotImplementedError), match=match):
-        dense_indexer_kl(*tensors, **kwargs)
+        dense_indexer_kl_forward(*tensors, **kwargs)
 
 
 @pytest.mark.usefixtures("supported_gpu")
@@ -140,7 +140,7 @@ def test_side_stream_without_host_sync():
         iq, ik = (x.clone().requires_grad_() for x in tensors[2:])
         torch.cuda.set_sync_debug_mode("error")
         try:
-            loss = dense_indexer_kl(tensors[0], tensors[1], iq, ik, **kwargs, use_kf=True, teacher_lse=lse)
+            loss = dense_indexer_kl_forward(tensors[0], tensors[1], iq, ik, **kwargs, use_kf=True, teacher_lse=lse)
             dq, dk = torch.autograd.grad(loss * 0.7, (iq, ik))
         finally:
             torch.cuda.set_sync_debug_mode("default")

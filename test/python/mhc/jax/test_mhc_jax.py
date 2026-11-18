@@ -52,7 +52,7 @@ def _reference(x, fn, scale, base, weight, iters):
 @pytest.mark.parametrize("iters", [7, 20])
 def test_connection_jit_grad_reference_replay(data, iters):
     def native(*args):
-        return api.mhc_jax(*args[:4], _branch, args[4], sinkhorn_iters=iters)
+        return api.block_forward_jax(*args[:4], _branch, args[4], sinkhorn_iters=iters)
 
     def reference(*args):
         return _reference(*args, iters)
@@ -82,7 +82,7 @@ def test_connection_jit_grad_reference_replay(data, iters):
 
 def test_head_jit_gradient(data):
     x = data[0]
-    forward = jax.jit(lambda x: api.mhc_head_forward_jax(x)[0])
+    forward = jax.jit(lambda x: api.head_forward_jax(x)[0])
     expected = jnp.mean(x.astype(jnp.float32), axis=1).astype(jnp.bfloat16)
     np.testing.assert_array_equal(forward(x), expected)
     derivative = jax.jit(jax.grad(lambda x: jnp.sum(forward(x).astype(jnp.float32))))
@@ -91,25 +91,25 @@ def test_head_jit_gradient(data):
 
 
 def test_public_exports():
-    from cudnn import ops
+    from cudnn.ops import mhc
 
     for name in (
-        "mhc_jax",
-        "mhc_prepare_jax",
-        "mhc_finish_jax",
-        "mhc_backward_prepare_jax",
-        "mhc_backward_finish_jax",
-        "mhc_head_forward_jax",
-        "mhc_head_backward_jax",
+        "block_forward_jax",
+        "pre_mix_forward_jax",
+        "post_mix_forward_jax",
+        "post_mix_backward_jax",
+        "pre_mix_backward_jax",
+        "head_forward_jax",
+        "head_backward_jax",
     ):
-        assert getattr(ops, name) is getattr(api, name)
+        assert getattr(mhc, name) is getattr(api, name)
 
 
 def test_validation_before_native_load(monkeypatch):
     monkeypatch.setattr(api, "_build", lambda *a: pytest.fail("invalid input reached native loader"))
     with pytest.raises(ValueError, match="x\\[T,4,H\\]"):
-        api.mhc_head_forward_jax(jnp.zeros((1, 3, 4096), jnp.bfloat16))
+        api.head_forward_jax(jnp.zeros((1, 3, 4096), jnp.bfloat16))
     with pytest.raises(ValueError, match="sinkhorn_iters"):
-        api.mhc_jax(None, None, None, None, _branch, sinkhorn_iters=True)
+        api.block_forward_jax(None, None, None, None, _branch, sinkhorn_iters=True)
     with pytest.raises(ValueError, match="dtype"):
-        api.mhc_head_backward_jax(jnp.zeros((1, 4096), jnp.float32))
+        api.head_backward_jax(jnp.zeros((1, 4096), jnp.float32))

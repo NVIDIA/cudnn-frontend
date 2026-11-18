@@ -95,6 +95,7 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
         from cudnn import _pybind_module
         from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
         from cudnn.frost.device import compute_capability, resolve_device
+        from cudnn.sdpa.bwd.d128_contract import DENSE_EXTRA_CCS
         from cudnn.sdpa.bwd.prepared import ROLES, _same_geometry
 
         def require(condition, reason):
@@ -105,7 +106,7 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
         require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
-        require(100 <= cc[0] * 10 + cc[1] <= 106, f"requires SM100-106; got {cc}")
+        require(100 <= cc[0] * 10 + cc[1] <= 106 or tuple(cc) in DENSE_EXTRA_CCS, f"requires SM100-106 or SM110; got {cc}")
         arch_error = cutedsl_arch_requirement_error(cc)
         require(arch_error is None, arch_error)
         binder = getattr(_pybind_module, "_SdpaBwdBinder", None)

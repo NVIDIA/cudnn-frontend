@@ -33,7 +33,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 
 from ..common import expand, gate_bwd, head_reduce, l2norm
 from ..common.host import get_dtype, family_slots
@@ -1046,7 +1048,7 @@ def build_chain_backward(
             from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
             for buffer in post_buffers
         ]
-        chain_backward_cache[key] = cute.compile(
+        chain_backward_cache[key] = compile_cached(
             chain_backward_head_host,
             int(unit_chunks),
             int(b_t),
@@ -1162,6 +1164,8 @@ def build_chain_backward(
             cutlass.Int32(int(gate_blocks)),
             *post_placeholders,
             from_dlpack(m_count, assumed_align=4).mark_layout_dynamic() if m_count is not None else None,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_chain_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_backward_cache[key]
@@ -1251,7 +1255,8 @@ def run_chain_backward(
     """Replay the chain backward: one crossing into the DSL for its launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
     cu_stream = cuda.CUstream(int(stream))
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
@@ -1751,7 +1756,7 @@ def build_chain_summary_backward(
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         state_m_placeholder = from_dlpack(state_m, assumed_align=16)
         state_m_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        chain_summary_backward_cache[key] = cute.compile(
+        chain_summary_backward_cache[key] = compile_cached(
             chain_summary_backward_host,
             int(unit_chunks),
             int(b_t),
@@ -1816,6 +1821,8 @@ def build_chain_summary_backward(
                 from_dlpack(buffer, assumed_align=16).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
                 for buffer in l2norm_buffers
             ),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_chain_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_summary_backward_cache[key]

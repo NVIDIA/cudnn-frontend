@@ -161,7 +161,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
-from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, get_smem_capacity_in_bytes
+from cudnn._cutlass_compat import AddressSpace, LayoutEnum, SmemAllocator, get_smem_capacity_in_bytes
 from cudnn._cutlass_helpers.static_persistent_tile_scheduler import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 from cudnn.frost.buffers import cutedsl_state
 from cudnn.frost.tile_dsl import barrier, pointwise, sf_layout, tma
@@ -1796,9 +1796,8 @@ def launch(
     m = activation.shape[0]
     a = cute.make_tensor(cute.recast_ptr(weight.iterator, dtype=cutlass.Float4E2M1FN), cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)))
     b = cute.make_tensor(cute.recast_ptr(activation.iterator, dtype=cutlass.Float4E2M1FN), cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
-    # The product is never stored: C is a NULL-pointer tensor that carries the shape (2 x INTERMEDIATE, rows) and the bf16 staging
-    # dtype only.  No buffer stands behind it.
-    c = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16), cute.make_ordered_layout((n, m, 1), order=(0, 1, 2)))
+    # C carries the product shape and BF16 staging dtype; the product is never stored.
+    c = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, 0, AddressSpace.gmem, assumed_align=16), cute.make_ordered_layout((n, m, 1), order=(0, 1, 2)))
     sa = cute.make_tensor(cute.recast_ptr(weight_scale.iterator, dtype=cutlass.Float8E4M3FN), cute.make_layout(weight_scale.shape))
     sb = cute.make_tensor(cute.recast_ptr(activation_scale.iterator, dtype=cutlass.Float8E4M3FN), cute.make_layout(activation_scale.shape))
     gemm(a, b, sa, sb, c, alpha, max_clusters, stream, out, out_scale, out_global_scale)

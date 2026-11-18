@@ -759,6 +759,11 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
         dO.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            for tensor in (q, k, dQ, dK):
+                tensor.set_ragged_offset_multiplier(cfg.d_qk)
+            for tensor in (v, o, dV, dO):
+                tensor.set_ragged_offset_multiplier(cfg.d_v)
 
     try:
         graph.validate()

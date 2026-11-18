@@ -31,7 +31,7 @@ def test_vendor_files():
 def test_cpu_rejected_before_load(monkeypatch):
     monkeypatch.setattr(api, "_backend", lambda *_: pytest.fail("CPU input reached native loader"))
     with pytest.raises(ValueError, match="CUDA"):
-        api.mhc_head_forward(torch.empty((3, 4, 4096)))
+        api.head_forward(torch.empty((3, 4, 4096)))
 
 
 @pytest.mark.parametrize("value", [0, 65, True, 1.5])
@@ -97,19 +97,19 @@ def test_full_connection_reference_capture(gpu, hidden, iters):
     a = _data(gpu, hidden)
     x = a["x"]
     args = (x, a["fn"], a["scale"], a["base"])
-    u, stats = api.mhc_prepare(*args, sinkhorn_iters=iters)
-    y = api.mhc_finish(x, a["branch"], stats)["out"]
-    db, gs = api.mhc_backward_prepare(x, a["branch"], stats, a["dy"])
+    u, stats = api.pre_mix_forward(*args, sinkhorn_iters=iters)
+    y = api.post_mix_forward(x, a["branch"], stats)["out"]
+    db, gs = api.post_mix_backward(x, a["branch"], stats, a["dy"])
     backargs = (x, a["dy"], a["du"], a["fn"], a["scale"], a["base"], stats, gs)
-    grads = api.mhc_backward_finish(*backargs, sinkhorn_iters=iters)
-    fw = torch.empty(api.mhc_workspace_size(3, hidden, device=gpu), dtype=torch.uint8, device=gpu)
-    bw = torch.empty(api.mhc_workspace_size(3, hidden, device=gpu, backward=True), dtype=torch.uint8, device=gpu)
+    grads = api.pre_mix_backward(*backargs, sinkhorn_iters=iters)
+    fw = torch.empty(api.workspace_size(3, hidden, device=gpu), dtype=torch.uint8, device=gpu)
+    bw = torch.empty(api.workspace_size(3, hidden, device=gpu, backward=True), dtype=torch.uint8, device=gpu)
 
     def run(stream=None):
-        api.mhc_prepare(*args, sinkhorn_iters=iters, out=u, stats=stats, workspace=fw, stream=stream)
-        api.mhc_finish(x, a["branch"], stats, out=y, stream=stream)
-        api.mhc_backward_prepare(x, a["branch"], stats, a["dy"], grad_branch=db, grad_stats=gs, stream=stream)
-        api.mhc_backward_finish(*backargs, sinkhorn_iters=iters, workspace=bw, stream=stream, **grads)
+        api.pre_mix_forward(*args, sinkhorn_iters=iters, out=u, stats=stats, workspace=fw, stream=stream)
+        api.post_mix_forward(x, a["branch"], stats, out=y, stream=stream)
+        api.post_mix_backward(x, a["branch"], stats, a["dy"], grad_branch=db, grad_stats=gs, stream=stream)
+        api.pre_mix_backward(*backargs, sinkhorn_iters=iters, workspace=bw, stream=stream, **grads)
 
     def check():
         ref = _reference(a, iters)
@@ -147,20 +147,20 @@ def test_full_connection_reference_capture(gpu, hidden, iters):
     run()
     assert all(torch.equal(a, b) for a, b in zip(first, grads.values()))
     with pytest.raises(ValueError, match="alias"):
-        api.mhc_finish(x, a["branch"], stats, out=x)
+        api.post_mix_forward(x, a["branch"], stats, out=x)
     with pytest.raises(ValueError, match="workspace"):
-        api.mhc_prepare(*args, workspace=fw[:1])
+        api.pre_mix_forward(*args, workspace=fw[:1])
 
 
 def test_head_native_replay(gpu):
     x = _data(gpu, 4096)["x"]
     dy = x[:, 0, :].contiguous()
-    out = api.mhc_head_forward(x)["out"]
-    dx = api.mhc_head_backward(dy)["out"]
+    out = api.head_forward(x)["out"]
+    dx = api.head_backward(dy)["out"]
 
     def run():
-        api.mhc_head_forward(x, out=out)
-        api.mhc_head_backward(dy, out=dx)
+        api.head_forward(x, out=out)
+        api.head_backward(dy, out=dx)
 
     def check():
         torch.testing.assert_close(out, x.float().mean(1).bfloat16(), atol=0, rtol=0)

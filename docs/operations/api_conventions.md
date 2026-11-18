@@ -50,7 +50,8 @@ Inside a family:
 - Do not nest families.
 
 Families: `dsa` (DeepSeek sparse attention, including the CSA/HCA compressor),
-`nsa` (native sparse attention) and `gnn`.
+`nsa` (native sparse attention), `mhc` (manifold-constrained hyper-connections)
+and `gnn`.
 
 ## Rules
 

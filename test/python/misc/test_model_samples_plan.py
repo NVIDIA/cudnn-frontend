@@ -58,6 +58,145 @@ def test_tables_agree_with_the_family_readme():
     assert set(configs.PROVIDERS) == set(configs.BLOCK_TITLES) == set(QwenDense().calls())
 
 
+def test_the_drafters_plan_its_table_and_its_keys():
+    """The drafter of a checkpoint as a model of a plan: its provider table resolved on stated facts in every stack, for any
+    GPU class and any row count; every block a reference chain but the embedding lookup; the five provider keys its pass
+    added to the closed list; its call sites; and the two tables of the family README rendered from the data."""
+    from model_samples import providers
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter, configs
+    from model_samples.qwen_dense.drafter import BODY, HEAD, MULTIPLIES
+
+    drafter = QwenDenseDrafter.seeded(QwenDense.reduced())
+    table = configs.DRAFTER_PROVIDERS
+    assert drafter.provider_table is table and drafter.regimes is configs.REGIMES and drafter.table_source == "model_samples/qwen_dense/configs.py"
+    assert not hasattr(drafter, "target_stacks"), "the drafter declares no target kernel set: no census section holds a draft pass"
+    assert drafter.geometry.layer_kinds == ("full_attention",) and drafter.norm_eps == QwenDense().norm_eps == 1.0e-6
+
+    # one pass: 18 block calls, 15 of the body and 3 of the head; the multiply at five sites, the norm + quantise at two
+    wiring, sites = drafter.wiring(), drafter.sites()
+    assert len(wiring) == len(sites) == drafter.calls_per_pass() == len(BODY) + len(HEAD) == 18 and (len(BODY), len(HEAD)) == (15, 3)
+    assert wiring == tuple((block, 0) for block, _ in (*BODY, *HEAD)) and sites == tuple(site for _, site in (*BODY, *HEAD))
+    assert [block for block, _ in wiring] == [
+        "draft.embedding",
+        "draft.pre_fc_norm",
+        "draft.projection",
+        "draft.norm_quantize",
+        "draft.projection",
+        "draft.attention.prepare",
+        "draft.attention.core",
+        "draft.gate_quantize",
+        "draft.projection",
+        "draft.norm_quantize",
+        "draft.projection",
+        "draft.silu_mul",
+        "draft.activation_quantize",
+        "draft.projection",
+        "draft.final_norm",
+        "draft.head.quantize",
+        "draft.head",
+        "draft.token_choice",
+    ]
+    assert sites == ("", "", "fc", "input", "qkv", "", "", "", "o", "mlp", "gate_up", "", "", "down", "", "", "", "")
+    assert drafter.calls() == {block: (5 if block == "draft.projection" else 2 if block == "draft.norm_quantize" else 1) for block in table}
+    assert drafter.calls_text() == {block: str(count) for block, count in drafter.calls().items()} and sum(drafter.calls().values()) == 18
+    assert list(table) == list(dict.fromkeys(block for block, _ in wiring)) == list(configs.DRAFTER_BLOCK_TITLES), "one row per block, in the order of the pass"
+    assert len(table) == 13 and set(table).isdisjoint(configs.PROVIDERS) and set(configs.DRAFTER_BLOCK_TITLES).isdisjoint(configs.BLOCK_TITLES)
+
+    # the call sites are data: the five weights by the loader's names with their shapes at the published widths, the two norms
+    assert (
+        [site for site, _ in configs.DRAFT_PROJECTION_SITES]
+        == [name for name, _ in MULTIPLIES]
+        == [s for (b, _), s in zip(wiring, sites) if b == "draft.projection"]
+    )
+    assert [site for site, _ in configs.DRAFT_NORM_SITES] == ["input", "mlp"] == [s for (b, _), s in zip(wiring, sites) if b == "draft.norm_quantize"]
+    shapes = {spec.name[len("drafter.") : -len(".weight")]: spec.shape for spec in drafter.tensor_specs() if spec.name.startswith("drafter.")}
+    merged = {name: (sum(shapes[part][0] for part in parts), shapes[parts[0]][1]) for name, parts in MULTIPLIES}
+    assert {site: (dict(fields)["OUT_FEATURES"], dict(fields)["IN_FEATURES"]) for site, fields in configs.DRAFT_PROJECTION_SITES} == merged
+    assert merged == {"fc": (5120, 10240), "qkv": (14336, 5120), "o": (5120, 6144), "gate_up": (34816, 5120), "down": (5120, 17408)}
+    assert dict(configs.DRAFT_NORM_SITES) == {"input": (("ADD", False),), "mlp": (("ADD", True),)}
+
+    # every row: every stack, any GPU class, any row count; a reference chain but the gather, and no form named for a chain
+    chain = "reference chain"
+    for block, rows in table.items():
+        assert len(rows) == 1, block
+        row = rows[0]
+        assert row.stacks == ("fe-cublas", "reference", "native", "fe-entries") and row.classes == ("any",) and row.serves == "any" and row.band == "same"
+        assert all(row.serves_run(sequences, tokens) for sequences, tokens in ((1, 1), (1, 6), (1, 8), (4, 6), (64, 1), (1000, 100))), block
+        assert all(row.serves_class(cc) for cc in ((8, 0), (10, 0), (10, 3), (12, 1))) and row.serves_model(drafter) and row.serves_model(None)
+        assert (row.form, row.sites, row.widths) == ((), (), ()), "a reference chain is called in no form: the kernel check has nothing to hold one to"
+        assert row.fallback == (
+            "" if block == "draft.embedding" else chain + " over a plain cache of the drafter's own" if block == "draft.attention.core" else chain
+        )
+    keys = {block: rows[0].key for block, rows in table.items()}
+    assert keys == {
+        "draft.embedding": "torch.index_select",
+        "draft.pre_fc_norm": "torch_ref.pre_fc_norm_quantize",
+        "draft.projection": "torch_ref.linear",
+        "draft.norm_quantize": "torch_ref.add_norm_quantize",
+        "draft.attention.prepare": "torch_ref.attention_prepare",
+        "draft.attention.core": "torch_ref.attention",
+        "draft.gate_quantize": "torch_ref.gate_row_quantize",
+        "draft.silu_mul": "torch_ref.silu_mul",
+        "draft.activation_quantize": "torch_ref.quantize",
+        "draft.final_norm": "torch_ref.add_norm_quantize",
+        "draft.head.quantize": "torch_ref.quantize",
+        "draft.head": "torch_ref.linear",
+        "draft.token_choice": "torch.argmax+lookup",
+    }
+
+    # the five keys of the pass in the closed list, each with its factory; the list is the model's keys and these
+    new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
+    classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
+    assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 22 and set(providers.KEYS) == set(providers.factories())
+    used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
+    assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
+    assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
+
+    # a dry plan in every stack: the same rows, the same table but for the stack's name
+    tables = {}
+    for stack in ("fe-cublas", "native", "fe-entries", "reference"):
+        for cc, sequences, tokens in (((10, 0), 1, 1), ((12, 0), 4, 6), ((8, 0), 1, 1)):
+            resolved = plan(table, drafter.regimes, DeviceFacts(cc), sequences, tokens, stack, model=drafter, source=drafter.table_source)
+            assert {block: row.key for block, row in resolved.rows.items()} == keys and list(resolved) == list(table), (stack, cc)
+            assert all(block.provider == "PyTorch" and block.row is resolved.rows[name] for name, block in resolved.items())
+            assert [kernel.id for kernel in resolved["draft.embedding"].kernels] == ["embedding_gather"]
+            assert all(
+                [kernel.relation for kernel in block.kernels] in (["fallback"], ["fallback", "fallback"])
+                for name, block in resolved.items()
+                if name != "draft.embedding"
+            )
+        text = plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, stack, model=drafter, source=drafter.table_source).table().splitlines()
+        assert text[0] == f"served by (decided before the load from model_samples/qwen_dense/configs.py; stack {stack}, 1 sequence, cc 10.0)"
+        assert text[-2] == "  by provider: fallbacks 12 (PyTorch chains 12) | PyTorch 1" and len(text) == 1 + 1 + 13 + 2
+        tables[stack] = text[1:]
+    assert tables["fe-cublas"] == tables["native"] == tables["fe-entries"] == tables["reference"]
+    lines = {line.split()[0]: line for line in tables["native"][1:14]}
+    assert lines["draft.projection"].split()[1:4] == ["5", "PyTorch", "torch_ref.linear"] and lines["draft.norm_quantize"].split()[1] == "2"
+    assert lines["draft.attention.core"].endswith("fallback: reference chain over a plain cache of the drafter's own")
+    assert lines["draft.embedding"].split() == ["draft.embedding", "1", "PyTorch", "torch.index_select", "any", "none"]
+    with pytest.raises(ValueError, match="unknown stack 'fast'"):
+        plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, "fast", model=drafter)
+
+    # the family README: the drafter's block table and its call-site table are rendered from this data; the model's table is untouched
+    readme = (MODELS / "qwen_dense" / "README.md").read_text()
+    rendered = configs.readme_table(drafter.calls_text(), "native", table=table, titles=configs.DRAFTER_BLOCK_TITLES, per="pass")
+    assert rendered.splitlines()[0] == "| block | calls per pass | provider key | entry [form] |" and len(rendered.splitlines()) == 2 + 13
+    assert rendered in readme, "regenerate the drafter's block table of the README from configs.readme_table(.., table=configs.DRAFTER_PROVIDERS, ..)"
+    assert all(
+        rendered == configs.readme_table(drafter.calls_text(), stack, cc, table, configs.DRAFTER_BLOCK_TITLES, "pass")
+        for stack in configs.EVERY
+        for cc in ((10, 0), (12, 0))
+    )
+    assert configs.readme_draft_sites() in readme and len(configs.readme_draft_sites().splitlines()) == 2 + 5 + 2
+    assert configs.readme_table(QwenDense().calls_text()).splitlines()[0] == "| block | calls per step (64 layers) | provider key | entry [form] |"
+    assert configs.readme_table(QwenDense().calls_text()) == configs.readme_table(
+        QwenDense().calls_text(), table=configs.PROVIDERS, titles=configs.BLOCK_TITLES
+    )
+
+
 def test_call_counts_of_a_decode_step():
     from model_samples.qwen_dense import QwenDense
 
@@ -267,7 +406,7 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().out
+        return module.main(arguments), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -299,7 +438,7 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
     assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
@@ -699,7 +838,7 @@ def _checked_run(sequences, step_defect=None, multiply_defect=None, band="declar
             return out
 
     class Multiply(torch_ref.Linear):
-        def __call__(self, qx, weight):
+        def __call__(self, qx, weight, site=""):  # the in-projection is handed its call site; a multiply over a copy ignores it
             product = super().__call__(qx, weight)
             return product if multiply_defect is None else multiply_defect(product, weight)
 
@@ -824,7 +963,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     capsys.readouterr()
     forced = StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
     ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
-    out = capsys.readouterr().out.splitlines()
+    out = capsys.readouterr().err.splitlines()
     assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
     first = (
         "[00] decoding: 3 prompt tokens through the decode step, then 5 new tokens and a traced pass; the report and the text follow, the text is not streamed"
@@ -837,7 +976,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     session.new_report()
     open_end = StopRule(text.eos_ids, max_new_tokens=4)
     ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
     assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 
@@ -936,6 +1075,11 @@ def test_the_traced_pass_is_read_from_kernel_activity_records():
     assert "note                  GPU busy 83% of the period: the GPU work of this stack bounds this step, not the launch path; no floor" in report.text()
     assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in text
     assert "bytes per step        model 17.92 GB (weights 17.61 in their stored formats, state and cache 0.31); this stack moves 51.56 GB (2.88x)" in text
+    assert "this stack moves 51.56 GB (2.88x): bf16 copies of the weights (arithmetic, not a measurement)" in text, "every weight read as a copy"
+    kept = Report("qwen_dense", reduced=False)  # a stack with a block that multiplies on the stored format: those weights are read there
+    kept.bytes = {"weights": 17_610_000_000, "copies": 46_050_000_000, "stored": 5_200_000_000, "state": 310_000_000}
+    moves = "this stack moves 46.36 GB (2.59x): bf16 copies of the weights, and 5.20 GB of weights in their stored format (arithmetic, not a measurement)"
+    assert moves in kept.text()
     assert "first token           prefill route: decode step, 58 tokens x one step; not a time to first token of record" in text
     report.trace, report.trace_missing = None, "the profiler recorded no kernel activity on this GPU"
     assert "traced pass           not available: the profiler recorded no kernel activity on this GPU" in report.text()
@@ -1004,6 +1148,7 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     assert 51.2e9 < step["copies"] < 51.3e9 and 2.90 < step["copies"] / step["weights"] < 2.92, "the bf16 copies: 2 bytes per weight element"
     assert 0.30e9 < step["state"] < 0.36e9, "48 recurrent states read and written, 16 key/value caches read"
     assert model.bytes_per_step(4, 343)["state"] == 4 * step["state"] and model.bytes_per_step(4, 343)["copies"] - step["copies"] == 3 * 2 * 5120
+    assert step["stored"] == 0 and set(step) == {"weights", "copies", "stored", "state"}, "no weight of this stack is read on its stored format"
     need = model.memory_bytes(sequences=1, capacity=343)
     copies = model.copy_bytes()
     assert 50.0 * GIB < copies < 50.2 * GIB, "the bf16 copies incl. the embedding table"
@@ -1042,3 +1187,105 @@ def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_refer
     assert bounded.record.inputs.shape[0] == 5 and bounded.record.logits.shape[0] == 5, "a long run keeps the ids and logits of its first steps only"
     bounded.prefill([text.encode("abcdefg")])
     assert bounded.record.count == 7 and tie_out.run_checks(bounded, prompt_tokens=7).lines[0] == "checks (1 sequence, the first 5 steps: 5 prompt + 0 decode)"
+
+
+def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_state(monkeypatch):
+    """A session built with ``draft_tokens=`` has a verify plan and a decode plan, on ONE state.  On stated facts (compute
+    capability 10.0, 148 SMs, stack ``native``, the published geometry): its load keeps the forms both plans read -- as a
+    run of a decode session and a verify session does -- and the memory sentence counts one state of ``draft_tokens + 1``
+    tokens per sequence, where two sessions count two."""
+    from model_samples import Session, TextIO, blocks, loop
+    from model_samples.qwen_dense import QwenDense
+
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * GIB)))
+    model = QwenDense()
+    text = TextIO.synthetic(model.geometry.vocab)
+    common = dict(sequences=1, stack="native", device="cuda:0", capacity=2051)
+
+    def new(**more):
+        return Session(model, text, **common, **more)
+
+    session = new(draft_tokens=5)
+    table = session.plan_table()
+    assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
+    numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 49, 321)
+    stored = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
+    alone = ("projection.fp8.in", "mlp.gate_up")
+    assert session.stored_weights() == stored and session.uncopied_weights() == alone
+    # the same forms as a decode session and a verify session on one load: the linear-attention out-projections in both forms
+    decode, verify = new(), new(tokens=6)
+    verify._share = decode
+    two = decode.plan_table([verify])
+    assert set(decode.stored_weights()) == set(stored) and set(decode.uncopied_weights()) == set(alone)
+    assert (
+        new(tokens=6).uncopied_weights() == stored
+    ), "a verify plan alone keeps no copy of that weight; with a prompt in front of it the decode plan reads one"
+    # the tables: the verify steps' rows, one line, the prompt's rows, then ONE memory sentence
+    head, line, rest = table.partition(f"\n{loop.PROMPT_ROWS}\n")
+    assert line and head == session.plan.table() and rest.startswith(session.prefill_plan.table() + "\n  this stack needs about ")
+    assert "stack native, 1 sequence x 6 tokens per sequence, cc 10.0" in head.splitlines()[0] and "stack native, 1 sequence, cc 10.0" in rest.splitlines()[0]
+    assert "cudnn.GdnVerifyFused" in head and "cudnn.GdnDecodeFused" not in head and "cudnn.GdnDecodeFused" in rest
+    need = model.memory_bytes(1, 2051, stored=stored, uncopied=alone, tokens=6)
+    checks = model.check_bytes(alone)
+    sentence = (
+        f"this stack needs about {need / GIB:.1f} GiB on this GPU for a session of 1 sequence x 6 tokens behind its prompt, "
+        f"{checks / GIB:.2f} GiB of it for the checks"
+    )
+    assert table.count("this stack needs about") == 1 and sentence in table, table.splitlines()[-1]
+    # one state: two sessions count the decode session's state of one token beside the verify session's
+    both = model.memory_bytes(1, 2051, stored=stored, uncopied=alone) + model.state_bytes(1, 2051, tokens=6)
+    assert both - need == model.state_bytes(1, 2051) and f"needs about {both / GIB:.1f} GiB on this GPU for 1 and 1 sequences, one count after the other" in two
+    # a run of a plain session and such a session names the kinds of step; a run without one keeps its words
+    plain = new()
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
+    run = plain.plan_table([behind])
+    assert plain.stored_weights() == decode.stored_weights() and plain.uncopied_weights() == decode.uncopied_weights()
+    assert (
+        f"needs about {both / GIB:.1f} GiB on this GPU for a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt, one after the other"
+        in run
+    )
+    assert loop.PROMPT_ROWS not in run, "the first session's table; a later session prints its own"
+    four = Session(model, text, share=plain, **{**common, "sequences": 4})
+    counts = new().plan_table([four])
+    assert "for 1 and 4 sequences, one count after the other" in counts
+    # an override selects its row in both plans; a key whose rows do not serve one of the two kinds of step declines there
+    chain = new(draft_tokens=5, overrides={"linear_attention.step": "torch_ref.gdn_decode_step"})
+    chain.resolve()
+    assert chain.plan.rows["linear_attention.step"].key == chain.prefill_plan.rows["linear_attention.step"].key == "torch_ref.gdn_decode_step"
+    with pytest.raises(NotImplementedError, match="cudnn.GdnDecodeFused serves .*; this run has 1 sequences x 6 tokens per sequence"):
+        new(draft_tokens=5, overrides={"linear_attention.step": "fe.gdn_decode_fused"}).resolve()
+    with pytest.raises(NotImplementedError, match="cudnn.GdnVerifyFused serves .*; this run has 1 sequences x 1 tokens per sequence"):
+        new(draft_tokens=5, overrides={"linear_attention.step": "fe.gdn_verify_fused"}).resolve()
+    # a count no verify row of the stack holds is declined by that row's sentence, before anything is loaded
+    with pytest.raises(NotImplementedError) as declined:
+        new(draft_tokens=8).plan_table()
+    assert str(declined.value) == "cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per sequence"
+    with pytest.raises(NotImplementedError) as declined:
+        Session(model, text, draft_tokens=5, **{**common, "sequences": 5}).plan_table()
+    assert str(declined.value) == "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
+    # what the first launch of the fused step reserves outside the pool is reserved once in a process, so the sentence carries it
+    # once -- not once more for the second plan of such a session.  On a class that has such a reserve (compute capability
+    # 12.x) a run with such a session asks what a decode session and a verify session on one load ask, and a lone one what
+    # its forms and its one state need plus one reserve
+    from model_samples.providers import fe
+
+    monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
+    monkeypatch.setattr(fe, "_VERIFY_LAUNCHED", set())
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, 80 * GIB)))
+    reserve = model.first_launch_reserve["cc12.x"]
+    assert reserve == 3 * GIB
+
+    def asked(table):
+        return table.splitlines()[-1].split("needs about ")[1].split(" GiB on this GPU")[0]
+
+    lone = new(draft_tokens=5)
+    alone_table = lone.plan_table()
+    assert lone.plan.reserve_bytes() == lone.prefill_plan.reserve_bytes() == reserve, "each plan has a fused step that would make the first launch"
+    need = model.memory_bytes(1, 2051, **lone._kept(), tokens=6)
+    assert asked(alone_table) == f"{(need + reserve) / GIB:.1f}" != f"{(need + 2 * reserve) / GIB:.1f}", alone_table.splitlines()[-1]
+    decode, verify, plain = new(), new(tokens=6), new()
+    verify._share = decode
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
+    with_prompt, two_sessions = plain.plan_table([behind]), decode.plan_table([verify])
+    assert asked(with_prompt) == asked(two_sessions), "one reserve and one more state in both runs"
