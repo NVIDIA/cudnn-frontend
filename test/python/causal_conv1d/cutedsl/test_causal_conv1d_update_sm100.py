@@ -16,6 +16,9 @@ from cudnn._causal_conv1d_arch import (
 )
 
 
+from reference import causal_conv1d_decode_reference as _reference_step
+
+
 def _has_supported_gpu() -> bool:
     return torch.cuda.is_available() and is_supported_causal_conv1d_update_compute_capability(torch.cuda.get_device_capability())
 
@@ -45,37 +48,6 @@ def _load_api():
     except ImportError as error:
         pytest.skip(f"CuTe DSL dependencies unavailable: {error}")
     return causal_conv1d_update
-
-
-def _reference_step(
-    x,
-    weight,
-    state,
-    state_indices=None,
-    bias=None,
-    activation=None,
-):
-    """Explicit FP32 output oracle plus exact BF16 state transition."""
-
-    rows = x.shape[0]
-    slots = torch.arange(rows, device=x.device, dtype=torch.long) if state_indices is None else state_indices.long()
-    valid = slots >= 0
-    output = torch.zeros_like(x)
-    expected_state = state.clone()
-    if valid.any():
-        valid_slots = slots[valid]
-        selected = state.index_select(0, valid_slots)
-        history = torch.cat((selected, x[valid].unsqueeze(-1)), dim=-1)
-        updated = history[..., -state.shape[-1] :]
-        window = history[..., -weight.shape[-1] :]
-        accumulator = (window.float() * weight.float().unsqueeze(0)).sum(dim=-1)
-        if bias is not None:
-            accumulator = accumulator + bias.float()
-        if activation in ("silu", "swish"):
-            accumulator = F.silu(accumulator)
-        output[valid] = accumulator.to(torch.bfloat16)
-        expected_state.index_copy_(0, valid_slots, updated)
-    return output, expected_state
 
 
 def _assert_state_bits_equal(actual, expected):
@@ -252,8 +224,9 @@ def test_public_api_returns_an_ordinary_tensor():
 
 @pytest.mark.L0
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
-def test_state_shift_and_append_are_bitwise(state_len):
+def test_state_shift_and_append_are_bitwise(state_len, dtype):
     causal_conv1d_update = _load_api()
     torch.manual_seed(2)
     rows, channels = 2, 257
@@ -271,9 +244,9 @@ def test_state_shift_and_append_are_bitwise(state_len):
         device="cuda",
         dtype=torch.int16,
     )
-    state = state_bits.view(torch.bfloat16)
-    x = x_bits.view(torch.bfloat16)
-    weight = torch.zeros(channels, 4, device="cuda", dtype=torch.bfloat16)
+    state = state_bits.view(dtype)
+    x = x_bits.view(dtype)
+    weight = torch.zeros(channels, 4, device="cuda", dtype=dtype)
     expected_bits = torch.cat((state_bits, x_bits.unsqueeze(-1)), dim=-1)[..., -state_len:]
 
     causal_conv1d_update(x, state, weight)
@@ -283,7 +256,8 @@ def test_state_shift_and_append_are_bitwise(state_len):
 
 @pytest.mark.L0
 @torch.no_grad()
-def test_channel_fast_wminus1_state_shift_and_append_are_bitwise():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_channel_fast_wminus1_state_shift_and_append_are_bitwise(dtype):
     causal_conv1d_update = _load_api()
     torch.manual_seed(3)
     rows, channels = 2, 257
@@ -294,7 +268,7 @@ def test_channel_fast_wminus1_state_shift_and_append_are_bitwise():
         device="cuda",
         dtype=torch.int16,
     )
-    state = backing_bits.view(torch.bfloat16).transpose(1, 2)
+    state = backing_bits.view(dtype).transpose(1, 2)
     initial_bits = state.contiguous().view(torch.int16)
     x_bits = torch.randint(
         -(2**15),
@@ -303,8 +277,8 @@ def test_channel_fast_wminus1_state_shift_and_append_are_bitwise():
         device="cuda",
         dtype=torch.int16,
     )
-    x = x_bits.view(torch.bfloat16)
-    weight = torch.zeros(channels, 4, device="cuda", dtype=torch.bfloat16)
+    x = x_bits.view(dtype)
+    weight = torch.zeros(channels, 4, device="cuda", dtype=dtype)
     expected_bits = torch.cat((initial_bits, x_bits.unsqueeze(-1)), dim=-1)[..., -3:]
 
     causal_conv1d_update(x, state, weight)
@@ -391,13 +365,14 @@ def test_public_torch_compile_fullgraph_observes_state_mutation():
 
 @pytest.mark.L0
 @torch.no_grad()
-def test_public_cuda_graph_capture_and_replay_observe_state_mutation():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_public_cuda_graph_capture_and_replay_observe_state_mutation(dtype):
     causal_conv1d_update = _load_api()
     torch.manual_seed(29)
     rows, channels = 2, 257
-    x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16)
-    initial_state = torch.randn(rows, channels, 4, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(rows, channels, device="cuda", dtype=dtype)
+    weight = torch.randn(channels, 4, device="cuda", dtype=dtype)
+    initial_state = torch.randn(rows, channels, 4, device="cuda", dtype=dtype)
     warmup_stream = torch.cuda.Stream()
     with torch.cuda.stream(warmup_stream):
         causal_conv1d_update(x, initial_state.clone(), weight, activation="silu")
@@ -413,14 +388,34 @@ def test_public_cuda_graph_capture_and_replay_observe_state_mutation():
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(captured_output, expected_output, atol=3e-2, rtol=3e-2)
+    tolerance = 1e-3 if dtype == torch.float16 else 3e-2
+    torch.testing.assert_close(captured_output, expected_output, atol=tolerance, rtol=tolerance)
     _assert_state_bits_equal(state, expected_state)
 
+    x.neg_()
     expected_output_2, expected_state_2 = _reference_step(x, weight, expected_state, activation="silu")
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured_output, expected_output_2, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(captured_output, expected_output_2, atol=tolerance, rtol=tolerance)
     _assert_state_bits_equal(state, expected_state_2)
+
+
+@pytest.mark.L0
+@torch.no_grad()
+def test_decode_dtype_specialization_with_identical_shapes():
+    causal_conv1d_update = _load_api()
+    # Narrow arithmetic rounds 2048 + 1 back to 2048 before cancellation.
+    for dtype in (torch.bfloat16, torch.float16, torch.bfloat16, torch.float16):
+        x = torch.zeros(2, 17, device="cuda", dtype=dtype)
+        weight = torch.ones(17, 4, device="cuda", dtype=dtype)
+        history = torch.tensor([8, 2048, 1, -2048], device="cuda", dtype=dtype)
+        state = history.expand(2, 17, 4).contiguous()
+
+        output = causal_conv1d_update(x, state, weight)
+
+        torch.testing.assert_close(output, torch.ones_like(x), rtol=0, atol=0)
+        expected_state = torch.cat((history[1:], history.new_zeros(1))).expand_as(state)
+        _assert_state_bits_equal(state, expected_state)
 
 
 @pytest.mark.L0
