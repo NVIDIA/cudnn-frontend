@@ -117,6 +117,71 @@ def test_build_cfg_preserves_logged_tensor_layout():
     assert cfg["right_bound"] is None
 
 
+def paged_fwd_payload(table_names=("Page_table_K", "Page_table_V"), dtype="FLOAT16", max_seq_len_kv=300, seq_len_kv=None):
+    payload = fwd_payload()
+    payload["context"]["io_data_type"] = dtype
+    node = payload["nodes"][0]
+    node["inputs"].update({"SEQ_LEN_Q": 5, "SEQ_LEN_KV": 6, table_names[0]: 7, table_names[1]: 8})
+    node.update(padding_mask=True, max_seq_len_kv=max_seq_len_kv)
+    payload["tensors"] = [
+        {"uid": 1, "dim": [2, 4, 1, 64], "stride": [256, 64, 64, 1]},
+        {"uid": 2, "dim": [20, 2, 32, 64], "stride": [4096, 2048, 64, 1]},
+        {"uid": 3, "dim": [20, 2, 32, 64], "stride": [4096, 2048, 64, 1]},
+        {"uid": 4, "dim": [2, 4, 1, 64], "stride": [256, 64, 64, 1]},
+        {"uid": 5, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1]},
+        {"uid": 6, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": seq_len_kv},
+        {"uid": 7, "dim": [2, 1, 10, 1], "stride": [10, 10, 1, 1]},
+        {"uid": 8, "dim": [2, 1, 10, 1], "stride": [10, 10, 1, 1]},
+    ]
+    return payload
+
+
+@pytest.mark.parametrize(
+    "table_names,dtype,max_seq_len_kv,logged_lengths,expected_s_kv",
+    [
+        pytest.param(("Page_table_K", "Page_table_V"), "FLOAT16", 300, [128, 267], 300, id="serialized-fields"),
+        pytest.param(("PAGED_ATTENTION_K_TABLE", "PAGED_ATTENTION_V_TABLE"), "BFLOAT16", 300, None, 300, id="table-aliases-without-dumps"),
+        pytest.param(("Page_table_K", "Page_table_V"), "FLOAT16", None, [128, 267], 320, id="table-capacity"),
+    ],
+)
+def test_build_cfg_recovers_paged_kv_geometry(table_names, dtype, max_seq_len_kv, logged_lengths, expected_s_kv):
+    payload = paged_fwd_payload(table_names, dtype, max_seq_len_kv, logged_lengths)
+
+    cfg = operations.select_operation(payload).build_cfg("{}", payload)
+
+    assert cfg["is_paged"] is True
+    assert cfg["block_size"] == 32
+    assert cfg["s_kv"] == expected_s_kv
+    assert cfg["shape_k"] == cfg["shape_v"] == (2, 2, expected_s_kv, 64)
+    assert cfg["stride_k"] is None
+    assert cfg["stride_v"] is None
+    assert cfg["seq_len_q"] == [1, 1]
+    assert cfg["seq_len_kv"] == (logged_lengths or [expected_s_kv, expected_s_kv])
+
+
+def test_build_cfg_uses_paged_bias_extent_when_max_is_unspecified():
+    payload = paged_fwd_payload(max_seq_len_kv=None)
+    payload["nodes"][0]["inputs"]["Bias"] = 9
+    payload["tensors"].append({"uid": 9, "dim": [1, 4, 1, 300], "stride": [1200, 300, 300, 1]})
+
+    cfg = operations.select_operation(payload).build_cfg("{}", payload)
+
+    assert cfg["s_kv"] == 300
+    assert cfg["is_bias"] is True
+
+
+@pytest.mark.parametrize("one_sided", [True, False], ids=["one-sided-cache", "different-page-sizes"])
+def test_build_cfg_rejects_paged_geometry_the_runner_cannot_recreate(one_sided):
+    payload = paged_fwd_payload()
+    if one_sided:
+        del payload["nodes"][0]["inputs"]["Page_table_V"]
+    else:
+        payload["tensors"][2]["dim"][2] = 64
+
+    with pytest.raises(ValueError, match="Paged SDPA replay requires K and V caches with a shared page size"):
+        operations.select_operation(payload).build_cfg("{}", payload)
+
+
 def test_build_cfg_detects_ragged_from_offset_inputs():
     payload = fwd_payload()
     node = payload["nodes"][0]
