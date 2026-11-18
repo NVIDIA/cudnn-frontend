@@ -661,6 +661,7 @@ pytest core/test_determinism_utils.py
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `norm/frost/test_add_norm_quant_decode_determinism.py` | `AddNormQuantDecode` (the add + RMSNorm + quantize decode step, hidden 5120, rows 1 .. 1024) | the updated BF16 residual, BF16 output `out`, FP8 E4M3 or packed E2M1 `codes`, the NVFP4 E4M3 block `scales` | — (inference-only step kernel; no backward) |
 | `attention_prepare/frost/test_attention_prepare_decode_determinism.py` | `AttentionPrepareDecode` (the attention preparation decode step, 24 query and 4 key/value heads of width 256, tokens 1 .. 1024) | BF16 `q_out` and `gate_out`, the K and V rows of the paged cache | — (inference-only step kernel; no backward) |
+| `row_quantize/frost/test_row_quantize_fp4_decode_determinism.py` | `RowQuantizeFp4Decode` (the FP4 row quantization decode step, width 5120, rows 1 .. 1024) | packed E2M1 `codes`, the E4M3 block `scales` in the 128 x 4 layout | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 | `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_backward_metadata` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
@@ -3553,6 +3554,58 @@ CuTe DSL 4.8.1 on the cc 10.0 part (2026-11-13 UTC; the 4.8.1 wheels put first o
 `CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -x -q -ra` -> 182 passed; its 5 records hold the input and output
 hashes of the committed 4.8.0 set and are not committed.  The DSL version is part of the runtime key, so against the committed
 directory the 5 golden cases skip under 4.8.1 -- a coverage gap there, not a pass.
+
+### FP4 row quantization decode step: replay, batch invariance, locality and goldens
+
+`row_quantize/frost/test_row_quantize_fp4_decode_determinism.py` pins `cudnn.RowQuantizeFp4Decode` (the block-scaled FP4 quantization of
+bf16 rows under a global scale in one launch: bf16 `x` `[rows, 5120]`, one fp32 scale; packed E2M1 `codes`, E4M3 block `scales` in the
+128 x 4 layout; rows 1 .. 1024).  Forward only: the entry is an inference step with no backward entry point, no gradient and no state,
+so there is no backward case.  Every comparison is raw bytes over both buffers a launch writes.  The entry has ONE kernel body; its
+three launch arms write the same bytes and are compared where a case says so.
+
+What is held fixed: a block's bytes are a function of its sixteen values and of the global scale -- one thread owns the whole block,
+and the kernel has no reduction across threads, no barrier and no shared memory -- so no split, pick or knob selects another
+association and there is nothing to pin across batch layouts besides the operands.  Operands are built on the host (an operand set
+has the same bytes on every device), once per case; the cases slice and permute them.  Every output is a fresh caller-owned buffer:
+the codes filled with the sentinel `0xA5`, the scale buffer zero-filled, as its owner must (the kernel writes the live rows' scale
+bytes only).  A block scale's position in the 128 x 4 layout follows its row index while its value does not, so batch layouts are
+compared on the scale bytes per row, read through the layout written out in the test helpers; the replay and golden cases compare the
+whole scale buffer.  The independent references are a separate check (`row_quantize_fp4_decode_utils.assert_reference`: every block
+scale bitwise the definition's `e4m3(gs x (amax x fp32(1/6)))`, every code inside the bracket of the two approximate reciprocals) and
+gate the goldens.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | rows 1 / 17 / 160 / 1024; eight executions into fresh buffers under side-stream contention; then the references | 4 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | two entries, two identical 24-row operand sets built afresh | 1 |
+| `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | launch arm (plain, wait, wait + release); 17 rows under a side stream (ordered after the operands' producer stream) vs the current stream | 3 |
+| `test_batch_invariance` | L0 | two global scales; one 1024-row operand set: the 1024-row call replayed three times and checked against the references; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 16 / 17 / 31 / 32 / 33 / 63 / 64 / 65 / 95 / 96 / 97 / 127 / 128 / 129 / 160 rows as one call (both sides of the 32-row lines of a scale atom and of the 128-row band edge), vs the reversed batch | 2 |
+| `test_insertion_removal_and_reordering` | L0 | a 130-row call (two scale bands), then a row inserted at position 5 (row 127 moves into the second band; rows 31, 63 and 95 move to the next quarter of their atoms), rows 3 / 11 / 129 removed (rows 128 / 129 move into the first band), a permutation: every row keeps its bytes, the inserted row writes its alone bytes | 1 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | a row twice in one call (both copies = alone); the row at position 5 among 63 and at position 128 among 159 redrawn neighbours | 1 |
+| `test_inputs_are_unmodified` | L0 | launch arm x rows 1 / 17 / 1024, caller-owned and entry-owned outputs (18 launches): `x` and `scale` hold their bytes | 1 |
+| `test_one_element_moves_one_block` | L0 | one element changed (the first and the last element of the first, a middle and the last block; the first, a middle and the last row: 18 changes): the eight code bytes and the one scale byte of its block move, and no other byte of the call | 1 |
+| `test_the_row_ceiling_call` | L0 | eight executions at 1024 rows; rows 0 / 511 / 512 / 1023 and the rows on both sides of every scheduling-wave edge below 1024 (where the part has one) alone vs inside; whether the call crossed a wave is reported in the run's `measured` section, not asserted | 1 |
+| `test_row_ceiling_is_the_typed_decline` | L0 | 1025 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch (sentinel-filled outputs keep their bytes), never another provider | 1 |
+| `test_golden` | L0 | four cases: three executions, the references, the wait and the wait + release arms on the same operands, the saved hashes of the codes and of the whole scale buffer | 4 |
+
+Collected: 20 cases, all on a device.  Replay executions: `test_replay` 4 x 8 = 32; `test_batch_invariance` 2 x 3 of the 1024-row call
+and 2 x 1,024 of a row alone; `test_the_row_ceiling_call` 8; `test_golden` 4 x 3.
+
+Golden sets: `row-quantize-fp4-decode-w5120-<case>`, four files in `c84dd9abaee769b4/`, the first goldens of this API -- `random-rows1`
+(one row under a non-power-of-two global scale), `random-rows8` (eight rows under 0.25), `structured-rows130` (two scale bands, under a
+global scale that separates the associations of the block-scale product) and `code-domain-rows854`: the ENUMERATED code domain of the
+non-power-of-two scale -- for every scale byte 0 .. `0x7E` every positive and every negative bf16 element a block of that byte can
+hold.  A code is a function of its block's scale byte, the element and the global scale, so that case holds every code the kernel can
+write under that scale, among them the elements whose code follows the last bit of the approximate reciprocals; random operands meet
+those only by chance.  The launch arms write the default's bytes inside `test_golden` and, on more shapes, in
+`test_row_quantize_fp4_decode.py` (`test_bit_neutral_arms_write_the_default_bytes`; behind a predecessor that released its dependents
+before it wrote the operand, `test_wait_holds_every_read_behind_a_predecessor_that_released_early`), so the one set holds for every
+arm.  The codes follow the part's approximate reciprocal: the hashes are a record of this runtime, not a claim across GPU
+architectures.  A new set is owed with a stated reason when the rounding chain or the scale layout changes.
+
+GPU coverage: cc 10.0 (replay, batch invariance and goldens).  cc 10.3 and cc 10.7 have not been run on a device: the entry admits
+compute capability 10.x and the status page reads "SM103: Unverified" and, for SM107, "Unverified"; a run there skips the four golden
+cases (no set for its runtime) -- a coverage gap, not a pass.  cc 9.0 and cc 12.x are declined by type.
 
 ### QSA: 42 cases
 
