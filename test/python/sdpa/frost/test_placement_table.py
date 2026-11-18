@@ -337,7 +337,8 @@ def test_b300_dense_prefill_entries_lead_the_sm100_row():
     assert pt.class_key(row, prefill(dtype=half)) not in pt.TABLE  # f16 keeps the hand rules
     assert pt.class_key(row, prefill(dtype=half, **d64)) not in pt.TABLE
     assert pt.class_key(row, prefill(dtype=half, d_qk=128, d_v=128)) not in pt.TABLE
-    assert pt.class_key(row, prefill(has_paged_kv=True, page_size=64)) not in pt.TABLE
+    # a paged cache is another study's class (paged THD d192 x 192 context, sm100_prefill_d192_gaps_20261118)
+    assert pt.TABLE[pt.class_key(row, prefill(has_paged_kv=True, page_size=64))].study == "sm100_prefill_d192_gaps_20261118"
     assert pt.class_key(row, prefill(device_cc=(10, 0))) not in pt.TABLE
 
 
@@ -1276,6 +1277,26 @@ def test_sm107_paged_wide_head_verify_entries_lead(d, heads, s_qs):
     assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
     assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_sm100_paged_d192_prefill_entries_follow_the_study(device_cc):
+    """Study sm100_prefill_d192_gaps_20261118 (B200, B300 transfer): paged THD d192 x 192 context (step5) leads with the full cache and
+    with a window, on and off the tile, on cc 10.0 and 10.3. The mimo d192 x 128 classes failed their holdout and have no entry."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def paged(**over):
+        base = dict(b=1, h_q=64, h_kv=4, s_q=8192, s_kv=8192, d_qk=192, d_v=192, causal=True, bottom_right=True, thd=True)
+        base.update(device_cc=device_cc, has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for over in (dict(), dict(s_q=512, s_kv=131072), dict(s_q=512, s_kv=131073), dict(window_left=511), dict(window_left=511, s_kv=131073, s_q=2048)):
+        assert pt.lookup(row, paged(**over)) is True, over
+        assert pt.matched_entry(row, paged(**over)).study == "sm100_prefill_d192_gaps_20261118"
+    assert pt.lookup(row, paged(d_v=128)) is None  # mimo d192 x 128: no entry
+    assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
 
 
 @pytest.mark.L0

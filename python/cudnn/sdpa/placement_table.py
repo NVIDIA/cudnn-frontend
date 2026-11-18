@@ -1623,6 +1623,34 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm103_swa_prefill_20261031"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", True): Entry("always", None, "sm103_swa_prefill_20261031"),
+    # study sm100_prefill_d192_gaps_20261118 (B200 1000 W on cuDNN 9.24.0.43 and 9.30.0.8, B300 1100 W transfer; the inference
+    # benchmark's paged THD context, page 16, bottom-right causal, d192 x 192 full cache and 512 / 2048-key windows, GQA 4-16; 686 train
+    # cells over all families + a 120-cell holdout at fresh head pairs, scored once on each board: changed 0.41-0.58 of the default;
+    # run-559 gates GB200 10 rows at 0.540, GB300 10 rows at 0.513. The mimo d192 x 128 classes failed their B200 holdout at GQA 12: no entry)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
     # study sm103_d256_bwd_v2_20261031, THD half (B300 SXM6 1100 W, cuDNN 9.28.0.38; 129 train cases: S 128-32k, b 1-128, GQA 16/2 /
     # 32/4 / 32/1 / 64/2 and MHA 16/16; 24 off-lattice holdout cases). The dense classes have no entry: they lost on small-work
     # holdout cases there, and their refit (study sm103_d256_bwd_v3_20261031) lost again on its own holdout.
