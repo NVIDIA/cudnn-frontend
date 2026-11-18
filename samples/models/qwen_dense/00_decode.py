@@ -52,8 +52,8 @@ launch shape of every target launch against the census.  ``--stack fe-entries`` 
 the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has three rows more: the multiplies the
 target runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone
 (``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``); without it, or with
-a version this area has not validated, ``--stack native`` is a ``SKIP`` before anything is loaded.  The library builds its
-kernels at its first use: the run makes that use while it plans and says so.
+a version this area has not validated, on compute capability 10.x ``--stack native`` is a ``SKIP`` before anything is loaded.
+The library builds its kernels at its first use: the run makes that use while it plans and says so.
 
 ``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
 launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's

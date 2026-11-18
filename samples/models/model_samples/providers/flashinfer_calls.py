@@ -9,11 +9,15 @@ weight on the packed codes of both: one launch per call.  The library picks the 
 the GPU: one of two kernel classes of one module, in a grid of its own choice.  That pick is a function of the call as long
 as nothing has tuned the operation, so the row says ``TUNED False`` and the adapter calls the library outside any tuning
 context; which class and which launch shape the call then gets is data of the family's kernel census, held exactly by
-the kernel check.  The operand is the 4-bit output of the block before it: from a kernel on the stored formats it comes
-with its block scales in the 128 x 4 layout this kernel reads and is handed over as it is; from a block that is not a
-kernel the scales come row by row, and bringing them into the layout is this block's own launch.  The weight is the
-stored 4-bit weight with its block scales in that layout (``weights.TiledBlockScaledWeight``), built once per weight at
-load (``stored_layout``) and kept as the weight's one stored form.
+the kernel check.  ``TUNED`` is a statement about this process: the library's tuner is tuning, or has tuned the operation
+here.  A tuning store the caller attached to the library is not seen by it; a tactic replayed from one is held by the
+kernel class and the launch shape alone, where the census has a section for the run.
+
+The operand is the 4-bit output of the block before it: from a kernel on the stored formats it comes with its block
+scales in the 128 x 4 layout this kernel reads and is handed over as it is; from a block that is not a kernel the scales
+come row by row, and bringing them into the layout is this block's own launch.  The weight is the stored 4-bit weight
+with its block scales in that layout (``weights.TiledBlockScaledWeight``), built once per weight at load
+(``stored_layout``) and kept as the weight's one stored form; the loader holds it to the bytes it was made from.
 
 ``torch_ref.quantize+flashinfer.mm_fp4`` is the same multiply for a block whose operand reaches it as bf16 rows -- the
 output head, whose operand the target quantises with a launch of its own.  The block quantises them with the reference
@@ -32,10 +36,13 @@ validated (``VALIDATED``: the versions the launch records of the census were rec
 
 **First use is part of the plan.**  The library builds what a call needs when it is first made: its CuTe DSL kernels in the
 process, its CUTLASS multiply as a module compiled with the installed CUDA compiler and ninja (minutes, once per machine).
-So an adapter makes the call of the run's row count on scratch operands while the run is planned (``first_use``), after the
-memory sentence has held and before anything is loaded, and a sample announces it (``first_use_note``).  A refusal of the
-operands this adapter built is a ``ValueError`` -- an ``ERROR``, because a faulty adapter must not read as an unsupported
-installation; anything else that keeps the library from making the call there is the installation's, and the ``SKIP``.
+The 4-bit kernel is built per range of row counts.  So an adapter makes the call on scratch operands while the run is
+planned (``first_use``) -- at the run's row count and, for a run of several sequences, at the rows of one sequence, which
+is what the batch-invariance check calls -- after the memory sentence has held and before anything is loaded, and a sample
+announces it (``first_use_note``).  A refusal of the operands this adapter built is a ``ValueError`` -- an ``ERROR``,
+because a faulty adapter must not read as an unsupported installation; whatever else keeps the LIBRARY from importing,
+building or launching there is the installation's, and the ``SKIP``.  A fault of this adapter's own code is neither: it
+is raised as it is.
 """
 
 from __future__ import annotations
@@ -97,6 +104,8 @@ class LibraryBlock(BlockBase):
     #: the device types on which the plan makes the first use (a host test names its own device to run it on a stand-in library)
     first_use_devices = ("cuda",)
     _served = None  # the fields of the row's form as the last call passed them and the library's tuner stood: the call log's line
+    _passed = ()  # the keywords of the last library call as (FIELD, value), written by ``_call`` from what it handed over
+    _first = False  # inside the plan's first use (``first_use``): a failure of the library call is the installation's then
     _scalars = None  # (value, device) -> the one-element fp32 tensor a call reads: built once per value, never inside a later step
 
     def _library(self):
@@ -129,9 +138,10 @@ class LibraryBlock(BlockBase):
 
     @property
     def first_use_note(self) -> str:
-        version = installed()
+        if not self._launches_here():  # a plan on stated device facts makes no first use: nothing to announce
+            return ""
         return (
-            f"first use of FlashInfer {version or '(not installed)'}: it builds the kernels of its multiplies now, in this process and with the "
+            f"first use of FlashInfer {installed() or '(not installed)'}: it builds the kernels of its multiplies now, in this process and with the "
             'installed CUDA compiler and ninja (minutes on the first run of a machine, nothing on a later one; the family README, "What the first run does")'
         )
 
@@ -140,22 +150,41 @@ class LibraryBlock(BlockBase):
         raise NotImplementedError
 
     def first_use(self, sequences: int, tokens: int) -> None:
-        """While the run is planned, on a real CUDA device: the call of the run's row count on scratch operands.  The library
-        builds its kernel there.  ``ValueError`` (an ERROR) where it refuses the operands this adapter built;
-        ``NotImplementedError`` (a SKIP) for anything else that keeps it from making the call on this installation."""
+        """While the run is planned, on a real CUDA device: the call on scratch operands, at the run's row count and -- for a
+        run of several sequences -- at the rows of one sequence, which the batch-invariance check calls (the library builds
+        the kernel of the 4-bit multiply per range of row counts).  ``ValueError`` (an ERROR) where the library refuses the
+        operands this adapter built; ``NotImplementedError`` (a SKIP) for whatever else keeps the library itself from
+        importing, building or launching on this installation (``_call``).  The scratch operands and everything else of
+        this adapter's own code are outside that: a fault there is raised as it is, never read as the installation's."""
         import torch
 
         if not self._launches_here():
             return
+        device = torch.device(self.options["device"])
+        for rows in dict.fromkeys((sequences * tokens, tokens)):
+            operands = self._scratch(device, rows)
+            self._first = True
+            try:
+                self(*operands)
+            except (TypeError, ValueError) as error:  # the library's own checks of what it was handed
+                first = (str(error).splitlines() or [type(error).__name__])[0][:200]
+                raise ValueError(f"{self.entry} declined the operands this adapter built for its first use: {first}") from None
+            finally:
+                self._first = False
+                self._served = None  # a first use is no call of a step: the call log starts empty
+
+    def _call(self, name: str, *operands, **passed):
+        """The library call ``flashinfer.gemm.<name>`` itself, and what it was passed by keyword (``_passed``: what the call
+        log reads back).  During the plan's first use the import, the build and the launch are the library's first on this
+        installation: whatever keeps it from them, but its own check of the operands, is a ``NotImplementedError``."""
+        self._passed = tuple((key.upper(), value) for key, value in passed.items())
+        if not self._first:
+            return getattr(self._library().gemm, name)(*operands, **passed)
         try:
-            self(*self._scratch(torch.device(self.options["device"]), sequences * tokens))
-            self._served = None  # a first use is no call of a step: the call log starts empty
-        except (TypeError, ValueError) as error:  # the library's own checks of what it was handed
-            first = (str(error).splitlines() or [type(error).__name__])[0][:200]
-            raise ValueError(f"{self.entry} declined the operands this adapter built for its first use: {first}") from None
-        except NotImplementedError:
+            return getattr(self._library().gemm, name)(*operands, **passed)
+        except (TypeError, ValueError, NotImplementedError):
             raise
-        except Exception as error:  # noqa: BLE001 -- whatever keeps the library from building or launching: the installation's
+        except Exception as error:  # noqa: BLE001 -- whatever keeps the library from importing, building or launching: the installation's
             raise NotImplementedError(
                 f"{self.entry}: FlashInfer could not make its first use on this installation ({type(error).__name__}); it builds its kernels "
                 f'there and needs the CUDA compiler and ninja (the family README, "What the first run does"); {WITHOUT}'
@@ -213,8 +242,9 @@ class MmFp4Block(LibraryBlock):
         raise ValueError(f"{self.entry} multiplies packed 4-bit codes with their block scales; this block is handed {type(qx).__name__}")
 
     def _tuned(self) -> bool:
-        """Whether something else than the library's untuned pick may have served the call that has just returned: its tuner
-        is tuning, or has tuned this operation in this process (a tuned winner outlives the context it was tuned in)."""
+        """Whether the library's tuner may have chosen the kernel of the call that has just returned: it is tuning, or has
+        tuned this operation in this process (a tuned winner outlives the context it was tuned in).  A tuning store the
+        caller attached to the library is not read here: the tuner states none of it."""
         tuner = self._library().autotuner.AutoTuner.get()
         return bool(tuner.is_tuning_mode) or FP4_OPERATION in tuner.stats.tuned_op_total_configs
 
@@ -242,10 +272,8 @@ class MmFp4Block(LibraryBlock):
         codes, scales, scale = self._operand(qx)
         backend, e4m3 = self._form()["BACKEND"], torch.float8_e4m3fn
         alpha = self._scalar(codes.device, scale, stored.scale)  # the fp32 product of the two global scales
-        out = self._library().gemm.mm_fp4(
-            codes, stored.codes.t(), scales.view(e4m3), stored.tiled_scales.view(e4m3).t(), alpha, torch.bfloat16, backend=backend
-        )
-        self._served = (("BACKEND", backend), ("TUNED", self._tuned()))  # what the call log of a traced step reads back (``serving``)
+        out = self._call("mm_fp4", codes, stored.codes.t(), scales.view(e4m3), stored.tiled_scales.view(e4m3).t(), alpha, torch.bfloat16, backend=backend)
+        self._served = (*self._passed, ("TUNED", self._tuned()))  # what the call log of a traced step reads back (``serving``)
         return out
 
 
@@ -293,6 +321,6 @@ class BmmFp8Block(LibraryBlock):
             raise ValueError(f"{self.entry} multiplies static 8-bit codes; this block is handed {type(qx).__name__}")
         backend, e4m3, device = self._form()["BACKEND"], torch.float8_e4m3fn, qx.codes.device
         a, b = qx.codes.view(e4m3).unsqueeze(0), stored.codes.view(e4m3).t().unsqueeze(0)
-        out = self._library().gemm.bmm_fp8(a, b, self._scalar(device, qx.scale), self._scalar(device, stored.scale), torch.bfloat16, backend=backend)
-        self._served = (("BACKEND", backend),)
+        out = self._call("bmm_fp8", a, b, self._scalar(device, qx.scale), self._scalar(device, stored.scale), torch.bfloat16, backend=backend)
+        self._served = self._passed
         return out.view(qx.codes.shape[0], stored.codes.shape[0])

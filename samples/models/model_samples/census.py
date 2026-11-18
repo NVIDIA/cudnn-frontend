@@ -93,6 +93,7 @@ This module imports nothing beyond the standard library.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -204,9 +205,14 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     # FlashInfer's multiplies on the stored formats.  The 4-bit multiply launches one of two kernel classes of one module, and
     # the class is in the name (a census entry names it: ``class``).  The 8-bit multiply is served by the kernel the library
     # chooses among its own: a cuBLASLt kernel of 8-bit operands, or the library's own CUTLASS multiply, whose name the
-    # profiler leaves mangled.  Both stand in front of the family they would otherwise fall to
+    # profiler leaves mangled -- of that one the name must carry what the call launches: the SM100 mainloop on tensor-core
+    # multiplies and E4M3 operands (another CUTLASS multiply is no member).  Both stand in front of the family they would
+    # otherwise fall to
     ("fi_mm_fp4", re.compile(r"^kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100")),
-    ("cublaslt_fp8_gemm", re.compile(r"^nvjet_sm\d+_qq|^_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalI")),
+    (
+        "cublaslt_fp8_gemm",
+        re.compile(r"^nvjet_sm\d+_qq|^_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalI\w*MainloopSm100TmaUmmaWarpSpecializedI\w*NS_12float_e4m3_tE"),
+    ),
     # ``torch.index_select`` launches one of three kernels, by the number of rows it gathers and the size of a table row: the
     # small-index kernel up to 16 rows, and from 17 the large-index kernel or PyTorch's vectorized gather (seen on a bf16
     # table of 5120 columns with int32 ids)
@@ -410,6 +416,15 @@ def form_text(form: Sequence[Tuple[str, object]]) -> str:
 def shape_text(shape) -> str:
     grid, block, shared = shape
     return f"grid {tuple(grid)}, block {tuple(block)}, shared memory {shared:,} B"
+
+
+def _named(name: str, width: int = 72) -> str:
+    """A kernel name as a line names it where the name itself is the statement: whole up to ``width`` characters, else its
+    start with its length and a digest of the whole name -- two long names that differ late are told apart by the digest
+    (a mangled CUTLASS name runs to more than a thousand characters and carries its operand types far from its start)."""
+    if len(name) <= width:
+        return name
+    return f"{name[: width - 3]}... ({len(name):,} characters, sha256 {hashlib.sha256(name.encode()).hexdigest()[:12]})"
 
 
 def _short(name: str, width: int = 96) -> str:
@@ -667,7 +682,9 @@ ENTRY_FACTS = ("launch", "at", "form", "class", "pick")
 #: first layer (the first norm of a step has no residual to add)
 FIRST_LAYER = "first_layer"
 #: the packages the providers of this area import, as a run names them: of the versions a census records, these are
-#: compared with what is installed.  A change that brings a provider of another package adds the package here
+#: compared with what is installed.  A change that brings a provider of another package adds the package here -- unless
+#: the provider's adapter holds that package to a validated version itself and does not run on another (FlashInfer:
+#: ``providers.flashinfer_calls.VALIDATED``); what such a package depends on is not compared
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
 
 
@@ -1216,8 +1233,9 @@ class Traced:
         """Per exact row what a step launched, and the kernels a library chose inside the fallback rows (printed, not gated)."""
         lines = []
         calls = Counter((site.block, site.site) for site in self.sites)
-        recorded = {self.sites[index].block: shape for index, shape in self._recorded().items()}
-        classes = {self.sites[index].block: named for index, named in self._classes().items()}
+        # what the census records is recorded per call: a block whose call sites two rows serve has it for one of them alone
+        recorded = {(self.sites[index].block, self.sites[index].site): shape for index, shape in self._recorded().items()}
+        classes = {(self.sites[index].block, self.sites[index].site): named for index, named in self._classes().items()}
         for site in {(site.block, site.site): site for site in self.sites}.values():
             for kernel in site.kernels:
                 if kernel.relation != "exact":
@@ -1231,11 +1249,12 @@ class Traced:
                     )
                 elif kernel.shape == "entry":
                     lines.append(f"{site.row}: {site.entry}{form_text(site.form)}, {count}; the entry states no launch for this run")
-                elif site.block in recorded:  # no entry states its shape; the census of the target records one
-                    what = "the launch shape" if site.block not in classes else f"the kernel class {classes[site.block]} and the launch shape"
+                elif (site.block, site.site) in recorded:  # no entry states its shape; the census of the target records one for this call site
+                    at = (site.block, site.site)
+                    what = "the launch shape" if at not in classes else f"the kernel class {classes[at]} and the launch shape"
                     lines.append(
-                        f"{site.block}: {site.entry}{form_text(site.form)}, {count}; {kernel.id} by name, and in {what} the census records: "
-                        f"{shape_text(recorded[site.block])}"
+                        f"{site.row}: {site.entry}{form_text(site.form)}, {count}; {kernel.id} by name, and in {what} the census records: "
+                        f"{shape_text(recorded[at])}"
                     )
                 else:
                     lines.append(f"{site.row}: {site.entry}{form_text(site.form)}, {count}; {kernel.id} by name (no launch shape is declared for it)")
@@ -1286,7 +1305,7 @@ class Traced:
             names = self.result.served.get(row)
             if not names:
                 continue
-            launched = ", ".join(f"{name if len(name) <= 72 else name[:69] + '...'} x {count}" for name, count in names.most_common(4))
+            launched = ", ".join(f"{_named(name)} x {count}" for name, count in names.most_common(4))
             same = "the pick the census records" if set(names) == {pick} else f"not the pick the census records ({pick}): another kernel of the same entry"
             lines.append(f"chosen by the library for {row} (printed and compared, never gated): {launched} over the traced steps; {same}")
         return lines

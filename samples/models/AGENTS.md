@@ -1015,19 +1015,36 @@ the stored weights (`providers/flashinfer_calls.py`). What building these rows s
   names what makes the pick a function of the call (`TUNED False`), the adapter reads the library's tuner after each
   call and the call log carries what it found, and the kernel class and launch shape of the untuned pick are census
   data that the kernel check holds exactly. A row that cannot name such a condition holds its launch by membership and
-  prints the pick: the 8-bit multiply.
+  prints the pick: the 8-bit multiply. Say what such a field sees: `TUNED` is the tuner's statement about this
+  process, and a tuning store a caller attached is outside it.
+- A launch held by membership is the same call, not the same kernel. In every run of these rows the library's untuned
+  8-bit multiply was its own CUTLASS kernel, not the cuBLASLt kernel the census records as the target's pick. A count
+  of target launches that includes such launches says how many are held to a recorded launch shape and how many by
+  membership, wherever the count stands.
 - The class and the grid of a pick follow the weight shape: the output head of a reduced vocabulary is another kernel
   launch than the published one's. The census entry of such a call names the widths it was recorded at (`at`), and a
   run of another width says that no launch shape is held for that block instead of failing.
 - A library that builds kernels at its first use must make that first use while the run is planned. Its first build
   of a compiled module took more than a minute and printed nothing; inside a decode loop that would have been a
-  stalled step. The first use is the call of the run's own row count on scratch operands, after the memory sentence
-  and before any load, announced in one line; a decline there is typed -- the adapter's operands an `ERROR`, the
-  installation a `SKIP` with the type of the exception and never its text, which can hold a local path.
-- A library kernel's name may reach the profiler mangled. The family pattern of such a kernel matches the head of the
-  mangled name; the table prints what the profiler printed.
+  stalled step. The first use is the call on scratch operands at every row count the run will call the block with --
+  its own, and the rows of one sequence, which the batch-invariance check calls: the library builds per range of row
+  counts -- after the memory sentence and before any load, announced in one line; a decline there is typed -- the
+  adapter's operands an `ERROR`, the installation a `SKIP` with the type of the exception and never its text, which
+  can hold a local path. The catch that makes the `SKIP` is around the library call alone: around the adapter's own
+  code it would turn a fault of the adapter into advice about the installation, with exit code 0.
+- A library kernel's name may reach the profiler mangled, and long: two kernels of one template differ far from the
+  start of their names. The family pattern of such a kernel names what the declared call launches (the mainloop, the
+  operand type), not the head all kernels of the template share; and a line that prints such a name prints its length
+  and a digest with it.
+- What a census records is recorded per call. A line that prints it for a block whose call sites two rows serve looks
+  it up by call site; by block name it printed one row's recorded launch shape for the other row's kernel.
+- A layout that a provider builds of a stored weight at load is held to the bytes it was made from, at load. The
+  reference's copy of such a weight is made through the layout's own way back to the checkpoint's order, so a wrong
+  layout agrees with its reference in every later check of the run.
 - A third-party adapter is tested as it is, over a stand-in of the library: the adapter reaches the library through
-  one method, and a host test replaces that method. A stand-in of the adapter would test the stand-in.
+  one method, and a host test replaces that method. A stand-in of the adapter would test the stand-in. The stand-in
+  of the library has the library's own defaults and records what it is handed, or a call without the row's argument
+  passes on the stand-in and runs another kernel on a device.
 - A library's tuner may start worker processes that import the main module again. A script that calls a sample
   inside a tuning context of the library needs its `if __name__ == "__main__":` guard, or every worker runs the
   sample.

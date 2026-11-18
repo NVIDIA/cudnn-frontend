@@ -227,8 +227,9 @@ this sample prefills a prompt with a kernel of its own, so a prompt of N tokens 
 N new tokens before the first new token appears. It gives a count and no time, because before the load a run has no
 time of its own to give; the `first token` line of the report has the measured one. In the runs of 2026-11-17 on
 compute capability 10.0, a prompt of 29 tokens took 4.3 s before the first new token on the stack `fe-cublas` (0.15 s
-per step) and the 58 tokens of the default prompt took 7.8 s on the stack `native` (0.13 s per step): orientation
-values of single runs on a shared GPU, as every timing on this page.
+per step) and the 58 tokens of the default prompt took 7.8 s on the cuDNN Frontend rows of the stack `native`, the
+rows `fe-entries` selects today (0.13 s per step): orientation values of single runs on a shared GPU, as every timing
+on this page.
 
 What is not here, and is not planned for a sample: a network interface of any kind; a request queue, or admission of
 work while a step runs; different prompts in one step; sampling; stop strings, constrained output, logit processors;
@@ -466,8 +467,9 @@ starts on the in-projection's release and waits before it reads the projection's
 well, on each 10.x class: the MLP's norm releases at its own wait, the gate / up kernel behind it starts on that
 release, issues two stages of its weight and waits for the norm before it reads the 4-bit operand, its block scales
 and the two scalars. The kernel signals the launch after it before its last output tile is written (it has no knob
-for that); the down multiply behind it is a fallback row, launched without the attribute, and starts when the kernel
-has completed. Each
+for that). In `fe-entries` the down multiply behind it is a fallback row, launched without the attribute, and starts
+when the kernel has completed; in `native` it is the library's kernel, which the library launches with programmatic
+dependent launch at its own default and which waits for the launch before it at its start. Each
 row of `configs.py` says what the launch before it must not write and what the launch after it must wait for. With `--provider
 linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
@@ -486,18 +488,24 @@ each on compute capability 10.x: `flashinfer.mm_fp4` for the MLP's down multiply
 for the output head, and `flashinfer.bmm_fp8` for the out-projection (in a verify step behind the projection entry's
 rows, which keep the linear-attention layers' call). FlashInfer is an optional package of this stack alone. It is
 imported inside the adapters of the rows that call it, on a device; no other stack and no plan on stated device facts
-imports it, so `--dry-plan --stack native` prints these rows without the package -- as `unverified in CI`, because no
-lane of this repository installs it. Install it with
+imports it. Such a plan is made through the helper layer (`model_samples.blocks.plan` with a `DeviceFacts` of your
+own; the script has no flag for it) and shows these rows without the package -- as `unverified in CI`, because no
+requirement file of this repository's tests names the package. Install it with
 
 ```bash
 pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt
 ```
 
 The requirement file is a lower bound; the constraints file pins the versions the launch records of the census were
-recorded with, and the adapters run on a validated version alone (`VALIDATED` in
-`model_samples/providers/flashinfer_calls.py`). Without the package, or with another version of it, `--stack native`
-ends in `[00] SKIP` before anything is loaded, exit code 0; the line names the version, the command above and
-`--stack fe-entries`, which runs the cuDNN Frontend rows of the stack without the package.
+recorded with -- PyTorch 2.14.0, CuTe DSL 4.8.0, FlashInfer 0.7.2.post1 and apache-tvm-ffi 0.1.11 -- so in an
+environment that has another PyTorch the line replaces it, and its cuDNN with it: an environment of its own is the safe
+place for `native`. FlashInfer requires `nvidia-cudnn-frontend` itself; run `pip install -e .` again if pip lists
+that package among what it installed. The adapters hold the version of FlashInfer alone, to a validated one
+(`VALIDATED` in `model_samples/providers/flashinfer_calls.py`); a PyTorch or a CuTe DSL of another version than the
+recorded one is named in the census line of a run. Without the package, or with another version of it, `--stack native`
+on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0; the line names the version,
+the command above and `--stack fe-entries`, which runs the cuDNN Frontend rows of the stack without the package. On
+compute capability 12.x no row of the library serves, and the stack runs without the package.
 
 The 4-bit multiply is held exactly. The library picks the kernel of a call itself, by the shape and the GPU -- one of
 two kernel classes, in a grid of its own choice -- and that pick is a function of the call as long as nothing has
@@ -505,22 +513,32 @@ tuned the operation in the process. So the row says `TUNED False`, the census re
 shape of each call, and the kernel check fails a launch of another class or in another shape. The same call inside a
 tuning context of the library (`flashinfer.autotune`), or after one has tuned the operation in the process, is not the
 row's form: the call log reads `TUNED True`, and the kernel check fails with the form it found beside the form the row
-names. The 8-bit multiply is the other case, by design: which kernel serves `bmm_fp8` is the library's choice among its
+names. `TUNED` is a statement about this process: the library's tuner is tuning, or has tuned the operation here. A
+tuning store that a caller attached to the library is not seen by it (the sample attaches none); a tactic replayed
+from one is held by the kernel class and the launch shape alone, where the census has a section for the run. The 8-bit
+multiply is the other case, by design: which kernel serves `bmm_fp8` is the library's choice among its
 own -- its tuner's where one has run, else its first candidate -- so the kernel check holds the launch by membership,
 prints the kernel that was chosen beside the pick the census records, says whether it is that pick, and never fails
-on it.
+on it. A member is a cuBLASLt kernel of 8-bit operands or the library's own CUTLASS multiply of 8-bit operands; a long
+kernel name is printed with its length and a digest, so that two such names are told apart. In every run of this page
+the library launched its own CUTLASS multiply there, not the cuBLASLt kernel the census records as the target's pick:
+those launches are the same call as the target's and another kernel, and a count of target launches that includes
+them says so.
 
 ### What the first run does
 
 FlashInfer builds what a call needs when the call is first made: the kernel of a 4-bit multiply is compiled in the
 process, and the 8-bit multiply is a module the library compiles with the installed
-CUDA compiler and ninja and keeps in its own cache directory -- more than a minute on the machine these rows were
-written on, once per machine. A run of `native` therefore makes each call of a library row once, on scratch operands
-of the run's row count, while it plans: after the memory sentence has held and before anything is loaded. It says so
+CUDA compiler and ninja and keeps in its own cache directory (`.cache/flashinfer` under the home directory, or under
+the directory `FLASHINFER_WORKSPACE_BASE` names) -- more than a minute on the machine these rows were
+written on, once per machine. A run of `native` therefore makes each call of a library row on scratch operands while
+it plans, after the memory sentence has held and before anything is loaded: at the run's row count and, for a run of
+several sequences, at the rows of one sequence, which its batch-invariance check calls (the kernel of the 4-bit
+multiply is compiled per range of row counts). It says so
 in one line, `[00] planning: first use of FlashInfer <version>: ...`, and the `plan` figure of its stage line is what
-that cost. A call the library refuses for the operands the adapter built ends the run in `[00] ERROR`; anything else
-that keeps the library from building or launching there ends it in `[00] SKIP`, with the type of the exception and
-nothing loaded.
+that cost. A call the library refuses for the operands the adapter built ends the run in `[00] ERROR`; whatever else
+keeps the library itself from importing, building or launching there ends it in `[00] SKIP`, with the type of the
+exception and nothing loaded. A fault of the adapter's own code is neither: it is raised as it is.
 
 On compute capability 12.x neither the gate entry nor the norm entry serves; both blocks then stay on their reference
 chains (`not yet (reference chain)`) in both stacks, and the census has no section for that class. The row of the
@@ -1949,7 +1967,9 @@ capability 10.x; its own page lists 10.3 and 10.7 as not run on a device. So doe
 entry, whose rows here claim every 10.x class as the entry does: on 10.3 and 10.7 the rows, the weight in the kernel's
 row order and the memory sentence of that plan are unverified. The rows of the projection entry for the
 out-projection of a verify step claim 10.3 and 10.7 as well, in the split the target runs there, and are as
-unverified: the entry's page lists that weight shape as not run on those classes. So has the build of the entries' kernels while a run is
+unverified: the entry's page lists that weight shape as not run on those classes. The three rows a library serves
+claim every 10.x class too and have run on 10.0 alone: on 10.3 and 10.7 the rows are unrun, the census has no section,
+and which kernel the library picks there for either multiply is not recorded. So has the build of the entries' kernels while a run is
 planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
 decline, not on such an installation.
@@ -1967,11 +1987,15 @@ On the reduced models the memory sentence is an estimate: its working memory is 
 miss it by a few tenths of a GiB in either direction, with the copies of the in-projections and of the gate / up
 weights, with both of their forms and with their codes alone. Over these runs on compute capability 10.0 (one to four
 layers, 1 to 33 sequences) PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said, and the
-device grew by about 0.2 GiB more than PyTorch reserved. The default `native` run, with the in-projections and the
+device grew by about 0.2 GiB more than PyTorch reserved. The default run on the cuDNN Frontend rows (`fe-entries`
+today; `native` selected the same rows until 2026-11-17), with the in-projections and the
 gate / up weights on their codes alone, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; the
 four-layer run asked for about 4.4 GiB, reserved 4.4 GiB and grew it by 4.6 GiB; the one-layer run asked for about
-3.1 GiB, reserved 2.6 GiB and grew it by 2.8 GiB; `--stack native --sequences 32,33`, which keeps both forms of the
-in-projections, asked for about 4.0 GiB, reserved 4.1 GiB and grew it by 4.2 GiB. The room a run takes beyond its
+3.1 GiB, reserved 2.6 GiB and grew it by 2.8 GiB; `--sequences 32,33` on those rows, which keeps both forms of the
+in-projections, asked for about 4.0 GiB, reserved 4.1 GiB and grew it by 4.2 GiB. The default run of `native` with
+its library rows, which keeps every multiplied weight on its codes alone, asked for about 3.2 GiB, reserved 2.7 GiB
+and grew the device by 2.9 GiB; its four-layer run asked for about 3.8 GiB, reserved 3.2 GiB and grew it by 3.4 GiB.
+The room a run takes beyond its
 weights does not follow the copies it leaves out: with every multiplied weight of the two-layer model on its stored
 format alone (a driver's own blocks, 1.5 GiB of copies not made) a run asked for about 3.2 GiB, reserved 2.7 GiB and
 grew the device by 2.9 GiB. So a GPU whose free memory is within half a GiB of the sentence can still fail to allocate
@@ -1980,8 +2004,10 @@ and the runs stayed inside the sentence (the section on checkpoints).
 Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step -- the
 sentence is short, on every stack: what a run holds per row beyond the state the
 sentence counts is not in its flat allowance. At 64 sequences the default stack asked for about 3.9 GiB, reserved
-6.6 GiB and grew the device by 6.8 GiB; `--stack native` asked for about 3.8 GiB, reserved 6.0 GiB and grew it by
-6.2 GiB; and `--stack native --sequences 64,65` asked for about 4.4 GiB, reserved 8.0 GiB and grew it by 8.2 GiB. A
+6.6 GiB and grew the device by 6.8 GiB; the cuDNN Frontend rows (`fe-entries` today) asked for about 3.8 GiB,
+reserved 6.0 GiB and grew it by 6.2 GiB, and with `--sequences 64,65` for about 4.4 GiB, reserved 8.0 GiB and grew it
+by 8.2 GiB; `--stack native --sequences 64,65` with its library rows asked for about 4.2 GiB, reserved 7.5 GiB and
+grew it by 7.6 GiB. A
 verify plan of 48 to 80 rows is short by 0.3 to 2.6 GiB (the section "The verify step" has the runs). At
 such a count a GPU needs several GiB more than the sentence says.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center

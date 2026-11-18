@@ -654,7 +654,15 @@ class QwenDense:
                     copied = dequantize(whole)
             if block in layouts:  # the provider multiplies on a layout of its own: the one stored form this load keeps
                 with stages.stage("lay out"):
-                    whole = layouts[block](whole)
+                    merged, whole = whole, layouts[block](whole)
+                    # a layout that states its way back to the checkpoint's order (``row_major``) is held to the bytes it was
+                    # made from, here: the reference's copy of such a weight is made through that way back, so no later
+                    # check of the run could tell a wrong layout from a right one
+                    if hasattr(whole, "row_major") and stored_checksum(whole.row_major()) != stored_checksum(merged):
+                        raise ValueError(
+                            f"the layout of the stored weight of {block}{'' if layer is None else f' (layer {layer})'} does not hold the bytes of the "
+                            f"checkpoint's tensor: {type(whole).__name__}, read back in the checkpoint's order, is another weight than the one it was made from"
+                        )
             if copied is None:  # every plan of the run multiplies this weight on its stored format: no copy is made
                 with stages.stage("checksum"):  # of the bytes the block multiplies on and the checks' reference is made from
                     bare = Dequantized(None, whole.scale, whole, stored_checksum(whole))

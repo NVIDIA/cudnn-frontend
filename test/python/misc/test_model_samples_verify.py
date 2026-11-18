@@ -850,6 +850,8 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
             f"kernel identity, as planned: {reached}; not yet: {not_yet}; 1 declared stand-in (not yet: output_head.quantize)",
         ]
         assert claim.name == "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)" and claim.of("linear_attention.step") == "target"
+        if not vocab:  # the published model: the line of the family README's verify section is the plan's own
+            assert claim.coverage()[1] in (MODELS / "qwen_dense" / "README.md").read_text(), "the coverage line of a verify plan of native"
         # the out-projection: the target's kernel at both call sites -- the FP8 projection entry at the linear-attention layers'
         # call, the library's 8-bit multiply at the attention layers' (its kernel the library's choice: held by membership)
         assert claim.of("projection.fp8.out") == "target"
