@@ -18,10 +18,14 @@ import contextlib
 import functools
 import importlib
 import itertools
+import json
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -3622,6 +3626,62 @@ def test_bwd_same_graph_two_streams(backend, variant, dtype):
             for label, baseline, grads in (("A", baseline_a, grads_a), ("B", baseline_b, grads_b)):
                 for name, want, got in zip(LEAF_NAMES[variant], baseline, grads):
                     assert_bitwise(f"stream {label} d{name} repeat {repeat}", got, want)
+
+
+# ---------------------------------------------------------------------------
+# Compiled cache: a training step in a fresh process
+# ---------------------------------------------------------------------------
+
+RELOAD_CHILD = r"""
+import json, sys
+from pathlib import Path
+import torch, cudnn
+from linear_attention.test_la import make_case, op, op_tail, random_state, summary_bwd_inputs, thd_tensors
+variant, phase, result_path, expected_module = sys.argv[1:]
+assert Path(cudnn.__file__).resolve() == Path(expected_module).resolve(), cudnn.__file__
+case = make_case(variant, torch.bfloat16, seq_lens=[128, 64], H=4)
+d_o, _, d_final = summary_bwd_inputs(case)
+seed = random_state(case).requires_grad_(True)
+leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
+o, fs = op(variant)(*leaves, *op_tail(case), initial_state=seed, output_final_state=True, plan_name=f"{variant}_frost")
+sums = [o.double().sum().item(), fs.double().sum().item()]
+if phase != "forward":
+    sums += [g.double().sum().item() for g in torch.autograd.grad([o, fs], leaves + [seed], [d_o, d_final])]
+Path(result_path).write_text(json.dumps(sums))
+"""
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_training_step_reloads_in_a_fresh_process(backend, variant, tmp_path):
+    """The backward of a training step stores its compiled hosts in the on-disk cache, and a fresh process runs the same step
+    from them: it leaves the cache directory as it found it and returns the same o, final_state and gradients."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    cache = tmp_path / "cache"
+    env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(cache), CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0")
+    env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
+    module_path = Path(cudnn.__file__).resolve()
+    env["PYTHONPATH"] = os.pathsep.join([str(module_path.parent.parent), str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH", "")])
+    results, listings = [], []
+    for phase in ("forward", "cold", "warm"):
+        path = tmp_path / f"{phase}.json"
+        process = subprocess.run(
+            [sys.executable, "-c", RELOAD_CHILD, variant, phase, str(path), str(module_path)],
+            env=env,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert process.returncode == 0, process.stdout[-4000:] + process.stderr[-6000:]
+        results.append(json.loads(path.read_text()))
+        listings.append(sorted((str(p.relative_to(cache)), p.stat().st_size, p.stat().st_mtime_ns) for p in cache.rglob("*") if p.is_file()))
+    objects = [{name for name, _, _ in listing if name.endswith("kernel.o")} for listing in listings]
+    assert objects[1] > objects[0], "the backward stored no compiled kernel object (kernel.o) in the cache directory"
+    assert listings[2] == listings[1], "the warm process rewrote or added cache artifacts instead of reusing them"
+    assert results[2] == results[1], "the warm process computed different outputs from the cached artifacts"
 
 
 # ---------------------------------------------------------------------------
@@ -8538,6 +8598,24 @@ def test_one_long_cut_on_device(backend, variant, shape, checkpoints):
         assert_bitwise(f"d{name}", g, grads_inv[name])
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_one_long_piece_counts_one_after_the_other(backend, variant):
+    """Two batches above the SM count, one long sequence among short ones, whose device chains differ in piece count, run one
+    after the other: o, final_state and every gradient of each are bitwise its ``batch_invariant`` run."""
+    heads, B, _, _ = over_sm_shape()
+    for long in (32768, 65536):
+        case = long_case(variant, [long] + [64] * (B - 1), H=heads, HK=heads, HV=heads)
+        state0, d_final, dO = bwd_inputs(case)
+        kw = dict(initial_state=state0, d_final_state=d_final, dO=dO)
+        o, fs, grads, _, _ = long_grads(backend, case, **kw)
+        o_inv, fs_inv, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, **kw)
+        assert_bitwise("o", o, o_inv)
+        assert_bitwise("final_state", fs, fs_inv)
+        for name, g in grads.items():
+            assert_bitwise(f"d{name}", g, grads_inv[name])
+
+
 def prepared_kda_graph(inputs, phase, safe_gate, handle):
     """``(execute, outputs, storage, size)`` of one pinned batch_invariant KDA graph over ``inputs`` with all storage built before
     any capture; ``storage`` carries a canary after the exact workspace extent ``size``."""
@@ -8703,7 +8781,7 @@ def test_ragged_pieces_cap():
     assert ragged_pieces(heads_out=32, num_sm=152, total_tokens=1 << 20) == 4
     assert ragged_pieces(heads_out=50, num_sm=152, total_tokens=1 << 20) == 3
     assert ragged_pieces(heads_out=64, num_sm=152, total_tokens=1 << 20) == 0
-    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=3 * 8192) == 3
+    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=3 * 8192) == 9
     assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=2 * 8192) == 0
 
 

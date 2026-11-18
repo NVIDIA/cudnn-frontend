@@ -34,6 +34,7 @@ from cutlass.cute.runtime import from_dlpack
 import cutlass.experimental.cuda.tensor_map as tma
 from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common import expand, gate_bwd, head_reduce, l2norm, split_k
@@ -1551,7 +1552,7 @@ def build_warmup_backward(
             from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
             for buffer in post_buffers
         ]
-        warmup_backward_cache[key] = cute.compile(
+        warmup_backward_cache[key] = compile_cached(
             warmup_backward_host,
             facts.split,
             facts.b_t,
@@ -1650,6 +1651,8 @@ def build_warmup_backward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_warmup_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return warmup_backward_cache[key], facts
@@ -2367,7 +2370,7 @@ def build_warmup_summary_backward(
                     leading_dim=3
                 ),
             ]
-        warmup_summary_backward_cache[key] = cute.compile(
+        warmup_summary_backward_cache[key] = compile_cached(
             warmup_summary_backward_host,
             facts.split,
             facts.b_t,
@@ -2439,6 +2442,8 @@ def build_warmup_summary_backward(
             ),
             *tail_constexprs,
             *tail_placeholders,
+            cache_key=repr((__name__, "summary", key)),
+            symbol="frost_la_gdn_warmup_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return warmup_summary_backward_cache[key], facts

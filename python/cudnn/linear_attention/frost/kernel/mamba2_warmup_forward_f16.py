@@ -30,6 +30,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 
 from ..common import split_k
 from ..common.host import get_dtype
@@ -671,7 +672,7 @@ def build_warmup_forward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        warmup_forward_cache[key] = cute.compile(
+        warmup_forward_cache[key] = compile_cached(
             warmup_forward_host,
             facts.split,
             facts.b_t,
@@ -730,6 +731,8 @@ def build_warmup_forward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_forward_cache[key]
@@ -1188,7 +1191,7 @@ def build_recompute(
                 from_dlpack(buffers["seed"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["seed"] is not None else None,
                 from_dlpack(buffers["final_state"], assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        recompute_cache[key] = cute.compile(
+        recompute_cache[key] = compile_cached(
             recompute_host,
             facts.split,
             facts.b_t,
@@ -1238,6 +1241,8 @@ def build_recompute(
             from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
             *tail_constexprs,
             *tail_placeholders,
+            cache_key=repr((__name__, "recompute", key)),
+            symbol="frost_la_mamba2_recompute_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = recompute_cache[key]

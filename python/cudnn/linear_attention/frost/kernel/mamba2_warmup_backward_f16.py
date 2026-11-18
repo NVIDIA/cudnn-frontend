@@ -32,6 +32,7 @@ from cutlass.cute.runtime import from_dlpack
 
 import cutlass.experimental.cuda.tensor_map as tma
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common import gate_bwd, head_reduce, split_k
@@ -862,7 +863,7 @@ def build_warmup_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        warmup_backward_cache[key] = cute.compile(
+        warmup_backward_cache[key] = compile_cached(
             warmup_backward_host,
             facts.split,
             facts.b_t,
@@ -926,6 +927,8 @@ def build_warmup_backward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_warmup_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_backward_cache[key]
@@ -2035,7 +2038,7 @@ def build_regenerate_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        regenerate_backward_cache[key] = cute.compile(
+        regenerate_backward_cache[key] = compile_cached(
             regenerate_backward_host,
             facts.split,
             facts.b_t,
@@ -2110,6 +2113,8 @@ def build_regenerate_backward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, "regenerate", key)),
+            symbol="frost_la_mamba2_regenerate_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return regenerate_backward_cache[key], facts
@@ -2467,7 +2472,7 @@ def build_summary_backward(
                 from_dlpack(buffers["dstate_in"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["dstate_in"] is not None else None,
                 from_dlpack(buffers["dstate0"], assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        summary_backward_cache[key] = cute.compile(
+        summary_backward_cache[key] = compile_cached(
             summary_backward_host,
             int(b_t),
             io_dtype,
@@ -2492,6 +2497,8 @@ def build_summary_backward(
             from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
             *tail_constexprs,
             *tail_placeholders,
+            cache_key=repr((__name__, "summary", key)),
+            symbol="frost_la_mamba2_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return summary_backward_cache[key]
