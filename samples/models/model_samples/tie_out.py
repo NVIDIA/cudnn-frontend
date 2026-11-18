@@ -369,6 +369,7 @@ class BlockTap:
         self.rows: Dict[str, object] = {}  # the provider row behind every entry of ``stats``
         self.blocks: Dict[str, object] = {}  # and the block: for a block several rows serve, the part of that call site
         self.step = 0  # set by the checked pass before every step
+        self.calls = 0  # the block calls this tap was handed: none where no step of its plan ran under the check
 
     def _part(self, name, block, operands) -> tuple:
         """``(label, row, block)`` of what serves this call: the block and its row, or -- for a block whose calls several
@@ -403,6 +404,7 @@ class BlockTap:
         return (slice(sequence * tokens, (sequence + 1) * tokens),) * len(_tensors(holder))
 
     def __call__(self, name, layer, block, operands):
+        self.calls += 1
         label, row, block = self._part(name, block, operands)
         ref = block.twin(self.reference[name])  # the reference block, or the block's own twin
         independent = type(ref) is not type(block)
@@ -729,7 +731,7 @@ def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
 def _block_lines(tap: BlockTap, precision: str, what: str = "") -> Tuple[bool, int, List[str]]:
     """The ``blocks`` line of a checked pass and one line per judged block: ``(held, provider blocks judged, lines)``.
     ``what`` names the kind of step where a run has two (``"the prompt's decode steps: "``)."""
-    if what and not tap.stats:  # a run of two kinds of step, and no step of this kind ran under the check: nothing was judged
+    if what and not tap.calls:  # a run of two kinds of step, and no step of this kind ran under the check: nothing was judged
         return True, 0, [f"  blocks            {what}no step of this kind was judged    REPORTED"]
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
@@ -751,7 +753,7 @@ def _block_lines(tap: BlockTap, precision: str, what: str = "") -> Tuple[bool, i
 def _batch_lines(tap: BlockTap, sequences: int, facts, what: str = "") -> Tuple[bool, List[str]]:
     """The ``batch invariance`` line of a checked pass of several sequences, and what an entry states beside it: ``(held,
     lines)``.  ``what`` names the kind of step where a run has two."""
-    if what and not tap.stats:  # as for the blocks: no step of this kind ran under the check
+    if what and not tap.calls:  # as for the blocks: no step of this kind ran under the check
         return True, [f"  batch invariance  {what}no step of this kind was judged    REPORTED"]
     cls = f"cc{facts.cc[0]}.{facts.cc[1]}"
     batch_ok, differs, gated = True, [], []

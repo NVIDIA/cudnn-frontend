@@ -2083,9 +2083,12 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
         f"tokens kept behind the first: {kept}; behind a prompt of 5 decode steps)"
     ), own.text()
     assert own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS")
-    assert [line.split("steps: ")[0] for line in own.lines if line.startswith("  blocks ")] == [
-        "  blocks            the prompt's decode ",
-        "  blocks            the verify ",
+    # the reference stack: steps of both kinds ran under the check and none of their blocks is a provider's -- which is not
+    # the sentence of a kind of step of which no step was judged
+    chain = "no provider block to judge: every block of this run is the reference chain itself    REPORTED"
+    assert [line for line in own.lines if line.startswith("  blocks ")] == [
+        f"  blocks            the prompt's decode steps: {chain}",
+        f"  blocks            the verify steps: {chain}",
     ]
     total = sequences * (5 + tokens * len(scheduled))  # the reference stack runs the prompt's decode steps and the verify steps
     assert f"{total} of {total} greedy tokens equal to the reference stack's" in own.text()
@@ -2116,6 +2119,7 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
     none = tie_out.run_checks(session, prompt_tokens=5, max_prompt_steps=0)
     assert none.ok and none.lines[0].endswith("; behind a prompt of 5 decode steps, the first 0 of them judged)")
     assert "  blocks            the prompt's decode steps: no step of this kind was judged    REPORTED" in none.lines
+    assert f"  blocks            the verify steps: {chain}" in none.lines
     assert ("  batch invariance  the prompt's decode steps: no step of this kind was judged    REPORTED" in none.lines) == (sequences > 1)
     # the replay holds the prompt's recorded steps too: a recorded logit that is not what a second run gives fails it
     _scheduled_loop(session, prompts, stream, new)
