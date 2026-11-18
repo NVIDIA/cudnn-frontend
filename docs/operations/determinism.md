@@ -784,6 +784,22 @@ and synccheck coverage, including separate multi-tile THD cases. This evidence
 does not establish SM121 or cross-runtime bit identity, independent physical
 THD origins for quantized inputs, or backward behavior.
 
+## Shared THD backward fold
+
+The shared physical-origin dK/dV fold preserves fixed-order FP32 group sums
+when a large batch or KV-head count requires a flat launch grid. Direct
+helper checks cover FP16/BF16 outputs from FP32 or matching half partials on
+SM80, SM89, SM90 and SM100, including empty sequences, unequal dK/dV widths,
+independent output origins, fresh bindings and changed-input capture replay.
+Bounded physical grids and Int64 live-work iteration also cover logical work
+above the CUDA grid.x limit and 2^32, including the final live sequence/head.
+These checks exercise runtime maximum sequence lengths and retain fixed-order
+FP32 accumulation.
+SM100 also has ordinary-shape D128 single/two-CTA and D512 THD caller checks.
+This evidence does not upgrade the full SDPA API rows, establish an SM89
+attention API, or qualify complete attention chains at the new boundary.
+Native SM103, SM107 and SM120 execution remains unverified for these
+new helper cases. See the [qualification record](../../test/python/determinism_goldens/README.md#shared-thd-backward-fold-grid-boundaries-2026-11-16).
 ## SM89 half backward
 
 On SM89 (Ada), `sdpa_bwd_sm89` runs the SM80 FP16/BF16 backward chain and

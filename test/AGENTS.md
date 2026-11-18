@@ -63,6 +63,14 @@ Torch's capture entry may synchronize before capture begins; guarding that
 entry tests Torch's setup rather than the executor. Restore the previous mode
 before leaving capture, including on exceptions.
 
+A shared auxiliary kernel needs both direct boundary tests and caller checks.
+THD fold inputs can be FP32 or half partials, independently of the output
+precision. Preserve each output's physical origin when testing batch
+reordering, and test the full output allocation to detect writes into gaps.
+`test_sdpa_bwd_thd_fold_grid_determinism.py` covers these contracts at B/Hkv
+65535 and 65536. Its compile test retains a runtime max length: specializing
+batch must not accidentally specialize callers' runtime length arguments.
+
 Moving a kernel requires checking dynamic fixture paths as well as full-path
 imports. The D256 implementation contract's `test_dynamic_kernel_fixture_paths_exist`
 checks the actual paged-kernel and service-register-release case providers;
@@ -581,6 +589,7 @@ A check on an earlier launch alone does not validate the actual cold baseline.
 - **Paged overrides retain the producer's storage bound.** Validate each pool's effective TMA byte strides and observed span, and page-table element alignment, before launch. A larger override does not enlarge the allocation. Use host-only malformed-fact probes instead of launching an invalid tensor; `test_sdpa_paged_binding.py` covers short pools, misaligned strides/tables, and valid wide-stride or unknown-span bindings.
 - **Wide host strides must stay wide through device setup arguments.** An Int64 pointer host can still truncate a stride while launching a descriptor-setup kernel. Check casts at the launch site and the setup parameter, not just the host signature. Exercise two live sequences with a physical row stride above `2**32` and poisoned output; a singleton-axis or binder-only probe never steps the truncated address. `test_thd_output_row_stride_above_int32_reaches_device_descriptors` checks numerical output and replay. Cover every served arch/flavor: a pre-Rubin-only marker hid narrowing in all four SM107 half hosts. `test_mhas_v2.py::test_sdpa_thd_output_stride_int64` is collected by both CI arch selections and checks native and Python binding independently, including D192/D128.
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
+- **Compiled PTX entries are not runtime launch counts.** A host function can select between two compile-time specializations of one kernel at runtime, with both entries present in one artifact but only one launched. Per-function rendering hashes must retain every allowed specialization; still reject duplicate full symbols and unexpected variants. Keep a launch-counter test for execution count instead of inferring it from PTX entry count.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 - **A standalone FROST adapter is compiled at plan time, so every test driver calls `compile()` before `execute()`.** The sparse d256 adapter refuses to compile on the execute path (plan-time keys only), and the helpers that still relied on an execute-time compile failed every GPU cell of two modules while the host tier, where those cells skip, stayed green — so a change to an adapter's execute contract re-runs the GPU tier of every suite that drives it, and the detector is an `.execute(` with no preceding `.compile(` in the same driver (`sdpa/frost/test_sdpa_fwd_sparse_sm107.py`, `sdpa/frost/sparse_item_sequences.py`).
 
@@ -1683,6 +1692,16 @@ unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
 
+
+A flattened CUDA launch must account for every runtime work factor before
+narrowing dimensions. For ragged work, bound the physical grid and iterate
+Int64 owners/live vectors instead of scanning the declared maximum for every
+empty sequence. Keep live canaries past grid.x's limit and past 2^32; a wrapped
+launch can succeed while leaving outputs unwritten. The THD-fold complete-grid
+regression keeps the maximum sequence length as a runtime argument. Compile
+these Int64 loop forms on the installed compiler as well as newer targets.
+An architecture enum alone does not prove compiler support: skip only its
+explicit unsupported-target diagnostic and preserve other compile errors.
 
 ### Backend workspace capacity
 

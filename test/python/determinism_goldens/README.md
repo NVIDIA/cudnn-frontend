@@ -7867,6 +7867,111 @@ batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
 
 
+## Shared THD backward fold grid boundaries (2026-11-16)
+
+The direct `dkv_reduce_thd_origins_host` regression covers FP16 and BF16 outputs
+from FP32 or matching half partials, MHA and GQA=3, and Dk/Dv=64/128 and 128/64.
+It checks batch and KV-head counts 65535/65536, a live second block, empty
+sequences, independent physical output origins, and the complete output
+allocations including gap canaries. An independent FP64 sum of exactly
+representable values checks every live gradient. Eight repeats include concurrent
+GPU work. Fresh storage, singleton/reordered/duplicated sequences, changed
+neighbors, and changed-input CUDA Graph replay preserve the expected bytes.
+All input partials and metadata are checked for unintended mutation.
+
+The base reducer at `b837a4eae4f4` produces **24 failed / 16 passed** on A100
+with small golden cases deselected: all failures are `CUDA_LAUNCH_INVALID_CONFIG`
+above grid.y/z limits; the legal edge controls pass. The fix retains ordinary
+three-dimensional grids and each row's reduction order. Only overflowing batch
+or head dimensions use a flat grid. The maximum sequence length stays a runtime
+host argument. D128 single/two-CTA callers pass their existing compile-time
+batch fact without first converting it into a runtime scalar.
+
+Qualification uses Torch 2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 and
+CUDA compiler 13.4, with the isolated source import verified:
+
+| Device | Direct helper | Other checks |
+| --- | --- | --- |
+| A100 / SM80 | 48 passed | None |
+| L40S / SM89 | 48 passed | 15 host/cross-compilation checks passed |
+| P2021 / SM100 | 48 passed | 2 existing D128 single/two-CTA numerical comparisons and 9 D512 THD graph/standalone cases passed |
+
+The SM100 command also deselects 14 existing L1 cases; these are not coverage.
+The two D128 cases compare both native half partials and FP32 accumulation
+against the existing reference. The D512 checks include independent origins,
+rebinding, changed-input replay and deterministic repeatability at ordinary
+shapes. The 15 non-native checks comprise one launch-bound test and half/FP32
+partial cross-compilation for SM80/89/90/100/103/107/120, retaining a runtime
+maximum length. They do not establish numerical behavior on absent GPUs.
+
+Twenty-four new small golden records (eight per measured GPU) were recorded
+only after the reference and replay checks, inspected, and checked with recording
+disabled. No previous golden was replaced. The eight output pairs match across
+these three measured runtimes; this is not a cross-runtime compatibility promise.
+
+Reproduction, after installing this checkout and verifying `cudnn.__file__`:
+
+```bash
+cd test/python
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest -o addopts= -m L0 \
+  sdpa/frost/test_sdpa_bwd_thd_fold_grid_determinism.py \
+  sdpa/frost/test_sdpa_bwd_thd_fold_grid_contract.py
+# On SM100, additionally run the caller integration cases:
+pytest -o addopts= -m L0 \
+  sdpa/frost/test_sdpa_bwd_d128_dkv_accum_sm100.py::test_dkv_accum_fp32_dq_bitwise_vs_default_on_one_kv_block_and_dk_dv_recorded \
+  sdpa/frost/test_sdpa_bwd_thd_origins_sm100.py::test_origins_rebind_and_replay \
+  sdpa/frost/test_sdpa_bwd_thd_origins_sm100.py::test_graph_deterministic_origins_repeat_bitwise \
+  sdpa/frost/test_sdpa_bwd_thd_origins_sm100.py::test_graph_independent_origins_2x2
+```
+
+This helper has no forward or FP8-output contract. Forward kernels and the
+other backward reducers are not changed. SM90/103/107/120 native execution,
+complete attention chains at B/H=65536, and metadata addressing at billion-entry
+batch sizes remain unverified. No FROST capability or full-API determinism row
+is widened by this helper qualification. Other main/auxiliary launch chains
+and the native backend remain within the open #1573 audit.
+
+
+### Full-product correction after independent review
+
+The initial flattened revision (`756febfd5942`) bounded B*H but omitted the
+runtime tile factor. On H100, the new compact-allocation regression at B=65536,
+Hkv=32, Dk/Dv=512/256 and max_skv=8193 is **1 failed**: the launch and sync
+succeed, but live gradients retain 123 instead of 1. This original numerical
+failure is distinct from the earlier explicit invalid-grid failures.
+
+The correction bounds each physical grid.x to 65535 and traverses owners and
+live vectors with Int64 indices. Empty sequences do not scan the declared
+max_skv tile range. Ordinary layouts retain their batch/head axes and stride
+through local vectors; reduction order and output conversion are unchanged.
+The existing B*H admission bound remains. Eight added native cases cover
+logical work above 2^31-1, above 2^32, a 2097184-token sequence, and ordinary
+grid-stride tails, with both output dtypes, independent origins and changed
+input capture replay. The helper's max_skv is now runtime in the native test
+wrapper as well as offline compilation.
+
+On the frozen correction, Torch2.14.1/cuDNN9.28.0.38/DSL4.8/compiler12.9:
+
+| Device | Full helper + host suite | Follow-up |
+| --- | --- | --- |
+| A100 SM80 | 69 passed, 2 compiler-target skips | Existing 8 small goldens match |
+| L40S SM89 | 69 passed, 2 compiler-target skips | Existing 8 small goldens match |
+| H100 NVL SM90 | 61 passed, 10 skips | 8 missing small goldens added; 8 strict checks passed |
+| SM100, 148 SMs | 61 passed, 10 skips | 8 missing small goldens added; 8 strict checks passed |
+
+The two remaining skips are the installed CUDA12.9 compiler's explicit
+unsupported-SM107 diagnostic. All other compiler errors still fail the test.
+Sixteen new runtime records were first written to a separate directory; their
+input and output hashes match every existing corresponding three-device record.
+No golden was overwritten, and recording was disabled for strict rechecks.
+These results are direct-helper qualification, including all eight new extreme
+cases on each GPU; they do not qualify complete attention at those dimensions.
+On the same frozen production source, DSL4.8/compiler13.4 compiles all seven
+architecture/precision pairs (15 host/offline checks passed). The actual SM100
+D128 single/two-CTA and D512 THD caller packet passes 11 L0 cases; 14 L1 cases
+are deselected. Pre-commit passes and Fern check reports zero errors.
+
+
 ### SM100/SM103 FP8 swap-AB wide output addressing — 2026-11-16
 
 The D128 body now widens all coordinates before an Array row slice accumulates
