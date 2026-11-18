@@ -110,6 +110,9 @@ navigation:
           - page: NVFP4 block-scale conversion
             path: ../../operations/block_scaling/nvfp4_block_scale_conversion.md
             slug: nvfp4_block_scale_conversion
+          - page: FP4 Row Quantization Decode Step (SM100-class)
+            path: ../../operations/block_scaling/row_quantize_fp4_decode.md
+            slug: row_quantize_fp4_decode
       - section: Causal Conv1d
         path: ../../operations/CausalConv1d.md
         slug: operations/CausalConv1d
