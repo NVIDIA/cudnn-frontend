@@ -505,7 +505,8 @@ assert _WIDE_COMM_TILE_SHAPE in COMM_TILE_SHAPES
 def comm_tile_shape(hidden_size: int, requested=None) -> CommTileShape:
     """The communication tile shape of the BF16 megakernels for a routed hidden size: one of the contract's
     COMM_TILE_SHAPES, the compile-time parameter of the communication CTAs of the forward and the backward
-    megakernel and an entry of their executor keys.  Every hidden size takes the default, 32 x 512.
+    megakernel and an entry of their executor keys.  ``requested`` None (the hosts' own default) takes 32 x 512 for
+    every hidden size; ``CuteMoKConfig`` defaults to ``"auto"``.
 
     ``requested`` (``CuteMoKConfig.comm_tile_shape``, the ``comm_tile_shape`` keyword of ``forward_bf16`` /
     ``backward_bf16``): a CommTileShape or its (rows, columns), returned as the contract's CommTileShape; None

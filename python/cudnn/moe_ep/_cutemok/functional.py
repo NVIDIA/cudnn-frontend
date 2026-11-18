@@ -70,11 +70,10 @@ class CuteMoKConfig:
     outputs; tune it per model.
 
     ``comm_tile_shape`` (BF16 forward and backward only, a compiled variant): rows x columns of one
-    communication tile, ``(32, 512)`` (default) or ``(16, 1024)`` (a tuple or the contract's
-    ``CommTileShape``), or ``"auto"``: 16 x 1024 when the routed hidden size is a multiple of 1024,
-    otherwise 32 x 512 (chosen from the hidden size alone, a model parameter).  A communication warp moves one
-    32 KiB tile at a time; each row is one TMA bulk copy of ``columns * 2`` bytes: 1 KiB at 32 x 512, 2 KiB at
-    16 x 1024.
+    communication tile, ``"auto"`` (default): 16 x 1024 when the routed hidden size is a multiple of 1024,
+    otherwise 32 x 512 (chosen from the hidden size alone, a model parameter); or ``(32, 512)`` or
+    ``(16, 1024)`` (a tuple or the contract's ``CommTileShape``).  A communication warp moves one 32 KiB tile at a
+    time; each row is one TMA bulk copy of ``columns * 2`` bytes: 1 KiB at 32 x 512, 2 KiB at 16 x 1024.
     It changes only how the communication CTAs move bytes; the results are bit-identical.  Part of the
     executor cache key; MXFP8 routed weights (their stream has its own fixed tile) take 32 x 512 under
     ``"auto"`` and refuse any other value.
@@ -91,7 +90,7 @@ class CuteMoKConfig:
     gate_up_context: str = "mxfp8"
     epilogue_combine: bool = False
     bwd_recompute_num_comm_sms: int | None = None
-    comm_tile_shape: tuple[int, int] | str = (32, 512)
+    comm_tile_shape: tuple[int, int] | str = "auto"
 
     def __post_init__(self) -> None:
         # A config built from JSON passes a list: keep the frozen config hashable.
@@ -134,7 +133,7 @@ def _require_default_comm_tile_shape(workspace, config: CuteMoKConfig) -> None:
     if config.comm_tile_shape == "auto":
         return
     if _comm_tile_shape(workspace, config) != comm_tile_shape(workspace.routed_hidden_size):
-        raise ValueError("comm_tile_shape is an option of the BF16 megakernels; MXFP8 routed weights " "take the default (32, 512)")
+        raise ValueError("comm_tile_shape is an option of the BF16 megakernels; MXFP8 routed weights " 'take "auto" (the default) or (32, 512)')
 
 
 def _routed_hidden_differs(workspace) -> bool:
