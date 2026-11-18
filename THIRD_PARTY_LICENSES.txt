@@ -396,3 +396,24 @@ FlashInfer's NOTICE:
     Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
 
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+13. vLLM (vllm-project/vllm)
+    https://github.com/vllm-project/vllm
+
+The attention preparation kernel for decode rows in
+python/cudnn/attention_prepare/frost/kernel/prepare_decode_f16.py follows the
+thread shape and the arithmetic of vLLM's fused QK-RMSNorm + partial RoPE +
+gate copy kernel (_fused_qk_rmsnorm_rope_gate_kernel in
+vllm/model_executor/layers/fused_qk_norm_rope.py), pinned to commit
+2a777ce26e8315fa503ac5e88b595235d1c2b928. vLLM distributes the source file
+under Apache License 2.0 (Copyright contributors to the vLLM project); the
+derived file names the source and its licence in its header. The port is
+written on the CuTe DSL (the source is a Triton kernel), makes the geometry,
+the epsilon, the position form, the page size and the integer dtypes
+compile-time constants, loads a thread's elements once, reads the rotary
+partner from another lane of the warp, writes the keys and values into paged
+pools at a slot with the store predicated by the pool's capacity, and adds the
+host entry with its typed declines and launch arms.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
