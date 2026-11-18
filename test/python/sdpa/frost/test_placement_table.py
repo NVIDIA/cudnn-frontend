@@ -552,7 +552,8 @@ def test_sm80_thd_q_paged_verify_keys_the_unpacked_regime(s_kv):
 @pytest.mark.parametrize("s_kv", [65536, 65537], ids=["on_tile", "off_tile"])
 def test_sm80_generation_gaps_follow_their_study(s_kv):
     """Study sm80_gen_gaps_20261117 (A100, padded Q): paged d64 (muse_spark), windowed d64 / d128 and d192 x 192 (step5) MTP and verify
-    lead (the backend ran them 1.2-5.1x behind); windowed d64 single-row decode has no entry; THD-Q verify keeps its own class."""
+    lead (the backend ran them 1.2-5.1x behind); windowed d64 single-row decode follows sm80_paged_window_decode_pcie_20261118; THD-Q
+    verify keeps its own class."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_gen_gaps_20261117"
 
@@ -575,9 +576,38 @@ def test_sm80_generation_gaps_follow_their_study(s_kv):
         expected = "sm80_paged_d64_ontile_pcie_20261118" if on_tile_d64_sink else study
         assert pt.matched_entry(row, f(**over)).study == expected, over
         assert pt.lookup(row, f(**over)) is True, over
-    assert pt.matched_entry(row, f(s_q=1, window_left=2047)) is None
+    assert pt.matched_entry(row, f(s_q=1, window_left=2047)).study == "sm80_paged_window_decode_pcie_20261118"
     thd = f(s_q=8, thd=True, max_total_seq_len_q=32)
     assert pt.class_key(row, thd)[8] == "gqa_unpacked" and pt.matched_entry(row, thd).study != study
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_paged_window_decode_follows_the_pcie_study(s_kv):
+    """sm80_paged_window_decode_pcie_20261118 (A100 80GB PCIe, padded Q, no sink): d128 windowed MTP leads at every S_q on the tile
+    (step37 / ripple S_q 4 ran the backend at 1.3-3.9x); single-row windowed decode leads up to 2^5.5 parallel tiles for d128 and
+    2^7.5 tiles (on the tile) / 2^10.661 query rows (off it) for d64. Larger batches keep the backend."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_paged_window_decode_pcie_20261118"
+    on_tile = s_kv % 128 == 0
+
+    def f(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=1, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=(8, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == study
+    assert pt.lookup(row, f()) is True  # 2^3 tiles
+    assert pt.lookup(row, f(b=128, h_q=16, h_kv=2)) is False  # 2^8 tiles
+    if on_tile:
+        assert pt.lookup(row, f(s_q=4, b=128, h_q=16, h_kv=2)) is True
+        assert pt.matched_entry(row, f(s_q=4)).study == study
+    else:
+        assert pt.matched_entry(row, f(s_q=4)).study == "sm80_gen_gaps_20261117"
+    d64 = dict(d_qk=64, d_v=64, h_q=16, h_kv=2, window_left=2047)
+    assert pt.lookup(row, f(**d64)) is True
+    assert pt.lookup(row, f(**dict(d64, b=128, h_q=128, h_kv=16))) is False
 
 
 @pytest.mark.L0

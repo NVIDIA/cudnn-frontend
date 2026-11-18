@@ -1057,8 +1057,26 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
     # on and off the tile, windows 512-2048 keys; 660 train cells; the backend ran them 1.2-5.1x behind). Holdout at fresh heads, scored
-    # once: 0.21-0.53 geomean of changed cells (worst 0.932). d64 windowed single-row failed (1.381): no entry. d512 is #2636's.
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False): Entry("le", 1.792, "sm80_gen_gaps_20261117", "q"),
+    # once: 0.21-0.53 geomean of changed cells (worst 0.932). d64 windowed single-row failed (1.381) there. d512 is #2636's.
+    # study sm80_paged_window_decode_pcie_20261118 (A100 80GB PCIe 300 W; padded-Q paged window decode without a sink, the gaps study's
+    # cells re-timed plus d128 single-row): d128 MTP on the tile leads at every S_q (holdout 0.366); single-row decode leads up to 2^5.5
+    # parallel tiles (d128, 0.590 / 0.644) and, for d64, up to 2^7.5 tiles on the tile and 2^10.661 query rows off it (0.738 / 0.545).
+    # Past them the two run close (FROST 0.82-1.35 of the backend), so the backend keeps them.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm80_paged_window_decode_pcie_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 5.5, "sm80_paged_window_decode_pcie_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 5.5, "sm80_paged_window_decode_pcie_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 7.5, "sm80_paged_window_decode_pcie_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 10.661, "sm80_paged_window_decode_pcie_20261118", "rows"
+    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 0.5, "sm80_gen_gaps_20261117", "tiles"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry("ge", 22.292, "sm80_gen_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
