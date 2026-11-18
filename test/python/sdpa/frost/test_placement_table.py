@@ -1283,7 +1283,8 @@ def test_sm107_paged_wide_head_verify_entries_lead(d, heads, s_qs):
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
 def test_sm100_paged_d192_prefill_entries_follow_the_study(device_cc):
     """Study sm100_prefill_d192_gaps_20261118 (B200, B300 transfer): paged THD d192 x 192 context (step5) leads with the full cache and
-    with a window, on and off the tile, on cc 10.0 and 10.3. The mimo d192 x 128 classes failed their holdout and have no entry."""
+    with a window, on and off the tile, on cc 10.0 and 10.3. The mimo d192 x 128 classes failed their holdout there; paged d192 x 128
+    now has its own study (sm100_d192x128_paged_v2_20261118)."""
     row = "sdpa_fwd_prefill_sm100"
 
     def paged(**over):
@@ -1295,7 +1296,7 @@ def test_sm100_paged_d192_prefill_entries_follow_the_study(device_cc):
     for over in (dict(), dict(s_q=512, s_kv=131072), dict(s_q=512, s_kv=131073), dict(window_left=511), dict(window_left=511, s_kv=131073, s_q=2048)):
         assert pt.lookup(row, paged(**over)) is True, over
         assert pt.matched_entry(row, paged(**over)).study == "sm100_prefill_d192_gaps_20261118"
-    assert pt.lookup(row, paged(d_v=128)) is None  # mimo d192 x 128: no entry
+    assert pt.matched_entry(row, paged(d_v=128)).study == "sm100_d192x128_paged_v2_20261118"  # mimo d192 x 128: its own v2 study
     assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
 
 
@@ -1363,6 +1364,36 @@ def test_sm100_dense_d192x128_window_sink_prefill_entries_follow_the_study(devic
     for over in (dict(h_q=16, h_kv=1, s_q=8, s_kv=131072, b=128), dict(h_q=48, s_q=255)):  # below the measured S_q: the hand rules
         assert pt.class_key(row, dense(**over))[8] == "gqa_short", over
         assert pt.lookup(row, dense(**over)) is None, over
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_sm100_paged_d192x128_context_entries_follow_the_study(device_cc):
+    """Study sm100_d192x128_paged_v2_20261118: mimo full paged d192 x 128 context (THD Q) leads on the tile from S_q ~887 at enough
+    work, off the tile from S_q ~362; graphs below S_q 256 (spec-decode verify included) key `gqa_short` and keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def paged(**over):
+        base = dict(b=1, h_q=64, h_kv=4, s_q=8192, s_kv=8192, d_qk=192, d_v=128, causal=True, bottom_right=True, thd=True)
+        base.update(device_cc=device_cc, has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for over, lead in (
+        (dict(), True),
+        (dict(s_q=1024, s_kv=131072), True),
+        (dict(h_q=128, h_kv=8, s_q=32768, s_kv=32768), True),
+        (dict(s_q=512, s_kv=131072), False),
+        (dict(s_q=768, s_kv=768), False),
+        (dict(s_q=512, s_kv=131073), True),
+    ):
+        facts = paged(**over)
+        assert pt.class_key(row, facts)[8] == "gqa", over
+        assert pt.lookup(row, facts) is lead, over
+        assert pt.matched_entry(row, facts).study == "sm100_d192x128_paged_v2_20261118"
+    for short in (paged(s_q=8, s_kv=131072, thd=False), paged(s_q=255, s_kv=16384)):
+        assert pt.class_key(row, short)[8] == "gqa_short"
+        assert pt.lookup(row, short) is None
 
 
 @pytest.mark.L0

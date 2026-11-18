@@ -184,9 +184,14 @@ def _sm100_unpacked_window_prefill(row: str, facts) -> bool:
 
 
 def _sm100_short_window_d192(row: str, facts) -> bool:
-    """Dense d192 x 128 windowed graphs below the packing study's S_q floor: their own class with no entry, so the row's hand rules
-    keep deciding them as before the study."""
-    return _sm100_window_prefill_measured(row, facts) is False and (facts.d_qk, facts.d_v) == (192, 128)
+    """SM100 / SM103 d192 x 128 GQA graphs below the S_q their studies timed (256): dense with a window
+    (sm100_d192x128_swa_sink_pack_20261118) and paged without one (sm100_d192x128_paged_v2_20261118). Their own class with no
+    entry, so the row's hand rules keep deciding them as before the studies."""
+    if _sm100_window_prefill_measured(row, facts) is False and (facts.d_qk, facts.d_v) == (192, 128):
+        return True
+    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)) or (facts.d_qk, facts.d_v) != (192, 128):
+        return False
+    return bool(facts.has_paged_kv) and facts.window_left is None and facts.h_q != facts.h_kv and 4 < facts.s_q < SM100_WINDOW_PREFILL_MIN_S_Q
 
 
 def _sm90_partial_pack(row: str, facts) -> bool:
@@ -1706,6 +1711,21 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", True): Entry(
         "always", None, "sm100_d128_window_prefill_unpacked_20261118"
+    ),
+    # study sm100_d192x128_paged_v2_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, the earlier study's cells included;
+    # holdout at fresh head pairs scored once, B200 0.364 / 0.371 and B300 0.297 / 0.313 on / off the tile): mimo full paged d192 x 128
+    # context leads from S_q ~887 at enough work on the tile and from S_q ~362 off it. Graphs below S_q 256 key `gqa_short`
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 34.407, "sm100_d192x128_paged_v2_20261118", "cost", ("ge", 9.792, "q")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 8.5, "sm100_d192x128_paged_v2_20261118", "q"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 34.407, "sm100_d192x128_paged_v2_20261118", "cost", ("ge", 9.792, "q")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 8.5, "sm100_d192x128_paged_v2_20261118", "q"
     ),
     # study sm100_d192x128_swa_sink_pack_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, B200 + B300 holdout at fresh head
     # pairs scored once; run-559 gates GB200 11 rows at 0.690, GB300 11 at 0.591): mimo swa dense d192 x 128 with a window and a sink,
