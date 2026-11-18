@@ -11,6 +11,7 @@ import math
 from operator import itemgetter
 
 import cudnn
+from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -565,7 +566,8 @@ class CompiledGdn2:
             carved = workspace.carve(self.carve)
             context_views = context.carve(self.context.carve) if self.has_context else ()
             merged = (*views, *carved, *context_views, None)
-            self.chain_launch(
+            cpp_launcher.launch(
+                self.chain_launch,
                 *self.chain_scalars,
                 *self.chain_buffers(merged),
                 self.stream_type(int(stream or 0)),

@@ -31,6 +31,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 import cutlass.experimental.cuda.tensor_map as tma
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
@@ -980,7 +981,8 @@ def run_warmup_backward(
     ragged_buffers=(),
 ) -> None:
     """Replay the warmup or uncut backward: one crossing into the DSL for the table, prologue and bprop launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
@@ -2174,7 +2176,8 @@ def run_regenerate_backward(
     ragged_buffers=(),
 ) -> None:
     """Replay the regenerate backward: one crossing into the DSL for the table, prologue, recompute and bprop launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
@@ -2529,7 +2532,8 @@ def run_summary_backward(
     tail_buffers=(),
 ) -> None:
     """Replay the backward summary: one crossing into the DSL for the prologue and kernel launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         float(dt_min),
         float(dt_max),
         q,

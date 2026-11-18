@@ -33,6 +33,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.cpp_launcher import cpp_launched
 
 from .common import check_composed_state, check_composed_summaries, execute_graph, make_execution_resources, select_plan, torch_dtype_to_cudnn
 
@@ -244,6 +245,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@cpp_launched
 def run_mamba2_fwd(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -810,8 +812,8 @@ def build_bprop_graph(
     )
 
 
-@torch.library.custom_op("cudnn::mamba2_bwd", mutates_args=())
-def mamba2_bwd_op(
+@cpp_launched
+def run_mamba2_bwd(
     dy: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -993,6 +995,9 @@ def mamba2_bwd_op(
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
     return dx, ddt, dA, dB, dC, dD, ddt_bias, dz, dstate0
+
+
+mamba2_bwd_op = torch.library.custom_op("cudnn::mamba2_bwd", run_mamba2_bwd, mutates_args=())
 
 
 @mamba2_bwd_op.register_fake
@@ -1473,8 +1478,8 @@ def check_summary_args(op, dt, A, B, cu_seqlens, dt_bias, state, state_name, tot
     return N
 
 
-@torch.library.custom_op("cudnn::mamba2_summary", mutates_args=())
-def mamba2_summary_op(
+@cpp_launched
+def run_mamba2_summary(
     x: torch.Tensor,
     dt: torch.Tensor,
     A: torch.Tensor,
@@ -1561,6 +1566,9 @@ def mamba2_summary_op(
     return final_state, transition
 
 
+mamba2_summary_op = torch.library.custom_op("cudnn::mamba2_summary", run_mamba2_summary, mutates_args=())
+
+
 @mamba2_summary_op.register_fake
 def mamba2_summary_fake(
     x,
@@ -1585,8 +1593,8 @@ def mamba2_summary_fake(
     return final_state, transition
 
 
-@torch.library.custom_op("cudnn::mamba2_summary_bwd", mutates_args=())
-def mamba2_summary_bwd_op(
+@cpp_launched
+def run_mamba2_summary_bwd(
     dy: torch.Tensor,
     dt: torch.Tensor,
     A: torch.Tensor,
@@ -1673,6 +1681,9 @@ def mamba2_summary_bwd_op(
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
     return d_initial_state, transition
+
+
+mamba2_summary_bwd_op = torch.library.custom_op("cudnn::mamba2_summary_bwd", run_mamba2_summary_bwd, mutates_args=())
 
 
 @mamba2_summary_bwd_op.register_fake

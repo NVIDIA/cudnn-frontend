@@ -1496,7 +1496,8 @@ def run_chain_summary_backward(
 ) -> None:
     """Replay the backward summary chain: one crossing into the DSL for the four launches."""
     buffers = locals()
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

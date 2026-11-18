@@ -12,6 +12,7 @@ import math
 from operator import itemgetter
 
 import cudnn
+from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -397,7 +398,9 @@ class CompiledMamba2:
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)), None, *fold_buffers)
+            cpp_launcher.launch(
+                self.chain_launch, *self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)), None, *fold_buffers
+            )
             return
         k = views[self.index_k]
         v = views[self.index_v]
