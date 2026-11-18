@@ -1247,7 +1247,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         need = each.memory_bytes(1, capacity, stored=kept, uncopied=alone) + each.state_bytes(1, capacity, tokens=6)
         assert f"{need / 2**30:.1f}" == asked, (capacity, need / 2**30)
     assert "The run of `native` asked for about 3.6 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB." in section
-    assert "The sentence asked for about 40.0 GiB, PyTorch reserved 38.3 GiB and the device grew by 38.4 GiB, the GPU otherwise empty." in section
+    assert "The sentence asked for about 40.0 GiB, PyTorch reserved 38.9 GiB and the device grew by 39.0 GiB, the GPU otherwise empty." in section
     # ... and the figures of the runs, as the section states them beside the class they ran on
     assert "What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only)." in section
     assert "`tokens` passed with 31 of 31 kept tokens equal to the decode steps' and the logits within 1.00 bf16 unit, inside the band of 4" in section
@@ -2145,6 +2145,8 @@ def test_what_a_session_with_draft_tokens_refuses():
             session.verify(window, wrong)
     assert session.record.count == 0 and session.state.position == 0 and session.prompt_record.count == 0, "refused before the step: nothing ran"
     session.read(session.prefill(prompts))
+    with pytest.raises(ValueError, match="compares the verify steps a session recorded behind its prompt; this session recorded none"):
+        tie_out.speculative_checks(session, plain)
     session.verify(window)  # the step runs; its count is open
     assert session.record.accepted == [None] and session.state.position == 5 and session.state.verify_steps == 1
     with pytest.raises(ValueError, match=r"the step before this one has not been told how many of its tokens are kept \(Session.accept\)"):

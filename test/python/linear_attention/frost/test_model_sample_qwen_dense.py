@@ -444,6 +444,7 @@ try:
     say(session.resolve().table())
     say(loop.PROMPT_ROWS)
     say(session.prefill_plan.table())
+    say(census.table(session.prefill_plan))
     say(census.table(session.plan, session.claim()))
 except NotImplementedError as error:
     say(f"[speculative] SKIP {{error}}")

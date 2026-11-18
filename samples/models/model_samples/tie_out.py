@@ -1224,6 +1224,8 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     S, T, vocab = session.sequences, session.tokens, session.model.geometry.vocab
     kept_records = (session.record, session.prompt_record)
     steps = min(session.record.count, session.record.inputs.shape[0])
+    if steps < 1:
+        raise ValueError("speculative_checks compares the verify steps a session recorded behind its prompt; this session recorded none")
     windows = session.record.inputs[:steps].clone().view(steps, S, T)
     counts = list(session.record.accepted[:steps])
     prompt = session.prompt_record.prompt
@@ -1299,26 +1301,23 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
         f"speculative against decode ({S} sequence{plural} x {T} tokens per sequence, {steps} engine steps behind a prompt of {fed} tokens; "
         f"tokens kept behind the first: {', '.join(str(count) for count in counts)}; {layers} layers)"
     ]
-    tokens_ok, near = True, [False] * steps
-    if steps:
-        a, r, ids_a, ids_r = torch.cat(kept_logits), torch.cat(ref_logits), torch.cat(kept_ids), torch.cat(ref_ids)
-        tokens_ok, tokens_text = token_check(a, r, ids_a, ids_r, band_units)
-        tokens_text = tokens_text.replace("equal to the reference;", "equal;")  # of this comparison: the decode steps, named in front
-        differs = (ids_a != ids_r).nonzero()
-        where = f"the first that differs is kept token {int(differs[0]) // S + 1}" if differs.numel() else "none differs"
-        tokens_text = (
-            f"{int((ids_a == ids_r).sum())} of {ids_a.numel()} kept tokens equal to those of the decode steps of the same tokens ({where}); "
-            f"{greedy_kept} of {greedy_all} are the greedy token of the session's own step in front of them; " + tokens_text
-        )
-        if band_units is not None:  # a loop that kept a token its steps did not choose is no rounding
-            tokens_ok = tokens_ok and greedy_kept == greedy_all
-        if band_units is not None:  # the steps with a near-tie among their compared rows: what the acceptance line stops at
-            unit = 2.0 ** (math.frexp(float(r.float().abs().amax()))[1] - 8)
-            near = [bool((each <= LOGITS_FACTOR * band_units * unit).any()) for each in margins]
-    else:
-        tokens_text = "no verify step was recorded: nothing to compare"
-    lines.append(f"  tokens            {tokens_text}    {'REPORTED' if (band_units is None or not steps) and tokens_ok else _verdict(tokens_ok)}")
-    state_ok, text, gated, state_verdict = standing.line(_first_layer_fed_alike(session, decode))
+    near = [False] * steps
+    a, r, ids_a, ids_r = torch.cat(kept_logits), torch.cat(ref_logits), torch.cat(kept_ids), torch.cat(ref_ids)
+    tokens_ok, tokens_text = token_check(a, r, ids_a, ids_r, band_units)
+    tokens_text = tokens_text.replace("equal to the reference;", "equal;")  # of this comparison: the decode steps, named in front
+    differs = (ids_a != ids_r).nonzero()
+    where = f"the first that differs is kept token {int(differs[0]) // S + 1}" if differs.numel() else "none differs"
+    tokens_text = (
+        f"{int((ids_a == ids_r).sum())} of {ids_a.numel()} kept tokens equal to those of the decode steps of the same tokens ({where}); "
+        f"{greedy_kept} of {greedy_all} are the greedy token of the session's own step in front of them; " + tokens_text
+    )
+    if band_units is not None:  # a loop that kept a token its steps did not choose is no rounding
+        tokens_ok = tokens_ok and greedy_kept == greedy_all
+        # ... and the steps with a near-tie among their compared rows: what the acceptance line stops at
+        unit = 2.0 ** (math.frexp(float(r.float().abs().amax()))[1] - 8)
+        near = [bool((each <= LOGITS_FACTOR * band_units * unit).any()) for each in margins]
+    lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
+    _, text, gated, state_verdict = standing.line(_first_layer_fed_alike(session, decode))
     lines.append(f"  kept state        {text}    {state_verdict}")
     astray = next((index for index, (mine, theirs, own) in enumerate(positions) if not mine == theirs == own), None)
     position_ok = astray is None
@@ -1335,7 +1334,7 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     )
     rows_equal = sum(int(bytes_equal(mine[n], theirs[n])) for mine, theirs in zip(kept_logits, ref_logits) for n in range(mine.shape[0]))
     rows_all = sum(int(mine.shape[0]) for mine in kept_logits)
-    layers_equal = sum(standing.equal.values()) if steps else layers
+    layers_equal = sum(standing.equal.values())
     bytes_ok = rows_equal == rows_all and layers_equal == layers
     gate_bytes = session.stack == "reference"
     bytes_text = (

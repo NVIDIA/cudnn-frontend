@@ -826,8 +826,8 @@ On the published checkpoint (`native`, one sequence of six tokens, the default p
 30 of 31 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs
 kept token 13; replay, the blocks of both kinds of step and the kernel check passed, with 370 of 484 launches
 of a verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal
-results). The sentence asked for about 40.0 GiB, PyTorch reserved 38.3 GiB and the device grew by
-38.4 GiB, the GPU otherwise empty.
+results). The sentence asked for about 40.0 GiB, PyTorch reserved 38.9 GiB and the device grew by
+39.0 GiB, the GPU otherwise empty.
 
 **The state.** The recurrent state after EVERY token of a step is written to a slot of its own, so the next step can
 start from whichever token the run kept, with nothing copied. The slots are numbered token by token -- sequence `i`,
