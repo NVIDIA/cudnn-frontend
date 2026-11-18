@@ -54,22 +54,17 @@ def test_norm_device_properties_follow_current_device(monkeypatch):
     monkeypatch.setattr(utils, "_SMEM_PER_SM", None)
     current = [0]
     calls = []
-    from cudnn import _cutlass_compat
     from cudnn.frost import device
 
     monkeypatch.setattr(device, "current_device", lambda: current[0])
     monkeypatch.setattr(device, "multiprocessor_count", lambda index: (148, 108)[index])
-    monkeypatch.setattr(device, "shared_memory_per_block_optin", lambda index: 232448)
+    monkeypatch.setattr(device, "shared_memory_per_block_optin", lambda index: (232448, 101376)[index])
     monkeypatch.setattr(device, "oversized_shared_memory_per_block", lambda index: (0, 334848)[index])
-    monkeypatch.setattr(utils, "_SMEM_CAPACITIES", {})
-    monkeypatch.setattr(_cutlass_compat, "get_smem_capacity_in_bytes", lambda: (232448, 334848)[current[0]])
     monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
 
     def properties(index):
         calls.append(index)
         return SimpleNamespace(
-            multi_processor_count=(148, 108)[index],
-            shared_memory_per_block_optin=(232448, 334848)[index],
             shared_memory_per_multiprocessor=(233472, 335872)[index],
         )
 
@@ -77,7 +72,7 @@ def test_norm_device_properties_follow_current_device(monkeypatch):
     for index in (0, 1, 0, 1):
         current[0] = index
         assert utils.sm_count() == (148, 108)[index]
-        assert utils.smem_capacity() == (232448, 334848)[index]
+        assert utils.smem_capacity() == (232448, 101376)[index]
         assert utils.smem_per_sm() == (233472, 335872)[index]
     assert calls == [0, 1]
 
@@ -211,28 +206,24 @@ def test_norm_workspace_rejects_non_cuda_storage(storage):
     assert Workspace().take(16, torch.float32) is None
 
 
-def test_norm_resources_follow_build_scope_and_compiler_limit(monkeypatch):
-    from cudnn import _cutlass_compat
+def test_norm_resources_follow_build_scope_and_optin_limit(monkeypatch):
     from cudnn.frost import device
     from cudnn.norm import utils
 
     monkeypatch.setattr(utils, "_SM_COUNT", None)
     monkeypatch.setattr(utils, "_SMEM_CAPACITY", None)
-    monkeypatch.setattr(utils, "_SMEM_CAPACITIES", {})
     monkeypatch.setattr(device, "ambient_device", lambda: 0)
     monkeypatch.setattr(device, "multiprocessor_count", lambda index: (148, 108)[index])
-    monkeypatch.setattr(device, "shared_memory_per_block_optin", lambda index: 232448)
+    monkeypatch.setattr(device, "shared_memory_per_block_optin", lambda index: (232448, 101376)[index])
     monkeypatch.setattr(device, "oversized_shared_memory_per_block", lambda index: (0, 334848)[index])
-    monkeypatch.setattr(_cutlass_compat, "get_smem_capacity_in_bytes", lambda: 334848)
     assert utils.device_key() == 0
     assert utils.sm_count() == 148
     assert utils.smem_capacity() == 232448
     with device.build_device(1):
         assert utils.device_key() == 1
         assert utils.sm_count() == 108
-        assert utils.smem_capacity() == 334848
-        monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
-        monkeypatch.setattr(_cutlass_compat, "get_smem_capacity_in_bytes", lambda: 232448)
-        assert utils.smem_capacity() == 232448
+        # Even an available oversized carveout does not raise the norm budget.
+        assert utils.smem_capacity() == 101376
     assert utils.device_key() == 0
     assert utils.sm_count() == 148
+    assert utils.smem_capacity() == 232448

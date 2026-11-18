@@ -723,3 +723,93 @@ def test_norm_workspace_rejects_invalid_cuda_storage(monkeypatch, invalid):
         monkeypatch.setattr(torch.cuda, "current_device", lambda: buf.device.index + 1)
     with pytest.raises(ValueError, match="workspace must"):
         Workspace(buf)
+
+
+@pytest.mark.parametrize("format", ["e4m3", "e5m2", "nvfp4"])
+def test_norm_block_scale_default_fp32_intermediate(cudnn_handle, format):
+    """The shared graph contract retains FP32 between norm and quantization."""
+    torch.manual_seed(83)
+    shape = (2, 32, 96, 1)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    gamma = torch.zeros((1, 1, 96, 1), device="cuda")
+    beta = torch.ones_like(gamma)
+    block_size = 16 if format == "nvfp4" else 32
+    maximum, midpoint = {"e4m3": (448.0, 1.0625), "e5m2": (57344.0, 1.125), "nvfp4": (6.0, 1.25)}[format]
+    beta[..., ::block_size, 0] = maximum
+    beta[..., 1::block_size, 0] = midpoint + 0.001
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
+    vp = {}
+
+    def inp(value):
+        tensor = g.tensor_like(value)
+        vp[tensor] = value
+        return tensor
+
+    fp4 = format == "nvfp4"
+    y, mean, rstd = g.layernorm(
+        input=inp(x),
+        scale=inp(gamma),
+        bias=inp(beta),
+        epsilon=inp(torch.full((1, 1, 1, 1), 1e-3)),
+        norm_forward_phase=cudnn.norm_forward_phase.INFERENCE if fp4 else cudnn.norm_forward_phase.TRAINING,
+    )
+    # Do not override Y's dtype: infer it from the graph's FP32 intermediate type.
+    for tensor in (mean, rstd):
+        if tensor is not None:
+            value = torch.empty((2, 32, 1, 1), device="cuda")
+            tensor.set_output(True).set_dim(value.shape).set_stride(value.stride()).set_data_type(value.dtype)
+            vp[tensor] = value
+    outputs = []
+    axes = (2,) if fp4 else (2, 1)
+    dtype = torch.float8_e5m2 if format == "e5m2" else torch.float8_e4m3fn
+    for axis in axes:
+        q, s = g.block_scale_quantize(input=y, block_size=16 if fp4 else 32, axis=axis)
+        payload = torch.empty((2, 32, 48, 1) if fp4 else shape, device="cuda", dtype=torch.uint8)
+        dims = list(shape)
+        dims[axis] //= 16 if fp4 else 32
+        scale = torch.empty(dims, device="cuda", dtype=torch.uint8)
+        q.set_output(True).set_dim(shape).set_stride(x.stride()).set_data_type(cudnn.data_type.FP4_E2M1 if fp4 else dtype)
+        sf_dtype = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
+        s.set_output(True).set_dim(dims).set_stride(scale.stride()).set_data_type(sf_dtype)
+        vp[q] = payload if fp4 else payload.view(dtype)
+        vp[s] = scale.view(sf_dtype)
+        outputs.append((payload, scale))
+    g.validate()
+    assert y.get_is_virtual() and y.get_data_type() == cudnn.data_type.FLOAT
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    original_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+        for backend in (False, True):
+            candidates = [i for i, p in enumerate(g.plans) if (p.engine_id < 20_000) == backend]
+            assert candidates, f"missing {'backend' if backend else 'FROST'} norm/block-scale plan"
+            for plan_index in candidates:
+                g.select_plan(plan_index)
+                g.check_support()
+                g.build_plans()
+                workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
+                for payload, scale in outputs:
+                    payload.fill_(255)
+                    scale.fill_(255)
+                g.execute(vp, workspace, handle=cudnn_handle)
+                # gamma=0 isolates conversion semantics from norm reduction order.
+                for axis, (payload, scale) in zip(axes, outputs):
+                    if fp4:
+                        expected_y, expected_s = nvfp4_reference(beta.expand(shape).squeeze(-1))
+                        expected_y, expected_s = expected_y.unsqueeze(-1), expected_s.unsqueeze(-1)
+                    else:
+                        expected_y, expected_s = mxfp8_reference(beta.expand(shape), dtype, axis)
+                    if axis == 2:
+                        rounded = beta.expand(shape).to(x.dtype)
+                        if fp4:
+                            rounded_y, _ = nvfp4_reference(rounded.squeeze(-1))
+                            rounded_y = rounded_y.unsqueeze(-1)
+                        else:
+                            rounded_y, _ = mxfp8_reference(rounded, dtype, axis)
+                        # A BF16 staging bug must fail, even with a finite exact norm result.
+                        assert torch.any(expected_y != rounded_y).item()
+                    torch.testing.assert_close(payload, expected_y, rtol=0, atol=0)
+                    torch.testing.assert_close(scale, expected_s, rtol=0, atol=0)
+    finally:
+        cudnn.set_stream(cudnn_handle, original_stream)

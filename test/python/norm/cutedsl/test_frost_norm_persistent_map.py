@@ -123,7 +123,7 @@ def main():
     saved = warp_mod._SM_COUNT if hasattr(warp_mod, "_SM_COUNT") else None
 
     def force(mod, n):
-        mod._SM_COUNT = n  # _nsm() caches into this
+        mod._SM_COUNT = n  # test override for _nsm()
 
     try:
         for nsm in _SM_COUNTS:

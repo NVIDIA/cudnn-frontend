@@ -114,24 +114,16 @@ def run_coop(key, run):
 
 
 _SMEM_CAPACITY = None  # test override
-_SMEM_CAPACITIES = {}
 
 
 def smem_capacity():
-    """Shared-memory budget bounded by both the compiler and the build device."""
+    """Opt-in per-block shared memory limit of the build/current CUDA device."""
     if _SMEM_CAPACITY is not None:
         return _SMEM_CAPACITY
-    import os
-    from cudnn._cutlass_compat import get_smem_capacity_in_bytes
-    from cudnn.frost.device import oversized_shared_memory_per_block, shared_memory_per_block_optin
+    from cudnn.frost.device import shared_memory_per_block_optin
 
-    device = device_key()
-    key = (device, os.environ.get("CUTE_DSL_ARCH", "auto"))
-    if key not in _SMEM_CAPACITIES:
-        # SM107 exposes an oversized carveout; the compiler must support it too.
-        limit = max(shared_memory_per_block_optin(device), oversized_shared_memory_per_block(device))
-        _SMEM_CAPACITIES[key] = min(int(get_smem_capacity_in_bytes()), limit)
-    return _SMEM_CAPACITIES[key]
+    # Norm launches do not request the oversized carveout.
+    return shared_memory_per_block_optin(device_key())
 
 
 def smem_budget(preferred_bytes):

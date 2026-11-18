@@ -52,8 +52,7 @@ _SM_COUNT = None
 
 
 def _nsm():
-    nsm = _SM_COUNT if _SM_COUNT is not None else sm_count()
-    return nsm
+    return _SM_COUNT if _SM_COUNT is not None else sm_count()
 
 
 def red_scratch_len(block_threads: int) -> int:

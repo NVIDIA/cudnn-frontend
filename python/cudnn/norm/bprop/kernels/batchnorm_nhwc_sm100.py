@@ -69,8 +69,7 @@ def nhwc_cfg(C, eb, block_threads=512):
 
 
 def _nsm():
-    nsm = _SM_COUNT if _SM_COUNT is not None else sm_count()
-    return nsm
+    return _SM_COUNT if _SM_COUNT is not None else sm_count()
 
 
 @cute.kernel

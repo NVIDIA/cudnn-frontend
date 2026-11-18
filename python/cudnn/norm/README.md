@@ -296,22 +296,33 @@ same logical shape and element strides. Byte outputs may start at any byte offse
 the norm intermediate uses the aligned CUDA uint8 workspace reported by the plan.
 Singleton strides do not affect addressing. NVFP4 payload storage is packed uint8.
 
-Block-scale plans follow backend plans until comparative performance is qualified.
+Block-scale plans follow preferred backend candidates until comparative performance
+is qualified; fallback backend candidates may follow FROST.
 They remain available for explicit selection and graphs the backend declines.
 The shared compiled-object cache records the bound CUDA compiler and any forced
 `CUTE_DSL_ARCH`. If an internal build cannot identify its compiler, it retains
 in-process reuse but does not persist objects across processes.
 
-The FROST block-scale path rounds the virtual norm output to its declared
-FP16, BF16, or FP32 dtype before quantization. The fused cuDNN backend can retain
-an FP32 intermediate. Engine selection can therefore change payload and scale
-bytes near rounding boundaries. On backend 93000, the finite LN probe matched
-an unrounded FP32 oracle for the backend and a declared-dtype rounded oracle for
-FROST; BF16 E4M3/E5M2 and FP16 E4M3 differences were observed. The sampled NVFP4
-inputs fell in the same bins for both oracles and do not establish equivalence.
+The virtual norm output's declared dtype determines the precision passed to
+quantization. Set `intermediate_data_type=cudnn.data_type.FLOAT` on the graph
+and keep Y (or backward DX) virtual to preserve FP32. FP16/BF16 inputs do not
+force a low-precision intermediate. An explicit FP16/BF16 dtype on that virtual
+tensor requests rounding before quantization; FROST honors that declaration.
 
-Nonfinite inputs also differ on that runtime: in the tested Inf-containing
-blocks, the backend emitted maximum-finite payload codes where FROST emitted
+The persistent backend norm source uses the same declared-dtype contract. On
+cuDNN 93000, a finite forward LayerNorm probe with zero gamma isolated conversion
+order: FROST and backend engine 3 matched the declared-dtype oracle, including
+the discriminating FP16/BF16 E4M3 cases. Backend engine 1 instead matched the unrounded FP32
+oracle in the low-precision cases. With an FP32 intermediate, every tested
+backend/FROST plan matched payload and scale bytes for E4M3, E5M2 and NVFP4.
+Backend engine 4 did not compile the tested FP16/BF16 NVFP4 intermediates.
+This controlled probe does not establish byte parity for arbitrary norm
+reductions. The default-FP32 graph regression tests check both routes against
+an independent quantizer reference.
+
+Nonfinite inputs also differed in the earlier first-plan probe on that runtime:
+in the tested Inf-containing blocks, backend engine 1 emitted maximum-finite
+payload codes where FROST emitted
 NaN or signed zero. The scale bytes agreed in those tests. These differences
 are not covered by a byte-parity guarantee. Backward backend parity and
 comparative performance still need qualification; no numerical tolerance was
