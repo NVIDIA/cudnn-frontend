@@ -1733,3 +1733,9 @@ which enumerates every candidate before choosing one: include convolution,
 matmul and SDPA, raw/Python entry points, serialization and fresh execution.
 `core/graph/test_restored_plan_metadata.py` covers these consumer paths; a
 restored-plan-only check can miss an ordinary convolution build regression.
+
+When an SDPA device helper gains operands, audit subclasses in other operation
+packages as well as SDPA callers. BSA SM120 inherits the dense/paged tile loader;
+its dense calls must supply the complete signature even when paging is compiled
+out. Pin the actual kernel route, retain full/tail wave coverage, and replay
+changed KV data and selection metadata (`test_sm120_blk128_fixed_topk`).

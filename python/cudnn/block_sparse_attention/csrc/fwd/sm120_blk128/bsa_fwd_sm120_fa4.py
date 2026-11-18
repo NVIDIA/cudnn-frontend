@@ -361,6 +361,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 physical_idx * self.kv_tile,
                 is_v=False,
                 envelope=False,
+                pool=mK,
+                page_table=None,
+                seqlen_k=seqlen_k,
             )
             self.load_one_kv_tile(
                 sV,
@@ -371,6 +374,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 physical_idx * self.kv_tile,
                 is_v=True,
                 envelope=False,
+                pool=mV,
+                page_table=None,
+                seqlen_k=seqlen_k,
             )
 
             # Four-fold unrolling reduces loop-control issue overhead while
@@ -393,6 +399,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     physical_idx * self.kv_tile,
                     is_v=False,
                     envelope=False,
+                    pool=mK,
+                    page_table=None,
+                    seqlen_k=seqlen_k,
                 )
 
                 prims.barrier_cta_sync(
@@ -408,6 +417,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     physical_idx * self.kv_tile,
                     is_v=True,
                     envelope=False,
+                    pool=mV,
+                    page_table=None,
+                    seqlen_k=seqlen_k,
                 )
 
             prims.barrier_cta_sync(
