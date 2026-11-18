@@ -85,6 +85,12 @@ def _decode_pack_group(row: str, facts) -> Optional[int]:
             depth = _VERIFY_MAX_S_Q
     if not row.startswith("sdpa_fwd") or facts.s_q > depth or facts.h_q == facts.h_kv:
         return None
+    return _row_pack_group(row, facts)
+
+
+def _row_pack_group(row: str, facts) -> Optional[int]:
+    """The FROST forward row's own GQA packing for ``facts`` at its 128-row tile (the query heads one packed row-group holds),
+    whatever the phase; None when the row has no spec."""
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, sm100_legacy_policy_spec
 
@@ -149,6 +155,18 @@ def _decode_pack_group(row: str, facts) -> Optional[int]:
 
 def _unpacked_decode(row: str, facts) -> bool:
     return _decode_pack_group(row, facts) == 1
+
+
+def _sm100_unpacked_window_prefill(row: str, facts) -> bool:
+    """SM100 / SM103 windowed paged d128 prefill whose GQA group the row does not pack whole (the packed group must divide its tile):
+    groups 5 / 6 / 9 / 10 / 12 ran unpacked at parity with the backend (up to 1.23) where group 8 ran 0.75-0.80, and the windowed
+    classes' `always` entries led both (sm100_prefill_d192_gaps_20261118, d128 diagnostic family). Scoped to the measured class."""
+    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)) or (facts.d_qk, facts.d_v) != (128, 128):
+        return False
+    if facts.window_left is None or not facts.has_paged_kv or facts.s_q <= 4 or facts.h_q == facts.h_kv:
+        return False
+    pack = _row_pack_group(row, facts)
+    return pack is not None and pack < facts.h_q // facts.h_kv
 
 
 def _sm90_partial_pack(row: str, facts) -> bool:
@@ -254,7 +272,7 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         mask = "none"
     if facts.h_q == facts.h_kv:
         group = "mha"
-    elif _unpacked_decode(row, facts):
+    elif _unpacked_decode(row, facts) or _sm100_unpacked_window_prefill(row, facts):
         group = "gqa_unpacked"
     elif _sm90_partial_pack(row, facts):
         group = "gqa_partial"
@@ -1650,6 +1668,22 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", True): Entry(
         "always", None, "sm100_prefill_d192_gaps_20261118"
+    ),
+    # study sm100_d128_window_prefill_unpacked_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8; holdout at fresh unpacked
+    # head pairs scored once: B200 18 changed cells at 0.923, B300 at 0.905, worst 1.067; run-559 gates GB200 12 rows at 0.903, GB300
+    # 12 at 0.872): windowed paged d128 prefill the row does not pack whole (`_sm100_unpacked_window_prefill`) leads on the tile only
+    # up to 2k keys. Off the tile it keeps the `always` it had under the swa_prefill_20261031 entries
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", False): Entry(
+        "le", 11.0, "sm100_d128_window_prefill_unpacked_20261118", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", True): Entry(
+        "always", None, "sm100_d128_window_prefill_unpacked_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", False): Entry(
+        "le", 11.0, "sm100_d128_window_prefill_unpacked_20261118", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", True): Entry(
+        "always", None, "sm100_d128_window_prefill_unpacked_20261118"
     ),
     # study sm103_d256_bwd_v2_20261031, THD half (B300 SXM6 1100 W, cuDNN 9.28.0.38; 129 train cases: S 128-32k, b 1-128, GQA 16/2 /
     # 32/4 / 32/1 / 64/2 and MHA 16/16; 24 off-lattice holdout cases). The dense classes have no entry: they lost on small-work

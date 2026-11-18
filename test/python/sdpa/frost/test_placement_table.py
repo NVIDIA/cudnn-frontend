@@ -1300,6 +1300,34 @@ def test_sm100_paged_d192_prefill_entries_follow_the_study(device_cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_sm100_windowed_d128_prefill_keys_unpacked_groups_apart(device_cc):
+    """Study sm100_d128_window_prefill_unpacked_20261118: SM100 / SM103 windowed paged d128 prefill whose GQA group the row does not
+    pack whole keys `gqa_unpacked` and leads on the tile only up to 2k keys, off the tile as before. Group 8 packs whole and keeps the
+    swa_prefill_20261031 entries; dense caches keep their key."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def paged(**over):
+        base = dict(b=1, h_q=72, h_kv=8, s_q=1024, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True, thd=True, window_left=511)
+        base.update(device_cc=device_cc, has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for h_q, h_kv in ((72, 8), (80, 8), (10, 1), (48, 8), (24, 2)):  # groups 9 / 10 / 10 / 6 / 12
+        facts = paged(h_q=h_q, h_kv=h_kv)
+        assert pt.class_key(row, facts)[8] == "gqa_unpacked", (h_q, h_kv)
+        assert pt.lookup(row, facts) is False, (h_q, h_kv)
+        assert pt.matched_entry(row, facts).study == "sm100_d128_window_prefill_unpacked_20261118"
+        assert pt.lookup(row, paged(h_q=h_q, h_kv=h_kv, s_q=2048, s_kv=2048)) is True, (h_q, h_kv)
+        assert pt.lookup(row, paged(h_q=h_q, h_kv=h_kv, s_kv=131073)) is True, (h_q, h_kv)
+    packed = paged(h_q=64, h_kv=8)
+    assert pt.class_key(row, packed)[8] == "gqa"
+    assert pt.lookup(row, packed) is True
+    assert pt.matched_entry(row, packed).study.endswith("_swa_prefill_20261031")
+    assert pt.class_key(row, paged(has_paged_kv=False, padded=False, page_size=0))[8] == "gqa"
+
+
+@pytest.mark.L0
 def test_sm107_paged_window_entries_follow_the_study():
     """Study sm107_window_gaps_20261118 (Rubin, the inference benchmark's windowed paged generation graph): windowed paged d192 x 192 and
     d256 lead at S_q 1 through prefill, d64 up to S_q 45, d128 MTP (whole-pack groups) on caches up to 32k. Windowed d128 verify
