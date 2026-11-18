@@ -67,8 +67,9 @@ def _unmeasured(facts, row: Optional[str] = None) -> bool:
     )
 
 
-def _unpacked_decode(row: str, facts) -> bool:
-    """A decode-shaped GQA graph the FROST forward row cannot pack (every query head re-reads K/V): a different kernel regime
+def _decode_pack_group(row: str, facts) -> Optional[int]:
+    """The query heads one packed tile row-group of the FROST forward row holds for a decode-shaped GQA graph, None for any other
+    graph. 1 is :func:`_unpacked_decode`: a decode-shaped GQA graph the row cannot pack (every query head re-reads K/V), a different kernel regime
     from the packed graphs the studies measured (paged d512 at G = 12-96 ran 5-21x slower than its packed neighbours). The
     row's own heuristics decide it, so the class follows the kernel rather than a shape proxy.
 
@@ -83,7 +84,7 @@ def _unpacked_decode(row: str, facts) -> bool:
         if sm80_half.owner(facts) not in (None, SM80_WIDE):
             depth = _VERIFY_MAX_S_Q
     if not row.startswith("sdpa_fwd") or facts.s_q > depth or facts.h_q == facts.h_kv:
-        return False
+        return None
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, sm100_legacy_policy_spec
 
@@ -91,7 +92,7 @@ def _unpacked_decode(row: str, facts) -> bool:
         sm100_legacy_policy_spec(row) if row in ("sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm107") else next((s for s in ENGINE_SPECS if s.name == row), None)
     )
     if spec is None:
-        return False
+        return None
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
     from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
     from cudnn.sdpa.fwd.kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
@@ -143,7 +144,21 @@ def _unpacked_decode(row: str, facts) -> bool:
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):
         caps = heuristics.sm100_legacy_policy_spec(row).capabilities
-    return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
+    return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128))
+
+
+def _unpacked_decode(row: str, facts) -> bool:
+    return _decode_pack_group(row, facts) == 1
+
+
+def _sm90_partial_pack(row: str, facts) -> bool:
+    """SM90 dense d256 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile):
+    each packed CTA still re-reads K/V G / pack times. On H100 it ran 1.35-1.40x the backend where full packs ran 0.87-0.95
+    at b >= 8 (sm90_dense_d256_q1_h100_20261118), so it keys apart. Scoped to the measured class."""
+    if row != "sdpa_fwd_prefill_sm90" or (facts.d_qk, facts.d_v) != (256, 256) or facts.s_q != 1 or facts.thd or facts.has_paged_kv:
+        return False
+    pack = _decode_pack_group(row, facts)
+    return pack is not None and 1 < pack < facts.h_q // facts.h_kv
 
 
 def _sm120_paged_body(row: str, facts) -> bool:
@@ -241,6 +256,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "mha"
     elif _unpacked_decode(row, facts):
         group = "gqa_unpacked"
+    elif _sm90_partial_pack(row, facts):
+        group = "gqa_partial"
     else:
         group = "gqa_split" if _packed_split(row, facts) else "gqa"
     if group == "gqa" and _sm120_paged_body(row, facts):
@@ -1243,6 +1260,16 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "le", 5.407, "sm90_dense_d256_chunk_v2_20261117", "tiles"
+    ),
+    # study sm90_dense_d256_q1_fullpack_h100_20261118 (H100 80GB, cuDNN 9.24.0.43, FE 4faf13dea; dense d256 single-row decode, groups
+    # 2-16, b 1-128, KV 2k-131k on and off the tile, mean of 100 cold launches; 152 train cells of whole-group packs, a 40-cell holdout of
+    # new head pairs scored once: 20 + 20 changed at 0.83 / 0.81, worst 0.92). FROST leads once the decode carries enough work; graphs
+    # the row packs only in part (gqa_partial) or not at all lost 1.35-2.6x and keep the backend. h200 run-564 qwen3.5: 24 rows at 0.85.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry(
+        "ge", 26.001, "sm90_dense_d256_q1_fullpack_h100_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry(
+        "ge", 1.5, "sm90_dense_d256_q1_fullpack_h100_20261118", "tiles"
     ),
     # study sm90_mha_mtp_v2_20261117 re-fits the MHA twins (H100 80GB, cuDNN 9.24.0.43, FE ba0b35370; heads 4-64 MHA, b 1-64, s_q 2/4,
     # KV 8k-128k with a full off-tile lattice; 240 train cells, a 60-cell holdout scored once: 34 changed at 0.54-0.59, worst 0.98).

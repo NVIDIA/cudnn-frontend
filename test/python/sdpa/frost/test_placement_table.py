@@ -1485,6 +1485,31 @@ def test_sm90_decode_gaps_follow_their_study(s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [32768, 32769], ids=["on_tile", "off_tile"])
+def test_sm90_dense_d256_single_row_decode_keys_partial_packs_apart(s_kv):
+    """Study sm90_dense_d256_q1_fullpack_h100_20261118 (H100): whole-group packs lead once the decode carries enough work (FROST 0.81-0.83
+    of the backend on the holdout); a group the row packs only in part keys `gqa_partial` (1.35-1.40x on H100) and keeps the backend,
+    as does an unpacked one. The partial key is scoped to the measured class: dense d256 single-row decode on SM90."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def q1(**over):
+        base = dict(b=128, h_q=32, h_kv=2, s_q=1, s_kv=s_kv, d_qk=256, d_v=256, causal=False, bottom_right=True)
+        base.update(device_cc=(9, 0), has_paged_kv=False, page_size=0, padded=False)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.class_key(row, q1())[8] == "gqa"
+    assert pt.lookup(row, q1()) is True  # qwen3.5 32/2: h200 run-564 ran it on the backend at 1.14-1.25x
+    assert pt.matched_entry(row, q1()).study == "sm90_dense_d256_q1_fullpack_h100_20261118"
+    assert pt.lookup(row, q1(h_q=8, h_kv=1, b=32)) is True  # qwen3.5 TP4 8/1
+    assert pt.lookup(row, q1(b=1, s_kv=s_kv // 16)) is False  # little work: the backend
+    assert pt.class_key(row, q1(h_q=24, h_kv=4))[8] == "gqa_partial"  # G6 packs 2
+    assert pt.lookup(row, q1(h_q=24, h_kv=4)) is None
+    assert pt.class_key(row, q1(h_q=12, h_kv=4))[8] == "gqa_unpacked"  # G3
+    assert pt.class_key(row, q1(h_q=24, h_kv=4, has_paged_kv=True, page_size=16, padded=True))[8] == "gqa"  # paged: not measured, keeps its class
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [62208, 62209], ids=["on_tile", "off_tile"])
 def test_sm90_mha_mtp_follows_its_study(s_kv):
     """Study sm90_mha_mtp_v2_20261117 (H100): dense d128 MHA MTP leads while few head-batch units cover a long cache (FROST splits
