@@ -996,15 +996,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 3.085, "sm80_prefill_gaps_20261117", "tiles"
     ),
-    # study sm80_paged_d64_v2_20261117 (A100, FE 50a9943c0; paged THD-Q d64 causal prefill, chunks S_q 17-4096 over KV 256-128k and
-    # squares, groups 2-16, 320 train cells, two-feature constrained fit) lowers the no-sink on-tile floor from 2^37.292: its own twins
-    # failed (off-tile sides vacuous), and an on-tile confirmation at fresh heads (sm80_paged_d64_v3_20261117, scored once) passed
-    # 0.682 (15 changed, worst 1.005). Its sink rule failed that confirmation (worst 1.199), so the sink and off-tile entries stay.
+    # study sm80_paged_d64_ontile_pcie_20261118 (A100 80GB PCIe 300 W, FE e0d68be47): the on-tile paged THD-Q d64 causal floors, re-fit
+    # in their own form on the nightly's board (the 2^34.161 / 2^33.792 floors came from a 275 W board that slowed the FROST leg), 100
+    # train cells per class. Fresh holdout at 8 new head pairs, scored once: no sink 17 changed at 0.739 (worst 0.921), sink 16 changed
+    # at 0.807 (worst 1.016). Nightly rows moved: 9 llama3.2 at 0.761 of the backend, 8 gpt-oss (sink) at 0.591. Off the tile unchanged.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 34.161, "sm80_paged_d64_v2_20261117"
+        "ge", 29.292, "sm80_paged_d64_ontile_pcie_20261118"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa", True): Entry("ge", 26.588, "sm80_prefill_gaps_20261117"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", False): Entry("ge", 33.792, "sm80_prefill_gaps_20261117"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", False): Entry(
+        "ge", 30.044, "sm80_paged_d64_ontile_pcie_20261118"
+    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", True, "gqa", True): Entry("ge", 27.047, "sm80_prefill_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", False): Entry(
         "ge", 7.792, "sm80_prefill_gaps_20261117", "tiles"

@@ -566,7 +566,9 @@ def test_sm80_generation_gaps_follow_their_study(s_kv):
         dict(d_qk=128, d_v=128, h_q=80, h_kv=8, s_q=8, window_left=1023),
     )
     for over in leads:
-        assert pt.matched_entry(row, f(**over)).study == study, over
+        on_tile_d64_sink = over == dict(has_sink=True) and s_kv % 128 == 0
+        expected = "sm80_paged_d64_ontile_pcie_20261118" if on_tile_d64_sink else study
+        assert pt.matched_entry(row, f(**over)).study == expected, over
         assert pt.lookup(row, f(**over)) is True, over
     assert pt.matched_entry(row, f(s_q=1, window_left=2047)) is None
     thd = f(s_q=8, thd=True, max_total_seq_len_q=32)
@@ -595,7 +597,9 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
         dict(d_qk=512, d_v=512, h_q=64, h_kv=1, has_paged_kv=False, thd=False, max_total_seq_len_q=None, page_size=0, padded=False),
     )
     for over in leads:
-        assert pt.matched_entry(row, f(**over)).study == study, over
+        on_tile_d64_sink = over == dict(has_sink=True) and s_kv % 128 == 0
+        expected = "sm80_paged_d64_ontile_pcie_20261118" if on_tile_d64_sink else study
+        assert pt.matched_entry(row, f(**over)).study == expected, over
         assert pt.lookup(row, f(**over)) is True, over
     small = dict(s_q=32, s_kv=1024 + s_kv % 2, max_total_seq_len_q=32)
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
@@ -607,25 +611,26 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
 
 
 @pytest.mark.L0
-def test_sm80_paged_d64_no_sink_on_tile_floor_follows_v2():
-    """sm80_paged_d64_v2_20261117 (confirmed by v3): A100 paged THD-Q d64 causal prefill without a sink leads on the KV tile from cost
-    2^34.161; llama3.2-1b 32/8 at b 4, S_q 512 over 32k ran the backend at 1.80x under the old 2^37.292 floor. The sink and off-tile
-    classes keep sm80_prefill_gaps_20261117's entries."""
+@pytest.mark.parametrize("sink", [False, True], ids=["no_sink", "sink"])
+def test_sm80_paged_d64_on_tile_floors_follow_the_pcie_study(sink):
+    """sm80_paged_d64_ontile_pcie_20261118 (A100 80GB PCIe): paged THD-Q d64 causal prefill on the KV tile leads from cost 2^29.292
+    without a sink and 2^30.044 with one (the 2^34.161 / 2^33.792 floors were fit on a 275 W board), so llama3.2 and gpt-oss chunks
+    at cost 2^31-2^34 (FROST 0.51-0.92 of the backend) lead; small chunks keep the backend. Off the tile the earlier entries stay."""
     row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_paged_d64_ontile_pcie_20261118"
 
     def f(**over):
-        base = dict(b=4, h_q=32, h_kv=8, s_q=512, s_kv=32768, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(8, 0))
-        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=4 * 512)
+        base = dict(b=4, h_q=32, h_kv=8, s_q=128, s_kv=8192, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=4 * 128, has_sink=sink)
         base.update(over)
         return _facts(**base)
 
     moved = f()
-    assert pt.matched_entry(row, moved).study == "sm80_paged_d64_v2_20261117"
-    assert 34.161 <= pt.FEATURES["cost"](moved) < 37.292
+    assert 31.0 <= pt.FEATURES["cost"](moved) < 33.792
+    assert pt.matched_entry(row, moved).study == study
     assert pt.lookup(row, moved) is True
-    assert pt.lookup(row, f(b=1, s_q=128, s_kv=4096, max_total_seq_len_q=128)) is False
-    for over in (dict(has_sink=True), dict(s_kv=32769)):
-        assert pt.matched_entry(row, f(**over)).study == "sm80_prefill_gaps_20261117", over
+    assert pt.lookup(row, f(b=1, h_q=8, h_kv=2, s_q=32, s_kv=1024, max_total_seq_len_q=32)) is False
+    assert pt.matched_entry(row, f(s_kv=8193)).study == "sm80_prefill_gaps_20261117"
 
 
 @pytest.mark.L0
