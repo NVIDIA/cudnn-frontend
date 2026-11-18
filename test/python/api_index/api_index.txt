@@ -1037,6 +1037,7 @@ cudnn.knob_type.CLUSTER_K_REDUCE
 cudnn.knob_type.CTA_COUNT
 cudnn.knob_type.CTA_GROUP
 cudnn.knob_type.EDGE
+cudnn.knob_type.FULL_PRECISION_MATH
 cudnn.knob_type.IDX_MODE
 cudnn.knob_type.INPUT_TMA_ENABLE
 cudnn.knob_type.KERNEL_CFG

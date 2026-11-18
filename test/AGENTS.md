@@ -208,6 +208,12 @@ tests and samples use this separation.
 
 ## Python tests (`test/python`)
 
+When adding a public Python export, including an enum member, regenerate
+`test/python/api_index/api_index.txt` using the same built package and inspect
+the diff. Run the API-index unittest suite with `CUDNN_API_INDEX_PACKAGE_ROOT`
+set to that package; without it, the runtime API check is skipped. This check
+needs no GPU.
+
 Architecture-specific test adjustments use device capability, not an engine-name
 suffix. Explicit implementation names can change during a migration while the
 scheduler domain stays the same. The D64 origins-helper host control exercises
