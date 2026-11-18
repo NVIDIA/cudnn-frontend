@@ -1,0 +1,107 @@
+{
+  "inputs": {
+    "descale_k": {
+      "dtype": "torch.float32",
+      "sha256": "d388666e2351caf97e32db79dd5efdff3de2d4073eff49ef61edc7d7fd6a6250",
+      "shape": [
+        1
+      ]
+    },
+    "descale_q": {
+      "dtype": "torch.float32",
+      "sha256": "030a1a64b337c633d995221728d15e8b0d086cc0dcf4557205111b089b04464d",
+      "shape": [
+        1
+      ]
+    },
+    "descale_v": {
+      "dtype": "torch.float32",
+      "sha256": "2f0d6f3d65a7e28c4223e4389106e46f1e9010a2bd724d35f9794cb8a86d7c68",
+      "shape": [
+        1
+      ]
+    },
+    "k": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "5e7c69d3837f4426142d85f4639450d70d0eae393853e067d812659eb9d2b064",
+      "shape": [
+        2,
+        257,
+        256
+      ]
+    },
+    "public_s_pair": {
+      "dtype": "torch.float32",
+      "sha256": "cc73355d8e606c23e23bb973812acf0231bbc9e5e62c6e9d3d96fad5a2e13908",
+      "shape": [
+        2
+      ]
+    },
+    "q": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "3fafca923cf12fc05ba3192021823ccb3a2fe26d959e89896c1c2f00ed03c009",
+      "shape": [
+        4,
+        129,
+        256
+      ]
+    },
+    "scale_o": {
+      "dtype": "torch.float32",
+      "sha256": "ffcd594324296033e35bb6b3ea4a3d6e9b3b4db169f4e1968861c5746a9bf958",
+      "shape": [
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "908eaf534c7b60846c517a45020bbe38cf3b840b20d257233483389ae8d52896",
+      "shape": [
+        2,
+        257,
+        256
+      ]
+    }
+  },
+  "outputs": {
+    "amax_o": {
+      "dtype": "torch.float32",
+      "sha256": "b0955e7343df6ed0c01bfe01393ebaaefb437d8a2428aabed0e1203c41ad2916",
+      "shape": [
+        1
+      ]
+    },
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "612cd823e8c354a83674752ea4f616c2f61a72ee928a8d98ee384e5cb125fd25",
+      "shape": [
+        129,
+        4
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "c45bb6378278c3decd85f2db94a6944c9b419b8ba72828e442f2612c07219c23",
+      "shape": [
+        129,
+        4,
+        256
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13050,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      7
+    ],
+    "sm_count": 208,
+    "torch": "2.11.0+cu130",
+    "tvm_ffi": "0.1.12"
+  },
+  "schema": 1
+}

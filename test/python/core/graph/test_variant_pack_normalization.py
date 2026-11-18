@@ -82,8 +82,9 @@ def test_operand_order_is_the_backend_order():
 
     A walk over node ports cannot produce it: a tensor's ragged_offset is a
     user operand but hangs off the Tensor rather than off a port, and the slots
-    the graph fills itself (pass-by-value scalars, slice replacement
-    destinations, workspace modifications) must be excluded.
+    the graph fills internally (slice replacement destinations and workspace
+    modifications) must be excluded. Runtime PBV scalars remain overridable
+    input slots even when the graph owns their default value.
     """
     g, _, _ = _matmul_graph()
     order = g._variant_pack_uids()

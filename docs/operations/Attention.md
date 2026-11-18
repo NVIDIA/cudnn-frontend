@@ -1081,8 +1081,8 @@ Args:
     descale_q (cudnn_tensor): Descale factor for query.
     descale_k (cudnn_tensor): Descale factor for key.
     descale_v (cudnn_tensor): Descale factor for value.
-    descale_s (cudnn_tensor): Descale factor for S tensor.
-    scale_s (cudnn_tensor): Scale factor for S tensor.
+    descale_s (Optional[cudnn_tensor]): Descale factor for S; omit together with scale_s to use the qualified default described below.
+    scale_s (Optional[cudnn_tensor]): Scale factor for S; omit together with descale_s to use the qualified default described below.
     scale_o (cudnn_tensor): Scale factor for output.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
     bias (Optional[cudnn_tensor]): The bias data for attention. Default is None. See the bias tensor contract in the Input Tensors table.
@@ -1105,6 +1105,25 @@ Returns:
     amax_o (cudnn_tensor): The absolute maximum of output tensor.
 ```
 
+#### Optional S operands in the Python graph
+
+For E4M3 inputs without dropout, `graph.sdpa_fp8` accepts either both
+`scale_s` and `descale_s`, or neither. Omitting both declares graph-owned
+runtime defaults `(256.0, 1.0 / 256.0)` before the backend or FROST provider
+is selected. Callers need no scalar buffer allocation for these defaults.
+Use keyword arguments when omitting the pair; the positional argument order
+is unchanged.
+
+Supplying both operands applies their declared values. The values need not
+be reciprocals, and `(1.0, 1.0)` requests identity scaling. Supplying only one
+operand is an error. Other input formats and dropout require an explicit
+pair; they do not inherit the E4M3 default.
+
+The scale and descale surround a low-precision conversion. Reciprocal values
+therefore do not promise the same rounded result as identity scaling. The
+operands belong to the numerical graph contract, not the tuning-knob space.
+The C++ graph API continues to take explicit S operands.
+
 #### Configurable Options
 
 The current FP8 support is a subset of the options supported in FP16 and BF16 support.
@@ -1117,7 +1136,7 @@ The current FP8 support is a subset of the options supported in FP16 and BF16 su
 - Requires Hopper (SM90) or newer architecture.
 - Head dimension must be a multiple of 16.
 - Masking support is limited compared to FP16/BF16; FP8 supports causal, padding and bias masks.
-- Requires explicit scale/descale tensors for all FP8 inputs and outputs.
+- Q/K/V descales and the O scale remain explicit. The Python graph S pair follows the optional-operand contract above.
 
 #### Tensors
 

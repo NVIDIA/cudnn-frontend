@@ -26,7 +26,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _launch_public_s, _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one, _public_s_scale_factors
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
 from dataclasses import dataclass
@@ -573,8 +573,14 @@ def _kernel(
     thd_origins: Optional[cute.Tensor] = None,
     qk_padded: cutlass.Constexpr[bool] = False,
     v_padded: cutlass.Constexpr[bool] = False,
+    scale_s_t=None,
+    descale_s_t=None,
+    fixed_s_pair: cutlass.Constexpr = None,
 ) -> None:
 
+    if cutlass.const_expr(fixed_s_pair is not None):
+        scale_s_t = fixed_s_pair[0]
+        descale_s_t = fixed_s_pair[1]
     if cutlass.const_expr(CFG.SPLIT_KV > 1):
         _initialize_split_amax(amax_o_tensor)
     if cutlass.const_expr(thd_origins is not None):
@@ -736,7 +742,8 @@ def _kernel(
         scale_log2_fused = cute.math.abs(
             scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         )
-    o_scale_fused = o_scale_fused * cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * _scale_or_one(scale_o_t)
+    p_cast_gain, pv_gain = _public_s_scale_factors(scale_s_t, descale_s_t, 0, CFG.RESCALE_THRESHOLD)
+    o_scale_fused = o_scale_fused * cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * _scale_or_one(scale_o_t) * pv_gain
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -786,6 +793,7 @@ def _kernel(
             softmax_exchange=softmax_exchange,
             mb_softmax_max=mb_softmax_max,
             mb_softmax_hi_loaded=mb_softmax_hi_loaded,
+            p_cast_gain=p_cast_gain,
         )
 
     elif cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2) and warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -817,6 +825,7 @@ def _kernel(
             softmax_exchange=softmax_exchange,
             mb_softmax_max=mb_softmax_max,
             mb_softmax_hi_loaded=mb_softmax_hi_loaded,
+            p_cast_gain=p_cast_gain,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -1851,6 +1860,7 @@ def _softmax_warp_group(
     softmax_exchange,
     mb_softmax_max,
     mb_softmax_hi_loaded,
+    p_cast_gain: cutlass.Float32,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
     tmem_base = tmem_ptr_i32.load()
@@ -2053,7 +2063,7 @@ def _softmax_warp_group(
                         p_addr_base + cutlass.Int32(softmax_half * P_COLS_PER_CHUNK),
                         cutlass.Float32,
                     ),
-                    chunk_P_a.to(STORAGE_DTYPE),
+                    (chunk_P_a * p_cast_gain).to(STORAGE_DTYPE),
                 )
                 chunk_P_b = _exp2_dense_chunk_b(reg_S_half[P_SUBCHUNK:CHUNK].vec, softmax_half)
                 new_p_sum_pair = new_p_sum_pair + row_reduction_pair(chunk_P_b)
@@ -2063,7 +2073,7 @@ def _softmax_warp_group(
                         p_addr_base + cutlass.Int32(softmax_half * P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK),
                         cutlass.Float32,
                     ),
-                    chunk_P_b.to(STORAGE_DTYPE),
+                    (chunk_P_b * p_cast_gain).to(STORAGE_DTYPE),
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(softmax_half)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2213,7 +2223,7 @@ def _softmax_warp_group(
                             p_addr_base + cutlass.Int32(softmax_half * P_COLS_PER_CHUNK),
                             cutlass.Float32,
                         ),
-                        chunk_P_a.to(STORAGE_DTYPE),
+                        (chunk_P_a * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     chunk_P_b = cute.math.exp2(reg_S_half[P_SUBCHUNK:CHUNK].vec, fastmath=True)
                     new_p_sum_pair = new_p_sum_pair + row_reduction_pair(chunk_P_b)
@@ -2223,7 +2233,7 @@ def _softmax_warp_group(
                             p_addr_base + cutlass.Int32(softmax_half * P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK),
                             cutlass.Float32,
                         ),
-                        chunk_P_b.to(STORAGE_DTYPE),
+                        (chunk_P_b * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(softmax_half)].arrive(
@@ -2306,13 +2316,13 @@ def _softmax_warp_group(
 
                 chunk_P_0a = cute.math.exp2(reg_S[0:P_SUBCHUNK].vec, fastmath=True)
                 hoisted_sum = row_reduction_pair(chunk_P_0a)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
+                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), (chunk_P_0a * p_cast_gain).to(STORAGE_DTYPE))
                 chunk_P_0b = cute.math.exp2(reg_S[P_SUBCHUNK:CHUNK].vec, fastmath=True)
                 hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
                 nvvm.tcgen05_st(
                     "32x32b",
                     nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                    chunk_P_0b.to(STORAGE_DTYPE),
+                    (chunk_P_0b * p_cast_gain).to(STORAGE_DTYPE),
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2324,14 +2334,14 @@ def _softmax_warp_group(
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32),
-                        chunk_P_1a.to(STORAGE_DTYPE),
+                        (chunk_P_1a * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     chunk_P_1b = cute.math.exp2(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, fastmath=True)
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                        chunk_P_1b.to(STORAGE_DTYPE),
+                        (chunk_P_1b * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2397,17 +2407,17 @@ def _softmax_warp_group(
 
                 chunk_P_0a = _exp2_dense_chunk_a(reg_S[0:P_SUBCHUNK].vec, 0)
                 if cutlass.const_expr(_E5_STYLE_SOFTMAX and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
-                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), (chunk_P_0a * p_cast_gain).to(STORAGE_DTYPE))
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
                 else:
                     hoisted_sum = row_reduction_pair(chunk_P_0a)
-                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), (chunk_P_0a * p_cast_gain).to(STORAGE_DTYPE))
                 chunk_P_0b = _exp2_dense_chunk_b(reg_S[P_SUBCHUNK:CHUNK].vec, 3)
                 if cutlass.const_expr(_E5_STYLE_SOFTMAX and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                        chunk_P_0b.to(STORAGE_DTYPE),
+                        (chunk_P_0b * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
                 else:
@@ -2415,7 +2425,7 @@ def _softmax_warp_group(
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                        chunk_P_0b.to(STORAGE_DTYPE),
+                        (chunk_P_0b * p_cast_gain).to(STORAGE_DTYPE),
                     )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2427,14 +2437,14 @@ def _softmax_warp_group(
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32),
-                        chunk_P_1a.to(STORAGE_DTYPE),
+                        (chunk_P_1a * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     chunk_P_1b = _exp2_dense_chunk_b(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, 2)
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                        chunk_P_1b.to(STORAGE_DTYPE),
+                        (chunk_P_1b * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2511,13 +2521,13 @@ def _softmax_warp_group(
 
                 chunk_P_0a = cute.math.exp2(reg_S[0:P_SUBCHUNK].vec, fastmath=True)
                 hoisted_sum = row_reduction_pair(chunk_P_0a)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
+                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), (chunk_P_0a * p_cast_gain).to(STORAGE_DTYPE))
                 chunk_P_0b = cute.math.exp2(reg_S[P_SUBCHUNK:CHUNK].vec, fastmath=True)
                 hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
                 nvvm.tcgen05_st(
                     "32x32b",
                     nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                    chunk_P_0b.to(STORAGE_DTYPE),
+                    (chunk_P_0b * p_cast_gain).to(STORAGE_DTYPE),
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2529,14 +2539,14 @@ def _softmax_warp_group(
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32),
-                        chunk_P_1a.to(STORAGE_DTYPE),
+                        (chunk_P_1a * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     chunk_P_1b = cute.math.exp2(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, fastmath=True)
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                        chunk_P_1b.to(STORAGE_DTYPE),
+                        (chunk_P_1b * p_cast_gain).to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -3003,6 +3013,8 @@ def _host(
     paged_hnd_prepared: cutlass.Constexpr[bool] = False,
     thd_origin_ptrs=None,
     thd_origin_specs: cutlass.Constexpr = None,
+    scale_s_t=None,
+    descale_s_t=None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -3175,41 +3187,50 @@ def _host(
             if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL)
             else (grid_q_supers * (QH // HEADS_PER_TILE) * B * SPLIT_KV, 1, 1)
         )
-    _kernel(
-        tma_q_desc,
-        tma_k_desc,
-        tma_v_desc,
-        tma_o_desc,
-        lse_tensor,
-        sinks_tensor,
-        seq_kv_lens_tensor,
-        o_desc_words,
-        cutlass.Int32(SQ),
-        cutlass.Int32(SKV),
-        cutlass.Int32(q_supers),
-        cutlass.Int32(QH // HEADS_PER_TILE),
-        cutlass.Int32(B),
-        cutlass.Int32(QH // KH),
-        scale_softmax_log2,
-        o_scale_fused,
-        descale_q_t,
-        descale_k_t,
-        descale_v_t,
-        scale_o_t,
-        amax_o_tensor,
-        bottom_right_diagonal,
-        seq_q_lens_addr,
-        o_partial_f32,
-        block_table_tensor,
-        block_table_v_tensor,
-        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
-        qk_padded=qk_padded,
-        v_padded=v_padded,
-    ).launch(
-        grid=grid_shape,
-        block=[CFG.THREADS_PER_CTA, 1, 1],
-        cluster=(CFG.CTA_MMA, 1, 1),
-        stream=stream,
+    _launch_public_s(
+        _kernel,
+        (
+            tma_q_desc,
+            tma_k_desc,
+            tma_v_desc,
+            tma_o_desc,
+            lse_tensor,
+            sinks_tensor,
+            seq_kv_lens_tensor,
+            o_desc_words,
+            cutlass.Int32(SQ),
+            cutlass.Int32(SKV),
+            cutlass.Int32(q_supers),
+            cutlass.Int32(QH // HEADS_PER_TILE),
+            cutlass.Int32(B),
+            cutlass.Int32(QH // KH),
+            scale_softmax_log2,
+            o_scale_fused,
+            descale_q_t,
+            descale_k_t,
+            descale_v_t,
+            scale_o_t,
+            amax_o_tensor,
+            bottom_right_diagonal,
+            seq_q_lens_addr,
+            o_partial_f32,
+            block_table_tensor,
+            block_table_v_tensor,
+        ),
+        dict(
+            thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
+            qk_padded=qk_padded,
+            v_padded=v_padded,
+        ),
+        dict(
+            grid=grid_shape,
+            block=[CFG.THREADS_PER_CTA, 1, 1],
+            cluster=(CFG.CTA_MMA, 1, 1),
+            stream=stream,
+        ),
+        scale_s_t,
+        descale_s_t,
+        CFG.DTYPE_QKV == 0,
     )
 
 
@@ -3228,6 +3249,7 @@ def compile_prepared(
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
     thd_origin_specs: Optional[tuple] = None,
+    s_scales: Optional[tuple[bool, bool]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
@@ -3261,6 +3283,7 @@ def compile_prepared(
         scale_o_in_combine,
         paged_hnd,
         thd_origin_specs=thd_origin_specs,
+        s_scales=s_scales,
     )
 
 

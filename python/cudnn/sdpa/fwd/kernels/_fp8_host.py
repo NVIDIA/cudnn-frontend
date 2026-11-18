@@ -67,6 +67,10 @@ def host(
     table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
     thd_origin_ptrs: Optional[tuple] = None,
     thd_origin_specs: cutlass.Constexpr = None,
+    scale_s_ptr: Optional[cute.Pointer] = None,
+    descale_s_ptr: Optional[cute.Pointer] = None,
+    scale_s_value: Optional[cutlass.Float32] = None,
+    descale_s_value: Optional[cutlass.Float32] = None,
     # The prepared binder requires the runtime stream slot to remain last.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -141,6 +145,11 @@ def host(
     if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel_kwargs = dict(prepared=True)
+    if cutlass.const_expr(scale_s_ptr is not None or scale_s_value is not None):
+        kernel_kwargs.update(
+            scale_s_t=scalar(scale_s_ptr) if cutlass.const_expr(scale_s_ptr is not None) else scale_s_value,
+            descale_s_t=scalar(descale_s_ptr) if cutlass.const_expr(descale_s_ptr is not None) else descale_s_value,
+        )
     if cutlass.const_expr(thd_origin_specs is not None):
         kernel_kwargs.update(thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs)
     if cutlass.const_expr(epilogue_gate):
@@ -203,7 +212,12 @@ def compile_host(
     sfo_geometry=None,
     amax_prescaled=False,
     thd_origin_specs=None,
+    s_scales=None,
 ):
+    if s_scales is not None and (len(s_scales) != 2 or any(type(host) is not bool for host in s_scales)):
+        raise ValueError("S scales require two host/device binding modes")
+    if cache_key is not None and s_scales is not None:
+        cache_key = f"{cache_key}:public_s_scales:{s_scales}"
     # None means this specialization cannot be identified for reuse.
     if cache_key is not None and amax_prescaled:
         cache_key = f"{cache_key}:amax_prescaled"
@@ -281,6 +295,10 @@ def compile_host(
             else None
         ),
         thd_origin_specs=thd_origin_specs,
+        scale_s_ptr=P(cutlass.Float32, 4) if s_scales is not None and not s_scales[0] else None,
+        descale_s_ptr=P(cutlass.Float32, 4) if s_scales is not None and not s_scales[1] else None,
+        scale_s_value=cutlass.Float32(0.0) if s_scales is not None and s_scales[0] else None,
+        descale_s_value=cutlass.Float32(0.0) if s_scales is not None and s_scales[1] else None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

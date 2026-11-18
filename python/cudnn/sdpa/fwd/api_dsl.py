@@ -1131,6 +1131,8 @@ class SdpaFwdDsl(APIBase):
         # Stats = -inf).  0 = plain causal.  Numerics-changing, compile-time; served by the SM100 MXFP8 dense d128 body
         # (cc 10.0 / 10.3) at B = 32, the MXFP8 V scale block, and declined typed everywhere else.
         causal_exclude_own_block: int = 0,
+        sample_scale_s: Optional[torch.Tensor | TensorDesc] = None,
+        sample_descale_s: Optional[torch.Tensor | TensorDesc] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -1306,6 +1308,18 @@ class SdpaFwdDsl(APIBase):
         # MXFP8 input: whether execute() binds scale_o (see the constructor doc);
         # False compiles the operand out and the kernel folds an identity.
         self.has_scale_o = sample_scale_o is not None
+        # Public per-tensor S operands specialize only their address space.
+        # Values and pointers are rebound each execute; GPU scales stay live in capture.
+        if (sample_scale_s is None) != (sample_descale_s is None):
+            raise ValueError("scale_s and descale_s must be supplied together")
+        self._s_scale_modes = None
+        if sample_scale_s is not None:
+            if not pertensor_fp8:
+                raise ValueError("scale_s and descale_s are per-tensor FP8 operands")
+            descs = tuple(self._make_tensor_desc(value, name=name) for value, name in ((sample_scale_s, "scale_s"), (sample_descale_s, "descale_s")))
+            if any(desc.dtype != torch.float32 or math.prod(desc.shape) != 1 or desc.device.type not in ("cpu", "cuda") for desc in descs):
+                raise ValueError("scale_s and descale_s require one float32 host or device element")
+            self._s_scale_modes = tuple(desc.device.type == "cpu" for desc in descs)
         # Block-scaled O: 0 (plain), 16 (FP4 O + E4M3 SF), 32 (E4M3 O + UE8M0
         # SF); set by check_support together with the SF_O layout geometry.
         self.o_block_scale = 0
@@ -1787,6 +1801,8 @@ class SdpaFwdDsl(APIBase):
         from cudnn._torch_stream import device_context
 
         spec = self._thd_spec if self.thd else self._dense_spec
+        if spec.quant.s_scales is None and any(scales.get(name) is not None for name in ("scale_s", "descale_s")):
+            raise ValueError("S scales require a specialization constructed with both S samples")
         if self.thd:
             # Standalone declarations fix both counts, including independent
             # prefix-sum forms. Graph binding may use a smaller effective batch.
@@ -4727,6 +4743,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         km = self._k_mod
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
         accepted = _parameter_names(compile_fn)
+        if self._s_scale_modes is not None and "s_scales" not in accepted:
+            raise NotImplementedError("this FP8 implementation does not yet consume public S scales")
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
         if getattr(self, "_thd_origin_specs", None) is not None:
             if "thd_origin_specs" not in accepted:
@@ -4754,6 +4772,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             kw["has_scale_o"] = bool(self.o_block_scale and self.has_scale_o)
         if "has_amax" in accepted:
             kw["has_amax"] = self.has_amax_o
+        if "s_scales" in accepted:
+            kw["s_scales"] = self._s_scale_modes
         if "scale_o_in_combine" in accepted:
             kw["scale_o_in_combine"] = self._split_scale_o()
         if "d_qk" in accepted:  # head-dim envelope
@@ -5066,6 +5086,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         kv_mask_tensor: Optional[torch.Tensor] = None,
         ragged_k: Optional[torch.Tensor] = None,
         ragged_v: Optional[torch.Tensor] = None,
+        scale_s: Optional[torch.Tensor] = None,
+        descale_s: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
 
@@ -5261,7 +5283,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sinks,
                 seq_q_lens,
                 seq_kv_lens,
-                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o, gate=gate),
+                dict(
+                    descale_q=descale_q,
+                    descale_k=descale_k,
+                    descale_v=descale_v,
+                    scale_o=scale_o,
+                    amax_o=amax_o,
+                    sf_o=sf_o,
+                    gate=gate,
+                    scale_s=scale_s,
+                    descale_s=descale_s,
+                ),
                 scale_val,
                 workspace,
                 current_stream,
@@ -7002,6 +7034,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 else {}
             ),
             **({"bias_dtype": "float32" if self.bias_desc.dtype == torch.float32 else "io"} if self.bias_desc is not None else {}),
+            **({"s_scales": self._s_scale_modes} if self._prepared_fp8 else {}),
             persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor in _SM120_WIDE_F16_FLAVORS else 0,
         )
         if self.thd:
@@ -7044,6 +7077,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         ragged_o: Optional[torch.Tensor] = None,
         ragged_lse: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
+        scale_s: Optional[torch.Tensor] = None,
+        descale_s: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization.
 
@@ -7059,11 +7094,18 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
         On MXFP8, ``scale_o`` is that O's optional global scale (bound exactly
         when constructed with ``sample_scale_o``).
+        ``scale_s`` / ``descale_s`` bind the pair declared with the corresponding
+        samples for per-tensor FP8. Their values are read on each execution.
+
         Prepared FP8 / MXFP8, half THD and split-KV require caller-owned ``workspace``
         of at least ``scratch_workspace_bytes()`` bytes, contiguous, 16-byte
         aligned and on the Q device. Graph callers use ``get_workspace_size()``.
         """
 
+        self._value_error_if(
+            self._s_scale_modes is None and (scale_s is not None or descale_s is not None),
+            "S scales require a specialization constructed with both S samples",
+        )
         origins = (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)
         if any(value is not None for value in origins) and getattr(self, "_thd_origin_specs", None) is None:
             raise ValueError("physical offsets require a compiled THD origin specialization")
@@ -7120,7 +7162,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if mxfp8:
             quant = dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v, amax_o=amax_o, sf_o=sf_o, scale_o=scale_o)
         elif self._fp8:
-            quant = dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o)
+            quant = dict(
+                descale_q=descale_q,
+                descale_k=descale_k,
+                descale_v=descale_v,
+                scale_o=scale_o,
+                amax_o=amax_o,
+                sf_o=sf_o,
+                scale_s=scale_s,
+                descale_s=descale_s,
+            )
         else:
             quant = {}
         if self._fp8:

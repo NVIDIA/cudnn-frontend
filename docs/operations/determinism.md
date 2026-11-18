@@ -111,6 +111,7 @@ arbitrary user callbacks.
 | FROST native D64 dense/THD paged forward (standalone qualification; fixed split count and packing) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations, including matching-half THD splits) |
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | FROST D128 paged forward with at most eight live query rows per packed unit (fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported for this lowering | Supported (tested configurations) | Unsupported for this lowering |
+| `pygraph.sdpa_fp8`, FROST public S defaults or explicit `(256, 1/256)`; fixed records described below | fprop | E4M3 Q/K/V, BF16 O, FP32 Stats/Amax | Unsupported for these FROST implementations | Supported (SM100 and SM103, tested configurations) | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D128 paged decode with at most eight live query rows per packed unit (fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | SM100: Supported (tested configurations); SM103: Supported (tested D128 paged configurations, existing lowering) | Unsupported for this lowering |
 | `pygraph.sdpa_fp8`, FROST D64/D128 paged KV with dense Q (fixed CTA width, packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or matching FP8 O | Unsupported | Supported (tested configurations) | Unverified by this suite |
@@ -1088,3 +1089,27 @@ Stats-stride-override or batch-invariance claim.
 See the [SM107 support reference](../../python/cudnn/sdpa/frost/support/sm107.md)
 for the implementation boundaries and the
 [coverage report](../../test/python/determinism_goldens/README.md) for measured scope.
+
+## Public S operands with fixed forward plans
+
+The public S suite verifies repeatability and batch invariance for E4M3
+Q/K/V and BF16 O with omitted defaults or a device `(256, 1/256)` pair.
+SM100/SM103 cover D128 multi-Q (CGA1/2), dual-KV, swap-AB, D192/V128
+(CGA1/2), D256 and D512. SM107 covers the four native D128/D192/D256/D512
+bodies with FP16 and FP32 softmax, plus the shared FP32 swap-AB body.
+SM120 has the same bounded support for its general D64/D128/D256 and
+paired D512 forward bodies.
+
+These checks fix the engine, tile, CTA group, unpacked GQA and split count
+one. They cover dense and supported nonpaged THD layouts; dual-KV and
+swap-AB use dense queries, and SM100/SM103 unsplit D128 FP8 THD requires
+CGA2. Per-request O and FP32 Stats preserve bytes across singleton,
+reordered and duplicated batches and changed neighbors. Global Amax_O is
+checked against the maximum of the singleton results.
+
+The status is limited to these configurations on a fixed runtime. Automatic
+plan changes, other public S values, FP8 outputs, dropout, paging, other
+precisions and backward are not qualified by this suite. It does not change
+engine behavior notes or backend determinism declarations. The dated
+[coverage report](../../test/python/determinism_goldens/README.md#public-s-forward-contract-2026-11-17)
+records runtime and execution evidence.

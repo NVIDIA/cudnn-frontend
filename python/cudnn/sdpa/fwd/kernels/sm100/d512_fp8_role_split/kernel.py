@@ -36,7 +36,8 @@ them is derived from ``CFG`` rather than spelled as a literal:
     ``descale_v * scale_o`` into ``o_scale_fused``, which the epilogue folds
     into ``beta``.  ``Amax_O`` is produced in-kernel by atomicMax over the
     fp32 pre-cast output and divided by ``scale_o`` on device in the adapter.
-    ``descale_s`` / ``scale_s`` are accepted and ignored (P is cast unscaled).
+    Explicit S scales apply at the P conversion and matching output fold;
+    row sums and Stats keep their original units.
 
 MXFP8 (block-scale) uses its separate D512 implementation.
 """
@@ -56,7 +57,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _launch_public_s, _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one, _public_s_scale_factors
 from cutlass.base_dsl.typing import Pointer
 import cuda.bindings.driver as _cuda_driver
 
@@ -511,8 +512,8 @@ def _kernel(
     # 1-element fp32 DEVICE scales (Rule 3: no host readback anywhere).  The
     # kernel folds descale_q*descale_k into scale_softmax_log2 and
     # descale_v*scale_o into o_scale_fused; the scalar args carry only the
-    # bases (attn*log2(e) and 1.0).  descale_s / scale_s are accepted by the
-    # adapter and ignored — P is cast unscaled.
+    # bases (attn*log2(e) and 1.0). Public S operands are applied separately
+    # at the P conversion and matching output fold.
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -528,7 +529,13 @@ def _kernel(
     block_table_v_tensor: Optional[cute.Tensor] = None,
     paged_hnd: cutlass.Constexpr[bool] = False,
     thd_origins: Optional[cute.Tensor] = None,
+    scale_s_t=None,
+    descale_s_t=None,
+    fixed_s_pair: cutlass.Constexpr = None,
 ) -> None:
+    if cutlass.const_expr(fixed_s_pair is not None):
+        scale_s_t = fixed_s_pair[0]
+        descale_s_t = fixed_s_pair[1]
     if cutlass.const_expr(CFG.SPLIT_KV > 1):
         _initialize_split_amax(amax_o_tensor)
     if cutlass.const_expr(thd_origins is not None):
@@ -646,7 +653,8 @@ def _kernel(
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = _scale_or_one(scale_o_t)
     scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
-    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
+    p_cast_gain, pv_gain = _public_s_scale_factors(scale_s_t, descale_s_t, 0, CFG.RESCALE_THRESHOLD)
+    o_scale_fused = o_scale_fused * _dsc_v * _scl_o * pv_gain
 
     sg_id = cta_id_x // cutlass.Int32(CFG.CTA_MMA)
     is_sg0 = sg_id == cutlass.Int32(0)
@@ -746,6 +754,7 @@ def _kernel(
             qh_per_kh=qh_per_kh,
             o_partial_f32=o_partial_f32,
             thd_origins=thd_origins,
+            p_cast_gain=p_cast_gain,
         )
 
     elif warp_idx == cutlass.Int32(CFG.MMA_WARP_ID):
@@ -897,6 +906,7 @@ def _sg0_softmax_kv_iter(
     is_lead_warp,
     leader_cta_id,
     cross_sg_peer,
+    p_cast_gain: cutlass.Float32,
 ):
     cur_parity_S = sg0_xfer_state.idx
     cur_phase_S = sg0_xfer_state.phase
@@ -985,7 +995,7 @@ def _sg0_softmax_kv_iter(
 
         reg_S_chunk = reg_S_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
         reg_P_fp32_chunk = cute.math.exp2(reg_S_chunk * scale_log2 - total_max_safe, fastmath=True)
-        reg_P_half_chunk = reg_P_fp32_chunk.to(P_STORAGE_DTYPE)
+        reg_P_half_chunk = (reg_P_fp32_chunk * p_cast_gain).to(P_STORAGE_DTYPE)
         total_sum_vec = total_sum_vec + row_reduction_pair(reg_P_fp32_chunk)
 
         smem_off = cutlass.Int32(chunk * P_BLOCK_BYTES) + tid_in_wg * cutlass.Int32(P_D_BLOCK)
@@ -1058,6 +1068,7 @@ def _compute_warp_group(
     qh_per_kh,
     o_partial_f32=None,
     thd_origins: Optional[cute.Tensor] = None,
+    p_cast_gain: cutlass.Float32 = 1.0,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WG_WARPS + 1))
     tmem_base_addr = tmem_ptr_i32.load()
@@ -1169,6 +1180,7 @@ def _compute_warp_group(
                             is_lead_warp,
                             leader_cta_id,
                             cross_sg_peer,
+                            p_cast_gain=p_cast_gain,
                         )
                 else:
                     for _kv in cutlass.range(kv_left, kv_unmasked_lo, 1, unroll=1):
@@ -1192,6 +1204,7 @@ def _compute_warp_group(
                             is_lead_warp,
                             leader_cta_id,
                             cross_sg_peer,
+                            p_cast_gain=p_cast_gain,
                         )
                     for _kv in cutlass.range(kv_unmasked_lo, kv_unmasked_hi, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_max_safe, total_sum_vec = _sg0_softmax_kv_iter(
@@ -1214,6 +1227,7 @@ def _compute_warp_group(
                             is_lead_warp,
                             leader_cta_id,
                             cross_sg_peer,
+                            p_cast_gain=p_cast_gain,
                         )
                     for _kv in cutlass.range(kv_unmasked_hi, kv_right, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_max_safe, total_sum_vec = _sg0_softmax_kv_iter(
@@ -1236,6 +1250,7 @@ def _compute_warp_group(
                             is_lead_warp,
                             leader_cta_id,
                             cross_sg_peer,
+                            p_cast_gain=p_cast_gain,
                         )
 
             bars.mb_stats_xfer_empty.wait(stats_xfer_empty_state.phase)
@@ -2456,6 +2471,8 @@ def _host(
     paged_hnd_prepared: cutlass.Constexpr[bool] = False,
     thd_origin_ptrs=None,
     thd_origin_specs: cutlass.Constexpr = None,
+    scale_s_t=None,
+    descale_s_t=None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2576,41 +2593,49 @@ def _host(
             if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL)
             else (grid_q_supers * (QH // HEADS_PER_TILE) * B * SPLIT_KV, 1, 1)
         )
-    _kernel(
-        tma_q_desc,
-        tma_k_desc,
-        tma_v_desc,
-        tma_o_desc,
-        lse_tensor,
-        sinks_tensor,
-        seq_kv_lens_tensor,
-        o_desc_words,
-        cutlass.Int32(SQ),
-        cutlass.Int32(SKV),
-        cutlass.Int32(q_supers),
-        cutlass.Int32(QH // HEADS_PER_TILE),
-        cutlass.Int32(B),
-        cutlass.Int32(QH // KH),
-        scale_softmax_log2,
-        o_scale_fused,
-        descale_q_t,
-        descale_k_t,
-        descale_v_t,
-        scale_o_t,
-        amax_o_tensor,
-        seq_q_lens_addr,
-        o_partial_f32,
-        block_table_tensor,
-        block_table_v_tensor,
-        paged_hnd_prepared,
-        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
-    ).launch(
-        grid=grid_shape,
-        block=[CFG.THREADS_PER_CTA, 1, 1],
-        cluster=(CFG.CGA_M, CFG.CGA_N, 1),
-        stream=stream,
-        # Keep the paged producer/consumer register split live in ptxas.
-        min_blocks_per_mp=1 if PAGED_KV else 0,
+    _launch_public_s(
+        _kernel,
+        (
+            tma_q_desc,
+            tma_k_desc,
+            tma_v_desc,
+            tma_o_desc,
+            lse_tensor,
+            sinks_tensor,
+            seq_kv_lens_tensor,
+            o_desc_words,
+            cutlass.Int32(SQ),
+            cutlass.Int32(SKV),
+            cutlass.Int32(q_supers),
+            cutlass.Int32(QH // HEADS_PER_TILE),
+            cutlass.Int32(B),
+            cutlass.Int32(QH // KH),
+            scale_softmax_log2,
+            o_scale_fused,
+            descale_q_t,
+            descale_k_t,
+            descale_v_t,
+            scale_o_t,
+            amax_o_tensor,
+            seq_q_lens_addr,
+            o_partial_f32,
+            block_table_tensor,
+            block_table_v_tensor,
+            paged_hnd_prepared,
+        ),
+        dict(
+            thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
+        ),
+        dict(
+            grid=grid_shape,
+            block=[CFG.THREADS_PER_CTA, 1, 1],
+            cluster=(CFG.CGA_M, CFG.CGA_N, 1),
+            stream=stream,
+            min_blocks_per_mp=1 if PAGED_KV else 0,
+        ),
+        scale_s_t,
+        descale_s_t,
+        CFG.DTYPE_QKV == 0,
     )
 
 
@@ -2629,6 +2654,7 @@ def compile_prepared(
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
     thd_origin_specs: Optional[tuple] = None,
+    s_scales: Optional[tuple[bool, bool]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
@@ -2662,4 +2688,5 @@ def compile_prepared(
         scale_o_in_combine,
         paged_hnd,
         thd_origin_specs=thd_origin_specs,
+        s_scales=s_scales,
     )

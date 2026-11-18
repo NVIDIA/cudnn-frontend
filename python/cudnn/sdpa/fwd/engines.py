@@ -5037,6 +5037,16 @@ def _epilogue_gate_ctor_kwargs(facts: "ga.SdpaGraphFacts", ctor_params: frozense
     return out
 
 
+def _s_scale_sample(t, name):
+    if t is None:
+        return None
+    from dataclasses import replace
+    from cudnn.api_base import Device
+
+    desc = ga.tensor_desc_from_ir(t, name)
+    return replace(desc, device=Device("cpu")) if t.get_is_pass_by_value() else desc
+
+
 def lower_dsl_prefill(
     spec: EngineSpec,
     facts: "ga.SdpaGraphFacts",
@@ -5117,6 +5127,9 @@ def lower_dsl_prefill(
         paged_table_v_stride=_table_stride(facts.paged_v_table_t) if facts.has_paged_kv else None,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
+        **(
+            {"sample_" + name: _s_scale_sample(t, name) for name, t in (("scale_s", facts.scale_s_t), ("descale_s", facts.descale_s_t))} if facts.is_fp8 else {}
+        ),
         # Block-scaled O: the sf_o output's declared geometry selects the
         # per-(b,h)-plane or token-major scale-factor layout (see
         # SdpaFwdDsl._sf_o_geometry).
@@ -5455,6 +5468,8 @@ def lower_dsl_prefill(
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
         scale_o=facts.scale_o_t,
+        scale_s=facts.scale_s_t,
+        descale_s=facts.descale_s_t,
         # The gate tail's G is a REQUIRED bound operand; its virtual O_v and s
         # never are (facts.o_t already points at the mul output).
         gate=facts.epilogue_gate_t,
@@ -5545,6 +5560,8 @@ def lower_dsl_prefill(
                 ("descale_k", binding.descale_k),
                 ("descale_v", binding.descale_v),
                 ("scale_o", binding.scale_o),
+                ("scale_s", binding.scale_s),
+                ("descale_s", binding.descale_s),
                 # Block-scaled O: the SF_O output travels with the quantized operands.
                 ("sf_o", binding.sf_o),
             )
@@ -5699,6 +5716,18 @@ def lower_dsl_prefill(
             )
         if _execute.prepared is not None:
             _execute.default_stream = lambda: api._get_default_stream(None)
+            prepared_spec = _execute.prepared.spec
+            quant = getattr(prepared_spec, "quant", None)
+            if quant is not None and any(value is not None for value in quant.s_defaults):
+                # The tensor adapter binds the same graph-owned S defaults as
+                # the direct graph entry. Caller buffers still override them.
+                _execute.tensor_default_uids = tuple(
+                    getattr(binding, role).get_uid() for role, value in zip(("scale_s", "descale_s"), quant.s_defaults) if value is not None
+                )
+                if facts.thd:
+                    api._thd_spec = prepared_spec
+                else:
+                    api._dense_spec = prepared_spec
     if facts.shape_overrides and _execute.prepared is None:
         raise NotImplementedError("this plan has no prepared shape/stride override executor")
     return _execute

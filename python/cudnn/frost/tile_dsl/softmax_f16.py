@@ -45,7 +45,7 @@ from cutlass._mlir.dialects import vector as _vector
 from cutlass._mlir.extras import types as _T
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
-from .pointwise import ex2_f16x2, f16x2_to_f32, f16x2x2_to_fp8_word, fp32_to_fp16, row_reduction_pair
+from .pointwise import ex2_f16x2, f16x2_to_f32, f16x2x2_to_fp8_word, fp32_to_fp16, fp32_to_fp8x2, pack_fp8x2_pairs, row_reduction_pair
 
 # The fused shift+convert needs the DSL's packed f16x2 <- f32x2 subtract in its result-type-first
 # builder form.  The f32x2 op family's form differs and is not a proxy for this op.
@@ -104,8 +104,25 @@ def _exp_pairs(elems, n):
     return [ex2_f16x2(w) for w in pairs]
 
 
-def _fp8_words(p_pairs, fp8_tag, n):
-    """``n // 2`` f16x2 P words -> ``n // 4`` packed FP8 words in :func:`pointwise.fp32_to_fp8_pack` byte order."""
+@cute.jit
+def _scaled_fp8_words(p_pairs, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr, output_scale: cutlass.Float32):
+    """Scale HALF exponents at the FP8 conversion, retaining an identity arm."""
+    words = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(n // 4)), cutlass.Int32)
+    if output_scale == cutlass.Float32(1.0):
+        words = cutlass.Vector.from_elements(tuple(f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], fp8_tag) for g in range(n // 4)), cutlass.Int32)
+    else:
+        unpacked = [f16x2_to_f32(p_pairs[i]) for i in range(n // 2)]
+        dtype = cutlass.Float8E4M3FN if cutlass.const_expr(fp8_tag == "e4m3") else cutlass.Float8E5M2
+        pairs = [fp32_to_fp8x2(lo * output_scale, hi * output_scale, dtype=dtype) for lo, hi in unpacked]
+        words = cutlass.Vector.from_elements(tuple(pack_fp8x2_pairs(pairs[2 * g], pairs[2 * g + 1]) for g in range(n // 4)), cutlass.Int32)
+    return words
+
+
+def _fp8_words(p_pairs, fp8_tag, n, output_scale=None):
+    """Convert P to FP8; optional scaling leaves the caller's row-sum pairs intact."""
+    if output_scale is not None:
+        words = _scaled_fp8_words(cutlass.Vector.from_elements(tuple(p_pairs), cutlass.Int32), fp8_tag, n, output_scale)
+        return [words[i] for i in range(n // 4)]
     return [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], fp8_tag) for g in range(n // 4)]
 
 
@@ -125,33 +142,33 @@ def fused_shift_f16_pairs(elems, m, n):
 
 
 @cute.jit
-def f16_exp_chunk(chunk_S, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr[int] = 64):
+def f16_exp_chunk(chunk_S, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr[int] = 64, output_scale=None):
     """HALF tail for one ``n``-elem chunk of shifted exp-args (f32): f32 pairs pack to f16x2 (CVT),
     the exponent runs as MUFU EX2.F16x2, and P casts straight from f16x2 to the FP8 pair format.
     Returns the ``n // 4`` packed FP8 words (ones-MMA kernels, stats-less)."""
     elems = [chunk_S[i] for i in range(n)]
-    words = _fp8_words(_exp_pairs(elems, n), fp8_tag, n)
+    words = _fp8_words(_exp_pairs(elems, n), fp8_tag, n, output_scale)
     return cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
 
 
 @cute.jit
-def f16_exp_chunk_sum(chunk_S, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr[int] = 64):
+def f16_exp_chunk_sum(chunk_S, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr[int] = 64, output_scale=None):
     """:func:`f16_exp_chunk` plus the EXACT f32 row-sum pair of P (Stats specializations): the
     published LSE keeps the f32 denominator (summing the f16 P instead measured rms 3.6e-4 off it).
     HALF + Stats is honored, not faster than the f32 chain."""
     elems = [chunk_S[i] for i in range(n)]
-    words = _fp8_words(_exp_pairs(elems, n), fp8_tag, n)
+    words = _fp8_words(_exp_pairs(elems, n), fp8_tag, n, output_scale)
     p_sum = row_reduction_pair(cute.math.exp2(chunk_S, fastmath=True))
     return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), p_sum
 
 
 @cute.jit
-def f16_exp_chunk_f16sum(chunk_S, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr[int] = 64):
-    """:func:`f16_exp_chunk` plus the f16-tree row-sum pair of the SAME P words (register-sum kernels,
+def f16_exp_chunk_f16sum(chunk_S, fp8_tag: cutlass.Constexpr, n: cutlass.Constexpr[int] = 64, output_scale=None):
+    """:func:`f16_exp_chunk` plus the f16-tree row-sum pair of the original HALF exponents (register-sum kernels,
     stats-less): O's denominator stays self-consistent with the P the MMA consumes."""
     elems = [chunk_S[i] for i in range(n)]
     p_pairs = _exp_pairs(elems, n)
-    words = _fp8_words(p_pairs, fp8_tag, n)
+    words = _fp8_words(p_pairs, fp8_tag, n, output_scale)
     return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), f16_pairs_sum_pair(p_pairs)
 
 
@@ -174,14 +191,14 @@ def fused_shift_f16_exp_chunk_f16sum(chunk_S_raw, m, fp8_tag: cutlass.Constexpr,
     return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), f16_pairs_sum_pair(p_pairs)
 
 
-def f16_exp_values(values, fp8_tag, n, *, fused_m=None):
+def f16_exp_values(values, fp8_tag, n, *, fused_m=None, output_scale=None):
     """Granularity-free form for kernels that pack P per 16-byte vector (the role-split d512 bodies):
     ``values`` is a list of ``n`` f32 scores (shifted, or RAW when ``fused_m`` is given); returns
     ``(fp8_words, p_pairs)`` as Python lists -- ``n // 4`` packed FP8 words in fp32_to_fp8_pack byte
-    order and the ``n // 2`` f16x2 P words, so the caller can gather the pairs of a whole kv-step and
-    call :func:`f16_pairs_sum_pair` once."""
+    order and the ``n // 2`` unscaled f16x2 P words, so the caller can gather the pairs of a whole kv-step
+    and call :func:`f16_pairs_sum_pair` once. ``output_scale`` affects only FP8 conversion."""
     if fused_m is None:
         p_pairs = _exp_pairs(values, n)
     else:
         p_pairs = [ex2_f16x2(w) for w in fused_shift_f16_pairs(values, fused_m, n)]
-    return _fp8_words(p_pairs, fp8_tag, n), p_pairs
+    return _fp8_words(p_pairs, fp8_tag, n, output_scale), p_pairs

@@ -6,6 +6,7 @@
 // native pack's observed storage/device and effective geometry are kept separate.
 #include "variant_pack.h"
 #include "sdpa_mxfp8_binding.h"
+#include "sdpa_s_scale_binding.h"
 #include <memory>
 
 #include <algorithm>
@@ -345,6 +346,8 @@ class SdpaThdBinder {
                 gate_decl_[4] != 1)
                 invalid("invalid native THD gate declaration");
         }
+        if (quantized_ && py::hasattr(quant, "s_scales") && !quant.attr("s_scales").is_none())
+            s_scales_ = std::make_unique<SdpaSScaleBinding>(spec);
         auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
             // Pointer-origin hosts use each port's physical extent directly;
@@ -489,7 +492,7 @@ class SdpaThdBinder {
                 py::object stream,
                 py::object scale,
                 int64_t gate_index) const {
-        const size_t base_roles = mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles);
+        const size_t base_roles = this->base_roles();
         if (indices.size() != base_roles + (has_origins_ ? 5 : 0))
             invalid("native THD binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
@@ -558,7 +561,7 @@ class SdpaThdBinder {
         py::object origin_ptrs = py::none();
         if (has_origins_) {
             py::list pointers;
-            const size_t base_roles = mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles);
+            const size_t base_roles = this->base_roles();
             for (size_t i = 0; i < 5; ++i) {
                 const auto &offset = facts[base_roles + i];
                 if (!origin_bits_[i]) {
@@ -793,6 +796,14 @@ class SdpaThdBinder {
     }
 
    private:
+    size_t
+    quant_role_prefix() const {
+        return mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles);
+    }
+    size_t
+    base_roles() const {
+        return quant_role_prefix() + (s_scales_ ? 2 : 0);
+    }
     void
     bind_quantized_scalars(const std::vector<NativeOperandView> &facts, BoundLaunch &bound, int64_t workspace) const {
         if (!workspace || workspace % 16) invalid("prepared FP8 requires an aligned caller workspace");
@@ -815,6 +826,15 @@ class SdpaThdBinder {
             }
             pointers[role - DescaleQ] = ptr;
         }
+        if (s_scales_) {
+            if (bound.frame.is_none()) {
+                s_scales_->bind(facts, quant_role_prefix(), nullptr);
+            } else {
+                py::list frame(bound.frame);
+                s_scales_->bind(facts, quant_role_prefix(), &frame);
+                bound.frame = py::tuple(frame);
+            }
+        }
         bound.amax          = pointers[AmaxO - DescaleQ];
         const auto amax_end = add(bound.amax, 4);
         if (facts[AmaxO].filled && workspace < amax_end && bound.amax < end)
@@ -835,8 +855,11 @@ class SdpaThdBinder {
             }
             if (!bytes) continue;
             const auto operand_end = add(f.pointer, bytes);
-            const auto base_roles  = mx_scales_ ? NumRoles : PerTensorNumRoles;
-            const auto name        = has_origins_ && role >= base_roles ? "THD physical offsets" : names[role];
+            const auto name =
+                has_origins_ && role >= base_roles()
+                    ? "THD physical offsets"
+                    : (s_scales_ && role >= quant_role_prefix() ? SdpaSScaleBinding::name(role - quant_role_prefix())
+                                                                : names[role]);
             if (workspace < operand_end && f.pointer < end)
                 invalid("prepared FP8 workspace overlaps " + std::string(name));
             if (bound.amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(name));
@@ -1059,6 +1082,7 @@ class SdpaThdBinder {
     bool has_v_table_strides_     = false;
     size_t table_v_strides_index_ = 0;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
+    std::unique_ptr<SdpaSScaleBinding> s_scales_;
     int64_t scratch_bytes_ = 0;
     int64_t quant_offset_  = 0;
     bool quantized_ = false, has_amax_ = false;
@@ -1100,6 +1124,8 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def_prop_ro_static("supports_nonpaged_mxfp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
+        .def_prop_ro_static("supports_public_s_scales", [](py::object) { return true; })
+        .def_prop_ro_static("supports_public_s_defaults", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })

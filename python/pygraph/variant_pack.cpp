@@ -1307,15 +1307,42 @@ read_buffer_extent(py::handle buffer) {
     return read_buffer_extent_with_device(buffer, nullptr);
 }
 
-// The graph owns this provider-independent schema. It owns no Python objects,
-// tensor addresses, stream, or plan: selection and observations remain per call.
+// The graph owns this provider-independent schema. It retains no caller
+// buffers, addresses, stream, or plan. Only graph-owned scalar default bytes
+// are copied here; explicit bindings and observations remain per call.
 // Only the most recent metadata snapshot is cached. In-flight packs own their
 // immutable snapshot, so re-entry cannot change an earlier call's overrides.
 class OrderedBindingSchema {
     std::vector<int64_t> uids_;
     DeclaredLayout declared_;
     bool strict_;
+    struct ScalarDefault {
+        size_t slot;
+        int code;
+        int bits;
+        alignas(8) unsigned char value[8]{};
+    };
+    std::vector<ScalarDefault> defaults_;
     std::shared_ptr<const OrderedGeometry> cached_;
+
+    void
+    fill_defaults(VariantPackNative &pack, const std::vector<size_t> &unread = {}) const {
+        for (auto const &value : defaults_) {
+            if (pack.is_filled(value.slot) || std::find(unread.begin(), unread.end(), value.slot) != unread.end())
+                continue;
+            auto const &declared = declared_.slots()[value.slot];
+            pack.set_operand(value.slot,
+                             reinterpret_cast<int64_t>(value.value),
+                             declared.present ? declared.shape : std::vector<int64_t>{1, 1, 1, 1},
+                             declared.present ? declared.stride : std::vector<int64_t>{1, 1, 1, 1},
+                             value.code,
+                             value.bits,
+                             1,
+                             value.bits / 8,
+                             kDLCPU,
+                             0);
+        }
+    }
 
     static py::sequence
     sequence(py::handle object, const char *name) {
@@ -1440,17 +1467,46 @@ class OrderedBindingSchema {
     }
 
    public:
-    OrderedBindingSchema(std::vector<int64_t> uids, const DeclaredLayout &declared, bool strict)
+    OrderedBindingSchema(std::vector<int64_t> uids,
+                         const DeclaredLayout &declared,
+                         bool strict,
+                         const py::dict &defaults)
         : uids_(std::move(uids)), declared_(declared), strict_(strict) {
         if (uids_.size() != declared_.size() || !std::is_sorted(uids_.begin(), uids_.end()) ||
             std::adjacent_find(uids_.begin(), uids_.end()) != uids_.end())
             throw py::value_error("An ordered binding schema needs distinct sorted graph uids and their layout");
+        defaults_.reserve(defaults.size());
+        for (auto item : defaults) {
+            auto uid = py::cast<int64_t>(item.first);
+            // Workspace/replacement targets can have cached values too, but
+            // they are not caller inputs and must remain internal.
+            auto found = std::lower_bound(uids_.begin(), uids_.end(), uid);
+            if (found == uids_.end() || *found != uid) continue;
+            auto scalar = py::cast<py::tuple>(item.second);
+            if (scalar.size() != 3) throw py::value_error("Invalid scalar default metadata");
+            ScalarDefault value{
+                static_cast<size_t>(found - uids_.begin()), py::cast<int>(scalar[0]), py::cast<int>(scalar[1])};
+            auto bytes = py::cast<py::bytes>(scalar[2]);
+            if (value.bits <= 0 || value.bits % 8 || bytes.size() != static_cast<size_t>(value.bits / 8) ||
+                bytes.size() > sizeof(value.value))
+                throw py::value_error("Invalid scalar default width");
+            std::memcpy(value.value, bytes.data(), bytes.size());
+            defaults_.push_back(value);
+        }
+    }
+
+    std::vector<size_t>
+    read_mapping(VariantPackNative &pack, const py::dict &inputs) const {
+        auto unread = pack.read_from(inputs, uids_);
+        fill_defaults(pack, unread);
+        return unread;
     }
 
     std::vector<size_t>
     finish(VariantPackNative &pack, const std::vector<size_t> &from_graph) const {
         if (!pack.ordered_geometry || pack.size() != uids_.size())
             throw py::value_error("Invalid ordered execution pack");
+        fill_defaults(pack);
         if (strict_) {
             auto hole = pack.first_unfilled();
             if (hole >= 0)
@@ -1709,7 +1765,12 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
         .def("__len__", &DeclaredLayout::size);
 
     py::class_<OrderedBindingSchema>(m, "_OrderedBindingSchema")
-        .def(py::init<std::vector<int64_t>, const DeclaredLayout &, bool>())
+        .def(py::init<std::vector<int64_t>, const DeclaredLayout &, bool, const py::dict &>(),
+             py::arg("uids"),
+             py::arg("declared"),
+             py::arg("strict"),
+             py::arg("defaults") = py::dict())
+        .def("read_mapping", &OrderedBindingSchema::read_mapping)
         .def(
             "read",
             [](OrderedBindingSchema &schema,

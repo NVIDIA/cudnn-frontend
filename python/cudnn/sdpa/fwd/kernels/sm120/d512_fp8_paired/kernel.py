@@ -35,7 +35,7 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one, _public_s_scale_factors, _launch_public_s
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16
@@ -87,8 +87,9 @@ PREPARED_KV_TAIL_NATIVE = True
 # module. A direct import uses dense e4m3 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=DTYPE_E4M3))
 
-# P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
-# accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE via the
+# Internal online-softmax cast bias. Public S operands convert these units
+# immediately before P quantization and in the output epilogue. Without
+# explicit S operands, P is quantized as P * 2**P_CAST_LOG2_SCALE via the
 # exp2 bias: the online softmax adopts every new row max, so P <= 1 and the
 # cast peaks at 2^8 = 256, below the e4m3 maximum of 448. P is relative to the
 # row max, not normalized, so in a peaked long row the other keys sit far below
@@ -762,9 +763,9 @@ class SM120FusedMultiHeadAttentionForward:
                 tile_sum = tile_sum + (p0 + p1)
                 # P stays in registers at the C-fragment coordinates; mma_pv
                 # redistributes it to the k32 A layout with shfl. The cast
-                # carries the baked 2^P_CAST_LOG2_SCALE bias only; graph
-                # Scale_S/Descale_S never reach the kernel.
-                p_regs[k_frag * 2 + row_half] = fp32_to_fp8x2(p0, p1, dtype=self.in_dtype)
+                # applies the public S conversion only to the MMA operand;
+                # the fp32 row sum above retains its internal units.
+                p_regs[k_frag * 2 + row_half] = fp32_to_fp8x2(p0 * softmax_params.p_cast_gain, p1 * softmax_params.p_cast_gain, dtype=self.in_dtype)
 
             # Reduce tile_sum across the four lanes that own one Q row.
             tile_sum = nvvm_threadquad_reduction_sum(tile_sum)
@@ -1141,6 +1142,7 @@ class SM120FusedMultiHeadAttentionForward:
         n_q_tiles,
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
+        p_cast_gain: cutlass.Float32 = cutlass.Float32(1.0),
     ) -> cutlass.Int32:
         """Compute one (Q tile, sequence, head) unit, optionally within a KV split.
 
@@ -1356,6 +1358,7 @@ class SM120FusedMultiHeadAttentionForward:
             row_max=row_max,
             row_sum=row_sum,
             softmax_scale_log2=softmax_scale_log2,
+            p_cast_gain=p_cast_gain,
         )
 
         kv_seq_idx = cutlass.Int32(0)
@@ -1705,6 +1708,9 @@ class SM120FusedMultiHeadAttentionForward:
         scale_o_t: Optional[cute.Tensor],
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
+        scale_s_t=None,
+        descale_s_t=None,
+        fixed_s_pair: cutlass.Constexpr = None,
     ) -> None:
         """SM120 FMHA prefill kernel.
 
@@ -1738,6 +1744,8 @@ class SM120FusedMultiHeadAttentionForward:
         :param descale_v_t: ``(1,)`` fp32 device descale of V.
         :param scale_o_t: ``(1,)`` fp32 device Scale_O, applied before the O cast.
         """
+        if cutlass.const_expr(fixed_s_pair is not None):
+            scale_s_t, descale_s_t = fixed_s_pair
         if cutlass.const_expr(self.split_kv > 1 and amax_o is not None):
             _initialize_split_amax(amax_o)
         descale_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
@@ -1745,7 +1753,8 @@ class SM120FusedMultiHeadAttentionForward:
         descale_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
         scale_o = _scale_or_one(scale_o_t)
         softmax_scale_log2 = softmax_scale_log2 * descale_q * descale_k
-        o_scale_fused = o_scale_fused * descale_v * scale_o * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
+        p_cast_gain, pv_gain = _public_s_scale_factors(scale_s_t, descale_s_t, P_CAST_LOG2_SCALE, 0)
+        o_scale_fused = o_scale_fused * descale_v * scale_o * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE) * pv_gain
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % cute.arch.WARP_SIZE
         warp = cute.arch.warp_idx()
@@ -1847,6 +1856,7 @@ class SM120FusedMultiHeadAttentionForward:
                     n_q_tiles,
                     thd_origins=thd_origins,
                     thd_origin_specs=thd_origin_specs,
+                    p_cast_gain=p_cast_gain,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -1904,6 +1914,7 @@ class SM120FusedMultiHeadAttentionForward:
                     n_q_tiles,
                     thd_origins=thd_origins,
                     thd_origin_specs=thd_origin_specs,
+                    p_cast_gain=p_cast_gain,
                 )
                 _uid = self._next_dense_unit(_uid)
 
@@ -1936,6 +1947,8 @@ class SM120FusedMultiHeadAttentionForward:
         prepared: cutlass.Constexpr[bool] = False,
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
+        scale_s_t=None,
+        descale_s_t=None,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
 
@@ -2166,33 +2179,34 @@ class SM120FusedMultiHeadAttentionForward:
         _persistent = self.thd_varlen and THD_PERSISTENT
         if cutlass.const_expr(_persistent):
             grid = (thd_n_ctas, cutlass.Int32(1), cutlass.Int32(1))
-        self.kernel(
-            q,
-            k,
-            v,
-            o,
-            lse,
-            sinks,
-            seq_q_lens,
-            seq_kv_lens,
-            tma_k_desc,
-            tma_v_desc,
-            tma_q_desc,
-            softmax_scale_log2,
-            cutlass.Int32(n_q_tiles),
-            amax_o,
-            o_scale_fused,
-            descale_q_t,
-            descale_k_t,
-            descale_v_t,
-            scale_o_t,
-            thd_origins=thd_origins,
-            thd_origin_specs=thd_origin_specs,
-        ).launch(
-            grid=grid,
-            block=(self.threads_per_cta, 1, 1),
-            stream=stream,
-            min_blocks_per_mp=1,
+        _launch_public_s(
+            self.kernel,
+            (
+                q,
+                k,
+                v,
+                o,
+                lse,
+                sinks,
+                seq_q_lens,
+                seq_kv_lens,
+                tma_k_desc,
+                tma_v_desc,
+                tma_q_desc,
+                softmax_scale_log2,
+                cutlass.Int32(n_q_tiles),
+                amax_o,
+                o_scale_fused,
+                descale_q_t,
+                descale_k_t,
+                descale_v_t,
+                scale_o_t,
+            ),
+            dict(thd_origins=thd_origins, thd_origin_specs=thd_origin_specs),
+            dict(grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream, min_blocks_per_mp=1),
+            scale_s_t,
+            descale_s_t,
+            True,
         )
 
 
@@ -2224,6 +2238,7 @@ def compile(  # noqa: A001
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
     thd_origin_specs=None,
+    s_scales: Optional[tuple[bool, bool]] = None,
 ) -> Callable:
     """Compile the dense/packed pointer host; geometry binds at execution."""
 
@@ -2271,4 +2286,5 @@ def compile(  # noqa: A001
         has_amax=has_amax,
         scale_o_in_combine=scale_o_in_combine,
         thd_origin_specs=thd_origin_specs,
+        s_scales=s_scales,
     )

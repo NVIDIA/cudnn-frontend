@@ -2398,8 +2398,9 @@ class pygraph:
         side that can see every user slot, including the ones a walk over node
         ports cannot name (a tensor's ragged_offset hangs off the Tensor, not
         off a port) and correctly excluding the slots the graph fills itself
-        (pass-by-value scalars it already knows, slice replacement
-        destinations, cached workspace modifications).
+        (slice replacement destinations and cached workspace modifications).
+        Runtime pass-by-value scalars remain input slots with graph-owned
+        defaults, so explicit bindings override them on either provider.
 
         A python-only graph — gdn / kda / gdn2, which cannot lower by
         construction — has no C++ side, so its variant_pack come from the IR. The
@@ -2440,7 +2441,10 @@ class pygraph:
             order = self._variant_pack_uids()
             if order is not None:
                 self._ordered_binding_uids = tuple(order)
-                self._ordered_binding_schema = _pybind_module._OrderedBindingSchema(order, self._declared_layout(order), self._lowered_graph is not None)
+                defaults = self._lowered_graph._get_variant_pack_scalar_defaults() if self._lowered_graph is not None else {}
+                self._ordered_binding_schema = _pybind_module._OrderedBindingSchema(
+                    order, self._declared_layout(order), self._lowered_graph is not None, defaults
+                )
         return self._ordered_binding_schema
 
     def _observe_unread(self, native, entries, order):
@@ -2529,7 +2533,7 @@ class pygraph:
         # One crossing for the whole pack, uid lookups included. What comes back
         # is the slots whose producer publishes no exchange vtable; those are
         # described here without taking the rest down with them.
-        unread = native.read_from(uid_to_data, order)
+        unread = self._prepare_ordered_binding_schema().read_mapping(native, uid_to_data)
         # The backend's layout is exactly the slots it REQUIRES, so a hole is the
         # caller's mistake. A python-only graph's layout is every wired port,
         # including optional ones, where a hole means "not requested".
@@ -4716,6 +4720,24 @@ def _install_captured_builders() -> None:
                     raise TypeError(f"{op}() got multiple values for {k!r}")
                 kwargs[k] = v
             drop = kwargs.pop("dropout", None)
+            if op == "sdpa_fp8":
+                has_s = kwargs.get("scale_s") is not None
+                has_ds = kwargs.get("descale_s") is not None
+                if has_s != has_ds:
+                    raise ValueError("sdpa_fp8: supply scale_s and descale_s together, or omit both")
+                if not has_s:
+                    q = kwargs.get("q")
+                    q_type = q.get_data_type() if isinstance(q, Tensor) else None
+                    if q_type is None and q is not None and hasattr(q, "dtype"):
+                        q_type = _torch_to_cudnn_data_type(q.dtype)
+                    q_type = q_type or self._context.io_data_type
+                    if q_type != cudnn.data_type.FP8_E4M3 or drop is not None:
+                        raise ValueError("sdpa_fp8: omitted S scales require E4M3 input without dropout; supply an explicit pair")
+                    # Declare the same operands before either provider is selected.
+                    # Runtime PBV works on 9.24; descriptor compile-time constants
+                    # have a separate backend defect on older releases.
+                    for role, value in (("scale_s", 256.0), ("descale_s", 1.0 / 256.0)):
+                        kwargs[role] = self.tensor_scalar(value, cudnn.scalar_type.RUNTIME_PARAM, name=f"{name_}::{role}").set_data_type(cudnn.data_type.FLOAT)
             out_kwargs = spec.get("out_kwargs", ())
             for k, v in kwargs.items():
                 if v is None:

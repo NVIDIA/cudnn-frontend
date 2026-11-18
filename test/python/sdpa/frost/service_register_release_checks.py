@@ -57,7 +57,7 @@ def _assert_service_guard(entry, first_warp, n_warps):
 _PROBE = r"""
 import faulthandler, json, os, pathlib, re, sys
 faulthandler.dump_traceback_later(270, exit=True)
-dump, filename, arch, kwargs, negative = sys.argv[1:]
+dump, filename, arch, kwargs, negative, compile_kwargs, entry_count = sys.argv[1:]
 os.environ["CUTE_DSL_DUMP_DIR"] = dump
 os.environ["CUTE_DSL_KEEP"] = "ptx"
 os.environ["CUTE_DSL_ARCH"] = arch
@@ -80,7 +80,10 @@ assert (cfg.TMALDG_WARP_ID, cfg.TMASTG_WARP_ID, cfg.SCHED_WARP_ID) == tuple(cfg.
 assert cfg.SCHED_WARP_ID + 1 == cfg.THREADS_PER_CTA // 32
 print("COMPILING", filename, "service budget", cfg.OTHER_REGS, flush=True)
 compile_fn = mod.compile_prepared if "fp8" in filename else mod.compile
-compile_fn()
+compile_kwargs = json.loads(compile_kwargs)
+if "s_scales" in compile_kwargs:
+    compile_kwargs["s_scales"] = tuple(compile_kwargs["s_scales"])
+compile_fn(**compile_kwargs)
 files = list(pathlib.Path(dump).glob("*.ptx"))
 assert files, (dump, "no PTX emitted")
 sites, entry_bodies = [], []
@@ -99,7 +102,9 @@ for path in files:
         sites.append({"file": path.name, "entry": entry.split("(", 1)[0], "instructions": instructions})
         entry_bodies.append(entry)
 # Output-slice recompute emits one entry per 256-column V slice; retained P runs both slices in one entry.
-expected_entries = 2 if filename == "sm100/d512_mxfp8_slice_recompute/kernel.py" else 1
+expected_entries = json.loads(entry_count)
+if expected_entries is None:
+    expected_entries = 2 if filename == "sm100/d512_mxfp8_slice_recompute/kernel.py" else 1
 assert len(sites) == expected_entries, ("missing or unexpected service-kernel entries", sites)
 result = {"template": filename, "arch": arch, "service_budget": cfg.OTHER_REGS, "sites": sites}
 print("RELEASE_RESULT", json.dumps(result), flush=True)
@@ -171,14 +176,25 @@ def release_cases(arch):
     return cases
 
 
-def check_service_release(tmp_path, filename, params, *, negative=""):
+def check_service_release(tmp_path, filename, params, *, negative="", compile_kwargs=None, expected_entries=None):
     arch = filename.split("/")[0].replace("sm", "sm_") + "a"
     if not arch_known_to_the_dsl(arch):
         pytest.skip(f"this cutlass-dsl has no {arch}")
     dump = tmp_path / ("ptx-" + negative if negative else "ptx")
     dump.mkdir()
     probe = inspect.getsource(_service_entries) + "\n" + inspect.getsource(_assert_service_guard) + "\n" + _PROBE
-    argv = [sys.executable, "-c", probe, str(dump), filename, arch, json.dumps(params), negative]
+    argv = [
+        sys.executable,
+        "-c",
+        probe,
+        str(dump),
+        filename,
+        arch,
+        json.dumps(params),
+        negative,
+        json.dumps(compile_kwargs or {}),
+        json.dumps(expected_entries),
+    ]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired as exc:

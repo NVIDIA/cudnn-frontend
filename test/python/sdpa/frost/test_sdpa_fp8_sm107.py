@@ -39,6 +39,10 @@ class TestServiceRegisterRelease:
 
     test_service_register_release = staticmethod(_release)
 
+    from sdpa_public_s_sm107_cases import public_s_register_release
+
+    test_public_s_register_release = staticmethod(public_s_register_release)
+
 
 class TestNativeHalfRegisterRelease:
     """Cross-compile the half kernel through the selected SM107 CI entry."""
@@ -2756,3 +2760,34 @@ class TestNativeFp8D192Pair:
     test_causal_empty_kv_tiles = staticmethod(_d192_pair_checks.test_causal_empty_kv_tiles)
     test_negative_scale_declined_at_check = staticmethod(_d192_pair_checks.test_negative_scale_declined_at_check)
     test_explicit_attn_scale = staticmethod(_d192_pair_checks.test_explicit_attn_scale)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestPublicSScales:
+    """Public S conversion and binding on every native FP8 main body."""
+
+    from sdpa_public_s_sm107_cases import conversion_and_replay, defaults_and_adapter, random_refill_and_replay, public_s_refill_warm_stress, refill_sanitizer
+
+    test_conversion_and_replay = staticmethod(conversion_and_replay)
+    test_defaults_and_adapter = staticmethod(defaults_and_adapter)
+    test_random_refill_and_replay = staticmethod(random_refill_and_replay)
+    test_refill_warm_stress = staticmethod(public_s_refill_warm_stress)
+    test_refill_sanitizer = staticmethod(refill_sanitizer)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestPublicSDeterminism:
+    """Fixed-plan E4M3/BF16 forward; backward is outside these cases."""
+
+    from sdpa_public_s_determinism_cases import cases as _public_s_cases
+
+    @pytest.mark.parametrize("case", _public_s_cases("sm107"))
+    @pytest.mark.parametrize("source", ["buffer", "omitted"], ids=["device-pair", "default-pair"])
+    def test_batch_and_golden(self, case, source):
+        from sdpa_public_s_determinism_cases import check_public_s_batch_and_golden
+
+        check_public_s_batch_and_golden(case, source)

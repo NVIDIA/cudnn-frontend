@@ -37,7 +37,10 @@ class _FrostSdpaFwdPlan(_FrostSdpaPlan):
         for t, uid in zip(self._tensors, self._uids):
             buf = uid_to_data.get(uid)
             if buf is None:
-                missing = [t.get_name() or uid for t, uid in zip(self._tensors, self._uids) if uid_to_data.get(uid) is None]
+                optional = getattr(self._compiled, "tensor_default_uids", ())
+                if uid in optional:
+                    continue
+                missing = [t.get_name() or uid for t, uid in zip(self._tensors, self._uids) if uid_to_data.get(uid) is None and uid not in optional]
                 raise ValueError(f"{self._name}: the variant pack is missing buffers for {missing}")
             resolved[id(t)] = buf
         required = self._workspace_bytes
