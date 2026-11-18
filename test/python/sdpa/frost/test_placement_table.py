@@ -1397,6 +1397,26 @@ def test_sm100_paged_d192x128_context_entries_follow_the_study(device_cc):
 
 
 @pytest.mark.L0
+def test_sm90_d64_sink_mtp_entries_follow_the_study():
+    """Study sm90_d64_sink_mtp_20261118 (H100): gpt-oss paged d64 MTP with a sink, which SM90 runs unpacked, leads with a window always
+    and with the full cache up to 2^4.5 parallel tiles, on and off the KV tile."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def mtp(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=3, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True, has_sink=True, device_cc=(9, 0))
+        base.update(has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm90_d64_sink_mtp_20261118"
+    for kv in (131072, 131073):
+        assert pt.class_key(row, mtp(s_kv=kv))[8] == "gqa_unpacked"
+        assert pt.lookup(row, mtp(s_kv=kv)) is True and pt.matched_entry(row, mtp(s_kv=kv)).study == study
+        assert pt.lookup(row, mtp(s_kv=kv, b=128, h_q=8, h_kv=1)) is False  # 128 parallel tiles: past the full-cache floor
+        assert pt.lookup(row, mtp(s_kv=kv, b=128, h_q=8, h_kv=1, window_left=127)) is True
+
+
+@pytest.mark.L0
 def test_sm107_paged_window_entries_follow_the_study():
     """Study sm107_window_gaps_20261118 (Rubin, the inference benchmark's windowed paged generation graph): windowed paged d192 x 192 and
     d256 lead at S_q 1 through prefill, d64 up to S_q 45, d128 MTP (whole-pack groups) on caches up to 32k. Windowed d128 verify
