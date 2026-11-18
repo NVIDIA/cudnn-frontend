@@ -686,6 +686,7 @@ __all__ = [
     "cc_supported",
     "launch_arguments",
     "make_cfg",
+    "OPERAND_NAMES",
     "SERVED_GEOMETRIES",
     "SERVED_PAGE_SIZES",
 ]

@@ -127,7 +127,6 @@ SIGN_BIT = -(2**31)  # the fp32 sign bit as an Int32
 def _load_int(addr, wide: cutlass.Constexpr[bool]):
     """One integer of ``positions`` / ``slot_mapping`` at the byte address ``addr`` as an ``Int64``: a 64-bit load as two 32-bit
     halves recombined (the 64-bit value is what an address or a range check sees), or one 32-bit load, sign-extended."""
-    value = INT64(0)
     if cutlass.const_expr(wide):
         lo, hi = ld_global_v2(addr, INT32)
         value = (hi.to(INT64) * INT64(1 << 32)) + (lo.to(INT64) & INT64(0xFFFFFFFF))

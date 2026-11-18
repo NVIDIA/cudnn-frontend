@@ -34,12 +34,9 @@ cudnn = pytest.importorskip("cudnn")
 from attention_prepare_utils import (  # noqa: E402
     BF16,
     CANARY_BITS,
-    D,
     DEFAULT_FORM,
     FORMS,
-    HEADS,
     I16,
-    KV_HEADS,
     LAUNCH_ARM_IDS,
     LAUNCH_ARMS,
     SENTINEL_BITS,
