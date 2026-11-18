@@ -26,13 +26,21 @@ class ModelPreset:
 
     Attributes:
         name: Identifier used in CSV rows and chart legends.
-        num_q_heads: Query heads (there is a single shared KV head).
-        head_dim_qk: Width of the shared K record (512, or 576 = 512 + 64 RoPE).
-        head_dim_vo: Width read as V / written as O (512).
-        topk: Logical K — KV rows gathered per query.
+        num_q_heads: Query heads (DSA: over a single shared KV head).
+        head_dim_qk: Width of the shared K record (512, or 576 = 512 + 64 RoPE);
+            256 for QSA.
+        head_dim_vo: Width read as V / written as O (512; 256 for QSA).
+        topk: Logical K — KV rows gathered per query (DSA), or the per-query
+            block budget (QSA: up to ``topk`` complete causal blocks, plus the
+            partial tail block).
         indexer_topk: Leading prefix of ``topk`` that the indexer selected; the
             forward kernel emits a separate LSE over it (0 = off). Forward only.
         has_sink: Per-head attention-sink logit in the softmax denominator.
+        kind: ``dsa`` = flat MQA over one shared K=V record (``cudnn.DSA``);
+            ``qsa`` = packed GQA over per-head K/V with a four-token block
+            selection bitmap (``cudnn.ops.qsa_forward`` / ``qsa_backward``).
+        num_kv_heads: KV heads (1 for DSA's shared record; QSA keeps its own).
+        block_size: Tokens per selected block (QSA = 4; DSA gathers single rows).
     """
 
     name: str
@@ -42,6 +50,43 @@ class ModelPreset:
     topk: int = 2048
     indexer_topk: int = 0
     has_sink: bool = True
+    kind: str = "dsa"
+    num_kv_heads: int = 1
+    block_size: int = 1
+
+
+def with_tp_shards(preset: ModelPreset, degrees: List[int]) -> List[ModelPreset]:
+    """Expand a whole-model preset into per-GPU tensor-parallel shards.
+
+    Same rules as ``../attention_inference/config_types.with_tp_shards`` and
+    what training and serving frameworks do: q heads must divide evenly across
+    ranks, and kv heads either divide evenly or are replicated when there are
+    fewer kv heads than ranks (``tp % num_kv_heads == 0``, each rank then
+    holding one kv head). Anything else is rejected. Tokens do not shard, so
+    every rank runs the full sequence with its slice of heads. TP=1 keeps the
+    original preset; shards are named ``<name>-tp<n>``. A shard the kernels do
+    not serve is still a case: its support check lands it as a skipped row.
+    """
+    from dataclasses import replace
+
+    out = []
+    for n in degrees:
+        if n == 1:
+            out.append(preset)
+            continue
+        if preset.num_q_heads % n != 0:
+            raise ValueError(f"{preset.name}: {preset.num_q_heads} q heads do not shard across tp={n}")
+        if preset.num_kv_heads % n != 0 and n % preset.num_kv_heads != 0:
+            raise ValueError(f"{preset.name}: {preset.num_kv_heads} kv heads neither divide nor replicate across tp={n}")
+        out.append(
+            replace(
+                preset,
+                name=f"{preset.name}-tp{n}",
+                num_q_heads=preset.num_q_heads // n,
+                num_kv_heads=max(1, preset.num_kv_heads // n),
+            )
+        )
+    return out
 
 
 @dataclass
@@ -97,6 +142,12 @@ class BenchmarkResult:
     time_ms: float
     tflops: float
     num_iterations: int
+
+    # Preset kind and the geometry fields DSA rows leave at their defaults
+    # (one shared KV record, single-row gather).
+    kind: str = "dsa"
+    num_kv_heads: int = 1
+    block_size: int = 1
 
     success: bool = True
     # True when the kernel's own support check rejected this (arch, shape,

@@ -1,45 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 block-scale GEMM kernel (nvfp4 / mxfp4 / mxfp8, including mixed
-MXFP8/MXFP4 on baseline SM100 K32 and Rubin K64): persistent + CLC scheduler.
-
-Serves both MMA modes; ``cta_group`` is an injected tile constant.
-
-  cta_group=1  single-CTA MMA — every CTA runs its own MMA on its own
-               SMEM/TMEM, no leader-follower pair.
-  cta_group=2  2-CTA MMA cluster pair — the leader CTA issues the MMA while the
-               follower CLC-consumes only. SFB is loaded FULL per CTA, so the
-               pair's accumulator region spans num_gemms x epi_cols_per_mma_m.
-
-The packed FP4/FP8 operands carry a per-block scale factor: SFA/SFB ride their
-own SMEM ring, the MMA warp ``tcgen05_cp``s each into TMEM right before the
-instruction that reads it, and the MMA is ``tcgen05_mma_block_scale``. When the
-accumulator cannot double-buffer, ``use_acc_overlap`` overlaps the two regions
-and drains the shared columns first.
-
-For a one-sided-dequant GEMM, the raw FP8 peer is represented by a fake scale
-factor.  Its TMEM region is still reserved, but it has no SF kernel argument or
-SMEM/TMA/``tcgen05_cp`` path.  The four epilogue warps seed the same 32-row
-image in the four TMEM warp partitions, emulating the real copy's ``WARPX4``
-coverage, before the MMA warp proceeds.
-
-``mma_inst_k_bytes`` selects the MMA-inst K width. At 64 (SM 10.7+ silicon) the
-K-tile takes half as many MMAs, each consuming ``sf_scales_per_inst`` scales;
-when that outgrows a 128x4 utccp atom one SF word spans ``word_atoms`` atoms,
-and SFA is then laid out block-major while SFB is atom-major. At 32 every word
-is one atom and both collapse to the same addresses. fp4 rides the OMMA
-descriptor only at 64. At 32 homogeneous fp4 keeps the Mx descriptor's E5M2
-piggy-back, while mixed fp8/fp4 uses the padded E2M1 operand encoding.
-
-Warp layout (8 warps × 32 = 256 threads/CTA):
-  warps 0–3 : epilogue (warp 0 also allocates TMEM)  — setmaxnreg.inc 216
-  warp  4   : MMA driver (cta_group=2: leader runs the MMA, follower
-              CLC-consumes only)  — setmaxnreg.dec 40
-  warp  5   : TMA producer (data + SF)  — setmaxnreg.dec 40
-  warp  6   : CLC scheduler  — setmaxnreg.dec 40
-  warp  7   : unused donor — setmaxnreg.dec 40
-"""
+"""sm100 block-scale GEMM kernel (nvfp4 / mxfp4 / mxfp8, including mixed MXFP8/MXFP4 on baseline SM100 K32 and Rubin K64): persistent + CLC scheduler."""
 
 from __future__ import annotations
 
@@ -48,6 +10,8 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
+    cluster_split_k_reduce,
+    extract_block_scale_sfb,
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -66,22 +30,20 @@ from cutlass.cute.arch import clc as cute_clc
 
 # @@INJECT_TILE_CONSTANTS@@
 
-# Rank decomposition below uses shifts and masks instead of runtime integer
-# division.  The catalog satisfies this; keep synthesized configs from silently
-# taking the fast path with a non-power-of-two cluster dimension.
 if any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in cluster_shape_mnk[:2]):
     raise NotImplementedError(f"{__name__}: cluster M/N dimensions must be powers of two")
 if fallback_cluster_shape_mnk is not None and any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in fallback_cluster_shape_mnk[:2]):
     raise NotImplementedError(f"{__name__}: fallback cluster M/N dimensions must be powers of two")
 
-# Keep the two launch alternatives as host constants and spell the preferred /
-# fallback operations at each use site. This exposes constant masks and shift
-# alternatives before backend canonicalization.
 _preferred_cluster_m_shift = cluster_shape_mnk[0].bit_length() - 1
 _preferred_cluster_n_shift = cluster_shape_mnk[1].bit_length() - 1
 _fallback_cluster_m_shift = _preferred_cluster_m_shift if fallback_cluster_shape_mnk is None else fallback_cluster_shape_mnk[0].bit_length() - 1
 _fallback_cluster_n_shift = _preferred_cluster_n_shift if fallback_cluster_shape_mnk is None else fallback_cluster_shape_mnk[1].bit_length() - 1
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
+_sf_words_resident = sf_word_stride_cols > 0
+_sf_word_slots = num_sf_atoms if _sf_words_resident else 1
+_sfa_word_stride = 0 if fake_dequant_a else sf_word_stride_cols
+_sfb_word_stride = 0 if fake_dequant_b else sf_word_stride_cols
 _cta_group_shift = cta_group.bit_length() - 1
 
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
@@ -109,14 +71,7 @@ TMEM_SCALE_ONE_BARRIER_ID = 3
 
 @cute.jit
 def _auto_swizzle_w(m, n, k, nt_n):
-    """N-super-block width for the tile rasterization, resolved per launch.
-
-    ``tile_swizzle_n > 0`` pins it. Otherwise: the walk keeps one operand slice
-    resident and re-reads the other every super-block, so block along the SHORTER
-    problem side. Once that side outgrows what L2 can hold onto while C streams
-    through it, keeping it is no longer free -- fall back to the widest N block the
-    budget does cover.
-    """
+    """N-super-block width for the tile rasterization, resolved per launch."""
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
@@ -150,14 +105,7 @@ def _b_collector_op(mi):
 
 @cute.jit
 def _fill_scale_one(tmem_base, num_cols):
-    """Fill one logical SF region with the selected format's encoded 1.0.
-
-    The F8_128x4 layout uses 32 scale rows and a 32-bit cell carries four
-    identical scale bytes.  One warp-wide ``32x32b`` store fills those rows in
-    only the issuing warp's TMEM partition.  Calling this from warp positions
-    0..3 supplies the same four-partition coverage as an SF
-    ``tcgen05.cp(..., WARPX4)``.
-    """
+    """Fill one logical SF region with the selected format's encoded 1.0."""
     one = cutlass.Uint32(sf_one_word)
     one_vec = cutlass.Vector.from_elements((one,), cutlass.Uint32)
     for col in cutlass.range_constexpr(num_cols):
@@ -180,7 +128,7 @@ from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import 
 
 @cute.jit
 def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, aux):
-    """epilogue function for split-K reduction"""
+    """Apply the split-K reducer epilogue."""
     # @@INJECT_SPLITK_EPILOGUE_BINDINGS@@
     # @@INJECT_REDUCE_AUX_VIEWS@@
 
@@ -195,16 +143,17 @@ def _kernel(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
+    swizzle_w: cutlass.Int32,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
-    # @@SPLITK_ONLY:BEGIN@@
-    mSplitK_partials: cute.Tensor,
-    # @@SPLITK_ONLY:END@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    # @@SPLITK_ONLY:BEGIN@@
+    mSplitK_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -230,11 +179,6 @@ def _kernel(
     gridx = cute.arch.grid_dim()[0]
     gridy = cute.arch.grid_dim()[1]
 
-    # Mixed CGA: the launch carries a preferred (wide) cluster plus a smaller
-    # fallback one, and the device picks per cluster — a CTA can only tell which
-    # by reading the hardware cluster dims. Everything cluster-shaped below then
-    # follows from those, so the two kinds share one body; only the multicast bit
-    # patterns are loop-built and come in precomputed per shape.
     a_mcast_pattern = mixed_a_pattern_pref
     if cutlass.const_expr(cta_group == 2):
         b_mcast_pattern = mixed_b_pattern_pref
@@ -250,8 +194,6 @@ def _kernel(
         a_mcast_pattern = cutlass.Int32(mixed_a_pattern_pref)
         if cutlass.const_expr(cta_group == 2):
             b_mcast_pattern = cutlass.Int32(mixed_b_pattern_pref)
-        # Bitwise, not `or`: both operands are runtime Booleans (this is the form
-        # cutlass.cute.experimental.is_preferred_cluster uses).
         if (cdim_x != cluster_shape_mnk[0]) | (cdim_y != cluster_shape_mnk[1]):
 
             a_mcast_pattern = cutlass.Int32(mixed_a_pattern_fb)
@@ -260,21 +202,25 @@ def _kernel(
     cluster_size = cluster_m * cluster_n * cluster_shape_mnk[2]
 
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-    # Every catalog cluster dimension is a power of two.  Mixed-CGA makes the
-    # divisor runtime-visible, so spelling rank decomposition as div/mod would
-    # otherwise lower to reciprocal-based integer division in every warp.
     m_rank = cta_rank_in_cluster & (cluster_shape_mnk[0] - 1)
-    n_rank = cta_rank_in_cluster >> _preferred_cluster_m_shift
+    n_rank = (cta_rank_in_cluster >> _preferred_cluster_m_shift) & (cluster_shape_mnk[1] - 1)
     if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
         if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
             m_rank = cta_rank_in_cluster & (fallback_cluster_shape_mnk[0] - 1)
             n_rank = cta_rank_in_cluster >> _fallback_cluster_m_shift
 
+    k_rank = cutlass.Int32(0)
+    k_root_rank = cta_rank_in_cluster
+    if cutlass.const_expr(cluster_k_reduce):
+        plane_ctas = cluster_shape_mnk[0] * cluster_shape_mnk[1]
+        k_rank = cta_rank_in_cluster // plane_ctas
+        k_root_rank = cta_rank_in_cluster % plane_ctas
+
     if cutlass.const_expr(cta_group == 2):
         pair_member = m_rank % cta_group
         pair_m_idx = m_rank // cta_group
         is_pair_leader = pair_member == 0
-        pair_leader_rank = pair_m_idx * cta_group + n_rank * cluster_m
+        pair_leader_rank = pair_m_idx * cta_group + n_rank * cluster_m + k_rank * (cluster_shape_mnk[0] * cluster_shape_mnk[1])
     else:
         pair_member = 0
         pair_m_idx = m_rank
@@ -308,7 +254,6 @@ def _kernel(
             init_raw_n = bidy >> _fallback_cluster_n_shift
             init_nt_m = gridx >> _fallback_cluster_m_shift
             init_nt_n = gridy >> _fallback_cluster_n_shift
-    swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
     init_tile_m, init_tile_n = _l2_swizzle_tile(
         init_raw_m,
         init_raw_n,
@@ -338,7 +283,7 @@ def _kernel(
         a_part_arrive = cutlass.Int16(a_pattern) << m_rank
         b_part_arrive = cutlass.Int16(b_pattern) << (n_rank * cluster_m)
         if cutlass.const_expr(ab_empty_full_mask):
-            ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+            ab_empty_arrive_mask = cutlass.Int16((1 << (cluster_m * cluster_n)) - 1)
         else:
             ab_empty_arrive_mask = a_part_arrive | b_part_arrive
     else:
@@ -350,6 +295,13 @@ def _kernel(
             tma_mcast_mask_b = cutlass.Int16((b_mcast_pattern << pair_member) << (n_rank * cluster_m))
         else:
             tma_mcast_mask_b = cutlass.Int16(1 << cta_rank_in_cluster)
+
+    if cutlass.const_expr(cluster_k_reduce):
+        k_plane_shift = k_rank * (cluster_shape_mnk[0] * cluster_shape_mnk[1])
+        if cutlass.const_expr(multicast_a):
+            tma_mcast_mask_a = tma_mcast_mask_a << k_plane_shift
+        if cutlass.const_expr(multicast_b):
+            tma_mcast_mask_b = tma_mcast_mask_b << k_plane_shift
 
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
 
@@ -377,23 +329,8 @@ def _kernel(
 
     sA_elems = sA_packed_elems
     sB_elems = sB_packed_elems
-    # Declaration order IS the SMEM layout, and here it is load-bearing.  Every
-    # ring ROOT feeds `Tcgen05SmemDesc.build(start_address=...)`, whose lowering
-    # (cutlass-dsl experimental/primitives/descriptors.py:513-522, the
-    # non-versioned `_tcgen05_mma_smem_desc` intrinsic) keeps only 14 bits of
-    # `addr >> 4`: a root at or above 262144 B wraps to the bottom of SMEM with
-    # no error, and the SF UTCCP then copies A-operand bytes into the SF TMEM
-    # columns -> NaN/inf on every output.  Reachable on sm107 only, whose 327 KiB
-    # carveout lets the AB ring run past 256 KiB.  `advance_start_address`
-    # (descriptors.py:413-425) is a plain encoded add and carries the per-stage
-    # and per-k-step offsets past the line correctly (the d512 SDPA kernels
-    # already rely on it), so the SMALL scale-factor rings are declared FIRST and
-    # the big A/B rings -- whose roots then stay far below the line -- follow.
-    # The compiler models these roots (`_block_scale_smem_desc_roots`), trims
-    # `ab_stages` when a deeper ring would still put one past the line (the
-    # MoE template at sm107 512x128), and refuses a layout a single stage cannot
-    # fit; the CPU test test_block_scale_smem_layout_sm107.py pins this order.
-    # Do not reorder.
+    # Stage scale-factor rings before data rings.
+    # See python/cudnn/frost/README.md#sm100-block-scale-descriptor-roots.
     smem_sfa_list = [
         cutlass.Array(
             cutlass.Uint8,
@@ -432,8 +369,6 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
-    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         epi_store_dtype,
@@ -443,13 +378,18 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
+    if cutlass.const_expr(cluster_k_reduce):
+        cluster_mailbox = cutlass.Array(cutlass.Float32, split_k_slices * cluster_reduce_elems, space=cutlass.AddressSpace.smem, alignment=16)
+        cluster_ready_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+        cluster_free_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+
     if cutlass.const_expr(cta_group == 2):
         acc_empty_count = num_epilogue_warps * 2
     if cutlass.const_expr(ab_empty_full_mask):
         if cutlass.const_expr(cta_group == 1):
-            ab_empty_count = cluster_size
+            ab_empty_count = cluster_m * cluster_n
         else:
-            ab_empty_count = cluster_size // cta_group
+            ab_empty_count = (cluster_m * cluster_n) // cta_group
     else:
         if cutlass.const_expr(cta_group == 1):
             ab_empty_count = cluster_m + cluster_n - 1
@@ -458,6 +398,10 @@ def _kernel(
     num_consumer_warps_per_cta = 7
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:
+        if cutlass.const_expr(cluster_k_reduce):
+            if elect_one:
+                nvvm.mbarrier_init(cluster_ready_mbar_ptr, split_k_slices - 1)
+                nvvm.mbarrier_init(cluster_free_mbar_ptr, 1)
         if cutlass.const_expr(cta_group == 2):
             if cutlass.const_expr(use_acc_overlap):
                 if elect_one:
@@ -501,7 +445,7 @@ def _kernel(
                 nvvm.mbarrier_init(clc_empty_mbar_ptr.subview(i), clc_empty_count)
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cta_group == 1):
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             nvvm.barrier_cluster_arrive_relaxed()
             nvvm.barrier_cluster_wait()
         else:
@@ -519,13 +463,9 @@ def _kernel(
         sf_only_copy_bytes = (num_sfa_operands * sfa_smem_bytes + num_sfb_operands * sfb_smem_bytes) * 2
 
     if cutlass.const_expr(cta_group == 2):
-        # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
-        # constants even when the cluster shape is only known at runtime.
         logical_cta_tile_m = cgrp_tile_mnk[0] // cluster_shape_mnk[0]
         logical_cta_tile_n = cgrp_tile_mnk[1] // cluster_shape_mnk[1]
         pair_n_size = logical_cta_tile_n
-        # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
-        # the per-CTA mma_inst_m — half the instruction's hardware M.
     epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
     if cutlass.const_expr(cta_group == 2):
@@ -543,9 +483,6 @@ def _kernel(
     M = m
     N = n
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
-    # The tile this cluster owns spans its OWN cluster shape; both shapes walk
-    # the grid as the identity map (tile == blockIdx), so they tile the problem
-    # identically and every output tile is still covered exactly once.
     if cutlass.const_expr(cta_group == 1):
         cgrp_tile_m_cur = cta_tile_mnk[0] * cluster_m
         cgrp_tile_n_cur = cta_tile_mnk[1] * cluster_n
@@ -594,7 +531,7 @@ def _kernel(
 
             sched_iter += 1
 
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             if is_cluster_leader_cta:
                 for _ in range(CLC_SCHED_STAGES):
                     stage = sched_iter % CLC_SCHED_STAGES
@@ -629,7 +566,10 @@ def _kernel(
             # Split-K: grid z carries batch*S
             if cutlass.const_expr(split_k_slices > 1):
                 batch_tile_l = tile_l // split_k_slices
-                split_idx = cutlass.Int64(tile_l % split_k_slices)
+                if cutlass.const_expr(cluster_k_reduce):
+                    split_idx = cutlass.Int64(k_rank)
+                else:
+                    split_idx = cutlass.Int64(tile_l % split_k_slices)
                 k_tiles_per_split = num_k_tiles // split_k_slices
                 k_tiles_remainder = num_k_tiles % split_k_slices
                 k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
@@ -954,7 +894,7 @@ def _kernel(
         tail_phase = ab_empty_phase_bit
         if tail_stage == 0 and ab_iter != 0:
             tail_phase = tail_phase ^ 1
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             for _ in range(ab_stages):
                 while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
                     pass
@@ -974,7 +914,7 @@ def _kernel(
         a_part = a_part | (a_part << 1)
         b_part = b_arrive_pattern << (n_rank * cluster_m)
         if cutlass.const_expr(ab_empty_full_mask):
-            ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+            ab_empty_arrive_mask = cutlass.Int16((1 << (cluster_m * cluster_n)) - 1)
         else:
             ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if cutlass.const_expr(cta_group == 2):
@@ -1012,10 +952,6 @@ def _kernel(
             if cutlass.const_expr(split_k_slices > 1):
                 tile_l = bidz
 
-            # fp4 packs its K-mode into the OMMA descriptor's 2-bit split field;
-            # fp8 keeps the MX descriptor's 1-bit one. Both are built once,
-            # outside the loops — the fields depend only on j (the scale id
-            # within a word).
             if cutlass.const_expr(idesc_is_omma):
                 idesc_by_j = [
                     cutlass.experimental.primitives.Tcgen05MxOmmaInstrDesc.build(
@@ -1052,29 +988,33 @@ def _kernel(
             sfa_tmem_bases = [(base_row_id << 16) | (base_col_id_root + sfa_col_bases[i]) for i in range(num_a_operands)]
             sfb_tmem_bases = [(base_row_id << 16) | (base_col_id_root + sfb_col_bases[j]) for j in range(num_b_operands)]
             s2t_shape, s2t_multicast = nvvm.S2TCopyMode.S2T_32x128b_WARPX4
-            sfb_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfb_tmem_bases]
-            # utccp destination per (MN-block, atom within the scale word). SFB
-            # is atom-MAJOR across the N-blocks because ONE instruction walks
-            # all of them; SFA is block-major because one instruction covers
-            # exactly one 128-row block, so that word has to be contiguous.
-            # Both collapse to the same addresses at a single block, and to
-            # sm100's layout at word_atoms == 1.
+            sfb_scale_ptrs = [[nvvm.make_tmem_ptr(b + _sfb_word_stride * w, cutlass.Float32) for b in sfb_tmem_bases] for w in range(_sf_word_slots)]
             sfa_dst_ptrs = [
                 [
-                    [nvvm.make_tmem_ptr(sfa_tmem_bases[i] + m * registers_per_block + a * registers_per_atom, cutlass.Float32) for a in range(word_atoms)]
-                    for m in range(mma_size_m)
+                    [
+                        [
+                            nvvm.make_tmem_ptr(sfa_tmem_bases[i] + _sfa_word_stride * w + m * registers_per_block + a * registers_per_atom, cutlass.Float32)
+                            for a in range(word_atoms)
+                        ]
+                        for m in range(mma_size_m)
+                    ]
+                    for i in range(num_a_operands)
                 ]
-                for i in range(num_a_operands)
+                for w in range(_sf_word_slots)
             ]
             sfb_dst_ptrs = [
                 [
-                    [nvvm.make_tmem_ptr(sfb_tmem_bases[j] + (a * num_blocks_n + m) * registers_per_atom, cutlass.Float32) for a in range(word_atoms)]
-                    for m in range(num_blocks_n)
+                    [
+                        [
+                            nvvm.make_tmem_ptr(sfb_tmem_bases[j] + _sfb_word_stride * w + (a * num_blocks_n + m) * registers_per_atom, cutlass.Float32)
+                            for a in range(word_atoms)
+                        ]
+                        for m in range(num_blocks_n)
+                    ]
+                    for j in range(num_b_operands)
                 ]
-                for j in range(num_b_operands)
+                for w in range(_sf_word_slots)
             ]
-            # Descriptor metadata and the SMEM allocation base are invariant
-            # across persistent tiles. Only the encoded start address advances.
             desc_a_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                     start_address=smem_a_list[i],
@@ -1111,6 +1051,8 @@ def _kernel(
                 )
                 for j in range(num_sfb_operands)
             ]
+            if cutlass.const_expr(sfb_sub_tile_n > 0):
+                sfb_tile_n = init_tile_n
             while is_valid != 0:
                 acc_stage = tile_iter % acc_stages
                 if acc_stage == 0 and tile_iter != 0:
@@ -1127,9 +1069,6 @@ def _kernel(
                     acc_base_col = base_col_id_root + (tile_iter % 2) * acc_stage_stride
                 else:
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                # One accumulator per (gemm, M block); M block mi sits
-                # epi_cols_per_mma_m columns further into its GEMM's region and
-                # reads SF word block mi (SF words are one per 128 rows).
                 acc_tmem_ptrs = [
                     [
                         nvvm.make_tmem_ptr(
@@ -1142,7 +1081,10 @@ def _kernel(
                 ]
 
                 if cutlass.const_expr(split_k_slices > 1):
-                    split_idx = cutlass.Int64(tile_l % split_k_slices)
+                    if cutlass.const_expr(cluster_k_reduce):
+                        split_idx = cutlass.Int64(k_rank)
+                    else:
+                        split_idx = cutlass.Int64(tile_l % split_k_slices)
                     k_tiles_per_split = num_k_tiles // split_k_slices
                     k_tiles_remainder = num_k_tiles % split_k_slices
                     k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
@@ -1161,8 +1103,6 @@ def _kernel(
                     desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_sfa_operands)]
                     desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_sfb_operands)]
 
-                    # One SF word per group of MMAs, refreshed right before they
-                    # read it. A word spans word_atoms consecutive K-atoms in SMEM.
                     while not nvvm.mbarrier_try_wait_parity(
                         sf_full_mbar_ptr.subview(stage),
                         ab_full_phase_bit,
@@ -1170,14 +1110,47 @@ def _kernel(
                     ):
                         pass
 
-                    for sf_word in cutlass.range_constexpr(num_sf_atoms):
+                    if cutlass.const_expr(sfb_sub_tile_n > 0):
+                        sf_n_start = (sfb_tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]) % 128
+                        for _bj in cutlass.range_constexpr(num_sfb_operands):
+                            extract_block_scale_sfb(
+                                smem_sfb_list[_bj].subview(sfb_smem_bytes * stage), sf_n_start, sfb_sub_tile_n, sf_tma_box_k, sfb_smem_bytes
+                            )
+
+                    # Disjoint words let all SF copies precede the K-tile's MMAs.
+                    for sf_load_word in cutlass.range_constexpr(num_sf_atoms if _sf_words_resident else 0):
                         for _bj in cutlass.range_constexpr(num_sfb_operands):
                             for block_n in cutlass.range_constexpr(num_blocks_n):
                                 for _a in cutlass.range_constexpr(word_atoms):
                                     if elect_one:
                                         nvvm.tcgen05_cp(
                                             s2t_shape,
-                                            sfb_dst_ptrs[_bj][block_n][_a],
+                                            sfb_dst_ptrs[sf_load_word][_bj][block_n][_a],
+                                            desc_sfb_bases[_bj] + (sf_atom_desc_stride * (sf_load_word * word_atoms + _a) + sf_block_desc_stride * block_n),
+                                            group=_CTA_GROUP,
+                                            multicast=s2t_multicast,
+                                        )
+                        for _ai in cutlass.range_constexpr(num_sfa_operands):
+                            for mma_m in cutlass.range_constexpr(mma_size_m):
+                                for _a in cutlass.range_constexpr(word_atoms):
+                                    if elect_one:
+                                        nvvm.tcgen05_cp(
+                                            s2t_shape,
+                                            sfa_dst_ptrs[sf_load_word][_ai][mma_m][_a],
+                                            desc_sfa_bases[_ai] + (sf_atom_desc_stride * (sf_load_word * word_atoms + _a) + sf_block_desc_stride * mma_m),
+                                            group=_CTA_GROUP,
+                                            multicast=s2t_multicast,
+                                        )
+
+                    for sf_word in cutlass.range_constexpr(num_sf_atoms):
+                        _sf_slot = sf_word if _sf_words_resident else 0
+                        for _bj in cutlass.range_constexpr(0 if _sf_words_resident else num_sfb_operands):
+                            for block_n in cutlass.range_constexpr(num_blocks_n):
+                                for _a in cutlass.range_constexpr(word_atoms):
+                                    if elect_one:
+                                        nvvm.tcgen05_cp(
+                                            s2t_shape,
+                                            sfb_dst_ptrs[0][_bj][block_n][_a],
                                             desc_sfb_bases[_bj] + (sf_atom_desc_stride * (sf_word * word_atoms + _a) + sf_block_desc_stride * block_n),
                                             group=_CTA_GROUP,
                                             multicast=s2t_multicast,
@@ -1198,19 +1171,18 @@ def _kernel(
                                 desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * mma_k)
                                 desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * mma_k)
                                 for mma_m in cutlass.range_constexpr(mma_size_m):
-                                    if cutlass.const_expr(not fake_dequant_a and mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
+                                    if cutlass.const_expr(
+                                        not _sf_words_resident and not fake_dequant_a and mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]
+                                    ):
                                         for _a in cutlass.range_constexpr(word_atoms):
                                             if elect_one:
                                                 nvvm.tcgen05_cp(
                                                     s2t_shape,
-                                                    sfa_dst_ptrs[_ai][mma_m][_a],
+                                                    sfa_dst_ptrs[0][_ai][mma_m][_a],
                                                     desc_sfa_bases[_ai] + (sf_atom_desc_stride * (sf_word * word_atoms + _a) + sf_block_desc_stride * mma_m),
                                                     group=_CTA_GROUP,
                                                     multicast=s2t_multicast,
                                                 )
-                                    # The M sub-block offset is a whole SMEM swizzle atom, so
-                                    # the descriptor's swizzle phase is preserved. B and its SF
-                                    # are shared; A's SF word block follows the M block.
                                     desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mma_m)
                                     if elect_one:
                                         _tcgen05_mma_block_scale(
@@ -1221,20 +1193,18 @@ def _kernel(
                                             desc_b,
                                             idesc_k,
                                             enable_input_d=scale_d,
-                                            scale_a=sfa_dst_ptrs[_ai][mma_m][0],
-                                            scale_b=sfb_scale_ptrs[_bj],
+                                            scale_a=sfa_dst_ptrs[_sf_slot][_ai][mma_m][0],
+                                            scale_b=sfb_scale_ptrs[_sf_slot][_bj],
                                             scale_vec_size=scale_vec_size,
                                             collector_op=_a_collector_op(gemm_i),
                                             b_collector_op=_b_collector_op(mma_m),
                                         )
-                            # Every accumulator sees scale_d=False on exactly the first
-                            # k_block of the tile, so the flip stays outside mma_m.
                             scale_d = cutlass.Boolean(True)
 
                     if elect_one:
                         nvvm.tcgen05_commit(
                             ab_empty_mbar_ptr.subview(stage),
-                            multicast_mask=ab_empty_arrive_mask,
+                            multicast_mask=ab_empty_arrive_mask << (k_rank * (cluster_shape_mnk[0] * cluster_shape_mnk[1])),
                             group=_CTA_GROUP,
                         )
                     ab_iter += 1
@@ -1255,19 +1225,29 @@ def _kernel(
                     time_limit=10_000_000,
                 ):
                     pass
-                _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 is_valid = vld
                 if cutlass.const_expr(split_k_slices > 1):
-                    tile_l = _l_idx
+                    tile_l = l_idx
+                if cutlass.const_expr(sfb_sub_tile_n > 0):
+                    mma_raw_m = m_idx >> _preferred_cluster_m_shift
+                    mma_raw_n = n_idx >> _preferred_cluster_n_shift
+                    mma_nt_m = gridx >> _preferred_cluster_m_shift
+                    mma_nt_n = gridy >> _preferred_cluster_n_shift
+                    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+                        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                            mma_raw_m = m_idx >> _fallback_cluster_m_shift
+                            mma_raw_n = n_idx >> _fallback_cluster_n_shift
+                            mma_nt_m = gridx >> _fallback_cluster_m_shift
+                            mma_nt_n = gridy >> _fallback_cluster_n_shift
+                    _unused_m, sfb_tile_n = _l2_swizzle_tile(mma_raw_m, mma_raw_n, mma_nt_m, mma_nt_n, swizzle_w, identity=tile_swizzle_n == 1)
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
-            # Dense only: an early-launched reducer would pile its many small CTAs
-            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
             if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 
@@ -1370,9 +1350,14 @@ def _kernel(
         acc_full_phase_bit = cutlass.Int32(0)
         tile_m = init_tile_m
         tile_n = init_tile_n
-        tile_l = init_tile_l
+        tile_l = init_tile_l // cluster_shape_mnk[2]
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
+
+        write_epilogue = True
+        if cutlass.const_expr(cluster_k_reduce):
+            write_epilogue = k_rank == 0
+            cluster_reduce_iter = cutlass.Int32(0)
 
         # @@EPILOGUE_SETUP:BEGIN@@
         row_id_with_warp_offset = base_row_id + warp_idx * 32
@@ -1435,6 +1420,22 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
+                    if cutlass.const_expr(cluster_k_reduce):
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        c_rmem_vec = cluster_split_k_reduce(
+                            c_rmem_vec,
+                            cluster_mailbox,
+                            cluster_ready_mbar_ptr,
+                            cluster_free_mbar_ptr,
+                            cluster_reduce_iter,
+                            k_rank,
+                            k_root_rank,
+                            cluster_shape_mnk[0] * cluster_shape_mnk[1],
+                            split_k_slices,
+                            num_epilogue_warps * 32,
+                        )
+                        cluster_reduce_iter += 1
+
                     if cutlass.const_expr(not use_acc_overlap):
                         if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1465,17 +1466,17 @@ def _kernel(
                     col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
-                    vec_f32 = c_rmem_vec
-                    col_j = col
-                    linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                    if write_epilogue:
+                        vec_f32 = c_rmem_vec
+                        col_j = col
 
-                    # @@INJECT_EPILOGUE@@
+                        # @@INJECT_EPILOGUE@@
 
-                    # @@INJECT_TMA_STORE_SEQUENCE@@
+                        # @@INJECT_TMA_STORE_SEQUENCE@@
                     # @@TMA_STORE_ONLY:END@@
 
                     # @@STG_ONLY:BEGIN@@
-                    if row_active and row < M:
+                    if write_epilogue and row_active and row < M:
                         for j in cutlass.range_constexpr(subtile_w // vsize):
                             col_j = col + j * vsize
                             if col_j + vsize <= N:
@@ -1517,7 +1518,7 @@ def _kernel(
                 swizzle_w,
                 identity=tile_swizzle_n == 1,
             )
-            tile_l = l_idx
+            tile_l = l_idx // cluster_shape_mnk[2]
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1538,6 +1539,11 @@ def _kernel(
 
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+
+    if cutlass.const_expr(cluster_k_reduce):
+        # DSMEM slots must outlive every peer's final load and acknowledgement.
+        nvvm.barrier_cluster_arrive()
+        nvvm.barrier_cluster_wait()
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1709,25 +1715,24 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch * split_k_slices)
+    # Resolve shape-only rasterization once per launch on the host.
+    swizzle_w_host = _auto_swizzle_w(m, n, k_sym, num_tile_n_host)
     launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
+        swizzle_w_host,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
-        # @@SPLITK_ONLY:BEGIN@@
-        splitk_partials,
-        # @@SPLITK_ONLY:END@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
+        # @@SPLITK_ONLY:BEGIN@@
+        splitk_partials,
+        # @@SPLITK_ONLY:END@@
     )
-    # Mixed CGA: `cluster` is the preferred (wide) shape and
-    # `fallback_cluster` the regular one the device groups blocks into when a
-    # preferred cluster does not fit. The grid is already a multiple of the
-    # preferred shape, which the driver requires.
     if cutlass.const_expr(fallback_cluster_shape_mnk is None):
         launch.launch(
             grid=grid_shape,
@@ -1785,9 +1790,6 @@ def compile() -> Callable:
     b_stride_elems = 128 // b_dtype.width
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=out_vec_elems)
-    # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
-    # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
-    # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     # Packed K extent: same reasoning as sym_k -- no CTA-tile multiple is required.
     sym_akp = cute.sym_int64()
@@ -1818,8 +1820,6 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # SF reaches the kernel as a base pointer only; the host rebuilds the
-    # F8_128x4 view from problem_size, so no SF mode carries a layout contract.
     def _make_fake_sfa():
         return cute.runtime.make_fake_tensor(
             sf_cutlass_dtype,

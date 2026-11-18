@@ -9,13 +9,14 @@ One package per arch line -- ``sm80/``, ``sm100/`` (SM100/SM103), ``sm107/``
 (Rubin), ``sm120/`` (SM120/SM121) -- holding the kernels that arch owns, the
 same shape as ``sdpa/fwd/kernels/``.  Within a package the filename encodes the rest of the
 coverage matrix: ``bprop_d<dim>_<dtype-family>.py``, e.g.
-``sm100/bprop_d512_f16.py`` (``f16`` covers fp16 and bf16, picked by
+``sm100/d512_f16_role_split/kernel.py`` (``f16`` covers fp16 and bf16, picked by
 ``TemplateParams``).  A file omits the dimension when one implementation
-covers every supported head dim (``sm80/bprop_f16.py``, ``sm120/bprop_f16.py``);
+covers every supported head dim; an explicit implementation engine's body is
+``<arch>/<implementation>/kernel.py`` beside its ``contract.py`` and ``host.py`` (``sm120/f16_fused/``),
+and ``<arch>/half_contract.py`` names the body a multi-body row selects for a declaration;
 ``sm120/bprop_chain_f16.py`` is the SM120-only part of the launch chain around
 that arch's fused main kernel (the deterministic dQ GEMM and the converts), and
-the ``_common.py`` / ``_bprop_mxfp8_*.py`` modules inside a package are that
-arch's private helpers.  A ``prepared_host.py`` inside a package is that arch's
+the ``_common.py`` modules inside a package are that arch's private helpers.  A ``prepared_host.py`` inside a package is that arch's
 pointer host: the ONE ``@cute.jit`` entry that launches its whole backward chain
 from device pointers and the caller's workspace (the prepared-launch contract of
 ``bwd/prepared.py``; ``sm100/``, ``sm107/``, ``sm120/``, ``sm80/``).
@@ -43,12 +44,15 @@ import time (module global ``FROST_TEMPLATE_PARAMS``, injected by
 ``cudnn.frost.template_loader.load_template``). Tensor geometry remains an
 input to each module's cached ``compile()`` function. The adapter's
 ``_SM*_KERNEL_FILE`` constants hold paths RELATIVE to this directory
-(``"sm120/bprop_f16.py"``), which the loader joins onto it. Import a template
+(``"sm120/f16_fused/kernel.py"``), which the loader joins onto it. Import a template
 directly only for its all-defaults standalone path.
 
-The SM100 d=256 MXFP8 kernels (``sm100/bprop_dq_d256_mxfp8``,
-``sm100/bprop_dkdv_d256_mxfp8``, their shared ``sm100/_bprop_mxfp8_*`` helpers
-and the ``sm100/bprop_sf_repack_mxfp8`` scale-factor repack) are the exception:
+The SM100 d=256 MXFP8 kernels (``sm100/d256_mxfp8/dq``,
+``sm100/d256_mxfp8/dkdv``, their shared ``masks`` / ``common`` helpers
+and the ``sf_repack`` scale-factor repack in the same directory) are the exception:
 ported CuTe DSL kernel CLASSES that specialize through their constructors, so
-they are ordinary importable modules with no template parameters.
+they are ordinary importable modules with no template parameters. So are the
+SM100 / SM103 D128 MXFP8 chain kernels (``sm100/d128_mxfp8/prep``, ``dkdv``
+and ``dq``, their shared ``common`` helpers and the ``chain`` launcher), which
+specialize on the plan-time ``geometry`` in the same directory.
 """

@@ -273,7 +273,7 @@ class BenchmarkRunner:
                 thd_min_fill=case["thd_min_fill"],
                 time_ms=float("inf"),
                 tflops=0.0,
-                max_diff=0.0,
+                max_diff=float("nan"),
                 num_iterations=case["num_iterations"],
                 success=False,
                 skipped=True,
@@ -302,7 +302,7 @@ class BenchmarkRunner:
                 thd_min_fill=case["thd_min_fill"],
                 time_ms=float("inf"),
                 tflops=0.0,
-                max_diff=0.0,
+                max_diff=float("nan"),
                 num_iterations=case["num_iterations"],
                 success=False,
                 error_message=str(e),
@@ -420,6 +420,9 @@ class BenchmarkRunner:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = output_dir / f"{config.name}_{timestamp}.csv"
 
+        if "max_diff" in df:
+            # Small measured errors can round to zero at the precision used for timings.
+            df["max_diff"] = df["max_diff"].astype("string")
         df.to_csv(output_path, index=False, float_format="%.3f")
         logger.info(f"Results saved to {output_path}")
 
@@ -454,8 +457,7 @@ Examples:
 
     parser.add_argument(
         "--config",
-        required=True,
-        help="Config name (e.g., 'llama'). Must be a Python file in configs/",
+        help="Config name (e.g., 'llama'). Must be a Python file in configs/; required unless --list-configs",
     )
     parser.add_argument(
         "--dry-run",
@@ -509,6 +511,8 @@ Examples:
         for name in configs:
             print(f"  {name}")
         return
+    if args.config is None:
+        parser.error("the following arguments are required: --config")
 
     # Load config
     from .configs import load_config

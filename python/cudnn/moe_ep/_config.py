@@ -299,7 +299,7 @@ def _resolve_receive_capacity(
         padding_block=inference_padding,
     )
 
-    if config.training_backward_tuning.dgrad_optimization == "ds3_ep4_v1":
+    if config.training_backward_tuning.dgrad_optimization == "ds3_ep4_pattern":
         required_for_all_routes = _required_padded_rows(
             raw_route_count,
             experts_per_rank=topology.experts_per_rank,
@@ -307,7 +307,7 @@ def _resolve_receive_capacity(
         )
         if physical_rows < required_for_all_routes:
             raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires "
+                "dgrad_optimization='ds3_ep4_pattern' requires "
                 "physical_recv_pool_rows >= the padded full-topology "
                 f"capacity ({required_for_all_routes}), got {physical_rows}"
             )

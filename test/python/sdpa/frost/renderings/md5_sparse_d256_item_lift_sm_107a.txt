@@ -1,0 +1,13 @@
+# The sm107 index-list sparse tile's (sm107/sparse_d256_f16.py) cubin md5 per rendering, host trace-compiled for sm_107a at PYTHONHASHSEED=0 on the tree
+# BEFORE the visible-set helper lift into sm107/_sparse_item_common.py (visible_bounds / block_id_at; the SELECT helpers travel with it).
+# The lifted tree must render every rendering BYTE-IDENTICAL (test_sdpa_fwd_sparse_lean_sm107.py::test_item_helper_lift_keeps_the_tcgen05_cubins_byte_identical).
+# Lines: dsl=<distribution> <version>; sparse_d256_f16 sm_107a <rendering> cubin_md5=<md5>.  A record stays valid for the DSL build it names.
+dsl=nvidia-cutlass-dsl 4.8.0
+sparse_d256_f16 sm_107a decode_dense_split3_bf16_g1 cubin_md5=a62923e10ba1765aa4076c502d9183e1
+sparse_d256_f16 sm_107a decode_paged16_split16_bf16_g12 cubin_md5=52193461a039f123ef85fe3b6f3f2f7c
+sparse_d256_f16 sm_107a decode_paged16_split16_bf16_g12_pdl cubin_md5=2a41c43a181178d63a107d305ffc5f92
+sparse_d256_f16 sm_107a prefill_dense_bf16_g12 cubin_md5=65e1582df24e93f54903bb62f95b0df4
+sparse_d256_f16 sm_107a prefill_dense_f16_g16_top4 cubin_md5=8ad3877ba954f1e8d973fb5fb42191d9
+sparse_d256_f16 sm_107a prefill_gated_bf16_g12 cubin_md5=c3da5be7e0a10d63126e44b6a4f18ef2
+sparse_d256_f16 sm_107a prefill_paged64_bf16_g12_blocklens cubin_md5=e64007147c5f5b1bfbd2f940d4f599f7
+sparse_d256_f16 sm_107a prefill_thd_bf16_g12 cubin_md5=f10e4d68f68b55fca296b82e513cdfa1

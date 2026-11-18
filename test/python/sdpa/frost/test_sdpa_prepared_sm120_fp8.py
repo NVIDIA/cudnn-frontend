@@ -128,8 +128,8 @@ def test_sm120_fp8_dense_input_strides(d, dv):
 
 @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("padding", [8, 16])
-def test_sm120_fp8_output_pitch_preserves_conversion_route(output_dtype, padding, monkeypatch):
-    shared.test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype, padding, monkeypatch)
+def test_sm120_fp8_output_pitch_requires_native_byte_alignment(output_dtype, padding, monkeypatch):
+    shared.test_fp8_output_pitch_requires_native_byte_alignment(output_dtype, padding, monkeypatch)
 
 
 @pytest.mark.parametrize("thd", [False, True])

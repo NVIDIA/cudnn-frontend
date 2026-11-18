@@ -122,7 +122,7 @@ def fake_quantize_q(
     delta=None,
 ):
     """Fake-quantize Q and optionally compute the matching backward delta."""
-    batch_head = tl.program_id(1)
+    batch_head = tl.program_id(1).to(tl.int64)  # Rule S7: widen before the stride products
     q_ptr += stride_h * (batch_head % num_heads) + stride_b * (batch_head // num_heads)
     fake_q_ptr += fake_stride_h * (batch_head % num_heads) + fake_stride_b * (batch_head // num_heads)
 
@@ -163,7 +163,7 @@ def fake_quantize_kv(
     head_dim: tl.constexpr,
 ):
     """Fake-quantize matching K and V tiles into workspace storage."""
-    batch_head = tl.program_id(1)
+    batch_head = tl.program_id(1).to(tl.int64)  # Rule S7: widen before the stride products
     input_offset = stride_h * (batch_head % num_heads) + stride_b * (batch_head // num_heads)
     output_offset = fake_stride_h * (batch_head % num_heads) + fake_stride_b * (batch_head // num_heads)
     k_ptr += input_offset

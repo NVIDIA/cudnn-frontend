@@ -6,10 +6,10 @@
 Listed in ``cudnn/engines/manifest.py`` as ONE row owning the
 ``FROST_SDPA_BWD_ID_BASE`` block, so ``FrostSdpaBwdEngines()`` returns the whole
 family and a graph containing an sdpa_backward() node reaches them through the
-ordinary lifecycle — no registration call. ``sdpa_bwd_sm100`` (d in (256, 512],
-where the backend has no SM100 engine) is offered by default; the other slots stay
-opt-in (``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until they have the arch coverage
-to serve graphs unasked.
+ordinary lifecycle — no registration call. Each manifest slot declares ordinary
+or opt-in discovery (``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``). The two explicit
+SM100 D512 half owners participate in ordinary discovery; the legacy row
+declines their graph domain so old records require replanning.
 
 The capability table, the probe and the lowering stay in ``engines.py``
 (``ENGINE_SPECS`` / ``analyze_for`` / ``build``); this file is only the engine
@@ -18,6 +18,7 @@ contract around them.
 
 from typing import TYPE_CHECKING, List, Optional
 
+from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
 from cudnn.sdpa._plan import _FrostSdpaPlan, _check_workspace
 
@@ -53,6 +54,8 @@ class FrostSdpaBwdEngine(BaseEngine):
     spec's shipped name and ``engine_id`` is its fixed offset in the family's id
     block (see :func:`FrostSdpaBwdEngines`).
     """
+
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def __init__(self, spec: "EngineSpec", engine_id: int):
         super().__init__()

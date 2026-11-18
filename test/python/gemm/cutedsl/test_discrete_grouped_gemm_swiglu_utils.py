@@ -148,7 +148,9 @@ def discrete_grouped_gemm_init(
 ) -> Dict[str, Any]:
     """Initialize configuration for discrete grouped GEMM GLU tests."""
     major, _ = torch.cuda.get_device_capability()
-    if major < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
     nkl_str = request.config.getoption("--grouped-gemm-nkl", default=None)

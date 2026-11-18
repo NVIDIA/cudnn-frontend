@@ -1,0 +1,119 @@
+{
+  "inputs": {
+    "beta": {
+      "dtype": "torch.float32",
+      "sha256": "238b6d28d0f181b21a0bfc6215da77617aa6141cdb7a7c67d9940904b839755e",
+      "shape": [
+        20,
+        2
+      ]
+    },
+    "cu": {
+      "dtype": "torch.int32",
+      "sha256": "88702398ef1ac3707d182dfd94cf84975d2b0270a0df53dd4cb8836694a4b254",
+      "shape": [
+        3
+      ]
+    },
+    "dfs": {
+      "dtype": "torch.float32",
+      "sha256": "8f84c45530915872d8a129ab472ff0119d95a3ae2f3893c29f8571a72d15f798",
+      "shape": [
+        2,
+        2,
+        64,
+        64
+      ]
+    },
+    "do": {
+      "dtype": "torch.bfloat16",
+      "sha256": "ca19f41e42c11ab821c3a56d23f146a78ce47b280c725c0b3b61d05613a40046",
+      "shape": [
+        20,
+        2,
+        64
+      ]
+    },
+    "g": {
+      "dtype": "torch.float32",
+      "sha256": "d9c0ff2366ea4ea78affdd0aea6152a664052ca31959f9a2d5003149c70a6667",
+      "shape": [
+        20,
+        2
+      ]
+    },
+    "initial_state": {
+      "dtype": "torch.float32",
+      "sha256": "55bebbea988613d71f1ccaf8d86e159d165c1db36a64360f2e6f6be493945a5b",
+      "shape": [
+        2,
+        2,
+        64,
+        64
+      ]
+    },
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "466777ccc977149c1c23a3387e68b3e69d6a3ef210e34e971fc2a63e3457ee37",
+      "shape": [
+        20,
+        2,
+        64
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "36dc32d208ce134340619814d039f2b37491832db5b56ffb2c41f1f129e3e9eb",
+      "shape": [
+        20,
+        2,
+        64
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "1d33fe43e5406b2fc4fd3f516e4eb6da15943fed9a607fbfbca612001e427c5a",
+      "shape": [
+        20,
+        2,
+        64
+      ]
+    }
+  },
+  "outputs": {
+    "final_state": {
+      "dtype": "torch.float32",
+      "sha256": "40b23844643d6327374ceadb53a9f6f5e0c52277ef8e789f202ca4dd1b385221",
+      "shape": [
+        2,
+        2,
+        64,
+        64
+      ]
+    },
+    "out": {
+      "dtype": "torch.bfloat16",
+      "sha256": "33b79cdcb90c0f3912e3e9391dbb63930dfb0870b61fd907f93b033b06825d64",
+      "shape": [
+        20,
+        2,
+        64
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13050,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA VR NVL72",
+    "sm": [
+      10,
+      7
+    ],
+    "sm_count": 212,
+    "torch": "2.14.0a0+b2c75dd062.nv26.09",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

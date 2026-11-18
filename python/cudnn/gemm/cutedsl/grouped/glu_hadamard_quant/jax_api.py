@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for grouped GEMM GLU + Hadamard + quant,
-built on :func:`cudnn.jax.call`.
+built on :func:`cudnn._jax.call`.
 
 ``grouped_gemm_glu_hadamard_quant_jax_forward`` is the canonical forward with dense
 weights for packed FP4 inputs. Its NVFP4 outputs are packed too: uint8 arrays with
@@ -162,9 +162,11 @@ def glu_hadamard_quant_plan(inputs, mma_tiler_mn, cluster_shape_mn, sf_vec_size,
             raise ValueError("Unsupported grouped GEMM GLU hadamard quant dtype, tile, cluster, alignment, or layout configuration")
         validated_configs.add(validation_key)
     if config not in kernel_cache:
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = get_compute_capability()
-        if major < 10:
-            raise RuntimeError(f"Grouped GEMM GLU hadamard quant requires SM100+, found SM{major}{minor}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"Grouped GEMM GLU hadamard quant requires SM100+ with tcgen05 (not cc 12.x), found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
@@ -221,7 +223,8 @@ def grouped_gemm_glu_hadamard_quant_jax_forward(
     6-D E4M3 SFD. ``rht_rowwise_dtype`` (BF16 or NVFP4) adds the rowwise
     Hadamard output in the same layouts; ``rht_colwise_dtype`` (NVFP4 only)
     adds flat per-expert packed data (m*n_out/2,) and scales
-    (m*n_out/sf_vec_size,). At most one RHT output may be requested. n_out is
+    (m*n_out/sf_vec_size,) in standard GEMM 128x4 block order within each
+    expert segment. At most one RHT output may be requested. n_out is
     n/2, or n for ``act_func="srelu"``. ``norm_const``, ``rht_norm_const`` and
     the GLU scalars are compile-time constants of the traced call: pass Python
     numbers, since a traced JAX value raises ConcretizationTypeError. Returns a

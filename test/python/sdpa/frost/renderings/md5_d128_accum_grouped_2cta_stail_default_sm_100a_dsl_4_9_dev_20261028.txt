@@ -1,0 +1,16 @@
+# sm_100a per-kernel records for the same B, H, HK = 2, 8, 2 host probe as the 4.8.1 record.
+# Rendered with DSL/core/cu12/cu13 4.9.0.dev0+20261028185815.e475245 and
+# libs-base 4.9.0.dev0+20261028231650.f53b4ff. The existing 4.8.1 records remain unchanged.
+# The default and ldg module md5s are 08de69e0b7ff99cd25d16655f77e3c98 and 147dcf653b367b6ee7c274c661f27025.
+# Entry-region hashes include inter-entry annotations: the following main kernel's .globl comment differs
+# between forms, so the cast's recorded hash differs even though its instructions are identical.
+# The shared dK/dV fold remains excluded, as in the release record.
+dsl=nvidia-cutlass-dsl 4.9.0.dev0+20261028185815.e475245
+d128_accum_grouped_2cta_stail sm_100a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=8075cfdc6cf89caaff356b6592a377c1
+d128_accum_grouped_2cta_stail sm_100a default kernel=delta_zero_stats_thd_d128_2cta_kernel rc=0 ptx_md5=f071bde8e8e6886a1a81f2d8e29f950c
+d128_accum_grouped_2cta_stail sm_100a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=5fe5958ad75736e880018e1cad2e3fa1
+d128_accum_grouped_2cta_stail sm_100a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=f0e9582912436e349f41cf46951446e8
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=dcd9250396ec5e1517be1c9fc8a18648
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=delta_zero_thd_d128_kernel rc=0 ptx_md5=7451f8e1e48f06841bccba975577adbb
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=a0d0a6a31e177669c74b362b04d4893f
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=e9ef2d7b511c0e01745fa84282e5a5d6

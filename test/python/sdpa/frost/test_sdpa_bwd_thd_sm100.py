@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``sdpa_bwd_sm100`` THD / varlen: the packed backward, end to end.
+"""Explicit SM100 D512 half owners on THD / varlen: the packed backward, end to end.
 
 Two surfaces, deliberately both:
 
@@ -35,7 +35,7 @@ import cudnn
 
 pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
-_ENGINE = "sdpa_bwd_sm100"
+_ENGINE = "sdpa_bwd_sm100_d512_role_split"
 _D = 512
 _TOL_COS = 0.999
 
@@ -94,7 +94,7 @@ def _cos(a, b):
     return float((a @ b) / (a.norm() * b.norm() + 1e-30))
 
 
-def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=False):
+def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=False, adapter=None):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
 
     dev, b = "cuda", len(lens_q)
@@ -138,7 +138,7 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
     # kernel garbage that looks correctly shaped.
     stats = lse_p[0].transpose(0, 1).contiguous() if token_major_stats else lse_p
 
-    api = SdpaBwdDslSm100(
+    api = (adapter or SdpaBwdDslSm100)(
         sample_q=eq,
         sample_k=ekv,
         sample_v=ekv,
@@ -196,6 +196,28 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
             bad.append(f"seq {i} {name}: cos {_cos(got, want):.6f} (lens q={lens_q[i]} kv={lens_kv[i]})")
     failures = [m for m in bad if _below_tol(m)]
     assert not failures, "\n".join(bad)
+
+
+@pytest.mark.parametrize("twin", [False, True], ids=["role_split", "2x2"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("token_major_stats", [False, True])
+def test_fixed_d512_thd_envelope(twin, dtype, token_major_stats, monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+    Adapter = SdpaBwdDslSm100D512TwoByTwo if twin else SdpaBwdDslSm100D512RoleSplit
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not twin)
+    served, original = [], api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == Adapter._STAGE2_TAG:
+            served.append(path.rsplit("/kernels/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    _run([128, 64], [96, 192], d=384, dtype=dtype, token_major_stats=token_major_stats, adapter=Adapter)
+    assert served == ["sm100/d512_f16_2x2/kernel.py" if twin else "sm100/d512_f16_role_split/kernel.py"]
 
 
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
@@ -256,7 +278,8 @@ def test_thd_requires_declared_totals():
 # ---------------------------------------------------------------------------
 
 
-def _plan_index(g, name=_ENGINE):
+def _plan_index(g, name=None):
+    name = _ENGINE if name is None else name
     for i in range(g.get_execution_plan_count()):
         if name in g.get_plan_name_at_index(i):
             return i
@@ -536,21 +559,30 @@ def stage2_datapath(request, monkeypatch):
 
     from cudnn.sdpa.bwd import api_dsl
 
-    monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
+    owner = "sdpa_bwd_sm100_d512_2x2" if request.param else "sdpa_bwd_sm100_d512_role_split"
+    monkeypatch.setitem(globals(), "_ENGINE", owner)
+    # The physical-origin suite reuses this fixture with its own graph helper.
+    monkeypatch.setattr(request.module, "_ENGINE", owner)
+    if hasattr(request.module, "_ADAPTER"):
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+        monkeypatch.setattr(request.module, "_ADAPTER", SdpaBwdDslSm100D512TwoByTwo if request.param else SdpaBwdDslSm100D512RoleSplit)
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not request.param)
     served = []
     original = api_dsl.load_template
 
     def spy(path, params, tag="template"):
-        if tag == "sdpa_bwd_sm100_stage2":
-            served.append(path.rsplit("/", 1)[-1])
+        if tag == owner + "_stage2":
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
     guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
     with guard:
         yield request.param
-    want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
-    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
+    want = api_dsl._SM100_STAGE2_FILE_2X2 if request.param else api_dsl._SM100_STAGE2_FILE
+    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (owner={owner})"
 
 
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
@@ -854,7 +886,7 @@ def _thd_meta_words(case, h, chunk, seen):
 
 
 def _clusters():
-    from cudnn.sdpa.bwd.api_dsl import _sm100_device_clusters
+    from cudnn.sdpa.bwd.config_sm100 import _sm100_device_clusters
 
     return _sm100_device_clusters(torch.device("cuda"), 4)
 
@@ -928,9 +960,10 @@ def _cuda_kernel_names(fn):
 @pytest.mark.parametrize("h, hkv, chunk, kw", _CHUNK_CELLS)
 def test_graph_thd_launch_count_is_the_promised_chain(h, hkv, chunk, kw, stage2_datapath):
     """Launches per execute, from a CUPTI trace, == exactly the chain the host promises (Rules 1-2: no hidden launches):
-    ``setup + dot [+ zero-fill] + chunks * (clamp + stage 2 + (2 + group) * (patch + GEMM)) [+ dkv_reduce]`` -- for a dense-mask
+    ``setup + dot [+ zero-fill] + chunks * (maps + stage 2 + (2 + group) * (patch + GEMM)) [+ dkv_reduce]`` -- for a dense-mask
     MHA plan ``2 + 8 * chunks``.  The per-chunk THD helpers are counted by name too, so a chunk that silently skipped (or
-    doubled) a launch is attributed."""
+    doubled) a launch is attributed.  A graph binds every THD port with ragged offsets, so stage 2's input maps are the
+    sequence-local ones (``seq_thd_input_descs``), never the packed-total clamp."""
     guard, _ = _force_thd_head_chunk(chunk)
     with guard:
         case, *_ = _run_graph(_CHUNK_LENS, _CHUNK_LENS, h=h, hkv=hkv, check=False, **kw)
@@ -940,7 +973,8 @@ def test_graph_thd_launch_count_is_the_promised_chain(h, hkv, chunk, kw, stage2_
     want = 2 + int(causal) + chunks * 2 + 2 * gemms + int(group > 1)
     count = lambda sub: sum(sub in n for n in names)  # noqa: E731
     assert len(names) == want, f"{len(names)} launches != {want} (chunks {chunks}, group {group}, causal {causal}); trace:\n" + "\n".join(names)
-    assert count("thd_bwd_setup") == 1 and count("clamp_thd_input_descs") == chunks and count("thd_patch_descs") == gemms, names
+    assert count("thd_bwd_setup") == 1 and count("seq_thd_input_descs") == chunks and count("clamp_thd_input_descs") == 0, names
+    assert count("thd_patch_descs") == gemms, names
     assert count("bprop_matmul") == gemms and count("dot_do_o") == 1 and count("zero_workspace") == int(causal) and count("dkv_reduce") == int(group > 1), names
 
 

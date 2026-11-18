@@ -117,6 +117,71 @@ def test_build_cfg_preserves_logged_tensor_layout():
     assert cfg["right_bound"] is None
 
 
+def paged_fwd_payload(table_names=("Page_table_K", "Page_table_V"), dtype="FLOAT16", max_seq_len_kv=300, seq_len_kv=None):
+    payload = fwd_payload()
+    payload["context"]["io_data_type"] = dtype
+    node = payload["nodes"][0]
+    node["inputs"].update({"SEQ_LEN_Q": 5, "SEQ_LEN_KV": 6, table_names[0]: 7, table_names[1]: 8})
+    node.update(padding_mask=True, max_seq_len_kv=max_seq_len_kv)
+    payload["tensors"] = [
+        {"uid": 1, "dim": [2, 4, 1, 64], "stride": [256, 64, 64, 1]},
+        {"uid": 2, "dim": [20, 2, 32, 64], "stride": [4096, 2048, 64, 1]},
+        {"uid": 3, "dim": [20, 2, 32, 64], "stride": [4096, 2048, 64, 1]},
+        {"uid": 4, "dim": [2, 4, 1, 64], "stride": [256, 64, 64, 1]},
+        {"uid": 5, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1]},
+        {"uid": 6, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": seq_len_kv},
+        {"uid": 7, "dim": [2, 1, 10, 1], "stride": [10, 10, 1, 1]},
+        {"uid": 8, "dim": [2, 1, 10, 1], "stride": [10, 10, 1, 1]},
+    ]
+    return payload
+
+
+@pytest.mark.parametrize(
+    "table_names,dtype,max_seq_len_kv,logged_lengths,expected_s_kv",
+    [
+        pytest.param(("Page_table_K", "Page_table_V"), "FLOAT16", 300, [128, 267], 300, id="serialized-fields"),
+        pytest.param(("PAGED_ATTENTION_K_TABLE", "PAGED_ATTENTION_V_TABLE"), "BFLOAT16", 300, None, 300, id="table-aliases-without-dumps"),
+        pytest.param(("Page_table_K", "Page_table_V"), "FLOAT16", None, [128, 267], 320, id="table-capacity"),
+    ],
+)
+def test_build_cfg_recovers_paged_kv_geometry(table_names, dtype, max_seq_len_kv, logged_lengths, expected_s_kv):
+    payload = paged_fwd_payload(table_names, dtype, max_seq_len_kv, logged_lengths)
+
+    cfg = operations.select_operation(payload).build_cfg("{}", payload)
+
+    assert cfg["is_paged"] is True
+    assert cfg["block_size"] == 32
+    assert cfg["s_kv"] == expected_s_kv
+    assert cfg["shape_k"] == cfg["shape_v"] == (2, 2, expected_s_kv, 64)
+    assert cfg["stride_k"] is None
+    assert cfg["stride_v"] is None
+    assert cfg["seq_len_q"] == [1, 1]
+    assert cfg["seq_len_kv"] == (logged_lengths or [expected_s_kv, expected_s_kv])
+
+
+def test_build_cfg_uses_paged_bias_extent_when_max_is_unspecified():
+    payload = paged_fwd_payload(max_seq_len_kv=None)
+    payload["nodes"][0]["inputs"]["Bias"] = 9
+    payload["tensors"].append({"uid": 9, "dim": [1, 4, 1, 300], "stride": [1200, 300, 300, 1]})
+
+    cfg = operations.select_operation(payload).build_cfg("{}", payload)
+
+    assert cfg["s_kv"] == 300
+    assert cfg["is_bias"] is True
+
+
+@pytest.mark.parametrize("one_sided", [True, False], ids=["one-sided-cache", "different-page-sizes"])
+def test_build_cfg_rejects_paged_geometry_the_runner_cannot_recreate(one_sided):
+    payload = paged_fwd_payload()
+    if one_sided:
+        del payload["nodes"][0]["inputs"]["Page_table_V"]
+    else:
+        payload["tensors"][2]["dim"][2] = 64
+
+    with pytest.raises(ValueError, match="Paged SDPA replay requires K and V caches with a shared page size"):
+        operations.select_operation(payload).build_cfg("{}", payload)
+
+
 def test_build_cfg_detects_ragged_from_offset_inputs():
     payload = fwd_payload()
     node = payload["nodes"][0]
@@ -229,3 +294,42 @@ def test_payload_ignores_unrelated_ragged_log_text():
 
     assert annotated_payload["repro_metadata"]["ragged_tensor_names"] == []
     assert cfg["is_ragged"] is False
+
+
+@pytest.mark.parametrize("sides", ["q", "kv", "both"])
+@pytest.mark.parametrize("stats", [False, True])
+def test_forward_cumulative_length_ports(sides, stats):
+    payload = fwd_payload()
+    node = payload["nodes"][0]
+    node["generate_stats"] = stats
+    for t in payload["tensors"]:
+        t["dim"][0] = 3
+    for name, uid, lengths, prefix in [("Q", 5, [7, 0, 4], [0, 7, 7, 11]), ("KV", 6, [9, 11, 2], [0, 9, 20, 22])]:
+        cumulative = sides in (name.lower(), "both")
+        node["inputs"][("CU_SEQ_LEN_" if cumulative else "SEQ_LEN_") + name] = uid
+        payload["tensors"].append({"uid": uid, "pass_by_value": prefix if cumulative else lengths})
+
+    cfg = sdpa_fwd.build_cfg("", payload)
+    assert cfg["is_padding"] and cfg["is_cu_seq_len"] and cfg["is_infer"]
+    assert cfg["cu_seq_len_sides"] == sides and cfg["fwd_stats"] is stats
+    metadata = sdpa_fwd.extract_seq_and_ragged(payload, seed=0)
+    assert cfg["seq_len_q"] == metadata["seq_len_q"] == [7, 0, 4]
+    assert cfg["seq_len_kv"] == metadata["seq_len_kv"] == [9, 11, 2]
+
+
+def test_undumped_cumulative_ports_keep_graph_shape():
+    payload = fwd_payload()
+    payload["nodes"][0]["inputs"].update(CU_SEQ_LEN_Q=5, CU_SEQ_LEN_KV=6)
+    cfg = sdpa_fwd.build_cfg("", payload)
+    assert cfg["is_cu_seq_len"] and cfg["cu_seq_len_sides"] == "both"
+    assert cfg["seq_len_q"] == cfg["seq_len_kv"] == [16]
+    assert sdpa_fwd.extract_seq_and_ragged(payload, seed=0)["seq_len_q"] == []
+
+
+@pytest.mark.parametrize("prefix", [[0, 4, 8], [1, 4], [0, -1]])
+def test_unrepresentable_cumulative_dump(prefix):
+    payload = fwd_payload()
+    payload["nodes"][0]["inputs"]["CU_SEQ_LEN_Q"] = 5
+    payload["tensors"].append({"uid": 5, "pass_by_value": prefix})
+    with pytest.raises(ValueError, match="CU_SEQ_LEN_Q"):
+        sdpa_fwd.build_cfg("", payload)

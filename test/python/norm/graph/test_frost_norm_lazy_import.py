@@ -4,7 +4,7 @@
 
 AGENTS.md Rule 7 wants an engine on an unsupported install to DECLINE, not
 explode. That only works if nothing imports a kernel module before the decline
-runs: every kernel imports ``cutlass.primitives`` at its top, so on a DSL
+runs: every kernel imports ``cutlass.experimental.primitives`` at its top, so on a DSL
 without it the failure is a bare ``ModuleNotFoundError`` raised from inside the
 import machinery -- out of the engine's reach, with its plan already ranked.
 
@@ -77,26 +77,38 @@ def test_resolving_the_api_does_load_it():
     assert n > 0, "norm_fprop resolved without loading the DSL -- the probe is not measuring what it claims"
 
 
+_BLOCK_PRIMITIVES = """
+    import importlib.abc, sys
+    import cutlass
+
+    class _Block(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target=None):
+            if name in BLOCKED:
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return None
+
+    for name in BLOCKED:
+        sys.modules.pop(name, None)
+        parent, _, child = name.rpartition(".")
+        if parent in sys.modules and hasattr(sys.modules[parent], child):
+            delattr(sys.modules[parent], child)
+    sys.meta_path.insert(0, _Block())
+    import cudnn.frost.buffers as b
+    b._DSL_PRIMITIVES = None
+"""
+
+
+def _probe(blocked, body):
+    script = f"BLOCKED = {tuple(blocked)!r}\n" + textwrap.dedent(_BLOCK_PRIMITIVES) + textwrap.dedent(body)
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300)
+
+
 @pytest.mark.L0
 def test_missing_primitive_layer_declines_instead_of_raising():
-    """With cutlass.primitives unreachable, the API must raise OUR message.
-
-    Simulated by making that one import fail; everything else about the DSL
-    stays as it is, which is the shape of a public wheel that exports the layer
-    under ``cutlass.experimental.primitives`` instead.
-    """
-    probe = textwrap.dedent("""
-        import importlib
-        import cudnn.frost.buffers as b
-
-        real = importlib.import_module
-        def fake(name, *a, **k):
-            if name == "cutlass.primitives":
-                raise ModuleNotFoundError("No module named 'cutlass.primitives'")
-            return real(name, *a, **k)
-        importlib.import_module = fake
-        b._DSL_PRIMITIVES = None
-
+    """With no primitive layer under either name, the API must raise OUR message."""
+    out = _probe(
+        ("cutlass.primitives", "cutlass.experimental.primitives"),
+        """
         import cudnn.norm
         try:
             cudnn.norm.norm_fprop
@@ -104,9 +116,30 @@ def test_missing_primitive_layer_declines_instead_of_raising():
             print("DECLINED:", exc)
         else:
             print("NO ERROR")
-        """)
-    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=300)
+        """,
+    )
     assert out.returncode == 0, out.stderr[-2000:]
     line = out.stdout.strip().splitlines()[-1]
     assert line.startswith("DECLINED:"), f"expected a gated ImportError, got: {line}"
-    assert "cutlass.primitives" in line and "does not export" in line, f"message is not actionable: {line}"
+    assert "cutlass.experimental.primitives" in line and "does not export" in line, f"message is not actionable: {line}"
+
+
+@pytest.mark.L0
+def test_public_wheel_layout_is_served():
+    """Public nvidia-cutlass-dsl wheels export the layer only as ``cutlass.experimental.primitives``.
+
+    With ``cutlass.primitives`` unreachable the API must not decline, and a kernel module must import.
+    """
+    out = _probe(
+        ("cutlass.primitives",),
+        """
+        import importlib
+        import cudnn.norm
+        cudnn.norm.norm_fprop
+        importlib.import_module("cudnn.norm.fprop.kernels.layernorm_warp_sm100")
+        importlib.import_module("cudnn.norm.bprop.kernels.batchnorm_nhwc_sm100")
+        print("SERVED")
+        """,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "SERVED", out.stdout[-2000:]

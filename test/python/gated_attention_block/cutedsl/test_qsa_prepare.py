@@ -36,6 +36,12 @@ there): the fused launch's indexer queries and paged compressed-key rows BITWISE
 form under the same arm: two call sites of one store helper), and BITWISE the bf16 chain's rows ``.to(float8_e4m3fn)`` on the same inputs
 (the e4m3 cast of the bf16 row); the ring in bf16; one launch; the arm composes with the ring-slot and the RoPE-table arms (orthogonal
 compile keys); the refusals both ways naming the recipe's dtype; f16 io has no e4m3 arm.
+
+The rounding attribute (``QsaPrepareIndexArms.rounding``; 2026-10-29): the fused launch under ``rounding="hf"`` BITWISE its unfused
+twins under the same value (the pool-1 compress and the step form with ``rounding="hf"``: the query arm and the compress arm are two of
+the chain's four sites), dense and paged; a distinct compile key; an unknown value refused naming the tuple.  The chunk form's ring TAIL
+write (the extend step's second cache-write launch) is the cache-write kernel over the ring's circular slots -- pinned here, where the
+cache-write kernel's cells live, with no kernel change.
 """
 
 import os
@@ -177,9 +183,11 @@ class _Chain:
         padding=(),
         n_pos=None,
         index_cache_dtype=None,
+        rounding="single",
     ):
         dev = "cuda"
         self.dtype, self.slot_dtype, self.layout, self.apply_norm, self.band = dtype, slot_dtype, layout, apply_norm, band
+        self.rounding = arms.rounding if arms is not None else rounding  # the chain's rounding points: the arms record's, the unfused twins'
         self.cache_dtype = (
             dtype if index_cache_dtype is None else index_cache_dtype
         )  # the indexer queries' / compressed-key cache's dtype (e4m3 = the e4m3 store arm)
@@ -206,6 +214,7 @@ class _Chain:
                     paged=paged,
                     ring_slots=ring_slots,
                     rope_table=rope_table,
+                    rounding=rounding,
                 )
                 if band
                 else None
@@ -312,7 +321,9 @@ class _Chain:
             compile_cache_write(dtype=dt, h=1, d=self.d_i, page_size=_PAGE, slot_dtype=sd, two_operands=False) if (a is not None and a.raw_pool) else None
         )
         self.r_q1 = (
-            compile_qsa_compress(dtype=dt, d=self.d_i, rope_dim=self.rope, pool=1, has_seq_lens=False, table_dtype=dt, out_dtype=self.cache_dtype)
+            compile_qsa_compress(
+                dtype=dt, d=self.d_i, rope_dim=self.rope, pool=1, has_seq_lens=False, table_dtype=dt, out_dtype=self.cache_dtype, rounding=self.rounding
+            )
             if (a is not None and a.query)
             else None
         )
@@ -328,6 +339,7 @@ class _Chain:
                 ring_slots=self.ring_slots,
                 ring_slot_dtype=sd,
                 index_cache_dtype=self.cache_dtype,
+                rounding=self.rounding,
             )
             if (a is not None and a.compress)
             else None
@@ -599,13 +611,42 @@ def test_fused_prepare_is_bitwise_the_unfused_chain(geom, batch, rows, dtype, sl
         pytest.param(QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=False, query=True, compress=False), id="query_only"),
         pytest.param(QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=False, query=False, compress=True, n_commit=False), id="compress_only"),
         pytest.param(QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=True, query=False, compress=True, n_commit=False), id="raw_pool_and_compress"),
+        pytest.param(
+            QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=False, query=True, compress=True, n_commit=False, rounding="hf"), id="query_and_compress_hf"
+        ),
     ],
 )
 def test_every_arm_subset_is_bitwise_its_unfused_twins(arms):
     """The arms are traced by presence: each subset folds the others out and stays bitwise the kernels it keeps (the
-    block binds the raw-pool-only form today; the serving step binds the compress and query arms)."""
+    block binds the raw-pool-only form today; the serving step binds the compress and query arms); under ``rounding="hf"`` the query arm
+    and the compress arm stay bitwise their unfused twins compiled with the same value."""
     ch = _chain(_GEOM_SMALL, batch=2, rows=4, pos0=(3, 10), arms=arms, band=True)
     ch.assert_bitwise(f"arms {arms}")
+
+
+@requires_cuda
+@pytest.mark.parametrize("ring_slots, rope_table", [(False, False), (True, True)], ids=["derived_rows_per_token", "ring_slots_rope_table"])
+def test_paged_fused_prepare_under_hf_rounding_is_bitwise_the_paged_step_form(ring_slots, rope_table):
+    """The PAGED compress arm and the query arm under ``rounding="hf"``: the fused launch bitwise the step form and the pool-1 compress
+    compiled with ``rounding="hf"`` (three sequences, one padding), composed with the ring-slot and the RoPE-table arms."""
+    ch = _chain(
+        _GEOM_SMALL,
+        batch=4,
+        rows=4,
+        pos0=(3, 0, 11, 2050),
+        paged=True,
+        page=16,
+        cap=8,
+        ring_slots=ring_slots,
+        rope_table=rope_table,
+        padding=(1,),
+        rounding="hf",
+    )
+    ch.assert_bitwise(f"hf rounding paged slots={ring_slots} table={rope_table}")
+    assert ch.r_fused.index.rounding == "hf" and ch.r_step.rounding == "hf" and ch.r_q1.rounding == "hf"
+    plain = _chain(_GEOM_SMALL, batch=4, rows=4, pos0=(3, 0, 11, 2050), paged=True, page=16, cap=8, ring_slots=ring_slots, rope_table=rope_table, padding=(1,))
+    assert not _same(plain.Bf["comp"], ch.Bf["comp"]), "the attribute changed nothing on the compressed rows"
+    assert torch.equal(plain.Bf["cslot"], ch.Bf["cslot"]) and _same(plain.Bf["ring"], ch.Bf["ring"])
 
 
 @requires_cuda
@@ -1293,6 +1334,13 @@ def test_compile_rejects_unsupported_paged_declarations_and_keys_the_arms():
     assert compile_qsa_prepare(index=arms._replace(paged=True), **base).compiled is recipes[1].compiled
     assert compile_qsa_prepare(index=arms._replace(paged=True), index_cache_dtype=BF16, **base).compiled is recipes[1].compiled  # the io dtype spelled
     assert all(r.index_cache_dtype == BF16 for r in recipes)
+    # the rounding attribute: a distinct artifact per value (the record's appended field rides into the key), the default unchanged, an
+    # unknown value refused naming the tuple
+    hf = compile_qsa_prepare(index=arms._replace(paged=True, rounding="hf"), **base)
+    assert hf.compiled is not recipes[1].compiled and hf.index.rounding == "hf"
+    assert compile_qsa_prepare(index=arms._replace(paged=True, rounding="single"), **base).compiled is recipes[1].compiled
+    with pytest.raises(ValueError, match=r"rounding must be one of \('single', 'hf'\)"):
+        compile_qsa_prepare(index=arms._replace(rounding="vllm"), **base)
     if _CC is not None and _CC < (8, 9):
         with pytest.raises(NotImplementedError, match=r"cvt.rn.satfinite.e4m3x2.f32\) needs sm_89 or later"):
             compile_qsa_prepare(index=arms._replace(paged=True), index_cache_dtype=_E4M3, **base)
@@ -1355,3 +1403,66 @@ def test_paged_fused_prepare_e4m3_store_arm_is_bitwise_the_step_form_and_the_bf1
     if names is not None:
         (fused,) = names
         assert len(fused) == 1 and "frost_qsa_prepare" in fused[0], fused
+
+
+# ---------------------------------------------------------------------------
+# The chunk form's ring TAIL write: the cache-write kernel over the ring's circular slots (no kernel change -- the pin the extend step's stage relies on)
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64], ids=["slots_i32", "slots_i64"])
+@pytest.mark.parametrize("cap", [3, 4, 8], ids=["cap3", "cap4", "cap8"])
+def test_cache_write_ring_arm_writes_the_last_cap_tokens_at_the_circular_slots(cap, slot_dtype):
+    """The stack's ring ``[blocks, cap, 1, 128]`` permuted to a ``[blocks, 1, cap, 128]`` pool (``page_size = cap``) IS a cache-write pool, and
+    the stack's circular slots ``block x cap + pos % cap`` for the LAST ``cap`` tokens of every sequence (``-1`` elsewhere, ``-1`` on the
+    padding sequence on the null block) are its slot mapping: after one ``compile_cache_write(h=1, d=128, page_size=cap, two_operands=False)``
+    launch over a ``[B x T, 1, 128]`` raw-key band the ring rows hold the raw rows bit for bit, every other row and the null block are
+    untouched -- the chunk form's tail write with no kernel change (the chunk compress reads the ring; this launch follows it in stream order)."""
+    batch, t, d = 3, 11, 128
+    g = torch.Generator(device="cuda").manual_seed(cap)
+    raw = torch.randn(batch * t, d, generator=g, device="cuda").to(BF16)
+    kv_lens, state = [37, 5, 0], [1, 2, 0]  # a long sequence, one SHORTER than the chunk (its first rows below position 0), a padding one
+    ring = torch.full((batch + 1, cap, 1, d), float("nan"), device="cuda", dtype=BF16)
+    want = ring.clone()
+    slots = []
+    for b in range(batch):
+        for j in range(t):
+            pos = kv_lens[b] - t + j
+            live = state[b] > 0 and pos >= 0 and pos + cap >= kv_lens[b]
+            slots.append(state[b] * cap + pos % cap if live else -1)
+            if live:
+                want[state[b], pos % cap, 0] = raw[b * t + j]
+    slot = torch.tensor(slots, dtype=slot_dtype, device="cuda")
+    r = compile_cache_write(dtype=BF16, h=1, d=d, page_size=cap, slot_dtype=slot_dtype, two_operands=False)
+    run_cache_write(r, raw.view(batch * t, 1, d), None, ring.permute(0, 2, 1, 3), None, slot, stream=_stream())
+    torch.cuda.synchronize()
+    assert _same(ring, want), f"cap {cap}: the ring rows are not the last {cap} raw keys at their circular slots"
+    assert bool(torch.isnan(ring[0].float()).all()), "the null block was written"
+    n_live = sum(1 for x in slots if x >= 0)
+    assert n_live == min(cap, kv_lens[0]) + min(cap, kv_lens[1]) and int((~torch.isnan(ring.float()).any(-1)).sum()) == n_live
+
+
+@requires_cuda
+def test_paged_kv_lens_at_the_int32_extremes_are_dead_in_both_kernels():
+    """The fused prepare launch's compress arm and the step form on ``kv_lens`` {INT_MIN, INT_MIN + 1, -1, 0} beside a ``4`` control (S_q 4, every
+    sequence on live pages and a live ring block): the ONE shared ``step_position`` derives the row-0 position from ``max(L, 0) - S_q``, so every
+    ``L <= 0`` sequence is DEAD in both kernels -- every slot ``-1``, not one ring or cache byte of it moved -- instead of the int32 wrap at ``INT_MIN``
+    landing its rows at a live positive position; the two kernels bitwise each other on every output, the control's row 3 completes block 0."""
+    ch = _Chain(_GEOM_SMALL, batch=5, rows=4, pos0=(0, 0, 0, 0, 0), paged=True, page=16, cap=8)
+    int_min = -(2**31)
+    ch.kv_lens = torch.tensor([int_min, int_min + 1, -1, 0, 4], dtype=torch.int32, device="cuda")
+    ch.compile_unfused()
+    ch.compile_fused()
+    ch.run_unfused()
+    ch.run_fused()
+    ch.assert_bitwise("kv_lens at the int32 extremes")
+    cs = ch.Bf["cslot"].tolist()
+    assert cs == [[-1] * 4] * 4 + [[-1, -1, -1, 0]], cs
+    assert _same(ch.Bf["ring"][:5], ch.ring0[:5]), "a dead sequence (kv_lens <= 0) wrote a ring row"
+    for b in range(4):
+        assert bool((ch.kbar_row(ch.Bf, b, 0).float() == ch.sent).all()), f"sequence {b} wrote its block 0"
+    assert bool((ch.kbar_row(ch.Bf, 4, 0).float() != ch.sent).any()), "the control did not write block 0"
+    raw = ch.cols(ch.slab0, ch.o_ik, 1, ch.d_i)
+    for j in range(4):
+        assert _same(ch.Bf["ring"][5, j % ch.ring_n, 0], raw[4 * 4 + j, 0]), j

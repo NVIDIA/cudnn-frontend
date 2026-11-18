@@ -138,8 +138,8 @@ def test_previous_running_stats_come_from_the_input_port(_handle):
     xf = x.double().permute(1, 0, 2, 3).reshape(x.shape[1], -1)
     want_m = 0.9 * 5.0 + 0.1 * xf.mean(-1)
     want_v = 0.9 * 7.0 + 0.1 * xf.var(-1, correction=1)
-    assert torch.allclose(m0.double().flatten(), want_m, atol=1e-5), f"{m0.flatten()[:4]} vs {want_m[:4]}"
-    assert torch.allclose(v0.double().flatten(), want_v, atol=1e-5), f"{v0.flatten()[:4]} vs {want_v[:4]}"
+    torch.testing.assert_close(m0.flatten(), want_m, check_dtype=False)
+    torch.testing.assert_close(v0.flatten(), want_v, check_dtype=False)
 
     # the previous-state inputs are the caller's and must come back untouched
     assert torch.equal(pm, torch.full_like(pm, 5.0)), "in_running_mean was overwritten"
@@ -155,7 +155,7 @@ def test_momentum_tensor_is_honored(_handle):
     assert not torch.allclose(m_lo, m_hi), "momentum 0.1 and 0.5 produced the same running mean -- the tensor is being ignored"
     xf = x.double().permute(1, 0, 2, 3).reshape(x.shape[1], -1)
     want = 0.5 * 5.0 + 0.5 * xf.mean(-1)
-    assert torch.allclose(m_hi.double().flatten(), want, atol=1e-5), f"{m_hi.flatten()[:4]} vs {want[:4]}"
+    torch.testing.assert_close(m_hi.flatten(), want, check_dtype=False)
 
 
 @pytest.mark.L0
@@ -167,4 +167,4 @@ def test_epsilon_tensor_is_honored(_handle):
     assert not torch.allclose(iv_small, iv_big), "epsilon 1e-5 and 1e-1 produced the same inv_variance -- the tensor is being ignored"
     xf = x.double().permute(1, 0, 2, 3).reshape(x.shape[1], -1)
     want = torch.rsqrt(xf.var(-1, correction=0) + 1e-1)
-    assert torch.allclose(iv_big.double().flatten(), want, atol=1e-5), f"{iv_big.flatten()[:4]} vs {want[:4]}"
+    torch.testing.assert_close(iv_big.flatten(), want, check_dtype=False)

@@ -89,16 +89,17 @@ def sanitize_v_tail(
     S-side mask overwrites those columns with -inf (a select, NaN-safe),
     but P @ V still multiplies P = 0 against the NaN V row and
     ``0 * NaN = NaN`` poisons the whole accumulator column-free. Reached
-    only from THD specializations' first masked step (see the call
-    sites): dense descriptors carry the declared S_kv, so their overhang
-    loads zero-fill in hardware — a dense PADDED graph's pad rows are
-    user memory and deliberately NOT sanitized here (whether the
-    contract requires tolerating NaN bit patterns there is an open
-    question for the sibling kernels too).
+    from the first masked step of THD specializations and of dense graphs
+    with runtime ``seq_kv_lens`` (see the call sites). A dense padded
+    graph's pad rows lie inside the declared S_kv, so TMA loads them as
+    they are; they are unread data like the SM80 bodies treat them (#2135),
+    and NaN bit patterns there must not reach O. Without runtime lengths
+    the dense overhang past S_kv zero-fills in hardware.
 
-    Every compute warp redundantly zeroes the full overhang (idempotent
-    zero stores race benignly), so a warp-level sync is enough for each
-    warp's own ``ldmatrix`` lanes to observe the zeros.
+    This helper synchronizes only its calling warp. The caller must give
+    one warp ownership of these stores and synchronize every consuming
+    warp before its ``ldmatrix`` reads. Repeated zero stores are still a
+    write/read race when another warp has already started consuming V.
     """
     seg_elems = 16 // in_dtype.bytes  # elements per 16-byte store
     segs_per_row = head_tile_v // seg_elems

@@ -72,6 +72,7 @@ def GdnEngines(ids):
         ("gdn_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnFrostEngine"),
         ("gdn_cutile", "cudnn.linear_attention.cutile.gdn_engine", "GdnCuTileEngine"),
         ("gdn_summary_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnSummaryFrostEngine"),
+        ("gdn_cake_det", "cudnn.linear_attention.cake.gdn_engine", "GdnCakeDetEngine"),
     )
 
 
@@ -79,6 +80,7 @@ def KdaEngines(ids):
     """The KDA family: frost, cuTile, the CAKE C16 training route, and the Hopper sm90 path."""
     return _collect(
         ids,
+        ("kda_cake_det", "cudnn.linear_attention.cake.kda_det_engine", "KdaCakeDetEngine"),
         ("kda_frost", "cudnn.linear_attention.frost.kda_engine", "KdaFrostEngine"),
         ("kda_cutile", "cudnn.linear_attention.cutile.kda_engine", "KdaCuTileEngine"),
         ("kda_summary_frost", "cudnn.linear_attention.frost.kda_engine", "KdaSummaryFrostEngine"),

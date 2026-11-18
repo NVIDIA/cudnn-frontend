@@ -141,11 +141,11 @@ def test_discrete_grouped_gemm_swiglu_jax_fp8_matches_torch():
 
 @pytest.mark.L0
 def test_discrete_grouped_gemm_swiglu_jax_jit_matches_eager():
-    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper."""
+    """XLA custom-call entry point (cudnn._jax.call): bit-identical to the eager JAX wrapper."""
     import cutlass.jax
 
     if not cutlass.jax.is_available():
-        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+        pytest.skip("CuTeDSL JAX extensions unavailable")
     skip_unless_sm100()
     from cudnn import discrete_grouped_gemm_swiglu_jax_sm100, discrete_grouped_gemm_swiglu_wrapper_sm100
 

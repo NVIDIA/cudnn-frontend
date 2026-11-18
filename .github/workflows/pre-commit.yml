@@ -1,4 +1,4 @@
-name: Style check
+name: analysis
 
 # Enforces the formatting contract in CONTRIBUTING.md: clang-format for
 # C++/CUDA and black (line length 160) for Python/notebooks, exactly as

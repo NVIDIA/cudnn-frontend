@@ -33,8 +33,8 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
     sq, heads, dim = q.shape
     if sq <= 0 or kv.shape[0] <= 0 or indices.shape[1] <= 0:
         raise ValueError("sequence extents and physical Top-K must be positive")
-    if heads not in (16, 32, 64, 128) or dim not in (512, 576) or (heads, dim) == (128, 576):
-        raise NotImplementedError("native training supports H16/H32/H64 D512/D576 and H128 D512")
+    if heads not in (16, 32, 64, 96, 128) or dim not in (512, 576):
+        raise NotImplementedError("native training supports H16/H32/H64/H96/H128 with D512/D576")
     if kv.shape[1] != dim or indices.shape[0] != sq:
         raise ValueError("KV dimension and index row count must match Q")
     if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16 or indices.dtype != torch.int32:
@@ -48,8 +48,8 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
     scale = dim**-0.5 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("softmax_scale must be finite and positive")
-    if not q.is_cuda or torch.cuda.get_device_capability(q.device) != (10, 0):
-        raise NotImplementedError("native sparse attention training currently requires SM100")
+    if not q.is_cuda or torch.cuda.get_device_capability(q.device) not in ((10, 0), (10, 3)):
+        raise NotImplementedError("native sparse attention training currently requires SM100 or SM103")
     from cudnn.frost.buffers import cutedsl_requirement_error
 
     error = cutedsl_requirement_error("native DSA training")

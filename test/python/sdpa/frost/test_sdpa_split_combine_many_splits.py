@@ -19,9 +19,12 @@ from frost_test_utils import requires_blackwell, requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell]
 
 
-@pytest.mark.parametrize("group", [2, 4, 8])
+@pytest.mark.parametrize(
+    "group,splits,d",
+    [(2, 2, 128), (4, 3, 128), (8, 7, 128), (16, 9, 64), (16, 15, 128), (16, 16, 256), (16, 17, 64)],
+)
 @pytest.mark.parametrize("sink", [False, True])
-def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, sink):
+def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, splits, d, sink):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     # Select an explicit reducer specialization, independently of placement.
@@ -33,7 +36,7 @@ def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, sink)
 
     monkeypatch.setattr(comb, "_compile_cached", specialized)
     comb.compile_ptr.cache_clear()
-    splits, h, rows, d = max(2, group - 1), 2, 3, 128
+    h, rows = 2, 3
     op = torch.arange(splits * rows * h * d, device="cuda", dtype=torch.float32).reshape(splits, rows, h, d) / 1024
     lp = torch.zeros(splits, h, rows, device="cuda")
     lp[:, :, 0] = -torch.inf
@@ -122,7 +125,7 @@ def _partials(b, h, sq, d, splits):
 
 
 @pytest.mark.parametrize("splits", [4, 5, 16, 17, 20, 33, 64, 65], ids=lambda s: f"s{s}")
-@pytest.mark.parametrize("shape", [(1, 24, 1, 256), (2, 3, 5, 160)], ids=["decode_b1_h24_d256", "b2_h3_sq5_d160"])
+@pytest.mark.parametrize("shape", [(1, 24, 1, 256), (2, 3, 5, 160), (3, 5, 2, 128)], ids=["decode_b1_h24_d256", "b2_h3_sq5_d160", "b3_h5_sq2_head_tail"])
 def test_pointer_combine_many_splits_matches_the_reference(shape, splits):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 

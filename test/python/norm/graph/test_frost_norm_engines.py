@@ -85,7 +85,9 @@ def main():
 
     D = 256
     # LayerNorm forward (real cuDNN spelling)
-    ln = _Node("LAYERNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D]), "bias": _T([D])}, {"Y": _T([8, D]), "mean": _T([8]), "inv_var": _T([8])})
+    ln = _Node(
+        "LAYERNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D]), "bias": _T([D])}, {"Y": _T([8, D]), "mean": _T([8, 1]), "inv_var": _T([8, 1])}
+    )
     f = _facts(ln)
     expect(f.variant == NV.LAYER_NORM and f.phase == "fprop", "LAYERNORM -> LN fprop")
     expect(f.normalized_shape == (D,) and f.has_beta and f.has_mean, "LN normalized_shape/flags")
@@ -95,7 +97,7 @@ def main():
     expect(fe.mismatch(fcap, f) is None, "fprop engine accepts LN")
 
     # RMSNorm forward (no bias, no mean output)
-    rms = _Node("RMSNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D])}, {"Y": _T([8, D]), "inv_var": _T([8])})
+    rms = _Node("RMSNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D])}, {"Y": _T([8, D]), "inv_var": _T([8, 1])})
     fr = _facts(rms)
     expect(fr.variant == NV.RMS_NORM and not fr.has_mean and not fr.has_beta, "RMSNORM flags")
     expect(fe.mismatch(fcap, fr) is None, "fprop engine accepts RMS (same engine)")
@@ -121,7 +123,7 @@ def main():
     lnb = _Node(
         "LAYERNORM_BWD",
         {},
-        {"grad": _T([8, D]), "input": _T([8, D]), "scale": _T([D]), "mean": _T([8]), "inv_variance": _T([8])},
+        {"grad": _T([8, D]), "input": _T([8, D]), "scale": _T([D]), "mean": _T([8, 1]), "inv_variance": _T([8, 1])},
         {"DX": _T([8, D]), "DScale": _T([D]), "DBias": _T([D])},
     )
     fb = _facts(lnb)
@@ -129,6 +131,24 @@ def main():
     expect(fb.dy_t is not None and fb.mean_t is not None and fb.dscale_t is not None, "LN bwd ports resolved")
     expect(be.mismatch(bcap, fb) is None, "bprop engine accepts LN bwd")
     expect(fe.mismatch(fcap, fb) is not None, "fprop engine rejects bprop graph")
+
+    # Arch rows: the SM90 rows run the same kernels on cc 9.0 only; the SM100 rows
+    # stay cc 10.0 only.
+    fspec = {spec.name: spec.capabilities for spec in fe.ENGINE_SPECS}
+    bspec = {spec.name: spec.capabilities for spec in be.ENGINE_SPECS}
+    for cc, fwd_ok, bwd_ok in (
+        ((9, 0), "norm_fprop_sm90", "norm_bprop_sm90"),
+        ((10, 0), "norm_fprop_sm100", "norm_bprop_sm100"),
+        ((10, 3), "norm_fprop_sm100", "norm_bprop_sm100"),
+        ((8, 0), None, None),
+    ):
+        for name, cap in fspec.items():
+            for facts in (f, fbn):
+                accepted = fe.mismatch(cap, dataclasses.replace(facts, device_cc=cc)) is None
+                expect(accepted == (name == fwd_ok), f"{name} {'accepts' if name == fwd_ok else 'rejects'} {facts.variant.value} on cc {cc}")
+        for name, cap in bspec.items():
+            accepted = be.mismatch(cap, dataclasses.replace(fb, device_cc=cc)) is None
+            expect(accepted == (name == bwd_ok), f"{name} {'accepts' if name == bwd_ok else 'rejects'} LN bwd on cc {cc}")
 
     # Non-norm graph -> analyze returns None
     other = _Node("MATMUL", {}, {"a": _T([4, 4])}, {"c": _T([4, 4])})
@@ -141,9 +161,22 @@ def main():
 
     fams = {fam.name: fam for fam in mf.MANIFEST if fam.name.startswith("frost_norm")}
     expect(set(fams) == {"frost_norm_fwd", "frost_norm_bwd"}, f"2 norm families: {sorted(fams)}")
-    offered = {n: fam.offered_ids() for n, fam in fams.items()}
-    expect(set(offered["frost_norm_fwd"]) == {"norm_fprop_sm100"}, f"fwd slot: {offered['frost_norm_fwd']}")
-    expect(set(offered["frost_norm_bwd"]) == {"norm_bprop_sm100"}, f"bwd slot: {offered['frost_norm_bwd']}")
+    # The SM90 rows are opt-in: offered only under CUDNN_FRONTEND_ENABLE_FROST_ENGINES.
+    saved = os.environ.pop(mf._ENABLE_ENV, None)
+    try:
+        offered = {n: fam.offered_ids() for n, fam in fams.items()}
+        expect(set(offered["frost_norm_fwd"]) == {"norm_fprop_sm100"}, f"fwd slot: {offered['frost_norm_fwd']}")
+        expect(set(offered["frost_norm_bwd"]) == {"norm_bprop_sm100"}, f"bwd slot: {offered['frost_norm_bwd']}")
+        os.environ[mf._ENABLE_ENV] = "1"
+        offered = {n: fam.offered_ids() for n, fam in fams.items()}
+        expect(set(offered["frost_norm_fwd"]) == {"norm_fprop_sm100", "norm_fprop_sm90"}, f"fwd slots (opt-in): {offered['frost_norm_fwd']}")
+        expect(set(offered["frost_norm_bwd"]) == {"norm_bprop_sm100", "norm_bprop_sm90"}, f"bwd slots (opt-in): {offered['frost_norm_bwd']}")
+        expect(offered["frost_norm_fwd"]["norm_fprop_sm90"] == fams["frost_norm_fwd"].engine_id + 1, "norm_fprop_sm90 takes slot 1")
+        expect(offered["frost_norm_bwd"]["norm_bprop_sm90"] == fams["frost_norm_bwd"].engine_id + 1, "norm_bprop_sm90 takes slot 1")
+    finally:
+        os.environ.pop(mf._ENABLE_ENV, None)
+        if saved is not None:
+            os.environ[mf._ENABLE_ENV] = saved
     blocks = sorted((fam.engine_id, fam.engine_id + mf.FAMILY_BLOCK) for fam in mf.MANIFEST)
     expect(all(a[1] <= b[0] for a, b in zip(blocks, blocks[1:])), "engine-id blocks do not overlap")
     for node, fam in (
@@ -171,3 +204,21 @@ def test_frost_norm_engines():
         main()
     except SystemExit as exc:
         assert not exc.code, "checks failed -- see captured stdout"
+
+
+@pytest.mark.L0
+def test_has_tmem_follows_the_current_device(monkeypatch):
+    """The BatchNorm TMEM tier follows the current device: with an SM100 and an SM90
+    part in one process, each gets its own answer, in either query order."""
+    from cudnn.norm import utils
+
+    caps = {0: (10, 0), 1: (9, 0)}
+    current = [0]
+    monkeypatch.setattr(utils, "_HAS_TMEM", {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: caps[current[0] if device is None else device])
+    for order in ((0, 1), (1, 0)):
+        utils._HAS_TMEM.clear()
+        for device in order:
+            current[0] = device
+            assert utils.has_tmem() is (caps[device][0] == 10), (order, device)

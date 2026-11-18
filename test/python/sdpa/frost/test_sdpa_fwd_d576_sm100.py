@@ -274,7 +274,8 @@ def test_native_d576_long_cache_split_replay():
 @requires_dsl
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch):
+@pytest.mark.parametrize("thd,splits", [(False, 4), (True, 1), (True, 5)])
+def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd, splits):
     import os
     import sys
     from frost_test_utils import assert_no_new_spills, run_sass_probe, sass_probe_source
@@ -283,13 +284,21 @@ def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(sys.path))
     probe = sass_probe_source(
         """
+        thd = params_kw["thd"]
         params = TemplateParams(dtype_qkv=2, d_flavor=576, mma_2x2=True,
-            pack_gqa=True, qh_per_kh=96, split_kv=4, seq_q_lens_present=True,
+            pack_gqa=True, qh_per_kh=12 if thd else 96, split_kv=params_kw["splits"],
+            thd_varlen=thd, seq_q_lens_present=not thd,
             seq_kv_lens_present=True, paged_kv=True, page_size=32,
             window_right=0, bottom_right=True)
         mod = _load_sm100_kernel_module((576, 512), params)
         print("SMEM_TOTAL", mod._SMEM["total"])
-        mod.compile(d_qk=576, d_v=512, paged_hnd=False, paged_v_hnd=True)
+        origins = ((0, 1, 24*576, 64), None, None, (3, 1, 24*512, 32), (4, 1, 1, 64)) if thd else None
+        if thd and params_kw["splits"] > 1:
+            mod.compile_thd_split(paged_hnd=False, paged_v_hnd=True,
+                lse_kind="head", thd_origin_specs=origins)
+        else:
+            mod.compile(d_qk=576, d_v=512, paged_hnd=False, paged_v_hnd=True,
+                lse_kind="head" if thd else "dense", thd_origin_specs=origins)
         """,
         counts={
             "ALLOC_192": ("USETMAXREG.TRY_ALLOC", "0xc0"),
@@ -299,8 +308,147 @@ def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch):
             "STL": ("STL",),
         },
     )
-    result = run_sass_probe(tmp_path, probe_src=probe, arch=arch, params={}, tag="native_d576", timeout=180)
+    result = run_sass_probe(tmp_path, probe_src=probe, arch=arch, params={"thd": thd, "splits": splits}, tag="native_d576", timeout=180)
     assert result.expect["SMEM_TOTAL"] == 224120
     assert result.stats["ALLOC_192"] == result.stats["ALLOC_208"] == 1
-    assert result.stats["DEALLOC_40"] == 4
+    # All four service warps release at one common instruction before role dispatch.
+    # TestServiceRegisterRelease checks the emitted PTX guard's lane participation.
+    assert result.stats["DEALLOC_40"] == 1
     assert_no_new_spills(result.stats, {"LDL": 0, "STL": 0})
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize(
+    "dtype,packed,stats,sink,padded_stats,splits",
+    [
+        (torch.bfloat16, False, True, False, False, 1),
+        (torch.bfloat16, True, True, True, False, 1),
+        (torch.float16, True, False, False, False, 1),
+        (torch.bfloat16, True, True, True, True, 1),
+        pytest.param(torch.bfloat16, False, True, False, False, 2, id="split2_unpacked"),
+        pytest.param(torch.bfloat16, True, True, True, False, 5, id="split5_partial_pack_sink"),
+        pytest.param(torch.float16, True, False, False, False, 9, id="split9_fp16_no_stats"),
+    ],
+)
+def test_native_d576_compact_thd_rebind_and_capture(dtype, packed, stats, sink, padded_stats, splits):
+    """Standalone compact THD uses current device prefixes without caller offsets."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(20261027)
+    batch, heads, kv_heads, sq, skv = 3, 24, 2, 256, 320
+    scale = 576**-0.5
+    sinks = torch.linspace(-0.5, 0.5, heads, device="cuda") if sink else None
+
+    def buffers():
+        q = torch.empty(batch, sq, heads, 640, device="cuda", dtype=dtype)[..., :576]
+        k = torch.empty(batch, skv, kv_heads, 576, device="cuda", dtype=dtype)
+        v = k[..., :512]
+        backing_o = torch.empty(batch, sq, heads, 576, device="cuda", dtype=dtype)
+        o = backing_o[..., :512]
+        lse = torch.empty(batch, sq, heads, device="cuda", dtype=torch.float32) if stats else None
+        ql, kl = (torch.empty(batch, device="cuda", dtype=torch.int32) for _ in range(2))
+        return q, k, v, o, backing_o, lse, ql, kl
+
+    first = buffers()
+    q, k, v, o, _, lse, _, _ = first
+    api = SdpaFwdDslSm100(
+        *(t.transpose(1, 2) for t in (q, k, v, o)),
+        sample_lse=lse.transpose(1, 2) if stats else None,
+        thd=True,
+        thd_stats_padded=padded_stats,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=17 if sink else None,
+        has_sink=sink,
+        scale_softmax=scale,
+        pack_gqa=packed,
+        cga=2,
+        split_kv=splits,
+        stats_log2=splits > 1,
+    )
+    api.check_support()
+    api.compile()
+    assert api.flavor == (576, 512) and api._thd_spec.native is not None
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+
+    def fill(values, qlens, klens):
+        q, k, _, _, backing_o, lse, ql, kl = values
+        q.fill_(float("nan"))
+        k.fill_(float("nan"))
+        q.flatten(0, 1)[: sum(qlens)].normal_()
+        k.flatten(0, 1)[: sum(klens)].normal_()
+        backing_o.fill_(-17)
+        if stats:
+            lse.fill_(-29)
+        ql.copy_(torch.tensor(qlens, device="cuda", dtype=torch.int32))
+        kl.copy_(torch.tensor(klens, device="cuda", dtype=torch.int32))
+        workspace.fill_(255)
+
+    def launch(values):
+        q, k, v, o, _, lse, ql, kl = values
+        api.execute(
+            *(t.transpose(1, 2) for t in (q, k, v, o)),
+            lse_tensor=(lse.transpose(1, 2) if padded_stats else lse.flatten(0, 1)) if stats else None,
+            seq_q_lens=ql,
+            seq_kv_lens=kl,
+            sinks=sinks,
+            workspace=workspace,
+        )
+
+    def check(values, qlens, klens):
+        q, k, v, o, backing_o, lse, _, _ = values
+        q, k, v, o = (t.flatten(0, 1) for t in (q, k, v, o))
+        off_q = off_k = 0
+        for b, (nq, nk) in enumerate(zip(qlens, klens)):
+            if nq:
+                key = k[off_k : off_k + nk].double().repeat_interleave(heads // kv_heads, 1)
+                val = v[off_k : off_k + nk].double().repeat_interleave(heads // kv_heads, 1)
+                score = torch.einsum("qhd,khd->hqk", q[off_q : off_q + nq].double(), key) * scale
+                diag = torch.arange(nq, device="cuda")[:, None] + nk - nq
+                col = torch.arange(nk, device="cuda")[None, :]
+                score.masked_fill_((col > diag)[None], -torch.inf)
+                if sink:
+                    score.masked_fill_((col < diag - 17)[None], -torch.inf)
+                    score = torch.cat((score, sinks.double()[:, None, None].expand(heads, nq, 1)), -1)
+                ref = torch.einsum("hqk,khd->qhd", score.softmax(-1).nan_to_num()[..., :nk], val)
+                torch.testing.assert_close(o[off_q : off_q + nq].double(), ref, atol=0.005, rtol=0.005)
+                if stats:
+                    actual_lse = lse[b, :nq] if padded_stats else lse.flatten(0, 1)[off_q : off_q + nq]
+                    torch.testing.assert_close(actual_lse.double(), score.logsumexp(-1).T * (math.log2(math.e) if splits > 1 else 1), atol=0.003, rtol=0)
+            if padded_stats:
+                assert torch.isneginf(lse[b, nq:]).all()
+            off_q += nq
+            off_k += nk
+        assert torch.all(o[off_q:] == -17)
+        assert torch.all(backing_o[..., 512:] == -17)
+        if stats and not padded_stats:
+            assert torch.all(lse.flatten(0, 1)[off_q:] == -29)
+
+    captures = []
+    try:
+        for values in (first, buffers()):
+            qlens, klens = [173, 0, 37], [197, 311, 0]
+            fill(values, qlens, klens)
+            launch(values)
+            torch.cuda.synchronize()
+            check(values, qlens, klens)
+            graph = torch.cuda.CUDAGraph()
+            captures.append((graph, values))
+            with torch.cuda.graph(graph):
+                old_debug = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    launch(values)
+                finally:
+                    torch.cuda.set_sync_debug_mode(old_debug)
+        for qlens, klens in (([65, 17, 0], [97, 0, 31]), ([0, 0, 0], [0, 0, 0])):
+            for graph, values in reversed(captures):
+                fill(values, qlens, klens)
+                graph.replay()
+                torch.cuda.synchronize()
+                check(values, qlens, klens)
+    finally:
+        for graph, _ in captures:
+            graph.reset()

@@ -105,6 +105,7 @@ from cudnn._torch_stream import as_torch_stream  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from gated_block_bounds import OUTPUT_ATOL_FRAC, OUTPUT_COS_MIN, OUTPUT_RTOL  # noqa: E402
 from gated_block_reference import RefGeometry, gated_attention_block_reference, qk_norm_rope_reference  # noqa: E402
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 from test_block_training_forward import _alloc_saved, _declare, _declare_quant, _dequantized_bf16_inputs, _run_training, _run_training_quant  # noqa: E402
@@ -137,9 +138,8 @@ _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_K
 
 # The bounds (module docstring): one per output dtype, tensor-scaled atol, plus a cosine floor.
 # bf16: worst cells 0.40-0.66 of the bound over every accept cell; fp16 (8x tighter): 0.45-0.56 -- both MEASURED on Rubin cc 10.7.
-_RTOL = {torch.bfloat16: 2.0**-6, torch.float16: 2.0**-9}
-_ATOL_FRAC = {torch.bfloat16: 2.0**-7, torch.float16: 2.0**-10}
-_COS_MIN = 0.999
+# ONE definition (gated_block_bounds.py): the same numbers gate the forward suites' gated O (test_block_qsa_end_to_end.py / test_block_qsa_decode.py).
+_RTOL, _ATOL_FRAC, _COS_MIN = OUTPUT_RTOL, OUTPUT_ATOL_FRAC, OUTPUT_COS_MIN
 _DW_NORM_RTOL = 1e-2  # the systematic part (a wrong scale / a missing term shows up as a RELATIVE miss on the large cells)
 # |diff| per unit of sqrt(sum(terms^2)) -- the bf16 noise floor of the reduction. CALIBRATED ONCE (Rubin cc 10.7, 212 SMs) from the
 # measured 0.0156-0.0195 over 11 norm cells (two identical runs): 2^-5 = 0.03125 leaves a 1.6x margin. Never widen.

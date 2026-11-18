@@ -181,6 +181,52 @@ def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torc
     return t
 
 
+def _declarable(t: torch.Tensor) -> bool:
+    """Whether ``t`` can be declared as-is: head dim innermost (stride 1), 16B-aligned base, no aliasing, and every
+    outer stride (of a size>1 dim) a 16-byte multiple -- the descriptor contract. THD (T, H, D) is checked as one
+    (1, H, T, D) sequence."""
+    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+    if t.stride(-1) != 1 or t.data_ptr() % 16:
+        return False
+    if any(n > 1 and (st * t.element_size()) % 16 for n, st in zip(t.shape[:-1], t.stride()[:-1])):
+        return False
+    shape, stride = tuple(t.shape), tuple(t.stride())
+    if t.ndim == 3:
+        shape, stride = (1, shape[1], shape[0], shape[2]), (0, stride[1], stride[0], stride[2])
+    return dense_layout_ok(shape, stride)
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Conservative: the two tensors' byte extents intersect in the same storage."""
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+
+    def extent(t):
+        lo = t.data_ptr()
+        return lo, lo + (1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()) if n > 0)) * t.element_size()
+
+    (a0, a1), (b0, b1) = extent(a), extent(b)
+    return a0 < b1 and b0 < a1
+
+
+def _out_bindable(out: torch.Tensor, shape: Tuple[int, ...], q: torch.Tensor, inputs=()) -> bool:
+    """Whether a caller-owned O can be written in place: right shape/dtype/device, declarable, and not overlapping an
+    input the kernels read while writing O. Otherwise the op computes into its own O and the caller copies."""
+    if tuple(out.shape) != shape or out.dtype != q.dtype or out.device != q.device:
+        return False
+    return _declarable(out) and not any(t is not None and _overlaps(out, t) for t in inputs)
+
+
+def _grad_out_operand(grad_out: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    """dO is declared with its own strides. Only a dO no descriptor can carry (broadcast, overlapping, misaligned
+    pitch or base, strided head dim) is materialized, in O's layout."""
+    if not _declarable(grad_out):
+        _logger.warning("sdpa_bwd: copying grad_out into O's layout (slow path)")
+        grad_out = torch.empty_strided(o.shape, o.stride(), dtype=grad_out.dtype, device=grad_out.device).copy_(grad_out)
+    return grad_out
+
+
 def _round64(n: int) -> int:
     return ((n + 63) // 64) * 64
 
@@ -345,7 +391,9 @@ def _sdpa_fwd_impl(
     max_seqlen_q: int = 0,
     max_seqlen_kv: int = 0,
     return_lse: bool = True,
+    _out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``_out`` (not in the op schema): a caller-owned O to write in place, for the ``*_out`` provider overrides."""
     _check_io_dtypes("sdpa_fwd", q=q, k=k, v=v)
     if causal_bottom_right and not (is_causal or window_left >= 0 or window_right >= 0):
         raise ValueError("causal_bottom_right only re-anchors an active diagonal band; set is_causal, window_left or window_right too")
@@ -378,7 +426,9 @@ def _sdpa_fwd_impl(
         q_stride = _thd_desc_stride(q, S_q)
         k_stride = _thd_desc_stride(k, S_kv)
         v_stride = _thd_desc_stride(v, S_kv)
-        o_stride = _packed_bhsd_stride(B, H_q, S_q, D_v)
+        if _out is not None and not _out_bindable(_out, (T_q, H_q, D_v), q, (q, k, v, sinks)):
+            _out = None
+        o_stride = _thd_desc_stride(_out, S_q) if _out is not None else _packed_bhsd_stride(B, H_q, S_q, D_v)
         stats_stride = (S_q * H_q, 1, H_q, 1)  # TH1 token-major
     else:
         if q.ndim != 4:
@@ -398,7 +448,9 @@ def _sdpa_fwd_impl(
         k = _normalize_operand(k, "k")
         v = _normalize_operand(v, "v")
         q_stride, k_stride, v_stride = q.stride(), k.stride(), v.stride()
-        o_stride = _like_layout_stride((B, H_q, S_q, D_v), q)  # O adopts Q's layout
+        if _out is not None and not _out_bindable(_out, (B, H_q, S_q, D_v), q, (q, k, v, sinks)):
+            _out = None
+        o_stride = tuple(_out.stride()) if _out is not None else _like_layout_stride((B, H_q, S_q, D_v), q)  # O adopts Q's layout
         stats_stride = (H_q * S_q, S_q, 1, 1)
 
     _check_same_device(q, k=k, v=v, sinks=sinks, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv)
@@ -421,6 +473,7 @@ def _sdpa_fwd_impl(
         tuple(q.stride()),
         tuple(k.stride()),
         tuple(v.stride()),
+        tuple(o_stride),
         attn_scale,
         is_causal,
         causal_bottom_right,
@@ -468,10 +521,10 @@ def _sdpa_fwd_impl(
     # The no-LSE placeholder is a 0-elem CUDA fp32 tensor (a CUDA op must not
     # hand back a CPU tensor; the fake kernel mirrors this).
     if is_thd:
-        o = torch.empty(T_q, H_q, D_v, dtype=q.dtype, device=q.device)
+        o = _out if _out is not None else torch.empty(T_q, H_q, D_v, dtype=q.dtype, device=q.device)
         stats = torch.empty(T_q, H_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)
     else:
-        o = torch.empty_strided((B, H_q, S_q, D_v), o_stride, dtype=q.dtype, device=q.device)
+        o = _out if _out is not None else torch.empty_strided((B, H_q, S_q, D_v), o_stride, dtype=q.dtype, device=q.device)
         stats = torch.empty(B, H_q, S_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
@@ -487,7 +540,7 @@ def _sdpa_fwd_impl(
     if is_thd:
         # Each ragged offset is an int64 ELEMENT offset using its own tensor's
         # token stride. The shared producer widens prefixes before multiplying.
-        q_strides = (q.stride(0), H_q * D_v) + ((H_q,) if return_lse else ())
+        q_strides = (q.stride(0), o.stride(0)) + ((H_q,) if return_lse else ())
         metadata = prepare_varlen_metadata(cu_seqlens_q, cu_seqlens_kv, q_strides, (k.stride(0), v.stride(0)))
         buffers.extend(metadata)
     elif has_seq_lens:
@@ -569,6 +622,7 @@ def _build_bwd_graph(
     dq_stride=None,
     dk_stride=None,
     dv_stride=None,
+    do_stride=None,
 ):
     """Backward graph for the packed THD/varlen path or the dense BHSD one.
 
@@ -590,7 +644,7 @@ def _build_bwd_graph(
     k_t = g.tensor(name="k", dim=[B, H_k, S_kv, D_qk], stride=list(k_stride), data_type=io_dtype, uid=_UIDs.K)
     v_t = g.tensor(name="v", dim=[B, H_v, S_kv, D_v], stride=list(v_stride), data_type=io_dtype, uid=_UIDs.V)
     o_t = g.tensor(name="o", dim=[B, H_q, S_q, D_v], stride=list(o_stride), data_type=io_dtype, uid=_UIDs.O)
-    do_t = g.tensor(name="dO", dim=[B, H_q, S_q, D_v], stride=list(o_stride), data_type=io_dtype, uid=_UIDs.DO)
+    do_t = g.tensor(name="dO", dim=[B, H_q, S_q, D_v], stride=list(do_stride or o_stride), data_type=io_dtype, uid=_UIDs.DO)
     # Stats stay PADDED dense even in THD: the backend rejects ragged LSE for
     # bprop THD on SM8X/SM12X ("Packed/ragged LSE is not supported").
     stats_t = g.tensor(name="stats", dim=[B, H_q, S_q, 1], stride=list(stats_stride), data_type=cudnn.data_type.FLOAT, uid=_UIDs.STATS)
@@ -737,10 +791,7 @@ def _sdpa_bwd_dense(
     if not lse.is_contiguous() or lse.data_ptr() % 16:
         lse = lse.clone(memory_format=torch.contiguous_format)
     lse = lse.reshape(B, H_q, S_q, 1)
-    # dO must match O's layout (and be 16B-aligned) — equal strides with an
-    # odd storage offset would fault the kernels.
-    if grad_out.stride() != o.stride() or grad_out.data_ptr() % 16:
-        grad_out = torch.empty_strided(o.shape, o.stride(), dtype=grad_out.dtype, device=grad_out.device).copy_(grad_out)
+    grad_out = _grad_out_operand(grad_out, o)
 
     # Gradients adopt the corresponding input's layout; a broadcast/overlapping
     # input has no usable gradient layout, so fall back to packed there.
@@ -764,6 +815,7 @@ def _sdpa_bwd_dense(
         tuple(k.stride()),
         tuple(v.stride()),
         tuple(o.stride()),
+        tuple(grad_out.stride()),
         dq_stride,
         dk_stride,
         dv_stride,
@@ -801,6 +853,7 @@ def _sdpa_bwd_dense(
             k_stride=k.stride(),
             v_stride=v.stride(),
             o_stride=o.stride(),
+            do_stride=grad_out.stride(),
             stats_stride=stats_stride,
             is_deterministic=is_deterministic,
             is_thd=False,
@@ -903,9 +956,10 @@ def _sdpa_bwd_impl(
     if not lse.is_contiguous() or lse.data_ptr() % 16:
         lse = lse.clone(memory_format=torch.contiguous_format)
     lse = lse.reshape(B, H_q, S_q, 1)
-    # Normalize dO to O's layout; ALSO on base-pointer misalignment — equal
-    # strides with an odd storage offset would fault the kernels.
-    if grad_out.stride() != o.stride() or grad_out.data_ptr() % 16:
+    grad_out = _grad_out_operand(grad_out, o)
+    if grad_out.stride() != o.stride():
+        # THD dO shares O's layout and ragged offset: SM80 backend eng7 returns wrong gradients for a THD dO with its
+        # own token stride (#2051).
         grad_out = torch.empty_strided(o.shape, o.stride(), dtype=grad_out.dtype, device=grad_out.device).copy_(grad_out)
 
     q_stride = _thd_desc_stride(q, S_q)

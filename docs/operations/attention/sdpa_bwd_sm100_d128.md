@@ -1,0 +1,155 @@
+# SDPA backward, d = 64 or 128 (SM100 line and Rubin)
+
+The opt-in `sdpa_bwd_sm100_d128` engine serves dense multi-head attention with
+BF16 or FP16 inputs and gradients, compact BSHD physical storage, and
+contiguous FP32 natural-log Stats. Dense MHA supports head dimensions 64 and 128,
+unmasked or top-left causal attention, and a left sliding window, including
+rectangular query and key/value lengths within the [dense MHA declaration
+bounds below](#dense-mha-declaration-bounds).
+Packed THD MHA supports both dtypes at D128. Dense and THD GQA/MQA support
+BF16 at D128, without sliding windows. Packed
+and grouped paths require SM100, SM103 or SM107 (cc 10.0, 10.3 or 10.7), CuTeDSL 4.8 or newer (a build with the
+`sm_107a` target on cc 10.7) and positive FP32 attention scale. The same kernels serve every admitted part; the compile
+target follows the device. Grouped dense lengths must be multiples of 128;
+packed grouped lengths may have tails or empty actual sequences. Other masks,
+bias, sinks and dropout are declined. Dense MHA, GQA and MQA support deterministic
+requests; the packed path still declines them.
+
+Use the ordinary cuDNN graph preparation and execution API. After building
+and selecting a plan, allocate the size reported by that plan:
+
+```python
+workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device=q.device)
+graph.execute(variant_pack, workspace)
+```
+
+Plan construction selects the implementation from declarations and the build
+device. On SM100, SM103 or SM107 with public CuTeDSL 4.8 or newer and a positive attention
+scale and no deterministic request, the D64 and D128 MHA three-kernel chain (D128 without a sliding window, D64 with or without one) computes the row delta while initializing FP32 dQ
+scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
+Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
+their stores and dQ reductions are clipped, and the tail Stats rows contribute nothing.
+The output conversion applies no extra scale. Its scratch size is
+`4 * B * H * round_up(S_q, 128) * (D + 1) + 240` bytes. The final 240 bytes cover internal
+alignment for any valid 16-byte-aligned caller workspace.
+
+Dense MHA with `use_deterministic_algorithm=True` selects the kernel pair on SM100 and
+SM103 under the same CuTeDSL and positive-scale gates as the accumulation chain: the row delta,
+a key-owner kernel that accumulates dK/dV on chip and stores them, then a query-owner
+kernel that recomputes the score and score-gradient tiles and stores dQ once from its
+on-chip accumulator. Every gradient tile has one owner and a fixed summation order, so
+repeated executions return identical bits. It serves D64 and D128 in both dtypes,
+unmasked or top-left causal attention, a left sliding window, and GQA/MQA with an
+integral head ratio (the key-owner kernel walks the group's query heads). When the
+key tiles are unmasked and their count would leave the last wave of SMs mostly idle,
+each key tile's query range is split in two or four: every range stores FP32 dK/dV
+partials to the workspace and one fold launch per output sums them in a fixed order.
+The workspace holds the FP32 delta rows, `4 * B * H_q * round_up(S_q, 128)` bytes,
+plus `8 * splits * B * round_up(S_kv, 128) * H_kv * D` bytes of partials under a
+split, plus 240 bytes; query the plan. Dense MHA requests outside those gates (other devices,
+older CuTeDSL, negative scales) use the one-kernel recompute implementation with zero
+workspace; grouped requests outside them are declined. The choice is made when the
+plan is built.
+
+A D128 left sliding window without a deterministic request keeps the recompute
+implementation. D64 uses native 64-wide operand/MMA tiles and gradient stores on every implementation; score and dS
+tiles retain their 128-column geometry. A left window bounds both Q and KV owners' reduction
+loops and masks boundary tiles; rows containing one legal key have zero score
+gradients and contribute no dQ/dK.
+The graph's left bound counts keys, while standalone `window_size_left` counts
+positions before the query, so a graph left bound of 128 corresponds to a
+standalone radius of 127. Window declarations also require
+`max(S_q,S_kv) + window_size_left + 129 <= 2**31-1`.
+
+Dense MHA declarations that do not meet the three-kernel eligibility conditions,
+including negative finite nonzero scales and CuTeDSL releases older than 4.8, use
+the one-kernel recompute implementation with zero workspace. Always query the
+plan's size rather than assuming either implementation. Zero and nonfinite scales
+are unsupported.
+
+## Dense MHA declaration bounds
+
+Dense MHA declarations are bounded before either implementation is selected:
+`max(S_q,S_kv) <= 2**31-128`, `B*H*S_q <= 2**31-1`,
+`B*H*(ceil(S_q/128)+ceil(S_kv/128)) <= 2**31-1`, and
+`max(S_q,S_kv)*H*128*2 < 2**40`. These conservative limits keep tile rounding,
+Stats indexing, the recompute launch grid and tensor-map byte strides
+representable. Exceeding a limit declines the engine before compilation.
+
+The accumulation implementation requires both attention scale and its product
+with log2(e) to remain finite and positive in FP32. A scalar override on an
+already compiled accumulation plan must satisfy that requirement. Invalid
+overrides raise before any kernel launches; they do not change the plan.
+
+Inputs, outputs and workspace must remain on the declared CUDA device.
+Gradient outputs must not overlap each other or any input, and workspace
+must not overlap any operand. Execution binds the current buffers and stream,
+initializes its scratch each time, and performs no allocation, layout copy or
+device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
+atomic accumulation does not promise bitwise repeatability; the deterministic kernel
+pair does.
+
+The three-kernel implementation is selected for D64, and for D128 without a
+window, on SM100, SM103 and SM107 when determinism is not requested. For other
+supported devices in the row's range, or declarations that do not meet those
+conditions, plan construction uses the one-kernel recompute implementation
+described above.
+The engine remains opt-in while performance qualification proceeds.
+
+For packed THD, declare positive `max_total_seq_len_q` and
+`max_total_seq_len_kv` capacities and device sequence lengths. Each port's
+ragged offsets retain their declared origins, including nonzero initial
+offsets and gaps. Packed rows require compact head/token strides; the logical
+batch stride is unused. FP32 Stats may be packed token-major `(T,H)` or
+head-major `(1,H,head_stride)`, with the latter covering the physical query
+capacity. Actual sequences may be empty, and lengths need not divide 128.
+
+The packed MHA plan launches metadata/tensor-map setup, Delta plus dQ
+initialization, the backward main kernel, then dQ conversion. Its caller
+workspace holds FP32 dQ and Delta, sequence metadata, per-port origins and
+seven tensor maps per batch; it has no dK/dV workspace. Query the plan's
+workspace size. Execution reads lengths and offsets on the device and
+performs no allocation, tensor conversion or host read of metadata. Gradient
+outputs and workspace must also be disjoint from all metadata operands.
+Declared capacities must be positive even when every actual sequence is
+empty. This path requires cc 10.0, 10.3 or 10.7 and both scale and scale*log2(e)
+finite and positive in FP32.
+
+GQA/MQA requires `Hq > Hkv > 0` and an integral `Hq/Hkv`; ratios need not
+be powers of two. Each query head uses KV head `q_head // (Hq/Hkv)` and writes
+its own BF16 dK/dV partials. A final kernel sums them in fixed query-head order using FP32
+and converts to the native gradient dtype. Thus partial storage rounds each
+query head's contribution before the group fold. Regular correctness tests
+retain the same numerical tolerances as MHA.
+
+Grouped plans append two caller-workspace regions: dense
+`[B,Skv,Hq,128]` or packed `[1,round128(Tkv_compact),Hq,128]`, each at two
+bytes per element. Packed partials use compact KV prefixes; the final fold
+writes each dK/dV port at its independent declared origin. Dense grouped
+execution has four launches; packed grouped execution has five. Their dQ
+scratch, device metadata, alias checks, rebinding and capture contract match
+the corresponding MHA plan. Always query workspace size from the plan.
+
+Grouped BF16 GQA/MQA at long sequence lengths on cc 10.0 / 10.3 / 10.7 (SM100 / SM103 / SM107)
+may be served by a two-CTA pair implementation (one cluster of two CTAs per 256-row
+KV block) instead of the one-CTA grouped body, on packed THD and on dense compact
+BSHD declarations alike. The op-level field `cta_pair` on the adapter selects it:
+`auto` (the default) uses the pair when both declared `S_q` and `S_kv` are at least
+8192 and the device admits a cluster of two, `off` always uses the one-CTA body, and
+`on` uses the pair at any sequence length and raises a typed error naming the
+failing predicate (layout, compute capability, cluster admission, grouped heads)
+otherwise. The pair implementations (`accumulation_grouped_thd_2cta` on packed THD,
+`accumulation_grouped_dense_2cta` on dense compact BSHD) keep the grouped contract:
+the same inputs, outputs and declaration requirements as the one-CTA grouped body of
+the layout (dense: compact BSHD storage, contiguous FP32 Stats, lengths that are
+multiples of 128, BF16), a workspace sized like the packed grouped chain (the dense
+twin's packed capacities are `B * S_q` and `B * S_kv`), five launches, and dQ accumulated
+in FP32 without ordering guarantees. Always query the plan's workspace size. The dense
+twin's dK/dV are bitwise the packed chain's for the same per-sequence data.
+
+Grouped support and packed support do not imply performance parity with
+another backend; that qualification is a separate step.
+
+FP16 grouped attention is declined because per-query-head partials can overflow
+FP16 before cancellation in the final group sum. Wider partial storage is
+required before enabling that path. FP16 dense and packed MHA remain supported.

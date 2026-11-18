@@ -31,4 +31,19 @@ def requirement_error(what: str, minimum_version: tuple[int, int]) -> str | None
     return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {raw_version}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
 
 
-__all__ = ["BLOCK_SCALE_CUTEDSL_MIN_VERSION", "DENSE_CUTEDSL_MIN_VERSION", "requirement_error"]
+_SM100_FAMILY_TARGETS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
+def build_target() -> tuple[int, str]:
+    """The device a convolution built now targets (the handle's, inside ``build_plan``) and its CuTe target.
+
+    A compiled convolution belongs to that device: its arch-specific cubin, the max active clusters it bakes in and the
+    context it loads into. Both values therefore join every compile-cache key, and the compile runs under that device's
+    context with an explicit ``--gpu-arch``. A part outside the SM100 family (the engine declines it) reads as ``sm_100a``."""
+    from cudnn.frost.device import compute_capability, current_device
+
+    device = current_device()
+    return device, _SM100_FAMILY_TARGETS.get(tuple(compute_capability(device)), "sm_100a")
+
+
+__all__ = ["BLOCK_SCALE_CUTEDSL_MIN_VERSION", "DENSE_CUTEDSL_MIN_VERSION", "build_target", "requirement_error"]

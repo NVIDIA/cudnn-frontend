@@ -48,7 +48,9 @@ def gemm_srelu_init(
     vector_f32,
 ):
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
     mnkl_str = request.config.getoption("--gemm-srelu-mnkl", default=None)

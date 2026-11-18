@@ -14,6 +14,7 @@ from cutlass.cute.typing import Int32
 
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import has_tcgen05
 
 from ..utils import make_tensor_strided_like
 from .fmha import BlackwellFusedMultiHeadAttentionForward
@@ -185,8 +186,10 @@ class CompressionAttention(APIBase):
         device = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"CompressionAttention requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
+        if not has_tcgen05(major):
+            raise RuntimeError(
+                f"CompressionAttention requires SM100+ compute capability with tcgen05 (not cc 12.x), but found SM{compute_capability} on device {device}"
+            )
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

@@ -16,6 +16,9 @@ SUPPORTED_HEAD_DIMS = (*SM100_STANDARD_HEAD_DIMS, (192, 128), (256, 256))
 SUPPORTED_HEAD_DIM_RULE = "Dqk and Dv independently in [8, 128] and divisible by 8, " "or (192, 128), or (256, 256)"
 
 
+_INT32_MAX = 2**31 - 1
+
+
 def is_supported_head_dims(head_dim: int, head_dim_v: int) -> bool:
     """Return whether a public head shape has a supported kernel family."""
 
@@ -125,6 +128,15 @@ def validate_create_mask_plan_inputs(
             cu_seqlens_k,
             name="cu_seqlens_k",
         )
+        # The varlen kernels address a sequence as `cu_seqlens[b]` (Int32) times the token stride; past 2**31 elements that
+        # product wraps and reads another sequence's rows, so decline instead of computing a wrong answer.
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            span = 1 + sum((n - 1) * st for n, st in zip(tensor.shape, tensor.stride()))
+            if span > _INT32_MAX:
+                raise ValueError(f"varlen {name} spans {span} elements; the Int32 per-sequence offset math supports at most 2**31 - 1")
+        out_span = total_q * q.shape[-2] * v.shape[-1]
+        if out_span > _INT32_MAX:
+            raise ValueError(f"varlen output spans {out_span} elements; the Int32 per-sequence offset math supports at most 2**31 - 1")
         cu_q_owned = cu_seqlens_q.detach().clone()
         cu_k_owned = cu_seqlens_k.detach().clone()
         seqlen_q = None

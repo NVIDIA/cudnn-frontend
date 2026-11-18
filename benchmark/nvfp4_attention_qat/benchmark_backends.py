@@ -98,6 +98,11 @@ def main():
                 str(p.relative_to(package)) if p.is_relative_to(package) else p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files
             },
         )
+        # The candidate must resolve to FROST, and the Triton reference inputs use
+        # e2m1 conversions that SM8x/SM90 cannot assemble: refuse before building them.
+        major, minor = report["capability"]
+        if (major, minor) not in {(10, 0), (10, 3)}:
+            raise RuntimeError(f"this benchmark compares against the FROST backend, which needs an SM100 or SM103 GPU; found SM{major}{minor}")
         for sequence in args.lengths:
             inputs = make_inputs(args.heads, sequence)
             arms = {}

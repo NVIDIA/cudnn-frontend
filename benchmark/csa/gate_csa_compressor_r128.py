@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ratio=128 CSA fused-compressor numerics contract gate (see docs/fe-oss-apis/csa.md).
+"""ratio=128 CSA fused-compressor numerics contract gate (see docs/operations/sparse_attention/csa.md).
 
 Runs the contract over the full validation envelope — 15 union cases (coff {1, 2} x
 head_dim {128, 512} x {8k / 3x8k / ragged / edge / 64k / 128k token packs}; the 128k
@@ -60,16 +60,16 @@ gates bit-stable replay of the NaN pattern and NaN-mask equality vs eager on all
 outputs; the non-finite clause of the contract is THIS committed case, not an
 order-independence theorem — near fp32 max the fused evaluation order can saturate
 earlier than the eager one (un-normalized chunk partials; see the Numerics caveat in
-docs/fe-oss-apis/csa.md).
+docs/operations/sparse_attention/csa.md).
 
 Padding cases put static row-capacity padding (`total_comp > cu_seqlens_comp[-1]`)
 AND token-capacity padding (`kv/score` rows beyond `cu_seqlens[-1]`) on a ragged
 pack, and run the same three gates on the full padded shapes: the eager reference
-replicates the row-0 window on capacity rows exactly like the kernels, its autograd
+is explicitly zeroed on capacity rows to match the kernel contract, its autograd
 returns exact zeros on all never-consumed token rows, and the fused side runs with
 NONZERO grad_out on the padding rows while the reference zeroes them (proving the
-kernel ignores them). The token-padding gradient rows are additionally asserted to
-come back exactly zero.
+kernel ignores them). The token-padding gradient rows and output-capacity rows are
+additionally asserted to come back exactly zero.
 
 Also RECORDS (not gates) whether out/dKV/dScore happen to be bitwise-equal to eager
 per case, so docs can state honestly which parts remain bitwise. The eager reference
@@ -365,9 +365,9 @@ def gate_case(M, config, shape_name, lens, rec_list, covered, scale=1.0):
 def gate_padding(M, config, pad, tok_pad, rec_list, covered):
     """Static row-capacity padding (+pad rows, incoming grads ignored) + token-capacity
     padding (+tok_pad kv/score rows, gradients exactly zero), all three gates on the
-    full padded shapes. The eager reference models the capacity rows (row-0 window
-    replication) and runs with the padding-row grad_out zeroed — the fused side keeps
-    it NONZERO, so matching it proves the kernel ignores padding-row gradients."""
+    full padded shapes. The eager reference zeroes capacity rows and runs with the
+    padding-row grad_out zeroed — the fused side keeps it NONZERO, so matching it proves
+    the kernel ignores padding-row gradients."""
     coff, d = CONFIGS[config]
     lens = [1023, 2048, 509]
     kv, score, ape, cu, cuc, total_true = _make_inputs(lens, d, RATIO, coff)
@@ -414,6 +414,8 @@ def gate_padding(M, config, pad, tok_pad, rec_list, covered):
     score_full = score2.view(total, 1, w)
     ref32 = _eager_pool(kv_full, score_full, ape, cu, cuc, total_comp, RATIO, d, coff, "fp32").view(total_comp, d)
     ref64 = _eager_pool(kv_full, score_full, ape, cu, cuc, total_comp, RATIO, d, coff, "fp64").view(total_comp, d)
+    ref32[total_true:] = 0
+    ref64[total_true:] = 0
     _, ekv, es, eape = run_eager_bwd(kv_full, score_full, ape, cu, cuc, total_comp, RATIO, d, coff, go_zero_pad, mode="fp32")
     _, okv, os_, oape = run_eager_bwd(kv_full, score_full, ape, cu, cuc, total_comp, RATIO, d, coff, go_zero_pad, mode="fp64")
 
@@ -425,7 +427,7 @@ def gate_padding(M, config, pad, tok_pad, rec_list, covered):
     kv_or_ok, kv_errf, kv_erre = oracle_check(gkv.view_as(ekv), ekv, okv)
     s_or_ok, s_errf, s_erre = oracle_check(gs.view_as(es), es, os_)
     ape_or_ok, ape_errf, ape_erre = oracle_check(gape, eape, oape)
-    pad_zero_ok = bool((gkv[kv.shape[0] :] == 0).all().item() and (gs[kv.shape[0] :] == 0).all().item())
+    pad_zero_ok = bool((out[total_true:] == 0).all().item() and (gkv[kv.shape[0] :] == 0).all().item() and (gs[kv.shape[0] :] == 0).all().item())
 
     g1 = stable and nan_ok
     g2 = fwd_tol_ok and kv_tol_ok and s_tol_ok and ape_ma <= DAPE_TOL

@@ -15,18 +15,36 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 
 # dims, group, Q, KV, CGA, splits, packed, causal, left window, kernel
 CASES = {
-    "decode64": ((64, 64), 8, 4, 1025, 1, 8, True, True, None, "sm100/decode_d128_f16.py"),
-    "decode128": ((128, 128), 4, 7, 769, 1, 3, True, True, 127, "sm100/decode_d128_f16.py"),
-    "native128": ((128, 128), 4, 129, 513, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
-    "partial6": ((96, 80), 6, 129, 385, 2, 4, True, True, 31, "sm107/prefill_d128_f16.py"),
-    "plain128": ((128, 128), 1, 129, 257, 2, 4, False, False, None, "sm107/prefill_d128_f16.py"),
-    "native192": ((192, 128), 2, 257, 385, 2, 8, False, True, 47, "sm107/prefill_d192_d128_f16.py"),
-    "keyless": ((128, 128), 4, 257, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
-    "decode256": ((256, 256), 4, 4, 513, 2, 4, True, True, None, "sm107/decode_d256_f16.py"),
+    "decode64": ((64, 64), 8, 4, 1025, 1, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "decode128": ((128, 128), 4, 7, 769, 1, 3, True, True, 127, "sm100/d128_f16_single_q/kernel.py"),
+    "native128": ((128, 128), 4, 129, 513, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "partial6": ((96, 80), 6, 129, 385, 2, 4, True, True, 31, "sm107/d128_f16_multi_q/kernel.py"),
+    "plain128": ((128, 128), 1, 129, 257, 2, 4, False, False, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "native192": ((192, 128), 2, 257, 385, 2, 8, False, True, 47, "sm107/d192_f16_multi_q/kernel.py"),
+    "keyless": ((128, 128), 4, 257, 65, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "decode256": ((256, 256), 4, 4, 513, 2, 4, True, True, None, "sm107/d256_f16_swap_ab/kernel.py"),
+    "native64plain": ((64, 64), 1, 1, 4096, 1, 8, False, False, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "singleq64partial": ((48, 32), 12, 129, 385, 1, 3, True, True, 47, "sm100/d128_f16_single_q/kernel.py"),
+    "native64partial": ((48, 32), 12, 129, 385, 2, 3, True, True, 47, "sm107/d128_f16_multi_q/kernel.py"),
+    "native64keyless": ((64, 64), 4, 257, 65, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "native64empty": ((64, 64), 4, 65, 65, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
 }
+# The public graph rejects bottom-right Q capacity larger than KV capacity.
+GRAPH_CASES = [name for name, case in CASES.items() if case[2] <= case[3]]
 
 
-@pytest.mark.parametrize("case", [name for name in CASES if name != "keyless"])
+def _graph_owner(dims, cga, tile_n):
+    """Fixed graph body for the explicit sink/split fixtures below."""
+    if dims == (256, 256):
+        return "sdpa_fwd_sm107_d256_swap_ab"
+    if dims == (192, 128):
+        return "sdpa_fwd_sm107_d192_multi_q"
+    if all(0 < dim <= 128 and dim % 8 == 0 for dim in dims):
+        return "sdpa_fwd_sm107_shared_single_q" if cga == 1 and tile_n == 128 else "sdpa_fwd_sm107_d128_multi_q"
+    return "sdpa_fwd_prefill_sm107"
+
+
+@pytest.mark.parametrize("case", GRAPH_CASES)
 def test_sink_split_graph_admission(case, monkeypatch):
     from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
     from cudnn.frost import buffers
@@ -38,8 +56,11 @@ def test_sink_split_graph_admission(case, monkeypatch):
         b=2, h_q=2 * group, h_kv=2, s_q=sq, s_kv=sk, d_qk=dims[0], d_v=dims[1], has_sink=True, causal=causal, bottom_right=causal, window_left=window
     )
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed, tile_m=128, tile_n=128, sched_policy=0)
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), facts, knobs) is None
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), dataclasses.replace(facts, has_epilogue_gate=True), knobs) is not None
+    if dims == (256, 256):
+        knobs = dataclasses.replace(knobs, cga=1, tile_m=16)
+    caps = _caps(_graph_owner(dims, cga, 128))
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_epilogue_gate=True), knobs) is not None
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
@@ -66,7 +87,7 @@ def test_sink_split_standalone_replay(case, dtype_name, stats):
     _check_sink_split(case, dtype_name, stats, graph_api=False)
 
 
-@pytest.mark.parametrize("case", [name for name in CASES if name != "keyless"])
+@pytest.mark.parametrize("case", GRAPH_CASES)
 def test_sink_split_graph_rebind(case, cudnn_handle):
     _check_sink_split(case, "bfloat16", "log2", graph_api=True, handle=cudnn_handle)
 
@@ -82,7 +103,7 @@ def test_sink_split_narrow_graph_rebind(case, cudnn_handle):
     _check_sink_split(case, "bfloat16", "log2", graph_api=True, handle=cudnn_handle, tile_n=64)
 
 
-def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n=128):
+def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n=128, sink=True):
     import cudnn
     import torch
     from cuda.bindings import driver as cuda
@@ -104,7 +125,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
         causal=causal,
         bottom_right=causal,
         window_left=window,
-        sink=True,
+        sink=sink,
         pack_gqa=packed,
     )
     api.cga = cga
@@ -116,39 +137,41 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     saved_stream = cudnn.get_stream(handle) if graph_api else None
     captures, bindings = [], []
     if graph_api:
-        dt = cudnn.data_type.BFLOAT16
+        dt = cudnn.data_type.BFLOAT16 if dtype_name == "bfloat16" else cudnn.data_type.HALF
         graph = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
         ts = {n: graph.tensor_like(bufs[n]) for n in ("q", "k", "v")}
-        ts["sinks"] = graph.tensor_like(bufs["sinks"]).set_dim([1, 2 * group, 1, 1]).set_stride([2 * group, 1, 1, 1])
+        if sink:
+            ts["sinks"] = graph.tensor_like(bufs["sinks"]).set_dim([1, 2 * group, 1, 1]).set_stride([2 * group, 1, 1, 1])
         ts["out"], lse = graph.sdpa(
             q=ts["q"],
             k=ts["k"],
             v=ts["v"],
-            generate_stats=True,
+            generate_stats=stats != "none",
             attn_scale=bufs["attn_scale"],
             use_causal_mask_bottom_right=causal,
             sliding_window_length=None if window is None else window + 1,
-            sink_token=ts["sinks"],
-            stats_use_log2=True,
+            sink_token=ts.get("sinks"),
+            stats_use_log2=stats == "log2",
         )
         ts["out"].set_output(True).set_dim(list(bufs["out"].shape)).set_stride(list(bufs["out"].stride()))
-        bufs["lse"] = bufs["lse"].unsqueeze(-1)
-        ts["lse"] = lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(list(bufs["lse"].shape)).set_stride(list(bufs["lse"].stride()))
+        if stats != "none":
+            bufs["lse"] = bufs["lse"].unsqueeze(-1)
+            ts["lse"] = lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(list(bufs["lse"].shape)).set_stride(list(bufs["lse"].stride()))
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A])
-        idx = next(i for i in range(graph.get_execution_plan_count()) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm107"))
-        engine, knobs = graph.get_engine_and_knobs_at_index(idx)
-        knobs.update(
-            {
-                cudnn.knob_type.TILE_M: 128,
-                cudnn.knob_type.TILE_N: tile_n,
-                cudnn.knob_type.TILE_CGA_M: cga,
-                cudnn.knob_type.SPLIT_KV: splits,
-                cudnn.knob_type.PACK_GQA: int(packed),
-                cudnn.knob_type.SCHED_POLICY: 0 if dims == (192, 128) else 1,
-            }
-        )
+        from cudnn.engines.manifest import family_for
+
+        owner = _graph_owner(dims, cga, tile_n)
+        engine = family_for(graph).offered_ids(graph)[owner]
+        knobs = {
+            cudnn.knob_type.TILE_M: 16 if dims == (256, 256) else 128,
+            cudnn.knob_type.TILE_N: tile_n,
+            cudnn.knob_type.TILE_CGA_M: 1 if dims == (256, 256) else cga,
+            cudnn.knob_type.SPLIT_KV: splits,
+            cudnn.knob_type.PACK_GQA: int(packed),
+            cudnn.knob_type.SCHED_POLICY: 0 if dims in ((192, 128), (256, 256)) else 1,
+        }
         graph.create_execution_plan(engine, knobs)
         graph.select_plan(graph.get_execution_plan_count() - 1)
         graph.check_support()
@@ -159,8 +182,27 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     else:
         api.compile()
         ws_bytes = api.scratch_workspace_bytes()
+    if max(dims) <= 64 and cga == 1 and tile_n == 128 and (splits > 1 or api._d64_decode_tile()):
+        kernel = "sm100/d128_f16_single_q/kernel.py"
+        assert api._k_mod.CFG.TILES_Q == 1
+    if graph_api and owner != "sdpa_fwd_prefill_sm107":
+        kernel = {
+            "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",
+            "sdpa_fwd_sm107_shared_single_q": "sm100/d128_f16_single_q/kernel.py",
+            "sdpa_fwd_sm107_d192_multi_q": "sm107/d192_f16_multi_q/kernel.py",
+            "sdpa_fwd_sm107_d256_swap_ab": "sm107/d256_f16_swap_ab/kernel.py",
+        }[owner]
     assert api._k_mod.__file__.endswith(kernel), api._k_mod.__file__
     assert api._k_mod.CFG.SPLIT_KV == splits
+    if max(dims) <= 64:
+        assert api.flavor == (64, 64) and api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
+        assert api._k_mod.CFG.CTA_MMA == cga
+        if splits > 1:
+            if kernel.startswith("sm107/"):
+                assert not api._k_mod.FOLD_SINK
+            assert api._fp32_partial_split() and api._partial_torch_dtype() == torch.float32
+        else:
+            assert not api._fp32_partial_split()
     if tile_n == 64:
         assert api._k_mod.CFG.TILE_N == 64 and api._k_mod.CFG.S_SLOTS == 2
     try:
@@ -169,7 +211,8 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
             for n, t in current.items():
                 t.copy_(bufs[n])
             current["v"].mul_(1 if ordinal == 0 else -1)
-            current["sinks"].add_(ordinal * 2)
+            if sink:
+                current["sinks"].add_(ordinal * 2)
             ws = torch.empty(max(ws_bytes, 1), dtype=torch.uint8, device="cuda")
 
             def execute():
@@ -182,7 +225,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
                         v_tensor=current["v"],
                         o_tensor=current["out"],
                         lse_tensor=current.get("lse"),
-                        sinks=current["sinks"],
+                        sinks=current.get("sinks"),
                         workspace=ws,
                         current_stream=cuda.CUstream(stream.cuda_stream),
                     )
@@ -198,7 +241,8 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
             bindings.append((current, ws))
         for capture, (current, ws) in zip(captures, bindings):
             current["v"].neg_()
-            current["sinks"].add_(0.75)
+            if sink:
+                current["sinks"].add_(0.75)
             current["out"].fill_(torch.nan)
             ws.fill_(0xA5)
             if "lse" in current:
@@ -212,7 +256,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
                 current["v"],
                 logit_scale=bufs["attn_scale"],
                 masked=_dense_mask(sq, sk, causal=causal, bottom_right=causal, window_left=window),
-                sinks=current["sinks"],
+                sinks=current.get("sinks"),
             )
             torch.testing.assert_close(current["out"].double(), ref_o, atol=4e-3, rtol=4e-3)
             if "lse" in current:

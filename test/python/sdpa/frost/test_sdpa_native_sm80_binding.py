@@ -19,16 +19,16 @@ pytestmark = [pytest.mark.L0]
 _INDICES = tuple(range(9))
 
 
-def _fixture(dtype="bfloat16", features=True, wide=0, rope=False, planned=0.125):
+def _fixture(dtype="bfloat16", features=True, wide=0, planned=0.125):
     path = Path(prep.__file__).parent / "kernels/sm80/prepared_host.py"
-    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("_dense_host" if rope else "host"))
+    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
     names = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
-    roles = prep.ROLES[: 10 if rope else 9]
+    roles = prep.ROLES
     assert tuple(names[:-3]) == roles
     assert names[-3:] == ["scale_log2", "inv_scale", "stream"]
     ops, facts, frames = [], {}, []
     for i, role in enumerate(roles):
-        if i >= 4 and not features and role != "rope":
+        if i >= 4 and not features:
             ops.append(None)
             continue
         dt = dtype if i < 4 else "int32" if role.startswith("seq_") else "float32"
@@ -37,8 +37,6 @@ def _fixture(dtype="bfloat16", features=True, wide=0, rope=False, planned=0.125)
             if wide:
                 shape = (2 if wide == 1 else 6, *shape[1:])
                 strides = (2**32 + 120 if wide == 1 else 2**30, *strides[1:])
-        elif role == "rope":
-            shape, strides = (7, 4, 2), (8, 2, 1)
         elif role == "stats":
             shape, strides = (2, 3, 5, 1), (30, 10, 2, 1)
         elif role == "bias":
@@ -59,7 +57,7 @@ def _fixture(dtype="bfloat16", features=True, wide=0, rope=False, planned=0.125)
 
 
 def _pack(facts):
-    roles = prep.ROLES[: 10 if "rope" in facts else 9]
+    roles = prep.ROLES
     pack = cudnn._pybind_module.VariantPackNative(len(roles))
     for i, role in enumerate(roles):
         _set_native_fact(pack, i, facts.get(role))
@@ -70,10 +68,9 @@ def _pack(facts):
 @pytest.mark.parametrize("features", [False, True])
 @pytest.mark.parametrize("wide", [0, 1, 2])
 @pytest.mark.parametrize("scale", [None, 0.0, 0.25, -0.5])
-@pytest.mark.parametrize("rope", [False, True])
 @pytest.mark.parametrize("planned", [0.125, 0.0, -0.25])
-def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale, rope, planned):
-    spec, facts, frames = _fixture(dtype, features, wide, rope, planned)
+def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale, planned):
+    spec, facts, frames = _fixture(dtype, features, wide, planned)
     indices = tuple(range(len(spec.operands)))
     resolved = planned if scale is None else scale
     if (resolved > 0) - (resolved < 0) != (planned > 0) - (planned < 0):
@@ -169,24 +166,6 @@ def test_sm80_unknown_storage_and_checked_int64_ranges():
     with pytest.raises(ValueError, match="int64"):
         replace(spec, operands=(replace(spec.operands[0], span=2**62), *spec.operands[1:]))
     assert not frames
-
-
-@pytest.mark.parametrize("fault", ["missing", "dtype", "device", "short", "geometry"])
-def test_sm80_rope_is_validated_before_host_launch(fault):
-    spec, facts, frames = _fixture(rope=True)
-    rope = facts["rope"]
-    changed = {
-        "missing": None,
-        "dtype": rope._replace(dtype="float16"),
-        "device": rope._replace(device=(2, 1)),
-        "short": rope._replace(span=rope.span - 1),
-        "geometry": rope._replace(shape=(rope.numel,), strides=(1,)),
-    }[fault]
-    with pytest.raises(ValueError):
-        prep.execute(spec, dict(facts, rope=changed), 17)
-    assert not frames
-    prep.execute(spec, facts, 19, scale=0.25)
-    assert frames == [tuple(reference_bind(spec, facts, 19, scale=0.25))]
 
 
 @requires_dsl
@@ -308,7 +287,7 @@ def test_sm80_direct_standalone_with_another_device_current(dtype, explicit_stre
         )
         api.check_support()
         api.compile()
-        assert api._sm80_spec is not None and api._sm80_copy_spec is None
+        assert api._sm80_spec is not None
         stream = torch.cuda.Stream(device=target)
         stream.wait_stream(torch.cuda.current_stream())
         captured = torch.cuda.CUDAGraph()

@@ -7,6 +7,57 @@ never renumber.
 
 ## Hard rules
 
+An isolated implementation's thin host entry must not import the engine
+registry that imports it. Inject common lowering and knob construction from
+the registry. Keep historical-domain metadata with engine definitions so
+placement need not import the candidate generator to retrieve it. The cold
+host-import and explicit-lowering tests in
+`test_sdpa_fwd_d512_fp8_implementation_contract.py` detect these boundaries.
+
+Pure body-selection functions used by both recommendation and placement can
+live in `fwd/implementation_selection.py`, independent of either caller and
+the registry. Keep performance policy out of fixed kernel contracts. The
+wide-placement import-guard test detects a reverse dependency on the candidate
+generator; preserving the selector's logic and candidate/placement comparison
+checks that moving it does not change ranking.
+Capability-aware SM107 half selection lives in `fwd/sm107_half_selection.py`:
+the registry resolves capability-derived geometry and passes scalar inputs
+to that policy, without a reverse registry import. A direct import of registry
+helpers can close a cycle through its legacy adapter even when placement no
+longer imports heuristics. The selection-module and placement import guards
+detect both edges; fixed hosts never call the policy. Keep selection shared
+rather than copying its decisions into placement.
+
+For explicit implementation records, distinguish the physical CTA cluster
+(`TILE_CGA_M/N`) from the MMA group (`CTA_GROUP`). D512 uses a four-CTA
+cluster containing two-CTA MMA groups; D576 uses a single pair. Translate
+only at an adapter boundary that still uses the historical MMA-group
+encoding, including its second support check. Compare the built config
+with both quantities. Detectors: `test_sdpa_fwd_d512_explicit_engines.py`
+(public recipe, metadata and retained capture) and
+`test_public_cluster_width_is_honored_or_rejected` (wrong-width declines).
+
+When selecting a specialized launch body, check its grid bounds independently
+of the generic scheduler. The SM100 FP8 D128 decode body puts batch in
+`gridDim.y` for every scheduler policy, so it only replaces the existing body
+for batch sizes at most 65535. Its architecture-route test checks both sides
+of that boundary without allocating a huge batch.
+
+In swap-AB decode, count token units using live softmax columns, independently
+of the padded MMA width. SM100 FP8 uses sixteen physical columns but only
+eight live columns; counting the padding as tokens skips MTP rows at G8.
+The D64 cases in `TestNativeFp8Decode` check Q3/G8 and Q4/G8 with explicit
+`SWAP_AB=1`, plus unset/zero knob controls retaining the prefill body.
+
+Paged live-page counts are scalar integer arithmetic. Preserve the existing
+`(length + page_size - 1) // page_size` expression in persistent loaders:
+CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations
+and fail with an illegal `cute.derefine`, even when both inputs are scalar.
+The page8 case in `TestNativeSingleQPaged` exercises the initial and next-work
+page counts. For an opaque compiler failure, retain the module after the
+failing pass with line information; raw pre-pass IR can point at unrelated
+constants with the same value.
+
 **Rule S1 — Respect the declared Stats (LSE) packing: packed and explicitly
 padded Stats are different contracts.**
 
@@ -15,6 +66,11 @@ padded Stats are different contracts.**
   callers take head-major `(H, head_stride)`. A dense-padded declaration
   (per-sequence stride) mis-addresses under that packing — it must be
   rejected for a packed Stats declaration, not silently accepted and mis-read.
+- The packed-layout requirement applies to the **graph declaration**, not
+  the shape of a variant-pack buffer. A flat or capacity-shaped carrier is raw
+  storage: bind the declared strides after checking its exposed storage span.
+  Do not require a packed carrier shape or infer packing from its strides.
+  Standalone APIs without graph storage semantics retain their layout checks.
 - Validate by stride, not by a `thd`/`packed` flag: token-major is
   `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1` with
   `stride_h` the declared head stride, which must cover the **packed token
@@ -33,6 +89,13 @@ padded Stats are different contracts.**
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+
+Packed graph Stats can also arrive as a `(T, H, 1)` carrier for either packing.
+Validate its token/head strides and capacity against the declaration, then bind
+the same storage without copying. The SM80 detector
+`test_graph_thd_independent_pitches_rebind_replay` covers both carrier forms,
+fresh pointers, changed-length replay, and pre-launch rejection of short or
+incorrectly pitched carriers.
 
 An explicitly padded Stats output is a separate existing forward contract:
 when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
@@ -80,13 +143,84 @@ The initial-wave limit is a plan-time choice evaluated against current host-know
 capacity at binding. Where an exact packed workload is available, count packed
 token tiles rather than unpacked tiles times all query heads.
 
-**Rule S2 — A change to any FROST SDPA `Capabilities` row updates
-`python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
+Packed split partials use compact work prefixes, but Q/K/V and final O/Stats
+may each have independent physical origins. Do not reuse partial indexing for
+input addressing or drop the origin declarations while lowering a split plan.
+The D128 nonpaged split cases in `test_sdpa_fwd_thd_origins.py` poison the gaps
+and rebind all pitches; mixed FP8 KV repeats them in
+`test_sdpa_fwd_mixed_kv_sm100.py`. Sequence-local K/V maps clip each live segment,
+so interior NaN padding cannot enter a tile tail.
+The physical-origin binding must be enabled for every supported architecture
+and layout, not just its paged path. Assert the prepared THD spec contains
+`origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
+THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
+gaps, independent port origins, rebinding, and changed-length replay.
+The SM120 half, per-tensor FP8 and MXFP8 hosts must also retain each port's physical capacity: a
+`max_total_seq_len_*` hint bounds live work, not the address span of a gapped
+buffer. Exercise both prepared graph binding and the graph's standalone-adapter
+fallback; forwarding offsets only through the prepared route leaves the fallback
+without required operands. The SM120 origin and prepared-rebind suites detect both.
+The FP8 detector `test_sdpa_fwd_thd_origins_fp8_sm120.py` also changes device
+descale values during retained replay. Quantized origin operands follow the
+quantization-role tuple in the native binder frame; keep that order in the
+standalone adapter as well.
 
-- The matrix is the only place a reader can see what FROST serves across
-  arch x pass x head-dim x dtype without reading five `engines.py` rows. It
-  is generated by hand from those rows, so it goes stale the moment one
-  changes and nothing else notices.
+MXFP8 origin operands follow the full quantization-role tuple, including
+Q/K/V scale buffers; using the shorter per-tensor FP8 role count binds scales
+as offsets. Data origins do not move the logically packed scale-tile prefixes.
+`test_sdpa_fwd_thd_origins_mxfp8_sm120.py` checks both facts with poisoned
+physical gaps, unchanged quantized payloads and repacked scale bytes across
+batch changes, then modifies scale exponents during retained replay.
+
+Tensor-map token dimensions need not match across ports or match the source
+tensor's axis number. SM100 D512 MXFP8 uses rank-5 Q/K/V maps with token
+dimension 1, while O retains dimension 2. Pass each map's token dimension to
+`build_thd_origins`; keep byte origins based on the source tensor's token
+stride. Data-map sequence selection must not change the logically packed SF
+batch/tile coordinates. `TestPhysicalOrigins` in
+`test_sdpa_fwd_mxfp8_sm100.py` pins D128 CGA2 and D512 CGA1, rebinds every
+port and checks changed-length and scale-only retained replay.
+
+MXFP8 V-scale tail sanitization in the leader MMA warp can access its peer's
+shared slab even when that peer has no live query rows. Keep the peer CTA
+alive until those cluster-memory accesses finish; role-local completion alone
+does not establish peer lifetime. The D128 CGA2 `TestPhysicalOrigins` replay
+cases in `test_sdpa_fwd_mxfp8_sm100.py` detect the unsafe exit with racecheck.
+
+A test that changes a port's token pitch must update that port's physical
+ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
+an SDPA output's generated name need not be `o`. A prefix-only kernel can mask
+an incorrect fixture until physical-origin addressing is enabled. The SM80
+`test_graph_thd_independent_pitches_rebind_replay` and
+`test_independent_origins_rebind_replay` check these two contracts separately.
+
+For single-Q ragged split decode, physical Q-offset differences can include
+storage gaps. The combine must use the declared device Q lengths (ordinary or
+cumulative), independently of output addresses. Exercise an empty sequence with
+nonzero offset distance and assert that both O and Stats canaries remain intact;
+`test_half_q_single_q_ragged_decode` covers graph and standalone execution,
+rebinding and retained replay. Standalone THD requires Q lengths independently
+of the dense-only `seq_q_lens_present` flag: bind against the compiled spec,
+validate ordinary B or cumulative B+1 storage, and reject uncompiled operands.
+A graph-only test misses a direct-API operand silently dropped by that flag.
+
+When narrowing a backward owner's legacy mask flags with `dataclasses.replace`,
+pass `band=None` to recompute its normalized band declaration. Otherwise the
+copied `BandSupport` still advertises the parent's masks. The band matrix must
+sample each owner's actual non-mask domain (for example grouped heads for the
+two-CTA backward body and D64 for the one-CTA body's sliding window).
+`test_every_row_carries_a_normalized_band_support` and
+`test_unmasked_baseline_is_accepted_by_every_row` detect these mismatches.
+
+**Rule S2 — A change to FROST SDPA graph eligibility updates the affected
+architecture section under [frost/support/](frost/support/README.md) in the same commit.**
+
+- The support index and architecture pages describe current support by pass,
+  precision and head domain. Use [the template](frost/support/TEMPLATE.md) and
+  [SM90 example](frost/support/sm90.md) when a section has not yet migrated.
+  Document the scope you checked and mark other sections **Pending migration**;
+  pending documentation does not mean unsupported. Update the index's coverage
+  when adding a page or completing a section. Do not copy unverified legacy rows.
 - Applies to every field that changes what a graph gets: `dtypes`,
   `out_dtypes`, `d_shapes` / `d_pad_multiple` / `d_envelope_floors` /
   `thd_d_shapes`, the mask and feature booleans (`causal`, `bottom_right`,
@@ -94,16 +228,34 @@ token tiles rather than unpacked tiles times all query heads.
   `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
   `layouts`, ...), and adding or retiring an `EngineSpec` row. A change
   confined to knob domains (`tile_ms`, `sched_policies`, ...) does not
-  need a matrix edit — the matrix deliberately does not track knobs.
-- The matrix distinguishes **native** (a kernel for this geometry exists)
+  need a support-page edit — these pages do not enumerate knob domains.
+  A support-preserving refactor still updates moved source links and engine
+  identities in its section.
+- The pages distinguish **native** (a kernel for this geometry exists)
   from **envelope-served** (the graph rides a larger flavor with TMA
   zero-padding, at that flavor's MMA cost). When adding a head dim, say
   which one it is — an envelope hit is a perf cliff a user cannot see from
   a `Capabilities` row. `d_pad_multiple=0` means exact-only, so no
   envelope at all.
+- Link enforcing capabilities, declaration checks and relevant accept/reject
+  tests. State feature-combination restrictions and distinguish ordinary
+  discovery from opt-in and hardware qualification. Keep development logs,
+  temporary heads, test counts and performance results in their existing reports.
+  `SUPPORT_MATRIX_TRACKER.md` is a legacy reference, not the update destination.
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
-  `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
-  untouched, ask why before approving.
+  `cudnn/engines/manifest.py` and no affected support section changes, check
+  whether the edit is exempt before approving. The registered source and local
+  declaration/binding checks, not a legacy table, determine the documented domain.
+- Prefill-only backward rows explicitly set `decode=False`: the capability
+  default is `True`, which otherwise admits `S_q == 1` before the adapter
+  rejects it. `test_sdpa_bwd_d192_sm107.py::test_decode_declines_before_lowering`
+  checks real dense/THD graph declarations at that boundary.
+- When enabling partial PackGQA, test ordinary candidate generation as well
+  as explicit plans at groups `tile_q`, `tile_q + 2` and `2 * tile_q`.
+  `create_execution_plan` alone does not exercise `_pack_gqa_points`: its
+  packed token span must use the effective subgroup width. Dividing a tile
+  by the full sharing ratio can produce zero before any kernel launches.
+  Keep the full Q/K ratio separately for KV-head mapping and validation.
 
 **Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
 that stores into columns another warpgroup still has to read must be
@@ -111,7 +263,7 @@ ordered after that read.**
 
 - Some kernels have no spare TMEM and pack P into the tail of the S slot it
   was computed from (`P_EVEN_OFF`/`P_ODD_OFF` inside the `S_ACC_*` column
-  range — e.g. `sm100/prefill_d256_fp8.py`, `P_EVEN_OFF = 96` in a 128-col
+  range — e.g. `sm100/d256_fp8_single_q/kernel.py`, `P_EVEN_OFF = 96` in a 128-col
   slot). With a single softmax owner that is safe: all of S is in registers
   before any P store. It is a race the moment a row's keys are split across
   two softmax warpgroups: the half storing into the aliased columns
@@ -123,13 +275,13 @@ ordered after that read.**
   after its `tcgen05.ld` has landed (`tcgen05.wait::ld` first — the
   softmax paths otherwise never wait on loads explicitly), and the storing
   half waits on it right before the aliased store (`mb_softmax_hi_loaded`
-  in `sm100/prefill_d256_fp8.py`, mirroring `mb_softmax_max`). Do NOT try
+  in `sm100/d256_fp8_single_q/kernel.py`, mirroring `mb_softmax_max`). Do NOT try
   to fix it by swapping which half owns which keys: the alpha/stats value
   is aliased too (`STATS_*_OFF == S_ACC_*_OFF`, i.e. S column 0), so the
   half that stores alpha must also be the one that owns key 0 — the
   original ownership is forced, only the ordering was missing.
 - The same kernel family can hide the split behind a different role name.
-  `sm100/prefill_d256_mxfp8.py` has no `mb_softmax_max`: its
+  `sm100/d256_mxfp8_single_q/kernel.py` has no `mb_softmax_max`: its
   `FUSED_CORR_SPLIT_P` schedule (mxfp8 + strict top-left causal) gives
   keys 64–127 to the *correction* warpgroup (`_fused_p1_step`), and half 0
   stored P into cols 96–111 with nothing ordering it after that
@@ -238,6 +390,42 @@ read the wrong K/V at batch one. The detector is
 `test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
 both source padding and output copy-out with canaries in unused physical rows.
 
+A TMA view split into fixed head chunks must retain the logical head bound.
+A rank-5 `(chunk, row, inner)` view can treat storage slack as live columns even
+when Q is correctly zero-padded; `0 * NaN` still poisons BMM1. Keep the bounded
+rank-4 loads for partial head chunks, and preserve the exact-head lowering.
+`test_sdpa_fwd_fp8_sm100.py::TestD192Fp8HeadPadding` and the native SM107
+`TestNativeD192Fp8HeadPadding` bridge poison Q/K/V head slack and check full
+O/Stats/Amax, output canaries, rebinding and retained replay on both arch lines.
+For paged head chunks, the descriptor box may cover only one page slice while
+the MMA operand still uses the full tile-height pitch between dimension slabs.
+Preserve that pitch and step dimensions in exactly one layer: a paged helper
+that loops dimension subtiles must not also request multiple loads per subtile.
+`TestD256Fp8HeadPadding::test_paged_rebind_replay` covers partial K/V heads,
+short and wide pages, independent pools/tables, sinks and changed-length replay.
+
+Native backward gradient outputs must not overwrite each other.
+
+
+- A native route replacing ordered staged copy-back must reject overlapping
+  gradient address sets before any initialization or launch, on both graph and
+  standalone calls. Recheck current pointers on every binding.
+- Shared allocation or overlapping bounding spans do not imply overlapping
+  elements: disjoint interleaved Q/K/V gradients remain valid. Use declared
+  strides even when the graph binds flat storage or raw pointers.
+- Cache disjointness geometry at plan time. Regular padded interleaves need
+  a bounded check even when outer padding defeats the stride-GCD shortcut;
+  include head/batch carry gaps and recheck current pointer offsets. Compare
+  the result against an address-set oracle with mixed layouts, different block
+  widths and both pointer orders. Measure large declarations without walking
+  every row per bind.
+- Detectors: `test_native_gradient_overlap_rejected_before_entry`,
+  `test_native_shared_gradient_storage_matches_address_oracle`, and
+  `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
+  existing legal interleaved-gradient tests. When retiring a staged copy-order
+  path, replace its overlap case with a pre-launch rejection test that guards
+  the same output and workspace storage.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -250,6 +438,14 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
   to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
   the cases (the block-scaled O review found SM120 FP4 declining itself
   and the Rubin lane skipping the epilogue entirely).
+- When an architecture CI lane selects an explicit file list, check collection
+  through those entries. A directory-wide local sweep does not prove CI coverage.
+  A guarded class in the selected entry can expose parametrized helper tests via
+  `staticmethod`; retain the architecture guard because the helper module's
+  `pytestmark` does not transfer with its functions. The SM107 sink/split
+  detector is `test_sdpa_fp8_sm107.py::TestNativeFp8SinkSplit`.
+  Put shared implementations in modules without the `test_` prefix so directory
+  sweeps collect each architecture entry once, rather than also collecting helpers.
 - The DSL traces the kernel in Python before any arch-specific codegen, so a
   lowering for an arch you do not have still fails or passes its trace here:
   `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
@@ -321,6 +517,13 @@ batch, where the linear offsets are largest. Rendering a kernel host-only for
 a `>= 2^31` geometry and grepping its PTX for `mul.wide.s32` / `cvt.s64.s32`
 on the address path shows the wrap before any GPU run.
 
+For paired dQ and dK/dV schedulers, bound each decoder's Int32 divisor using
+its own tile count and operand footprint. FP8 dQ derives its swizzle from
+K/V while dK/dV derives it from Q/dO; checking just one misses asymmetric
+sequence lengths. The host-only detector
+`test_fp8_accumulation_swizzle_accounts_for_byte_payload` exercises both
+orientations, the last safe tile and the first overflowing row.
+
 **Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
 
 - A setup kernel may publish K/V maps once before attention. Acquire each map
@@ -344,6 +547,14 @@ on the address path shows the wrap before any GPU run.
   whenever the selected batch/map changes. Exercise empty and repeated work items
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
+
+A caller that explicitly acquires an immutable runtime map must also disable
+its tile helper's default acquire for that lifetime. Otherwise every q tile
+repeats the tensor-map invalidation and flush despite the outer acquire.
+In 2x2 backward, loaders acquire compact maps at entry and physical maps per
+work item; the fused Qdk map belongs to the store warp and needs its own acquire
+on both CTAs. Preserve the initialized dead-unit fallback. The D192/D256 THD
+origin/rebind suites and their empty replay cases exercise these boundaries.
 
 **Rule S9 — Every scheduler reader needs a reuse back-edge; match output-phase cadence.**
 
@@ -415,17 +626,212 @@ production kernels gain no debug knob or timing-dependent assertion.
   with `batch_idx == n_batch`. Allocating `B+1` map slots makes that address
   in bounds but does not initialize a descriptor there.
 - When setup writes maps only for the `B` real sequences, exit dead initial
-  clusters before acquiring maps or shared resources. Use the cluster-uniform
+  clusters before acquiring maps, allocating TMEM, or entering role-specific
+  barrier protocols. Use the cluster-uniform
   `exit_if_dead_thd_cluster` helper; a role-local exit can strand barrier peers.
+- Under programmatic dependent launch, wait for setup before the dead-unit
+  check reads its metadata. Uniform CTA/cluster-local initialization may
+  overlap setup if all roles finish it before the exit and it owns no TMEM
+  or tensor maps. The SM107 paged physical-origin replay tests cover this order.
 - Exercise overlaunch without total-length hints and replay after changing
   all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
   live-row numerical comparisons do not cover the dead-unit path.
 
+- Physical-origin Stats and other raw per-row scalar loads need their own live-unit
+  guard if dead units remain in the barrier protocol. Clamping to the last batch
+  is not sufficient: its final sequence can be empty with its origin at capacity.
+  A zero numerical contribution does not make an out-of-range read safe.
+  Run `test_empty_final_origin_stats_guard` under initcheck with a retained,
+  uninitialized backing guard; initialized-guard and interior-origin controls
+  distinguish this read from unrelated uninitialized accesses.
+
+**Rule S12 — Placement grows by measured table entries, not by new hand-written boxes.**
+
+- `cudnn/sdpa/placement_table.py` answers first in both `fwd/placement.place` and `bwd/heuristics._leads`. Its entries are
+  generated by `benchmark/placement_gen/gen.py` from a frozen sweep and qualified on a frozen holdout. Never edit
+  `TABLE` by hand; regenerate it and cite the study in the entry.
+- A new FROST-vs-backend boundary first tries a study: a class key read off graph facts and, per class, one monotone
+  threshold on whichever `placement_table.FEATURES` scalar (cost proxy, parallel tiles, query rows, KV per request, query tokens per request) fits the training grid best,
+  qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
+  non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
+- A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
+- A refinement can be local to the affected row and part. Keep existing keys for unrelated studies; an unqualified
+  new class gets no entry and retains its prior default route. Check both sides of the first placement-tile boundary
+  and retain long off-tile controls (`test_sm120_short_square_class_keeps_default_and_long_square_leads`).
+- Test study ownership through `class_key` and the matched entry's `study`, not a global absence of entries for another
+  measured class. Square causal masks canonicalize to bottom-right; use unequal Q/KV lengths to test the top-left class.
+  Re-run placement-table tests on the actual develop integration when another study lands in the same table.
+- Native default-placement qualification under `test/python/sdpa/frost` must explicitly unset
+  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` in the test body: the directory's autouse fixture enables it and ranks FROST
+  first even when a measured entry is removed. Record the actual default and candidate plan identities before timing;
+  a forced-FROST baseline cannot qualify automatic placement. `test_sdpa_fwd_placement.py` demonstrates unsetting the flag.
+- An entry answers for its whole class, so the grid must reach the class's extremes and straddle every boundary. Three
+  misses each found in review or on a holdout:
+  - an `always` fitted on long prefills that also claimed q = KV = 16 (FROST 2x slower there);
+  - a threshold placed midway across an unmeasured 32-64 tile gap;
+  - a power-of-two head grid that never saw the unpacked GQA regime (d512 decode at G = 12-96, 5-21x slower).
+
+  Draw holdouts OFF the training lattice (odd head counts, batches, off-tile lengths), and add a key field only when it
+  follows the kernel (`_unpacked_decode` reads the row's own pack decision).
+- A new FROST capability that changes a class's plan (e.g. the SM100 packed split) makes that class's entries stale where
+  the plan changed. Key the new regime from the row's own decision (`gqa_split`) and fit it; keep an older study's
+  entries for the unchanged regime instead of refitting it over a narrower grid than that study measured.
+- When ownership moves to explicit implementation rows, look up their measured
+  entries before a legacy-name fallback. An inherited study must retain its
+  original pack/split classification even when the old engine no longer admits
+  that shape. `test_sdpa_fwd_d256_implementation_contract.py` checks both actual-name
+  verdicts and the paged packed-split classification with real pool strides.
+
+
+**Rule S13 — Register redistribution must converge at warpgroup scope.**
+
+All four warps in a warpgroup must execute the same `setmaxnreg` instruction.
+Put a shared service-role register release before branching into individual
+MMA, load, store and scheduler warps; calling the same helper separately from
+those branches emits distinct instructions and violates the PTX contract.
+An increase in one warpgroup may wait for registers released by another, so
+keep the original register budget and ensure every releasing warp can reach it.
+
+Detector: inspect generated PTX/SASS around the kernel's role dispatch. The
+service warpgroup must reach one common `setmaxnreg.dec` / `USETMAXREG.DEALLOC`
+site before splitting into roles. Separate sites reached by individual warps
+are invalid even when their immediate register counts match. Repeated CUDA
+Graph replay and sanitizer checks are also required; a single launch cannot
+establish liveness. See the [PTX setmaxnreg contract](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg).
+
+`test_sdpa_fp8_sm107.py::TestNativeHalfRegisterRelease` cross-compiles the
+D32/D64/D128 half body, including packed Stats and three softmax warpgroups,
+and counts the two common release sites (correction and service groups).
+The selected SM107 CI entry collects these checks; they also cross-compile
+from other architectures when the installed tools support the target.
+
+`TestServiceRegisterRelease` in the selected SM100 and SM107 entry files
+also compiles every remaining half, FP8 and MXFP8 service-role template.
+It checks each generated PTX entry for a common service release before the
+role-local acquisitions, accounting separately for the correction group
+(which can share the same budget). Dense D512 is included; previously only
+its paged specialization converged. D512 MXFP8 emits separate V-half entries.
+These compile checks do not establish native execution or performance on
+the target architecture; retain numerical, replay and sanitizer coverage.
+Instruction counts alone cannot establish participation. Trace the emitted
+release guard's operand back to `tid.x` and check every service lane; a
+single-warp guard leaves the release count unchanged. The SM100 D128 FP8
+compile test also rejects a private single-warp-guard control without launching it.
+Identify expected entries by the template's named `cudnn_kernel__kernel_`
+symbol, independently of register instructions; reset/unscale helper entries
+do not redistribute registers. Check both SM100 D512 MXFP8 V-half entries,
+including negative controls that remove all redistribution from either half.
+
+
+**Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
+
+An empty tile can skip memory transfers and arithmetic, but its output path
+must still wait until the loader has observed the buffer's empty phase.
+Otherwise zero-output completion can release the buffer before the loader's
+initial wait, making that parity wait target the next cycle forever.
+For D192 accumulation, publish zero-byte K/V full arrivals for empty tiles and
+consume those phases on every tile before signaling output completion.
+
+Detector: `test_d192_causal_empty_kv_tiles` repeatedly replays a causal graph
+whose KV extent exceeds Q. Packed kernels also need declared-envelope tails
+and live/empty transitions; a sanitizer pass or a single launch does not
+establish liveness.
+
+
+**Rule S15 — A scheduler payload, a statistics word and a mailbox slot are consumed before their slot credit (package Rule 11).**
+
+Every role that reads a slot another role refills — the scheduler response
+and its predecoded fields, the per-tile softmax statistics and the alpha
+transfer slot, a cross-CTA mailbox — returns the slot with every word it
+loaded, through `tile_dsl.consume`, or names in the kernel's barrier table
+which other ordering of Rule 11 the site relies on. `read_clc_payload` keeps
+its cross-proxy fence. Between the last load and the release, that fence is
+measured to order a read against async-proxy refills (a TMA load, a bulk
+copy). The cluster launch-control response is a write of that kind; it was
+not measured separately, and none of this is proven (Rule 11).
+It does not order a slot that ordinary stores refill (a single-CTA persistent
+scheduler, a statistics slot written by the softmax warps). Reading through
+lane zero and broadcasting, as the single-CTA path does, stops other lanes
+from holding their own loads; it does not order lane zero's load before the
+credit. A compare, a vote or a shuffle written between the load and the
+credit is not an ordering either: the compiler can place such a use behind
+the credit.
+
+The rule applies to new and changed credit sites; existing sites move onto
+the helper in follow-up changes. A slot credit that has not moved keeps its
+release arrive, fence or named barrier: none of them is the ordering Rule 11
+asks for, and removing one changes the timing of an unordered site.
+
+Detector: per rendering, the disassembly reading of Rule 11 for the slot's
+loads, and `warm_stress.assert_release_dependence` on the PTX once the site
+uses the helper; at run time `warm_stress.assert_warm_stress` on a shape with
+several KV tiles per Q tile (the slot must be refilled inside the launch; a
+one-tile or top-k-1 shape cannot fail).
+
+
+An elected slot release must join every reader warp first. D512 role-split
+correction reads the final sum/max with four warps but returns one Stats
+credit. Put a post-load async-proxy fence in every reader before their group
+barrier, then release the slot; the next fill is a cross-CTA bulk copy.
+`TestD512PhysicalOrigins.test_stats_slot_waits_for_all_warps` delays the
+nonleader readers in a private template and forces one persistent cluster.
+It fails numerically with the old elected-only release and retains changed
+bindings, batch invariance and live/empty capture replay. Racecheck can report
+zero hazards while these numerical checks fail.
+
+**Rule S16 — TMEM deallocation joins every reader warp.**
+
+A single elected release credit cannot stand in for multiple independent
+TMEM readers. Each reader must complete its `tcgen05.wait::ld`, and the
+release must join all readers before allowing the MMA pair to deallocate.
+The D512 role-split half and FP8 bodies use a non-aligned, 128-thread named
+barrier before their elected local and peer credits. Each MMA warp's barrier
+counts both credits, so neither starts deallocation before both reader groups
+finish. A peer-only credit leaves the issuing CTA's readers unguarded. Keep
+this terminal join outside the persistent loop.
+
+Freed TMEM can retain readable bytes, so a numerical pass alone does not
+verify its lifetime. `TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers`
+delays one output warp and records final-load/deallocation event order in
+a temporary template, using synthetic inputs. Its old-kernel control fails
+for BF16, E4M3 and E5M2 even when output values remain correct. The test
+checks event order, not a hardware-dependent duration threshold. Delay only
+the even CTA and only the odd CTA as well as both: symmetric delays can hide
+a missing local completion credit. Check both CTAs' final loads against each
+deallocation; the 2x2 body's local-plus-peer protocol is the existing control.
+
+
+**Rule S17 — Keep additive logits in range before softmax.**
+
+A representable attention scale and finite bias must not overflow merely from
+an algebraic rewrite. Folding `bias / scale` into unscaled QK overflows at
+`scale = 1e-38` with ordinary finite bias; pre-converting a large scale or row
+max to base 2 can also overflow while the natural-unit logits are finite.
+Form `scale * QK + bias` in natural units, subtract the row max before base-2
+conversion, and retain that natural-unit max for LSE (or explicitly bound and
+decline an unsafe numerical domain). Preserve the bias-free specialization.
+An all-`-inf` attention row with an `-inf` sink has zero mass (O = 0,
+LSE = -inf); a `+inf` sink dominates finite attention logits (O = 0,
+LSE = +inf). Handle these endpoints before an `inf - inf` exponent.
+Detector: `test_frost_sdpa_bias_sm120.py` checks negative/tiny/large scales,
+finite `±3e38` bias, all-`-inf` rows and sink endpoints through graph and
+standalone execution and changed-input replay.
+
+Bias arithmetic also changes when the compiler consumes the K/V MMA results.
+Keep the result-dependent shared stores ahead of both named stage credits
+(`store_consumed_result`, package Rule 11), including dense bias, not only
+paged half-storage. Short replay and batch-isolation checks missed a byte
+drift reproduced by `test_frost_sdpa_bias_sm120_stress.py` within 13/55 warm
+launches on SM120. The same-input develop no-bias control passed; enabling
+the existing consumption stores fixed the bias stress. Inspect the compiled
+load/MMA/result-store/release order and retain the refilling warm stress.
+
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
-Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
-(`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/bprop_d512_f16_2x2.py` (`config_sm100.CfgBwdD512x2`,
-`TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
+Kernels on this atom: forward `fwd/kernels/sm100/d512_f16_2x2/kernel.py` + `fwd/kernels/sm107/d512_f16_2x2/kernel.py`
+(`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/d512_f16_2x2/kernel.py` (`config_sm100.CfgBwdD512x2`,
+`TemplateParams2x2`), backward d256 `bwd/kernels/sm100/d256_f16_2x2/kernel.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
 `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
 
@@ -436,6 +842,13 @@ Keep physical per-port origins separate from compact workspace prefixes and
 retain barrier arrivals for dead work while suppressing its output stores.
 `test_sdpa_bwd_thd_d256_sm100.py::test_origins_rebind_and_replay` checks this
 with poisoned scratch, one-sided empties and changed device metadata.
+
+The loader must follow a lookahead consumer's operand order. In the D192
+backward body, waiting for dO_dV(i)'s slot before loading Q(i+1) delays the
+MMA's next score even with extra Q buffers. Preload Q0, then issue dO(i),
+Q(i+1), dO_dV(i); guard the empty prologue and final prefetch and advance the
+Q ring once per actual tile. The D192 dense/THD replay suites and D256
+`test_mma_order_arms_match_the_fp64_reference` exercise both issue orders.
 
 Shared protocol (both passes):
 
@@ -586,7 +999,7 @@ Backward (d512 stage 2):
 - **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
   CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
   rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
-  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  (`bwd/kernels/sm107/d512_f16_2x2/kernel.py`, parent `sm100/`) differs from its
   parent in a handful of code lines (the ring-arm default record, the
   hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
   fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
@@ -791,6 +1204,18 @@ replay after previously active rows become fully masked. The detector is
 
 ## Adapter declines that other suites pin
 
+For SM80 native admission, distinguish stepped dense axes from packed THD
+addressing: THD never reads the declared batch stride. A shared dense-layout
+predicate can silently select staging for an otherwise valid packed graph.
+Keep per-port graph/standalone rejection checks and legal gapped THD controls
+in `test_sdpa_native_admission_sm80.py`, plus actual launch-count/replay checks.
+Keep declaration-only validators in `native_sm80.py`, outside prepared launch
+modules: the latter depend back on adapter helpers and can introduce import
+cycles when called by `check_support()`. After removing a supported route,
+remove its unreachable test branches and name the retained decline/replay
+cases for the contract they actually assert.
+
+
 `gated_attention_block` runs the SDPA forward adapter as its attention stage, and
 its tests pin the adapter's declines by message (`match="multiple of 128"`).
 Those tests run only on the `oss` CI lanes (`python/*/cutedsl`, SM107). A change
@@ -801,6 +1226,35 @@ for the old message.
 
 
 ## Prepared THD launch bounds and setup
+
+A single-sequence setup specialization must check the invocation's runtime
+batch. A declared batch capacity can exceed the invocation (FlashInfer uses
+4096), so do not gate this runtime optimization on a one-sequence declaration.
+Each independent descriptor writer must read its own lengths and physical
+origin; removing barriers while retaining cross-warp metadata reads is unsafe.
+`test_single_sequence_runtime_batch_guard` runs four sequences, with changing
+offsets and empty replay, to exercise the generic branch.
+`test_single_sequence_batch_bytes` reuses one capacity-4096 plan across
+B1/B3/B5/B129 and back to B1 through public shape overrides. The paired physical-origin tests cover both offset integer widths and
+changed token strides. Preserve the ordinary setup for PDL releases and compact
+single-map consumers unless those contracts are independently qualified.
+
+Optional TMA descriptors at a kernel boundary must retain their grid-constant
+ABI: use `Optional[cutlass.GridConstant[TensorMap]]` when a specialization
+passes `None`. Removing the annotation can let the paged specialization pass
+while the dense TMA path traps with an illegal instruction. Run the existing
+`test_sm120_prepared_rebind_strides_and_storage` dense control alongside
+`test_sdpa_fwd_paged_sm120.py` whenever changing this boundary.
+
+Compiled host defaults must be serializable by `compiled_cache._json_plain`.
+A tuple default such as `table_strides=(0, 0)` silently prevents artifact
+persistence, even when normal execution passes. Use `None` for optional runtime
+metadata defaults and supply the actual tuple through the binder. Run
+`test_f16_host_entries_carry_only_record_reproducible_defaults` and the affected
+flavor's `TestNativeHalfStrides::test_artifact_reload`. D256 also needs
+`test_prefill_artifact_reload`: the short-Q fixture selects the separate decode
+host. The prefill test asserts its actual module; both tests forbid JIT in the
+second process and check output after replay.
 
 Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
 per-port dtype tuple in the prepared artifact key, alongside origin strides and
@@ -921,8 +1375,8 @@ the Rule 1-2 pin for this chain).
 
 Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
 on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
-`sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
-`kernels/thd_helpers.py` or `kernels/bprop_chain_common.py` does not move the
+`sm` -- an edit confined to `bwd/kernels/sm100/prepared_host.py`,
+`bwd/kernels/thd_helpers.py` or `bwd/kernels/bprop_chain_common.py` does not move the
 key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
 testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
 confirm the key moved (the detector pair above fails on the stale host).
@@ -1175,7 +1629,8 @@ heuristics made before it, and the public knob record's round trip through
 with its margin and its process's node class, clock and control pair -- never a
 default flip from one cell. The per-rendering constants were re-measured on the
 new renderings: see the module constants' comments in
-`kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+`fwd/kernels/sm107/d128_f16_multi_q/kernel.py` and `fwd/kernels/sm107/small_f16_batch_pair/kernel.py`
+for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 
@@ -1195,6 +1650,12 @@ Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
 the original response before returning a slot credit. A vector response read
 alone leaves scalar field loads racing with the next local publication; the
 D256 multiwave racecheck catches the output-store warp reading a reused slot.
+The D256/D512 MXFP8 custom schedulers also publish single-CTA payloads
+locally. D256 uses the same field broadcasts with elected warp credits;
+D512 retains per-lane credits and the matching 32-times arrival count.
+Their compact THD multi-unit cases and
+`test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins` cover both the existing
+compact contract and independent data origins under memcheck/racecheck.
 
 The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
 publication and reuse, with matching barrier counts. Keep elected warp
@@ -1214,6 +1675,16 @@ including when a sink dominates the row. Mask its partial O by the computed
 weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contamination.
 `test_packed_prefetch_excludes_zero_weight_partials` compares explicit reducer
 specializations with FP64, including sink-dominated rows and changed-total replay.
+`test_quantized_sink_combine_excludes_zero_weight_payload` covers the dense
+quantized small/serial reductions with NaN and both infinite payloads.
+The grid reducer must also discard zero-weight chain accumulators and old
+round accumulators when their rescaling factor underflows. The architecture
+entries' `TestSplitCombineZeroWeight` covers local, inter-chain and next-round
+underflow (16/32/129 splits), plus unchanged goldens and changed-input replay.
+After changing a weight predicate, inspect generated load placement and run
+finite-input A/B/A: testing the selected weight directly can delay the grid's
+prefetched partial-O reads. Retaining the original live predicate and testing
+the unselected exponential preserves the same mask without that dependency.
 
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by
@@ -1249,6 +1720,69 @@ logical scale and reject a runtime sign change. Zero is a logical zero scale,
 not a request to reuse the plan's scale. `test_graph_thd_nonpositive_scale_and_replay`
 checks zero/negative scales, keyless rows and changed-V replay.
 
+
+A paged producer that zero-fills invalid rows must not also run legacy
+compute-warp tail sanitation. Multiple compute warps can then overwrite V
+while another warp reads it through `ldmatrix`, even when the stores repeat
+zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
+and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
+For dense runtime lengths and THD, give one warp ownership of that zero fill
+and synchronize all consuming warps before PV. The wide-head THD cases in
+`test_sdpa_fwd_d576_sm120.py` and the small/D256 cases in
+`test_sdpa_fwd_thd_origins_sm120.py` detect this write/read race under racecheck.
+For per-thread `cp.async` production, use an async-tracked mbarrier arrival
+(`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
+rather than publishing those copies with an ordinary mbarrier arrival. The
+qualified SM120 prefill loader retains producer-local commit/wait-group completion
+by default: removing both K and V drains passed numerics but failed racecheck.
+Paged half prefill has a K-only exception in `sm120/f16_general/kernel.py`: separate,
+16-byte-aligned static completion barriers retain commit and tracked arrivals,
+while the V producer drain retires both copy groups. Each compute lane stores
+a value dependent on every QK/PV result fragment before its named K/V reuse
+arrival; inspect the compiled load-use/store/release ordering (package Rule 11).
+The native paged rebind, vector-loop warm/determinism and D512 control cases
+cover this protocol. Removing the V drain still fails native racecheck even
+with ordered consumer releases; keep it unless a new protocol is qualified.
+Paged half decode has a separately qualified exception: `decode_f16.py` allocates
+its full completion barriers with `cute.arch.alloc_smem`, separately from the
+dynamic K/V ring. It retains commit and async-tracked arrivals while omitting
+the producer wait; consumer full waits and empty-barrier ring credits still
+order publication and reuse. `test_dsl_sm120_paged_decode_async_warm` covers
+FP16/BF16 warm and poisoned replay with repeated slot reuse; the native paged
+rebind and decode-ring tests cover sanitizer/capture behavior. Keep this
+exception confined to that allocation and protocol; prefill's exception remains
+K-only, with the V drain and result-dependent release stores described above.
+For a persistent CTA that reinitializes its K/V barriers between work units,
+keep the same producer arrival count at initial launch and every rearm. D512
+paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
+one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
+two CTAs so even compact tests exercise repeated unit transitions.
+An async-copy completion does not substitute for ownership synchronization
+of other shared buffers. The wide-head warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on every loader path,
+including dense and THD TMA. Their K/V handoff does not release score reads.
+`test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
+read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+`test_d576_dense_features[dims0-plain-dtype1]` and the D576 THD cases detect
+the same reuse hazard with TMA. Keep those separate from old-tool RAW reports:
+on SM121, sanitizer2025.3.1 also flags the already synchronized paged exchange;
+the identical cached binary is clean with sanitizer2026.3.0. Confirm active
+instrumentation before interpreting a newer-tool run as a pass.
+The quantized siblings need the same ownership rules: FP8/MXFP8 V-tail
+zeroing has one compute-warp owner, wide-head score exchange has a post-read
+pair barrier, and the MXFP8 D512 K-scale producer drains its copy group
+before arrival. Run `test_sdpa_fp8_v_tail_sync_sm120.py` together with the
+existing FP8/MXFP8 multi-tile THD cases under racecheck; the short tail test
+alone does not exercise score-buffer reuse.
+The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
+it publishes those stores with release arrivals, while uniform half retains
+copy-tracked arrivals. Do not select the publication operation by the output
+MMA type: it must follow the producer's actual storage operation. The exhaustive
+`test_sm120_mixed_paged_conversion_all_encodings` also checks the supported
+compiler floor; a direct packed BF16 conversion can require a newer PTX ISA
+than the installed DSL compiler even when the GPU supports the operation.
+See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+and run the native paging racecheck as well as memcheck and numerical replay.
 
 Paged pool layout is per operand. A logical `(pages, heads, page_size, dim)`
 shape does not imply physical HND storage; singleton head axes can make two
@@ -1289,3 +1823,134 @@ sink. An empty softmax's reset max is a sentinel, not a real score: folding
 sink-only result explicitly and retain the later padded-Q trim override.
 Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
 `test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.
+
+
+A shared GMEM operand can need different SMEM swizzles for its MMA consumers.
+In native FP8 D192x128 backward, the nontransposed dP contraction reads dO/V
+with 128-byte atoms, while transposed dV reads 64 value columns per CTA with
+64-byte atoms. Keep each TMA map, SMEM descriptor and MMA instruction walker
+consistent; V's descriptor stride follows V, not Q/K. The host detector
+`test_fp8_tma_layout_matches_each_mma_consumer` compares config values against
+`MmaDesc`'s independently derived contraction/transpose geometry. Whole-backward
+native numerical and replay tests remain necessary; compilation alone misses
+these wrong-address walks.
+
+Physical THD origin forwarding must cover every admitted CGA, including unsplit
+nonpaged paths. A CGA2 replay does not validate CGA1 lowering: the kernel can
+accept the plan while missing origin specs silently select compact prefixes.
+`TestMixedFp8Kv.test_thd_cga1_origins` pins CGA1 for uniform and mixed KV, asserts
+prepared origin specs before launch, and checks gapped inputs/output canaries
+under changed bindings and retained replay.
+
+An explicit tile-domain extension must not silently enroll another dtype in
+a measured default picker. Rubin's `tile_ns_by_d_shape` also feeds the
+half-precision resident-arm selector; explicit-only per-tensor widths belong
+in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
+`test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
+first-half tails as well as tile multiples, while admitting an explicit N64.
+
+Shared kernel geometry constants must live below the heuristics/adapter layer.
+Importing heuristics from split-combine creates a cycle when an adapter imports
+that reducer. Re-export shared constants from heuristics when callers already
+use those names, preserving their values and policy. The cold-interpreter
+`test_split_combine_import_without_heuristics` blocks heuristics imports while
+loading both the reducer and SM80 prepared host; a warmed test process can hide
+this dependency.
+
+Test launch recorders retained by a native binder must not capture the owning
+API or prepared spec. That reference cycle can cross a non-GC nanobind object
+and survive Python collection. Capture the immutable stride/index metadata
+and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
+reproduced eighteen binder leaks before this correction and runs cleanly
+afterwards; keep the pointer/stride assertions and inspect process shutdown.
+
+A smaller backward KV tile also narrows the transposed dS shared-memory row.
+Select its swizzle from that row's byte width on both stores and ldmatrix loads:
+a 32-column half row requires 64-byte swizzling. Keeping the old 128-byte
+swizzle can cross row boundaries even when the total allocation fits. The
+D256 cases in `test_sdpa_bwd_thd_sm120_gqa.py` exercise the native 32x32 tile
+with independent origins, GQA reduction, tails and bottom-right quiet rows.
+
+A backward gradient-column partition multiplies the physical CTA grid, not the
+logical KV tile count. Both reverse scheduling and the deterministic relay's
+last KV visitor must divide out that partition factor; counters and workspace
+must include the partition and actual Q tile. The dense deterministic cases in
+`test_sdpa_bwd_sm120_wide.py` catch a relay that otherwise waits forever for a
+nonexistent predecessor, while THD's length-derived count alone cannot catch it.
+
+
+FP8 `mma.sync` A/B operands must be registers, including compile-time-dead
+head or sequence tails. A DSL inline-PTX input can fold to literal `0` even
+when its Python type is `Int32`; ptxas rejects `mma ... {0,0}`. Keep the zero
+opaque through a register `mov`, as `_zero_word` in SM120 FP8 backward does.
+The small SQ19/SKV37/D64 case in `test_sdpa_bwd_fp8_sm120.py` reaches both
+fully dead score columns and gradient columns; retain the failing PTX when
+diagnosing this so register-type guesses do not replace the actual operand.
+
+When two warps split a head dimension, each half must contain whole shared-memory
+swizzle chunks. A swizzle that divides the full head can still straddle the warp
+boundary (D576 has 288 columns per half). Check every aliased storage phase too:
+wide Q staging and the O epilogue can exceed different slabs even when the main
+K/V allocation fits. `test_sdpa_fwd_d576_sm120.py` exercises asymmetric envelopes,
+partial packing and persistent reuse. Keep native binder dimension admission in
+sync with the Python row and adapter, and gate new envelopes on the matching
+extension; a host eligibility pass alone does not exercise binder construction.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.
+
+
+When splitting a broad engine into explicit implementations, preserve each
+capability subdomain rather than filling every shape list with the new exact
+width. In particular, paged packed-split support does not imply nonpaged THD
+PackGQA support; `test_d256_thd_split_explicit_contract` detects that expansion.
+Compare canonical compiled geometry when old public knobs were ignored.
+`test_explicit_d256_body_does_not_reselect_for_query_extent` exports the public
+engine/knob record into a fresh graph, checks the actual body/tile/CGA and
+replays changed inputs under CUDA Graph capture.
+
+Backward rows delegate by selected body, not by exact head pair: their head
+dims are a set plus an envelope, so exact pairs would leave every padded width
+on the row. The row declares `select_implementation` (the same function its
+lowering dispatches on) and `delegated`. Owners come from `explicit_engine`,
+which keeps the row's contract and its name as `policy`. Heuristics and
+`placement_table` read row-keyed decisions through `policy_name`. When one
+graph admits two bodies (a knob choice on the same facts), return a tuple of
+legal bodies, default first, so that each owner's explicit record stays
+valid. If a row restates an adapter's own body test on facts, test the two
+against each other. Detectors: `test_sdpa_bwd_explicit_engines.py` covers the
+partition, legal-tuple ranking, identities and
+`test_sm80_selector_is_the_adapters_d64_rule`.
+
+When deriving an architecture row with `replace(parent.capabilities)`, rebind
+its implementation selector and delegation to the new architecture's owners.
+Copying a fully delegated parent can make every child declaration decline even
+when its adapter supports the device. Reuse the pure body-selection predicate,
+map its results to the new fixed owner names, and retain the placement policy.
+The SM89 `test_default_plan_order` and `test_fixed_d64_owner_rebind_replay`
+checks detect this lost admission and exercise both retained bodies on-device.
+
+Moving a body into its implementation directory changes what a relative import
+resolves against (after #2617 moved the D256 MXFP8 bodies into
+`sm100/d256_mxfp8/`, their `from . import _bprop_mxfp8_masks` looked in the new
+package instead of `sm100/`). An AST comparison of the moved file passes, and
+host suites never import template bodies, so import every moved module
+(`importlib.import_module`) before the GPU run. After delegating a row, diff
+failing test ids across every file under `test/python/sdpa` against the parent:
+row-name pins in band, admission and GPU suites do not match a `*bwd*` glob.
+
+After moving a body, search both its retired path and its basename across
+`docs`, `python` and `test` (for example, `git grep -n retired_kernel.py --
+docs python test`). Operation pages may spell the filename differently from
+loader constants, so a loader-only replacement can miss a current reference.
+Update current documentation; preserve frozen historical tracker entries and
+existing diagnostic labels.

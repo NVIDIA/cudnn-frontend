@@ -9,6 +9,7 @@ module.
 """
 
 from cudnn._cutlass_compat import SmemAllocator, TmemAllocator, get_num_tmem_alloc_cols, get_smem_capacity_in_bytes
+from cudnn.frost.device import device_context
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal, Optional, Tuple, Type, Union
@@ -39,6 +40,7 @@ from cutlass.cutlass_dsl import if_generate as _if_generate
 from cutlass._mlir.dialects import nvvm
 
 from .epilogue import get_epilogue_op
+from .._cutedsl import build_target
 from ..tile_config import ConvTileConfig, _get_config
 
 
@@ -3620,11 +3622,14 @@ def _compile_cached(
     *,
     tile_config: ConvTileConfig,
     epilogue_attrs: tuple[tuple[str, float], ...] = (),
+    device: int = 0,
+    gpu_arch: str = "sm_100a",
 ):  # noqa: A001
     """Compile an SM100 NVFP4 convolution from plan-time graph metadata.
 
-    The input/filter/output shapes and resolved tile configuration form the
-    cache key. Padding, stride, and dilation remain runtime launch arguments;
+    The input/filter/output shapes, the resolved tile configuration and the
+    build device with its target (``_cutedsl.build_target``) form the cache
+    key. Padding, stride, and dilation remain runtime launch arguments;
     configurations producing the same tensor shapes share one artifact.
     Aligned fake tensors define the TVM-FFI launch ABI, so compilation never
     depends on runtime tensor objects or pointers. A/B are fixed to packed FP4
@@ -3700,37 +3705,38 @@ def _compile_cached(
         swizzle_size=_SWIZZLE_SIZE,
         raster_along=_RASTER_ALONG,
     )
-    return cute.compile(
-        conv_op,
-        fake_a,
-        fake_b,
-        fake_d,
-        fake_sfa,
-        fake_sfb,
-        cutlass.Float32(1.0),
-        epilogue_op,
-        fake_sfd,
-        cutlass.Float32(1.0),
-        None,
-        None,
-        0.0,
-        # Representative values establish only the runtime Int32 ABI. The
-        # compiled callable rebinds the graph's actual geometry at launch.
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        make_fake_stream(),
-        options="--enable-tvm-ffi",
-    )
+    with device_context(device):
+        return cute.compile(
+            conv_op,
+            fake_a,
+            fake_b,
+            fake_d,
+            fake_sfa,
+            fake_sfb,
+            cutlass.Float32(1.0),
+            epilogue_op,
+            fake_sfd,
+            cutlass.Float32(1.0),
+            None,
+            None,
+            0.0,
+            # Representative values establish only the runtime Int32 ABI. The
+            # compiled callable rebinds the graph's actual geometry at launch.
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            make_fake_stream(),
+            options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+        )
 
 
 def compile(
@@ -3768,6 +3774,7 @@ def compile(
     else:
         _validate_block_scale_config(tile_config, c)
 
+    device, gpu_arch = build_target()
     return _compile_cached(
         ncdhw,
         ktrs,
@@ -3776,6 +3783,8 @@ def compile(
         d_dtype,
         tile_config=tile_config,
         epilogue_attrs=epilogue_attrs,
+        device=device,
+        gpu_arch=gpu_arch,
     )
 
 

@@ -384,6 +384,10 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
         return 1
+    reason = bu.frost_gemm_unsupported_reason()
+    if reason is not None:
+        print(reason)
+        return 1
 
     parts = [int(x) for x in args.shape.split(",")]
     if len(parts) != 4:

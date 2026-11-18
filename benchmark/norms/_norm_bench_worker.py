@@ -93,6 +93,22 @@ def run_frost(a):
     return fwd_ms, bwd_ms, fwd_maxabs, bwd_maxabs
 
 
+def _deselect_frost_norm(graph):
+    """The `cudnn` worker measures the native backend. The FROST norm engines are default candidates on the parts they serve
+    (cc 10.0 / 10.3; cc 9.0 behind the opt-in), so bar both families by name and the walk settles on a backend plan, as
+    benchmark_single_sdpa.py does for FROST SDPA on its backend leg."""
+    from cudnn.engines.manifest import MANIFEST
+
+    graph.deselect_engines([name for fam in MANIFEST if fam.name in ("frost_norm_fwd", "frost_norm_bwd") for name in fam.slots])
+
+
+def _plan_name(graph) -> str:
+    try:
+        return graph.get_plan_name_at_index(graph._plan_index)
+    except Exception:
+        return "unknown"
+
+
 def run_cudnn(a):
     import torch
     import cudnn
@@ -124,6 +140,7 @@ def run_cudnn(a):
         MEAN.set_output(True).set_data_type(torch.float32)
     gf.validate()
     gf.build_operation_graph()
+    _deselect_frost_norm(gf)
     gf.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     gf.check_support()
     gf.build_plans()
@@ -158,6 +175,7 @@ def run_cudnn(a):
         DB.set_output(True).set_data_type(dt)
     gb.validate()
     gb.build_operation_graph()
+    _deselect_frost_norm(gb)
     gb.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     gb.check_support()
     gb.build_plans()
@@ -180,6 +198,7 @@ def run_cudnn(a):
 
     fwd_ms = _median_ms(lambda: gf.execute(vpf, ws), a.iters, a.warmup, l2)
     bwd_ms = _median_ms(lambda: gb.execute(vpb, ws), a.iters, a.warmup, l2)
+    print(f"PLANS fwd={_plan_name(gf)} bwd={_plan_name(gb)}")
     return fwd_ms, bwd_ms, -1.0, -1.0  # correctness checked in the frost worker
 
 

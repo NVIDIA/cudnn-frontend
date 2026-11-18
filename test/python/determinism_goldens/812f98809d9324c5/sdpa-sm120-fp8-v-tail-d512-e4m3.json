@@ -1,0 +1,141 @@
+{
+  "inputs": {
+    "dk": {
+      "dtype": "torch.float32",
+      "sha256": "4abeb7e04407af6d4256f29b91c71479bd701e60ee7468c778f55b1df0247dc7",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "dq": {
+      "dtype": "torch.float32",
+      "sha256": "4abeb7e04407af6d4256f29b91c71479bd701e60ee7468c778f55b1df0247dc7",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "ds": {
+      "dtype": "torch.float32",
+      "sha256": "4abeb7e04407af6d4256f29b91c71479bd701e60ee7468c778f55b1df0247dc7",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "dv": {
+      "dtype": "torch.float32",
+      "sha256": "4abeb7e04407af6d4256f29b91c71479bd701e60ee7468c778f55b1df0247dc7",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "k": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "6a27afa23bbe1866402a1e6523c66fc333ff4b4c26d7802fa8cc739f60b0796c",
+      "shape": [
+        1,
+        2,
+        80,
+        512
+      ]
+    },
+    "q": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "555b341a0e79b0c5b594a696c873e5bbdafca5083a0408f1c9d25a4dfa8ae4c7",
+      "shape": [
+        1,
+        4,
+        33,
+        512
+      ]
+    },
+    "so": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "ss": {
+      "dtype": "torch.float32",
+      "sha256": "7a851fa1703894ca74af043265c82f52e2237db147af77c83af2d23cc29ffdd7",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "3cccdacd5f5470aff09826e6f557fa8dc6f08a5863912f39543d8669dd6d7d65",
+      "shape": [
+        1,
+        2,
+        80,
+        512
+      ]
+    }
+  },
+  "outputs": {
+    "amax": {
+      "dtype": "torch.float32",
+      "sha256": "ce51706a0f16828edc5d107fdee5c1e1cd0aca741db666e9a9663e55073f1b72",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "a183095632ddf8a227976fcb490ed1e686323944328459a1c69a5b5b51056480",
+      "shape": [
+        1,
+        4,
+        33,
+        512
+      ]
+    },
+    "stats": {
+      "dtype": "torch.float32",
+      "sha256": "319f999949d18aac0e388bfd4656c94df0d9ff2872d71eed893b5b4470d5e7f6",
+      "shape": [
+        1,
+        4,
+        33,
+        1
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "sm": [
+      12,
+      0
+    ],
+    "sm_count": 188,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

@@ -37,8 +37,8 @@ from test_sdpa_fwd_decode_d256_sm107 import _DSL_FLOOR_WHY
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ARCH = "sm107" if _SM == 107 else "sm100"
-_ROW = f"sdpa_fwd_prefill_{_ARCH}"
-_ROWS = {"sdpa_fwd_prefill_sm100": (10, 0), "sdpa_fwd_prefill_sm107": (10, 7)}
+_ROW = "sdpa_fwd_sm100_d128_multi_q" if _ARCH == "sm100" else "sdpa_fwd_sm107_d128_multi_q"
+_ROWS = {"sdpa_fwd_sm100_d128_multi_q": (10, 0), "sdpa_fwd_sm107_d128_multi_q": (10, 7)}
 
 
 # --------------------------------------------------------------------------- tier 1: CPU contract
@@ -80,12 +80,17 @@ def test_rows_claim_exactly_the_wired_flavors():
     from cudnn.sdpa.fwd.config_sm107 import SM107_SCORE_STATS_SHAPES
 
     assert SM100_SCORE_STATS_SHAPES == frozenset({(128, 128)}) and SM107_SCORE_STATS_SHAPES == frozenset({(128, 128)})
-    for name, shapes in (("sdpa_fwd_prefill_sm100", SM100_SCORE_STATS_SHAPES), ("sdpa_fwd_prefill_sm107", SM107_SCORE_STATS_SHAPES)):
+    for name, shapes in (
+        ("sdpa_fwd_sm100_d128_multi_q", SM100_SCORE_STATS_SHAPES),
+        ("sdpa_fwd_prefill_sm100", SM100_SCORE_STATS_SHAPES),
+        ("sdpa_fwd_sm107_d128_multi_q", SM107_SCORE_STATS_SHAPES),
+        ("sdpa_fwd_prefill_sm107", SM107_SCORE_STATS_SHAPES),
+    ):
         caps = _caps(name)
         assert caps.score_max and caps.score_sum_exp, name
         assert caps.score_stats_d_shapes is shapes, name
     for spec in engines.ENGINE_SPECS:
-        if spec.name not in _ROWS:
+        if spec.name not in (*_ROWS, "sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107"):
             assert not spec.capabilities.score_max and not spec.capabilities.score_sum_exp, spec.name
 
 
@@ -93,7 +98,7 @@ def test_rows_claim_exactly_the_wired_flavors():
 def test_mismatch_accepts_and_rejects(row):
     """Accept: dense d128 f16, each output alone, with Stats, with base-2 Stats, without Stats.  Reject (typed reasons):
     THD, paged KV, an unwired flavor, split_kv > 1 and the cga=1 tile."""
-    if row == "sdpa_fwd_prefill_sm107" and _DSL_FLOOR_WHY:
+    if row == "sdpa_fwd_sm107_d128_multi_q" and _DSL_FLOOR_WHY:
         pytest.skip(_DSL_FLOOR_WHY)  # Rule 7: below the sm_107a DSL floor the Rubin row declines typed before any claim
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -113,21 +118,30 @@ def test_mismatch_accepts_and_rejects(row):
     assert reason(has_sink=True) is None
     assert "dense graphs only" in reason(thd=True, packed_layout=True)
     assert "paged-KV" in reason(has_paged_kv=True, padded=True, page_size=128)
-    assert "wired on the d128" in reason(d_qk=256, d_v=256)
-    if row == "sdpa_fwd_prefill_sm100":
+    d256_reason = reason(d_qk=256, d_v=256)
+    assert ("exact D32/D64/D128" if row == "sdpa_fwd_sm100_d128_multi_q" else "requires SM107 and supported half small-head graph declarations") in d256_reason
+    if row == "sdpa_fwd_sm100_d128_multi_q":
+        d256_caps = _caps("sdpa_fwd_sm100_d256_lookahead")
+        assert "score_max output, which this engine does not support" in engines.mismatch(d256_caps, _facts(device_cc=cc, d_qk=256, d_v=256))
+    if row == "sdpa_fwd_sm100_d128_multi_q":
         # The native d64 flavor is the same file at d_flavor=64 but is not validated with the outputs: not claimed.
         assert "wired on the d128" in reason(d_qk=64, d_v=64)
-        assert "wired on the d128" in reason(d_qk=24, d_v=24), "Blackwell's smallest flavor is its native d64"
+        assert "wired on the d128" in reason(d_qk=24, d_v=24)
     else:
         # RE-INVERTED 2026-10-08: on Rubin a d64 / d24 graph WITH the outputs rides the d128 envelope, i.e. the kernel that
         # carries the store, exactly as before the small head-dim tiles -- the tiles carry the dense leg only
         # (engines.Capabilities.dense_only_d_shapes), so a graph asking for the ports is selected past them.
         for d in (64, 24):
-            assert reason(d_qk=d, d_v=d) is None, (d, reason(d_qk=d, d_v=d))
-            assert engines._selected_d_shape(caps, _facts(device_cc=cc, d_qk=d, d_v=d)) == (128, 128), d
-            assert engines._selected_d_shape(caps, _facts(device_cc=cc, d_qk=d, d_v=d, has_score_max=False, has_score_sum_exp=False)) != (128, 128), d
+            # The fixed implementation also owns the existing score-store
+            # envelopes; its physical flavor still promotes these to D128.
+            owner_caps = caps
+            facts = _facts(device_cc=cc, d_qk=d, d_v=d)
+            assert engines.mismatch(owner_caps, facts) is None, (d, engines.mismatch(owner_caps, facts))
+            assert engines._selected_d_shape(owner_caps, facts) == (128, 128), d
+            assert engines._selected_d_shape(owner_caps, _facts(device_cc=cc, d_qk=d, d_v=d, has_score_max=False, has_score_sum_exp=False)) != (128, 128), d
+        assert reason(d_qk=24, d_v=24) is None
     assert "split_kv > 1" in reason(SdpaFwdKnobs(split_kv=2))
-    assert "cga" in reason(SdpaFwdKnobs(cga=1))
+    assert ("cga" if row == "sdpa_fwd_sm100_d128_multi_q" else "dense D128 CTA1 uses the shared SM100 single-Q body") in reason(SdpaFwdKnobs(cga=1))
     assert reason(SdpaFwdKnobs(cga=2, split_kv=1)) is None
     # The knob DOMAIN narrows to the prefill tile with the ports requested, so the heuristics never propose the
     # cga1 decode tile for a decode-shaped graph (S_q <= 128) and leave the row without a plan.
@@ -146,9 +160,10 @@ def test_capabilities_field_is_appended():
     from cudnn.sdpa.fwd.engines import Capabilities
 
     names = [f.name for f in fields(Capabilities)]
+    names = names[: names.index("thd_excluded_d_shapes") + 1]  # Preserve this historical segment.
     # ... the zero-scale and pre-folded-scale fields after it, then the resident-bias / kv_mask fields of the Rubin small tiles
-    # and their per-shape TILE_N domain after THOSE, then the PackGQA divisibility rule.
-    assert names[-11:] == [
+    # and their per-shape TILE_N domain after THOSE, then the PackGQA divisibility rule and per-shape THD exclusions.
+    assert names[-12:] == [
         "thd_pack_gqa_d_shapes",
         "zero_scale",
         "attn_scale_prefolded_d_shapes",
@@ -160,6 +175,7 @@ def test_capabilities_field_is_appended():
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
+        "thd_excluded_d_shapes",
     ], names[-12:]
     assert Capabilities.__dataclass_fields__["score_stats_d_shapes"].default is None
     assert Capabilities.__dataclass_fields__["dense_only_d_shapes"].default == frozenset()
@@ -168,7 +184,7 @@ def test_capabilities_field_is_appended():
 
 
 def test_adapter_signatures_append_the_score_kwargs():
-    """Public-API signatures evolve append-only: the constructor's samples and execute's tensors are the last parameters."""
+    """Public-API signatures evolve append-only: existing parameter segments retain their order."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     ctor = inspect.signature(SdpaFwdDsl.__init__).parameters
@@ -186,10 +202,13 @@ def test_adapter_signatures_append_the_score_kwargs():
         "dead_subtile_quiet",
         "bias_max_form",
         "softmax_wgs",
+        "swap_ab",
+        "causal_exclude_own_block",
     ], list(ctor)[j:]
     assert ctor["sample_score_max"].default is None and ctor["sample_score_sum_exp"].default is None
     ex = inspect.signature(SdpaFwdDslSm100.execute).parameters
-    assert list(ex)[-4:] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
+    j = list(ex).index("score_max_tensor")
+    assert list(ex)[j : j + 4] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
     assert ex["score_max_tensor"].default is None and ex["score_sum_exp_tensor"].default is None
     assert ex["bias_tensor"].default is None and ex["kv_mask_tensor"].default is None
 
@@ -732,8 +751,6 @@ def test_score_stats_graph_declines_an_unwired_flavor_and_lists_no_split_or_cga1
     softmax outputs stats alone, the pair alone, or neither) -- so a declined row leaves a servable graph behind."""
     import cudnn
 
-    from cudnn.sdpa.fwd.engines import engine_name
-
     torch.manual_seed(3)
     for d, want in ((256, False), (128, True)):
         b, h, s = 1, 4, 256
@@ -747,7 +764,7 @@ def test_score_stats_graph_declines_an_unwired_flavor_and_lists_no_split_or_cga1
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        assert offers_engine(g, engine_name(arch=_ARCH)) is want, (d, want)
+        assert offers_engine(g, _ROW) is want, (d, want)
         if want:
             names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
             ours = [g.plans[i].knobs for i, n in enumerate(names) if n == _ROW or n.startswith(_ROW + "[")]

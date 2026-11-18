@@ -25,7 +25,7 @@ def _fixture(d=128, dv=128, dtype="float8_e4m3fn", output="bfloat16", arch="sm10
     path = Path(prep.__file__).parent / "kernels"
     path = path / "sm120/prepared_host.py" if arch == "sm120" else path / "_fp8_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("fp8_host" if arch == "sm120" else "host"))
-    s.order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    s.order = [a.arg for a in host.args.args if a.annotation is None or "Constexpr" not in ast.unparse(a.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [old.get(name) for name in s.order]
     s.d_qk, s.d_v = d, dv
@@ -286,6 +286,7 @@ def test_thd_fp8_rejects_measured_empty_workspace_before_writes(ordered, native,
     assert plan._prepared.spec.native is not None and g.get_workspace_size() > 1
     if not native:
         binding_reference.use_reference(plan._prepared.spec)
+        plan._ordered_native = None  # The comparison must also bypass the retained native transport entry.
     if empty:
         vp[tensors["q"]] = bufs["q"][:0]
 

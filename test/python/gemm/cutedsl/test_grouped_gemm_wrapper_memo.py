@@ -22,7 +22,9 @@ def require_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("SM100 is required")
 
 

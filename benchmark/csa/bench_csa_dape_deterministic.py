@@ -45,6 +45,11 @@ GENERIC_SHAPES = (
     *SHAPES[:4],
 )
 
+SM90_PRIMARY_SHAPES = (
+    ("r4-c1-d128-1x8192", [8192], 128, 4, 1),
+    ("r4-c1-d128-3x8192", [8192] * 3, 128, 4, 1),
+)
+
 LONG_CONTEXT_SHAPES = (
     (
         "r4-c1-d128-packed256k-cp32-or64",
@@ -250,6 +255,11 @@ def main():
         help="Run the ratio-2/4 d128/d512 1x/3x8192 matrix (supported on SM90)",
     )
     shape_group.add_argument(
+        "--sm90-primary",
+        action="store_true",
+        help="Run ratio=4, coff=1, head_dim=128 on 1x/3x8192 THD packs",
+    )
+    shape_group.add_argument(
         "--long-context",
         action="store_true",
         help="Run the unequal packed 256K/CP32-or-64 and 1M/CP64 production shapes",
@@ -266,6 +276,8 @@ def main():
         shapes = PACKED_METADATA_SHAPES
     elif args.generic_only:
         shapes = GENERIC_SHAPES
+    elif args.sm90_primary:
+        shapes = SM90_PRIMARY_SHAPES
     else:
         shapes = SHAPES[::4] if args.quick else SHAPES
     results = [_bench_shape(*shape, args) for shape in shapes]

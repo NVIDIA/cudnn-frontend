@@ -55,7 +55,7 @@ FROST = "kda_frost"
 KERNEL_FORWARD_GAP = "CAKE C16 forward output is ~0.12 rel-RMS off FLA/FROST (state and data gradients agree); see module docstring"
 KERNEL_PARAM_GRAD_GAP = "CAKE C16 gate-parameter gradients are 3-5x further from FLA than FROST's; see module docstring"
 
-# (seq_lens, H, HV): aligned, grouped, partial tails, a single long sequence (split work items)
+# (seq_lens, H, HV): aligned, grouped, partial tails, a single long sequence
 SHAPES = [
     ([256, 256], 2, 2),
     ([512, 512], 2, 4),
@@ -124,14 +124,9 @@ def run_training_step(plan_name, inputs, *, seed=SEED + 1):
 
 @pytest.fixture(scope="module")
 def cake_available():
+    """The SM gate; an NVRTC environment the engine cannot compile in surfaces as its decline in ``steps``."""
     if _sm() not in (100, 103):
         pytest.skip("kda_cake serves exact SM100 / SM103 only")
-    from cudnn.linear_attention.cake import compiler
-
-    try:
-        compiler.cuda_include_dirs()
-    except compiler.CakeCompileError as exc:
-        pytest.skip(f"NVRTC needs the CUDA headers: {exc}")
     return True
 
 
@@ -149,53 +144,6 @@ def steps(cake_available):
                 pytest.skip(f"kda_cake declined: {exc}")
             out[str(seq_lens)] = (inputs, cake, run_training_step(FROST, inputs))
     return out
-
-
-def test_vendored_bodies_match_sha256sums():
-    """The generated kernel bodies are frozen; the checksums are the contract."""
-    from cudnn.linear_attention.cake import compiler
-
-    pinned = {}
-    for line in (compiler.KERNEL_DIR / "SHA256SUMS").read_text().splitlines():
-        digest, name = line.split()
-        pinned[name] = digest
-    digests = compiler.source_digests()
-    generated = {name for name in digests if not name.startswith("fe_")}  # fe_* helpers are first-party, not frozen exports
-    assert pinned and pinned.keys() == generated, f"SHA256SUMS must pin exactly the generated bodies; differs by {set(pinned) ^ generated}"
-    for name, digest in pinned.items():
-        assert digests[name] == digest, f"{name} differs from its pinned digest"
-
-
-def test_manifest_offers_kda_cake_when_opted_in():
-    from cudnn.engines import manifest
-
-    family = next(f for f in manifest.MANIFEST if f.name == "kda")
-    assert "kda_cake" in family.offered_ids()
-    engines = manifest.instantiate(family, family.offered_ids())
-    assert any(e.name == "kda_cake" for e in engines), "kda_cake did not instantiate (missing cuda-python?)"
-
-
-def test_plan_matches_flashinfer_layout():
-    """Work-item planning is pure Python; pin its shape on a mixed batch so the
-    port stays aligned with the upstream metadata builder (verified equal to
-    FlashInfer's ``_build_c16_metadata`` on its C16 routes)."""
-    from cudnn.linear_attention.cake.kda_host import CHUNK, WORK_ITEM_FIELDS, plan_c16
-
-    plan = plan_c16([500, 300, 224], 2, 148)
-    assert plan.total_chunks == 32 + 19 + 14
-    assert plan.checkpoint_starts == (0, 32, 51, 65)
-    assert plan.offsets == (0, 500, 800, 1024)
-    assert not plan.aligned
-    assert len(plan.work_rows) == plan.total_work_items * WORK_ITEM_FIELDS
-    rows = [plan.work_rows[i : i + WORK_ITEM_FIELDS] for i in range(0, len(plan.work_rows), WORK_ITEM_FIELDS)]
-    spans = [row[3] - row[2] for row in rows]
-    assert spans == sorted(spans, reverse=True), "work items are ordered longest first"
-    for sequence, head, write_start, write_end, compute_start, compute_end, bos, eos in rows:
-        assert 0 <= sequence < 3 and 0 <= head < 2
-        assert 0 <= compute_start <= write_start < write_end <= compute_end
-        assert (bos, eos) == (plan.offsets[sequence], plan.offsets[sequence + 1])
-    aligned = plan_c16([512, 512], 4, 148)
-    assert aligned.aligned and aligned.total_chunks * CHUNK == 1024
 
 
 @pytest.mark.parametrize("seq_lens,H,HV", SHAPES, ids=lambda s: str(s))

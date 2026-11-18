@@ -14,7 +14,7 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.pointwise import fadd2, ffma2, fmul2, fp32_to_fp16, opaque_f32_zero, sigmoid
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 
-from .steep_decay import exchange_offset, has_exact_path, row_operand_scales
+from .steep_decay import exchange_offset, STEEP_EXACT, row_operand_scales
 
 LOG2_E = 1.4426950408889634
 L2_NORM_EPS = 1.0e-6
@@ -51,7 +51,7 @@ def scan_gate_prefixes(cfg: cutlass.Constexpr, gate_raw, chunk_start, batch_seql
         for row in cutlass.range_constexpr(cfg.b_t):
             g_prefix_regs[row] = cutlass.Float32(0.0) if chunk_start + cutlass.Int32(row) >= batch_seqlen else g_prefix_regs[row]
 
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         for row in cutlass.range_constexpr(cfg.b_t):
             gate_raw[row] = g_prefix_regs[row]
 
@@ -126,8 +126,10 @@ def load_qk_beta_row(cfg: cutlass.Constexpr, sQ_ptr, sK_ptr, sBeta_ptr, row, lan
 
 
 @cute.jit
-def load_operand_scales(cfg: cutlass.Constexpr, row, lane_in_row_group, bits, exchange_ptr, log_last_ptr, with_restore: cutlass.Constexpr):
-    """Read all exchange data before the schedule can release its raw stage.
+def load_operand_scales(
+    cfg: cutlass.Constexpr, row, lane_in_row_group, bits, exchange_ptr, log_last_ptr, with_restore: cutlass.Constexpr, only_half: cutlass.Constexpr = None
+):
+    """Read the exchange data of every key half, or of ``only_half`` alone, before the schedule can release its raw stage.
 
     Backward needs decay and inverse scales only. Forward also retains the last
     factor for K restore. Exact steep channels use bounded prefix/suffix factors.
@@ -139,6 +141,8 @@ def load_operand_scales(cfg: cutlass.Constexpr, row, lane_in_row_group, bits, ex
     if cutlass.const_expr(with_restore):
         restore_regs = cutlass.Array(cutlass.Float32, width, alignment=16)
     for half in cutlass.range_constexpr(cfg.d_k // 64):
+        if cutlass.const_expr(only_half is not None and half != only_half):
+            continue
         for group in cutlass.range_constexpr(2):
             channel = half * 64 + lane_in_row_group * 8 + group * 4
             values = (exchange_ptr + exchange_offset(cfg, row, channel)).load(count=4, alignment=16)

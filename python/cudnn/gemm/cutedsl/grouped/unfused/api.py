@@ -19,6 +19,7 @@ from cudnn.tensor_adapter import (
     cuda_is_available,
     detect_framework,
     get_compute_capability,
+    has_tcgen05,
     get_data_ptr,
     get_device,
     get_shape,
@@ -245,8 +246,8 @@ def _normalize_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if compute_capability < 100:
-        raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability}")
+    if not has_tcgen05(major):
+        raise RuntimeError(f"GroupedGemmSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
     tensor_m, k = a_shape[:2]
     if tensor_m % 256 != 0:

@@ -187,13 +187,16 @@ def hadamard_transpose_out_amax(tmem_ptr, tidx, amax_fp32):
     import cutlass._mlir.dialects.math as _math
 
     for i in cutlass.range_constexpr(cute.size(rmem_dst)):
-        abs_val = cutlass.Float32(_math.absf(rmem_dst[i].ir_value()))
+        # The consumer quantizes the transformed values after rounding them to BF16
+        # (the RHT runs as a BF16 MMA there), so take the amax of the rounded values.
+        rounded = rmem_dst[i].to(cutlass.BFloat16).to(cutlass.Float32)
+        abs_val = cutlass.Float32(_math.absf(rounded.ir_value()))
         amax_fp32 = cute.arch.fmax(amax_fp32, abs_val)
     return amax_fp32
 
 
 @cute.jit
-def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Constexpr, tidx, amax_fp32):
+def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Constexpr, tidx, amax_fp32, sign_mask: cutlass.Constexpr = 0):
     token_block = tidx // HADAMARD_SIZE
     feature = (tidx % HADAMARD_SIZE) + feature_offset
     token_base = token_block * HADAMARD_SIZE
@@ -201,6 +204,10 @@ def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Cons
     rmem_vals = cute.make_rmem_tensor((HADAMARD_SIZE,), cutlass.Float32)
     for i in cutlass.range_constexpr(HADAMARD_SIZE):
         rmem_vals[i] = sD[(token_base + i, feature, d_buffer)].to(cutlass.BFloat16).to(cutlass.Float32)
+        # Randomized Hadamard transform: ``sign_mask`` bit ``i`` negates input element ``i``
+        # of each 16-token block (the convention of the consumer's RHT quantization).
+        if cutlass.const_expr(((sign_mask >> i) & 1) == 1):
+            rmem_vals[i] = -rmem_vals[i]
 
     for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 2):
         x = rmem_vals[base]
@@ -228,7 +235,11 @@ def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Cons
     import cutlass._mlir.dialects.math as _math
 
     for i in cutlass.range_constexpr(HADAMARD_SIZE):
-        abs_val = cutlass.Float32(_math.absf(rmem_vals[i].ir_value()))
+        # The consumer quantizes the transformed values after rounding them to BF16 (its
+        # RHT runs as a BF16 MMA), so take the amax of the rounded values. The 1/4
+        # normalization applied by the caller is exact and commutes with the rounding.
+        rounded = rmem_vals[i].to(cutlass.BFloat16).to(cutlass.Float32)
+        abs_val = cutlass.Float32(_math.absf(rounded.ir_value()))
         amax_fp32 = cute.arch.fmax(amax_fp32, abs_val)
     return amax_fp32
 

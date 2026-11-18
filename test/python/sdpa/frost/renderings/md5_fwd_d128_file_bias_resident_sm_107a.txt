@@ -7,6 +7,9 @@
 # config_sm107.sm107_bias_preload_chunks(CFG.TILE_N) -- 0 on this 128-wide tile (one chunk ahead of the bmm1_done wait before), which
 # moves the softmax lanes' bias-row read behind the wait and so the instruction stream of exactly these two renderings (numerics unchanged).
 # Lines: dsl=<distribution> <version>; fwd_d128_file sm_107a <arm> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
+# Re-recorded for the common service-warpgroup register release. Same-toolchain parent
+# renders reproduce all prior records under public DSL 4.8.0 / CUDA 13.4; the four
+# role-local release sites become one common site, with unchanged register budgets.
 dsl=nvidia-cutlass-dsl 4.8.0
-fwd_d128_file sm_107a d32_pair4 rc=0 cubin_md5=848fe763552fb3cff5de7246e703d1be
-fwd_d128_file sm_107a d32_pair4_mask_padded_causal rc=0 cubin_md5=b3e44ba855fd63404f23a1c9a4e77380
+fwd_d128_file sm_107a d32_pair4 rc=0 cubin_md5=9639c034237702bcfdb948b5fabd8c5d
+fwd_d128_file sm_107a d32_pair4_mask_padded_causal rc=0 cubin_md5=00ffaa88a356974cabed8f32102e1bc5

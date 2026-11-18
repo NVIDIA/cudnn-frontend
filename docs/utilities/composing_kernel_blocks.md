@@ -5,7 +5,7 @@
 ## What this is
 
 A *block* is a model sub-layer served by several kernels behind ONE Python class, ONE workspace and ONE
-`execute()` call — for example the [gated attention block](../fe-oss-apis/gated_attention_block.md):
+`execute()` call — for example the [gated attention block](/operations/Attention/gated_attention_block):
 projection GEMM, QK-RMSNorm + RoPE, SDPA, sigmoid gate, out projection. Some of its stages are FROST engines
 reached through the graph API (`cudnn.pygraph` GEMM plans), some are CuTe-DSL kernels the block owns, and the
 fusions between stages are compile-time specializations behind the same signature. This page records the rules

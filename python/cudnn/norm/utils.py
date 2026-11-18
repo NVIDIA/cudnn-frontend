@@ -6,12 +6,16 @@
 Mirrors the role of ``cudnn.sdpa.utils``: DLPack -> cute.Tensor conversion and a
 couple of small launch-side helpers. The heavy device-side primitives (cp.async
 staging, block reductions) live in each pass's ``kernels/_common_sm100.py`` and
-build on ``cudnn.frost.tile_dsl`` + ``cutlass.primitives``.
+build on ``cudnn.frost.tile_dsl`` + ``cutlass.experimental.primitives``.
 """
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from cutlass.cute.runtime import from_dlpack
+
+from cudnn.frost.compiled_cache import dsl_compile_lock  # noqa: F401  (the kernels' lazy compiles take it)
 
 
 def dyn(t):
@@ -29,17 +33,34 @@ def dyn(t):
     return from_dlpack(t, assumed_align=16).mark_layout_dynamic()
 
 
-def sm_count():
-    """Multiprocessor count of the current device (cached)."""
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+def ffi(t):
+    """A torch tensor as a tvm-ffi launch argument: the tensor itself, detached when it is on an autograd tape (the same
+    export rule as :func:`dyn`). The tvm-ffi entry binds torch tensors natively, without a per-call DLPack round trip."""
+    return t.detach() if t.requires_grad else t
 
 
-_SM_COUNT = None
+def fake_rows(dtype, *cols, rows=None, align=16):
+    """A compile-time placeholder for a row-major ``[rows, *cols]`` operand whose row count is DYNAMIC (one compiled
+    artifact serves every R); ``rows`` is the shared ``cute.sym_int`` (pass the same symbol to every row-indexed
+    operand), ``dtype`` a cutlass element type. ``cols=()`` is a ``[rows]`` vector."""
+    import cutlass.cute as cute
+
+    shape = (rows,) + tuple(cols)
+    return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
+
+
+def is_aligned_contiguous_vector(t):
+    """Whether a vector can be used by a 16-byte bulk affine load."""
+    return t is None or (t.stride(0) == 1 and t.data_ptr() % 16 == 0)
+
+
+def sm_count() -> int:
+    """Multiprocessor count of the build or current CUDA device, cached per device."""
+    from cudnn.frost.device import current_device, multiprocessor_count
+
+    return multiprocessor_count(current_device())
+
+
 _COOP_OCC = {}
 COOP_OCC_MAX = 4
 
@@ -72,31 +93,15 @@ def run_coop(key, run):
             occ //= 2
 
 
-_SMEM_CAPACITY = None
-
-
 def smem_capacity():
-    """Per-block shared memory budget for the CURRENT architecture, via the CuTe DSL.
+    """Opt-in per-block shared memory limit of the build/current CUDA device.
 
-    ``cutlass.memory.get_smem_capacity_in_bytes()`` resolves the running arch through
-    ``CuTeDSL.get_arch_enum()`` and returns the per-BLOCK opt-in limit, which is what a
-    launch is actually validated against. Two reasons not to hardcode it:
-
-    * it is architecture-dependent -- 232448 on sm_90/sm_100, but 101376 on sm_120, so
-      a Blackwell constant does not merely mis-tune elsewhere, it over-requests and the
-      launch fails;
-    * it is NOT ``shared_memory_per_multiprocessor`` (233472 on sm_100). Sizing against
-      the per-SM figure leaves a 1 KB window where the driver rejects the launch
-      instead of us rejecting it first.
-
-    Queried once and cached; the call itself is ~4 us.
+    Use the per-device driver cache: the DSL's ambient architecture may describe
+    another GPU, and the larger per-SM limit is not a valid per-block budget.
     """
-    global _SMEM_CAPACITY
-    if _SMEM_CAPACITY is None:
-        from cutlass.memory import get_smem_capacity_in_bytes
+    from cudnn.frost.device import current_device, shared_memory_per_block_optin
 
-        _SMEM_CAPACITY = int(get_smem_capacity_in_bytes())
-    return _SMEM_CAPACITY
+    return shared_memory_per_block_optin(current_device())
 
 
 def smem_budget(preferred_bytes):
@@ -108,6 +113,59 @@ def smem_budget(preferred_bytes):
     ratio nobody measured.
     """
     return min(int(preferred_bytes), smem_capacity())
+
+
+def coop_launch_too_large(exc):
+    """Whether ``exc`` is a cooperative launch whose grid cannot co-reside. The driver spells
+    it CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE, the runtime cudaErrorCooperativeLaunchTooLarge,
+    and the DSL can surface either."""
+    return "COOPERATIVELAUNCHTOOLARGE" in str(exc).upper().replace("_", "")
+
+
+_DEVICE_FLOOR_ERROR = {}
+
+
+def unsupported_device_reason(device):
+    """Why the norm kernels cannot run on CUDA ``device``, or ``None``.
+
+    The kernels lower through Hopper-and-later instructions (``cp.async.bulk`` row
+    staging, mbarrier transaction counts, thread-block clusters), so on an older GPU
+    most shapes would fail inside NVVM with an opaque "unsupported operation".
+    Refusing up front gives one clear error instead. Cached per device ordinal, so a
+    call costs a dict lookup."""
+    import torch
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _DEVICE_FLOOR_ERROR:
+        major, minor = torch.cuda.get_device_capability(index)
+        _DEVICE_FLOOR_ERROR[index] = (
+            None
+            if major >= 9
+            else (
+                f"cudnn.norm needs an SM90 or newer GPU (its kernels use bulk async copies, mbarrier "
+                f"transaction counts and thread-block clusters); found SM{major}{minor}. On older GPUs, "
+                "build the normalization with the graph API (for example graph.layernorm or graph.rmsnorm), "
+                "which the cuDNN backend serves."
+            )
+        )
+    return _DEVICE_FLOOR_ERROR[index]
+
+
+_HAS_TMEM = {}
+
+
+def has_tmem():
+    """Whether the current device has tensor memory (``tcgen05``): the SM10x/SM11x
+    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve.
+
+    Cached per device ordinal: the kernels launch on the current device, and a
+    process can hold an SM100 and an SM90 part."""
+    import torch
+
+    device = torch.cuda.current_device()
+    if device not in _HAS_TMEM:
+        _HAS_TMEM[device] = torch.cuda.get_device_capability(device)[0] in (10, 11)
+    return _HAS_TMEM[device]
 
 
 _SMEM_PER_SM = None
@@ -161,6 +219,10 @@ def on_stream(raw):
     if raw is None:
         return torch.cuda.stream(None)  # no stream requested: leave the current one alone
     handle = int(raw)
+    from cudnn._torch_stream import _raw_current_stream
+
+    if handle == _raw_current_stream(torch, torch.cuda.current_device()):
+        return nullcontext()  # the requested stream is already current (the usual call): entering it again is pure cost
     if handle == 0:
         return torch.cuda.stream(torch.cuda.default_stream())  # explicitly the default stream
     s = _EXT_STREAMS.get(handle)
@@ -192,7 +254,11 @@ def cur_stream():
     """
     import torch
 
-    h = torch.cuda.current_stream().cuda_stream
+    from cudnn._torch_stream import _raw_current_stream
+
+    h = _raw_current_stream(torch, torch.cuda.current_device())  # ~0.3 us; current_stream() builds a Stream (~6 us)
+    if h is None:
+        h = torch.cuda.current_stream().cuda_stream
     s = _CU_STREAMS.get(h)
     if s is None:
         from cuda.bindings import driver as _drv

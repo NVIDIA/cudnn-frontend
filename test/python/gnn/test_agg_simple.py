@@ -14,6 +14,8 @@ from cudnn.gnn import CscGraph, agg_simple
 def _require_gnn_agg_simple() -> None:
     if not hasattr(cudnn, "gnn_agg_simple_forward") or not hasattr(cudnn, "gnn_agg_simple_backward"):
         pytest.skip("cudnn-frontend was built without cudnnGnnAggSimple support")
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("the cudnnGnnAggSimple backend requires SM 8.0 or newer")
 
 
 def _reduce(values: torch.Tensor, aggr: str) -> torch.Tensor:

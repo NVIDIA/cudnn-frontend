@@ -25,7 +25,7 @@ import cutlass.experimental.primitives as nvvm
 
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 
-from .steep_decay import has_exact_path, steep_token_log
+from .steep_decay import STEEP_EXACT, steep_token_factor
 
 GUARD_MARGIN = 1.0 / 32
 GUARD_QUANT_TOL_MULT = 4.0
@@ -73,10 +73,9 @@ def beta_guard(
                 if decay_row == 0:
                     prev_val = one
                 ratio = exp_g_frag[elem] * cute.math.rcp(prev_val, approx=True, ftz=True)
-                if cutlass.const_expr(has_exact_path(cfg)):
+                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
                     if ((steep_bits >> (dim_half * 8 + f32_group * 4 + elem)) & 1) != 0:
-                        token_log = steep_token_log(cfg, gate_prefix_ptr, log_last_ptr, decay_row, f32_dim_base + elem)
-                        ratio = cute.math.exp2(token_log, fastmath=True)
+                        ratio = steep_token_factor(cfg, gate_prefix_ptr, log_last_ptr, decay_row, f32_dim_base + elem)
                 max_ratio = cute.math.max(max_ratio, ratio)
     max_ratio = cute.math.max(max_ratio, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, max_ratio, 4, 31, kind=nvvm.Shfl.BFLY)))
     max_ratio = cute.math.max(max_ratio, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, max_ratio, 2, 31, kind=nvvm.Shfl.BFLY)))

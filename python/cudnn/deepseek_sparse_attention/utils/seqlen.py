@@ -68,7 +68,9 @@ class SeqlenInfoQK:
         else:
             seqlen_q = seqlen_q_static if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx + 1] - offset_q
         if const_expr(mSeqUsedK is not None):
-            seqlen_k = mSeqUsedK[batch_idx]
+            # A used length is a device value, so it is bounded by the static extent the
+            # outputs were sized for.
+            seqlen_k = cutlass.min(mSeqUsedK[batch_idx], seqlen_k_static)
         else:
             seqlen_k = seqlen_k_static if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx + 1] - offset_k
         has_cu_seqlens_q: int = mCuSeqlensQ is not None

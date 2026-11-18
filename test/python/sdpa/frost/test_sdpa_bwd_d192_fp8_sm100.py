@@ -1,0 +1,133 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+"""``sdpa_bwd_sm100_d192_fp8``: dense D_QK = 192 / D_V = 128 per-tensor FP8 backward on SM100 / SM103."""
+
+import cudnn
+import pytest
+
+import test_sdpa_bwd_fp8_sm107 as _rubin
+import d192_fp8_pair_checks as _pair_checks
+from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
+
+pytestmark = [pytest.mark.L0, requires_dsl]
+
+_ENGINE = "sdpa_bwd_sm100_d192_fp8"
+_D, _DV = 192, 128
+_SM100_CC = (10, 0)
+_SM103_CC = (10, 3)
+_SM107_CC = (10, 7)
+
+
+def _spec():
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    spec = next((s for s in ENGINE_SPECS if s.name == _ENGINE), None)
+    assert spec is not None
+    return spec
+
+
+def _mismatch(monkeypatch, cc=_SM100_CC, **kw):
+    from cudnn.sdpa.bwd import engines
+
+    monkeypatch.setattr(_rubin, "_D", _D)
+    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.1")))
+    monkeypatch.setattr(engines, "cutedsl_too_old", lambda v: False)
+    monkeypatch.setattr(engines, "cutedsl_arch_requirement_error", lambda cc: None)
+    g = _rubin._build_graph(**{"d": _D, "d_v": _DV, **kw})
+    facts = g._facts_for(engines.ga.analyze)
+    facts = facts.__class__(**{**facts.__dict__, "device_cc": cc}) if hasattr(facts, "__dict__") else facts
+    return engines.mismatch(_spec().capabilities, facts)
+
+
+def test_engine_is_registered():
+    c = _spec().capabilities
+    assert c.is_fp8 and not c.is_mxfp8
+    assert c.d == frozenset({128, 192}) and c.dqk_ge_dv and not c.d_envelope
+    assert c.dtypes == frozenset({cudnn.data_type.FP8_E4M3})
+    assert c.out_dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
+    assert c.amax_dgrad and c.causal and c.deterministic and not c.gqa and not c.swa and not c.bottom_right and not c.thd
+    assert (c.sm_lo, c.sm_hi) == (100, 119)
+
+
+def test_row_ranks_right_behind_the_half_row():
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    names = [s.name for s in ENGINE_SPECS]
+    assert names.index("sdpa_bwd_sm100_d192") + 1 == names.index(_ENGINE) < names.index("sdpa_bwd_sm100_d256")
+
+
+@pytest.mark.parametrize("cc", [_SM100_CC, _SM103_CC, _SM107_CC], ids=["sm100", "sm103", "sm107"])
+def test_row_admits_dense_d192_e4m3(monkeypatch, cc):
+    assert _mismatch(monkeypatch, cc=cc) is None
+    assert _mismatch(monkeypatch, cc=cc, causal=False) is None
+    assert _mismatch(monkeypatch, cc=cc, grad_dtypes=(cudnn.data_type.BFLOAT16,) * 3) is None
+    assert _mismatch(monkeypatch, cc=cc, request_amax=()) is None
+    assert _mismatch(monkeypatch, cc=cc, deterministic=True) is None
+
+
+@pytest.mark.parametrize(
+    "kw,needle",
+    [
+        (dict(d=128, d_v=128), ""),
+        (dict(d=256, d_v=256), ""),
+        (dict(cc=(12, 0)), "requires SM100-119"),
+        (dict(cc=(9, 0)), "requires SM100-119"),
+        (dict(h=4, hkv=2), ""),
+        (dict(left_bound=64), ""),
+        (dict(bottom_right=True), ""),
+    ],
+    ids=["d128", "d256", "sm120", "sm90", "gqa", "window", "bottom-right"],
+)
+def test_row_declines(monkeypatch, kw, needle):
+    reason = _mismatch(monkeypatch, **kw)
+    assert reason is not None and needle.lower() in reason.lower(), reason
+
+
+def test_pair_host_binds_one_kernel_pair_per_specialization(monkeypatch):
+    import cutlass
+
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d192_fp8_host as pair
+
+    compiled = []
+
+    def record(host, *args, **kwargs):
+        compiled.append(host)
+        return object()
+
+    mx_w0, mx_w128 = (128, 128, False, True, 0), (128, 128, False, True, 128)
+    fp8_sm103, fp8_sm100, mx_192 = (192, 128, False, False, 0), (192, 128, True, False, 0), (192, 128, False, True, 0)
+    modules = {spec: pair._specialized(spec) for spec in (mx_w0, mx_w128, fp8_sm103, fp8_sm100, mx_192)}
+    for module in modules.values():
+        monkeypatch.setattr(module, "compile_cached", record)
+    out = cutlass.BFloat16
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 128, 128, 0)
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 128, 128, 128)
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 128, 128, 0)
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 192, 128, 0)
+    pair.compile_host((), (), out, True, 103, (False,) * 4, 192, 128, 1)
+    pair.compile_host((), (), out, True, 100, (False,) * 4, 192, 128, 1)
+    assert len(compiled) == 6
+    for spec, module in modules.items():
+        assert module.SPEC == spec and (module.dkdv_host, module.dq_host) == pair._kernel_hosts(spec)
+    assert modules[mx_w0].dq_host is not modules[mx_w128].dq_host
+    assert modules[fp8_sm103].dkdv_host is not modules[mx_192].dkdv_host
+    assert modules[fp8_sm103].dkdv_host is not modules[fp8_sm100].dkdv_host
+
+
+@requires_pre_rubin_blackwell
+class TestD192Fp8Pair:
+    @pytest.fixture
+    def sm100_row(self, monkeypatch):
+        """Point the Rubin fp8 suite's helpers at this row."""
+        monkeypatch.setattr(_rubin, "_ENGINE", _ENGINE)
+        monkeypatch.setattr(_rubin, "_D", _D)
+        return _rubin
+
+    test_dense = staticmethod(_pair_checks.test_dense)
+    test_causal = staticmethod(_pair_checks.test_causal)
+    test_non_tile_multiple_seqlens = staticmethod(_pair_checks.test_non_tile_multiple_seqlens)
+    test_amax_subsets = staticmethod(_pair_checks.test_amax_subsets)
+    test_repeated_launches_are_bitwise = staticmethod(_pair_checks.test_repeated_launches_are_bitwise)
+    test_causal_empty_kv_tiles = staticmethod(_pair_checks.test_causal_empty_kv_tiles)
+    test_negative_scale_declined_at_check = staticmethod(_pair_checks.test_negative_scale_declined_at_check)
+    test_explicit_attn_scale = staticmethod(_pair_checks.test_explicit_attn_scale)

@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Callable
 
 import torch
@@ -42,6 +42,19 @@ class _PlanWithWorkspace:
 
     def __call__(self, variant_pack, stream=None):
         return self.compiled(variant_pack, stream=stream, workspace=self.workspace)
+
+
+def frost_gemm_unsupported_reason() -> str | None:
+    """Why the FROST GEMM engines cannot serve the current GPU, or ``None``.
+
+    They serve the SM100 family (SM 10.x / 11.x) and SM 12.x. On an older GPU every
+    strategy declines with ``NotImplementedError``, which the sweeps below would
+    otherwise report as "no strategy produced a correct result".
+    """
+    major, minor = torch.cuda.get_device_capability()
+    if major < 10:
+        return f"FROST GEMM needs an SM100-family or SM 12.x GPU; found SM{major}{minor}, skipping."
+    return None
 
 
 def with_workspace(compiled):
@@ -97,13 +110,18 @@ def select_configs(arg, spec_map):
 
 def expand_config_variants(spec_map, *, sweep_swap_ab: bool = False, sweep_split_k: int | None = None):
     """Expand a base config map over the requested swap-AB / split-K axes."""
-    split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (1,)
-    swap_ab_values = (False, True) if sweep_swap_ab else (False,)
     expanded = {}
     for cfg, _cta_group in spec_map.values():
+        split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (cfg.split_k_slices,)
+        swap_ab_values = (False, True) if sweep_swap_ab else (cfg.swap_ab,)
         for split_k_slices in split_k_values:
             for swap_ab in swap_ab_values:
-                variant = replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab)
+                try:
+                    variant = replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab)
+                except NotImplementedError:
+                    # The config owns geometry validity, including whether all
+                    # slices fit one cluster. Keep the requested reduction mode.
+                    continue
                 expanded[variant.name] = (variant, getattr(variant, "cta_group", 1))
     return expanded
 
@@ -125,19 +143,12 @@ def select_config_variants(arg, spec_map, *, sweep_swap_ab: bool = False, sweep_
             expanded.append(name)
             continue
         cfg = spec[0]
-        base = replace(
-            cfg,
-            split_k_slices=1 if sweep_split_k is not None else cfg.split_k_slices,
-            swap_ab=False if sweep_swap_ab else cfg.swap_ab,
-        )
-        if base.name in seen_bases:
+        swept = ({"split_k_slices"} if sweep_split_k is not None else set()) | ({"swap_ab"} if sweep_swap_ab else set())
+        base = tuple((field.name, getattr(cfg, field.name)) for field in fields(cfg) if field.name not in swept)
+        if base in seen_bases:
             continue
-        seen_bases.add(base.name)
-        split_k_values = range(1, sweep_split_k + 1) if sweep_split_k is not None else (cfg.split_k_slices,)
-        swap_ab_values = (False, True) if sweep_swap_ab else (cfg.swap_ab,)
-        for split_k_slices in split_k_values:
-            for swap_ab in swap_ab_values:
-                expanded.append(replace(cfg, split_k_slices=split_k_slices, swap_ab=swap_ab).name)
+        seen_bases.add(base)
+        expanded.extend(expand_config_variants({name: spec}, sweep_swap_ab=sweep_swap_ab, sweep_split_k=sweep_split_k))
     return list(dict.fromkeys(expanded))
 
 

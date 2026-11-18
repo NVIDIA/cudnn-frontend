@@ -134,7 +134,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
     :param deterministic: Compute ``dprob`` run-to-run bit-exactly. ``dprob`` must then carry
         one slot per N-tile so that each ``(token, tile_n)`` pair has a single writer, and the
         caller reduces over that dimension afterwards. Rationale and cost:
-        docs/fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
+        docs/operations/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
     """
 
     FIX_PAD_SIZE = 256

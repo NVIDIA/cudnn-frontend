@@ -150,6 +150,10 @@ init_gnn_submodule(py::module_ &);
 void
 init_variant_pack(py::module_ &);
 
+// pybinds for the C++ launcher (cudnn.cpp_launcher)
+void
+init_cpp_launcher(py::module_ &);
+
 void
 set_dlhandle_cudnn(std::intptr_t dlhandle) {
 #ifdef _WIN32
@@ -162,11 +166,14 @@ set_dlhandle_cudnn(std::intptr_t dlhandle) {
 NB_MODULE(_compiled_module, m) {
     m.def("backend_version", &detail::get_backend_version);
     m.def("backend_version_string", &detail::get_backend_version_string);
+    // Private. The header version can be older than backend_version(), and some features need both to be new enough.
+    m.attr("_compiled_cudnn_version") = CUDNN_VERSION;
 
     init_properties(m);
     init_pygraph_submodule(m);
     init_gnn_submodule(m);
     init_variant_pack(m);
+    init_cpp_launcher(m);
 
     m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 

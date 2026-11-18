@@ -61,6 +61,36 @@ def _time_region_ms(fn):
     return start.elapsed_time(end)
 
 
+_replay_handle = None
+
+
+def _time_graph_replay_ms(fn, n):
+    """Device milliseconds per call of fn(): n calls captured into one CUDA graph, its replay timed with CUDA events."""
+    global _replay_handle
+    if _replay_handle is None:
+        _replay_handle = cudnn.create_handle()
+    cudnn.set_stream(handle=_replay_handle, stream=torch.cuda.current_stream().cuda_stream)
+    fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        cudnn.set_stream(handle=_replay_handle, stream=torch.cuda.current_stream().cuda_stream)
+        for _ in range(n):
+            fn()
+    cudnn.set_stream(handle=_replay_handle, stream=torch.cuda.current_stream().cuda_stream)
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    g.replay()
+    end.record()
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end) / n
+    g.reset()
+    return ms
+
+
 def _run_forward_once():
     """One forward execution, used by both the profiled and the event-timed path.
 
@@ -69,7 +99,10 @@ def _run_forward_once():
     """
     global output
     if is_cudnn_fe:
-        graph_fwd.execute(variant_pack_fwd, workspace)
+        if _replay_handle is not None:
+            graph_fwd.execute(variant_pack_fwd, workspace, handle=_replay_handle)
+        else:
+            graph_fwd.execute(variant_pack_fwd, workspace)
     else:
         output = sdpa_function(query, key, value)
 
@@ -301,6 +334,12 @@ def parse_args():
         type=int,
         help="Number of warmup iterations to run before measuring performance",
     )
+    parser.add_argument(
+        "--graph_replay",
+        default=0,
+        type=int,
+        help="Opt-in: time N executes captured in one CUDA graph by replaying it; rows are tagged [graph-replay xN]. cuDNN legs only.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
         "--fa4_num_splits",
@@ -385,6 +424,14 @@ def parse_args():
         help="thd only: each sequence's Q length is drawn (seeded) from [min_fill * q_seqlen, q_seqlen], its KV length "
         "scaled by kv_seqlen / q_seqlen; sequences are packed back to back. 1.0 = equal-length sequences",
     )
+    parser.add_argument(
+        "--causal_exclude_own_block",
+        default=0,
+        type=int,
+        help="mxfp8 top_left forward only: the sdpa_mxfp8 op attribute of the same name, which limits query i to keys "
+        "j < B * floor(i / B) (B = 32, the V scale block). 0 = plain causal. TFLOPS still count the plain causal mask, "
+        "so they compare directly with a plain causal run",
+    )
     return parser.parse_args()
 
 
@@ -443,7 +490,7 @@ def run_benchmark(
         Dict with keys:
             - time_ms: Median time of the requested pass in milliseconds
             - tflops: TFLOPS for the requested pass
-            - max_diff: Maximum difference vs reference
+            - max_diff: Maximum absolute difference across checked tensors, or NaN if validation was skipped or failed
             - gpu_name: GPU name string
             - cudnn_version: cuDNN version (if available)
 
@@ -568,7 +615,7 @@ def run_benchmark(
         "backend_detail": ",".join(parts[15:]) or None,
         "time_ms": time_ms,
         "tflops": tflops,
-        "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
+        "max_diff": float(parts[12]) if len(parts) > 12 else float("nan"),
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
         "cudnn_backend_version": cudnn_backend_version,
@@ -647,6 +694,8 @@ else:
     else:
         raise ValueError(f"Invalid data type: {args.data_type}")
 
+    if args.sliding_window_size is not None and args.sliding_window_size < 1:
+        raise ValueError("Sliding window size must be positive")
     if args.sliding_window_size is not None and args.attn_mask not in ("top_left", "bottom_right"):
         raise ValueError("Sliding window attention requires attn_mask='top_left' or 'bottom_right' (causal)")
 
@@ -682,6 +731,11 @@ else:
     if o_block_scale and (head_dim_qk != 128 or head_dim_vo != 128):
         exit_unsupported("block-scaled O is served by the d128 fp8 / mxfp8 kernel flavors only")
     enable_gqa = num_q_heads != num_kv_heads
+    if args.causal_exclude_own_block:
+        if args.data_type != "mxfp8" or args.attn_mask != "top_left" or args.sliding_window_size is not None:
+            raise ValueError("--causal_exclude_own_block requires --data_type mxfp8 --attn_mask top_left without a sliding window")
+        if run_bwd:
+            exit_unsupported("--causal_exclude_own_block is a forward-only op attribute (no backward engine carries the bound)")
     if args.data_type == "mxfp8":
         if not is_cudnn_fe:
             raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss'/'cudnn_auto' backends")
@@ -962,6 +1016,7 @@ else:
                 diagonal_band_right_bound=right_bound,
                 generate_stats=True,
                 **({"sf_o": sf_o_fwd} if o_block_scale else {}),
+                **({"causal_exclude_own_block": args.causal_exclude_own_block} if args.causal_exclude_own_block else {}),
                 **({"scale_o": scale_o_fwd} if scale_o_fwd is not None else {}),
             )
         else:
@@ -1165,13 +1220,6 @@ else:
                     use_deterministic_algorithm=args.deterministic_bwd,
                 )
             elif args.data_type == "mxfp8":
-                if left_bound is not None:
-                    # No band on this call (the FROST MXFP8 backward row serves causal only): the graph below is PLAIN
-                    # causal, and `bwd_sliding_window` below rates it on causal pairs -- never window pairs for a graph
-                    # that carries no window.
-                    print(
-                        f"[WARN] mxfp8 backward: --sliding_window_size {left_bound} is not applied to the backward graph (plain causal); its TFLOPS count causal pairs"
-                    )
                 # MXFP8 backward requires transposed tensor views and scale factors
                 # Q, K, V in FP8_E4M3
                 q_bwd = graph_bwd.tensor_like(query)
@@ -1276,6 +1324,7 @@ else:
                     attn_scale=attn_scale,
                     use_causal_mask=(args.attn_mask == "top_left"),
                     use_causal_mask_bottom_right=(args.attn_mask == "bottom_right"),
+                    left_bound=left_bound,
                     diagonal_alignment=diagonal_align,
                     use_deterministic_algorithm=args.deterministic_bwd,
                 )
@@ -1555,41 +1604,57 @@ else:
                 is_causal=args.attn_mask in ("top_left", "bottom_right"),
             )
 
+    # FlashAttention centers both window radii on its bottom-right diagonal.
+    flash_causal = args.attn_mask != "no_mask"
+    width = args.sliding_window_size
+    flash_window = (width - 1, 0) if width is not None else (None, None)
+    reverse_reference = False
+    if args.attn_mask == "top_left" and q_seqlen != kv_seqlen:
+        shift = q_seqlen - kv_seqlen
+        flash_causal = False
+        # Relative to bottom-right, top-left has right radius shift and left radius W - 1 - shift.
+        if shift >= 0 and (width is None or width > shift):
+            flash_window = (None if width is None else width - 1 - shift, shift)
+        else:
+            if args.sdpa_backend.startswith("flash_attention"):
+                exit_unsupported(f"{args.sdpa_backend} cannot express this rectangular top-left mask with native window radii")
+            # For the untimed reference, reverse Q and KV. The top-left band
+            # becomes a bottom-right band pointing toward increasing key indices.
+            reverse_reference = True
+            flash_window = (0, None if width is None else width - 1)
+    # FA2 and FA3 require integer radii. FA4 uses None for an unbounded side.
+    flash_window_int = tuple(-1 if radius is None else radius for radius in flash_window)
+
     if args.sdpa_backend == "flash_attention":
         import flash_attn
         from flash_attn import flash_attn_func
 
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
-            # flash-attn 2.7+ requires ints here: (-1, -1) is its no-window
-            # sentinel; passing None fails the SymInt cast in the op schema.
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return flash_attn_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window_int,
                 deterministic=args.deterministic_bwd,
             )
 
     if args.sdpa_backend == "flash_attention_3":
-        import flash_attn_interface
+        from flash_attn_interface import flash_attn_func as fa3_func
 
         def flash_attention_3_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(
+            return fa3_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window_int,
                 deterministic=args.deterministic_bwd,
             )
-            return output
 
     if args.sdpa_backend == "flash_attention_4" or (not args.skip_ref):
-        import flash_attn.cute.interface as flash_attn_interface
+        from flash_attn.cute.interface import flash_attn_func as fa4_func
 
         # flash_attn_func's own default is num_splits=1 (never split KV); 0 engages
         # FA4's split-KV heuristic. Always pass the resolved value explicitly.
@@ -1600,20 +1665,21 @@ else:
             fa4_num_splits = 1
 
         def flash_attention_4_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            if reverse_reference:
+                query, key, value = (t.flip([1]) for t in (query, key, value))
             kwargs = dict(
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window,
                 deterministic=args.deterministic_bwd,
                 num_splits=fa4_num_splits,
             )
-            output, _ = flash_attn_interface.flash_attn_func(
+            output, _ = fa4_func(
                 query,
                 key,
                 value,
                 **kwargs,
             )
-            return output
+            return output.flip([1]) if reverse_reference else output
 
     def get_sdpa_function(backend):
         if backend == "pyt_math":
@@ -1671,6 +1737,21 @@ else:
             return dQuery, dKey, dValue, dOutput
         else:
             raise ValueError(f"Invalid backend: {backend}")
+
+    def check_reference(query, key, value, output, gradients, d_output):
+        # The measured tensors are in BHSD after postprocessing. FA4 takes and returns BSHD.
+        ref_inputs = preprocess_qkv(query, key, value, "flash_attention_4")
+        output_ref = flash_attention_4_sdpa(*ref_inputs).transpose(1, 2)
+        comparisons = [(output, output_ref, 1e-2)]
+        if gradients:
+            ref_grads = torch.autograd.grad(output_ref, (query, key, value), d_output)
+            comparisons.extend((actual, expected, 2e-2) for actual, expected in zip(gradients, ref_grads))
+
+        max_diffs = []
+        for actual, expected, tol in comparisons:
+            torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+            max_diffs.append((actual.detach() - expected.detach()).abs().max())
+        return torch.stack(max_diffs).max().item()
 
     # Util functions for calculating flops and tflops/s achieved
     def flops(
@@ -1758,7 +1839,7 @@ else:
 
     forward_times = []
     backward_times = []
-    forward_diffs = []
+    reference_diffs = []
 
     total_iters = num_iters + dry_run_iters
 
@@ -1831,7 +1912,9 @@ else:
                 dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
                 dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
 
-            # Only variant pack and workspace need to be updated for each iteration.
+            # Rebind the new tensors, but reuse the workspace allocated for these
+            # fixed graph plans. Replacing it here temporarily keeps two full
+            # workspaces alive and can OOM before an otherwise fitting launch.
             if run_bwd:
                 if args.data_type == "fp8":
                     variant_pack_fwd = {
@@ -1938,11 +2021,6 @@ else:
                         dK_bwd: dKey,
                         dV_bwd: dValue,
                     }
-                workspace = torch.empty(
-                    max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
-                    device="cuda",
-                    dtype=torch.uint8,
-                )
             else:
                 if args.data_type == "fp8":
                     variant_pack_fwd = {
@@ -1986,8 +2064,6 @@ else:
                     }
                     if not is_infer:
                         variant_pack_fwd[stats_fwd] = stats
-                workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
-
             if thd:
                 variant_pack_fwd.update({thd_fwd[name]: t for name, t in thd_buffers.items()})
                 if run_bwd:
@@ -2002,7 +2078,11 @@ else:
         l2_flush_buffer.zero_()
 
         # Run kernel with profiler for forward if requested, else run unprofiled to prep for backward
-        if run_fwd and _EVENT_TIMING:
+        if run_fwd and args.graph_replay > 0 and is_cudnn_fe:
+            fwd_time = _time_graph_replay_ms(_run_forward_once, args.graph_replay)
+            if i >= dry_run_iters:
+                forward_times.append(fwd_time)
+        elif run_fwd and _EVENT_TIMING:
             # CUPTI already known unavailable -> ONE execution, timed with events.
             fwd_time = _time_region_ms(_run_forward_once)
             if i >= dry_run_iters:
@@ -2028,6 +2108,7 @@ else:
                 or item.key.startswith("kernel_cutlass")
                 or "pytorch_flash::" in item.key
                 or "flash::" in item.key
+                or "flashinfer::" in item.key
                 or "at::native::" in item.key
                 or "cutlass3x" in item.key
                 or "(anonymous namespace)::" in item.key
@@ -2104,12 +2185,17 @@ else:
                 or item.key.startswith("kernel_cutlass")
                 or "pytorch_flash::" in item.key
                 or "flash::" in item.key
+                or "flashinfer::" in item.key
                 or "at::native::" in item.key
                 or "cutlass3x" in item.key
                 or "(anonymous namespace)::" in item.key
                 or item.key.startswith("fmha_")
             ]
-            if len(matched_kernels) >= 1:
+            if args.graph_replay > 0 and is_cudnn_fe:
+                bwd_time = _time_graph_replay_ms(lambda: graph_bwd.execute(variant_pack_bwd, workspace, handle=_replay_handle), args.graph_replay)
+                if i >= dry_run_iters:
+                    backward_times.append(bwd_time)
+            elif len(matched_kernels) >= 1:
                 # device_time_total, NOT device_time: key_averages() aggregates by
                 # kernel name and device_time is the per-occurrence MEAN, so a
                 # kernel launched n times per pass was being counted once.
@@ -2132,21 +2218,9 @@ else:
             value,
             output,
         ) = postprocess_qkvo(query, key, value, output, args.sdpa_backend)
-        if args.data_type not in ("fp8", "mxfp8") and not args.skip_ref and run_fwd:
+        if args.data_type not in ("fp8", "mxfp8") and not args.skip_ref:
             try:
-                output_ref = flash_attention_4_sdpa(query, key, value)
-                if run_bwd:
-                    query.retain_grad()
-                    key.retain_grad()
-                    value.retain_grad()
-                    output_ref.backward(dOutput)
-
-                    torch.testing.assert_close(dQuery, query.grad, rtol=2e-2, atol=2e-2)
-                    torch.testing.assert_close(dKey, key.grad, rtol=2e-2, atol=2e-2)
-                    torch.testing.assert_close(dValue, value.grad, rtol=2e-2, atol=2e-2)
-
-                torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
-                forward_diffs.append(torch.max(torch.abs(output.detach() - output_ref.detach())).item())
+                reference_diffs.append(check_reference(query, key, value, output, (dQuery, dKey, dValue) if run_bwd else (), dOutput))
             except Exception as e:
                 if first_error:
                     print(
@@ -2154,9 +2228,7 @@ else:
                     )
                     print(f"[WARN] See error message: {e}")
                     first_error = False
-                forward_diffs.append(0.0)
-        else:
-            forward_diffs.append(0.0)
+                reference_diffs.append(float("nan"))
 
         if is_cudnn_fe:
             del query, key, value, output, dQuery, dKey, dValue, dOutput, stats
@@ -2187,10 +2259,7 @@ else:
     bwd_median_time = (
         np.median(np.array(backward_times[5:])) if len(backward_times) > 5 else (np.median(np.array(backward_times)) if len(backward_times) > 0 else 0.0)
     )
-    # The backward FLOP count follows the GRAPH that ran: the mxfp8 backward carries no band (its build above warns), so a
-    # `--sliding_window_size` run of it is a plain-causal graph rated on causal pairs; the fp8 and half backward graphs
-    # pass `left_bound`, so the window counts there.
-    bwd_sliding_window = None if args.data_type == "mxfp8" else args.sliding_window_size
+    bwd_sliding_window = args.sliding_window_size
     bwd_tflops = 0.0
     if run_bwd and bwd_median_time > 0:
         bwd_tflops = tflops_per_sec(
@@ -2252,6 +2321,8 @@ else:
     bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
+        # A failed check on any iteration invalidates the aggregate, including during timing warmup.
+        max_diff = np.max(reference_diffs) if reference_diffs else float("nan")
         # Trailing field: the plan the measured pass ran (cuDNN legs; may itself contain commas, so it goes last).
         _plan = ""
         if is_cudnn_fe:
@@ -2260,11 +2331,13 @@ else:
                 _plan = _g.get_plan_name_at_index(_g._plan_index)
             except Exception:
                 _plan = "unknown"
+        if args.graph_replay > 0 and is_cudnn_fe:
+            _plan = f"{_plan} [graph-replay x{args.graph_replay}]"
         print(
-            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''},{_plan}"
+            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{max_diff},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''},{_plan}"
         )
     else:
-        _tt = " [cuda-events]" if _EVENT_TIMING else ""
+        _tt = f" [graph-replay x{args.graph_replay}]" if (args.graph_replay > 0 and is_cudnn_fe) else (" [cuda-events]" if _EVENT_TIMING else "")
         if run_fwd and run_bwd:
             print(
                 f"{args.sdpa_backend}{_tt}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"

@@ -25,7 +25,7 @@ accumulator is already in activation units), and then, per tile class:
 So the block's whole MXFP8 stage-1 chain (block-scale GEMM, norm + RoPE, THREE block
 quantize passes = 5 launches unfused) is ONE launch writing FOUR compact tensors plus
 THREE scale-factor blobs, byte-for-byte what the unfused path
-(``kernels/quantize_mxfp8.py``) hands ``sm107/prefill_d256_mxfp8.py``.
+(``kernels/quantize_mxfp8.py``) hands ``sm107/d256_mxfp8_single_q/kernel.py``.
 
 THE e2m1-B ARM (``NormRopeFusionParams.weight_fp4``)
 ----------------------------------------------------

@@ -64,6 +64,8 @@ read_native_execution_bindings(nanobind::handle pack);
 // The same observation/validation used by Python ordered normalization. A
 // nonempty unread list or a None workspace extent asks Python to finish this
 // exact result before launch; errors propagate instead of choosing a new path.
+// workspace_device is populated only when a non-None extent was observed from
+// a producer. It is call-local and must not be retained with the schema.
 nanobind::tuple
 read_ordered_binding(nanobind::handle schema,
                      nanobind::handle buffers,
@@ -72,7 +74,8 @@ read_ordered_binding(nanobind::handle schema,
                      nanobind::handle workspace,
                      nanobind::handle override_uids,
                      nanobind::handle override_shapes,
-                     nanobind::handle override_strides);
+                     nanobind::handle override_strides,
+                     DLDevice *workspace_device = nullptr);
 
 void
 init_variant_pack(nanobind::module_ &);

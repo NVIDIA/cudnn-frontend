@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 """The arch-NEUTRAL half of the f16/bf16 d128-FILE prefill configuration: the small-tile seams the Rubin and Blackwell
-d128-file kernels share (``sm107/prefill_d128_f16.py``, ``sm100/prefill_d128_f16.py``) -- the additive bias / kv_mask arms,
+d128-file kernels share (``sm107/d128_f16_multi_q/kernel.py``, ``sm107/small_f16_batch_pair/kernel.py``,
+``sm100/d128_f16_multi_q/kernel.py``) -- the additive bias / kv_mask arms,
 the (n, n+1) pair item, the streamed ring, the row-max forms, the padded tail and dead-sub-tile forms, the double-buffered S,
 Q in TMEM, the third softmax warp group -- as ONE field block, ONE TMEM map formula, ONE set of budgets and ONE set of
 validators, each taking the arch's BUDGET (:class:`D128FamilyArch`) as a parameter.
@@ -618,11 +619,12 @@ def validate_swizzles(cfg, flavor: str) -> None:
     )
 
 
-def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0) -> None:
+def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0, kv_copy_bytes: int = 0) -> None:
     """``sf_bytes``: the block-scale kernel's scale-factor slabs (0 on the f16 /
     per-tensor flavors); ``bias_bytes``: the resident bias row-block of the f16 d128-file
     tiles (0 without the bias); both named in the message so a reader sees every term.  ``arch``: the budget
-    (``smem_usable_bytes`` / ``smem_fixed_overhead``) and the name the message prints."""
+    (``smem_usable_bytes`` / ``smem_fixed_overhead``) and the name the message prints.
+    ``kv_copy_bytes`` counts the raw FP8 slab separately from the converted K/V rings."""
     gate_bpe = cfg.GATE_BPE if getattr(cfg, "EPILOGUE_GATE", 0) else 0
     gate_kib = (cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * gate_bpe) // 1024
     used = (
@@ -641,6 +643,7 @@ def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_
             sf_bytes=sf_bytes,
         )
         + bias_bytes
+        + kv_copy_bytes
         + arch.smem_fixed_overhead
     )
     if used > arch.smem_usable_bytes:
@@ -648,6 +651,8 @@ def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_
         sf_term = (
             f" + {sf_bytes // 1024} KiB MXFP8 scale-factor slabs (Q 1 | K {cfg.STAGES_KV}x1 | P 1 (512 B padded) | V {cfg.STAGES_KV}x1)" if sf_bytes else ""
         )
+        if kv_copy_bytes:
+            gate_term += f" + {kv_copy_bytes // 1024} KiB raw FP8 KV staging slab"
         if bias_bytes:
             _streamed = getattr(cfg, "BIAS_MODE", 0) in BIAS_STREAMED_MODES
             gate_term += (
@@ -1089,10 +1094,15 @@ def validate_small_tile_masks(cfg, flavor: str) -> None:
             (
                 not (
                     int(getattr(cfg, "DEAD_SUBTILE_QUIET", 0)) == 1
-                    and (int(getattr(cfg, "N_CHUNK", 0)) or cfg.PACK_GQA or cfg.THD_VARLEN or int(getattr(cfg, "EPILOGUE_GATE", 0)))
+                    and (
+                        int(getattr(cfg, "N_CHUNK", 0))
+                        or cfg.PACK_GQA
+                        or (cfg.THD_VARLEN and (cfg.TILE_K != 64 or getattr(cfg, "PAGED_KV", False) or cfg.SPLIT_KV > 1))
+                        or int(getattr(cfg, "EPILOGUE_GATE", 0))
+                    )
                 ),
-                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without PackGQA, THD or the gated "
-                f"epilogue -- the quiet body replicates its live body's barrier sequence (the plain row mapping's on the Rubin file, the -inf body's "
+                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without PackGQA or the gated "
+                f"epilogue (THD requires non-paged, unsplit D64) -- the quiet body replicates its live body's barrier sequence (the plain row mapping's on the Rubin file, the -inf body's "
                 f"with the ring handshake on the SM100 file; each factory admits the half its file renders) (got N_CHUNK={getattr(cfg, 'N_CHUNK', 0)}, "
                 f"PACK_GQA={cfg.PACK_GQA}, THD_VARLEN={cfg.THD_VARLEN}, EPILOGUE_GATE={getattr(cfg, 'EPILOGUE_GATE', 0)})",
             ),

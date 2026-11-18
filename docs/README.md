@@ -8,7 +8,7 @@ The docs here describe installation and the graph-oriented frontend APIs (Python
 
 | Area | Path | Contents |
 |------|------|----------|
-| Pages | `*.mdx`, `**/*.md` | Landing page, quick start, samples, installation, developer guide, frontend API reference (`operations/`, `utilities/`, `fe-oss-apis/`), reference material |
+| Pages | `*.mdx`, `**/*.md` | Landing page, quick start, samples, installation, developer guide, frontend API reference (`operations/`, `utilities/`), reference material |
 | Images | `images/` | Figures referenced from pages (stored in Git LFS) |
 | Fern config | `fern/` | `fern.config.json`, `docs.yml` (site settings, redirects), `versions/latest.yml` (left navigation) |
 
@@ -21,9 +21,8 @@ docs/
   samples.mdx
   installation/*.mdx
   developer/*.mdx
-  operations/*.md
+  operations/**/*.md
   utilities/*.md
-  fe-oss-apis/**/*.md
   reference/*.mdx
   images/
   fern/
@@ -32,7 +31,9 @@ docs/
     versions/latest.yml     # navigation (paths are ../../<page>)
 ```
 
-Every page must be listed in `fern/versions/latest.yml` to be built. Page `slug`s are the source file names, so links between pages use `/section/page` (for example `/developer/graph-api`), never file paths.
+Every page must be listed in `fern/versions/latest.yml` to be built. Links between pages use the slugs from that navigation tree, such as `/developer/graph-api`. File-relative links do not work for Fern pages. Shared API pages can provide separate `docs` and `GitHub` links so readers can follow either the site route or the repository file.
+
+Redirect sources and destinations must include the `/cudnn` base path. The default version uses unversioned paths; preserve explicit `/cudnn/latest/` aliases when moving pages that used them.
 
 ## Building locally
 

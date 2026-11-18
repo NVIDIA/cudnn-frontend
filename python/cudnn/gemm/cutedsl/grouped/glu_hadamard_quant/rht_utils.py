@@ -114,7 +114,6 @@ def hadamard_rmem_colwise_fwht_quant(
     pitch16=None,
     feat0=None,
     tok16=None,
-    row_blocks=None,
     gSf=None,
 ):
     """Colwise FWHT + NVFP4 quantization from the load_colwise_pairs_bf16 registers,
@@ -146,7 +145,6 @@ def hadamard_rmem_colwise_fwht_quant(
         pitch16,
         feat0,
         tok16,
-        row_blocks,
         gSf,
     )
 
@@ -166,7 +164,6 @@ def _nvfp4_quant_colwise_transposed(
     pitch16=None,
     feat0=None,
     tok16=None,
-    row_blocks=None,
     gSf=None,
 ):
     """Colwise NVFP4 quantization of two 16-token feature columns.
@@ -211,14 +208,9 @@ def _nvfp4_quant_colwise_transposed(
             row = feat0 + sf_row_base + feature + c
             col = tok16 + token_block
             col_blocks = pitch16 // 4
-            sf_idx = (
-                seg16
-                + (row % 32) * 4 * row_blocks * 4 * col_blocks
-                + ((row // 32) % 4) * row_blocks * 4 * col_blocks
-                + (row // 128) * 4 * col_blocks
-                + (col % 4) * col_blocks
-                + (col // 4)
-            )
+            # Standard GEMM 128x4 scale atoms, packed independently per expert.
+            # The logical CuTe axis order is not its contiguous byte order.
+            sf_idx = seg16 + ((row // 128) * col_blocks + col // 4) * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + col % 4
             gSf[sf_idx] = tCrSFC_f8x4[c]
         else:
             sSf[(sf_row_base + feature + c, token_block)] = tCrSFC_f8x4[c]

@@ -30,10 +30,23 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.primitives as nvvm
+import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
+from cudnn.norm.utils import (
+    ws_bytes,
+    ws_empty,
+    ws_reset,
+    ws_zeros,
+    cur_stream,
+    dyn,
+    fake_stream,
+    smem_budget,
+    smem_per_sm,
+    has_tmem,
+    coop_launch_too_large,
+    dsl_compile_lock,
+)
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -599,11 +612,11 @@ _BIG_M = 131072
 def _knobs_for(M: int, C: int):
     if M > _BIG_M:
         return (2, 0, 6, 0)  # large M: occ=2 + a moderate smem cache
-    if C >= 1024:
-        return (2, 0, 0, 8)  # wide C: occ=2 + the TMEM cache
-    if M <= 32768:
+    if M <= 32768 and C < 1024:
         return (0, 8, 0, 0)  # small M: occ=1, registers only, big L1
-    return (2, 0, 0, 8)  # mid: occ=2 + the TMEM cache
+    if not has_tmem():
+        return (2, 0, 6, 0)  # no TMEM (SM90): the large-M smem tier stands in for it
+    return (2, 0, 0, 8)  # wide C or mid M: occ=2 + the TMEM cache
 
 
 def _tmem_cap(BT: int, V: int, occ: int) -> int:
@@ -615,6 +628,8 @@ def _tmem_cap(BT: int, V: int, occ: int) -> int:
     in a cooperative grid is a hang -- so this cap is a correctness constraint, not a
     tuning knob.
     """
+    if not has_tmem():
+        return 0
     return max(0, (512 // occ) // (max(1, BT // 128) * V))
 
 
@@ -670,12 +685,16 @@ def forward(
         rv = running_var if running_var is not None else torch.ones(C, dtype=torch.float32, device=x2d.device)
         nblk = max(1, min(_nsm() * 4 // max(1, cblks), (M + PPL - 1) // PPL))
         ce = (C, V, TPP, PPL, BT, cblks, nblk, it_ty, et, float(eps), has_beta)
-        key = ("infer", params.io_dtype) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
         args = (dyn(x2d), dyn(y2d), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(M))
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_bn_nhwc_infer_host, *args, *ce, fake_stream())
-            _KCACHE[key] = fn
+            with dsl_compile_lock():
+                fn = _KCACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_bn_nhwc_infer_host, *args, *ce, fake_stream())
+                    _KCACHE[key] = fn
         fn(*args, cur_stream())
         # Inference still reports the statistics it normalised with.
         saved_mean.copy_(rm.float())
@@ -706,7 +725,7 @@ def forward(
             # tcgen05_alloc leaves a garbage base address.
             smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = ce_head + (KT_occ, _UR) + ce_tail[:-2] + (smem_bytes, mbpm)
-        key = (params.io_dtype,) + ce
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
         fn = _KCACHE.get(key)
         mparts = _mparts(M, PPL, cblks, occ)
         # Partials [cblks, 2, mparts, C_tile]; every slot is written, so no zeroing.
@@ -729,14 +748,17 @@ def forward(
             cutlass.Float32(momentum),
         )
         if fn is None:
-            fn = cute.compile(_bn_nhwc_host, *args, *ce, fake_stream())
-            _KCACHE[key] = fn
+            with dsl_compile_lock():
+                fn = _KCACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_bn_nhwc_host, *args, *ce, fake_stream())
+                    _KCACHE[key] = fn
         try:
             fn(*args, cur_stream())
             _OCC[okey] = occ
             return y2d, saved_mean, saved_rstd
         except Exception as e:  # COOPERATIVE_LAUNCH_TOO_LARGE -> retry at occ=1
-            if "TOO_LARGE" in str(e) and occ == 2:
+            if coop_launch_too_large(e) and occ == 2:
                 continue
             raise
     return y2d, saved_mean, saved_rstd

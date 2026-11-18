@@ -12,8 +12,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def supported():
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("native DSA training requires SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("native DSA training requires SM100 or SM103")
     from cudnn.frost.buffers import cutedsl_requirement_error
 
     error = cutedsl_requirement_error("DSA training test")
@@ -64,7 +64,10 @@ def assert_numerics(actual, expected, tol=0.035):
         (32, 512, False, True),
         (64, 512, True, False),
         (64, 576, True, True),
+        (96, 512, True, True),
+        (96, 576, False, True),
         (128, 512, True, True),
+        (128, 576, True, True),
     ],
 )
 def test_native_training_and_original_score_slots(heads, dim, sink, lengths):
@@ -144,8 +147,8 @@ def test_stream_and_changed_input_graph_replay():
 
 
 def test_unsupported_shape_and_device_scale_fail_before_launch():
-    q, kv, idx, a, lens = inputs(128, 576)
-    with pytest.raises(NotImplementedError, match="H128 D512"):
+    q, kv, idx, a, lens = inputs(48, 576)
+    with pytest.raises(NotImplementedError, match="H16/H32/H64/H96/H128"):
         DSA.sparse_attention(q, kv, idx, a)
     q, kv, idx, a, lens = inputs()
     with pytest.raises(TypeError, match="host real"):
@@ -193,3 +196,41 @@ def test_training_graph_replay_uses_changed_inputs_and_metadata():
         for grad, tensor in zip(actual, (q, kv, a)):
             assert_numerics(grad, tensor.grad, 0.01)
     torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize("order", [((10, 0), (10, 3)), ((10, 3), (10, 0))], ids=["sm100_then_sm103", "sm103_then_sm100"])
+def test_compiled_dependencies_follow_the_device_target(monkeypatch, order):
+    """One process may drive an SM100 and an SM103 GPU: the training composition's compiled dependencies (the index compaction and
+    the attention score recompute) take the device's CuTe target per call and key their artifacts by it, so neither part reuses or
+    compiles the other's sm_100a / sm_103a code. Host-modeled: the capability is patched and cute.compile only records its target."""
+    import re
+
+    import cutlass.cute as cute
+    from cudnn.deepseek_sparse_attention.indexer_top_k import compactify as compact_mod
+    from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm100 as score_mod
+    from cudnn.deepseek_sparse_attention.utils.compiler import _ARCH_MAP, gpu_arch_flag
+
+    compiled = []
+
+    def record(kernel, *args, options=""):
+        compiled.append((type(kernel).__name__, re.search(r"--gpu-arch (\S+)", options).group(1)))
+        return lambda *a, **k: None
+
+    monkeypatch.setattr(cute, "compile", record)
+    monkeypatch.setattr(compact_mod, "_compile_cache", {})
+    monkeypatch.setattr(score_mod._sparse_attn_score_recompute, "compile_cache", {})
+    idx = torch.tensor([[1, -1, 3, 0], [2, 2, -1, -1]], dtype=torch.int32, device="cuda")
+    q = torch.zeros(1, 4, 16, 512, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, 19, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.zeros(1, 4, 16, device="cuda")
+    top = torch.zeros(1, 4, 128, device="cuda", dtype=torch.int32)
+    out = torch.empty(1, 4, 128, device="cuda")
+    for cc in order + order:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, cc=cc: cc)
+        assert gpu_arch_flag() == gpu_arch_flag(idx.device) == _ARCH_MAP[cc]
+        compact_mod.compactify(idx)
+        score_mod.sparse_attn_score_recompute(q, k, lse, top, 512**-0.5, qhead_per_kv_head=16, out=out, topk_indices_global=False)
+    want = [_ARCH_MAP[cc] for cc in order]  # one compile per part; the repeat of each part hits its own artifact
+    assert [arch for name, arch in compiled if name == "CompactifyKernel"] == want, compiled
+    assert [arch for name, arch in compiled if name == "SparseScoreRecomputeSm100"] == want, compiled
+    assert sorted(key[-1] for key in compact_mod._compile_cache) == sorted(want)

@@ -45,7 +45,7 @@ _DGRAD_OPTIMIZATIONS = frozenset(
     {
         "baseline",
         "rolling",
-        "ds3_ep4_v1",
+        "ds3_ep4_pattern",
     }
 )
 
@@ -63,8 +63,9 @@ class MoeEpTuningConfig:
 
     ``dgrad_optimization`` applies only to training backward. ``baseline``
     preserves the default grouped schedule, ``rolling`` selects the upstream
-    rolling schedule, and ``ds3_ep4_v1`` selects the strictly qualified
-    upstream preset. The DS3 profile owns its preset fields and canonicalizes
+    rolling schedule, and ``ds3_ep4_pattern`` selects the upstream preset originally
+    qualified on DS3 EP4 and now supported on additional topology and shape
+    combinations. The DS3 profile owns its preset fields and canonicalizes
     ``epi_flag_batch`` to ``(4, 2)``.
     """
 
@@ -76,7 +77,7 @@ class MoeEpTuningConfig:
     dgrad_optimization: Literal[
         "baseline",
         "rolling",
-        "ds3_ep4_v1",
+        "ds3_ep4_pattern",
     ] = "baseline"
 
     def __post_init__(self) -> None:
@@ -94,18 +95,18 @@ class MoeEpTuningConfig:
             raise ValueError("dgrad_optimization must be one of " f"{tuple(sorted(_DGRAD_OPTIMIZATIONS))}, got " f"{self.dgrad_optimization!r}")
         if self.reduce_topk_in_kernel and self.token_back_mode != "epi_warps":
             raise ValueError("reduce_topk_in_kernel requires " "token_back_mode='epi_warps'")
-        if self.dgrad_optimization != "ds3_ep4_v1":
+        if self.dgrad_optimization != "ds3_ep4_pattern":
             return
         if self.token_back_mode != "epi_warps":
-            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "token_back_mode='epi_warps'")
+            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "token_back_mode='epi_warps'")
         if self.epi_flag_batch not in ((1, 1), (4, 2)):
-            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "epi_flag_batch=(1, 1) or (4, 2)")
+            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "epi_flag_batch=(1, 1) or (4, 2)")
         if self.token_in_flag_batch != 1:
-            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "token_in_flag_batch=1")
+            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "token_in_flag_batch=1")
         if self.group_hint is not None:
-            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires group_hint=None")
+            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires group_hint=None")
         if self.reduce_topk_in_kernel:
-            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "reduce_topk_in_kernel=False")
+            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "reduce_topk_in_kernel=False")
         object.__setattr__(self, "epi_flag_batch", (4, 2))
 
 

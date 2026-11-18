@@ -1034,20 +1034,13 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
                     softmax_head = (local_softmax_warp & Int32(1)) * Int32(32) + softmax_lane
                     r_probability_vectors = cute.flat_divide(r_probability, (8,))
                     sP_vectors = cute.flat_divide(sP[softmax_head, None], (8,))
-                    if const_expr(self.indexer_topk > 0):
-                        half_vector_offset = (local_softmax_warp // Int32(2)) * Int32(self.B_TOPK // 16)
-                        for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 8):
-                            cute.autovec_copy(
-                                r_probability_vectors[None, vector],
-                                sP_vectors[None, half_vector_offset + Int32(vector)],
-                            )
-                    else:
-                        if local_softmax_warp < Int32(2):
-                            for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 8):
-                                cute.autovec_copy(r_probability_vectors[None, vector], sP_vectors[None, vector])
-                        else:
-                            for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 8):
-                                cute.autovec_copy(r_probability_vectors[None, vector], sP_vectors[None, vector + self.B_TOPK // 16])
+                    # Each warp stores its owned 32-token half of P.
+                    half_vector_offset = (local_softmax_warp // Int32(2)) * Int32(self.B_TOPK // 16)
+                    for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 8):
+                        cute.autovec_copy(
+                            r_probability_vectors[None, vector],
+                            sP_vectors[None, half_vector_offset + Int32(vector)],
+                        )
 
                     if const_expr(self.indexer_topk > 0):
                         if tile_idx == Int32(self.indexer_tile):
@@ -1252,20 +1245,14 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
         local_warp = thread_in_wg // Int32(32)
         lane = thread_in_wg % Int32(32)
 
-        # Indexer-enabled instances have enough tiles to amortize the dynamic
-        # TMEM-half address.  Load the owned half into r_left and its peer into
-        # r_right up front so the exchange below stays straight-line and does
-        # not materialize a 32-value SSA select at the warp-role merge.
-        if const_expr(self.indexer_topk > 0):
-            owned_half = local_warp // Int32(2)
-            peer_half = owned_half ^ Int32(1)
-            cute.copy(tiled_load, t_tmem[None, None, owned_half], r_left)
-            cute.copy(tiled_load, t_tmem[None, None, peer_half], r_right)
-        else:
-            # Keep tcgen05 loads out of runtime control flow on the low-
-            # pressure indexer-free specialization.
-            cute.copy(tiled_load, t_tmem[None, None, 0], r_left)
-            cute.copy(tiled_load, t_tmem[None, None, 1], r_right)
+        # Load the warp-owned score half into r_left and its peer partial into
+        # r_right, chosen by the TMEM column, so the masking and exchange below
+        # are straight-line: selecting two 32-value fragments by the local warp
+        # would merge them element by element (SEL/FSEL).
+        owned_half = local_warp // Int32(2)
+        peer_half = owned_half ^ Int32(1)
+        cute.copy(tiled_load, t_tmem[None, None, owned_half], r_left)
+        cute.copy(tiled_load, t_tmem[None, None, peer_half], r_right)
         cute.arch.fence_view_async_tmem_load()
 
         # The score slot is dead once both TMEM fragments are resident in
@@ -1274,80 +1261,42 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
         tcgen05_fence_before_thread_sync()
         qk_handle.release()
 
-        # The indexer-free specialization also serves one-tile requests.  Its
-        # lower-pressure mask-before-add form is faster for that short path;
-        # indexer-enabled kernels have at least four tiles and benefit from
-        # masking only the owned half after the peer reduction below.
-        if const_expr(self.indexer_topk == 0):
-            for i in cutlass.range_constexpr(self.B_TOPK // 2):
-                invalid = (valid_word & (Uint32(1) << i)) == Uint32(0)
-                mask_left = invalid and local_warp < Int32(2)
-                mask_right = invalid and local_warp >= Int32(2)
-                r_left[i] = -Float32.inf if mask_left else r_left[i]
-                r_right[i] = -Float32.inf if mask_right else r_right[i]
-
         # Exchange the peer partial as eight aligned float4 vectors.  The
         # (warp, vector, lane, element) layout avoids the lane*32 same-bank
         # pattern of the former scalar score surface.
         half_linear_layout = cute.make_layout((self.B_TOPK // 2,), stride=(1,))
-        r_left_linear = cute.make_tensor(r_left.iterator, half_linear_layout)
         r_right_linear = cute.make_tensor(r_right.iterator, half_linear_layout)
-        r_left_vectors = cute.flat_divide(r_left_linear, (4,))
         r_right_vectors = cute.flat_divide(r_right_linear, (4,))
         peer_warp = local_warp ^ Int32(2)
-        if const_expr(self.indexer_topk > 0):
-            for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
-                cute.autovec_copy(r_right_vectors[None, vector], sPExchange[peer_warp, vector, lane, None])
-        else:
-            if local_warp < Int32(2):
-                for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
-                    cute.autovec_copy(r_right_vectors[None, vector], sPExchange[peer_warp, vector, lane, None])
-            else:
-                for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
-                    cute.autovec_copy(r_left_vectors[None, vector], sPExchange[peer_warp, vector, lane, None])
+        for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
+            cute.autovec_copy(r_right_vectors[None, vector], sPExchange[peer_warp, vector, lane, None])
         self._softmax_pair_sync(local_warp)
 
-        if const_expr(self.indexer_topk > 0):
-            for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
-                cute.autovec_copy(sPExchange[local_warp, vector, lane, None], r_right_vectors[None, vector])
-        else:
-            if local_warp < Int32(2):
-                for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
-                    cute.autovec_copy(sPExchange[local_warp, vector, lane, None], r_right_vectors[None, vector])
-            else:
-                for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
-                    cute.autovec_copy(sPExchange[local_warp, vector, lane, None], r_left_vectors[None, vector])
+        for vector in cutlass.range_constexpr((self.B_TOPK // 2) // 4):
+            cute.autovec_copy(sPExchange[local_warp, vector, lane, None], r_right_vectors[None, vector])
         for i in cutlass.range_constexpr(0, self.B_TOPK // 2, 2):
             r_left[i], r_left[i + 1] = cute.arch.add_packed_f32x2(
                 (r_left[i], r_left[i + 1]),
                 (r_right[i], r_right[i + 1]),
             )
 
-        if const_expr(self.indexer_topk > 0):
-            # Each warp now owns one fully reduced 32-token half.  Applying
-            # the packed validity word once here is equivalent to masking its
-            # local partial before the peer add (invalid gathers are
-            # zero-filled), while avoiding a second 32-element select stream
-            # for the unowned half.
-            for i in cutlass.range_constexpr(self.B_TOPK // 2):
-                invalid = (valid_word & (Uint32(1) << i)) == Uint32(0)
-                r_left[i] = -Float32.inf if invalid else r_left[i]
+        # Each warp now owns one fully reduced 32-token half.  Applying the
+        # packed validity word once here is equivalent to masking its local
+        # partial before the peer add (invalid gathers are zero-filled), while
+        # avoiding a second 32-element select stream for the unowned half.
+        for i in cutlass.range_constexpr(self.B_TOPK // 2):
+            invalid = (valid_word & (Uint32(1) << i)) == Uint32(0)
+            r_left[i] = -Float32.inf if invalid else r_left[i]
 
         half_raw_max = -Float32.inf
         for i in cutlass.range_constexpr(self.B_TOPK // 2):
-            if const_expr(self.indexer_topk > 0):
-                half_raw_max = fmax_ftz_nonan(half_raw_max, r_left[i])
-            else:
-                half_raw_max = r_left[i] if r_left[i] > half_raw_max else half_raw_max
+            half_raw_max = fmax_ftz_nonan(half_raw_max, r_left[i])
         half_max = half_raw_max * scale_log2
         sRowMax[thread_in_wg] = half_max
         self._softmax_pair_sync(local_warp)
 
         peer_half_max = Float32(sRowMax[thread_in_wg ^ Int32(64)])
-        if const_expr(self.indexer_topk > 0):
-            tile_max = fmax_ftz_nonan(peer_half_max, half_max)
-        else:
-            tile_max = peer_half_max if peer_half_max > half_max else half_max
+        tile_max = fmax_ftz_nonan(peer_half_max, half_max)
         new_mi = old_mi
         scale_old = Float32(1.0)
 
@@ -1355,10 +1304,7 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
         # the threshold decision uniform for the same 32-head group.
         should_rescale = cute.arch.vote_any_sync(tile_max - old_mi > Float32(self.RESCALE_THRESHOLD_LOG2))
         if should_rescale:
-            if const_expr(self.indexer_topk > 0):
-                new_mi = fmax_ftz_nonan(tile_max, old_mi)
-            else:
-                new_mi = tile_max if tile_max > old_mi else old_mi
+            new_mi = fmax_ftz_nonan(tile_max, old_mi)
             scale_old = cute.math.exp2(old_mi - new_mi, fastmath=True)
 
         # Keep the two probability partial sums packed so Blackwell can issue
@@ -1381,10 +1327,7 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
         half_sum = half_sum_pair[0] + half_sum_pair[1]
 
         new_li = old_li * scale_old + half_sum
-        if const_expr(self.indexer_topk > 0):
-            new_real_max = fmax_ftz_nonan(tile_max, old_real_max)
-        else:
-            new_real_max = tile_max if tile_max > old_real_max else old_real_max
+        new_real_max = fmax_ftz_nonan(tile_max, old_real_max)
         return new_mi, new_li, new_real_max, scale_old, should_rescale, r_probability.load()
 
     @cute.jit

@@ -5,7 +5,7 @@
 
 The engines must be able to DECLINE on a machine whose CuTe DSL cannot serve
 them. That only works if the decline runs before anything imports a kernel
-module, because a kernel module imports ``cutlass.primitives`` at its top and an
+module, because a kernel module imports ``cutlass.experimental.primitives`` at its top and an
 install without it raises there -- out of the engine's reach, with the plan
 already in the ranked list.
 

@@ -23,6 +23,7 @@ import torch
 from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, requires_pre_rubin_blackwell, requires_dsl
+from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
 # Pre-Rubin Blackwell only. Most of this module drives the SM100 kernel modules
 # directly (_kernel_module loads prefill_*_sm100.py), which cc10.7 never runs --
@@ -68,43 +69,12 @@ def _ref_sdpa(q, k, v, scale, is_causal, kh, sinks=None):
     return torch.matmul(p, vb).permute(0, 2, 1, 3)
 
 
-def _partial_o_dtype(splits, o_dtype):
-    """The dtype the compiled kernel WRITES its O argument in.
-
-    Under a split the epilogue stores its fp32 accumulator registers straight to
-    the partial workspace; unsplit it TMA-stores the staged SMEM tile in O's own
-    dtype.  These tests drive the compiled kernel directly, so they have to hand
-    it the buffer the template's ABI expects rather than the caller-facing one.
-    """
-    return torch.float32 if splits > 1 else o_dtype
-
-
-def _partial_kwargs(splits, o_p):
-    """The extra ``o_partial_f32`` argument a split-compiled kernel carries.
-
-    Keyword, not positional: the slot is LAST in the kernel signature precisely
-    so the THD tensors ahead of it do not shift when it is absent.
-    """
-    return {"o_partial_f32": o_p} if splits > 1 else {}
-
-
-def _partial_tag(splits, o_dtype):
-    """The matching ``dtype_partial`` for ``sm100/split_combine.compile_ptr``.
-
-    Compiling the combine for the wrong width reinterprets the workspace and
-    yields garbage rather than an error, so it has to track _partial_o_dtype.
-    """
-    if splits > 1:
-        return "f32"
-    return "f16" if o_dtype == torch.float16 else "bf16"
-
-
 def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1, stats_log2=False, has_sink=False):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d128_f16.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/d128_f16_multi_q/kernel.py")
     kw = {
         "dtype_qkv": dtype_qkv,
         "split_kv": splits,
@@ -421,7 +391,8 @@ def test_split_kv_and_cta_mma_flavor_gating():
     # record keeps the role-split CfgD512; mma_2x2=True builds the CfgD512X2 and still honours split_kv (the fp32-partials
     # arm is in the kernel body; the ADAPTER twin keeps split plans on the role split in phase 1 -- see
     # test_sdpa_fwd_d512_2x2_sm100.test_twin_declines_split_and_g128).
-    from cudnn.sdpa.fwd.config_sm100 import CfgD512, CfgD512X2
+    from cudnn.sdpa.fwd.config_sm100 import CfgD512X2
+    from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.config import CfgD512
 
     assert isinstance(make_cfg_d512(TemplateParams())[0], CfgD512) and not isinstance(make_cfg_d512(TemplateParams())[0], CfgD512X2)
     cfg_2x2 = make_cfg_d512(TemplateParams(mma_2x2=True))[0]
@@ -442,10 +413,10 @@ def test_split_kv_and_cta_mma_flavor_gating():
 # a regression here shows up as a HANG, not a wrong number.
 
 _F16_FLAVORS = {
-    "d128": ("sm100/prefill_d128_f16.py", 128, 128),
-    "d192": ("sm100/prefill_d192_d128_f16.py", 192, 128),
-    "d256": ("sm100/prefill_d256_f16.py", 256, 256),
-    "d512": ("sm100/prefill_d512_f16.py", 512, 512),
+    "d128": ("sm100/d128_f16_multi_q/kernel.py", 128, 128),
+    "d192": ("sm100/d192_f16_multi_q/kernel.py", 192, 128),
+    "d256": ("sm100/d256_f16_lookahead/kernel.py", 256, 256),
+    "d512": ("sm100/d512_f16_role_split/kernel.py", 512, 512),
 }
 
 
@@ -769,7 +740,7 @@ def _assert_amax_is_of_the_output(amax_o, got):
 def test_split_kv_fp8(splits, cta_mma):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
-    got, ref, amax_o = _fp8_family_split("sm100/prefill_d128_fp8.py", DTYPE_E4M3, splits, cta_mma, mx=False)
+    got, ref, amax_o = _fp8_family_split("sm100/d128_fp8_multi_q/kernel.py", DTYPE_E4M3, splits, cta_mma, mx=False)
     assert (got - ref).abs().max().item() <= 5e-2
     _assert_amax_is_of_the_output(amax_o, got)
 
@@ -781,7 +752,7 @@ def test_split_kv_fp8_d192(splits, causal):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
     got, ref, amax_o = _fp8_family_split(
-        "sm100/prefill_d192_d128_fp8.py",
+        "sm100/d192_fp8_multi_q/kernel.py",
         DTYPE_E4M3,
         splits,
         2,
@@ -805,7 +776,7 @@ def test_split_kv_mxfp8_d192(in_key, splits, causal):
     dtype_qkv = DTYPE_E5M2 if in_key == "e5m2" else DTYPE_E4M3
 
     got, ref, amax_o = _fp8_family_split(
-        "sm100/prefill_d192_d128_mxfp8.py",
+        "sm100/d192_mxfp8_multi_q/kernel.py",
         dtype_qkv,
         splits,
         2,
@@ -826,7 +797,7 @@ def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d192_d128_mxfp8.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/d192_mxfp8_multi_q/kernel.py")
     params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, split_kv=2, cta_mma=2)
     mod = load_template(path, params, tag="d192_mxfp8_split_lse_stride_reject")
     with pytest.raises(ValueError, match="dense unsplit Stats"):
@@ -839,7 +810,7 @@ def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
 def test_split_kv_mxfp8(splits, cta_mma):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
-    got, ref, amax_o = _fp8_family_split("sm100/prefill_d128_mxfp8.py", DTYPE_E4M3, splits, cta_mma, mx=True)
+    got, ref, amax_o = _fp8_family_split("sm100/d128_mxfp8_multi_q/kernel.py", DTYPE_E4M3, splits, cta_mma, mx=True)
     assert (got - ref).abs().max().item() <= 1.5e-1
     _assert_amax_is_of_the_output(amax_o, got)
 
@@ -1057,7 +1028,7 @@ def test_split_kv_swa_causal(splits):
     W = 256
     B, H, SQ, SKV = 1, 4, 1024, 1024
     got, q, k, v, scale = _run_masked(
-        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, window_left=W)
+        "sm100/d128_f16_multi_q/kernel.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, window_left=W)
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True, swa_window=W)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
@@ -1071,7 +1042,7 @@ def test_split_kv_bottom_right_causal(splits):
 
     B, H, SQ, SKV = 1, 4, 128, 2048
     got, q, k, v, scale = _run_masked(
-        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, bottom_right=True)
+        "sm100/d128_f16_multi_q/kernel.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, bottom_right=True)
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True, bottom_right=True)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
@@ -1086,7 +1057,7 @@ def test_split_kv_padded_kv(splits):
     B, H, SQ, SKV = 2, 4, 128, 2048
     lens = torch.tensor([2048, 1531], dtype=torch.int32, device="cuda")  # 2nd ends mid-tile
     got, q, k, v, scale = _run_masked(
-        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens
+        "sm100/d128_f16_multi_q/kernel.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, seq_kv_lens=lens)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
@@ -1169,7 +1140,18 @@ def test_split_kv_cga1_empty_splits_multiwave(splits):
     B, H, SQ, SKV = 3, 8, 1, 4224
     lens = torch.tensor([4000, 1, 129], dtype=torch.int32, device="cuda")
     got, q, k, v, scale = _run_masked(
-        "sm100/prefill_d128_f16.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens, cta_mma=1
+        "sm100/d128_f16_multi_q/kernel.py",
+        128,
+        128,
+        splits,
+        B=B,
+        H=H,
+        KH=H,
+        SQ=SQ,
+        SKV=SKV,
+        tp_kwargs=dict(seq_kv_lens_present=True),
+        seq_kv_lens=lens,
+        cta_mma=1,
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, seq_kv_lens=lens)
     assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-3
@@ -1600,9 +1582,8 @@ def test_quantized_split_reduces_in_half_not_in_the_output_type(out_dtype):
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        # Conversion O belongs to caller scratch now. Remove that separately
-        # sized final-output region when comparing the partial reservations.
-        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
+        # Native layout binding does not reserve a final-output copy.
+        return api.scratch_workspace_bytes()
 
     assert carved(out_dtype) == carved(torch.float16) > 0
 
@@ -1676,9 +1657,8 @@ def test_api_d256_quantized_split_reduces_in_half():
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        # Conversion O belongs to caller scratch now. Remove that separately
-        # sized final-output region when comparing the partial reservations.
-        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
+        # Native layout binding does not reserve a final-output copy.
+        return api.scratch_workspace_bytes()
 
     assert carved(torch.float8_e4m3fn) == carved(torch.float16) > 0
 
@@ -1752,8 +1732,7 @@ def test_split_workspace_is_sized_for_fp32_partials(split):
     over whatever the caller placed after the workspace."""
     b, h_q, s_q, d = 1, 8, 512, 128
     api, _got, _ref, wsb = _fp32_partials_api(split, b=b, h_q=h_q, s_q=s_q, d=d)
-    assert {region[0] for region in api._staged_spec.regions} == {"q", "o"}
-    wsb -= b * h_q * s_q * d * (1 + torch.float16.itemsize)  # gathered FP8 Q and final half O
+    assert api._dense_spec.native is not None and not hasattr(api, "_staged_spec")
     o_bytes = split * b * s_q * h_q * d * 4
     lse_bytes = split * b * h_q * s_q * 4
     assert wsb >= o_bytes + lse_bytes, f"workspace {wsb} cannot hold fp32 partials ({o_bytes} O + {lse_bytes} LSE)"
@@ -1785,9 +1764,9 @@ def test_fp32_partials_fold_off_without_a_split():
     fold away and leave the single-pass SMEM/TMA epilogue byte-identical."""
     api, _got, _ref, wsb = _fp32_partials_api(1)
     assert not api._fp32_partial_split()
-    assert api._staged_spec.core.combine is None
-    # Dense conversion still owns Q/O scratch and the core scalar dummies.
-    assert wsb == 1 * 8 * 512 * 128 * (1 + torch.float16.itemsize) + 128
+    assert api._dense_spec.combine is None
+    # No layout scratch: only the scalar identity reservation remains.
+    assert wsb == 128
 
 
 # --- narrow head dims under a split -----------------------------------------

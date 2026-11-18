@@ -9,21 +9,21 @@ import pytest
 
 
 def pytest_addoption(parser):
-    parser.addoption("--require-sm100", action="store_true", help="Fail qualification if the default JAX device is not an SM100 GPU")
+    parser.addoption("--require-sm100", action="store_true", help="Fail qualification if the default JAX device is not an SM100 or SM103 GPU")
 
 
 def sm100_available():
     import jax
 
     device = jax.local_devices()[0]  # where uncommitted test arrays land
-    return device.platform == "gpu" and str(getattr(device, "compute_capability", "")) == "10.0"
+    return device.platform == "gpu" and str(getattr(device, "compute_capability", "")) in ("10.0", "10.3")
 
 
 def pytest_configure(config):
     for marker in ("L0: smoke tests", "gpu_exclusive: requires exclusive GPU access"):
         config.addinivalue_line("markers", marker)
     if config.getoption("--require-sm100", default=False) and not sm100_available():
-        raise pytest.UsageError("BSA JAX qualification requires the default JAX device to be an SM100 GPU")
+        raise pytest.UsageError("BSA JAX qualification requires the default JAX device to be an SM100 or SM103 GPU")
 
 
 @pytest.fixture(autouse=True)
@@ -31,4 +31,4 @@ def cuda_device(request):
     if request.node.name == "test_import_isolation":
         return
     if not sm100_available():
-        pytest.skip("BSA JAX tests require the default JAX device to be an SM100 GPU")
+        pytest.skip("BSA JAX tests require the default JAX device to be an SM100 or SM103 GPU")

@@ -54,6 +54,14 @@ def _run(M: int, N: int, K: int) -> None:
 
 
 def main() -> None:
+    if not torch.cuda.is_available():
+        print("[03] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[03] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     _run(512, 512, 512)
     _run(2048, 2048, 2048)
 

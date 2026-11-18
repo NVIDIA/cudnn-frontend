@@ -1,0 +1,113 @@
+{
+  "inputs": {
+    "attn_score": {
+      "dtype": "torch.float32",
+      "sha256": "99b9fc29fdbeb8fcc0d96233aa523a401e46d1b74d3d836a508bbde73f0c4aa2",
+      "shape": [
+        1,
+        1,
+        128
+      ]
+    },
+    "index_k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "e4159bf37169399ca680326ac2dacfe47c2d60ff8cca1e2a3b75dae307a45b98",
+      "shape": [
+        1,
+        256,
+        128
+      ]
+    },
+    "index_q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "04ff7e4e8dc3c7b763c8aba622e64ec2ad2cf95b829b5c08b269aabf6d4a0750",
+      "shape": [
+        1,
+        1,
+        64,
+        128
+      ]
+    },
+    "index_score": {
+      "dtype": "torch.float32",
+      "sha256": "dfdaa1252920aa258f1e3d6bd7a7f23171f1c64d9abef61ebd09c1ea43262775",
+      "shape": [
+        1,
+        1,
+        128
+      ]
+    },
+    "topk_indices": {
+      "dtype": "torch.int32",
+      "sha256": "3fe63df82e5fe735fec1cf061ae5df32f1deff7569a994c22cd5ebef25a259ef",
+      "shape": [
+        1,
+        1,
+        128
+      ]
+    },
+    "weights": {
+      "dtype": "torch.bfloat16",
+      "sha256": "7b893135d41a9144bfae26b471405ef4de8df0544656db49e62f8a463ece9be1",
+      "shape": [
+        1,
+        1,
+        64
+      ]
+    }
+  },
+  "outputs": {
+    "attn_score": {
+      "dtype": "torch.float32",
+      "sha256": "5ee9b64dc1df083a9cd42615a9be9673aae7db440ef40a7f83acf557c8bc167a",
+      "shape": [
+        1,
+        1,
+        128
+      ]
+    },
+    "d_index_k": {
+      "dtype": "torch.float32",
+      "sha256": "c0343f4c002d1efd9356b76d4a44395f8a133a2d3e2949ec573522ace17a3900",
+      "shape": [
+        1,
+        256,
+        128
+      ]
+    },
+    "d_index_q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "dfa3b7bf4640727478a33d3ac64f40fc8bbb44665c6fd42acdcce8eed7509e36",
+      "shape": [
+        1,
+        1,
+        64,
+        128
+      ]
+    },
+    "d_weights": {
+      "dtype": "torch.bfloat16",
+      "sha256": "fbafc9894614f127ee076650823d894b7f1c18f633f5c9bbbb9b3ae77563c34a",
+      "shape": [
+        1,
+        1,
+        64
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13050,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA VR NVL72",
+    "sm": [
+      10,
+      7
+    ],
+    "sm_count": 212,
+    "torch": "2.14.0a0+b2c75dd062.nv26.09",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

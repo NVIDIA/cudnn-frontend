@@ -10,8 +10,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine, sm120_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
 
@@ -44,7 +43,7 @@ def _case(dq=128, dv=128, dtype=torch.bfloat16, *, stats=True, padded=False, ove
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = select_engine(g, engine_name(arch="sm120"), pack_gqa=False)
+    chosen = select_engine(g, sm120_half_owner(dq, dv), pack_gqa=False)
     if (chosen.knobs.split_kv or 1) != split:
         from dataclasses import replace
 
@@ -319,8 +318,6 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     """Every half THD arch/flavor preserves wide strides through device descriptor setup."""
     import math
 
-    from cudnn.sdpa.fwd.engines import engine_name
-
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     b, hq, hk, ql, kl = 2, 4, 2, 1, 64
     row_stride = 2**32 + hq * d_v
@@ -336,6 +333,7 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
 
     cu_q, cu_kv = lengths("cu_q"), lengths("cu_kv")
     off_q, off_k, off_v, off_o, off_lse = [lengths(n) for n in ("off_q", "off_k", "off_v", "off_o", "off_lse")]
+    off_o.set_data_type(cudnn.data_type.INT64)
 
     def operand(name, h, s, d, offset):
         return graph.tensor(dim=[b, h, s, d], stride=[s * h * d, d, h * d, 1], data_type=bf16, name=name).set_ragged_offset(offset)
@@ -358,9 +356,10 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    want = engine_name(arch="sm120")
+    owners = sm120_half_owner(d_qk, d_v)
+    want = owners if isinstance(owners, tuple) else (owners,)
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
+    graph.select_plan(next(i for i, name in enumerate(names) if name.split("[")[0] in want))
     graph.check_support()
     graph.build_plans()
     spec = graph._compiled_plans[graph._plan_index]._prepared.spec
@@ -392,7 +391,9 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
         off_q: cq * hq * d_qk,
         off_k: ck * hk * d_qk,
         off_v: ck * hk * d_v,
-        off_o: cq * hq * d_v,
+        # Offsets are physical element addresses under the current override.
+        # A compact prefix would address row zero after division by row_stride.
+        off_o: cq.to(torch.int64) * row_stride,
         off_lse: cq * hq,
     }
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)

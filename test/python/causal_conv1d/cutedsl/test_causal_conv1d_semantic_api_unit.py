@@ -43,6 +43,7 @@ def test_signature_matches_consumed_semantics_and_hides_backend_lifecycle():
         "initial_states",
         "return_final_states",
         "final_states_out",
+        "backend",
     )
     for name in (
         "seq_idx",
@@ -50,8 +51,10 @@ def test_signature_matches_consumed_semantics_and_hides_backend_lifecycle():
         "initial_states",
         "return_final_states",
         "final_states_out",
+        "backend",
     ):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["backend"].default == "auto"
     for forbidden in (
         "wrapper",
         "sm100",
@@ -98,7 +101,7 @@ def test_ops_surface_adds_only_the_semantic_causal_conv_name():
 
 
 def test_primary_docs_do_not_promote_legacy_or_backend_api_names():
-    docs = Path(__file__).resolve().parents[4] / "docs" / "fe-oss-apis" / "causal_conv1d.md"
+    docs = Path(__file__).resolve().parents[4] / "docs" / "operations" / "causal_conv1d" / "causal_conv1d.md"
     text = docs.read_text()
 
     assert "`cudnn.ops.causal_conv1d`" in text

@@ -4,18 +4,30 @@
 
 import math
 from contextlib import nullcontext
-from copy import copy
-from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
-from .prepared import BwdLaunchSpec, Operand, ROLES
+from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
+
+
+def native_io_strides(desc):
+    """Canonical TMA strides; unused B/H/S axes carry no storage contract."""
+    from cudnn.sdpa.fwd.config_sm100 import canonical_bhsd_strides
+    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+    shape, strides = tuple(desc.shape), tuple(desc.stride)
+    if len(shape) != 4 or len(strides) != 4 or strides[-1] != 1 or not dense_layout_ok(shape, strides):
+        return None
+    strides = canonical_bhsd_strides(shape, strides)
+    if any(int(st) <= 0 or int(st) % 8 for st in strides[:-1]):
+        return None
+    return strides
 
 
 def native_io_layout(desc):
     """The declared layout can be addressed directly by the TMA chain."""
-    return len(desc.shape) == 4 and desc.stride[-1] == 1 and all(int(st) > 0 and int(st) % 8 == 0 for st in desc.stride[:-1])
+    return native_io_strides(desc) is not None
 
 
 def compile_plan(api, stage2, mm_lo, mm_hi):
@@ -23,7 +35,7 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     import torch
 
     from cudnn.frost.device import compute_capability, resolve_device
-    from .api_dsl import _sm100_device_clusters
+    from .config_sm100 import _sm100_device_clusters
     from .kernels.sm100.prepared_host import Params, compile_host
     from .kernels.sm120.prepared_host import compact
 
@@ -31,6 +43,12 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     tq = api._t_q_cap if api.thd else api.s_q_max
     tk = api._t_kv_cap if api.thd else api.s_k_max
     actual_batch = 1 if api.thd else b
+    # Independent physical origins (THD): a port bound with ragged offsets is viewed at its DECLARED capacity -- its
+    # sequences sit anywhere inside it -- while the workspace stays sized from the packed totals.
+    origins = bool(api.thd and api._thd_ro_spec)
+    ro_ports = api._thd_ro_spec if origins else {}
+    phys_q = int(api.max_total_seq_len_q) if origins else tq
+    phys_k = int(api.max_total_seq_len_kv) if origins else tk
     geometry = []
     operands = []
     for role in ROLES[:9]:
@@ -38,15 +56,23 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
         shape, strides = tuple(desc.shape), tuple(desc.stride)
         if role == "stats":
             if api.thd:
-                geom = compact((tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or tq))
+                stats_tq = phys_q if "stats" in ro_ports else tq
+                geom = compact((stats_tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or stats_tq))
             else:
                 geom = (shape[:3], strides[:3])
             alignment = 4
         else:
             if api.thd:
-                tokens = tk if role in ("k", "v", "dk", "dv") else tq
+                if role in ro_ports:
+                    tokens = phys_k if role in ("k", "v", "dk", "dv") else phys_q
+                else:
+                    tokens = tk if role in ("k", "v", "dk", "dv") else tq
                 shape = (1, shape[1], tokens, shape[3])
                 strides = (max(tokens, 1) * strides[2], *strides[1:])
+            else:
+                strides = native_io_strides(desc)
+                if strides is None:
+                    raise ValueError(f"SM100 backward {role} requires native aligned non-overlapping strides")
             geom = tuple(shape[i] for i in (0, 2, 1, 3)), tuple(strides[i] for i in (0, 2, 1, 3))
             alignment = 16
         geometry.append(geom)
@@ -54,6 +80,10 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
         span = 0 if not math.prod(shape) else 1 + sum((n - 1) * st for n, st in zip(shape, strides))
         operands.append(Operand(str(desc.dtype).split(".")[-1], shape, strides, span, alignment, desc.dtype.itemsize))
     operands.extend([Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) if api.thd else None for _ in range(2)])
+    if origins:
+        for name in api._thd_origin_dtypes:
+            width = 8 if name == "int64" else 4
+            operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
     offset = 0
 
     def region(shape, itemsize):
@@ -68,10 +98,11 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     scores = region((actual_batch, api._qh_chunk, rows, api._skv_pad), 2)
     dscores = region((actual_batch, api._qh_chunk, rows, api._skv_pad), 2)
     meta = region((THD_BWD_META_WORDS(b) if api.thd else b,), 4)
-    desc2 = region((4 * 16 if api.thd else 1,), 8)
-    desc3 = region(((b + 1) * 16,), 8) if api.thd else None
+    desc2 = region(((4 * b if origins else 4) * 16 if api.thd else 1,), 8)
+    desc3 = region(((2 * b if origins else b + 1) * 16,), 8) if api.thd else None
     dkw = region((actual_batch, tk, h, d), 2) if hk != h else None
     dvw = region((actual_batch, tk, h, d), 2) if hk != h else None
+    org = region((9, b), 8) if origins else None
     if offset != api.scratch_workspace_bytes():
         raise RuntimeError("SM100 backward prepared workspace differs from its advertised requirement")
     # Stage 2's q span per cluster: CLUSTER_Q_ROWS on the 2x2 twin, TILE_M * CTA_MMA on the role split (both 256).
@@ -81,20 +112,58 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     # the record `compile()` rendered: the group = one dQ launch per chunk, 1 = per member (`prepared_host._dq_launches`).
     params = Params(b, h, hk, d, api.s_q_max, api.s_k_max, rows, api._skv_pad, api._qh_chunk, api.thd, api._zero_ws, units, gran, int(api._dq_b_head_group))
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
-    major, minor = compute_capability(resolve_device(api.q_desc.device))
+    device_index = resolve_device(api.q_desc.device)
+    major, minor = compute_capability(device_index)
     sm = major * 10 + minor
-    regions = delta, scores, dscores, meta, desc2, desc3, dkw, dvw
+    # The origins region is appended only on an origins plan, so the compact artifact's key and carve are unchanged.
+    regions = (delta, scores, dscores, meta, desc2, desc3, dkw, dvw) + ((org,) if origins else ())
     geometry = tuple(geometry)
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (stage2, mm_lo, mm_hi)), params, geometry, regions, sm))
-    # The row's name is the spec's, the artifact symbol's (``frost_sdpa_bwd_sm100_prepared`` on the SM100 row, the cc 10.7 d512
-    # row's own on ``sdpa_bwd_sm107_d512``) and the launch spec's; the chain is the same for both.
+    if origins:
+        key = repr((key, "thd-origins", api._thd_origins, api._thd_origin_dtypes))
+    # The implementation owns its artifact symbol. Fixed SM100 stage-2 owners
+    # retain the shared chain's native binding name: that contract includes
+    # gradient-overlap validation. Adjacent adapters keep their existing names.
     name = api._NAME
-    entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key, symbol=f"frost_{name}_prepared")
+    binding_name = getattr(api, "_BINDING_NAME", name)
+    if origins:
+        entry = compile_host(
+            stage2._host_chain,
+            mm_lo._host_chain,
+            mm_hi._host_chain,
+            params,
+            geometry,
+            regions,
+            dtype,
+            sm,
+            key,
+            symbol=f"frost_{name}_prepared",
+            origin_specs=api._thd_origins,
+            origin_dtypes=api._thd_origin_dtypes,
+        )
+    else:
+        entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key, symbol=f"frost_{name}_prepared")
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("SM100 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, name, True, native_binding=True)
+    if origins:
+        from .d128_thd_contract import RAGGED_ROLES
+
+        return BwdLaunchSpec(
+            owner,
+            fn,
+            tuple(operands),
+            offset,
+            device_index,
+            api.scale_softmax,
+            binding_name,
+            True,
+            roles=ROLES[:11] + RAGGED_ROLES,
+            attributes=ATTRIBUTES[:11] + RAGGED_ROLES,
+            native_binding=True,
+        )
+    return BwdLaunchSpec(owner, fn, tuple(operands), offset, device_index, api.scale_softmax, binding_name, True, native_binding=True)
 
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):
@@ -109,7 +178,7 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
         raise ValueError(f"{spec.name} requires {spec.workspace_bytes} bytes of contiguous uint8 workspace on CUDA device {spec.device_index}")
     if current_stream is None:
         current_stream = torch.cuda.current_stream(api.q_desc.device).cuda_stream
-    facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
+    facts = dict(zip(spec.roles, map(facts_of_tensor, tensors)))
     geometry = []
     for i, op in enumerate(spec.operands):
         geom = None
@@ -127,130 +196,3 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
     with device_context:
         ensure_current_context(stream, spec.device_index)
         execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)
-
-
-@dataclass(frozen=True)
-class StagedPlan:
-    spec: BwdLaunchSpec
-    copies: tuple
-    launches: tuple
-    workspace_bytes: int
-
-
-def _copy_entry(shapes):
-    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
-
-    # Large half-precision staging amortizes block scheduling and address math
-    # across four coalesced element groups while retaining Int64 addresses.
-    artifact = compile_copy(shapes, (2,) * len(shapes), items_per_thread=4)
-    fn = positional_entry(artifact)
-    if fn is None:
-        raise NotImplementedError("SM100 backward staging requires a positional tvm-ffi entry")
-    return artifact, fn
-
-
-def compile_staged(api, stage2, mm_lo, mm_hi):
-    """Reuse the pointer chain after the already-advertised dense copies."""
-    plan = copy(api)
-    plan._stage_in = plan._stage_out = ()
-    names = {"dO": "do", "dQ": "dq", "dK": "dk", "dV": "dv"}
-    copies = []
-    for name in api._stage_in + api._stage_out:
-        role = names.get(name, name)
-        desc = getattr(api, role + "_desc")
-        b, h, s, d = desc.shape
-        strides = (s * h * d, d, h * d, 1)
-        setattr(plan, role + "_desc", replace(desc, stride=strides, stride_order=(3, 1, 2, 0)))
-        copies.append((role, tuple(desc.shape), strides))
-    spec = compile_plan(plan, stage2, mm_lo, mm_hi)
-    offset, regions = spec.workspace_bytes, []
-    for role, shape, strides in copies:
-        regions.append((role, offset, shape, strides))
-        offset += (math.prod(shape) * 2 + 127) // 128 * 128
-    if offset > api.scratch_workspace_bytes():
-        raise RuntimeError("SM100 backward staging exceeds its advertised workspace")
-    launches = []
-    for output in (False, True):
-        group = tuple(r for r in regions if (r[0] in ("dq", "dk", "dv")) == output)
-        if not group:
-            launches.append(None)
-            continue
-        shapes = tuple((b, s, h, d) for _, _, (b, h, s, d), _ in group)
-        # Potentially overlapping runtime gradient buffers retain the previous
-        # ordered copy-back semantics. Disjoint buffers share one launch.
-        serial = tuple(_copy_entry((shape,)) for shape in shapes) if output and len(group) > 1 else ()
-        launches.append((*_copy_entry(shapes), group, serial))
-    return StagedPlan(spec, tuple(regions), tuple(launches), api.scratch_workspace_bytes())
-
-
-def _copy(entry, frame, stream):
-    entry[1](*frame, stream)
-
-
-def execute_staged(api, tensors, workspace, current_stream, scale):
-    import torch
-    from cudnn._device import ensure_current_context
-    from cudnn.sdpa.fwd.prepared import BufferFacts, _covering, facts_of_tensor
-    from .prepared import _same_geometry, bind
-
-    staged = api._staged_prepared
-    spec = staged.spec
-    ws = facts_of_tensor(workspace)
-    total = staged.workspace_bytes
-    if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < total or ws.device != (2, spec.device_index):
-        raise ValueError(f"{spec.name} requires {total} bytes of contiguous uint8 caller workspace")
-    if ws.ptr % 16:
-        raise ValueError(f"{spec.name} workspace must be 16-byte aligned")
-    original = dict(zip(ROLES, tensors))
-    facts = {role: facts_of_tensor(tensor) for role, tensor in original.items()}
-    for role in ROLES[:9]:
-        f, desc = facts[role], getattr(api, role + "_desc")
-        if f is None or f.device != (2, spec.device_index) or f.dtype != str(desc.dtype).split(".")[-1]:
-            raise ValueError(f"{spec.name}: {role} must match the declared dtype and device")
-        if role == "stats":
-            if not f.contiguous or f.numel != math.prod(spec.operands[5].shape):
-                raise ValueError(f"{spec.name}: Stats must contain the declared contiguous elements")
-        elif not _same_geometry((f.shape, f.strides), (desc.shape, desc.stride)):
-            raise ValueError(f"{spec.name}: {role} must match the declared shape and strides")
-        if ws.ptr < f.ptr + f.span * desc.dtype.itemsize and f.ptr < ws.ptr + total:
-            raise ValueError(f"{spec.name}: caller workspace overlaps {role}")
-    if current_stream is None:
-        current_stream = torch.cuda.current_stream(api.q_desc.device).cuda_stream
-    frames, outputs = [], []
-    for output, entry in enumerate(staged.launches):
-        if entry is None:
-            frames.append(None)
-            continue
-        srcs, dsts, src_strides, dst_strides = [], [], [], []
-        for role, offset, shape, strides in entry[2]:
-            f = facts[role]
-            if not f.ptr or f.ptr % 2:
-                raise ValueError(f"{spec.name}: {role} requires an aligned live address")
-            if output:
-                if not _covering(f.shape, f.strides):
-                    raise ValueError(f"{spec.name}: {role} must have non-overlapping strides")
-                outputs.append(f)
-            temp = BufferFacts(ws.ptr + offset, f.dtype, ws.device, math.prod(shape), shape, strides)
-            src, dst = (temp, f) if output else (f, temp)
-            srcs.append(src.ptr)
-            dsts.append(dst.ptr)
-            src_strides.append(tuple(src.strides[i] for i in (0, 2, 1, 3)))
-            dst_strides.append(tuple(dst.strides[i] for i in (0, 2, 1, 3)))
-            facts[role] = temp
-        frames.append((tuple(srcs), tuple(dsts), tuple(src_strides), tuple(dst_strides)))
-    serial_scatter = any(a.ptr < b.ptr + b.span * 2 and b.ptr < a.ptr + a.span * 2 for i, a in enumerate(outputs) for b in outputs[i + 1 :])
-    stream = int(current_stream)
-    # Validate native operands and the core workspace before the first copy.
-    frame = bind(spec, facts, ws.ptr, stream, scale=scale)
-    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
-    with device_context:
-        ensure_current_context(stream, spec.device_index)
-        if frames[0] is not None:
-            _copy(staged.launches[0], frames[0], stream)
-        spec.fn(*frame)
-        if frames[1] is not None:
-            if serial_scatter:
-                for i, entry in enumerate(staged.launches[1][3]):
-                    _copy(entry, tuple((leaves[i],) for leaves in frames[1]), stream)
-            else:
-                _copy(staged.launches[1], frames[1], stream)

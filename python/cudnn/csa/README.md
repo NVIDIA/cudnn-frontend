@@ -10,7 +10,7 @@ that are not shared with the DSA module, which lives in
   direction. Ported from
   Megatron-LM ([PR #5984](https://github.com/NVIDIA/Megatron-LM/pull/5984), measurements
   in [issue #5968](https://github.com/NVIDIA/Megatron-LM/issues/5968)). See
-  [docs/fe-oss-apis/csa.md](../../../docs/fe-oss-apis/csa.md).
+  [docs/operations/sparse_attention/csa.md](../../../docs/operations/sparse_attention/csa.md).
 
 ## Acknowledgements
 

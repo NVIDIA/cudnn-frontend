@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The ROW-MAX FORM of the bias / kv_mask softmax body on the Rubin (SM107) f16/bf16 small head-dim tiles --
-``TemplateParams.bias_max_form`` (``CFG.BIAS_MAX_FORM``) of ``sm107/prefill_d128_f16.py``: 0 = the SOFTWARE row max over the biased,
+``TemplateParams.bias_max_form`` (``CFG.BIAS_MAX_FORM``) of ``sm107/d128_f16_multi_q/kernel.py``: 0 = the SOFTWARE row max over the biased,
 -inf-masked scores (the body as built), 1 = the HARDWARE UPPER BOUND -- the plain body's fused ``tcgen05.ld.red...max`` over the RAW
 scores plus the thread's per-ROW bias-tile max in the packed 16-bit domain (``max.bf16x2`` / ``max.f16x2`` over the words the FFMA
 reads), the online softmax on ``max_k S + max_k bias >= max_k (S + bias)``.  Any m >= the true row max is valid for the online softmax
@@ -71,6 +71,7 @@ def test_template_params_and_cfg_are_appended():
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     names = [f.name for f in dataclasses.fields(TemplateParams)]
+    names = names[: names.index("q_in_tmem") + 1]  # Later appended fields are legal.
     # appended after the two tail / quiet forms; the third softmax warp group's count (softmax_wgs, test_sdpa_softmax_wgs_sm107.py) after it
     assert names[-6:] == ["padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots", "q_in_tmem"], names[-8:]
     assert TemplateParams().bias_max_form == 0
@@ -142,7 +143,9 @@ def test_adapter_kwarg_is_appended_and_declines_typed():
     from cudnn.sdpa.fwd import api_dsl
 
     sig = inspect.signature(api_dsl.SdpaFwdDslSm100.__init__)
-    assert list(sig.parameters)[-2:] == ["bias_max_form", "softmax_wgs"] and sig.parameters["bias_max_form"].default is None
+    names = list(sig.parameters)
+    names = names[: names.index("swap_ab") + 1]  # Later appended parameters are legal.
+    assert names[-3:] == ["bias_max_form", "softmax_wgs", "swap_ab"] and sig.parameters["bias_max_form"].default is None
     assert "bias_max_form=self._resident_arm_bias_max_form()" in Path(api_dsl.__file__).read_text()
 
 
@@ -366,18 +369,19 @@ def test_hw_form_on_the_protocol_bias_ranges(monkeypatch):
 
 def _spy_loaded_forms(monkeypatch):
     """Record ``params.bias_max_form`` of every kernel module the adapter loads (the record the EXECUTED plan carries; a memoised load
-    still passes through the spy)."""
+    still passes through the spy). Explicit implementation engines bypass the legacy architecture loader, so observe the common
+    template-loader boundary used by both paths."""
     from cudnn.sdpa.fwd import api_dsl, config_sm107 as c
 
     monkeypatch.setattr(c, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", None)  # no seam: the adapter's own pick
     seen = []
-    real = api_dsl._load_sm100_kernel_module
+    real = api_dsl.load_template
 
-    def spy(flavor, params, *a, **kw):
+    def spy(path, params, *a, **kw):
         seen.append(int(getattr(params, "bias_max_form", -1)))
-        return real(flavor, params, *a, **kw)
+        return real(path, params, *a, **kw)
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", spy)
+    monkeypatch.setattr(api_dsl, "load_template", spy)
     return seen
 
 

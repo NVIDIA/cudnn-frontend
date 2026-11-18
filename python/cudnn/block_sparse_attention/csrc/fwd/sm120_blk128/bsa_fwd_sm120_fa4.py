@@ -12,7 +12,7 @@ from cutlass.experimental import primitives as prims
 import cuda.bindings.driver as cuda
 
 from cudnn.sdpa.fwd.kernels.sm120._common import ceil_div
-from cudnn.sdpa.fwd.kernels.sm120.prefill_f16 import (
+from cudnn.sdpa.fwd.kernels.sm120.f16_general.kernel import (
     SM120FusedMultiHeadAttentionForward,
     fmul2,
 )

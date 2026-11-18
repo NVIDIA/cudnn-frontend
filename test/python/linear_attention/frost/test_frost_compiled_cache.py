@@ -58,8 +58,8 @@ def _execution_context(device, stream=17):
 
 
 def _prepare_plan(monkeypatch, device):
-    slots = SimpleNamespace(inputs={}, outputs={})
-    monkeypatch.setattr(frost_engine, "bind_ports", lambda graph, variant_pack: {object(): slots})
+    ports = SimpleNamespace(inputs={}, outputs={})
+    monkeypatch.setattr(frost_engine, "bind_ports", lambda graph, variant_pack: {object(): ports})
     monkeypatch.setattr(frost_engine.Workspace, "over", lambda variant_pack, size, name: "workspace")
     compiled = _Compiled(device)
     return frost_engine.FrostLaPlan(compiled), compiled

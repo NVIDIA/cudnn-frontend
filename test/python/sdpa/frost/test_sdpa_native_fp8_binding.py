@@ -26,7 +26,7 @@ def _fixture(d, dv, split, dtype, output, *, missing=None, has_amax=True, arch="
     if arch == "sm120":
         path = path.parent / "sm120" / "prepared_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("fp8_host" if arch == "sm120" else "host"))
-    s.order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    s.order = [a.arg for a in host.args.args if a.annotation is None or "Constexpr" not in ast.unparse(a.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     s.elem_bytes = dict(q=2, k=2, v=2, o=4 if s.fp32_partial else 2)
@@ -223,14 +223,15 @@ def test_native_fp8_physical_wide_operand_address(role, product, monkeypatch, *,
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_native_fp8_paged_route_preserves_strides_and_capture(hnd, split, dtype, monkeypatch):
+@pytest.mark.parametrize("d", [128, 256])
+def test_native_fp8_paged_route_preserves_strides_and_capture(hnd, split, dtype, d, monkeypatch):
     from frost_test_utils import _dsl_installed
     from test_sdpa_prepared_fp8_paged import test_prepared_fp8_paged_strides_and_capture as check
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
         pytest.skip("SM100/SM103 and supported CuTe DSL required")
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native FP8 page pool rebuilt Python operand facts"))
-    check(hnd, split, dtype, monkeypatch)
+    check(hnd, split, dtype, d=d, monkeypatch=monkeypatch)
 
 
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])

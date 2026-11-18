@@ -4,7 +4,7 @@
 TILE_N 64, as a measured lever.
 
 With two S / P slots per softmax sub-tile the MMA warp issues BMM1(k + 1) of both sub-tiles into the free slot AHEAD of BMM2(k), so the tensor
-core runs it while the softmax warps are still on S(k) (``sm107/prefill_d128_f16.py`` at ``d_flavor`` 32 / 64; the ``sm100/decode_d128_f16.py``
+core runs it while the softmax warps are still on S(k) (``sm107/d128_f16_multi_q/kernel.py`` at ``d_flavor`` 32 / 64; the ``sm100/d128_f16_single_q/kernel.py``
 two-slot precedent).  Every role walks a depth-2 ``PipelineState`` cursor over the slots, advanced once per non-empty kv tile; the same MMAs and
 softmax steps run in the same order, so O and Stats are BITWISE the one-slot kernel's -- a pure overlap lever.  The switch is a TemplateParams
 FIELD (appended, default 1; the knob-less pick ``config_sm107.sm107_s_slots_pick`` is the MEASURED rule: 2 on the plain body at TILE_N 64, 1 on
@@ -61,10 +61,16 @@ def test_the_field_is_appended_the_seam_is_private_and_the_record_default_is_one
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-2:] == [
-        "s_slots",
-        "q_in_tmem",
-    ] and TemplateParams().s_slots == 1, "append-only; 1 renders every record byte-identically"
+    names = [f.name for f in dataclasses.fields(TemplateParams)]
+    names = names[: names.index("q_in_tmem") + 1]  # Later appended fields are legal.
+    assert (
+        names[-2:]
+        == [
+            "s_slots",
+            "q_in_tmem",
+        ]
+        and TemplateParams().s_slots == 1
+    ), "append-only; 1 renders every record byte-identically"
     assert c._S_SLOTS_OVERRIDE_FOR_SWEEPS is None, "the seam is a per-test / per-sweep pin, never a module default"
     assert c.SMALL_D_S_SLOTS == frozenset({1, 2}) and "SMALL_D_S_SLOTS" in c.__all__ and "sm107_s_slots_pick" in c.__all__
     assert c._CfgSm107.S_SLOTS == 1

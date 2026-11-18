@@ -43,6 +43,7 @@ import torch
 from cudnn.conv.frost.tile_config import CATALOG, _get_config, by_name
 
 from benchmark_utils import (
+    frost_conv_unsupported_reason,
     ConvShape,
     build_cudnn_plan,
     channels_last_stride,
@@ -338,6 +339,10 @@ def main() -> int:
     args = _parser().parse_args()
     if not torch.cuda.is_available():
         print("No CUDA device is available.", file=sys.stderr)
+        return 1
+    reason = frost_conv_unsupported_reason()
+    if reason is not None:
+        print(reason, file=sys.stderr)
         return 1
     validate_args(args)
 

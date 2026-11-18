@@ -207,7 +207,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         - Expert i processes A[padded_offsets[i-1]:padded_offsets[i], :] (with padded_offsets[-1]=0)
 
     :param deterministic: Write ``dprob`` into one slot per N-tile, ``(valid_m, n_slots, 1)``, for
-        the caller to reduce in a fixed order; see docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
+        the caller to reduce in a fixed order; see docs/operations/gemm_fusions/grouped_gemm_dglu.md.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)

@@ -16,6 +16,7 @@ measured. Use ``--configs default`` for only the heuristic choice for this
 shape, or pass comma-separated config names/globs to select a subset. Pass
 ``-o PREFIX`` to retain the cuDNN and per-config FROST reports; otherwise
 reports are temporary.
+The dense convolution template uses dynamic geometry.
 
 Example:
 
@@ -43,6 +44,7 @@ import torch
 from cudnn.conv.frost.tile_config import CATALOG, _get_config, by_name
 
 from benchmark_utils import (
+    frost_conv_unsupported_reason,
     ConvShape,
     build_cudnn_plan,
     make_parser,
@@ -119,7 +121,7 @@ def _build_frost_kernel(
     """Compile one explicitly selected convolution tile configuration."""
     from cudnn.conv.frost.templates.sm100_conv import compile
 
-    return compile(
+    compiled = compile(
         ncdhw=(shape.n, shape.c, shape.d, shape.h, shape.w),
         ktrs=(shape.k, shape.t, shape.r, shape.s),
         upper_padding_dhw=post_padding,
@@ -128,6 +130,14 @@ def _build_frost_kernel(
         dilation_dhw=dilation,
         tile_config=by_name(tile_config_name),
     )
+    import cutlass
+
+    conv_params = tuple(tuple(cutlass.Int32(value) for value in values) for values in (post_padding, pre_padding, stride, dilation))
+
+    def run(a, b, c, stream):
+        return compiled(a, b, c, stream, *conv_params)
+
+    return run
 
 
 def _execute(graph, tensors, workspace, data) -> None:
@@ -236,6 +246,10 @@ def main() -> int:
     args = _parser().parse_args()
     if not torch.cuda.is_available():
         print("No CUDA device is available.", file=sys.stderr)
+        return 1
+    reason = frost_conv_unsupported_reason()
+    if reason is not None:
+        print(reason, file=sys.stderr)
         return 1
     validate_args(args)
 

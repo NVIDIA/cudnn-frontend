@@ -29,9 +29,13 @@ BACKEND_CONFIG = {
     "fla": {"name": "FLA (Triton)", "color": "#FF8C00", "order": 0},
     "flash_qla": {"name": "FlashQLA (TileLang)", "color": "#6495ED", "order": 1},
     "flash_kda": {"name": "FlashKDA", "color": "#9370DB", "order": 2},
-    "cudnn": {"name": "cuDNN (default)", "color": "#76b900", "order": 3},
-    "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
+    "mamba_ssm": {"name": "mamba_ssm (Triton)", "color": "#B22222", "order": 2},
+    "cudnn": {"name": "cuDNN", "color": "#76b900", "order": 3},
 }
+
+# cuDNN run modes, one CSV column each: (column, legend word).  A row's mode (one bit per column) picks its legend entry, color and order.
+MODE_COLUMNS = (("checkpoint_chunks", "state on"), ("batch_invariant", "batch invariant"))
+MODE_COLORS = {1: "#2f6e00", 2: "#b3d96b", 3: "#1c4200"}
 
 LABEL_FONT_SIZE = 10
 LEGEND_FONT_SIZE = 8
@@ -55,6 +59,8 @@ CSV_COLUMNS = [
     "num_iters",
     "fwd_bw",
     "bwd_bw",
+    "checkpoint_chunks",
+    "batch_invariant",
 ]
 
 # One chart per metric: (fwd column, bwd column, y-axis label, bar label
@@ -89,8 +95,12 @@ def _clear_legend(ax, legend, margin=0.04):
         ax.set_ylim(0, max(under) / frac)
 
 
-def get_backend_display_name(backend: str, cudnn_version: Optional[str] = None) -> str:
-    return BACKEND_CONFIG.get(backend, {}).get("name", backend)
+def get_backend_display_name(backend: str, mode: int = 0, cudnn_version: Optional[str] = None) -> str:
+    name = BACKEND_CONFIG.get(backend, {}).get("name", backend)
+    if backend != "cudnn":
+        return name
+    words = [word for bit, (_, word) in enumerate(MODE_COLUMNS) if mode >> bit & 1]
+    return f"{name} ({', '.join(words) or 'default'})"
 
 
 def generate_charts(
@@ -112,12 +122,13 @@ def generate_charts(
     if df.empty:
         raise ValueError(f"No rows for variant {variant!r}")
 
-    df["backend_display"] = df["backend"].map(lambda b: get_backend_display_name(b, cudnn_version=cudnn_version))
-    df["backend_order"] = df["backend"].map(lambda b: BACKEND_CONFIG.get(b, {}).get("order", 99))
+    df["mode"] = sum((df[column] > 0).astype(int) * (1 << bit) for bit, (column, _) in enumerate(MODE_COLUMNS))
+    df["backend_display"] = df.apply(lambda row: get_backend_display_name(row["backend"], row["mode"], cudnn_version=cudnn_version), axis=1)
+    df["backend_order"] = df["backend"].map(lambda b: BACKEND_CONFIG.get(b, {}).get("order", 99)) + df["mode"]
 
     palette = {}
-    for _, row in df[["backend", "backend_display"]].drop_duplicates().iterrows():
-        palette[row["backend_display"]] = BACKEND_CONFIG.get(row["backend"], {}).get("color", "gray")
+    for _, row in df[["backend", "mode", "backend_display"]].drop_duplicates().iterrows():
+        palette[row["backend_display"]] = MODE_COLORS.get(row["mode"], BACKEND_CONFIG.get(row["backend"], {}).get("color", "gray"))
 
     x_col, group_col = ("seqlen", "batch_size") if x_axis == "seqlen" else ("batch_size", "seqlen")
     x_label = "Sequence Length" if x_axis == "seqlen" else "Batch Size"
@@ -146,7 +157,11 @@ def generate_charts(
                 fig, ax_bwd = plt.subplots(1, 1, figsize=(10, 6), dpi=150)
                 ax_fwd = None
 
-            heads = sub["num_q_heads"].iloc[0]
+            heads = sub["num_kv_heads"].iloc[0] if variant == "mamba2" else sub["num_q_heads"].iloc[0]
+            groups_label = f", B / C Heads = {sub['num_q_heads'].iloc[0]}" if variant == "mamba2" else ""
+            if variant != "mamba2" and sub["num_q_heads"].iloc[0] != sub["num_kv_heads"].iloc[0]:
+                heads = sub["num_kv_heads"].iloc[0]
+                groups_label = f", Q / K Heads = {sub['num_q_heads'].iloc[0]}"
             head_dim = sub["head_dim"].iloc[0]
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
@@ -154,7 +169,7 @@ def generate_charts(
             norm_label = "" if variant == "mamba2" else ", use_qk_l2norm = True"
             title_variant = "Mamba-2" if variant == "mamba2" else variant.upper()
             fig.suptitle(
-                f"{title_variant} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}" f"{norm_label}{gpu_info}",
+                f"{title_variant} Linear Attention (BF16) — {group_label}, Heads = {heads}{groups_label}, {dims}" f"{norm_label}{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 

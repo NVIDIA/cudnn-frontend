@@ -17,6 +17,7 @@ form (``cluster_ctas`` 4 / 8 / 16: the histogram merged over a thread-block clus
 and skip elsewhere; the single-CTA form runs on any CuTe DSL device, so the host tier covers the select itself.
 """
 
+import contextlib
 import hashlib
 import importlib
 import math
@@ -159,9 +160,24 @@ def _case(rows: int, cols: int, top_k: int, *, seed: int, device, kind: str = "r
     return logits.contiguous(), counts
 
 
+@contextlib.contextmanager
+def _skip_when_too_wide():
+    """The 1024-thread single-CTA form at ``K`` = 512 stages ``32 x (K + RANK_CAP)`` words per CTA (116144 B in all) and the cluster
+    form needs 108 - 118 KB; a part with less opt-in shared memory (cc 8.6 / 8.9 / 12.x: 101376 B) declines them by name before any
+    compile.  That decline is pinned on its own (``test_declines_a_shared_memory_need_above_the_device_limit``); a cell that only
+    needs the launch skips there with its text."""
+    try:
+        yield
+    except NotImplementedError as exc:
+        if "the row is too wide for this device" not in str(exc):
+            raise
+        pytest.skip(str(exc))
+
+
 def _run(logits, counts, top_k, **kw):
     out = torch.full((logits.shape[0], top_k), SENTINEL, dtype=torch.int32, device=logits.device)
-    topk_mod.qsa_topk_decode(logits, counts, out, **kw)
+    with _skip_when_too_wide():
+        topk_mod.qsa_topk_decode(logits, counts, out, **kw)
     return out
 
 
@@ -468,7 +484,7 @@ def test_entry_points_select_the_tensors_device_with_another_device_current(expl
     # (a) the convenience entry with another device current: compiled for the tensors' device, launched there, the caller restored
     out = torch.full((6, K), SENTINEL, dtype=torch.int32, device=device)
     side.wait_stream(torch.cuda.current_stream(target))
-    with torch.cuda.device(other):
+    with torch.cuda.device(other), _skip_when_too_wide():
         topk_mod.qsa_topk_decode(logits, counts, out, stream=handed)
         assert torch.cuda.current_device() == other, "the caller's device must be restored"
     torch.cuda.synchronize(target)
@@ -674,7 +690,8 @@ def test_a_row_stride_past_the_int32_range_passes_the_binder_and_matches_the_com
 def test_execute_form_checks_refuse_by_name():
     """Rule 1 in both directions at the run entry: dtype, rank, device, stride, alignment, width, capacity -- refused, never converted."""
     device = torch.device("cuda")
-    r = topk_mod.compile_qsa_topk_decode(cols_cap=2048, top_k=K, threads_per_cta=1024)
+    with _skip_when_too_wide():
+        r = topk_mod.compile_qsa_topk_decode(cols_cap=2048, top_k=K, threads_per_cta=1024)
     logits, counts = _case(2, 2048, K, seed=1, device=device)
     out = torch.empty(2, K, dtype=torch.int32, device=device)
     with pytest.raises(ValueError, match="counts must be a contiguous 1-D int32 CUDA tensor"):
@@ -805,7 +822,8 @@ def test_the_facade_serves_the_kernel_module_at_or_above_the_floor():
     device = torch.device("cuda")
     logits, counts = _case(6, 4096, K, seed=33, device=device)
     via_facade = torch.full((6, K), SENTINEL, dtype=torch.int32, device=device)
-    assert facade.qsa_topk_decode(logits, counts, via_facade, threads_per_cta=1024) is via_facade
+    with _skip_when_too_wide():
+        assert facade.qsa_topk_decode(logits, counts, via_facade, threads_per_cta=1024) is via_facade
     torch.cuda.synchronize()
     assert torch.equal(via_facade, _check(logits, counts, K, threads_per_cta=1024))
 

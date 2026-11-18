@@ -158,7 +158,7 @@ def test_prepared_fp8_split_output_stride_int64(arch, d, dv, output_dtype):
 
 @pytest.mark.parametrize("arch,d,dv", CASES + [pytest.param("sm100", 512, 512, marks=requires_pre_rubin_blackwell)])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_prepared_fp8_split_standalone_default_scales(arch, d, dv, output_dtype):
+def test_prepared_fp8_split_standalone_default_scales(arch, d, dv, output_dtype, *, sink=False):
     """Omitted scales use caller scratch, including a None-specialized main scale."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, SdpaFwdDslSm120
 
@@ -169,10 +169,15 @@ def test_prepared_fp8_split_standalone_default_scales(arch, d, dv, output_dtype)
         bufs[name] = (torch.randn(b, seq, heads, dim, device="cuda") * 0.4).to(torch.float8_e4m3fn).transpose(1, 2)
     bufs["o"] = torch.empty((b, sq, hq, dv), device="cuda", dtype=output_dtype).transpose(1, 2)
     bufs["amax_o"] = torch.empty(1, device="cuda")
+    if sink:
+        bufs["sinks"] = torch.linspace(-12, 12, hq, device="cuda").view(1, hq, 1, 1)
+        bufs["lse"] = torch.empty((b, hq, sq), device="cuda")
     api_type = SdpaFwdDslSm100 if arch in ("sm100", "sm107") else SdpaFwdDslSm120
     api = api_type(
         **{"sample_" + name: bufs[name] for name in ("q", "k", "v", "o")},
         pertensor_fp8=True,
+        has_sink=sink,
+        **({"sample_lse": bufs["lse"]} if sink else {}),
         pack_gqa=False,
         split_kv=4,
         **({"cga": 2} if arch in ("sm100", "sm107") and d == 192 else {}),
@@ -198,7 +203,11 @@ def test_prepared_fp8_split_standalone_default_scales(arch, d, dv, output_dtype)
                     **{name + "_tensor": bufs[name] for name in ("q", "k", "v", "o")},
                     workspace=workspace,
                     amax_o=bufs["amax_o"],
+                    **({"sinks": bufs["sinks"], "lse_tensor": bufs["lse"]} if sink else {}),
                     **scalars,
                 )
+            if sink:
+                bufs["sinks"].fill_(5 if explicit else -3)
+                bufs["lse"].fill_(float("nan"))
             graph.replay()
             shared._check(bufs, thd=False, sq=sq, skv=skv)

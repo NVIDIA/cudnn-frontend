@@ -1,4 +1,4 @@
-name: Publish docs
+name: docs
 
 # Publishes the Fern docs site with `fern generate --docs`.
 #
@@ -41,9 +41,13 @@ concurrency:
 env:
   PROD_INSTANCE: nvidia-cudnn.docs.buildwithfern.com/cudnn
   STAGING_INSTANCE: nvidia-cudnn-staging.docs.buildwithfern.com/cudnn
+  # docs/fern/fern.config.json pins Fern CLI 5.56.3. The launcher installed
+  # below (unpinned) refuses a pinned CLI older than 5.215.0 unless this is
+  # set. Remove it when the pinned version is raised (`fern upgrade`).
+  FERN_ALLOW_OLD_CLI_VERSION: "true"
 
 jobs:
-  publish:
+  fern-publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

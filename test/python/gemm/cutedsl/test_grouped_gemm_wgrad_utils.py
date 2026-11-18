@@ -229,7 +229,9 @@ def grouped_gemm_wgrad_init(
 ) -> Dict[str, Any]:
     major, minor = torch.cuda.get_device_capability()
     compute_capability = major * 10 + minor
-    if compute_capability < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Environment not supported: requires compute capability >= 100, found {compute_capability}")
 
     group_k_list = [256, 384]

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import cudnn
+import re
 from dataclasses import replace
 
 import pytest
@@ -50,6 +51,39 @@ def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_grou
     result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
     result.view(-1)[: live.numel()].copy_(live.reshape(-1))
     return result
+
+
+def _active_family():
+    try:
+        from cudnn.gemm.frost.arch_family import active_family
+
+        return active_family()
+    except Exception:  # noqa: BLE001 -- collection must not fail if the FROST import fails; the tests themselves report that
+        return "sm100"
+
+
+# Host-level checks of the sm100 tree reached through the cudnn.gemm.frost.compiler facade (or the active tile catalog).
+# The facade serves the sm100 tree everywhere except a cc 12.x process (no GPU, SM80 and SM90 included), where it is the
+# sm120 tree; skip only there.
+requires_sm100_tree = pytest.mark.skipif(
+    _active_family() != "sm100",
+    reason=f"checks the sm100 FROST GEMM tree; this process runs the {_active_family()} tree",
+)
+
+
+def plan_as_sm100(monkeypatch):
+    """The SM100 compiler, for planning-only checks of SM100 configs on any GPU.
+
+    Its arch probe and the active family's compiler's (the template gate reads that
+    one) are pinned to SM100, so the active GPU's own gate does not answer first. On
+    SM120 the active family is the sm120 tree, so the SM100 compiler is named
+    explicitly rather than reached through ``cudnn.gemm.frost.compiler``."""
+    from cudnn.gemm.frost import compiler as active
+    from cudnn.gemm.frost.sm100 import compiler as sm100
+
+    for module in {id(sm100): sm100, id(active): active}.values():
+        monkeypatch.setattr(module, "_current_arch", lambda device=None: 100)
+    return sm100
 
 
 def skip_unless_pipeline_active(cfg) -> None:
@@ -114,9 +148,11 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False):
+    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False, padded_e2m1=False):
         self.g = graph
         kw = {}
+        if padded_e2m1:
+            kw["padded_e2m1"] = True
         if swap_ab:
             config = replace(config or DEFAULT_CONFIG, swap_ab=True)
         if config is not None:
@@ -151,6 +187,36 @@ def resolve(name):
 def kw(name):
     """resolve() packaged as jit/Plan kwargs."""
     return dict(config=by_name(name))
+
+
+# --- kernel PTX -------------------------------------------------------------
+
+
+def keep_kernel_ptx(monkeypatch, compiler, dump_dir) -> None:
+    """Compile the kernels ``compiler`` (a family compiler module) renders in this test
+    with ``--keep-ptx`` and without the persistent compiled cache, whose reloaded object
+    carries no PTX; the PTX files and the generated sources (unique to ``dump_dir``) stay
+    under ``dump_dir``. :func:`kernel_ptx` reads the PTX back."""
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(dump_dir))
+    monkeypatch.setattr(compiler, "_FROST_COMPILE_OPTIONS", f"{compiler._FROST_COMPILE_OPTIONS} --keep-ptx --dump-dir={dump_dir}".strip())
+
+
+def kernel_ptx(compiled) -> str:
+    """The PTX of a plan (or :class:`Plan`) compiled under :func:`keep_kernel_ptx`."""
+    ptx = getattr(compiled, "_compiled", compiled)._launchable.__ptx__
+    assert ptx, "the kernel carries no PTX: compile it under keep_kernel_ptx"
+    return ptx
+
+
+def brev_bfind_types(ptx: str) -> list[str]:
+    """The type (``s32``, ``u32``, ...) of every ``bfind`` in ``ptx`` that reads a ``brev.b32``
+    result of the same function: each lowest-set-bit search ``31 - bfind(brev(x))``."""
+    types = []
+    for body in re.split(r"\.(?:entry|func)\s", ptx)[1:]:  # PTX registers are scoped to their function
+        reversed_regs = set(re.findall(r"\bbrev\.b32\s+(%r\d+),", body))
+        types += [t for t, src in re.findall(r"\bbfind\.([\w.]+)\s+%r\d+,\s*(%r\d+);", body) if src in reversed_regs]
+    return types
 
 
 # --- variant packs ----------------------------------------------------------
@@ -221,11 +287,15 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def to_blocked(x: torch.Tensor) -> torch.Tensor:
-    """Reorder a (rows, cols) SF tensor into the F8_128x4 blocked layout."""
+def to_blocked(x: torch.Tensor, k_pad_byte: int = 0) -> torch.Tensor:
+    """Reorder a (rows, cols) SF tensor into the F8_128x4 blocked layout.
+
+    ``k_pad_byte`` fills the K-padding slots (columns ``cols`` up to the next multiple of 4) of every row."""
     rows, cols = x.shape
     nrb, ncb = ceil_div(rows, 128), ceil_div(cols, 4)
     pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
+    if k_pad_byte:
+        pad.view(torch.uint8)[:, cols:] = k_pad_byte
     pad[:rows, :cols] = x
     blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
     return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
@@ -337,6 +407,97 @@ def assert_block_scale_reduction_close(actual, expected, mode):
         torch.testing.assert_close(actual, expected, atol=2.0, rtol=1e-4)
     else:
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
+
+
+# --- integer output reference ------------------------------------------------
+
+# Ties, fractions, both int8 / uint8 range edges, values past the int16 range and non-finite values, all exact in bf16.
+INT8_STORE_VALUES = (0.5, -0.5, 1.5, 2.5, -2.5, 2.75, -2.75, 126.5, 127.5, -127.5, 128.0, -129.0, 200.0, 255.0, 256.0, 300.0, -300.0, 40960.0, -40960.0) + (
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+)
+
+
+def int8_store_ref(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """What cuDNN's native engines store for an int8 / uint8 output (cvt.rni.sat):
+    round half to even, saturate to the dtype's range (inf included), NaN -> 0."""
+    info = torch.iinfo(out_dtype)
+    return torch.nan_to_num(x.float(), nan=0.0).round().clamp(info.min, info.max).to(out_dtype)
+
+
+# Fill byte of every quant-scale binding below; never a valid scale for the small inputs the callers use.
+SCALE_BLOB_FILL = 0xA5
+
+
+def quant_scale_bindings(shape, dtype):
+    """``(name, accepted, view, backing)`` bindings of an F8_128x4 quant-scale output of ``shape``.
+
+    The epilogue writes the packed blob from each batch plane's base and applies only the
+    batch stride, so a view is accepted when every plane is one dense byte run and the
+    planes do not overlap. ``backing`` is the whole allocation, filled with SCALE_BLOB_FILL;
+    the compact binding comes first."""
+    batch, rows, cols = shape
+    plane = rows * cols
+
+    def alloc(nbytes):
+        backing = torch.full((nbytes,), SCALE_BLOB_FILL, dtype=torch.uint8, device="cuda")
+        return backing.view(dtype), backing
+
+    bindings = []
+    view, backing = alloc(batch * plane)
+    bindings.append(("compact", True, view.view(batch, rows, cols), backing))
+    view, backing = alloc(batch * plane)
+    bindings.append(("transposed", True, view.view(batch, cols, rows).transpose(1, 2), backing))
+    view, backing = alloc(2 * batch * plane)
+    bindings.append(("row_pitch", False, view.view(batch, rows, 2 * cols)[:, :, :cols], backing))
+    view, backing = alloc(2 * batch * plane)
+    bindings.append(("element_stride", False, view.as_strided(shape, (2 * plane, 2 * cols, 2)), backing))
+    if cols > 1 and (rows - 1) % (cols - 1) == 0:
+        # Every row aliases row 0 and the column stride spreads the row's bytes over the plane:
+        # the view spans exactly its element count, which a whole-blob density check accepts.
+        view, backing = alloc(batch * plane)
+        bindings.append(("aliased_rows", False, view.as_strided(shape, (plane, 0, (plane - 1) // (cols - 1))), backing))
+    if batch > 1:
+        view, backing = alloc(2 * batch * plane)
+        bindings.append(("batch_pitch", True, view.view(batch, 2 * rows, cols)[:, :rows], backing))
+        view, backing = alloc(batch * plane)
+        bindings.append(("batch_interleaved", False, view.view(rows, batch, cols).transpose(0, 1), backing))
+        view, backing = alloc(batch * plane)
+        bindings.append(("batch_overlap", False, view.as_strided(shape, (plane // 2, cols, 1)), backing))
+    return bindings
+
+
+def assert_quant_scale_blob_guard(run, shape, dtype, others=()):
+    """``run(view)`` launches with ``view`` bound to an F8_128x4 quant-scale output of ``shape``.
+
+    A binding the epilogue cannot address must raise before any write: its allocation, and
+    ``others`` (byte views of the call's other outputs, refilled with SCALE_BLOB_FILL before
+    each such call), keep the fill byte. An accepted binding must hold, plane by plane,
+    exactly the bytes the compact one holds, and nothing outside it.
+    ``shape`` must need no 128x4 padding, so the compact blob is written in full."""
+    control = None
+    for name, accepted, view, backing in quant_scale_bindings(shape, dtype):
+        if not accepted:
+            for other in others:
+                other.fill_(SCALE_BLOB_FILL)
+            with pytest.raises(ValueError, match="packed blob"):
+                run(view)
+            torch.cuda.synchronize()
+            assert torch.all(backing == SCALE_BLOB_FILL), f"{name}: a declined call wrote its scale allocation"
+            assert all(bool(torch.all(o == SCALE_BLOB_FILL)) for o in others), f"{name}: a declined call wrote an output"
+            continue
+        run(view)
+        torch.cuda.synchronize()
+        inside = torch.zeros_like(backing, dtype=torch.bool)
+        inside.as_strided(view.shape, view.stride()).fill_(True)
+        assert torch.all(backing[~inside] == SCALE_BLOB_FILL), f"{name}: bytes outside the view were written"
+        planes = [backing[b * view.stride(0) : b * view.stride(0) + shape[1] * shape[2]] for b in range(shape[0])]
+        if control is None:
+            control = planes
+            assert not any(bool((p == SCALE_BLOB_FILL).any()) for p in planes), "the compact blob was not fully written"
+        else:
+            assert all(torch.equal(p, c) for p, c in zip(planes, control)), f"{name}: plane bytes differ from the compact blob"
 
 
 # --- shared MoE fixtures -----------------------------------------------------

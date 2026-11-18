@@ -23,6 +23,8 @@ BUFFER_NAME_FROM_CUDNN = {
     cudnn.data_type.FLOAT: "float32",
     cudnn.data_type.INT32: "int32",
     cudnn.data_type.INT64: "int64",
+    cudnn.data_type.FP8_E4M3: "float8_e4m3fn",
+    cudnn.data_type.FP8_E5M2: "float8_e5m2",
 }
 
 
@@ -124,6 +126,15 @@ class LaGraphFacts:
     wants_d_initial_state: bool = False
     wants_state_checkpoints: bool = False
     wants_transition: bool = False
+    has_composed_summaries: bool = False
+    has_composed_state: bool = False
+    output_context: bool = False  # a summary leaves its intermediates in the context buffer for the apply of the same tokens, a forward for the backward
+    input_context: bool = False  # an apply reads them back from it
+    context_from_forward: bool = False  # a backward's context was left by the forward, not by the backward summary
+    composed_state_port_dtype: Any = None
+    composed_rows: int = 0  # the rank count P' of the bound summaries
+    composed_state_dtype: Any = None
+    composed_transition_dtype: Any = None
 
     # attributes
     scale: Optional[float] = None
@@ -135,6 +146,7 @@ class LaGraphFacts:
     beta_guard: bool = False
     gate_lower_bound: Optional[float] = None
     checkpoint_every_n_tokens: int = 0
+    checkpoint_after_block: bool = False  # rows hold the state after each block (aligned end included) instead of before it
     batch_invariant: bool = False
     overwrite_initial_state: bool = False
     num_householder: int = 1
@@ -192,6 +204,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     parameter_gradients = (("dA", "a"), ("d_dt_bias", "dt_bias")) if is_mamba2 else (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))
     gate_domain = params.get("gate_domain") or "log"
     checkpoint = int(params.get("checkpoint_every_n_tokens", 0) or 0)
+    checkpoint_after_block = bool(params.get("checkpoint_after_block", False))
     num_householder = params.get("num_householder", 1)
     num_householder = 1 if num_householder is None else int(num_householder)
     batch_invariant = bool(params.get("batch_invariant", False))
@@ -199,6 +212,17 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     # The sub-token families (GDP) take k / v / beta either expanded ([T*n, H, D] / [T*n, HO]) or token-major
     # ([T, n, H, D] / [T, n, HO] with any token stride); every other family keeps the rank-3 / rank-2 forms.
     sub_token = op in ("GDP", "GDP_SUMMARY")
+    composed_state_port, composed_transition_port = (
+        ("following_state_grad", "following_transition") if is_bwd else ("preceding_state_update", "preceding_transition")
+    )
+    composed_folds_into = "d_final_state" if is_bwd else "initial_state"  # the caller's own table, optional beside the summaries
+    composed_state, composed_transition = ins.get(composed_state_port), ins.get(composed_transition_port)
+    composed = composed_state is not None or composed_transition is not None
+    composed_out = outs.get("composed_initial_state") if not is_bwd else ins.get("composed_initial_state")
+    output_context = bool(params.get("output_context", False))
+    input_context = bool(params.get("input_context", False))
+    context_from_forward = bool(params.get("context_from_forward", False))
+    cu_dim = ins["cu_seqlens"].dim if ins.get("cu_seqlens") is not None else None
 
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
@@ -207,6 +231,38 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing input(s) {missing_in}"
     elif missing_out:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
+    elif composed and (composed_state is None or composed_transition is None):
+        invalid = f"{composed_state_port} and {composed_transition_port} are bound together"
+    elif composed and not is_bwd and composed_out is None:
+        invalid = f"{composed_state_port} needs the one-row composed_initial_state output (the fold's result)"
+    elif not composed and not is_bwd and "composed_initial_state" in outs:
+        invalid = f"composed_initial_state requires {composed_state_port} and {composed_transition_port}"
+    elif not is_bwd and composed and composed_out.dim and composed_state.dim and list(composed_out.dim) != [1] + list(composed_state.dim[1:]):
+        invalid = f"composed_initial_state must be one state row [1, ...] shaped like one {composed_state_port} row {list(composed_state.dim[1:])}; got {list(composed_out.dim)}"
+    elif is_bwd and composed_out is not None and composed_out.dim and (len(composed_out.dim) != (4 if not is_mamba2 else 4) or int(composed_out.dim[0]) != 1):
+        invalid = f"composed_initial_state (the forward's one-row composed state) must be [1, ...]; got {list(composed_out.dim)}"
+    elif is_bwd and composed_out is not None and "state_indices" in ins:
+        invalid = "composed_initial_state cannot combine with state_indices"
+    elif composed and ("state_indices" in ins or overwrite_initial_state):
+        invalid = f"{composed_state_port} cannot combine with state_indices or overwrite_initial_state"
+    elif composed and composed_state.dim and composed_transition.dim and int(composed_state.dim[0]) != int(composed_transition.dim[0]):
+        invalid = f"{composed_state_port} and {composed_transition_port} must carry the same rank count; got {list(composed_state.dim)} and {list(composed_transition.dim)}"
+    elif (
+        composed
+        and composed_folds_into in ins
+        and composed_state.dim
+        and ins[composed_folds_into].dim
+        and list(composed_state.dim[1:]) != list(ins[composed_folds_into].dim[1:])
+    ):
+        invalid = f"{composed_state_port} rows must be shaped like one {composed_folds_into} row {list(ins[composed_folds_into].dim[1:])}; got {list(composed_state.dim)}"
+    elif (
+        composed
+        and composed_transition.dim
+        and composed_state.dim
+        and list(composed_transition.dim[1:])
+        != ([int(composed_state.dim[1])] if is_mamba2 else [int(composed_state.dim[1]), int(composed_state.dim[3]), int(composed_state.dim[3])])
+    ):
+        invalid = f"{composed_transition_port} must be [P, H] (Mamba-2) or [P, HO, K, K]; got {list(composed_transition.dim)}"
     elif not is_summary and "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
     elif "state_indices" in ins and "initial_state" not in ins:
@@ -236,12 +292,24 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "gate_lower_bound requires safe_gate=True"
     elif checkpoint < 0:
         invalid = "checkpoint_every_n_tokens must be non-negative"
+    elif checkpoint_after_block and checkpoint == 0:
+        invalid = "checkpoint_after_block requires checkpoint_every_n_tokens > 0"
     elif not is_bwd and not is_summary and checkpoint > 0 and "state_checkpoints" not in outs:
         invalid = "checkpoint_every_n_tokens > 0 requires the state_checkpoints output"
     elif not is_bwd and not is_summary and checkpoint == 0 and "state_checkpoints" in outs:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
-    elif is_bwd and checkpoint > 0 and "state_checkpoints" not in ins:
+    elif is_bwd and not is_summary and checkpoint > 0 and "state_checkpoints" not in ins:
         invalid = "checkpoint_every_n_tokens > 0 on a bwd node requires the state_checkpoints input"
+    elif output_context and is_bwd and not bool(params.get("output_transition", False)):
+        invalid = "output_context requires output_transition"
+    elif output_context and is_bwd and cu_dim and int(cu_dim[0]) != 2:
+        invalid = "output_context covers one local sequence"
+    elif input_context and not is_bwd and not bool(params.get("use_qk_l2norm", False)):
+        invalid = "a forward's context holds the normalized k rows, so input_context requires use_qk_l2norm"
+    elif output_context and input_context:
+        invalid = "a forward reads its summary's context or leaves one for the backward, not both"
+    elif context_from_forward and not input_context:
+        invalid = "context_from_forward names the context a backward reads, so it requires input_context"
     elif overwrite_initial_state and not is_bwd and not ("initial_state" in ins and "final_state" in outs):
         invalid = "overwrite_initial_state requires the initial_state input and the final_state output (one buffer may serve both)"
     elif overwrite_initial_state and is_bwd and not ("d_final_state" in ins and "d_initial_state" in outs):
@@ -415,6 +483,15 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         wants_d_initial_state="d_initial_state" in outs,
         wants_state_checkpoints="state_checkpoints" in outs,
         wants_transition="transition" in outs,
+        has_composed_summaries=composed,
+        has_composed_state=composed_out is not None,
+        output_context=output_context,
+        input_context=input_context,
+        context_from_forward=context_from_forward,
+        composed_state_port_dtype=(in_dt if is_bwd else out_dt).get("composed_initial_state"),
+        composed_rows=int(composed_state.dim[0]) if composed and composed_state.dim else 0,
+        composed_state_dtype=in_dt.get(composed_state_port),
+        composed_transition_dtype=in_dt.get(composed_transition_port),
         scale=float(scale) if scale is not None else None,
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
         safe_gate=safe_gate,
@@ -424,6 +501,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         beta_guard=bool(params.get("beta_guard", False)),
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,
+        checkpoint_after_block=checkpoint_after_block,
         batch_invariant=batch_invariant,
         overwrite_initial_state=overwrite_initial_state,
         num_householder=num_householder,

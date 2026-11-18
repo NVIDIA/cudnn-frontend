@@ -109,6 +109,10 @@ class KdaCakeEngine(BaseEngine):
             _decline("overwrite_initial_state is not supported (dynamic work-item scheduling)")
         if facts.has_state_indices:
             _decline("state_indices is not supported (dynamic work-item scheduling)")
+        if facts.has_composed_summaries or facts.has_composed_state:
+            _decline("composed context-parallel summaries and the composed_initial_state row (the fold into the boundary state row) are FROST-only")
+        if facts.output_context or facts.input_context:
+            _decline("the summaries' context is FROST-only")
         if facts.gate_lower_bound is not None and facts.gate_lower_bound != LOWER_BOUND:
             _decline(f"gate_lower_bound is fixed at {LOWER_BOUND}, got {facts.gate_lower_bound}")
         if facts.scale is not None and not math.isclose(facts.scale, SCALE, rel_tol=1e-9, abs_tol=1e-12):
@@ -117,6 +121,8 @@ class KdaCakeEngine(BaseEngine):
             _decline("recurrent states must be fp32")
         if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
             _decline(f"'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
+        if facts.checkpoint_after_block:
+            _decline("writes the state before each block only (checkpoint_after_block is not supported)")
         if facts.checkpoint_every_n_tokens != 16:
             _decline(f"requires checkpoint_every_n_tokens=16 (the route's checkpoint cadence), got {facts.checkpoint_every_n_tokens}")
         if facts.is_bwd:

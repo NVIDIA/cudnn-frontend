@@ -183,7 +183,7 @@ PyGraph::leaky_relu(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& i
 }
 
 void
-init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
+init_pygraph_pointwise_submodule(PyGraphClass& m) {
     m.def("add",
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::ADD>,
           py::arg("a"),

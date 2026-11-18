@@ -21,6 +21,7 @@ import cutlass
 
 import cutlass.cute as cute
 from cudnn._experimental_warnings import warn_experimental_api_once
+from cudnn._buffer_utils import check_buffers_disjoint, tensor_byte_span
 
 # ``TupleDict`` lives in the DSL-free ``cudnn._tupledict`` (the QSA front doors return it without importing this module, whose import
 # executes the DSL) and is re-exported here, so every ``from cudnn.api_base import TupleDict`` keeps resolving.
@@ -74,43 +75,6 @@ def ceil_div(a: int, b: int) -> int:
 def is_power_of_2(n: int) -> bool:
     """Check if n is a power of 2."""
     return n > 0 and (n & (n - 1)) == 0
-
-
-def tensor_byte_span(t) -> Tuple[int, int]:
-    """The half-open byte range ``[lo, hi)`` the elements of a framework tensor occupy: its base address (``data_ptr()``, the storage
-    offset included) plus the smallest and the largest element offset its shape and strides reach (a negative stride counted on the low
-    side, a zero stride on neither), the last element's bytes included; an empty tensor spans nothing (``lo == hi``).  Host arithmetic on
-    the metadata alone -- no device read, no synchronisation -- so it belongs on an execute path (Rule 1 / Rule 3)."""
-    base = int(t.data_ptr())
-    if t.numel() == 0:
-        return base, base
-    item = int(t.element_size())
-    lo = hi = 0
-    for size, stride in zip(t.shape, t.stride()):
-        if size > 1:
-            reach = (int(size) - 1) * int(stride)
-            if reach < 0:
-                lo += reach
-            else:
-                hi += reach
-    return base + lo * item, base + (hi + 1) * item
-
-
-def check_buffers_disjoint(writers, readers, *, what: str = "the kernels") -> None:
-    """Rule 1's aliasing check of an execute path: every buffer in ``writers`` (``(name, tensor)`` pairs; a ``None`` tensor is skipped) must
-    be disjoint, as a BYTE RANGE, from every buffer in ``readers`` and from the other writers.  Pointer equality is not that test: a caller's
-    view that starts inside an input (two views over one allocation) has a distinct ``data_ptr()``, and the kernel overwrites rows it has
-    still to read (measured on the triangle multiplicative update at N = 512: 16.7 M differing elements, max |diff| 2.56).  Inputs may
-    overlap each other (read-only).  A typed ``ValueError`` naming the two operands and their ranges, before any launch."""
-    spans = [(name, tensor_byte_span(t)) for name, t in writers if t is not None]
-    read = [(name, tensor_byte_span(t)) for name, t in readers if t is not None]
-    for i, (w_name, (w_lo, w_hi)) in enumerate(spans):
-        for r_name, (r_lo, r_hi) in read + spans[i + 1 :]:
-            if w_lo < r_hi and r_lo < w_hi:
-                raise ValueError(
-                    f"{w_name} must not alias {r_name}: their byte ranges intersect ({w_name} [{w_lo:#x}, {w_hi:#x}), {r_name} [{r_lo:#x}, {r_hi:#x})) "
-                    f"and {what} write {w_name} while {r_name} is still read or written; pass buffers that do not overlap"
-                )
 
 
 def is_sm107_device() -> bool:

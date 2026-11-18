@@ -197,9 +197,7 @@ def test_sm120_does_not_split_a_full_part(zero_copy):
     than a fixed 1 that only holds on one device."""
     result = _sm120_case(64, 8, 1024, 16384, zero_copy=zero_copy)
     assert result.split == result.expected_split
-    conversion_bytes = 0 if zero_copy else 2 * (64 * 1024 + 8 * 16384) * 128 * 2
-    assert result.workspace_bytes >= conversion_bytes
-    assert (result.workspace_bytes > conversion_bytes) == (result.split > 1), "only splits add partial slabs beyond the conversion buffers"
+    assert (result.workspace_bytes > 0) == (result.split > 1), "both layouts bind natively; only splits need partial slabs"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
@@ -268,8 +266,8 @@ def test_sm120_causal_split_requires_the_natural_scheduler():
 # --- An attention sink under a split ----------------------------------------
 #
 # The half templates write sink-free partials under a split and the combine
-# folds each head's sink once. The FP8 / MXFP8 templates fold it in their
-# epilogue, so they keep the pair declined (mismatch, config, adapter).
+# folds each head's sink once. Qualified D128 per-tensor FP8 lowering also
+# compiles sink-free partials; other FP8 and all MXFP8 sink splits decline.
 
 
 @pytest.mark.parametrize("split_kv", [1, 4], ids=["unsplit", "split4"])
@@ -318,8 +316,8 @@ def _sink_decode_facts(**over):
 
 
 @pytest.mark.parametrize("d", [64, 128, 256, 512])
-def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
-    """mismatch() and the template backstop admit a split sink graph at f16 / bf16 and decline it at FP8."""
+def test_sm120_split_sink_is_eligible_on_half_and_exact_fp8_d128(d):
+    """The graph admits qualified D128 FP8; a direct sink-folding template still declines the pair."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
     from cudnn.sdpa.fwd.config_sm120 import TemplateParams, validate_params
@@ -327,11 +325,14 @@ def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
 
     rows = {s.name: s.capabilities for s in ENGINE_SPECS}
     knobs = SdpaFwdKnobs(sched_policy=0, split_kv=4)
-    assert mismatch(rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None
+    from frost_test_utils import sm120_half_owner, sm120_owner
+
+    owners = sm120_half_owner(d, d)
+    assert any(mismatch(rows[o], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None for o in (owners if isinstance(owners, tuple) else (owners,)))
     if d <= 256:
         fp8 = _sink_decode_facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-        reason = mismatch(rows["sdpa_fwd_prefill_sm120_fp8"], fp8, knobs)
-        assert reason is not None and "a sink splits on the SM100, SM107 and SM120 half flavors only" in reason, reason
+        reason = mismatch(rows[sm120_owner("sdpa_fwd_prefill_sm120_fp8", d, d)], fp8, knobs)
+        assert (reason is None) == (d == 128), reason
     validate_params(TemplateParams(has_sink=True, split_kv=4))
     with pytest.raises(ValueError, match="served by the FP16/BF16 templates only"):
         validate_params(TemplateParams(dtype_qkv=DTYPE_E4M3, has_sink=True, split_kv=4), allowed_dtypes=(DTYPE_E4M3,))
@@ -347,7 +348,8 @@ def test_sm120_sink_sets_carry_the_split_choice(monkeypatch, over):
 
     monkeypatch.setattr(heuristics, "choose_split_kv", lambda **_: 4)
     rows = {s.name: s for s in ENGINE_SPECS}
-    half, facts = rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(**over)
+    # The half row's policy domain: exact D256 records are delegated to their TILE_M-named owners.
+    half, facts = heuristics.sm100_legacy_policy_spec("sdpa_fwd_prefill_sm120"), _sink_decode_facts(**over)
     sets = heuristics._knob_sets(half, facts)
     assert 4 in {knobs.split_kv for knobs in sets}, sets
     for knobs in sets:
@@ -437,19 +439,14 @@ def test_sm120_fp8_split_matches_unsplit(out_dtype):
 
 @pytest.mark.parametrize("zero_copy", [False, True])
 def test_sm120_quantized_split_reduces_in_half(zero_copy):
-    """Partials stay half; only the staged final-O buffer follows O's dtype."""
+    """Both layouts bind directly; partials stay half for either final-O dtype."""
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     _, _, _, ws_fp8 = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4, zero_copy=zero_copy)
     _, _, _, ws_half = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float16, split_kv=4, zero_copy=zero_copy)
     partials = ws_align(4 * 8 * 128 * 128 * 2) + ws_align(4 * 8 * 128 * 4)
     core = partials + ws_align(8)  # Amax scratch and the identity scalar
-    # Q needs a compact copy on the staged path; the one-head K/V already
-    # have compact physical storage. The final O copy has its own dtype.
-    q_bytes = 0 if zero_copy else ws_align(8 * 128 * 128)
-    o_elements = 0 if zero_copy else 8 * 128 * 128
-    assert ws_fp8 == core + q_bytes + ws_align(o_elements)
-    assert ws_half == core + q_bytes + ws_align(o_elements * 2)
+    assert ws_fp8 == ws_half == core
 
 
 @pytest.mark.parametrize("scale", [0.5, 2.0])
@@ -575,6 +572,8 @@ def test_sm120_direct_template_stats_base(fp8, q_tile, splits, stats_log2):
         amax = torch.zeros(1, device="cuda", dtype=torch.int32)
         unit_scale = torch.ones(1, device="cuda")
         args += [unit_scale.data_ptr()] * 4 + [amax.data_ptr(), None]
+    # Dense half and FP8 hosts retain both optional THD-origin ABI slots.
+    args += [None, None]
     raw = positional_entry(kernel)
     assert raw is not None
     raw(*args, stream)

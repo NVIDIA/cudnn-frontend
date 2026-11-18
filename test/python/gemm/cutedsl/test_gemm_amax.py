@@ -309,7 +309,9 @@ def test_gemm_amax_rejects_noncontiguous_scale_factors():
         from cudnn import gemm_amax_wrapper_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("requires SM100+")
 
     m, n, k, sf_vec_size = 512, 256, 256, 32

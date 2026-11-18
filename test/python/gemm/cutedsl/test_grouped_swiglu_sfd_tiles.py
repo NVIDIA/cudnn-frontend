@@ -14,7 +14,9 @@ pytestmark = pytest.mark.L0
 @pytest.fixture
 def api():
     capability = torch.cuda.get_device_capability()
-    if capability[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(capability[0]):
         pytest.skip("SM100+ is required")
     if capability == (10, 7):
         pytest.skip("The Rubin GLU route supports tile N=256 only; these regressions require tile N=128")

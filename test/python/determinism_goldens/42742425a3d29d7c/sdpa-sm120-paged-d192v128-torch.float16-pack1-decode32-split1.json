@@ -1,0 +1,107 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.float16",
+      "sha256": "e7a1828f1f85d0e59aa1ade830596fd548a0d34118f89f82321a3c6d850ba5de",
+      "shape": [
+        37,
+        2,
+        16,
+        192
+      ]
+    },
+    "kl": {
+      "dtype": "torch.int32",
+      "sha256": "2db923c39e877130df9d1ecd36548273b610d53157cea0153dffdd80d694c570",
+      "shape": [
+        5
+      ]
+    },
+    "kt": {
+      "dtype": "torch.int32",
+      "sha256": "ce5532f371bdf354d5d017afe44cec18ac2cc1d4793732595f15423ff5648484",
+      "shape": [
+        5,
+        5
+      ]
+    },
+    "q": {
+      "dtype": "torch.float16",
+      "sha256": "d0a1bd783afde61a845bdd8e2f63ee9b8add64a0312dd6dd80abfa1e4e4c97d7",
+      "shape": [
+        5,
+        4,
+        17,
+        192
+      ]
+    },
+    "ql": {
+      "dtype": "torch.int32",
+      "sha256": "a974b3d9980e87cdea80a0339e1a73ac63607aa603167ae94ad97b028e8def33",
+      "shape": [
+        5
+      ]
+    },
+    "sinks": {
+      "dtype": "torch.float32",
+      "sha256": "c63c3010101a79fd312b8d0e7bc3231bcd2dcdec85a6623895c8ef172771d0e3",
+      "shape": [
+        4
+      ]
+    },
+    "v": {
+      "dtype": "torch.float16",
+      "sha256": "8e13d1765825c879814c00130dad5edef870eedd044eb90860c3b5d5d6ac53ec",
+      "shape": [
+        37,
+        2,
+        16,
+        128
+      ]
+    },
+    "vt": {
+      "dtype": "torch.int32",
+      "sha256": "fae8ed2fba8dfbe1dbf586b27432cd7b6504684a4bc76fe3e03407aecfa9358f",
+      "shape": [
+        5,
+        5
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "4e4d099800f238f1c98e906daea2bcd75eda64ebd0e2522f7b4b40cd9a685ed1",
+      "shape": [
+        3,
+        4,
+        17
+      ]
+    },
+    "o": {
+      "dtype": "torch.float16",
+      "sha256": "5dcc5b4d9a8eae42bf39d66b9219c965a94c14b570809120b0cd01f489b7f7df",
+      "shape": [
+        3,
+        4,
+        17,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13040,
+    "cudnn": 93000,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA GeForce RTX 5080",
+    "sm": [
+      12,
+      0
+    ],
+    "sm_count": 84,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

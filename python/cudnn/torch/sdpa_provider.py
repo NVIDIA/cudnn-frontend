@@ -236,13 +236,19 @@ def _varlen_fwd_out(out, query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is
             False, scale=scale, window_size_left=ws[0], window_size_right=ws[1],
             seqused_k=seqused_k, block_table=block_table, num_splits=num_splits,
         )  # fmt: skip
-    o, lse, _rng = _varlen_fwd(
-        query, key, value, cu_seq_q, cu_seq_k, max_q, max_k,
-        is_causal=is_causal, scale=scale, window_size=window_size, enable_gqa=enable_gqa,
-        seqused_k=seqused_k, block_table=block_table, num_splits=num_splits,
+    is_causal, window_right = _fa_window_right_to_cudnn(is_causal, ws[1])
+    calls["fwd"] += 1
+    attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
+    # Below the dispatcher: write O straight into the caller's `out` (no extra O copy).
+    o, stats = _cudnn_ops._sdpa_fwd_impl(
+        query, key, value, attn_scale,
+        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]), window_right=window_right,
+        cu_seqlens_q=cu_seq_q, cu_seqlens_kv=cu_seq_k,
+        max_seqlen_q=max_q, max_seqlen_kv=max_k, return_lse=True, _out=out,
     )  # fmt: skip
-    out.copy_(o)
-    return lse
+    if o.data_ptr() != out.data_ptr():  # `out` not declarable as-is (_out_bindable)
+        out.copy_(o)
+    return stats.squeeze(-1).transpose(0, 1).contiguous()  # (T,H,1) -> (H,T) flash convention
 
 
 def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, rng_state, scale=None, window_size=None,):  # fmt: skip
@@ -364,7 +370,10 @@ def install_sdpa_overrides() -> SdpaOverrides:
     and its backward, and of ``torch_attn::_varlen_attn``,
     ``_varlen_attn_out`` and ``_varlen_attn_backward``. Where the varlen ops
     take a ``backend`` argument, their overrides serve only calls that
-    selected cuDNN. Returns the handle that removes them.
+    selected cuDNN. A transitional Flash-only out op stays with Torch even
+    when the forward/backward ops already select a backend. This does not
+    widen the public varlen selector's capability rules.
+    Returns the handle that removes the installed overrides.
     """
     lib = torch.library.Library("aten", "IMPL")
     lib.impl("_scaled_dot_product_cudnn_attention", _fwd, "CUDA")
@@ -372,10 +381,16 @@ def install_sdpa_overrides() -> SdpaOverrides:
     vlib = torch.library.Library("torch_attn", "IMPL")
     from torch.nn.attention import varlen as _varlen_mod  # noqa: F401 — ensure torch_attn ops are defined
 
+    selects_backend = _has_backend_arg(torch.ops.torch_attn._varlen_attn.default)
     for name, serve, serves, counter in _VARLEN_OVERRIDES:
         op = getattr(torch.ops.torch_attn, name).default
         if _has_backend_arg(op):
             vlib.impl(name, _honoring_backend(op, serve, serves, counter), "CUDA", with_keyset=True)
+        elif name == "_varlen_attn_out" and selects_backend:
+            # Transitional Torch versions select a backend for forward/backward
+            # but their out API is still Flash-only. Keep its original body:
+            # a legacy override here would steal an explicitly selected Flash call.
+            continue
         else:
             vlib.impl(name, serve, "CUDA")
     return SdpaOverrides(lib, vlib)

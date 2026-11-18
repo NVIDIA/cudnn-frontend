@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense d128 backward: graph eligibility, one launch, zero workspace, replay."""
 
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,22 +9,17 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import requires_bwd_engine_row, requires_dsl, select_engine
 from test_sdpa_bwd_dsl_sm107 import _TOL, _adapter, _bshd_empty, _build_graph, _causal_keep, _check, _half_bwd_graph, _reference64
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 _ENGINE = "sdpa_bwd_sm100_d128"
-
-
-@contextmanager
-def _recompute_route():
-    """Pin the one-launch recompute kernel: SM100 / SM103 select accumulation for every dense shape, so its
-    coverage below forces the host-side selection the way an older compiler or a negative scale would."""
-    from cudnn.sdpa.bwd import api_dsl_sm100_d128
-    from cudnn.sdpa.bwd.d128_contract import RECOMPUTE
-
-    with mock.patch.object(api_dsl_sm100_d128, "select_implementation", return_value=RECOMPUTE):
-        yield
+_RECOMPUTE_ENGINE = "sdpa_bwd_sm100_d128_recompute"
+_PAIR_ENGINE = "sdpa_bwd_sm100_d128_pair"
+_ACCUMULATION_ENGINE = "sdpa_bwd_sm100_d128_accumulation"
+# The GPU rows run on every part the row declares (its sm range: the SM100 line and, since the Rubin admission, cc 10.7 -- the bodies are
+# compiled per device, ``--gpu-arch sm_{cc}a``), read from the row; a pre-Rubin gate here would skip the one lane that proves the sm_107a body.
+requires_d128_part = requires_bwd_engine_row(_ENGINE)
 
 
 def _spec():
@@ -42,7 +36,10 @@ def _reason(monkeypatch, cc=(10, 0), **kw):
     graph, _, _ = _half_bwd_graph(d=kw.pop("d", 128), **kw)
     facts = ga.analyze(graph)
     assert facts is not None
-    return mismatch(_spec().capabilities, facts)
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS, policy_name
+
+    reasons = [mismatch(spec.capabilities, facts) for spec in ENGINE_SPECS if policy_name(spec) == _ENGINE]
+    return None if None in reasons else reasons[0]
 
 
 @pytest.mark.parametrize(
@@ -53,6 +50,9 @@ def _reason(monkeypatch, cc=(10, 0), **kw):
         dict(d=64, use_causal_mask=True, diagonal_band_left_bound=128),
         dict(use_causal_mask=True, diagonal_band_left_bound=1),
         dict(use_deterministic_algorithm=True),
+        dict(hq=4, hkv=2, use_deterministic_algorithm=True),
+        dict(d=64, hq=8, hkv=1, use_causal_mask=True, diagonal_band_left_bound=128, use_deterministic_algorithm=True),
+        dict(dt=torch.float16, hq=4, hkv=2, use_deterministic_algorithm=True),
         dict(sq=1, skv=65),
         dict(sq=257, skv=129),
     ],
@@ -73,7 +73,7 @@ def test_dense_graph_accepts(monkeypatch, kw):
         (dict(padded=True), "padding mask"),
         (dict(bias=True), "bias"),
         (dict(sink=True), "Sink"),
-        (dict(hq=4, hkv=2, use_deterministic_algorithm=True), "deterministic"),
+        (dict(hq=4, hkv=2, use_deterministic_algorithm=True, scale=-0.125), "positive"),
         (dict(thd=True, use_deterministic_algorithm=True), "deterministic"),
     ],
 )
@@ -160,10 +160,10 @@ def _case(
     d=128,
     left=None,
 ):
-    """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
-    None = leave the selection alone and expect recompute as the natural fallback (e.g. a negative scale).
-    ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance instead of demanding exact zeros
-    (the three-launch route rounds delta and dP separately, so a single-key dQ / dK is tiny but not bitwise zero)."""
+    """``accumulation`` True = the default accumulation route; False = select the explicit recompute engine;
+    None = leave the selection alone: a deterministic request takes the kernel pair under the accumulation gates, anything
+    else falls back to recompute (e.g. a negative scale).
+    ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def draw(s):
@@ -178,46 +178,60 @@ def _case(
         dk=_bshd_empty(b, sk, h, d, dt, fill=float("nan")),
         dv=_bshd_empty(b, sk, h, d, dt, fill=float("nan")),
     )
-    # The implementation is chosen while the plans are created, so the pin spans the whole build.
-    with _recompute_route() if accumulation is False else nullcontext():
-        graph, refs, outputs = _build_graph(
-            b=b,
-            hq=h,
-            sq=sq,
-            skv=sk,
-            d=d,
-            dt=dt,
-            use_causal_mask=causal,
-            scale="default" if scale is None else scale,
-            use_deterministic_algorithm=deterministic,
-            **({"diagonal_band_left_bound": left} if left is not None else {}),
-        )
-        select_engine(graph, _ENGINE)
-        before = torch.cuda.memory_allocated()
+    implementation, required = _expected_implementation(accumulation, deterministic, b, h, sq, sk, d, scale, left)
+    graph, refs, outputs = _build_graph(
+        b=b,
+        hq=h,
+        sq=sq,
+        skv=sk,
+        d=d,
+        dt=dt,
+        use_causal_mask=causal,
+        scale="default" if scale is None else scale,
+        use_deterministic_algorithm=deterministic,
+        **({"diagonal_band_left_bound": left} if left is not None else {}),
+    )
+    select_engine(graph, {"recompute": _RECOMPUTE_ENGINE, "pair": _PAIR_ENGINE, "accumulation": _ACCUMULATION_ENGINE}[implementation])
+    before = torch.cuda.memory_allocated()
+    if check_build:
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        graph.check_support()
+        graph.build_plans()
+    finally:
         if check_build:
-            torch.cuda.set_sync_debug_mode("error")
-        try:
-            graph.check_support()
-            graph.build_plans()
-        finally:
-            if check_build:
-                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.set_sync_debug_mode("default")
     if check_build:
         assert torch.cuda.memory_allocated() == before
     rounded = (sq + 127) // 128 * 128  # the accumulation workspace covers whole dQ tiles
-    required = 4 * b * h * rounded * 129 + 240 if accumulation else 0
+    required = {"accumulation": 4 * b * h * rounded * (d + 1) + 240, "pair": 4 * b * h * rounded + 240, "recompute": 0}[implementation]
     assert graph.get_workspace_size() == required
     refs.update(zip(("dq", "dk", "dv"), outputs))
     pack = {refs[n]: value for n, value in tensors.items()}
     prepared = graph._compiled_plans[graph._plan_index]._prepared
     assert prepared is not None and prepared.spec.workspace_bytes == required
-    assert prepared.spec.artifact.implementation == ("accumulation" if accumulation else "recompute")
+    assert prepared.spec.artifact.implementation == implementation
     assert len(prepared.spec.operands) == 9 and not prepared.spec.scale_log2
     workspace = torch.full((required,), 0xA5, dtype=torch.uint8, device="cuda") if required else None
     graph.execute(pack, workspace)
     case = SimpleNamespace(graph=graph, tensors=tensors, refs=refs, pack=pack, expected=expected, keep=keep, dt=dt, workspace=workspace)
     _check_case(case, allow_zero=allow_zero)
     return case
+
+
+def _expected_implementation(accumulation, deterministic, b, h, sq, sk, d, scale, left):
+    """The route ``_case`` expects: pinned accumulation / recompute, or the natural selection of a deterministic request."""
+    if accumulation is True:
+        return "accumulation", None
+    if accumulation is False or not deterministic:
+        return "recompute", None
+    from cudnn.frost.buffers import cutedsl_state
+    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION, PAIR_CCS, select_implementation
+
+    cc = torch.cuda.get_device_capability()
+    natural = select_implementation(cc, cutedsl_state()[1], b, h, sq, sk, d**-0.5 if scale is None else scale, d_qk=d, d_v=d)
+    bounded = left is None or left + 1 + sk + 2 * 128 <= 2**31 - 1
+    return ("pair" if natural == ACCUMULATION and bounded and cc in PAIR_CCS else "recompute"), None
 
 
 def _check_case(case, tensors=None, expected=None, allow_zero=False):
@@ -232,7 +246,7 @@ def _check_case(case, tensors=None, expected=None, allow_zero=False):
         _check(name, tensors[name], want, case.dt)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 @pytest.mark.parametrize(
     "dt,causal,sq,sk",
     [
@@ -251,7 +265,7 @@ def test_graph_matches_fp64(dt, causal, sq, sk):
     _case(dt=dt, causal=causal, sq=sq, sk=sk, b=b, h=h)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 def test_one_launch_without_workspace_allocation_or_sync():
     case = _case(check_build=True)
     torch.cuda.synchronize()
@@ -270,7 +284,7 @@ def test_one_launch_without_workspace_allocation_or_sync():
     _check_case(case)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 @pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_rebind_and_replay(dt, causal, deterministic):
@@ -297,13 +311,13 @@ def test_rebind_and_replay(dt, causal, deterministic):
         stream.wait_stream(torch.cuda.current_stream())
         other.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(other):
-            case.graph.execute(pack, None, handle=handle)
+            case.graph.execute(pack, case.workspace, handle=handle)
         torch.cuda.current_stream().wait_stream(stream)
         _check_case(case, tensors, expected)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.graph(capture, stream=stream):
             with torch.cuda.stream(other):
-                case.graph.execute(pack, None, handle=handle)
+                case.graph.execute(pack, case.workspace, handle=handle)
         expected = refresh()
         capture.replay()
         torch.cuda.synchronize()
@@ -313,7 +327,7 @@ def test_rebind_and_replay(dt, causal, deterministic):
         cudnn.destroy_handle(handle)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 def test_replan_reloads_artifact_without_compilation(monkeypatch, tmp_path):
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache
@@ -344,7 +358,7 @@ def test_replan_reloads_artifact_without_compilation(monkeypatch, tmp_path):
         capture.reset()
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 @pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("sq,sk", [(257, 193), (1024, 1153)])
@@ -365,7 +379,7 @@ def test_deterministic_dense_mha_repeated_eager_and_replay(dt, causal, sq, sk, c
         capture = torch.cuda.CUDAGraph()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.graph(capture, stream=stream):
-            case.graph.execute(case.pack, None, handle=cudnn_handle)
+            case.graph.execute(case.pack, case.workspace, handle=cudnn_handle)
         for replay in (False, True):
             for _ in range(3):
                 for name in expected_bits:
@@ -375,7 +389,7 @@ def test_deterministic_dense_mha_repeated_eager_and_replay(dt, causal, sq, sk, c
                     if replay:
                         capture.replay()
                     else:
-                        case.graph.execute(case.pack, None)
+                        case.graph.execute(case.pack, case.workspace)
                 finally:
                     torch.cuda.set_sync_debug_mode("default")
                 torch.cuda.synchronize()

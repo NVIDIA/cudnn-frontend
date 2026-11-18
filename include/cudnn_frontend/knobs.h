@@ -53,6 +53,23 @@ enum class KnobType_t : int64_t {
     INPUT_TMA_ENABLE      = 30,
     OUTPUT_TMA_ENABLE     = 31,
     TILE_CGA              = 32,
+    FULL_PRECISION_MATH   = 33,
+
+    // Deprecated backend knobs remain valid in offered and restored plans.
+    SPLIT_K          = 34,
+    USE_TEX          = 35,
+    KBLOCK           = 36,
+    LDGA             = 37,
+    LDGB             = 38,
+    CHUNK_K          = 39,
+    SPLIT_H          = 40,
+    WINO_TILE        = 41,
+    CTA_SPLIT_K_MODE = 42,
+    SLICED           = 43,
+    SPLIT_RS         = 44,
+    SINGLEBUFFER     = 45,
+    LDGC             = 46,
+    NUM_C_PER_BLOCK  = 47,
 
     // ---- frontend-only band -------------------------------------------------
     // Tile-scheduler policy (an engine-declared enumeration, e.g. natural /
@@ -79,6 +96,8 @@ enum class KnobType_t : int64_t {
     // Warp grid over the CTA tile for warp-scoped MMA families (sm120).
     WARPS_M = 1008,
     WARPS_N = 1009,
+    // Reduce all SPLIT_K_SLC partials inside one CTA cluster (0/1).
+    CLUSTER_K_REDUCE = 1010,
     // Knobs are performance-only: a plan must compute the same function
     // whichever knob values it runs with, so an autotuner may pick any of
     // them. Anything that changes numerics (e.g. a reduced-precision softmax
@@ -96,6 +115,9 @@ is_frontend_knob_type(KnobType_t const knob_type) {
 // The persisted values: a renumbering here silently re-targets every stored
 // (engine_id, knobs) record downstream.
 static_assert(static_cast<int64_t>(KnobType_t::TILE_CGA) == 32, "backend-mirror knob values are append-only");
+static_assert(static_cast<int64_t>(KnobType_t::FULL_PRECISION_MATH) == 33,
+              "backend-mirror knob values are append-only");
+static_assert(static_cast<int64_t>(KnobType_t::NUM_C_PER_BLOCK) == 47, "backend-mirror knob values are append-only");
 static_assert(static_cast<int64_t>(KnobType_t::SCHED_POLICY) == FRONTEND_KNOB_TYPE_BASE,
               "frontend-only knobs start at FRONTEND_KNOB_TYPE_BASE");
 
@@ -119,6 +141,50 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
         return cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED;
     }
     switch (knob_type) {
+        // Stable legacy identities avoid deprecated-enum warnings under -Werror.
+        case KnobType_t::SPLIT_K:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(0);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::USE_TEX:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(3);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::KBLOCK:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(5);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::LDGA:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(6);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::LDGB:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(7);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::CHUNK_K:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(8);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::SPLIT_H:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(9);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::WINO_TILE:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(10);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::CTA_SPLIT_K_MODE:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(16);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::SLICED:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(19);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::SPLIT_RS:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(20);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::SINGLEBUFFER:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(21);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::LDGC:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(22);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::NUM_C_PER_BLOCK:
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(32);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+
         case KnobType_t::SWIZZLE:
             cudnn_knob_type = CUDNN_KNOB_TYPE_SWIZZLE;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -231,6 +297,11 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
             // knob queries; the numeric value avoids the deprecation warning.
             cudnn_knob_type = (cudnnBackendKnobType_t)26;  // CUDNN_KNOB_TYPE_TILE_CGA
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case KnobType_t::FULL_PRECISION_MATH:
+            // A newer runtime can materialize this default in a restored plan
+            // even when FE was built against headers predating the knob.
+            cudnn_knob_type = static_cast<cudnnBackendKnobType_t>(46);
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -241,7 +312,43 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
 
 inline KnobType_t
 convert_from_backend_knob_type(cudnnBackendKnobType_t cudnn_knob_type) {
+    // Use the stable backend value so older-header builds preserve the record.
+    // Checking before the switch also avoids an out-of-enum case warning when
+    // that header's CUDNN_KNOB_TYPE_COUNTS precedes this value.
+    if (static_cast<int64_t>(cudnn_knob_type) == 46) {
+        return KnobType_t::FULL_PRECISION_MATH;
+    }
     switch (cudnn_knob_type) {
+        // Deprecation does not remove these identities from runtime plans.
+        case static_cast<cudnnBackendKnobType_t>(0):
+            return KnobType_t::SPLIT_K;
+        case static_cast<cudnnBackendKnobType_t>(3):
+            return KnobType_t::USE_TEX;
+        case static_cast<cudnnBackendKnobType_t>(5):
+            return KnobType_t::KBLOCK;
+        case static_cast<cudnnBackendKnobType_t>(6):
+            return KnobType_t::LDGA;
+        case static_cast<cudnnBackendKnobType_t>(7):
+            return KnobType_t::LDGB;
+        case static_cast<cudnnBackendKnobType_t>(8):
+            return KnobType_t::CHUNK_K;
+        case static_cast<cudnnBackendKnobType_t>(9):
+            return KnobType_t::SPLIT_H;
+        case static_cast<cudnnBackendKnobType_t>(10):
+            return KnobType_t::WINO_TILE;
+        case static_cast<cudnnBackendKnobType_t>(16):
+            return KnobType_t::CTA_SPLIT_K_MODE;
+        case static_cast<cudnnBackendKnobType_t>(19):
+            return KnobType_t::SLICED;
+        case static_cast<cudnnBackendKnobType_t>(20):
+            return KnobType_t::SPLIT_RS;
+        case static_cast<cudnnBackendKnobType_t>(21):
+            return KnobType_t::SINGLEBUFFER;
+        case static_cast<cudnnBackendKnobType_t>(22):
+            return KnobType_t::LDGC;
+        case static_cast<cudnnBackendKnobType_t>(32):
+            return KnobType_t::NUM_C_PER_BLOCK;
+
         case CUDNN_KNOB_TYPE_SWIZZLE:
             return KnobType_t::SWIZZLE;
         case CUDNN_KNOB_TYPE_TILE_SIZE:

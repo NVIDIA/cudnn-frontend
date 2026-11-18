@@ -17,7 +17,7 @@ Three tiers:
 * tier 3, on a cc 10.x device (the ``.f32x2`` ops are SM100+): the helper's output is BITWISE the
   tier-1 model over a sweep that covers integers, the clamp, the denormal edge and random fractions.
 
-The kernel that consumes it (``sdpa/fwd/kernels/sm100/prefill_d128_mxfp8.py``) pins its own
+The kernel that consumes it (``sdpa/fwd/kernels/sm100/d128_mxfp8_multi_q/kernel.py``) pins its own
 MUFU.EX2 count and its fp64-reference LSE in ``test_sdpa_fwd_mxfp8_sm100.py``.
 """
 

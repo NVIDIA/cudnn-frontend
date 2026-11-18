@@ -22,7 +22,7 @@ DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 FROST_SOURCE_DIGEST = DIGEST
 LOG2E, LN2 = math.log2(math.e), math.log(2.0)
 TILE_M, TILE_N, HEAD_DIM = 128, 64, 256
-TPC, WPC, CHUNK_KEYS, WARP, WG = 2, 4, 128, 32, 128
+TPC, WPC, WARP, WG = 2, 4, 32, 128
 GROUP = 2
 NEG_BIG = cutlass.Float32(-3.0e38)
 
@@ -74,7 +74,6 @@ def frost_qsa_fprop_dense(
         n_chunks = mRanges[coord_q, 1]
         n_tiles = n_chunks * TPC
         tile0 = k_begin // TILE_N
-        chunk0 = k_begin // CHUNK_KEYS
 
         thr_mma_qk = tiled_mma_qk.get_slice(0)
         thr_mma_pv = tiled_mma_pv.get_slice(0)
@@ -290,7 +289,8 @@ def frost_qsa_fprop_dense(
             rWords = cute.make_rmem_tensor(cute.make_layout(WPC), Int32)
             tPrP_layout = cute.make_layout(tPrP_shape)
 
-            bits_base = Int64(row_safe) * Int64(nw) + Int64(chunk0) * WPC
+            # the row's mask words start at the tile's first key chunk
+            bits_base = Int64(row_safe) * Int64(nw)
             rAhead = cute.make_rmem_tensor(cute.make_layout(WPC), Int32)
             cute.autovec_copy(cute.make_tensor(mBitsF.iterator + bits_base, cute.make_layout(WPC)), rWords)
             for ch in cutlass.range(n_chunks):

@@ -32,8 +32,9 @@ def _reference(values, bottom_right, scale):
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("bottom_right,with_sink", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("k_tile_growth", [1.0, 2.0], ids=["ordinary", "rescale"])
 @torch_fork_set_rng(seed=1391)
-def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_sink, cudnn_handle, monkeypatch):
+def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_sink, k_tile_growth, cudnn_handle, monkeypatch):
     import cudnn
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd import api_dsl
@@ -47,7 +48,7 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
 
     def record_template(path, params, *args, **kwargs):
         module = original_load(path, params, *args, **kwargs)
-        if path.endswith("/sm100/prefill_d128_f16.py") and params.d_flavor == 64:
+        if path.endswith("/sm100/d128_f16_multi_q/kernel.py") and params.d_flavor == 64:
             loaded_modules.append(module)
         return module
 
@@ -62,6 +63,9 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
             n: (torch.randn(b, s, h, d, device="cuda") * (2.0 if n != "v" else 0.5)).bfloat16().transpose(1, 2)
             for n, s, h in (("q", sq, hq), ("k", sk, hk), ("v", sk, hk))
         }
+        # Increasing key-tile magnitude forces online-max updates and O rescaling;
+        # ordinary random logits often leave that pipeline dependency dormant.
+        result["k"].mul_(k_tile_growth ** (torch.arange(sk, device="cuda") // 128)[None, None, :, None])
         if with_sink:
             result["sink"] = torch.tensor([-torch.inf, -100, 0, 9, -torch.inf, -100, 0, 9], device="cuda").view(1, hq, 1, 1)
         return result
@@ -87,7 +91,7 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
         stats.set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
-        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm100"]
+        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_sm100_d128_multi_q"]
         knobs = {
             getattr(cudnn.knob_type, n): v for n, v in dict(TILE_M=128, TILE_N=128, TILE_CGA_M=cga, PACK_GQA=int(packed), SPLIT_KV=1, SCHED_POLICY=1).items()
         }
@@ -99,6 +103,8 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
         for module in loaded_modules:
             assert module.CFG.CTA_MMA == cga
             assert module._E2E_ENABLED is (torch.cuda.get_device_capability() == (10, 0)), "the graph lost its architecture-specific exp2 path"
+            assert module._D64_EARLY_SOFTMAX_HANDOFF is (torch.cuda.get_device_capability() == (10, 0))
+            assert module._D64_JOINT_ROW_MAX is (torch.cuda.get_device_capability() == (10, 0) and cga == 1)
         workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
         def bindings():

@@ -3,9 +3,9 @@
 
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
-Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the unified SM100 engine, which selects the d128/d128, d192/d128, or d256/d256
-kernel flavor. The d128 flavor also serves the dense d<=128 head-dim envelope via
+Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) through
+the architecture's per-tensor FP8 owners. Exact SM100/SM103 D192/V128, D256 and
+D512 use explicit implementation engines. The d128 flavor also serves the dense d<=128 head-dim envelope via
 TMA zero-padding. O is validated against an fp32-dequant reference, and ``Amax_O``
 is checked against pre-cast fp32 values.
 
@@ -24,33 +24,44 @@ from typing import NamedTuple, Optional
 import pytest
 import torch
 
+import fp8_test_reference as fp8_reference
+
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import (
+    _SM,
+    fp8_engine_names,
+    assert_no_new_spills,
+    make_dense_stats,
+    requires_blackwell,
+    requires_dsl,
+    requires_pre_rubin_blackwell,
+    run_sass_probe,
+    sass_probe_source,
+)
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
+# Preserve the shared reference names used by this suite and its consumers.
+_FP8 = fp8_reference._FP8
+_E5M2_EDGE_MAX = fp8_reference._E5M2_EDGE_MAX
+_check = fp8_reference._check
+_half_atol = fp8_reference._half_atol
+_ref = fp8_reference._ref
+_ref_kwargs = fp8_reference._ref_kwargs
+
 pytestmark = [requires_blackwell, requires_dsl]
 
-# ONE per-tensor FP8 engine per arch line (sm100 = pre-Rubin Blackwell
-# 100-106, sm107 = the Rubin line): pin the engine that serves the device
-# under test.  Both lines carry all four native flavors -- d128, d192xd128,
+# The owner helper follows the device's architecture line and its migrated
+# implementation engines. Routing tests below additionally pin the exact body.
+# Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
-# -- so every flavor test below runs on both; the `_skip_*_on_rubin` markers
-# from the d128-only era are retired.  TWO Rubin declines are still true, each
-# kept as a marker with its real reason and pinned host-side in
-# test_sdpa_fwd_dsl_sm107.py:
-#   * the sm107 row packs GQA on d128 only (`pack_gqa_d_shapes = {(128, 128)}`,
-#     no PackGQA path in the wider siblings) -- a DECLARED decline
-#     (test_sm107_fp8_pack_gqa_is_d128_only); the packed d192 / d256 execute
-#     tests skip with that reason;
-# Per-tensor FP8 Stats strides are now runtime Int64 slots on all four flavors.
+# -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
+# serve PackGQA, as does the native D256 pipeline. D512 remains unpacked.
+# Per-tensor FP8 Stats strides are runtime Int64 slots on all four flavors.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(
-    _SM == 107, reason="the Rubin per-tensor FP8 row packs GQA on d128 only (pack_gqa_d_shapes; pinned by test_sm107_fp8_pack_gqa_is_d128_only)"
-)
 # Five e5m2 ids read `max|O-ref|` 0.0404-0.0423 against the shared 4e-2 e5m2 bound
 # (`_half_atol`, tightened by #971) on the 204-SM Rubin part -- a DATASET edge
 # (torch's Philox lays draws out by SM count, so the cc 10.7 tensors are not the
@@ -63,29 +74,25 @@ _skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(
 # mismatch (asserted first) or a deviation past the window all stay FATAL, and a
 # pass on another dataset is a plain pass (review on PR #1209).  Attached per param
 # combo (pytest.param) so the sibling e4m3 / dense / d256 combos are untouched.
-_E5M2_EDGE_MAX = 4.25e-2  # upper edge of the measured window (0.0404, 0.0406, 0.0409, 0.0409, 0.0423); past it the id is a real failure
 _known_e5m2_edge_on_rubin = pytest.mark.known_e5m2_edge_on_rubin
-_CURRENT_ITEM_IS_KNOWN_EDGE = False
 
 
 @pytest.fixture(autouse=True)
 def _known_e5m2_edge_scope(request):
     """Tell ``_check`` whether the running item is one of the marked ids on cc 10.7."""
-    global _CURRENT_ITEM_IS_KNOWN_EDGE
-    _CURRENT_ITEM_IS_KNOWN_EDGE = _SM == 107 and request.node.get_closest_marker("known_e5m2_edge_on_rubin") is not None
+    fp8_reference._CURRENT_ITEM_IS_KNOWN_EDGE = _SM == 107 and request.node.get_closest_marker("known_e5m2_edge_on_rubin") is not None
     yield
-    _CURRENT_ITEM_IS_KNOWN_EDGE = False
+    fp8_reference._CURRENT_ITEM_IS_KNOWN_EDGE = False
 
 
 _D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
-_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin)]
+_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 # test_fp8_pack_gqa_e5m2 only: its d128 combo is one of the five e5m2 edges.
 _D128_D256_PACK_GQA_E5M2 = [
     pytest.param(128, id="d128", marks=_known_e5m2_edge_on_rubin),
-    pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin),
+    pytest.param(256, id="d256"),
 ]
 
-_FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
 _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
@@ -96,11 +103,6 @@ _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_
 # per-(b,h) planes or as the token-major matrix a GEMM consumes (see
 # api_dsl.SdpaFwdDsl._sf_o_geometry).
 _BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
-
-
-class _ReferenceWithStats(NamedTuple):
-    output: torch.Tensor
-    stats: torch.Tensor
 
 
 class _RunResult(NamedTuple):
@@ -148,79 +150,6 @@ def _quant(x, in_key):
     fp8, fmax = _FP8[in_key], _FP8_MAX[in_key]
     dq = (x.abs().amax().clamp_min(1e-8) / fmax).item()
     return (x / dq).clamp(-fmax, fmax).to(fp8), dq
-
-
-# The kernels' softmax: 128-wide KV tiles, a running max in log2 units that moves only when a
-# tile beats it by more than config_sm100.rescale_threshold (4 at fp8), P cast to the INPUT fp8
-# type for P@V (scale_s/descale_s are accepted and ignored) while the row sum keeps the fp32 P,
-# and the sink added to the sum after the loop. sdpa.fp8_ref.compute_ref is that softmax
-# (BLOCK = 128, rescale_threshold in log2 units, sink_in_max=False); its s_scale is the cast
-# scale times 2**rescale_threshold. The d128 cell casts P * 2**4
-# (prefill_d128_fp8_sm100.P_CAST_LOG2_SCALE); the others cast P as is.
-_P_RESCALE_THRESHOLD_LOG2 = 4.0
-
-
-def _p_cast_log2_scale(d_qk):
-    return 4.0 if d_qk <= 128 else 0.0
-
-
-def _ref(
-    q8,
-    k8,
-    v8,
-    dq,
-    dk,
-    dv,
-    in_key,
-    *,
-    scale,
-    is_causal=False,
-    bottom_right=False,
-    swa_window=None,
-    right_bound=0,
-    sinks=None,
-    seq_lens_q=None,
-    seq_lens_kv=None,
-    return_stats=False,
-):
-    """sdpa.fp8_ref.compute_ref on this file's bhsd fp8 tensors (fp32 O, natural-log LSE [b, h, s])."""
-    import cudnn
-    from sdpa.fp8_ref import compute_ref
-
-    b, h_q, s_q, d_qk = q8.shape
-    s_kv = k8.shape[2]
-    dev = q8.device
-    padding = None
-    if seq_lens_q is not None or seq_lens_kv is not None:
-        padding = (
-            torch.as_tensor(seq_lens_q if seq_lens_q is not None else [s_q] * b, dtype=torch.int32, device=dev),
-            torch.as_tensor(seq_lens_kv if seq_lens_kv is not None else [s_kv] * b, dtype=torch.int32, device=dev),
-        )
-    s_scale = 2.0 ** (_p_cast_log2_scale(d_qk) + _P_RESCALE_THRESHOLD_LOG2)
-    o, stats, _ = compute_ref(
-        q8.transpose(1, 2),
-        k8.transpose(1, 2),
-        v8.transpose(1, 2),
-        attn_scale=scale,
-        q_descale=dq,
-        k_descale=dk,
-        v_descale=dv,
-        s_scale=s_scale,
-        s_descale=1.0 / s_scale,
-        torch_itype=_FP8[in_key],
-        torch_otype=torch.float16,
-        padding=padding,
-        left_bound=(swa_window + 1) if swa_window is not None else None,
-        right_bound=right_bound if is_causal else None,
-        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT,
-        sink_token=sinks.view(1, h_q, 1, 1) if sinks is not None else None,
-        rescale_threshold=_P_RESCALE_THRESHOLD_LOG2,
-        dtype=torch.float64,
-        quantize_o=False,
-        sink_in_max=False,
-    )
-    o = o.transpose(1, 2)
-    return _ReferenceWithStats(o, stats.squeeze(-1)) if return_stats else o
 
 
 def _run(
@@ -374,7 +303,7 @@ def _run(
     g.create_execution_plans([cudnn.heur_mode.A])
     # ONE fp8 engine per arch line — kernel-flavor choice (d128 vs d192xd128,
     # and the head-dim envelope) happens inside the lowering.
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True), pack_gqa=pack_gqa)
+    _select_engine(g, fp8_engine_names(_D128_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     if not stats:
@@ -438,59 +367,6 @@ def _run(
     return _RunResult(Ob, _gated(o_ref_ungated), amax_o.item(), o_ref_ungated.abs().max().item())
 
 
-def _ref_kwargs(sdpa_kwargs):
-    out = {}
-    if sdpa_kwargs.get("use_causal_mask"):
-        out["is_causal"] = True
-    if sdpa_kwargs.get("use_causal_mask_bottom_right"):
-        out["is_causal"] = True
-        out["bottom_right"] = True
-    right_bound = sdpa_kwargs.get("right_bound")
-    if right_bound is not None:
-        out["is_causal"] = True
-        out["right_bound"] = right_bound
-    diagonal_alignment = sdpa_kwargs.get("diagonal_alignment")
-    if diagonal_alignment is not None:
-        import cudnn
-
-        out["bottom_right"] = diagonal_alignment == cudnn.diagonal_alignment.BOTTOM_RIGHT
-    lb = sdpa_kwargs.get("left_bound")
-    if lb is not None:
-        out["swa_window"] = lb - 1
-    return out
-
-
-def _half_atol(in_key, d_v=None):
-    # _ref casts P the way the kernels do, so this is the residual of what the
-    # reference does NOT mirror. d128/d192/d512 cells: exp2 is MUFU, the cast
-    # reference matches to <= 0.006 (fp64, offline) except the d192 e5m2+sink
-    # path, whose kernel scales the rescale threshold by log2(e) (0.03). The
-    # d256 cell computes exp2 with ex2_emulation_2 (degree-1/2 polynomial) on
-    # part of every tile and, under a plain causal mask, for the rescale factor
-    # too: ~40% of its P values sit one fp8 step off an exact-exp2 cast, up to
-    # 0.058 on the suite's data (pack_gqa_ratios[d256-g16_mqa]).
-    return 7.5e-2 if d_v == 256 else 4e-2
-
-
-def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref, atol=None):
-    if atol is None:
-        atol = _half_atol(in_key, out.shape[-1])
-    diff = (out.float() - o_ref).abs().max().item()
-    if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
-        floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
-        atol = max(atol, 3.0 * floor)
-    # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32
-    # values), so they match the exact fp32 reference for every output dtype, incl. FP8.
-    # Asserted BEFORE the O comparison so the known-edge xfail below can never hide it.
-    assert abs(amax_o - amax_o_ref) <= 0.03, f"amax_o {amax_o:.4f} vs ref {amax_o_ref:.4f}"
-    if diff > atol and _CURRENT_ITEM_IS_KNOWN_EDGE and diff <= _E5M2_EDGE_MAX:
-        pytest.xfail(
-            f"known e5m2 dataset edge on the 204-SM Rubin part: max|O-ref|={diff:.4f} in ({atol:.4f}, {_E5M2_EDGE_MAX:.4f}] "
-            "-- the bound is not widened; build, run and Amax_O stayed fatal (PR #1209)"
-        )
-    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f}"
-
-
 _INS = ["e4m3", "e5m2"]
 _MASKS = {
     "none": {},
@@ -512,7 +388,7 @@ def test_known_e5m2_edge_is_scoped_to_the_o_compare(monkeypatch):
     atol = _half_atol("e5m2", 8)  # 4e-2
 
     def run(diff, amax_off=0.0, marked=True):
-        monkeypatch.setitem(globals(), "_CURRENT_ITEM_IS_KNOWN_EDGE", marked)
+        monkeypatch.setattr(fp8_reference, "_CURRENT_ITEM_IS_KNOWN_EDGE", marked)
         out = ref.clone()
         out[0, 0] = diff
         _check(out, ref, torch.float16, "e5m2", 1.0 + amax_off, 1.0)
@@ -800,27 +676,19 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 
 @pytest.mark.L0
-def test_fp8_large_flavors_serve_exact_shapes_only():
-    """The d192xd128 and D256 per-tensor FP8 flavors serve ONLY their exact shapes.
-    With d_qk zero-padded into d192 (144/160/176) the output is wrong (test_mhas_v2
-    fp8 fwd: 4-19% of elements off by O(1)); the D256 padded envelope shows
-    run-to-run nondeterminism on long causal e5m2/GQA/sink graphs (a case passes
-    alone and fails in the battery). The engine row floors both (128 / 255), the
-    adapter mirrors the floors, and both flavor selections honour them, so the
-    inexact (128, 256) region is declined everywhere -- the classic backend verdict
-    applies -- while the d128 flavor's envelope and the d512 band are unchanged.
-    The floor table is arch-independent (contract rule 8b'), so both rows are pinned."""
+def test_fp8_d256_dense_envelope_matches_adapter():
+    """Pin the shared D256 dense-envelope domain on both native arch lines."""
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert _SM100_FP8_ENVELOPE_FLOORS[(192, 128)] == 128 and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
+    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256}
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(192, 128): 128, (256, 256): 255, (512, 512): 256}, arch
+        assert dict(spec.capabilities.d_envelope_floors) == {(512, 512): 256}, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    for d_qk, d_v in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
-        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in ((96, 96), (128, 64), (320, 320)):
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in ((96, 96), (128, 64), (160, 96), (176, 128), (192, 96), (320, 320)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
     B, H, S, dev = 2, 4, 384, "cuda"
@@ -833,18 +701,14 @@ def test_fp8_large_flavors_serve_exact_shapes_only():
         lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
         return SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=1.0 / math.sqrt(d_qk), pertensor_fp8=True)
 
-    for d_qk, d_v, want in ((192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
+    for d_qk, d_v, want in ((160, 96, (192, 128)), (176, 128, (192, 128)), (192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
         api = _api(d_qk, d_v)
         assert api.check_support(), (d_qk, d_v)
         assert tuple(api.flavor) == want, (d_qk, d_v, api.flavor)
-    for d_qk, d_v in ((160, 96), (224, 208)):
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
         api = _api(d_qk, d_v)
-        try:
-            supported = api.check_support()
-        except ValueError as exc:  # the adapter may surface the envelope gate as a raise
-            supported = False
-            assert "floors" in str(exc), str(exc)
-        assert not supported, (d_qk, d_v)
+        assert api.check_support(), (d_qk, d_v)
+        assert tuple(api.flavor) == (256, 256), (d_qk, d_v, api.flavor)
 
 
 @pytest.mark.L0
@@ -1304,7 +1168,6 @@ def test_fp8_pack_gqa_e5m2(d):
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (16, 2)], ids=["g2", "g4", "g8"])
 @torch_fork_set_rng(seed=0)
@@ -1330,7 +1193,6 @@ def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_grouped_lpt():
@@ -1358,7 +1220,6 @@ def test_fp8_pack_gqa_d192_d128_grouped_lpt():
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_e5m2_sink():
@@ -1578,7 +1439,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
+    _select_engine(g, fp8_engine_names(_D128_ARCH))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amx_o: amax_o})
@@ -1956,7 +1817,7 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
 #
 # Same cga4x1 role-split kernel family as the d512 f16 sibling; the FP8 fork
 # runs STAGES_KV = XFER_STAGES = 3 with a 128-column TMEM-resident Q and the
-# Blackwell K=32 QMMA step (the Rubin sibling sm107/prefill_d512_fp8.py takes
+# Blackwell K=32 QMMA step (the Rubin sibling sm107/d512_fp8_role_split/kernel.py takes
 # the K=64 form).  Both arch lines serve the flavor, so this section runs on
 # both; the MXFP8 d512 kernels have their own suites.
 # ===========================================================================
@@ -2127,19 +1988,16 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
     """The D512 flavor serves the (256, 512] band on both head dims; shapes
-    straddling its floor decline.  Below it the D256 flavor is exact-shape only
-    (its padded envelope is non-deterministic, see
-    test_fp8_large_flavors_serve_exact_shapes_only), so a shape such as
-    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
-    Both device lines carry the flavor, so both shape maps are pinned.
+    straddling its floor decline. Below it D256 serves aligned dense heads.
+    Both device lines carry the flavors, so both shape maps are pinned.
     """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     for device_cc in ((10, 0), (10, 7)):
         shapes = _sm100_fp8_shapes(pertensor=True, device_cc=device_cc)
-        for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+        for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
             assert _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
-        for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
+        for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
             assert not _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
 
 
@@ -2284,7 +2142,7 @@ def test_fp8_gate_tail_graph_api(out_key):
 
 
 # ============================================================================ sm100 d128 per-tensor FP8: the exp2 MUFU / FMA split, pinned on the SASS per arch
-# The split (`sm100/prefill_d128_fp8.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
+# The split (`sm100/d128_fp8_multi_q/kernel.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
 # the fp32 row-sum moves by ~1e-5) and worth +4.5 % at S=8K on the llama chart layer on B200, so its only tripwire is the
 # SASS.  Two arms per specialization, one per cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds
 # (exp2_fma_split=True: 32 of the 128 columns per row on the FMA pipe) and sm_103a with the cc 10.3 record
@@ -2484,7 +2342,7 @@ def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
     loaded = {}
 
     def load_skewed(path, params, tag="template", extra_key=None):
-        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+        if not Path(path).as_posix().endswith("sm100/d192_fp8_multi_q/kernel.py"):
             return original_loader(path, params, tag=tag, extra_key=extra_key)
         key = (path, params, extra_key)
         if key not in loaded:
@@ -2545,3 +2403,212 @@ def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
     assert not flipped.output.isnan().any()
     assert torch.equal(flipped.output, plain.output)
     assert flipped.amax == plain.amax
+
+
+@pytest.mark.parametrize(
+    "d,dv,dtype,mask,pack",
+    [
+        (144, 128, "e4m3", "causal", False),
+        (144, 128, "e5m2", "causal_br", True),
+        (160, 112, "e4m3", "swa", True),
+        (160, 112, "e5m2", "causal", False),
+        (176, 64, "e4m3", "causal_br", False),
+        (176, 64, "e5m2", "swa", True),
+        (192, 16, "e4m3", "causal", True),
+        (192, 16, "e5m2", "causal_br", False),
+    ],
+)
+@torch_fork_set_rng(seed=827)
+def _check_fp8_d192_head_envelope_masks(d, dv, dtype, mask, pack):
+    known_edge = _SM == 107 and (d, dv, dtype, mask, pack) == (160, 112, "e5m2", "causal", False)
+    qkv = None
+    if known_edge:
+        qkv = [torch.randn(*shape, device="cuda") * 0.5 for shape in ((2, 8, 129, d), (2, 2, 256, d), (2, 2, 256, dv))]
+    result = _run(
+        2,
+        8,
+        2,
+        129,
+        256,
+        dtype,
+        torch.bfloat16,
+        scale=1 / math.sqrt(d),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d,
+        d_v=dv,
+        pack_gqa=pack,
+        seq_lens_kv=[256, 217],
+        return_lse=True,
+        poison_tmem_before_execute=True,
+        qkv_float=qkv,
+    )
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=_half_atol(dtype), rtol=3e-2)
+    try:
+        _check(result.output, result.reference, torch.bfloat16, dtype, result.amax, result.reference_amax)
+    except AssertionError:
+        error = (result.output.float() - result.reference).abs()
+        # One native E5M2 dataset has a 0.0407306 residual on BOTH padded and
+        # exact D192. Preserve the shared 0.04 bound: only this measured edge
+        # may xfail, after checking Stats, Amax and an exact-shape control.
+        if not (known_edge and 0.04 < error.max().item() <= 0.041 and (error > 0.04).sum().item() == 1 and abs(result.amax - result.reference_amax) <= 0.03):
+            raise
+        exact = _run(
+            2,
+            8,
+            2,
+            129,
+            256,
+            dtype,
+            torch.bfloat16,
+            scale=1 / math.sqrt(d),
+            sdpa_kwargs=_MASKS[mask],
+            d_qk=192,
+            d_v=128,
+            pack_gqa=False,
+            seq_lens_kv=[256, 217],
+            return_lse=True,
+            poison_tmem_before_execute=True,
+            qkv_float=[torch.nn.functional.pad(value, (0, (192 if i < 2 else 128) - value.shape[-1])) for i, value in enumerate(qkv)],
+        )
+        assert torch.equal(result.output, exact.output[..., :dv])
+        assert torch.equal(result.stats, exact.stats)
+        assert result.amax == exact.amax
+        pytest.xfail("known native D192 E5M2 output edge: one residual in (0.04, 0.041], bitwise identical to the exact-shape control (#1935)")
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD192Fp8HeadPadding:
+    """Collect the shared head-padding checks once on the SM100/SM103 line."""
+
+    from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
+
+    _masks = _check_fp8_d192_head_envelope_masks
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_masks = staticmethod(_masks)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD256Fp8HeadPadding:
+    """Collect bounded dense and paged D256 cases in the selected CI entry."""
+
+    from sdpa_fp8_d256_padding import test_dense_rebind_replay as _dense, test_dense_masks as _masks, test_paged_rebind_replay as _paged
+
+    test_dense_rebind_replay = staticmethod(_dense)
+    test_dense_masks = staticmethod(_masks)
+    test_paged_rebind_replay = staticmethod(_paged)
+
+
+import native_forward_fp8_cases as _native_fp8_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeFp8Strides:
+    test_fp8_native_uses_pointer_host_and_current_storage = staticmethod(_native_fp8_checks.test_fp8_native_uses_pointer_host_and_current_storage)
+    test_native_default_stream_is_resolved_for_q_device = staticmethod(_native_fp8_checks.test_native_default_stream_is_resolved_for_q_device)
+    test_native_default_stream_with_another_device_current = staticmethod(_native_fp8_checks.test_native_default_stream_with_another_device_current)
+    test_fp8_native_strided_stats = staticmethod(_native_fp8_checks.test_fp8_native_strided_stats)
+    test_native_physical_wide_batch_stride = staticmethod(_native_fp8_checks.test_native_physical_wide_batch_stride)
+    test_native_artifact_reloads_without_jit = staticmethod(_native_fp8_checks.test_native_artifact_reloads_without_jit)
+    test_native_block_output_matches_native_graph = staticmethod(_native_fp8_checks.test_native_block_output_matches_native_graph)
+    test_native_invalid_operand_is_rejected_before_any_launch = staticmethod(_native_fp8_checks.test_native_invalid_operand_is_rejected_before_any_launch)
+    test_native_amax_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_amax_alias_checks_original_operand)
+    test_native_sf_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_sf_alias_checks_original_operand)
+    test_native_paged_qo_preserves_kv_pool_views = staticmethod(_native_fp8_checks.test_native_paged_qo_preserves_kv_pool_views)
+    test_sm107_d256_strided_preserves_each_native_operand = staticmethod(_native_fp8_checks.test_sm107_d256_strided_preserves_each_native_operand)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD128Fp8PhysicalOrigins:
+    """Pin the repaired native route in the architecture-selected CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_thd_origins_fp8_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_half_origin_execution_routes = staticmethod(_origins.test_half_origin_execution_routes)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD512PhysicalOrigins:
+    """Exercise both half datapaths and FP8 through the selected CI entry."""
+
+    from sdpa.frost import sdpa_fwd_thd_origins_d512_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_half_head_envelope_origins = staticmethod(_origins.test_half_head_envelope_origins)
+    test_stats_slot_waits_for_all_warps = staticmethod(_origins.test_stats_slot_waits_for_all_warps)
+    test_tmem_release_waits_for_all_readers = staticmethod(_origins.test_tmem_release_waits_for_all_readers)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestMidwidthPhysicalOrigins:
+    """Exercise independent origins on the D192/V128 and D256 native bodies."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _checks("fp8")
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 100, reason="native FP8 decode lowering is selected on SM100")
+class TestNativeFp8Decode:
+    """Paged D64/D128 swap-AB through the architecture-selected CI entry."""
+
+    from sdpa.frost import native_fp8_decode_sm100 as _decode
+
+    test_graph = staticmethod(_decode.test_native_fp8_decode_graph)
+    test_features = staticmethod(_decode.test_native_fp8_decode_features)
+    test_route_boundaries = staticmethod(_decode.test_native_fp8_decode_route_boundaries)
+    test_config = staticmethod(_decode.test_native_fp8_decode_config)
+    test_d64_public_choice = staticmethod(_decode.test_d64_swap_ab_public_choice)
+    test_d64_knob_declines = staticmethod(_decode.test_d64_swap_ab_declines_unsupported)
+
+    test_packed_g3_decline = staticmethod(_decode.test_native_fp8_decode_keeps_packed_g3_decline)
+    test_optional_outputs = staticmethod(_decode.test_native_fp8_decode_optional_outputs)
+    test_direct_partial_log_base = staticmethod(_decode.test_native_fp8_decode_direct_partial_log_base)
+    test_score_release = staticmethod(_decode.test_native_fp8_decode_score_release)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 100, reason="native FP8 decode lowering is selected on SM100")
+class TestNativeFp8DecodeDeterminism:
+    from sdpa.frost import native_fp8_decode_determinism as _decode
+
+    test_replay_batch = staticmethod(_decode.test_replay_batch)
+    test_golden = staticmethod(_decode.test_golden)
+    test_warm_refill = staticmethod(_decode.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestDenseFp8SwapAB:
+    from sdpa.frost import native_fp8_dense_swap_ab as _dense
+
+    test_rebind_capture = staticmethod(_dense.test_rebind_capture)
+    test_public_choice = staticmethod(_dense.test_public_choice)
+    test_standalone_current_lengths_and_logbase = staticmethod(_dense.test_standalone_current_lengths_and_logbase)
+    test_domain = staticmethod(_dense.test_domain)
+    test_invalid_plan_then_recovery = staticmethod(_dense.test_invalid_plan_then_recovery)
+    test_replay_batch = staticmethod(_dense.test_replay_batch)
+    test_golden = staticmethod(_dense.test_golden)
+    test_warm_refill = staticmethod(_dense.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+def test_native_fp8_decode_architecture_route(monkeypatch):
+    from sdpa.frost.native_fp8_decode_sm100 import check_architecture_route
+
+    check_architecture_route(monkeypatch)

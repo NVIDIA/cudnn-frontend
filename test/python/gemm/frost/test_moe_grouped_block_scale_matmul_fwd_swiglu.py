@@ -347,10 +347,12 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_gro
 
 @requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_mixed_sm120(swap_ab) -> None:
-    """Gated mixed pair on sm120: an MXFP8 token against two MXFP4 weights
-    (packed e2m1 tiles, 128-byte TMA L2 promotion on every data descriptor), in
-    both kernel orientations."""
+@pytest.mark.parametrize("padded_e2m1", [False, True], ids=["packed", "padded"])
+def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_mixed_sm120(swap_ab, padded_e2m1) -> None:
+    """Gated mixed pair on sm120: an MXFP8 token against two MXFP4 weights, in
+    both kernel orientations and both e2m1 forms -- packed by default (128-byte
+    TMA L2 promotion on every data descriptor) and the opt-in padded form whose
+    e2m1 tiles ride TMA ``.b4x16_p64`` (K a multiple of 128)."""
     dev = "cuda"
     torch.manual_seed(0)
     E, S, N, K = 2, 1024, 256, 512
@@ -370,12 +372,21 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_mixed_sm120(swap_ab) -> 
     scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
 
     cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
-    compiled = _plan(_build_graph(E, S, N, K, num_groups, "mxfp8", weight_combo="mxfp4"), config=cfg, **({"swap_ab": True} if swap_ab else {}))
+    compiled = _plan(
+        _build_graph(E, S, N, K, num_groups, "mxfp8", weight_combo="mxfp4"),
+        config=cfg,
+        **({"swap_ab": True} if swap_ab else {}),
+        **({"padded_e2m1": True} if padded_e2m1 else {}),
+    )
     _bs = compiled.chain.block_scale
-    assert _bs.mixed_width and _bs.mma_block_scale_kind == "MXF8F6F4"
+    assert _bs.mixed_width and _bs.mma_block_scale_kind == "MXF8F6F4" and _bs.padded_e2m1 is padded_e2m1
     source = pathlib.Path(compiled.generated_path).read_text()
     weight_side = "a" if swap_ab else "b"
-    assert f"{weight_side}_tma_format = _tma.TensorMapDataFormat.B4X16" in source
+    if padded_e2m1:
+        assert f"{weight_side}_tma_format = _tma.TensorMapDataFormat.B4X16_P64" in source
+        assert f"{weight_side}_smem_dtype = cutlass.Uint8" in source
+    else:
+        assert f"{weight_side}_tma_format = _tma.TensorMapDataFormat.B4X16" in source
     assert source.count("l2_promotion=_tma.TensorMapL2Promotion.l2_128b") == 3
 
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]

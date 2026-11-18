@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """BF16 grouped d128 backward: native partial storage and FP32 group reduction.
 
-Graph cases pin engine 20609. Regular numerics use the unchanged independent
+Graph cases pin one-CTA engine 20630. Regular numerics use the unchanged independent
 FP64 gates; the exact-P cancellation test separately pins documented native
 partial rounding. GPU KV carriers contain Hkv heads, never replicated Hq data.
 """

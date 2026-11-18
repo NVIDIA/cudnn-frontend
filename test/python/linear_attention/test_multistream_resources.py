@@ -152,7 +152,7 @@ def test_first_graph_execution_is_serialized(monkeypatch):
             self.calls = 0
             self._la_ops_execution_lock = TrackingLock()
 
-        def execute(self, unused_variant_pack, *, workspace, handle):
+        def execute(self, unused_variant_pack, *, workspace, handle, context=None):
             """Block the first call and record entry into the second."""
             assert workspace is sentinel_workspace
             assert handle is sentinel_handle

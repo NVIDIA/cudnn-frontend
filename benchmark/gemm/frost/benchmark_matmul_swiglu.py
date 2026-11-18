@@ -23,6 +23,7 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    frost_gemm_unsupported_reason,
     add_sweep_args,
     expand_config_variants,
     report_pool,
@@ -177,6 +178,10 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
+        return 1
+    reason = frost_gemm_unsupported_reason()
+    if reason is not None:
+        print(reason)
         return 1
 
     parts = [int(x) for x in args.shape.split(",")]

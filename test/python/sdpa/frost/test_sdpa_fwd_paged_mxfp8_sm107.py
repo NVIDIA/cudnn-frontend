@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Paged MXFP8 pools on the cc 10.7 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``): the SM100 pool contract (#1214 --
+"""Paged MXFP8 pools on the cc 10.7 MXFP8 D128 / D256 engines: the SM100 pool contract (#1214 --
 F8_128x4 descale pools paging with K/V, page_size % 128, HND / NHD, V's own table, sinks and masks composed) served by
-the ``PAGED_KV`` loader of ``sm107/prefill_d128_mxfp8.py`` / ``sm107/prefill_d256_mxfp8.py`` with dense queries.
+the ``PAGED_KV`` loader of ``sm107/d128_mxfp8_multi_q/kernel.py`` / ``sm107/d256_mxfp8_single_q/kernel.py`` with dense queries.
 
 What ``test_mhas_v2.py``'s cc 10.7 paged MXFP8 sweeps and the native-binder replay test do not cover: the Rule 3
 sync-debug gate around ``execute`` on this row over pools, the sched-policy bit-identity under paging (d128: NATURAL /
@@ -15,21 +15,20 @@ policy and the e4m3-O pins -- do run there); adding it to that list is a maintai
 import pytest
 import torch
 
-from frost_test_utils import offers_engine, requires_dsl, requires_rubin, select_engine
+from frost_test_utils import mxfp8_engine_names, offers_engine, requires_dsl, requires_rubin, select_engine
 from test_sdpa_fwd_paged_sm100 import _build_mxfp8, _check_o, _ref_mxfp8
 
 pytestmark = [requires_rubin, requires_dsl, pytest.mark.L0]
 
 
 def _run(B, H, KH, P, max_pages, lens, hnd, *, sched=None, **build_kw):
-    """Build, pin the cc 10.7 MXFP8 row (optionally one scheduler policy), execute under Rule 3 and check O / LSE / Amax_O
+    """Build, pin the cc 10.7 MXFP8 engines (optionally one scheduler policy), execute under Rule 3 and check O / LSE / Amax_O
     against the pool reference; -> (plan, O, LSE or None).  Empty sequences write O := 0 and LSE := sink (-inf without one)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 -- registers the FROST engines
-    from cudnn.sdpa.fwd.engines import engine_name
 
     g, vp, Ob, stats_gpu, amax, ref_in = _build_mxfp8(B, H, KH, P, max_pages, lens, hnd, **build_kw)
-    name = engine_name(arch="sm107", mxfp8=True)
+    name = mxfp8_engine_names("sm107")
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -118,7 +117,6 @@ def test_declines_off_contract():
     """Plan-time declines stay plan-time on the real device: page 64, the d192x128 and d512 pools offer no cc 10.7 MXFP8 plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
 
     def _offers(P, **kw):
         g, *_ = _build_mxfp8(2, 8, 2, P, 4, [100, 200], False, **kw)
@@ -128,7 +126,7 @@ def test_declines_off_contract():
             g.create_execution_plans([cudnn.heur_mode.A])
         except (cudnn.cudnnGraphNotSupportedError, ValueError):
             return False
-        return offers_engine(g, engine_name(arch="sm107", mxfp8=True))
+        return offers_engine(g, mxfp8_engine_names("sm107"))
 
     assert _offers(128, d_qk=128, d_v=128) and _offers(256, d_qk=256, d_v=256)
     assert not _offers(64, d_qk=128, d_v=128), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"

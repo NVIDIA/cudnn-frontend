@@ -293,8 +293,8 @@ def test_DSA_indexer_top_k_sm120_deterministic_smem_limit(monkeypatch, dtype, ma
 @pytest.mark.parametrize("top_k", [129, 2048])
 def test_DSA_indexer_top_k_sm120_native_boundary(dtype, num_cols, top_k):
     """Admission must reach native compilation, execution, and changed-input replay."""
-    if torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("Native SM120 boundary qualification")
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        pytest.skip("Native SM120 / SM121 boundary qualification")
     DSA = _import_dsa()
     n_rows = 6
     columns = torch.arange(num_cols, device="cuda")
@@ -350,8 +350,8 @@ def test_DSA_indexer_top_k_sm120_native_boundary(dtype, num_cols, top_k):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_DSA_indexer_top_k_sm120_default_spill(dtype):
     """Small row counts must still fit the SM120 shared-memory budget."""
-    if torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("Native SM120 spill qualification")
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        pytest.skip("Native SM120 / SM121 spill qualification")
     DSA = _import_dsa()
     num_cols, top_k = 131072, 2048
     input_values = torch.randn(3, num_cols, dtype=dtype, device="cuda")
@@ -408,6 +408,42 @@ def test_DSA_indexer_top_k_deterministic_compact_index_storage():
     )
     assert bitonic_boundary.index_type == cutlass.Uint32
     assert bitonic_boundary.index_sentinel == 0xFFFFFFFF
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "rows,num_cols,top_k,expected",
+    [
+        (1, 4096, 64, "bitmap"),  # narrow rows: bitmap at every top_k (the SM100 rule picks bitonic here)
+        (64, 65536, 128, "bitmap"),
+        (64, 131072, 128, "bitonic"),  # wide rows, small top_k
+        (64, 131072, 129, "bitmap"),
+        (512, 262144, 512, "bitonic"),  # large occupancy widens the bitonic band to top_k 512
+        (64, 262144, 512, "bitmap"),
+        (512, 262144, 2048, "bitmap"),
+        (1, 300000, 2048, "bitonic"),  # past the bitmap column limit
+    ],
+)
+def test_DSA_indexer_top_k_sm103_auto_ordering(monkeypatch, rows, num_cols, top_k, expected):
+    """On SM103 the deterministic auto ordering follows the B300 measurements, not the SM100 bitmap limits."""
+    from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_decode_varlen as kernel_module
+
+    class _Resolved(Exception):
+        pass
+
+    def capture(max_num_cols, deterministic, ordering):
+        raise _Resolved(ordering)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    monkeypatch.setattr(kernel_module, "resolve_deterministic_ordering", capture)
+    with pytest.raises(_Resolved) as resolved:
+        kernel_module.compile_topk_kernel(torch.float32, rows, num_cols, top_k, 1, deterministic=True)
+    assert resolved.value.args[0] == expected
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    with pytest.raises(_Resolved) as resolved:
+        kernel_module.compile_topk_kernel(torch.float32, rows, num_cols, top_k, 1, deterministic=True)
+    bitmap_limit = kernel_module._sm100_deterministic_bitmap_max_cols(kernel_module.cutlass.Float32, top_k, rows > 148)
+    assert resolved.value.args[0] == ("bitmap" if kernel_module._bucket_num_cols(num_cols) <= bitmap_limit else "bitonic")
 
 
 @pytest.mark.L0
@@ -802,7 +838,7 @@ def test_DSA_indexer_top_k_deterministic_random_exact(dtype, n_rows, num_cols, t
     input_values = torch.randn(n_rows, num_cols, dtype=dtype, device="cuda")
     seq_lens = torch.full((n_rows,), num_cols, dtype=torch.int32, device="cuda")
 
-    if torch.cuda.get_device_capability() == (12, 0) and num_cols > (16384 if dtype == torch.float32 else 32768):
+    if torch.cuda.get_device_capability() in ((12, 0), (12, 1)) and num_cols > (16384 if dtype == torch.float32 else 32768):
         with pytest.raises(RuntimeError, match="SM120 supports at most"):
             DSA.IndexerTopK(input_values, seq_lens, top_k, return_val=return_val, deterministic=True).check_support()
         return

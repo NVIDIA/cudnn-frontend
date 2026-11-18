@@ -250,10 +250,14 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
     }
 
     def __init__(self, graph):
+        from . import cuda_host
+
         (node,) = graph.nodes
         q, cu = (node.inputs[p] for p in ("q", "cu_seqlens"))
         self.total, self.h, self.k = (int(d) for d in q.dim)
         self.n_seqs = int(cu.dim[0]) - 1
+        scale = node.params.get("scale", None)
+        self.q_scale = cuda_host.DEFAULT_Q_SCALE if scale is None else float(scale)
         self.ports = None
         self._zeros = {}
         self._scratch_dis = None
@@ -343,6 +347,7 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
             total_tokens=self.total,
             n_heads=self.h,
             n_seqs=self.n_seqs,
+            scale=self.q_scale,
         )
         # A bf16 d_initial_state was written through an fp32 staging buffer.
         marshal.write_back(staged_dis, caller_dis, stream)
@@ -424,6 +429,12 @@ class KdaHopperCudaEngine(BaseEngine):
             raise NotImplementedError("KdaHopperCudaEngine: state_indices (pool-addressed state) is unsupported")
         if getattr(facts, "overwrite_initial_state", False):
             raise NotImplementedError("KdaHopperCudaEngine: overwrite_initial_state is unsupported")
+        if getattr(facts, "has_composed_summaries", False) or getattr(facts, "has_composed_state", False):
+            raise NotImplementedError(
+                "KdaHopperCudaEngine: composed context-parallel summaries and the composed_initial_state row (the fold into the boundary state row) are FROST-only"
+            )
+        if facts.output_context or facts.input_context:
+            raise NotImplementedError("KdaHopperCudaEngine: the summaries' context is FROST-only")
         if facts.is_bwd and (facts.safe_gate or facts.has_a_log or facts.has_dt_bias):
             raise NotImplementedError("KdaHopperCudaEngine: the kernel takes log-space g directly; " "safe_gate/a_log/dt_bias are unsupported")
         # The forward kernel applies the q/k L2 norm, the safe gate and the beta
@@ -447,12 +458,6 @@ class KdaHopperCudaEngine(BaseEngine):
         if getattr(facts, "gate_domain", "log") != "log":
             raise NotImplementedError("KdaHopperCudaEngine: gate_domain='linear' is unsupported")
 
-        # The FORWARD kernel takes the query scale as an argument, so it serves
-        # any scale. The backward still bakes in 1/sqrt(D), and a mismatched
-        # scale there is a silently wrong dq -- caught by test_bwd_scale when the
-        # forward relaxation was applied to both directions.
-        if facts.is_bwd and facts.scale is not None and abs(facts.scale - HEAD_DIM**-0.5) > 1e-9:
-            raise NotImplementedError(f"KdaHopperCudaEngine: the backward kernel bakes in the default scale 1/sqrt({HEAD_DIM}), got {facts.scale}")
         # int64 cu_seqlens is converted at execute (N + 1 elements); see marshal.py.
         if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
             raise NotImplementedError(f"KdaHopperCudaEngine: cu_seqlens must be int32 or int64, got {facts.cu_dtype}")

@@ -13,7 +13,7 @@ from native_sparse_attention.cutedsl.nsa_utils import (
     allocate_input_tensors,
     allocate_output_tensors,
 )
-from native_sparse_attention.cutedsl.nsa_reference import check_ref_nsa_selection_attention
+from native_sparse_attention.cutedsl.nsa_reference import check_ref_nsa_selection_attention, run_ref_nsa_selection_attention
 
 """
 SelectionAttention API with explicitset_params, compile, and execute paths. 
@@ -173,6 +173,99 @@ def test_nsa_selection_wrapper(
         block_counts,
         cfg,
     )
+
+
+def _select_own_blocks_rotated(seq_lens, num_kv_heads, block_size, device, past_end_block=False):
+    """Every query selects all blocks of its own sequence, rotated by its position.
+
+    The rotation puts the sequence's last block in every metadata slot; the kernel
+    visits the slots in reverse order, so that block is processed first, in the
+    middle and last. With past_end_block, the block after the sequence's last one
+    (it starts at or past the end of the sequence) is appended in the last slot,
+    so the kernel processes it first.
+    """
+    extra = 1 if past_end_block else 0
+    max_blocks = max((seq_len + block_size - 1) // block_size for seq_len in seq_lens) + extra
+    block_counts = torch.zeros(sum(seq_lens), num_kv_heads, dtype=torch.int32)
+    block_indices = torch.zeros(sum(seq_lens), num_kv_heads, max_blocks, dtype=torch.int32)
+    offset = 0
+    for seq_len in seq_lens:
+        num_blocks = (seq_len + block_size - 1) // block_size
+        for t in range(seq_len):
+            shift = t % num_blocks
+            blocks = list(range(shift, num_blocks)) + list(range(shift)) + list(range(num_blocks, num_blocks + extra))
+            block_indices[offset + t, :, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
+            block_counts[offset + t, :] = len(blocks)
+        offset += seq_len
+    return block_counts.to(device), block_indices.to(device)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("block_size, past_end_block", [(32, False), (64, False), (128, False), (64, True)])
+def test_nsa_selection_thd_partial_last_block(block_size, past_end_block, request):
+    """Ragged THD lengths that are not multiples of block_size, non-causal.
+
+    Every query selects the partial last block of its sequence. The rest of that
+    block's tile holds the next sequence's keys, or rows past the end of K/V for
+    the last sequence; they must not enter the softmax. A selected block that
+    starts past the end of its sequence has no keys and contributes nothing, also
+    when the kernel processes it first. The reference clamps every block to its
+    sequence, and the row max (M) and row sum (L) must match it too.
+    """
+    try:
+        from cudnn import NSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    seq_lens = [70, 130, 100]
+    cfg = nsa_init(
+        request=request,
+        layout="thd",
+        dtype=torch.float16,
+        acc_dtype=torch.float32,
+        block_size=block_size,
+    )
+    cfg["b"] = len(seq_lens)
+    cfg["actual_s_q"] = torch.tensor(seq_lens, dtype=torch.int32).cuda()
+    cfg["actual_s_kv"] = cfg["actual_s_q"].clone()
+
+    Q, K, V, _, _, _, cum_seqlen_q, cum_seqlen_kv, _, _ = allocate_input_tensors(cfg)
+    block_counts, block_indices = _select_own_blocks_rotated(seq_lens, cfg["h_k"], block_size, Q.device, past_end_block)
+
+    O, L, M = NSA.selection_attention_wrapper(
+        q_tensor=Q,
+        k_tensor=K,
+        v_tensor=V,
+        block_indices_tensor=block_indices,
+        block_counts_tensor=block_counts,
+        cum_seqlen_q_tensor=cum_seqlen_q,
+        cum_seqlen_k_tensor=cum_seqlen_kv,
+        block_size=block_size,
+        scale_softmax=cfg["scale_softmax"],
+        o_dtype=cfg["dtype"],
+        acc_dtype=cfg["acc_dtype"],
+        is_causal=False,
+    )
+
+    # Reference logits in fp64, so the M and L bounds do not depend on the reference's own rounding.
+    O_ref, L_ref, M_ref = run_ref_nsa_selection_attention(
+        Q,
+        K,
+        V,
+        torch.zeros_like(O, dtype=torch.float32),
+        torch.zeros_like(L),
+        torch.zeros_like(M),
+        seq_lens,
+        block_indices,
+        block_counts,
+        block_size,
+        cfg["scale_softmax"],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(O.float(), O_ref.float(), atol=0.01, rtol=1e-05)
+    torch.testing.assert_close(M, M_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(L, L_ref, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.L0

@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cmath>
+#include <limits>
+#include <type_traits>
 #include <utility>
 #include <optional>
-#include <type_traits>
 #include <unordered_map>
 
 #include <nanobind/nanobind.h>
@@ -24,6 +26,257 @@ namespace python_bindings {
 
 void
 throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::string const& error_msg);
+
+namespace {
+
+using Custom_reduction_identity = cudnn_frontend::graph::Custom_reduction_identity;
+
+// The numbers ABCs include numpy scalars. A numpy bool is not a number, and a Python bool is refused explicitly.
+bool
+is_python_number(py::handle value, char const* abc_name) {
+    return !py::isinstance<py::bool_>(value) && py::isinstance(value, py::module_::import_("numbers").attr(abc_name));
+}
+
+py::int_
+python_index(py::handle value) {
+    auto index = py::steal<py::int_>(PyNumber_Index(value.ptr()));
+    if (!index) {
+        throw py::python_error();
+    }
+    return index;
+}
+
+template <typename T>
+T
+checked_python_integer(py::handle value, char const* data_type_name) {
+    if (!is_python_number(value, "Integral")) {
+        throw py::type_error(
+            (std::string("custom_reduction_identity value for ") + data_type_name + " must be an integer").c_str());
+    }
+
+    int64_t parsed = 0;
+    try {
+        parsed = py::cast<int64_t>(python_index(value));
+    } catch (py::cast_error const&) {
+        throw py::value_error(
+            (std::string("custom_reduction_identity value is out of range for ") + data_type_name).c_str());
+    }
+    if constexpr (std::is_signed_v<T>) {
+        if (parsed < static_cast<int64_t>(std::numeric_limits<T>::min()) ||
+            parsed > static_cast<int64_t>(std::numeric_limits<T>::max())) {
+            throw py::value_error(
+                (std::string("custom_reduction_identity value is out of range for ") + data_type_name).c_str());
+        }
+    } else {
+        if (parsed < 0 || static_cast<uint64_t>(parsed) > static_cast<uint64_t>(std::numeric_limits<T>::max())) {
+            throw py::value_error(
+                (std::string("custom_reduction_identity value is out of range for ") + data_type_name).c_str());
+        }
+    }
+    return static_cast<T>(parsed);
+}
+
+// Infinities are valid identities (for example -inf for max). NaN is never an identity, and a finite value must be
+// exactly representable; from_bits sets any other encoding.
+template <typename T>
+T
+checked_python_floating(py::handle value, char const* data_type_name) {
+    if (!is_python_number(value, "Real")) {
+        throw py::type_error(
+            (std::string("custom_reduction_identity value for ") + data_type_name + " must be a real number").c_str());
+    }
+    auto const not_exact = [&]() {
+        return py::value_error((std::string("custom_reduction_identity value is not exactly representable as ") +
+                                data_type_name + "; use custom_reduction_identity.from_bits for an exact encoding")
+                                   .c_str());
+    };
+    auto const out_of_range = [&]() {
+        return py::value_error(
+            (std::string("custom_reduction_identity value is out of range for ") + data_type_name).c_str());
+    };
+
+    double parsed = 0.0;
+    if (is_python_number(value, "Integral")) {
+        auto const integer = python_index(value);
+        parsed             = PyLong_AsDouble(integer.ptr());
+        if (parsed == -1.0 && PyErr_Occurred()) {
+            PyErr_Clear();
+            throw out_of_range();
+        }
+        auto const restored = py::steal<py::object>(PyLong_FromDouble(parsed));
+        if (!restored) {
+            throw py::python_error();
+        }
+        const int equal = PyObject_RichCompareBool(restored.ptr(), integer.ptr(), Py_EQ);
+        if (equal < 0) {
+            throw py::python_error();
+        }
+        if (!equal) {
+            throw not_exact();
+        }
+    } else {
+        auto const as_float = py::steal<py::object>(PyNumber_Float(value.ptr()));
+        if (!as_float) {
+            if (PyErr_ExceptionMatches(PyExc_OverflowError)) {
+                PyErr_Clear();
+                throw out_of_range();
+            }
+            throw py::python_error();
+        }
+        parsed = PyFloat_AsDouble(as_float.ptr());
+        // A wider type (for example numpy.longdouble) can hold a value that a double does not.
+        if (!std::isnan(parsed)) {
+            const int equal = PyObject_RichCompareBool(as_float.ptr(), value.ptr(), Py_EQ);
+            if (equal < 0) {
+                throw py::python_error();
+            }
+            if (!equal) {
+                throw not_exact();
+            }
+        }
+    }
+
+    if (std::isnan(parsed)) {
+        throw py::value_error((std::string("custom_reduction_identity value for ") + data_type_name +
+                               " is NaN, which is not an identity; use custom_reduction_identity.from_bits for a NaN "
+                               "encoding")
+                                  .c_str());
+    }
+    if (std::isinf(parsed)) {
+        return static_cast<T>(parsed);
+    }
+    if (std::fabs(parsed) > static_cast<double>(std::numeric_limits<T>::max())) {
+        throw out_of_range();
+    }
+    auto const converted = static_cast<T>(parsed);
+    if (static_cast<double>(converted) != parsed) {
+        throw not_exact();
+    }
+    return converted;
+}
+
+Custom_reduction_identity
+custom_reduction_identity_from_value(cudnn_frontend::DataType_t data_type, py::handle value) {
+    switch (data_type) {
+        case cudnn_frontend::DataType_t::INT8:
+            return Custom_reduction_identity(checked_python_integer<int8_t>(value, "INT8"));
+        case cudnn_frontend::DataType_t::UINT8:
+            return Custom_reduction_identity(checked_python_integer<uint8_t>(value, "UINT8"));
+        case cudnn_frontend::DataType_t::INT32:
+            return Custom_reduction_identity(checked_python_integer<int32_t>(value, "INT32"));
+        case cudnn_frontend::DataType_t::UINT32:
+            return Custom_reduction_identity(checked_python_integer<uint32_t>(value, "UINT32"));
+        case cudnn_frontend::DataType_t::INT64:
+            return Custom_reduction_identity(checked_python_integer<int64_t>(value, "INT64"));
+        case cudnn_frontend::DataType_t::FLOAT:
+            return Custom_reduction_identity(checked_python_floating<float>(value, "FLOAT"));
+        case cudnn_frontend::DataType_t::DOUBLE:
+            return Custom_reduction_identity(checked_python_floating<double>(value, "DOUBLE"));
+        case cudnn_frontend::DataType_t::BYTE_BOOLEAN:
+            if (!py::isinstance<py::bool_>(value)) {
+                throw py::type_error("custom_reduction_identity value for BYTE_BOOLEAN must be a bool");
+            }
+            return Custom_reduction_identity(
+                cudnn_frontend::graph::Custom_reduction_byte_boolean{static_cast<uint8_t>(py::cast<bool>(value))});
+        case cudnn_frontend::DataType_t::HALF:
+        case cudnn_frontend::DataType_t::BFLOAT16:
+        case cudnn_frontend::DataType_t::FP8_E4M3:
+        case cudnn_frontend::DataType_t::FP8_E5M2:
+            throw py::value_error(
+                "HALF, BFLOAT16, and FP8 custom-reduction identities require "
+                "custom_reduction_identity.from_bits(dtype, bits)");
+        default:
+            throw py::value_error("Unsupported custom-reduction identity data type");
+    }
+}
+
+template <typename T>
+Custom_reduction_identity
+custom_reduction_identity_from_raw(uint64_t bits) {
+    using raw_bits_t = typename cudnn_frontend::graph::serialization_detail::unsigned_scalar_bits<sizeof(T)>::type;
+    return Custom_reduction_identity(
+        cudnn_frontend::graph::serialization_detail::scalar_from_raw_bits<T>(static_cast<raw_bits_t>(bits)));
+}
+
+Custom_reduction_identity
+custom_reduction_identity_from_bits(cudnn_frontend::DataType_t data_type, uint64_t bits) {
+    auto const width = cudnn_frontend::detail::get_data_type_size(data_type);
+    if (width == 0 || width > sizeof(bits)) {
+        throw py::value_error("Unsupported custom-reduction identity data type");
+    }
+    if (width < sizeof(bits) && bits >= (uint64_t{1} << (width * 8))) {
+        throw py::value_error("custom_reduction_identity bits do not fit the requested data type");
+    }
+
+    switch (data_type) {
+        case cudnn_frontend::DataType_t::INT8:
+            return custom_reduction_identity_from_raw<int8_t>(bits);
+        case cudnn_frontend::DataType_t::UINT8:
+            return Custom_reduction_identity(static_cast<uint8_t>(bits));
+        case cudnn_frontend::DataType_t::INT32:
+            return custom_reduction_identity_from_raw<int32_t>(bits);
+        case cudnn_frontend::DataType_t::UINT32:
+            return Custom_reduction_identity(static_cast<uint32_t>(bits));
+        case cudnn_frontend::DataType_t::INT64:
+            return custom_reduction_identity_from_raw<int64_t>(bits);
+        case cudnn_frontend::DataType_t::HALF:
+            return custom_reduction_identity_from_raw<half>(bits);
+        case cudnn_frontend::DataType_t::FLOAT:
+            return custom_reduction_identity_from_raw<float>(bits);
+        case cudnn_frontend::DataType_t::DOUBLE:
+            return custom_reduction_identity_from_raw<double>(bits);
+        case cudnn_frontend::DataType_t::BFLOAT16:
+            return custom_reduction_identity_from_raw<nv_bfloat16>(bits);
+        case cudnn_frontend::DataType_t::FP8_E4M3:
+            return Custom_reduction_identity(
+                cudnn_frontend::graph::Custom_reduction_fp8_e4m3{static_cast<uint8_t>(bits)});
+        case cudnn_frontend::DataType_t::FP8_E5M2:
+            return Custom_reduction_identity(
+                cudnn_frontend::graph::Custom_reduction_fp8_e5m2{static_cast<uint8_t>(bits)});
+        case cudnn_frontend::DataType_t::BYTE_BOOLEAN:
+            return Custom_reduction_identity(
+                cudnn_frontend::graph::Custom_reduction_byte_boolean{static_cast<uint8_t>(bits)});
+        default:
+            throw py::value_error("Unsupported custom-reduction identity data type");
+    }
+}
+
+}  // namespace
+
+// The predicate lets ordinary execute calls avoid a Python context-manager
+// allocation while foreign/cold threads enter and restore the target context.
+std::optional<bool>
+try_execution_context_matches(std::optional<std::intptr_t> stream, int device) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    using GetCurrent              = CUresult(CUDAAPI*)(CUcontext*);
+    using StreamContext           = CUresult(CUDAAPI*)(CUstream, CUcontext*);
+    using ContextDevice           = CUresult(CUDAAPI*)(CUdevice*);
+    static const auto get_current = reinterpret_cast<GetCurrent>(detail::get_driver_entry_point("cuCtxGetCurrent"));
+    static const auto stream_context =
+        reinterpret_cast<StreamContext>(detail::get_driver_entry_point("cuStreamGetCtx"));
+    static const auto context_device =
+        reinterpret_cast<ContextDevice>(detail::get_driver_entry_point("cuCtxGetDevice"));
+    if (!get_current || !stream_context || !context_device) return std::nullopt;
+
+    CUcontext current = nullptr;
+    if (get_current(&current) != CUDA_SUCCESS) return std::nullopt;
+    if (current == nullptr) return false;
+    const auto raw_stream = stream.value_or(0);
+    if (raw_stream != 0 && raw_stream != reinterpret_cast<std::intptr_t>(CU_STREAM_LEGACY) &&
+        raw_stream != reinterpret_cast<std::intptr_t>(CU_STREAM_PER_THREAD)) {
+        CUcontext target = nullptr;
+        if (stream_context(reinterpret_cast<CUstream>(raw_stream), &target) != CUDA_SUCCESS) return std::nullopt;
+        return target == current;
+    }
+    CUdevice ordinal = 0;
+    if (context_device(&ordinal) != CUDA_SUCCESS) return std::nullopt;
+    return ordinal == device;
+#else
+    (void)stream;
+    (void)device;
+    return std::nullopt;
+#endif
+}
 
 // The graph's Python context policy, in one native crossing. Unlike the backend
 // shim's cold-thread repair, an explicit stream/device can replace a bound
@@ -74,17 +327,25 @@ try_ensure_current_context(std::optional<std::intptr_t> stream, std::optional<in
         CUdevice ordinal = 0;
         if (context_device(&ordinal) == CUDA_SUCCESS && ordinal == *device) return true;
     }
-    // The binding holds the GIL. Like _device._primary_context's lru_cache,
-    // retain at most once per device and preserve a failed lookup as nullptr.
+    // Different graphs can reach this process-wide cache from cold threads.
+    // Serialize lookup AND retain, so each primary context is retained once.
+    // No Python callbacks run while this lock is held. It is a no-op in a
+    // GIL-enabled extension, where the binding still holds the GIL.
+    static py::ft_mutex primary_contexts_mutex;
     static std::unordered_map<int, CUcontext> primary_contexts;
-    auto [entry, inserted] = primary_contexts.try_emplace(*device, nullptr);
-    if (inserted) {
-        CUdevice ordinal  = 0;
-        CUcontext primary = nullptr;
-        if (get_device(&ordinal, *device) == CUDA_SUCCESS && retain_primary(&primary, ordinal) == CUDA_SUCCESS)
-            entry->second = primary;
+    CUcontext target = nullptr;
+    {
+        py::ft_lock_guard lock(primary_contexts_mutex);
+        auto [entry, inserted] = primary_contexts.try_emplace(*device, nullptr);
+        if (inserted) {
+            CUdevice ordinal  = 0;
+            CUcontext primary = nullptr;
+            if (get_device(&ordinal, *device) == CUDA_SUCCESS && retain_primary(&primary, ordinal) == CUDA_SUCCESS)
+                entry->second = primary;
+        }
+        target = entry->second;
     }
-    if (entry->second != nullptr) set_current(entry->second);
+    if (target != nullptr) set_current(target);
     return true;
 #else
     (void)stream;
@@ -242,7 +503,31 @@ init_properties(py::module_& m) {
         .value("FP8_E5M3", cudnn_frontend::DataType_t::FP8_E5M3)
         .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
         .value("INT4", cudnn_frontend::DataType_t::INT4)
+        .value("UINT32", cudnn_frontend::DataType_t::UINT32)
+        .value("BYTE_BOOLEAN", cudnn_frontend::DataType_t::BYTE_BOOLEAN)
         .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
+
+    py::class_<Custom_reduction_identity>(m, "custom_reduction_identity")
+        .def(
+            "__init__",
+            [](Custom_reduction_identity* self, cudnn_frontend::DataType_t data_type, py::object const& value) {
+                new (self) Custom_reduction_identity(custom_reduction_identity_from_value(data_type, value));
+            },
+            py::arg("dtype"),
+            py::arg("value"))
+        .def_static("from_bits",
+                    &custom_reduction_identity_from_bits,
+                    py::arg("dtype"),
+                    py::arg("bits"),
+                    "Create an identity from its exact unsigned storage bits.")
+        .def_prop_ro("data_type", &Custom_reduction_identity::get_data_type)
+        .def_prop_ro("raw_hex", &Custom_reduction_identity::get_raw_hex)
+        .def("__repr__", [](Custom_reduction_identity const& identity) {
+            std::stringstream ss;
+            ss << "<cudnn.custom_reduction_identity data_type=" << static_cast<int>(identity.get_data_type())
+               << " raw_hex='" << identity.get_raw_hex() << "'>";
+            return ss.str();
+        });
 
     bind_enum<cudnn_frontend::TensorReordering_t>(m, "tensor_reordering")
         .value("NONE", cudnn_frontend::TensorReordering_t::NONE)
@@ -344,6 +629,21 @@ init_properties(py::module_& m) {
         .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
         .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE)
         .value("TILE_CGA", cudnn_frontend::KnobType_t::TILE_CGA)
+        .value("FULL_PRECISION_MATH", cudnn_frontend::KnobType_t::FULL_PRECISION_MATH)
+        .value("SPLIT_K", cudnn_frontend::KnobType_t::SPLIT_K)
+        .value("USE_TEX", cudnn_frontend::KnobType_t::USE_TEX)
+        .value("KBLOCK", cudnn_frontend::KnobType_t::KBLOCK)
+        .value("LDGA", cudnn_frontend::KnobType_t::LDGA)
+        .value("LDGB", cudnn_frontend::KnobType_t::LDGB)
+        .value("CHUNK_K", cudnn_frontend::KnobType_t::CHUNK_K)
+        .value("SPLIT_H", cudnn_frontend::KnobType_t::SPLIT_H)
+        .value("WINO_TILE", cudnn_frontend::KnobType_t::WINO_TILE)
+        .value("CTA_SPLIT_K_MODE", cudnn_frontend::KnobType_t::CTA_SPLIT_K_MODE)
+        .value("SLICED", cudnn_frontend::KnobType_t::SLICED)
+        .value("SPLIT_RS", cudnn_frontend::KnobType_t::SPLIT_RS)
+        .value("SINGLEBUFFER", cudnn_frontend::KnobType_t::SINGLEBUFFER)
+        .value("LDGC", cudnn_frontend::KnobType_t::LDGC)
+        .value("NUM_C_PER_BLOCK", cudnn_frontend::KnobType_t::NUM_C_PER_BLOCK)
         // frontend-only band (knobs.h): never handed to the backend
         .value("SCHED_POLICY", cudnn_frontend::KnobType_t::SCHED_POLICY)
         .value("PACK_GQA", cudnn_frontend::KnobType_t::PACK_GQA)
@@ -354,7 +654,8 @@ init_properties(py::module_& m) {
         .value("MMA_TILE_K", cudnn_frontend::KnobType_t::MMA_TILE_K)
         .value("CTA_GROUP", cudnn_frontend::KnobType_t::CTA_GROUP)
         .value("WARPS_M", cudnn_frontend::KnobType_t::WARPS_M)
-        .value("WARPS_N", cudnn_frontend::KnobType_t::WARPS_N);
+        .value("WARPS_N", cudnn_frontend::KnobType_t::WARPS_N)
+        .value("CLUSTER_K_REDUCE", cudnn_frontend::KnobType_t::CLUSTER_K_REDUCE);
     m.attr("FRONTEND_KNOB_TYPE_BASE") = py::int_(cudnn_frontend::FRONTEND_KNOB_TYPE_BASE);
     m.def(
         "is_frontend_knob_type",
@@ -437,6 +738,7 @@ init_properties(py::module_& m) {
           &try_ensure_current_context,
           py::arg("stream") = std::nullopt,
           py::arg("device") = std::nullopt);
+    m.def("_try_execution_context_matches", &try_execution_context_matches, py::arg("stream"), py::arg("device"));
 
     bind_enum<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)
@@ -479,7 +781,8 @@ init_properties(py::module_& m) {
         .value("WINOGRAD_TILE_4x4", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_4x4)
         .value("WINOGRAD_TILE_6x6", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_6x6)
         .value("WINOGRAD_TILE_13x13", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_13x13)
-        .value("STRICT_NAN_PROP", cudnn_frontend::NumericalNote_t::STRICT_NAN_PROP);
+        .value("STRICT_NAN_PROP", cudnn_frontend::NumericalNote_t::STRICT_NAN_PROP)
+        .value("FULL_PRECISION_MATH", cudnn_frontend::NumericalNote_t::FULL_PRECISION_MATH);
 
     bind_enum<cudnn_frontend::CudaGraphRetention_t>(m, "cuda_graph_retention", R"pbdoc(
         How CUDA graphs recorded from a graph keep its execution plans' resources alive.
@@ -510,7 +813,9 @@ init_properties(py::module_& m) {
         .value("REQUIRES_FILTER_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_FILTER_INT8x32_REORDER)
         .value("REQUIRES_BIAS_INT8x32_REORDER", cudnn_frontend::BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER)
         .value("SUPPORTS_CUDA_GRAPH_NATIVE_API", cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API)
-        .value("CUBLASLT_DEPENDENCY", cudnn_frontend::BehaviorNote_t::CUBLASLT_DEPENDENCY);
+        .value("CUBLASLT_DEPENDENCY", cudnn_frontend::BehaviorNote_t::CUBLASLT_DEPENDENCY)
+        .value("SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE",
+               cudnn_frontend::BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE);
 
     bind_enum<cudnn_frontend::DiagonalAlignment_t>(m, "diagonal_alignment")
         .value("TOP_LEFT", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT)

@@ -47,7 +47,7 @@ def served_softmax_knob_sets(family, d_qk, d_v, *, paged=False, thd=False):
 
     ``family``: "half" (f16/bf16 ``graph.sdpa``), "fp8" (per-tensor ``graph.sdpa_fp8``) or "mxfp8"
     (``graph.sdpa_mxfp8``).  ``paged``: K/V behind page tables.  ``thd``: ragged (packed) Q.  A path
-    the row does not serve at all (per-tensor FP8 paged KV, MXFP8 THD outside d256 or over pools, MXFP8 pools outside
+    the row does not serve at all (per-tensor FP8 pools outside dense-query d512, MXFP8 THD outside d256 or over pools, MXFP8 pools outside
     d128 / d256)
     yields the default set only -- the harness then waives the case for the path, not for a knob."""
     if family not in FAMILIES:
@@ -56,12 +56,12 @@ def served_softmax_knob_sets(family, d_qk, d_v, *, paged=False, thd=False):
     if flavor not in EXACT_FLAVORS:
         return (DEFAULT_KNOB_SET,)
     quantized = family in ("fp8", "mxfp8")
-    # Paths the quantized rows do not serve on cc 10.7: paged KV on the per-tensor FP8 row, THD on the MXFP8 row outside d256
+    # Paths the quantized rows do not serve on cc 10.7: per-tensor FP8 pools outside dense-query d512, THD on the MXFP8 row outside d256
     # (the row's thd_d_shapes, #1488) or over pools, and MXFP8 pools outside d128 / d256 (the row's paged_d_shapes).  The
     # f16x2 exponent arm is a softmax-warp constant, so it composes with the page loader; the fold stays declined over paged
     # KV on every row (engines.mismatch).
     path_served = (
-        not (family == "fp8" and paged)
+        not (family == "fp8" and paged and (thd or flavor != (512, 512)))
         and not (family == "mxfp8" and thd and (paged or flavor != (256, 256)))
         and not (family == "mxfp8" and paged and flavor not in ((128, 128), (256, 256)))
     )

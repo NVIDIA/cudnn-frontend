@@ -188,7 +188,7 @@ def test_sf_repack_steps_past_int32_with_allocated_guards(layout):
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import Mxfp8SfRepackSm100
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import Mxfp8SfRepackSm100
 
     planes = 2**20 + 1 if layout == "sfa" else 2**21 + 1
     repack = Mxfp8SfRepackSm100(128, 4, planes, layout)

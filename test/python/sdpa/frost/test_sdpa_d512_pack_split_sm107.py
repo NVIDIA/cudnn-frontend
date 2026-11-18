@@ -17,6 +17,8 @@ CASES = {
     "g128_unsplit": (128, 3, 257, 1, True, False, None, True, "natural", "bfloat16"),
     "g64_split": (64, 1, 2048, 8, True, False, None, False, "log2", "float16"),
     "g128_split": (128, 4, 1025, 8, True, True, None, True, "log2", "bfloat16"),
+    "g32_split": (32, 3, 257, 4, True, False, None, False, "natural", "float16"),
+    "g16_split": (16, 3, 257, 4, True, False, None, False, "natural", "bfloat16"),
     "partial6": (6, 17, 385, 3, True, True, 31, True, "natural", "bfloat16"),
     "keyless": (128, 129, 65, 8, True, True, 0, False, "log2", "bfloat16"),
     "unpacked": (128, 3, 257, 8, False, True, None, True, "none", "bfloat16"),
@@ -121,8 +123,8 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
             graph.validate()
             graph.build_operation_graph()
             graph.create_execution_plan(
-                family_for(graph).offered_ids()["sdpa_fwd_prefill_sm107"],
-                {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(packed), cudnn.knob_type.SCHED_POLICY: 0},
+                family_for(graph).offered_ids()["sdpa_fwd_sm107_d512_2x2"],
+                {cudnn.knob_type.TILE_CGA_M: 4, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(packed), cudnn.knob_type.SCHED_POLICY: 0},
             )
             graph.select_plan(0)
             graph.check_support()
@@ -133,7 +135,7 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
         else:
             api.compile()
             workspace_bytes = api.scratch_workspace_bytes()
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if graph_api else "sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.SPLIT_KV == splits
         assert api._k_mod.CFG.PACK_G == (math.gcd(group, 64) if packed else 1)
         assert api._partial_torch_dtype() == (torch.float32 if splits > 1 else getattr(torch, dtype_name))

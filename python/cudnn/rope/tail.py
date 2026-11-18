@@ -6,6 +6,7 @@ from dataclasses import replace
 from functools import lru_cache
 
 from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
 
 
 def _require_cute():
@@ -118,8 +119,8 @@ class TailRoPEForward(APIBase):
             raise ValueError("Tail RoPE has no autograd rule; detach inputs explicitly")
         self._validate(self._descs, declaration=True)
         self._capability = torch.cuda.get_device_capability(self._device)
-        if self._capability != (10, 0):
-            raise NotImplementedError("Frost tail RoPE currently supports SM100")
+        if self._capability not in PORTABLE_ELEMENTWISE_CCS:
+            raise NotImplementedError(f"Frost tail RoPE supports cc {PORTABLE_ELEMENTWISE_CCS}; got {self._capability}")
         self._is_supported = True
         return True
 

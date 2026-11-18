@@ -58,7 +58,21 @@ class PyGraph {
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
 
-    PyGraph(Graph_t graph_) : graph(graph_) {};
+    struct CustomCallbackState {
+        py::callable reducer;
+        py::object owner_weakref;
+    };
+    // Each callable has one native owner. Only the root visits it for cyclic GC; child proxies
+    // hold a real Python lease to that root, including proxies whose native graph outlives them.
+    std::vector<std::weak_ptr<CustomCallbackState>> custom_callback_states;
+    py::object callback_gc_owner;
+
+    py::object
+    callback_root_owner() const {
+        return callback_gc_owner ? callback_gc_owner : py::borrow<py::object>(py::find(*this));
+    }
+
+    PyGraph(Graph_t graph_, py::object owner = {}) : graph(graph_), callback_gc_owner(std::move(owner)) {};
 
     PyGraph(std::string const&,
             cudnn_frontend::DataType_t io_data_type,
@@ -157,7 +171,7 @@ class PyGraph {
     }
 
     std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function = [this](Graph_t graph, Tensor_t q_kt) {
-        auto py_graph = std::make_shared<PyGraph>(graph);
+        auto py_graph = std::make_shared<PyGraph>(graph, callback_root_owner());
 
         if (callback_fn.has_value()) {
             q_kt = this->callback_fn.value()(*py_graph, q_kt);
@@ -167,7 +181,7 @@ class PyGraph {
     };
 
     std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function_bprop = [this](Graph_t graph, Tensor_t q_kt) {
-        auto py_graph = std::make_shared<PyGraph>(graph);
+        auto py_graph = std::make_shared<PyGraph>(graph, callback_root_owner());
 
         if (callback_fn_bprop.has_value()) {
             q_kt = this->callback_fn_bprop.value()(*py_graph, q_kt);
@@ -384,6 +398,16 @@ class PyGraph {
               cudnn_frontend::DataType_t const& compute_data_type,
               std::string const& name,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> group_offset = nullptr);
+
+    std::vector<Tensor_t>
+    custom_reduction(std::vector<Tensor_t> inputs,
+                     py::callable reducer,
+                     std::string const& reducer_semantic_key,
+                     std::vector<int64_t> reduction_dims,
+                     std::vector<cudnn_frontend::graph::Custom_reduction_identity> identity_values,
+                     std::optional<std::vector<cudnn_frontend::DataType_t>> compute_data_types,
+                     std::optional<cudnn_frontend::DataType_t> compute_data_type,
+                     std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
@@ -772,18 +796,20 @@ class PyGraph {
     execute(std::unordered_map<int64_t, int64_t> var_pack,
             int64_t workspace,
             std::optional<std::intptr_t>,
-            py::object override_uids    = py::none(),
-            py::object override_shapes  = py::none(),
-            py::object override_strides = py::none());
+            py::object override_uids               = py::none(),
+            py::object override_shapes             = py::none(),
+            py::object override_strides            = py::none(),
+            std::optional<int64_t> workspace_bytes = std::nullopt);
 
     void
     execute_plan_at_index(std::unordered_map<int64_t, int64_t> var_pack,
                           int64_t workspace,
                           int64_t index,
                           std::optional<std::intptr_t>,
-                          py::object override_uids    = py::none(),
-                          py::object override_shapes  = py::none(),
-                          py::object override_strides = py::none());
+                          py::object override_uids               = py::none(),
+                          py::object override_shapes             = py::none(),
+                          py::object override_strides            = py::none(),
+                          std::optional<int64_t> workspace_bytes = std::nullopt);
 
     // --- Variant pack template (called automatically by build_plans) ---
     void
@@ -794,6 +820,17 @@ class PyGraph {
         return graph->get_variant_pack_uids_sorted();
     }
 
+    // Observed byte capacity is per call; a bare pointer carries none. Check
+    // before graph->execute can initialize FE scratch or launch any kernels.
+    void
+    check_workspace_capacity(std::intptr_t workspace,
+                             std::optional<int64_t> workspace_bytes,
+                             cudnnHandle_t exec_handle,
+                             int64_t plan_index,
+                             const std::vector<int64_t>& override_uids                 = {},
+                             const std::vector<std::vector<int64_t>>& override_shapes  = {},
+                             const std::vector<std::vector<int64_t>>& override_strides = {});
+
     // Takes a pointer to a contiguous array of device pointers, ordered as
     // get_variant_pack_uids_sorted() reports — no nanobind container copy and no
     // per-operand uid->pointer hash lookup. ``plan_index`` selects the plan;
@@ -803,10 +840,15 @@ class PyGraph {
                           int64_t n_user,
                           std::intptr_t workspace,
                           std::intptr_t exec_handle,
-                          int64_t plan_index);
+                          int64_t plan_index,
+                          std::optional<int64_t> workspace_bytes = std::nullopt);
 
     void
-    execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index);
+    execute_ordered_pack(py::handle pack,
+                         std::intptr_t workspace,
+                         std::intptr_t exec_handle,
+                         int64_t plan_index,
+                         std::optional<int64_t> workspace_bytes = std::nullopt);
 
     py::object
     execute_ordered(py::handle schema,
@@ -939,5 +981,7 @@ class PyGraph {
                   bool const unfuse_fma                                               = false,
                   bool const stats_use_log2                                           = false);
 };
+
+using PyGraphClass = py::class_<PyGraph>;
 
 }  // namespace cudnn_frontend::python_bindings

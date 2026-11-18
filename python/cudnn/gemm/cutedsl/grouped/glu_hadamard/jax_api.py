@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for grouped GEMM GLU + Hadamard, built on
-:func:`cudnn.jax.call`.
+:func:`cudnn._jax.call`.
 
 ``grouped_gemm_glu_hadamard_jax_forward`` is the canonical forward with dense weights
 for packed FP4 inputs: A ``(m, k / 2)`` and B ``(experts, n, k / 2)`` as uint8, and
@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.jax import zeros_init
+from cudnn._jax import zeros_init
 from cudnn.tensor_adapter import get_compute_capability
 from ..canonical import kernel_facing_fp4
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, grouped_call, output_type, sf_array
@@ -124,9 +124,11 @@ def glu_hadamard_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, sf_vec_si
             raise ValueError("Unsupported grouped GEMM GLU hadamard dtype, tile, cluster, alignment, or layout configuration")
         validated_configs.add(validation_key)
     if config not in kernel_cache:
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = get_compute_capability()
-        if major < 10:
-            raise RuntimeError(f"Grouped GEMM GLU hadamard requires SM100+, found SM{major}{minor}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"Grouped GEMM GLU hadamard requires SM100+ with tcgen05 (not cc 12.x), found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")

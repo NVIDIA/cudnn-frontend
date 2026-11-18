@@ -58,6 +58,21 @@ def test_backend_mirror_values_are_frozen():
         "INPUT_TMA_ENABLE": 30,
         "OUTPUT_TMA_ENABLE": 31,
         "TILE_CGA": 32,
+        "FULL_PRECISION_MATH": 33,
+        "SPLIT_K": 34,
+        "USE_TEX": 35,
+        "KBLOCK": 36,
+        "LDGA": 37,
+        "LDGB": 38,
+        "CHUNK_K": 39,
+        "SPLIT_H": 40,
+        "WINO_TILE": 41,
+        "CTA_SPLIT_K_MODE": 42,
+        "SLICED": 43,
+        "SPLIT_RS": 44,
+        "SINGLEBUFFER": 45,
+        "LDGC": 46,
+        "NUM_C_PER_BLOCK": 47,
     }
     backend_band = {name: int(member) for name, member in kt.__members__.items() if not cudnn.is_frontend_knob_type(member)}
     # Every member the backend band has today, with the value it shipped with;
@@ -67,6 +82,7 @@ def test_backend_mirror_values_are_frozen():
 
 
 def test_frontend_only_band():
+    """Keep frontend knob values stable and reject forwarding them to the backend."""
     kt = cudnn.knob_type
     assert cudnn.FRONTEND_KNOB_TYPE_BASE == 1000
     fe_only = {
@@ -80,6 +96,7 @@ def test_frontend_only_band():
         "CTA_GROUP": 1007,
         "WARPS_M": 1008,
         "WARPS_N": 1009,
+        "CLUSTER_K_REDUCE": 1010,
     }
     # The frontend band is persisted too: append-only, frozen here like the backend band.
     assert {name: int(member) for name, member in kt.__members__.items() if cudnn.is_frontend_knob_type(member)} == fe_only
@@ -89,7 +106,8 @@ def test_frontend_only_band():
     assert kt(1002) == kt.SPLIT_KV and int(kt(1002)) == 1002
 
 
-def test_frontend_only_knob_is_refused_by_a_backend_plan():
+@pytest.mark.parametrize("member,value", [("SPLIT_KV", 2), ("CLUSTER_K_REDUCE", 1)])
+def test_frontend_only_knob_is_refused_by_a_backend_plan(member, value):
     """A frontend-only knob has no backend counterpart; handing one to a
     backend engine must fail loudly rather than silently mis-map."""
     handle = cudnn.create_handle()
@@ -105,7 +123,7 @@ def test_frontend_only_knob_is_refused_by_a_backend_plan():
     # convert_to_backend_knob_type answers CUDNN_STATUS_NOT_SUPPORTED for the
     # frontend-only band; the binding surfaces that as a RuntimeError at replay.
     with pytest.raises(RuntimeError, match=r"convert_to_backend_knob_type.*CUDNN_STATUS_NOT_SUPPORTED"):
-        g.create_execution_plan(backend_id, {cudnn.knob_type.SPLIT_KV: 2})
+        g.create_execution_plan(backend_id, {getattr(cudnn.knob_type, member): value})
 
 
 def test_backend_plan_knobs_are_a_dict_never_none():
@@ -167,6 +185,12 @@ def test_sdpa_fwd_knobs_round_trip():
         kt.SPLIT_KV: 4,
     }
     assert SdpaFwdKnobs.from_public(public) == native
+    for value in (0, 1):
+        swapped = SdpaFwdKnobs(swap_ab=value)
+        assert swapped.to_public() == {kt.SWAP_AB: value}
+        assert SdpaFwdKnobs.from_public({int(kt.SWAP_AB): value}) == swapped
+    with pytest.raises(ValueError):
+        SdpaFwdKnobs.from_public({kt.SWAP_AB: True})
     # A persisted record is ints; anything that would round-trip to a different
     # native knob than the one recorded is refused rather than coerced.
     assert SdpaFwdKnobs.from_public({kt.PACK_GQA: True}) == SdpaFwdKnobs(pack_gqa=True)

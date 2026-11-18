@@ -19,6 +19,9 @@ from .kernels import fprop_dense, fprop_prepare, fprop_sm100
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 SOURCE_DIGESTS = tuple(module.FROST_SOURCE_DIGEST for module in (_metadata, fprop_dense, fprop_prepare, fprop_sm100))
+_N64_SOURCE_DIGESTS = tuple(
+    hashlib.sha256(Path(__file__).with_name("kernels").joinpath(name).read_bytes()).hexdigest() for name in ("fprop_n64_sm107.py", "_fprop_n64_ops.py")
+)
 
 
 @cute.jit
@@ -41,12 +44,13 @@ def _launch(
     stream: cuda.CUstream,
     arch: cutlass.Constexpr,
     gated: cutlass.Constexpr,
+    n64: cutlass.Constexpr,
 ):
     total, blocks = Int64(q.shape[0]), Int64(sel.shape[1])
     ids_offset = Int64(0)
     if cutlass.const_expr(gated):
         tiles = cute.ceil_div(total, 128)
-        words = cute.ceil_div(total, 256) * 8
+        words = cute.math.min(cute.ceil_div(total, 256) * 8, Int64(fprop_prepare.MASK_WORDS))
         pieces = cute.ceil_div(Int64(cute.size(k)), 1024) * 4
         modes_offset = pieces
         ranges_offset = modes_offset + cute.ceil_div(tiles, 4) * 4
@@ -63,7 +67,7 @@ def _launch(
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
         flat_k = cute.make_tensor(k.iterator, cute.make_layout((cute.size(k),)))
         flat_v = cute.make_tensor(v.iterator, cute.make_layout((cute.size(v),)))
-        fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream, arch == 107)
+        fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream)
         total, hq, dim = q.shape
         hkv = k.shape[1]
         q_view = cute.make_tensor(q.iterator, cute.make_layout((total, dim, hq), stride=(hq * dim, 1, dim)))
@@ -76,13 +80,22 @@ def _launch(
         fprop_dense._attn_launch(
             q_view, k_view, v_view, flat_bits, ranges, modes, order, flat_out, flat_out32, flat_lse, scale, Int32(bits.shape[1]), stream, hq // hkv, hq
         )
-        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+        # Past 16384 tokens a gathered query keeps its own CTA, which spreads a long sequence evenly over the SMs.
+        if total <= 16384:
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+        else:
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch, False)
     else:
         ids = cute.make_tensor(scratch.iterator, cute.make_layout((total, blocks), stride=(blocks, 1)))
         counts_offset = cute.ceil_div(total * blocks, 4) * 4
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
-        _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream, arch == 107)
-        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
+        _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream)
+        if cutlass.const_expr(n64):
+            from .kernels import fprop_n64_sm107
+
+            fprop_n64_sm107._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
+        else:
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
 
 
 @lru_cache(maxsize=None)
@@ -116,27 +129,37 @@ def _compile_args(hq, hkv, gated):
 
 
 @lru_cache(maxsize=None)
-def _compile_key(hq, hkv, arch, gated):
+def _compile_key(hq, hkv, arch, gated, n64=False):
     return template_key(
-        globals(), {**locals(), "sources": SOURCE_DIGESTS, "sm107": fprop_sm100._FPROP_SM107_SOURCE_DIGEST if arch == 107 else None}, "compile_kernel"
+        globals(),
+        {
+            **locals(),
+            "sources": SOURCE_DIGESTS,
+            "sm107": fprop_sm100._FPROP_SM107_SOURCE_DIGEST if arch == 107 else None,
+            "n64_sources": _N64_SOURCE_DIGESTS if n64 else None,
+        },
+        "compile_kernel",
     )
 
 
-def compile_kernel(hq, hkv, arch, gated):
-    key = _compile_key(hq, hkv, arch, gated)
+def compile_kernel(hq, hkv, arch, gated, n64=False):
+    key = _compile_key(hq, hkv, arch, gated, n64)
     return compile_cached(
-        _launch, *_compile_args(hq, hkv, gated), arch, gated, cache_key=key, symbol="qsa_forward_host", options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a"
+        _launch, *_compile_args(hq, hkv, gated), arch, gated, n64, cache_key=key, symbol="qsa_forward_host", options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a"
     )
 
 
 def launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, out, out_fp32, lse, scale, stream):
     total, hq, _ = q.shape
-    gated = 512 < total <= 16384
-    compiled = compile_kernel(hq, k.shape[1], arch, gated)
+    # The 64-key Rubin forward is specialised for 12 heads per KV head; 6:1 stays on the shared gathered body.
+    n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768
+    # Each query tile takes the dense or the gathered kernel on the device. The 64-key forward reads no tile modes.
+    gated = total > 512 and not n64
+    compiled = compile_kernel(hq, k.shape[1], arch, gated, n64)
     align4 = lambda value: (value + 3) // 4 * 4
     scratch_elements = align4(total * sel_blocks.shape[1]) + total
     if gated:
-        tiles, words = (total + 127) // 128, ((total + 255) // 256) * 8
+        tiles, words = (total + 127) // 128, min(((total + 255) // 256) * 8, fprop_prepare.MASK_WORDS)
         pieces = ((k.numel() + 1023) // 1024) * 4
         scratch_elements += pieces + 2 * align4(tiles) + align4(2 * tiles) + total * words
     scratch = torch.empty(scratch_elements, dtype=torch.int32, device=q.device)

@@ -235,7 +235,7 @@ Examples:
         """,
     )
 
-    parser.add_argument("--config", required=True, help="Config name (e.g., 'llama3_8b')")
+    parser.add_argument("--config", help="Config name (e.g., 'llama3_8b'); required unless --list-configs")
     parser.add_argument("--dry-run", action="store_true", help="Print benchmark cases without executing")
     parser.add_argument("--filter", dest="filter_norm", help="Filter by norm name (substring match)")
     parser.add_argument("--backend", dest="filter_backend", help="Filter by backend (exact match)")
@@ -255,6 +255,8 @@ Examples:
         for name in configs:
             print(f"  {name}")
         return
+    if args.config is None:
+        parser.error("the following arguments are required: --config")
 
     from .configs import load_config
 

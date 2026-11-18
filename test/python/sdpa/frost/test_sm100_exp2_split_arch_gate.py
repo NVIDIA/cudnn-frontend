@@ -3,7 +3,7 @@
 
 """The per-arch, per-kernel gate of the sm100 exp2 MUFU / FMA split (``TemplateParams.exp2_fma_split``).
 
-The split (the ``_E2E_*`` block of ``sm100/prefill_d128_mxfp8.py``, ``prefill_d128_fp8.py`` and
+The split (the ``_E2E_*`` block of ``sm100/d128_mxfp8_multi_q/kernel.py``, ``prefill_d128_fp8.py`` and
 ``prefill_d192_d128_f16.py``, and the ``_exp2_*`` helper mix of ``prefill_d192_d128_fp8.py``) trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's
 MUFU rate: MEASURED 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin, -9..-10 %); cc 10.3
 (GB300) DOCUMENTS the same doubled exp2 rate.  And it is claimed per KERNEL: on B200 it MEASURED a win on the
@@ -90,7 +90,7 @@ def test_exp2_fma_split_is_claimed_only_by_the_kernels_that_measured_a_win():
 
 
 def test_exp2_fma_split_of_the_d64_decode_tile_has_its_own_set():
-    """The d64 decode tile (``decode_tile``: sm100/decode_d128_f16.py at d_flavor 64) shares the f16 (64, 64) key with the d64 prefill tile but is
+    """The d64 decode tile (``decode_tile``: sm100/d128_f16_single_q/kernel.py at d_flavor 64) shares the f16 (64, 64) key with the d64 prefill tile but is
     another kernel: it claims the split through ``_EXP2_FMA_SPLIT_DECODE_KERNELS`` on the measured cc only, and the prefill spelling of the same
     flavor now admits measured BF16 causal interiors; other decode flavors and kinds stay off."""
     assert _EXP2_FMA_SPLIT_DECODE_KERNELS == frozenset({("f16", (64, 64))}), "widening the decode set is a per-kernel A/B, never a default"
@@ -104,7 +104,7 @@ def test_exp2_fma_split_of_the_d64_decode_tile_has_its_own_set():
 
 
 def test_template_params_default_is_the_all_mufu_kernel():
-    """A template loaded without the adapter (``python kernels/sm100/prefill_d128_mxfp8.py``, a probe that builds
+    """A template loaded without the adapter (``python kernels/sm100/d128_mxfp8_multi_q/kernel.py``, a probe that builds
     ``TemplateParams()`` itself) runs the develop exp2 path: the split is opt-in per build, never a default."""
     assert TemplateParams().exp2_fma_split is False
     assert TemplateParams(exp2_fma_split=True).exp2_fma_split is True
@@ -190,19 +190,20 @@ def test_d128_f16_folds_the_split_out_of_the_band_builds(band_kw, cta_mma, dtype
 
 @requires_dsl
 @pytest.mark.parametrize("enabled", [True, False], ids=["cc100_on", "cc103_off"])
-def test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate(enabled):
-    """The d192x128 f16 kernel's dense top-left causal arm carried a tail exp2 emulation BEFORE the split
-    (``_exp2_mixed_late``: the last 34 columns of chunk 1 on ``ex2_emulation_2``).  The measured form of the split
-    REPLACES it on every mask arm with the gate on; with the gate off the develop causal arm -- tail emulation
-    included -- must still be what the module traces (its own arch gate is a separate follow-up)."""
+def test_d192_f16_causal_arm_spelling_follows_the_split_claim(enabled):
+    """The d192x128 f16 kernel's dense top-left causal arm takes the exp2 split's spelling (``_DENSE_CAUSAL_PUBLIC_EXP2_MIX``
+    from ``CfgD192.EXP2_TAIL_MIX``: the BMM1/BMM2 issue tweaks and chunk 1's row-sum after its publish) only on a build
+    that claims the split; without the claim the arm traces the default issue order and the plain MUFU exp2 on every
+    column, and the module carries no causal-only tail emulation."""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
     params = TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=1, window_right=0, sched_policy=2, exp2_fma_split=enabled)
     mod = _load_sm100_kernel_module((192, 128), params, fp8=False, pertensor=False, rubin=False)
     assert mod._E2E_ENABLED is enabled
-    assert mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX is True, "this record is the dense top-left causal MHA arm"
-    assert callable(mod._exp2_mixed_late) and callable(mod.ex2_emulation_2), "the pre-existing tail emulation must stay importable for the gate-off arm"
-    assert mod._REUSE_BMM2_ISSUE_ELECTION is True, "the causal arm's BMM2 issue tweaks are independent of the split"
+    assert mod.CFG.EXP2_TAIL_MIX == int(enabled)
+    assert mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX is enabled, "this record is the dense top-left causal MHA arm"
+    assert mod._REUSE_BMM2_ISSUE_ELECTION is enabled, "the causal arm's BMM2 issue tweaks come with the split's spelling"
+    assert not hasattr(mod, "_exp2_mixed_late")
 
 
 @requires_dsl

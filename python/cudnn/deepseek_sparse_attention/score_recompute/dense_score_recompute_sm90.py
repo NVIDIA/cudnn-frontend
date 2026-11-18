@@ -19,6 +19,7 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.experimental import primitives as nvvm
 from cudnn._cutlass_compat import FastDivmodDivisor, LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
@@ -395,6 +396,11 @@ class DenseScoreRecomputeSm90:
             # per iter; producer wait = 1 wait/stage/iter.
             cute.arch.mbarrier_init(mbar_KVEmpty0_ptr, 128)
             cute.arch.mbarrier_init(mbar_KVEmpty1_ptr, 128)
+        # Initialize before the CTA rendezvous so producer stores cannot race
+        # the one-time fill of the same shared-memory buffer.
+        sWeights = storage.sWeights.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
+        if tidx == 0:
+            sWeights.fill(0.0)
         cute.arch.sync_threads()
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -402,9 +408,6 @@ class DenseScoreRecomputeSm90:
         sKV_0 = sKV_staged[None, None, 0]
         sKV_1 = sKV_staged[None, None, 1]
 
-        sWeights = storage.sWeights.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
-        if tidx == 0:
-            sWeights.fill(0.0)
         if const_expr(self.is_dense_indexer):
             sReduce_size = 16
         else:
@@ -576,12 +579,19 @@ class DenseScoreRecomputeSm90:
                 cute.arch.fence_view_async_shared()
                 # QueryWeightsReady3WG: 384-thread barrier, producer →
                 # both consumer WGs that Q + Weights are in SMEM.
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady3WG),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
+                if const_expr(self.num_head_tiles > 1):
+                    # Consumers have copied the current head tile's weights
+                    # before the producer can advance and overwrite them.
+                    nvvm.barrier_cta_sync(
+                        barrier_id=int(NamedBarrierBwd.QueryWeightsReady3WG),
+                        thread_count=self.num_threads,
+                    )
 
                 # ---- KV TMA pipeline (2-stage, alternating) ----
                 # Iter -> stage mapping:
@@ -651,9 +661,9 @@ class DenseScoreRecomputeSm90:
                     cute.arch.mbarrier_wait(mbar_KVEmpty1_ptr, kve1_phase)
                     kve1_phase = kve1_phase ^ 1
 
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete3WG),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -760,12 +770,19 @@ class DenseScoreRecomputeSm90:
                     )
 
                 cute.arch.fence_view_async_shared()
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady3WG),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
+                if const_expr(self.num_head_tiles > 1):
+                    # Consumers have copied the current head tile's weights
+                    # before the producer can advance and overwrite them.
+                    nvvm.barrier_cta_sync(
+                        barrier_id=int(NamedBarrierBwd.QueryWeightsReady3WG),
+                        thread_count=self.num_threads,
+                    )
 
                 # ---- KV TMA pipelines: warp 0 drives stage 0, warp 1 drives stage 1 ----
                 # Each warp runs its prologue + steady state + drain
@@ -848,14 +865,14 @@ class DenseScoreRecomputeSm90:
                 # barriers PingMmaWG0/1_3WG.  Skipped when num_head_tiles
                 # == 1 (compile-time) since the outer loop runs once.
                 if const_expr(self.num_head_tiles > 1):
-                    cute.arch.barrier(
+                    nvvm.barrier_cta_sync(
                         barrier_id=int(NamedBarrierBwd.ProducerHTileSync_3WG),
-                        number_of_threads=self.num_threads_per_warp_group,
+                        thread_count=self.num_threads_per_warp_group,
                     )
 
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete3WG),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1003,14 +1020,19 @@ class DenseScoreRecomputeSm90:
 
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 # Wait for Q / Weights from producer.
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady3WG),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
 
                 tWeightsrWeights = copy_ops.load_s2r(tWsWeights)
+                if const_expr(self.num_head_tiles > 1):
+                    nvvm.barrier_cta_sync(
+                        barrier_id=int(NamedBarrierBwd.QueryWeightsReady3WG),
+                        thread_count=self.num_threads,
+                    )
 
                 # WG0 handles iters n_block_max-1, n_block_max-3, ...
                 # WG1 handles iters n_block_max-2, n_block_max-4, ...
@@ -1028,9 +1050,9 @@ class DenseScoreRecomputeSm90:
                 # h_tile boundaries regardless of n_block_max parity.
                 if const_expr(consumer_id == 1):
                     if n_block_max > 0:
-                        cute.arch.barrier_arrive(
+                        nvvm.barrier_cta_arrive(
                             barrier_id=int(NamedBarrierBwd.PingMmaWG0_3WG),
-                            number_of_threads=256,
+                            thread_count=256,
                         )
 
                 # Pingpong main loop.
@@ -1040,9 +1062,9 @@ class DenseScoreRecomputeSm90:
                     kv_phase = kv_phase ^ 1
                     # Wait peer's arrive token so our WGMMA is strictly
                     # interleaved with peer's on the TC issue port.
-                    cute.arch.barrier(
+                    nvvm.barrier_cta_sync(
                         barrier_id=self_ping_id,
-                        number_of_threads=256,
+                        thread_count=256,
                     )
 
                     n_block_base_row = n_block * self.tile_n + warp_idx_in_wg * 16
@@ -1067,9 +1089,9 @@ class DenseScoreRecomputeSm90:
                     # peer still has a next MMA (peer's next n_block =
                     # n_block - 1 ≥ 0, i.e. current n_block > 0).
                     if n_block > 0:
-                        cute.arch.barrier_arrive(
+                        nvvm.barrier_cta_arrive(
                             barrier_id=peer_ping_id,
-                            number_of_threads=256,
+                            thread_count=256,
                         )
 
                     warpgroup.wait_group(0)
@@ -1116,14 +1138,14 @@ class DenseScoreRecomputeSm90:
                                 sReduce[my_sreduce_off + 4 + warp_idx_in_wg] = lse_state[1]
                         cute.arch.fence_view_async_shared()
                         if const_expr(consumer_id == 0):
-                            cute.arch.barrier(
+                            nvvm.barrier_cta_sync(
                                 barrier_id=int(NamedBarrierBwd.DenseConsumer0Sync_3WG),
-                                number_of_threads=self.num_threads_per_warp_group,
+                                thread_count=self.num_threads_per_warp_group,
                             )
                         else:
-                            cute.arch.barrier(
+                            nvvm.barrier_cta_sync(
                                 barrier_id=int(NamedBarrierBwd.DenseConsumer1Sync_3WG),
-                                number_of_threads=self.num_threads_per_warp_group,
+                                thread_count=self.num_threads_per_warp_group,
                             )
                         if is_last_h:
                             global_max = cute.arch.fmax(
@@ -1148,6 +1170,19 @@ class DenseScoreRecomputeSm90:
                             ) + global_sum_exp * cute.math.exp2((global_max - new_max) * LOG2_E, fastmath=True)
                             lse_accum_max = new_max
 
+                        # All warps must finish reading the shared reduction
+                        # slots before the next iteration or final combine reuses them.
+                        if const_expr(consumer_id == 0):
+                            nvvm.barrier_cta_sync(
+                                barrier_id=int(NamedBarrierBwd.DenseConsumer0Sync_3WG),
+                                thread_count=self.num_threads_per_warp_group,
+                            )
+                        else:
+                            nvvm.barrier_cta_sync(
+                                barrier_id=int(NamedBarrierBwd.DenseConsumer1Sync_3WG),
+                                thread_count=self.num_threads_per_warp_group,
+                            )
+
                     n_block = n_block - 2
 
                 # End of n_block loop for this h_tile.
@@ -1159,18 +1194,29 @@ class DenseScoreRecomputeSm90:
                         sReduce[my_sreduce_off + warp_idx_in_wg] = l1norm_warp_accum
                     cute.arch.fence_view_async_shared()
                     if const_expr(consumer_id == 0):
-                        cute.arch.barrier(
+                        nvvm.barrier_cta_sync(
                             barrier_id=int(NamedBarrierBwd.DenseConsumer0Sync_3WG),
-                            number_of_threads=self.num_threads_per_warp_group,
+                            thread_count=self.num_threads_per_warp_group,
                         )
                     else:
-                        cute.arch.barrier(
+                        nvvm.barrier_cta_sync(
                             barrier_id=int(NamedBarrierBwd.DenseConsumer1Sync_3WG),
-                            number_of_threads=self.num_threads_per_warp_group,
+                            thread_count=self.num_threads_per_warp_group,
                         )
                     block_col_sum = sReduce[my_sreduce_off + 0] + sReduce[my_sreduce_off + 1] + sReduce[my_sreduce_off + 2] + sReduce[my_sreduce_off + 3]
                     l1norm_accum += block_col_sum
                     l1norm_warp_accum = Float32(0.0)
+                    # Protect these reads from the next head tile or final combine.
+                    if const_expr(consumer_id == 0):
+                        nvvm.barrier_cta_sync(
+                            barrier_id=int(NamedBarrierBwd.DenseConsumer0Sync_3WG),
+                            thread_count=self.num_threads_per_warp_group,
+                        )
+                    else:
+                        nvvm.barrier_cta_sync(
+                            barrier_id=int(NamedBarrierBwd.DenseConsumer1Sync_3WG),
+                            thread_count=self.num_threads_per_warp_group,
+                        )
             # End of h_tile loop.
 
             # Cross-WG combine of l1norm / lse:
@@ -1186,9 +1232,9 @@ class DenseScoreRecomputeSm90:
                     else:
                         sReduce[4] = l1norm_accum
                 cute.arch.fence_view_async_shared()
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.ConsumersDone3WG),
-                    number_of_threads=256,
+                    thread_count=256,
                 )
                 if const_expr(consumer_id == 0):
                     final_l1norm = sReduce[0] + sReduce[4]
@@ -1203,9 +1249,9 @@ class DenseScoreRecomputeSm90:
                         sReduce[8] = lse_accum_max
                         sReduce[9] = lse_accum_sum_exp
                 cute.arch.fence_view_async_shared()
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.ConsumersDone3WG),
-                    number_of_threads=256,
+                    thread_count=256,
                 )
                 if const_expr(consumer_id == 0):
                     wg0_max = sReduce[0]
@@ -1218,9 +1264,9 @@ class DenseScoreRecomputeSm90:
                     )
                     self.write_lse_denom(new_max, final_sum, mL1NormDenom, batch_idx, m_block, tidx)
 
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete3WG),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()

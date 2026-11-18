@@ -1,6 +1,6 @@
 # LayerNorm/RMSNorm backward (sm_100) — optimization findings
 
-Kernels are **cutlass primitives** (`cutlass.primitives as nvvm`), not high-level CuTe-DSL.
+Kernels are **cutlass primitives** (`cutlass.experimental.primitives as nvvm`), not high-level CuTe-DSL.
 
 ## Current state
 Backward geomean **0.95×** vs cuDNN (bf16, Blackwell sm_100). Committed: `29fbdfd0`,

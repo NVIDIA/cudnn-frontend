@@ -170,6 +170,53 @@ def test_frost_compiler_failure_releases_the_artifact_lock(tmp_path, failure):
         _cleanup(processes)
 
 
+_THREADS_CHILD = r"""
+import importlib.util, os, sys, threading, time, types
+from pathlib import Path
+source, directory = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('cache_under_test', source)
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+cc.set_cache_dir(Path(directory) / 'cache')
+cc.environment_manifest = lambda: {'schema': cc._SCHEMA, 'cudnn_frontend': 'test'}
+cc._memo_device = lambda: (0, 0)
+os.environ.pop(cc._ENV_DISABLE, None)
+os.environ[cc._ENV_MEMO] = '0'
+
+guard, active, peak = threading.Lock(), [0], [0]
+def compile(*args, **kwargs):
+    with guard:
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+    time.sleep(.2)  # long enough for the other thread's miss to arrive mid-trace
+    with guard:
+        active[0] -= 1
+    return object()  # nothing to export: the in-process object is returned as is
+
+cute = types.ModuleType('cutlass.cute')
+cute.compile = compile
+cutlass = types.ModuleType('cutlass')
+cutlass.cute = cute
+sys.modules.update({'cutlass': cutlass, 'cutlass.cute': cute})
+start = threading.Barrier(2)
+def call(key):
+    start.wait()
+    cc.compile_cached(lambda: None, cache_key=key, options='--enable-tvm-ffi')
+threads = [threading.Thread(target=call, args=(key,)) for key in ('a', 'b')]
+[t.start() for t in threads]
+[t.join() for t in threads]
+print('peak', peak[0], 'misses', cc.stats()['misses'])
+"""
+
+
+def test_frost_threads_never_trace_two_keys_at_once(tmp_path):
+    """Within one process, misses on different keys must not overlap inside the compiler: the CuTe DSL keeps its
+    per-trace state on objects every compile shares, so two concurrent traces corrupt each other."""
+    out = subprocess.run([sys.executable, "-c", _THREADS_CHILD, str(_SOURCE), str(tmp_path)], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["peak", "1", "misses", "2"], out.stdout + out.stderr
+
+
 def test_frost_unavailable_lock_keeps_compilation_functional(tmp_path):
     """An unusable lock directory preserves best-effort compilation and export."""
     process = _start(tmp_path, "fallback", mode="unavailable")

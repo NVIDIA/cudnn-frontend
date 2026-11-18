@@ -29,38 +29,38 @@ if requirement_error:
 
 from cudnn.norm import NormVariant, norm_bprop, norm_fprop
 
-TOL = {
-    torch.float32: dict(fwd=3e-4, bwd=2e-4),
-    torch.float16: dict(fwd=6e-2, bwd=4e-2),
-    torch.bfloat16: dict(fwd=8e-2, bwd=7e-2),
-}
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 
 def _check(name, got, ref, dtype, kind):
     if got is None and ref is None:
         return True
-    got = got.float()
-    ref = ref.float()
-    amax = (got - ref).abs().max().item()
-    scale = max(1.0, ref.abs().max().item())
-    ok = amax <= TOL[dtype][kind] * scale
+    amax = (got.float() - ref.float()).abs().max().item()
+    try:
+        torch.testing.assert_close(got, ref, check_dtype=False)
+        ok = True
+    except AssertionError as exc:
+        print(f"  {name}: {exc}")
+        ok = False
     print(f"  [{'PASS' if ok else 'FAIL'}] {name:<22} {str(dtype):>16} maxabs={amax:.3e}")
     return ok
 
 
-def _ref_grads(fn, x, g, b, dy):
+def _ref_grads(fn, x, g, b):
     xr = x.float().detach().requires_grad_(True)
     gr = g.float().detach().requires_grad_(True) if g is not None else None
     br = b.float().detach().requires_grad_(True) if b is not None else None
     y = fn(xr, gr, br)
+    # Follow the norm notebooks and compare both backward paths with the same DY.
+    loss = F.mse_loss(y, torch.randn_like(x).float(), reduction="mean")
+    dy = torch.autograd.grad(loss, y, retain_graph=True)[0].to(x.dtype)
     ins = [t for t in (xr, gr, br) if t is not None]
     grads = torch.autograd.grad(y, ins, grad_outputs=dy.float())
     it = iter(grads)
     dx = next(it)
     dg = next(it) if gr is not None else None
     db = next(it) if br is not None else None
-    return y.detach(), dx, dg, db
+    return y.detach(), dy, dx, dg, db
 
 
 def _check_variant(variant, xshape, ref_fn, *, glen, has_beta=True, fwd=None, bwd=None):
@@ -75,10 +75,9 @@ def _check_variant(variant, xshape, ref_fn, *, glen, has_beta=True, fwd=None, bw
         b = torch.randn(glen, device="cuda", dtype=dtype) if has_beta else None
 
         y, mean, rstd = norm_fprop(variant, x, g, b, **fwd)
-        dy = torch.randn_like(y)
+        y_ref, dy, dx_ref, dg_ref, db_ref = _ref_grads(ref_fn, x, g, b)
         dx, dgamma, dbeta = norm_bprop(variant, dy, x, g, mean, rstd, has_beta=has_beta, **bwd)
 
-        y_ref, dx_ref, dg_ref, db_ref = _ref_grads(ref_fn, x, g, b, dy)
         all_ok &= _check("fwd y", y, y_ref, dtype, "fwd")
         all_ok &= _check("bwd dx", dx, dx_ref, dtype, "bwd")
         all_ok &= _check("bwd dgamma", dgamma, dg_ref, dtype, "bwd")

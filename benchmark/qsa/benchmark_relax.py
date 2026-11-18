@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--relax-source", type=Path, required=True, help="Directory containing unchanged grouped.py and selector.py")
     parser.add_argument("--frontend-source", type=Path, help="Verify that cudnn imports from this checkout; never silently overrides an editable install")
     parser.add_argument("--lengths", default="8192")
-    parser.add_argument("--heads", type=int, choices=(12, 24), default=12)
+    parser.add_argument("--heads", type=int, choices=(6, 12, 24), default=12)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--output", required=True)
@@ -48,8 +48,8 @@ def main():
     lengths = tuple(map(int, args.lengths.split(",")))
     if not lengths or min(lengths) < 1 or sum(lengths) > 131072 or args.repeats < 3 or args.warmup < 2:
         parser.error("Require positive packed lengths totaling at most 131072 and at least three samples and two warmups")
-    if args.indexed and args.heads != 12:
-        parser.error("The indexed path supports 12Q/1KV")
+    if args.indexed and args.heads not in (6, 12):
+        parser.error("The indexed path supports 12Q/1KV and 6Q/1KV")
     if args.causal_topk and not args.indexed:
         parser.error("--causal-topk requires --indexed")
     if args.compare_general and not args.causal_topk:
@@ -65,7 +65,7 @@ def main():
     reference = load(Path(__file__).with_name("reference.py"), "qsa_independent_reference")
     from benchmark_qsa import tensor_hash, file_hash, save
     from cudnn.ops import qsa_forward, qsa_backward, qsa_indexed_forward, qsa_indexed_backward
-    from cudnn.QSA.two_pass.api import _dsl_cuda_version
+    from cudnn.QSA._backward import dsl_cuda_major
 
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K"] = "32"
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES"] = "3"
@@ -73,7 +73,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(20261016)
-    total, hq, hkv = sum(lengths), args.heads, args.heads // 12
+    total, hq, hkv = sum(lengths), args.heads, max(args.heads // 12, 1)
     q = torch.randn((total, hq, 256), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((total, hkv, 256), device="cuda", dtype=torch.bfloat16)
     v, grad = torch.randn_like(k), torch.randn_like(q)
@@ -183,7 +183,7 @@ def main():
         cudnn_backend=cudnn.backend_version(),
         triton=importlib.metadata.version("triton"),
         dsl=importlib.metadata.version("nvidia-cutlass-dsl"),
-        dsl_compiler=_dsl_cuda_version(),
+        dsl_compiler=dsl_cuda_major(),
         source=cudnn.__file__,
         boundary="Warm full attention calls including allocation, metadata, gradient preparation and casts; selector, route expansion, compilation and TP communication excluded",
         reference_sha256={name: file_hash(args.relax_source / name) for name in ("grouped.py", "selector.py")},
@@ -201,11 +201,7 @@ def main():
         indices_shape=list(indices.shape),
         bitmap_bytes=0 if sel is None else sel.numel(),
         compact_forward_bytes=total * 513 * 4 if args.indexed else sel.numel() * 4,
-        compact_backward_bytes=(
-            None
-            if args.causal_topk
-            else ((total + 1) // 2) * 1026 * 4 if args.indexed else ((total + 1) // 2) * sel.shape[1] * 4 if hkv == 1 else sel.numel() * 4
-        ),
+        compact_backward_bytes=total * 513 * 4 if args.indexed else sel.numel() * 4,
         checks={},
         timings={},
     )

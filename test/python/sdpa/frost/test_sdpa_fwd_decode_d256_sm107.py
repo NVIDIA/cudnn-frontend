@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The d256 DECODE tile of the FROST Rubin (SM107) f16/bf16 engine (sm107/decode_d256_f16.py).
+"""The d256 DECODE tile of the FROST Rubin (SM107) f16/bf16 engine (sm107/d256_f16_swap_ab/kernel.py).
 
 The Rubin sibling of the SM100 swap-AB tile: the same body (KV tokens on the MMA M
 axis, the packed Q rows on N, one cta_group::1 CTA per unit) under
@@ -11,7 +11,7 @@ f16/bf16 d256 graphs whose S_q x packed heads fit 16 rows ride the 16-column til
 SM100, rows in (16, 32] ride the 32-column tile, and a packed MTP step of up to two TOKEN
 UNITS (24/2 at S_q = 4: two units of two tokens x 12 heads, each streaming the KV range once)
 rides it too (``Q_TOKEN_UNITS``).  Same graph contract,
-same engine row (``sdpa_fwd_prefill_sm107``): every graph test pins the engine with
+explicit implementation records: every graph test pins a D256 owner with
 ``select_engine`` and asserts WHICH template served the plan through the executor's
 ``kernel_template`` (a decline or a fallback to the prefill tile fails instead of
 passing on the wrong kernel).  The reference is an fp32 torch softmax over the dense
@@ -50,6 +50,7 @@ and wired into every ``SmemTile``, ``SPIN_RING_WAITS`` on exactly the per-KV-ite
 ring waits, the config twin's backstops, and the CuTe DSL version gate (Rule 7).
 """
 
+import ast
 import math
 import os
 import re
@@ -100,10 +101,25 @@ def _gpu(f):
     return requires_sm107_dsl(requires_rubin(f))
 
 
-def _engine():
-    from cudnn.sdpa.fwd.engines import engine_name
+_LEGACY_ENGINE = "sdpa_fwd_prefill_sm107"
+_D256_ENGINES = (
+    "sdpa_fwd_sm107_d256_swap_ab",
+    "sdpa_fwd_sm107_d256_lookahead",
+    "sdpa_fwd_sm107_shared_d256_lookahead",
+)
 
-    return engine_name(arch=ARCH)
+
+def _policy_caps():
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    return sm100_legacy_policy_spec(_LEGACY_ENGINE).capabilities
+
+
+def _offered_d256():
+    from cudnn.engines.manifest import MANIFEST
+
+    family = next(row for row in MANIFEST if row.factory == "FrostSdpaFwdEngines")
+    return {name: family.engine_id + family.slots[name].slot for name in _D256_ENGINES}
 
 
 def _load(rubin=True, **params):
@@ -136,33 +152,114 @@ def _wait_sites(code):
 
 
 def test_sm107_decode_routes_to_the_rubin_sibling():
-    """The decode record routes to sm107/decode_d256_f16.py on cc 10.7 (ahead of the shared
+    """The decode record routes to sm107/d256_f16_swap_ab/kernel.py on cc 10.7 (ahead of the shared
     paged-prefill arm: the paged record too) and to the SM100 file otherwise."""
     for extra in ({}, dict(paged_kv=True, page_size=16)):
         mod = _load(rubin=True, decode_q_tile=16, seq_kv_lens_present=True, **extra)
-        assert mod.__file__.endswith("/sm107/decode_d256_f16.py") and "sm107_decode" in mod.__name__, mod.__name__
+        assert mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py") and "sm107_decode" in mod.__name__, mod.__name__
     sm100 = _load(rubin=False, decode_q_tile=16, seq_kv_lens_present=True)
-    assert sm100.__file__.endswith("/sm100/decode_d256_f16.py") and "sm100_decode" in sm100.__name__, sm100.__name__
+    assert sm100.__file__.endswith("/sm100/d256_f16_swap_ab/kernel.py") and "sm100_decode" in sm100.__name__, sm100.__name__
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"split_kv": 4},
+        {"pack_gqa": False},
+        {"qh_per_kh": 8},
+        {"decode_q_tile": 32},
+        {"dtype_qkv": 3},
+        {"dtype_qkv": 3, "dtype_o": 3},
+        {"paged_kv": True, "page_size": 16, "seq_kv_lens_present": True},
+        {"has_sink": True},
+        {"window_right": 0},
+        {"stats_log2": True},
+        {"seq_q_lens_present": True, "seq_kv_lens_present": True},
+        {"seq_kv_lens_present": True},
+    ],
+)
+def test_cluster_combine_keeps_other_decode_contracts_unfused(change):
+    params = dict(dtype_qkv=2, split_kv=8, pack_gqa=True, qh_per_kh=16, decode_q_tile=16)
+    mod = _load(**(params | change))
+    assert mod.cluster_combine_supported(256, 256) == (not change)
+    if change:
+        with pytest.raises(ValueError, match="cluster combine requires"):
+            mod.compile(cluster_combine=True)
+
+
+@pytest.mark.parametrize("kwargs", [{"use_pdl": True}, {"has_lse": False}, {"d_qk": 248}, {"d_v": 248}])
+def test_cluster_combine_rejects_incompatible_compile_contract(kwargs):
+    mod = _load(dtype_qkv=2, split_kv=8, pack_gqa=True, qh_per_kh=16, decode_q_tile=16)
+    with pytest.raises(ValueError, match="cluster combine requires|per-split LSE"):
+        mod.compile(cluster_combine=True, **kwargs)
 
 
 def test_sm107_decode_body_matches_the_sm100_body():
-    """The SNAPSHOT pin: the Rubin module is the SM100 body line for line, modulo the
+    """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits and the header prose.  A fix that lands in one file and
-    not the other fails here; so does a body change smuggled into the port."""
+    keyword on the ring waits, the SM100-only live-column specialization, and the
+    header prose. The optional cluster reducer and
+    its host/compiler bindings are separate implementations, exercised by the cluster
+    binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
 
     kdir = Path(api_dsl.__file__).parent / "kernels"
-    sm100 = (kdir / "sm100" / "decode_d256_f16.py").read_text(encoding="utf-8")
-    sm107 = (kdir / "sm107" / "decode_d256_f16.py").read_text(encoding="utf-8")
+    sm100 = (kdir / "sm100" / "d256_f16_swap_ab" / "kernel.py").read_text(encoding="utf-8")
+    sm107 = (kdir / "sm107" / "d256_f16_swap_ab/kernel.py").read_text(encoding="utf-8")
 
     def _body(src):
+        lines = src.splitlines(keepends=True)
+        omitted = set()
+        for node in ast.parse(src).body:
+            if isinstance(node, ast.FunctionDef) and node.name in ("_host", "compile", "cluster_combine_supported"):
+                start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                omitted.update(range(start, node.end_lineno + 1))
+            if isinstance(node, ast.FunctionDef) and node.name == "_kernel":
+                for arg in node.args.args:
+                    if arg.arg in ("final_o_tensor", "final_lse_tensor"):
+                        omitted.update(range(arg.lineno, arg.end_lineno + 1))
+                tail = node.body[-1]
+                if isinstance(tail, ast.If) and ast.unparse(tail.test) == "cutlass.const_expr(final_o_tensor is not None)":
+                    omitted.update(range(tail.lineno, tail.end_lineno + 1))
+        src = "".join(line for n, line in enumerate(lines, 1) if n not in omitted)
         # everything after the module docstring, comments dropped
         end = src.index('"""', src.index('"""') + 3) + 3
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
 
     a, b = _body(sm100), _body(sm107)
+    sm100_name_import = "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME"
+    assert a.count(sm100_name_import) == 1
+    from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME
+
+    sm107_name_assignment = f'TEMPLATE_NAME = "{TEMPLATE_NAME}"'
+    assert b.count(sm107_name_assignment) == 1
+    a = [ln for ln in a if ln != sm100_name_import]
+    b = [ln for ln in b if ln != sm107_name_assignment]
+    # Pin the exact SM100-only specialization before comparing the shared body.
+    # Removing an arbitrary AST branch would hide edits to its zero-fill/fence.
+    sm100_only = {
+        'COLS = getattr(PARAMS, "decode_live_columns", 0) or 16': "COLS = 16",
+        "COL_GROUPS = N_Q // 16": "COL_GROUPS = N_Q // COLS",
+        'if COLS not in (8, 16) or (COLS == 8 and N_Q != 16):\n    raise ValueError("swap-AB decode: a reduced softmax width needs a single 16-column MMA group")': "",
+        "{4 * COL_GROUPS} softmax warps": "{4 * (N_Q // COLS)} softmax warps",
+        "\n".join(
+            (
+                "        if cutlass.const_expr(COLS < 16):",
+                "            zero4 = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32)",
+                "            for slot in cutlass.range_constexpr(2):",
+                "                offset = cutlass.Int32(slot * pBufferWords + COLS // 2) + tidx * cutlass.Int32(P_ROW_WORDS)",
+                "                Pointer(sP_raw.subview(offset).data_ptr(), dtype=cutlass.Int32).store_swizzled(zero4, _P_SMEM_SWIZZLE, alignment=16)",
+                '            nvvm.fence_proxy("async.shared", space="cta")',
+            )
+        ): "",
+    }
+    a_src = "\n".join(a)
+    for specialized, shared in sm100_only.items():
+        assert a_src.count(specialized) == 1, f"the declared SM100-only live-column delta changed:\n{specialized}"
+        a_src = a_src.replace(specialized, shared)
+    a = [ln for ln in a_src.splitlines() if ln.strip()]
     b = [ln for ln in b if ln.strip() not in ("desc_version=DESC_VERSION,",)]
     b = [ln.replace(", spin=SPIN_RING_WAITS)", ")") for ln in b]
     b = [
@@ -179,13 +276,16 @@ def test_sm107_decode_body_matches_the_sm100_body():
         )
     ]
     b = [ln for ln in b if ln != "from cudnn.frost.buffers import cutedsl_arch_requirement_error"]
+    sm107_config_import = "from cudnn.sdpa.fwd.kernels.sm107.d256_f16_swap_ab.config import d256_decode_desc_version, make_cfg_d256_decode"
+    assert b.count(sm107_config_import) == 1
     b = [
         ln.replace(
-            "from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d256_decode_desc_version, make_cfg_d256_decode",
-            "from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256_decode",
+            sm107_config_import,
+            "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode",
         )
         for ln in b
     ]
+    b = "\n".join(b).splitlines()
     assert a == b, "the Rubin decode module diverged from the SM100 body beyond the declared deltas:\n" + "\n".join(
         f"{'-' if x else '+'} {x or y}" for x, y in zip(a, b) if x != y
     )
@@ -348,7 +448,7 @@ def test_sm107_decode_module_declines_below_the_dsl_floor(monkeypatch):
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     want = buffers.cutedsl_arch_requirement_error((10, 7))
     assert want is not None and "sm_107a" in want
-    path = str(Path(api_dsl.__file__).parent / "kernels" / "sm107" / "decode_d256_f16.py")
+    path = str(Path(api_dsl.__file__).parent / "kernels" / "sm107" / "d256_f16_swap_ab/kernel.py")
     with pytest.raises(NotImplementedError, match=re.escape(want)):
         load_template(path, TemplateParams(decode_q_tile=16, seq_kv_lens_present=True, stats_log2=True, window_left=77, window_right=5), tag="dsl_floor_probe")
 
@@ -408,7 +508,7 @@ def test_decode_q_tile_rule():
     assert decode_d256_q_units(4, 12, 0) == 0 and decode_d256_q_units(1, 64, 32) == 0
     from cudnn.sdpa.fwd import engines
 
-    caps107 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _engine())
+    caps107 = _policy_caps()
     caps100 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm100"))
     assert engines.decode_d256_q_tile_for_row(caps107, 4, 12) == 64 and engines.decode_d256_q_tile_for_row(caps100, 4, 12) == 0
     assert engines.decode_d256_q_tile_for_row(caps107, 4, 12, paged=True, masked=False) == 32  # the facts twin reads the form too
@@ -419,12 +519,12 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     """The facts-level twin (engines.d256_decode_tile_selected) of the adapter's _decode_q_tile on the
     Rubin row: a decode-shaped half d256 graph is selected (paged or dense, sink or not); a gated,
     pre-folded, THD, quantized or wider graph is not -- and the row's paged rule admits exactly the
-    selected form while the paged PREFILL pipeline keeps its THD-only scope."""
+    selected D256 form; native D128 also serves dense-Q paging."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _engine())
+    caps = _policy_caps()
     assert caps.decode is True
     base = dict(
         b=4, h_q=24, h_kv=2, s_q=1, s_kv=4096, d_qk=D, d_v=D, dtype=cudnn.data_type.BFLOAT16, padded=True, has_paged_kv=True, page_size=16, device_cc=(10, 7)
@@ -442,10 +542,10 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     gated = SdpaGraphFacts(**{**base, "has_epilogue_gate": True, "epilogue_gate_dtype": cudnn.data_type.BFLOAT16})
     assert engines.d256_decode_tile_selected(caps, gated, 12) and engines.d256_decode_tile_selected(caps, gated, 12, split_kv=2)
     assert not engines.d256_decode_tile_selected(caps, gated, 12, split_kv=1)
-    for change in (dict(s_q=64), dict(d_qk=128, d_v=128)):
-        g = SdpaGraphFacts(**{**base, **change})
-        reason = engines.mismatch(caps, g, None)
-        assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
+    reason = engines.mismatch(caps, SdpaGraphFacts(**{**base, "s_q": 64}), None)
+    assert reason and "Rubin paged KV requires THD" in reason
+    # D128 has a native dense-Q page loader independently of the D256 decode tile.
+    assert engines.mismatch(caps, SdpaGraphFacts(**{**base, "d_qk": 128, "d_v": 128}), None) is None
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the 32-column tile, one unit
     # base is a PADDED, mask-free paged graph: the 64-column width's predicate declines it, so the (16, 32) table rules here
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units of the 32-column tile
@@ -473,9 +573,9 @@ def test_sm107_facts_twin_rule_and_ranked_list_agree_on_the_packed_decode_tile()
     from cudnn.sdpa.fwd import config_sm107, engines, heuristics
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _engine())
-    caps = spec.capabilities
-    offered = {spec.name: 20700}
+    caps = _policy_caps()
+    offered = _offered_d256()
+    by_id = {offered[spec.name]: spec.capabilities for spec in engines.ENGINE_SPECS if spec.name in offered}
 
     def facts(group, s_q, paged, masked):
         kw = dict(b=2, h_q=2 * group, h_kv=2, s_q=s_q, s_kv=700, d_qk=D, d_v=D, dtype=cudnn.data_type.HALF, padded=True, device_cc=(10, 7), device_sm_count=204)
@@ -502,7 +602,7 @@ def test_sm107_facts_twin_rule_and_ranked_list_agree_on_the_packed_decode_tile()
                     reason = engines.mismatch(caps, f, None)
                     assert (reason is None) is (packed_rides or unpacked_rides), (group, s_q, masked, reason)
                     plans = heuristics.recommend("A", f, offered) if reason is None else []
-                    assert all(engines.mismatch(caps, f, p.knobs) is None for p in plans)
+                    assert all(engines.mismatch(by_id[p.engine_id], f, p.knobs) is None for p in plans)
                     assert any(p.knobs.pack_gqa is True for p in plans) is packed_rides, (group, s_q, masked, [p.knobs for p in plans])
                     assert any(not p.knobs.pack_gqa for p in plans) is unpacked_rides, (group, s_q, masked, [p.knobs for p in plans])
                     checked += 1
@@ -524,15 +624,13 @@ def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
     12:1; a paged gated graph lists no unsplit set at all; a padded dense cache (no split) keeps the
     fused prefill kernel; a prefill-shaped gated graph keeps the old contract (unsplit, unpacked)."""
     import cudnn
-    from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _pack_gqa_group, _split_points, recommend
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _engine())
-    fam = next(r for r in MANIFEST if r.factory == "FrostSdpaFwdEngines")
-    offered = {_engine(): fam.engine_id + fam.slots[_engine()].slot}
+    caps = _policy_caps()
+    offered = _offered_d256()
     base = dict(
         b=4,
         h_q=24,
@@ -552,10 +650,12 @@ def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
     )
 
     def sets(f):
-        out = [p.knobs for p in recommend("A", f, offered) if p.engine_id == offered[_engine()]]
-        for k in out:
-            assert engines.mismatch(caps, f, k) is None, (k, engines.mismatch(caps, f, k))
-        return [(k.pack_gqa is True, k.split_kv or 1) for k in out]
+        plans = [p for p in recommend("A", f, offered) if p.engine_id in offered.values()]
+        by_id = {offered[spec.name]: spec.capabilities for spec in engines.ENGINE_SPECS if spec.name in offered}
+        for plan in plans:
+            reason = engines.mismatch(by_id[plan.engine_id], f, plan.knobs)
+            assert reason is None, (plan, reason)
+        return [(p.knobs.pack_gqa is True, p.knobs.split_kv or 1) for p in plans]
 
     paged = SdpaGraphFacts(**base)
     assert engines.mismatch(caps, paged, None) is None
@@ -727,12 +827,20 @@ def _run_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if explicit_knobs is None:
-        plan = select_engine(g, _engine(), pack_gqa=pack_gqa, split_kv=split_kv)
+        plan = select_engine(g, _D256_ENGINES, pack_gqa=pack_gqa, split_kv=split_kv)
     else:
-        select_engine(g, _engine())
-        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        select_engine(g, _D256_ENGINES)
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+        from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+        from cudnn.sdpa.graph_analyzer import analyze
+
+        _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
         knobs.update(explicit_knobs)
-        g.create_execution_plan(engine, knobs)
+        requested = SdpaFwdKnobs.from_public(knobs)
+        geometry = select_sm107_half_geometry(analyze(g), requested)
+        engine = family_for(g).offered_ids(g)[geometry.implementation]
+        g.create_execution_plan(engine, geometry.canonical_knobs(requested).to_public())
         g.select_plan(g.get_execution_plan_count() - 1)
         plan = g.plans[g._plan_index]
     idx = g._plan_index
@@ -995,7 +1103,7 @@ def test_decode_graph_mtp_qwen_24_2_s_q_three_to_five_ride_the_64_column_tile_in
     _assert_decode_tile_plan(plan, G=12)
     assert (plan.knobs.split_kv or 1) == 1, plan.knobs
     assert _mtp_module_facts(cap["module"]) == (64, 12, 5, 60, True, 16, 18), _mtp_module_facts(cap["module"])
-    assert cap["module"].__file__.endswith("/sm107/decode_d256_f16.py")
+    assert cap["module"].__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
 
 
 @_gpu
@@ -1069,11 +1177,13 @@ def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_for
     assert pw.knobs.pack_gqa is True and _mtp_module_facts(wide["module"])[:4] == (32, 12, 2, 24)
     # (b): the narrow tile in four token units -- the adapter's route pinned to N = 16 for this geometry (the engine's
     # row rule and the heuristics keep the real route: the packed set is eligible either way, the lowering decides the width).
-    monkeypatch.setattr(
-        api_dsl,
-        "_decode_d256_q_tile_sm107",
-        lambda s_q, pack_g, *a, **k: 16 if (s_q, pack_g) == (4, 12) else config_sm107.decode_d256_q_tile(s_q, pack_g, *a, **k),
-    )
+    actual_width = config_sm107.decode_d256_q_tile
+
+    def narrow_width(s_q, pack_g, *args, **kwargs):
+        return 16 if (s_q, pack_g) == (4, 12) else actual_width(s_q, pack_g, *args, **kwargs)
+
+    monkeypatch.setattr(config_sm107, "decode_d256_q_tile", narrow_width)
+    monkeypatch.setattr(api_dsl, "_decode_d256_q_tile_sm107", narrow_width)
     pn = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=narrow)
     monkeypatch.undo()
     assert pn.knobs.pack_gqa is True and _mtp_module_facts(narrow["module"])[:4] == (16, 12, 1, 12), _mtp_module_facts(narrow["module"])
@@ -1274,7 +1384,7 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    ours = [g.plans[i].knobs for i, n in enumerate(names) if _is_plan_for(n, _engine())]
+    ours = [g.plans[i].knobs for i, n in enumerate(names) if _is_plan_for(n, _D256_ENGINES)]
     assert ours and ours[0].pack_gqa is True and (ours[0].split_kv or 1) == 1, ours
     assert any(kn.pack_gqa is True and kn.split_kv == captured for kn in ours), ours
     # The same shape one token wider (32/2 at S_q=2 bottom-right: 32 packed rows) is the 32-column
@@ -1355,7 +1465,7 @@ def test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile():
     plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], page=16, dtype=torch.bfloat16, capture=cap)
     _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8, grid=(4, 24, 1))
     mod = cap["module"]
-    assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
+    assert mod.TEMPLATE_NAME == DECODE and mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__file__
     assert (mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.N_Q - mod.Q_BOX_ROWS, mod.N_Q, mod.CFG.SPLIT_KV) == (
         12,
         1,
@@ -1795,9 +1905,8 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     requires paged KV' gate declined): ACCEPT -- a decode-shaped graph packs the whole group (24/2
     -> 12 rows) and splits (the fp32 partials + the shared combine), the 16-row MTP step packs 8:1;
     the 24/2 MTP step packs on the 32-column tile in two token units and splits; REJECT -- a packed
-    graph past the route (24/2 at S_q = 5: a third token unit) and a split past the route (33 MHA
-    rows) are typed declines naming the decode tile, because the d256 prefill kernel wires neither
-    (never a silent unpacked / unsplit run)."""
+    graph past the route (24/2 at S_q = 5 under the 32-column cap) is a typed decline.
+    An unpacked split past the decode route (33 MHA rows) uses native prefill with its split intact."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def api(*, s_q, H, KH, pack, split=1, seq_lens=True, **extra):
@@ -1837,8 +1946,8 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
         api(s_q=11, H=24, KH=2, pack=True)  # 132 packed rows (a third token unit of the 64-column tile): no Rubin d256 kernel packs them
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
         api(s_q=5, H=24, KH=2, pack=True, decode_q_tile_max=32)  # 60 packed rows under the cap: a third unit of the 32-column tile
-    with pytest.raises(NotImplementedError, match="d256 decode tile"):
-        api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 33 MHA rows: the prefill kernel, no dense split
+    a = api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)
+    assert a._decode_q_tile() == 0 and a.split_kv == 2 and a._fp32_partial_split()
     with pytest.raises(ValueError, match="unpadded dense graphs only"):
         api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=True)  # a PADDED dense split: the shared structural rule
 
@@ -1880,8 +1989,8 @@ def _paged_graph_offers_engine(*, B, H, KH, s_q, d, lens, page=16, causal_br=Fal
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if packed is None:
-        return offers_engine(g, _engine())
-    ours = [g.get_plan_name_at_index(i) for i in range(len(g.plans)) if _is_plan_for(g.get_plan_name_at_index(i), _engine())]
+        return offers_engine(g, _D256_ENGINES)
+    ours = [g.get_plan_name_at_index(i) for i in range(len(g.plans)) if _is_plan_for(g.get_plan_name_at_index(i), _D256_ENGINES)]
     has_packed = [n for n in ours if "PACK_GQA=1" in n]
     return bool(has_packed) if packed else (bool(ours) and not has_packed)
 
@@ -2000,7 +2109,7 @@ def test_decode_routing_boundary_thd_queries():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, _engine())
+    select_engine(g, _D256_ENGINES)
     idx = g._plan_index
     g.check_support()
     g.build_plans()
@@ -2104,7 +2213,7 @@ def test_decode_graph_gated_qwen_24_2_splits_with_the_gate_in_the_combine():
     _assert_decode_tile_plan(plan, G=12, units=8, kv_tiles=32, gated=True, grid=(4, 24, 1))
     assert plan.knobs.split_kv >= 2, plan.knobs
     mod = cap["module"]
-    assert mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
+    assert mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__name__
     assert (mod.HEADS_PER_TILE, mod.CFG.SPLIT_KV, mod.PARAMS.epilogue_gate) == (12, plan.knobs.split_kv, False), (
         mod.HEADS_PER_TILE,
         mod.CFG.SPLIT_KV,
@@ -2450,7 +2559,7 @@ def test_decode_adapter_gated_split_cuda_graph_replay_no_host_sync():
 
 _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
     import glob, os, re, subprocess, sys
-    dump, n_q, g, form, cands = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5:]
+    dump, n_q, g, form, dtype, cands = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
     os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"       # unconditional: an inherited value would pin the wrong target's SASS
@@ -2458,7 +2567,7 @@ _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     toks = form.split("+")
-    kw = dict(decode_q_tile=n_q, dtype_qkv=2, seq_kv_lens_present=True, pack_gqa=g > 1, qh_per_kh=g)
+    kw = dict(decode_q_tile=n_q, dtype_qkv=dtype, seq_kv_lens_present=True, pack_gqa=g > 1, qh_per_kh=g)
     kw["split_kv"] = next((int(t[5:]) for t in toks if t.startswith("split")), 1)
     if "paged" in toks:
         kw.update(paged_kv=True, page_size=16)
@@ -2519,21 +2628,17 @@ def _nvdisasm_candidates():
         pytest.param(12, "paged+br+hnd+pdl", id="24to2_mtp_paged_hnd_pdl"),
     ],
 )
-def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
-    """The 64-column tile's register budget, pinned on the SASS (no Rubin GPU: an sm_107a trace-compile in a subprocess, the
-    file's SASS-pin recipe): the 18-warp CTA's rendering stays SPILL-FREE at ptxas's 96-register cap on the admitted forms --
-    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache, and the admitted forms nearest
-    the spill edge: a packed group of TWO heads over pages (eight distinct causal thresholds per 16-column group) under the
-    bottom-right causal mask and under a left WINDOW (the predicate's other mask), plus the 24/2 step with the programmatic-
-    dependent-launch sites traced (the griddepcontrol pair must add no register pressure).  The keyed max exchange, the ftz max
-    intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is a perf
-    regression no numerics test sees (local-memory traffic in the hottest loop) -- an arm that spills is a form the config must
-    REFUSE (decode_d256_wide_tile_admits), never a silent admit.  Skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the
-    cubin; a compile failure is a FAIL."""
+@pytest.mark.parametrize("dtype_qkv", [2, 3], ids=["bf16", "fp16"])
+def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form, dtype_qkv):
+    """Compile admitted Rubin forms and reject local-memory spills.
+
+    Int64 output slices must fit the 18-warp CTA's 96-register limit in both
+    half precisions. Keep dense, paged, masked, split, and PDL controls.
+    """
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    argv = [sys.executable, "-c", _SM107_DECODE_SPILL_PROBE, str(tmp_path), "64", str(g), form, *cands]
+    argv = [sys.executable, "-c", _SM107_DECODE_SPILL_PROBE, str(tmp_path), "64", str(g), form, str(dtype_qkv), *cands]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500, env={**os.environ, "CUDNN_FRONTEND_ENABLE_FROST_ENGINES": "1"})
     assert proc.returncode == 0, f"sm_107a trace-compile of the 64-column decode tile (G={g}, {form}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
@@ -2554,7 +2659,8 @@ def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
     [(24, 2, (64, 12, 5, 60)), (32, 2, (64, 16, 4, 64))],
     ids=["24to2_48_rows_one_unit", "32to2_64_rows_one_unit"],
 )
-def test_decode_kernel_four_column_groups(H, KH, facts, splits):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_decode_kernel_four_column_groups(H, KH, facts, splits, dtype):
     """The 64-column tile at the template level (the module loader + launch_f16): the MTP step S_q = 4 of the 24/2 geometry
     (48 live rows + the 12 rows of a fifth, dead token + 4 zero tail rows: Q_BOX_TOKENS 5, Q_BOX_ROWS 60) and of the 32/2
     geometry (64 live rows, no tail) in ONE token unit, bottom-right causal over a paged cache (page 16, HND), 16 softmax warps
@@ -2563,7 +2669,6 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     key at all: O := 0, LSE := -inf, an empty split range in BOTH splits), 384 (exactly the ring depth) and 500 (ring + a tail)."""
     B, P, s_q = 6, 16, 4
     lens = [700, 130, 5, 0, 384, 500]
-    dtype = torch.bfloat16
     torch.manual_seed(17 + H)
     S = max(lens)
     q = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype)
@@ -2571,7 +2676,7 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     v_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
     k_c, v_c, bt4 = _pools(k_dense, v_dense, P, True, seed=17)
     mod = _load(
-        dtype_qkv=2,
+        dtype_qkv=2 if dtype == torch.bfloat16 else 3,
         seq_kv_lens_present=True,
         paged_kv=True,
         page_size=P,
@@ -2613,6 +2718,39 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     assert dead[3].all() and torch.isneginf(lse[3]).all() and (o[3] == 0).all(), "the keyless batch: LSE := -inf, O := 0 exactly"
     assert not dead[:3].any() and not dead[4:].any()
 
+    from determinism_utils import assert_bitwise, assert_replays, snapshot
+
+    expected = snapshot({"o": o, "lse": lse})
+    inputs = dict(q=q, k=k_c, v=v_c, bt=bt4)
+    saved_inputs = snapshot(inputs)
+
+    def run(order, source_q=q):
+        index = torch.tensor(order, device="cuda")
+        out, stats = _launch_template(
+            mod,
+            q=source_q.index_select(0, index),
+            k_view=k_c.permute(0, 2, 1, 3),
+            v_view=v_c.permute(0, 2, 1, 3),
+            lens=[lens[i] for i in order],
+            scale=1.0 / math.sqrt(D),
+            splits=splits,
+            dtype=dtype,
+            bt=bt4.view(B, -1).index_select(0, index),
+            page=P,
+        )
+        return {"o": out, "lse": stats}
+
+    assert_bitwise(assert_replays(lambda: run(list(range(B))), repeats=3), expected, "fresh outputs and concurrent work")
+    for order in ([0], [5, 0, 3, 1, 0]):
+        index = torch.tensor(order, device="cuda")
+        want = {name: value.index_select(0, index) for name, value in expected.items()}
+        assert_bitwise(snapshot(run(order)), want, f"batch order {order}")
+    changed_q = q.clone()
+    changed_q[1:].mul_(-0.5)
+    actual = run(list(range(B)), changed_q)
+    assert_bitwise({name: value[:1] for name, value in actual.items()}, {name: value[:1] for name, value in expected.items()}, "changed neighbors")
+    assert_bitwise(inputs, saved_inputs, "inputs preserved")
+
 
 @_gpu
 @pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
@@ -2628,7 +2766,7 @@ def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(pag
     _assert_decode_tile_plan(plan, G=16)
     assert (plan.knobs.split_kv or 1) == 1, plan.knobs
     assert _mtp_module_facts(cap["module"]) == (64, 16, 4, 64, True, 16, 18), _mtp_module_facts(cap["module"])
-    assert cap["module"].__file__.endswith("/sm107/decode_d256_f16.py")
+    assert cap["module"].__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
 
 
 @_gpu
@@ -2759,6 +2897,13 @@ def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from test_sdpa_fwd_paged_sm100 import _run_graph
 
+    def check_body(graph, _vp, _workspace):
+        import inspect
+
+        api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
+        assert api.kernel_template == DECODE
+        assert api._k_mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
+
     _run_graph(
         2,
         8,
@@ -2776,7 +2921,8 @@ def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
         replay=True,
         arch="sm107",
         pack_gqa=pack,
-        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=pack, split_kv=split),
+        extra_checks=check_body,
+        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=128, cga=1, pack_gqa=pack, split_kv=split),
     )
 
 

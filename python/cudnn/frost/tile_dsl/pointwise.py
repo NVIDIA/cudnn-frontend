@@ -63,12 +63,19 @@ def row_max_reduction(vec):
     return elems[0]
 
 
-def row_reduction_pair(vec):
+def row_reduction_pair(vec, balanced=False):
+    """Sum even/odd lanes; optionally shorten dependencies with a pairwise tree."""
     n = int(vec.shape[0])
     assert n % 2 == 0, f"row_reduction_pair: N={n} must be even"
     half = n // 2
     paired_ty = _ir.VectorType.get([half, 2], T_.f32())
     paired = vector.shape_cast(paired_ty, vec.ir_value())
+
+    if balanced:
+        nodes = [vector.extract(paired, dynamic_position=[], static_position=[i]) for i in range(half)]
+        while len(nodes) > 1:
+            nodes = [arith.addf(nodes[i], nodes[i + 1]) if i + 1 < len(nodes) else nodes[i] for i in range(0, len(nodes), 2)]
+        return cutlass.Vector(nodes[0], dtype=cutlass.Float32)
 
     acc = vector.extract(paired, dynamic_position=[], static_position=[0])
     for i in range(1, half):
@@ -638,9 +645,17 @@ def opaque_i32_zero():
 
 
 @cutlass.cute.jit
-def opaque_i32(value: cutlass.Int32) -> cutlass.Int32:
-    """Identity mov.b32 that pins a per-lane loop invariant in its register."""
-    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=[value])
+def opaque_i32(value: cutlass.Int32, anchor=None) -> cutlass.Int32:
+    """Identity mov.b32 that pins a per-lane loop invariant in its register.
+
+    ``anchor`` (optional, append-only): a loop-VARIANT ``Int32`` (the q-tile counter) passed as an extra, unreferenced asm operand -- the
+    :func:`~cudnn.frost.tile_dsl.mma.desc_opaque` form for a 32-bit address term.  Without it an item-invariant SMEM address and every
+    ``base + vec`` add derived from it are hoisted by LLVM's LICM to the item loop's preheader and stay live across the whole tile body
+    (the sm100 d128 2-CTA softmax's 8 dS STS addresses: 8 registers, 4 of them spilled at the 144-register split, 2026-10-27); anchored,
+    the mov and the adds that depend on it sit inside the tile next to the STS that consumes them, so their live range is one tile.  The
+    default path (no anchor) emits exactly the asm it always did."""
+    args = [value] if cutlass.const_expr(anchor is None) else [value, anchor]
+    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=args)
 
 
 @cutlass.cute.jit
@@ -706,7 +721,7 @@ def exp2_emul_pair(x_lo, x_hi):
     shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Four sm100
     prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
     ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
-    d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
+    d128 MXFP8 kernel (``sm100/d128_mxfp8_multi_q/kernel.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
     dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
     +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
     H=128/128), and the d128 bf16 / fp16 kernel on its dense-band builds only (``_E2E_DENSE_BAND``:
@@ -757,7 +772,7 @@ def exp2_mixed(vec, emul_pairs, N: int):
     so an all-MUFU chunk stays IR-identical to the unsplit kernel.  Trace-time helper (plain
     Python over traced values), like :func:`row_max_reduction`.  Which pairs to emulate is a
     ptxas-schedule property of the CONSUMING kernel -- tune it there, per kernel, by A/B
-    (``sm100/prefill_d128_mxfp8.py`` documents its sweep)."""
+    (``sm100/d128_mxfp8_multi_q/kernel.py`` documents its sweep)."""
     assert N % 2 == 0, f"exp2_mixed: N={N} must be even"
     if not emul_pairs:
         return cute.math.exp2(vec, fastmath=True)
@@ -872,6 +887,62 @@ def rope_rotate_half(
     partner = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
     signed = -partner if lane < cutlass.Int32(half_lanes) else partner
     return y * cos_v + signed * sin_v
+
+
+@cute.jit
+def round_pair_io(lo: cutlass.Float32, hi: cutlass.Float32, io_dtype):
+    """Two fp32 values rounded to ``io_dtype`` (bf16 / f16: ``cvt.rn.{bf16,f16}x2.f32``, round-to-nearest-even -- the SAME
+    instruction the store path rounds with) and widened back EXACTLY: the io-dtype ROUNDING POINT of a value that stays in fp32
+    registers (``x.to(io).to(fp32)`` in torch terms).  The pair form is the hardware's (one ``cvt`` rounds two values); a lone
+    value rounds as ``round_pair_io(x, x, dt)[0]``.  Used by the ``"hf"`` rounding arm of the QSA indexer's compress chains
+    (``gated_attention_block/kernels/qsa_compress.py``: the pooled key before its norm, the normed row before its rotation, the
+    rotation's three operations); :func:`round_values_io` is the row form."""
+    return f16x2_to_f32(fp32_to_fp16(lo, hi, dtype=io_dtype), dtype=io_dtype)
+
+
+def round_values_io(values, io_dtype):
+    """:func:`round_pair_io` over an EVEN-length Python list of fp32 values (a lane's chunk of a row), pairwise; returns the new
+    list.  Plain Python at trace time (no staged control flow), so it is callable from a kernel body like the unpack comprehensions."""
+    assert len(values) % 2 == 0, f"round_values_io: an even number of values is needed, got {len(values)}"
+    out = []
+    for i in range(0, len(values), 2):
+        lo, hi = round_pair_io(values[i], values[i + 1], io_dtype)
+        out.append(lo)
+        out.append(hi)
+    return out
+
+
+@cute.jit
+def rope_rotate_half_io(
+    y0: cutlass.Float32,
+    y1: cutlass.Float32,
+    cos0: cutlass.Float32,
+    cos1: cutlass.Float32,
+    sin0: cutlass.Float32,
+    sin1: cutlass.Float32,
+    lane: cutlass.Int32,
+    half_lanes: cutlass.Constexpr[int],
+    io_dtype,
+):
+    """:func:`rope_rotate_half` for a PAIR of adjacent elements with the io-dtype rotation of the HF / vLLM-prepare dtype flow:
+    ``a = io(y * cos)``, ``b = io(signed_partner * sin)``, ``out = io(a + b)`` -- each of the three operations rounded to ``io_dtype``
+    (torch's bf16 ops and Triton's bf16 ops both round per op; ``a - b == a + (-b)`` exactly, so the sign convention of
+    :func:`rope_rotate_half` is kept).  The TABLES are rounded to ``io_dtype`` first -- the HF reference rotates with ``cos`` / ``sin``
+    cast to the key dtype, so a 16-bit table of the OTHER width (f16 tables under bf16 io, or the converse) meets the oracle's rounding
+    point here, and a table already in the io dtype passes unchanged (an exact identity: every io value is a fixed point of its own
+    ``cvt.rn``).  With that, every input is io-representable (the caller rounded the normed row), so the fp32 products are exact and
+    the ONE rounding per op is the io one.  Same partner shuffle (every lane of the warp must reach this call), same lane rules;
+    returns ``(out0, out1)``.  Pairs so that one ``cvt`` rounds two values (:func:`round_pair_io`)."""
+    cos0, cos1 = round_pair_io(cos0, cos1, io_dtype)
+    sin0, sin1 = round_pair_io(sin0, sin1, io_dtype)
+    p0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y0, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    p1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y1, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    lower = lane < cutlass.Int32(half_lanes)
+    s0 = -p0 if lower else p0
+    s1 = -p1 if lower else p1
+    a0, a1 = round_pair_io(y0 * cos0, y1 * cos1, io_dtype)
+    b0, b1 = round_pair_io(s0 * sin0, s1 * sin1, io_dtype)
+    return round_pair_io(a0 + b0, a1 + b1, io_dtype)
 
 
 @cute.jit
@@ -1297,7 +1368,7 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
 @cutlass.cute.jit
 def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
-    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/d256_fp8/kernel.py``, the gated block's
     gradient amax pass and gate backward).
 
     Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into
@@ -1308,3 +1379,224 @@ def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
     ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
     nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))
+
+
+@cutlass.cute.jit
+def quad_reduce_max(val: cutlass.Float32) -> cutlass.Float32:
+    """The max over the FOUR lanes of a thread quad (lanes ``4 g .. 4 g + 3``: the lanes that share an ``m16n8`` C-fragment row), two
+    ``shfl.sync.bfly`` steps (offsets 2, 1) on the full warp mask -- every lane of the quad holds the result.  ``ftz`` max (FMNMX; the
+    operands are scores, a flushed sub-normal max changes no exp2).  The SM120 SDPA kernels carry the same two shuffles as
+    ``sm120/_common.nvvm_threadquad_reduction_max``; this is the arch-neutral home so an sm107 ``mma.sync`` kernel need not import an
+    sm120 module.  Call it from EVERY lane of the warp (``shfl.sync`` with the full mask)."""
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    return val
+
+
+@cutlass.cute.jit
+def quad_reduce_sum(val: cutlass.Float32) -> cutlass.Float32:
+    """The sum over the four lanes of a thread quad (see :func:`quad_reduce_max`): offsets 2 then 1, a FIXED order, so every lane of
+    the quad holds the bitwise-same sum and two launches agree bitwise.  Call it from every lane of the warp."""
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY))
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY))
+    return val
+
+
+def rcp_div_rn(s: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``div.rn.f32(1, s)`` -- the IEEE correctly-rounded fp32 reciprocal, as ONE opaque op.
+
+    For a static per-tensor DEQUANTIZATION scale ``s`` whose stored code is ``fp8(x * (1 / s))``: the conventions this
+    reproduces compute ``inv = 1 / s`` once with a correctly rounded division and multiply by it, so the reciprocal must be
+    ``div.rn`` -- an approximate ``rcp`` (``MUFU.RCP`` alone) or a ``fastmath`` division can land one fp32 ulp off and move
+    a code on a rounding boundary.  The numerator is a PTX immediate (``0f3F800000``), never a constant float asm OPERAND
+    (that ICEs libNVVM, :func:`opaque_f32_bits`); ``s`` must be a traced register.  :func:`div_rn_f32` is the two-register
+    form of the same instruction."""
+    r = nvvm.inline_ptx("div.rn.f32 $0, 0f3F800000, $1;", write_only_types=[cutlass.Float32], read_only_args=[s])
+    return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
+
+
+def fp32_times_inv_to_e4m3(value: cutlass.Float32, inv_scale: cutlass.Float32) -> cutlass.Uint8:
+    """ONE E4M3 code of ``value * inv_scale``: the static per-tensor quantization of a single fp32 value.
+
+    ``mul.f32`` then ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating at +-448) with a literal zero as
+    the convert's second value; the low byte is the code.  The multiply sits INSIDE the asm block, so no pass can contract
+    it into a neighbouring add or reassociate it: the byte is ``e4m3(fl32(value * inv_scale))`` by construction.
+    ``inv_scale`` is the reciprocal of the consumer's dequantization scale (:func:`rcp_div_rn`).  For a store of one byte
+    per element (``out[i] = fp32_times_inv_to_e4m3(v, inv)``); :func:`fp32_to_fp8x2` is the two-value form without the
+    multiply.  Both operands must be traced registers.  Spelled as a raw asm block with float-register (``f``) operand
+    constraints rather than through ``inline_ptx``: that wrapper stages every float operand through a ``mov.f32`` block of
+    its own, which changes nothing numerically but does change the register allocation of an eight-element body."""
+    from cutlass._mlir.dialects import llvm  # the one raw asm block of this module: imported where it is used
+
+    word = llvm.inline_asm(
+        T_.i32(),
+        [value.ir_value(), inv_scale.ir_value()],
+        "{ .reg .f32 v; .reg .b16 p; mul.f32 v, $1, $2; cvt.rn.satfinite.e4m3x2.f32 p, 0f00000000, v; cvt.u32.u16 $0, p; }",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(word).to(cutlass.Uint8)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 under a GLOBAL scale, and the SiLU of the same decode chains.  A third NVFP4 scale
+# convention of this module -- :func:`e4m3_scale_from_amax` and :func:`e4m3_scale_rcp` are the
+# other two, each with OTHER bytes: here the block scale is ``e4m3(global_scale * (amax *
+# fp32(1/6)))`` with no floor, and the codes are ``e2m1(x * encode_scale)`` where
+# ``encode_scale`` comes from two APPROXIMATE reciprocals and is zero for a zero block scale.
+# Every spelling below is a rounding CONVENTION that a decode step reproduces byte for byte;
+# none may be swapped for a neighbour that computes "the same" quantity.
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def rcp_approx_ftz(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``rcp.approx.ftz.f32`` -- the hardware's APPROXIMATE fp32 reciprocal, as ONE opaque op.
+
+    NOT :func:`rcp_div_rn` / :func:`div_rn_f32` (the IEEE division): the result is ``1 / x`` exactly for a power of two and at
+    most one unit in the last place from the correctly rounded reciprocal otherwise (normal operand, normal result).  ``.ftz``:
+    a zero or subnormal operand gives the infinity of its sign; an operand whose reciprocal would be subnormal, or an infinite
+    one, the zero of its sign.
+
+    ``cute.arch.rcp_approx`` is the same instruction as a compiler intrinsic and the same function of ``x``; the spelling
+    decides the instruction stream only.  The compiler may speculate an intrinsic out of a run-time guard: the zero rule of
+    :func:`nvfp4_block_scale_global` then renders as two unconditional reciprocals and a select, where this opaque statement
+    stays inside the guarded region.  Use this spelling where a rendering is pinned.  It is opaque to the DSL's optimizer, not
+    to the assembler, which applies its own identities to approximate instructions: a constant operand is folded to an
+    immediate, a reciprocal of this reciprocal is cancelled.  ``x`` must be a traced register (a folded float immediate on an
+    asm operand ICEs libNVVM, :func:`opaque_f32_bits`)."""
+    return inline_ptx("rcp.approx.ftz.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def e4m3_round(x: cutlass.Float32):
+    """``(byte, value)``, in that order: ``x`` rounded to E4M3 (round-to-nearest-even, saturating at +-448) as an ``Int32`` in
+    ``[0, 255]``, and that code widened EXACTLY to fp32 (e4m3 -> f16 -> f32, both conversions exact).
+
+    The plain pair: no multiply, no floor, no reciprocal.  ``|x| <= 2^-10`` rounds to the zero code, whose value is a signed
+    zero.  (:func:`e4m3_scale_from_amax` is this convert behind ``amax * fp32(1/6)`` and a ``2^-9`` floor and returns
+    ``(value, byte)``; :func:`e4m3_scale_rcp` returns ``(byte, 1 / value)`` with an IEEE division.)
+
+    The block's instruction order is part of the spelling: the convert takes a ZERO upper operand (the 16-bit pair is then the
+    code itself, no mask selects the byte) and the widen reads the code back from the 32-bit output register -- convert,
+    16-bit mask, widen.  That is the instruction sequence of the reference chain of this convention, so a kernel that
+    reproduces the chain renders its block-scale instructions unchanged.  Two other blocks return the same pair from another
+    stream: converting ``(x, x)`` and masking the low byte changes the convert's operand and drops an instruction; widening
+    the convert's own 16-bit register moves the mask behind the widen.  ``x`` must be a traced register."""
+    byte, value = inline_ptx(
+        "{ .reg .b16 p, q, lo, hi; .reg .b32 w; .reg .f32 z; "
+        "mov.f32 z, 0f00000000; "
+        "cvt.rn.satfinite.e4m3x2.f32 p, z, $2; "
+        "cvt.u32.u16 $0, p; "
+        "cvt.u16.u32 q, $0; "
+        "cvt.rn.f16x2.e4m3x2 w, q; "
+        "mov.b32 {lo, hi}, w; "
+        "cvt.f32.f16 $1, lo; }",
+        write_only_types=[cutlass.Int32, cutlass.Float32],
+        read_only_args=[x],
+    )
+    return byte, value
+
+
+@cute.jit
+def silu_ex2_div_approx(x: cutlass.Float32) -> cutlass.Float32:
+    """``x / (1 + 2^(x * fp32(-log2 e)))`` as ONE opaque block of four instructions: ``mul.f32`` by ``0xBFB8AA3B``,
+    ``ex2.approx.ftz.f32``, ``add.f32`` of 1, ``div.approx.f32``.
+
+    A rounding CONVENTION (the SiLU of an activation-then-quantize decode chain), not a general SiLU: :func:`sigmoid` is
+    ``tanh.approx``, the GEMM families multiply ``x`` by a sigmoid, and the fused linear-attention steps spell ``ex2.approx``
+    (no ``.ftz``) with ``div.full`` -- other bytes each; do not unify them.  The block is opaque, so no pass contracts the
+    multiply or the add into a neighbour.  The divide is approximate: where ``1 + 2^(-x log2 e)`` exceeds ``2^126`` (``x`` in
+    about (-88.73, -87.33)) its operand is outside the instruction's documented accuracy range; below that window the
+    exponential overflows and the result is ``-0``; at the positive end the exponential is flushed to zero and the result is
+    ``x``.  ``x`` must be finite and a traced register."""
+    return inline_ptx(
+        "{ .reg .f32 t, e, d; mul.f32 t, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 e, t; add.f32 d, e, 0f3F800000; div.approx.f32 $0, $1, d; }",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[x],
+    )
+
+
+@cute.jit
+def nvfp4_block_scale_global(amax: cutlass.Float32, global_scale: cutlass.Float32):
+    """``(byte, encode_scale)`` of one NVFP4 block under a GLOBAL scale.
+
+    ``byte, value = e4m3_round(global_scale * (amax * fp32(1/6)))`` -- the association is ``amax * fp32(1/6)`` FIRST, two
+    fp32 multiplies, the 1/6 as the bits of :func:`opaque_fp4_max_rcp` -- and ``encode_scale = 0`` when ``value`` is zero,
+    else ``rcp_approx_ftz(value * rcp_approx_ftz(global_scale))``.  The block's codes are ``fp32_to_e2m1x2`` of
+    ``x * encode_scale``; ``byte`` is the stored block scale (``Int32`` in ``[0, 255]``).
+
+    NOT :func:`e4m3_scale_from_amax` (no global scale, a ``2^-9`` floor, an IEEE division): another convention with other
+    bytes.  A zero block scale gives a ZERO multiplier, never an infinite one, so an all-zero or underflowing block encodes
+    as zeros.  The guard is a run-time branch around two opaque reciprocals (see :func:`rcp_approx_ftz`).  ``amax`` is the
+    block's non-negative maximum magnitude; a ``global_scale`` in ``[2^-100, 2^100]`` keeps both reciprocals normal."""
+    byte, value = e4m3_round(global_scale * (amax * opaque_fp4_max_rcp()))
+    encode_scale = cutlass.Float32(0)
+    if value != cutlass.Float32(0):
+        encode_scale = rcp_approx_ftz(value * rcp_approx_ftz(global_scale))
+    return byte, encode_scale
+
+
+# ---------------------------------------------------------------------------
+# Four single instructions a kernel NAMES instead of leaving them to a lowering.  Each helper is
+# ONE opaque statement: the DSL's optimizer can neither contract it with a neighbour nor replace
+# it by the routine one of its own math functions resolves to.  A kernel whose bytes follow a
+# reference chain spells that chain through these, instruction by instruction.  The three
+# approximate ones are EXPANDED BY THE ASSEMBLER into short hardware sequences: the statement
+# fixes the instruction, the assembler of the build fixes the result's last bits, so equality
+# with another build of the same chain is measured per target and per assembler, never read off
+# the text.  Every operand must be a traced register (a folded float immediate on an asm operand
+# ICEs libNVVM, :func:`opaque_f32_bits`).
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def div_full_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``div.full.f32`` -- the full-range APPROXIMATE fp32 division ``a / b``, as ONE opaque op.
+
+    NOT :func:`div_rn_f32` / :func:`rcp_div_rn` (``div.rn.f32``, the IEEE correctly rounded quotient) and not the
+    ``div.approx.f32`` inside :func:`silu_ex2_div_approx` (a reciprocal and a multiply, accurate for divisors of ordinary
+    magnitude only).  By the instruction's specification the result is within 2 units in the last place of the exact
+    quotient over the full range of operands; it does not take a rounding mode.  A chain that is DEFINED with this
+    instruction keeps its bits only with this spelling: the correctly rounded quotient differs from it in the last bit on
+    some operands, and a normalized or gated value then rounds to another 16-bit value on some elements."""
+    return inline_ptx("div.full.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])
+
+
+@cute.jit
+def rsqrt_approx_ftz_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``rsqrt.approx.ftz.f32`` -- the hardware's approximate fp32 reciprocal square root with flush-to-zero, as ONE
+    opaque op.
+
+    NOT ``cute.math.rsqrt``, which is ``rsqrt.approx.f32`` WITHOUT ``.ftz``: the two agree on every normal operand and
+    differ on a positive subnormal one -- ``.ftz`` reads it as ``+0`` and returns ``+inf``, the plain form returns a large
+    finite value.  By the instruction's specification the relative error is at most ``2^-22.9`` over the positive finite
+    range.  ``+0`` gives ``+inf``, ``-0`` gives ``-inf``, ``+inf`` gives ``+0``, a negative operand a NaN."""
+    return inline_ptx("rsqrt.approx.ftz.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def ex2_approx_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``ex2.approx.f32`` -- the hardware's approximate ``2^x`` WITHOUT flush-to-zero, as ONE opaque op.
+
+    NOT the ``ex2.approx.ftz.f32`` inside :func:`silu_ex2_div_approx`: here a result below the smallest normal fp32 is a
+    subnormal value, not a zero (``x`` below about -126), so the two differ exactly where the exponential underflows.  By
+    the instruction's specification the result is within 2 units in the last place of the correctly rounded ``2^x``.  A
+    zero of either sign gives 1, ``-inf`` gives ``+0``, ``+inf`` gives ``+inf``.  ``exp(v)`` in this convention is
+    ``ex2_approx_f32(v * fp32(log2 e))`` with the multiply as its own fp32 operation."""
+    return inline_ptx("ex2.approx.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def min_xorsign_abs_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``min.xorsign.abs.f32`` -- the magnitude ``min(|a|, |b|)`` with the sign ``sign(a) XOR sign(b)``, as ONE opaque op.
+
+    With a positive bound ``b`` this is the symmetric clamp of ``a`` to ``[-b, b]`` in one instruction: the sign of ``a`` is
+    kept, also on a zero, and an infinity becomes the bound of its sign.  With a negative ``b`` the result carries the
+    opposite sign of ``a``.  Exact: no rounding takes place.  NOT a clamp spelled as two compares or as ``min(max(a, -b),
+    b)``: the same value for every operand that is not a NaN, another instruction stream.  In front of a saturating convert
+    it changes no code; a kernel carries it when its stream follows a reference that clamps.  NaN operands are outside the
+    contract.  The instruction needs PTX ISA 7.2 and a target of compute capability 8.6 or newer."""
+    return inline_ptx("min.xorsign.abs.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])

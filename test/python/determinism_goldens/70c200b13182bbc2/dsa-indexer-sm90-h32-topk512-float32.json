@@ -1,0 +1,113 @@
+{
+  "inputs": {
+    "attn_score": {
+      "dtype": "torch.float32",
+      "sha256": "8e29421bb01b885c9cec875387a5ff676fb43125474ca402c2890b6604672766",
+      "shape": [
+        2,
+        5,
+        512
+      ]
+    },
+    "index_k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "3f50bdc0a5742bc081aeee6771cbea4f0a61372d190ad0ef6fa0aae8c0d1146a",
+      "shape": [
+        2,
+        521,
+        128
+      ]
+    },
+    "index_q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "79b4f661775666f702219717c10d30cc6c6d82419171a2c468495c315e199ffe",
+      "shape": [
+        2,
+        5,
+        32,
+        128
+      ]
+    },
+    "index_score": {
+      "dtype": "torch.float32",
+      "sha256": "5d93bb9bff0cb2d3e71fbaadb7c40b485aa4a0be563f325a52eebf8d29af51ab",
+      "shape": [
+        2,
+        5,
+        512
+      ]
+    },
+    "topk_indices": {
+      "dtype": "torch.int32",
+      "sha256": "9b33013ea2c82d14b89b2917e1276fa7123ed3ae1137e3c41baefd4a6c619627",
+      "shape": [
+        2,
+        5,
+        512
+      ]
+    },
+    "weights": {
+      "dtype": "torch.bfloat16",
+      "sha256": "5245e7235b739f83247bec9b4d1fb2106404c58595c66953af67e7215b4b6424",
+      "shape": [
+        2,
+        5,
+        32
+      ]
+    }
+  },
+  "outputs": {
+    "attn_score": {
+      "dtype": "torch.float32",
+      "sha256": "4b3b84078bd0662f9ad6c44a056334fcb35a3b877dc1dc88e07fc00996e2b6fb",
+      "shape": [
+        2,
+        5,
+        512
+      ]
+    },
+    "d_index_k": {
+      "dtype": "torch.float32",
+      "sha256": "798cc298a6722879fccff649ff63c696d6eb497b1320319dfb9728c44a444e9c",
+      "shape": [
+        2,
+        521,
+        128
+      ]
+    },
+    "d_index_q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "e79dcfc0f6c5fd8991e5dd98195e7ab2398b9c988e59e6c383d7ec0cda170570",
+      "shape": [
+        2,
+        5,
+        32,
+        128
+      ]
+    },
+    "d_weights": {
+      "dtype": "torch.bfloat16",
+      "sha256": "9b3ee177b939188f271f9fb589357f242d020881d0cd6a7d400a7aff541725be",
+      "shape": [
+        2,
+        5,
+        32
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13000,
+    "cudnn": 92000,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA L20X",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.12.1+cu130",
+    "tvm_ffi": "0.1.11"
+  },
+  "schema": 1
+}

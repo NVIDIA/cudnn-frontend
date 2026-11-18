@@ -210,9 +210,9 @@ def _training_graph_pattern(
             physical_recv_pool_size=128,
             combine_format="bf16",
         )
-    if name == "ds3_ep4_v1":
+    if name == "ds3_ep4_pattern":
         if world_size != 4:
-            raise ValueError("ds3_ep4_v1 training graph pattern requires world_size=4, " f"got {world_size}")
+            raise ValueError("ds3_ep4_pattern training graph pattern requires world_size=4, " f"got {world_size}")
         return _TrainingGraphPattern(
             name=name,
             num_experts=32,
@@ -223,7 +223,7 @@ def _training_graph_pattern(
             physical_recv_pool_size=131968,
             combine_format="mxfp8",
         )
-    raise ValueError("training graph pattern must be 'smoke' or 'ds3_ep4_v1', " f"got {name!r}")
+    raise ValueError("training graph pattern must be 'smoke' or 'ds3_ep4_pattern', " f"got {name!r}")
 
 
 def _constant_mxfp8(
@@ -276,9 +276,6 @@ def make_training_graph_pattern_inputs(
         return (*args[:4], args[4].float().contiguous())
 
     experts_per_rank = pattern.num_experts // world_size
-    # Keep the optimized preset on its only qualified runtime workload.
-    # max_tokens_per_rank is not merely spare capacity for ds3_ep4_v1:
-    # upstream qualified every rank with exactly T4096 inputs.
     token_count = pattern.max_tokens_per_rank
     activation = _constant_mxfp8(
         (token_count, pattern.hidden_size),
