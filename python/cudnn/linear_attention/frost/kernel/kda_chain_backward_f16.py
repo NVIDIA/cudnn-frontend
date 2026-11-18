@@ -31,6 +31,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 
 from ..common import gate_bwd, head_reduce
@@ -963,7 +964,8 @@ def run_chain_backward(
     contexts/checkpoints retain full-head layouts. No allocation, compilation or
     device-to-host metadata read occurs here; the plan validates the bindings.
     """
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
