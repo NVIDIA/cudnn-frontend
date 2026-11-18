@@ -279,6 +279,12 @@ root (`test/python`); pytest's own `sys.path` changes are not inherited. Check
 the child from a temporary working directory without that root on `PYTHONPATH`.
 The delayed-MMA FP8 dual-KV probe needs both this root and `sdpa/frost`.
 
+When renaming a shared test reference module, search the whole test tree for
+both bare and package-qualified imports, then collect the full affected family
+alongside the neighboring family that originally collided, in both orders.
+The causal-conv1d reference rename fixed the HSTU collision but initially left
+four bulk/semantic test imports pointing at the removed module.
+
 Compiler subprocesses must import the same `cudnn` package as their parent.
 Derive its package root from `cudnn.__file__`, then check the child import path.
 CI may run source tests against an installed wheel while the source checkout
