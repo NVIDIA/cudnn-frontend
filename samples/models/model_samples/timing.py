@@ -257,10 +257,15 @@ class Report:
     """What a run prints after its loop: the text path, the first-token line with its route, the step timings, the traced
     pass and the bytes of a step."""
 
-    def __init__(self, tag: str, reduced: bool, tokens: int = 1):
+    def __init__(self, tag: str, reduced: bool, tokens: int = 1, draft_tokens: Optional[int] = None):
         """``tokens``: the tokens per sequence a step of the session feeds.  At more than one its steps are verify steps:
-        the first-token line, the rate and the bytes of a step are a decode step's and are not stated."""
-        self.tag, self.reduced, self.tokens = tag, reduced, tokens
+        the first-token line, the rate and the bytes of a step are a decode step's and are not stated.
+
+        ``draft_tokens``: the drafted tokens of a step of a session that feeds its prompt through decode steps and verifies
+        behind it (``Session(draft_tokens=)``).  Its prompt is prefilled, so the first-token line is a decode session's;
+        its rate is not printed, because the drafted tokens of its steps are its caller's; the bytes of a step stay not
+        stated; and the traced-pass line says that the prompt was replayed in front of the traced steps."""
+        self.tag, self.reduced, self.tokens, self.draft_tokens = tag, reduced, tokens, draft_tokens
         self.text_path: Dict[str, float] = {}
         self.prompt_tokens = 0
         self.prefill_route = "decode step"
@@ -292,7 +297,8 @@ class Report:
                 f"text out {tp.get('text_out', 0.0) * 1e6:.2f} us per token"
             )
         several = self.tokens > 1  # verify steps: nothing was prefilled through them, and a step is not one token
-        if several:
+        behind_prompt = self.draft_tokens is not None  # ... unless the session fed its prompt through decode steps in front of them
+        if several and not behind_prompt:
             lines.append(f"first token           not stated: a session of {self.tokens} tokens per sequence prefills nothing (its steps are verify steps)")
         else:
             lines.append(
@@ -316,11 +322,15 @@ class Report:
             lines.append(  # the traced period first: GPU busy and idle are parts of the traced step, host-exposed is not
                 f"traced pass ({t.steps})      {prefix}period under the profiler {t.period:.3f} ms{stretch} | GPU busy {t.busy:.3f} ms | "
                 f"idle inside the traced step {t.idle:.3f} ms | {t.kernels} kernel launches + {t.copies} copies per step | "
-                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy" + (f" ({share:.0%} of it)" if share is not None else "")
+                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy"
+                + (f" ({share:.0%} of it)" if share is not None else "")
+                + (f" | behind the prompt's {self.prompt_tokens} decode steps, replayed untraced" if behind_prompt else "")
             )
         elif self.trace_missing:
             lines.append(f"traced pass           not available: {self.trace_missing}")
-        if several:  # how many tokens a verify step keeps is its caller's: steps per second would not be tokens per second
+        if behind_prompt:  # no drafter runs: what a step keeps follows the tokens its caller drafted
+            lines.append(f"rate                  not printed: the drafted tokens of these steps are their caller's ({self.tokens} tokens per sequence a step)")
+        elif several:  # how many tokens a verify step keeps is its caller's: steps per second would not be tokens per second
             lines.append(
                 f"rate                  not printed for verify steps ({self.tokens} tokens per sequence a step; how many of them a run keeps is its caller's)"
             )

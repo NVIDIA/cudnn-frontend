@@ -740,3 +740,42 @@ per sequence alone). What building it showed:
   And state a comparison for the step shapes where it gated: a sentence that begins "at every step shape that ran"
   is read as a gate on all of them, also on those whose line was `REPORTED`. The memory sentence likewise: "within a
   tenth of a GiB" is a statement about every run, and one step shape reserved half a GiB less than it asked for.
+
+## What one session for a prompt and its verify steps taught
+
+A session built with `draft_tokens=` feeds its prompt through decode steps and runs verify steps behind it on one state
+(`Session.prefill`, `Session.verify`, `Session.accept`, `tie_out.speculative_checks`). What building it showed:
+
+- A comparison of tokens is blind where a model's token does not follow its state. The seeded model's output head is a
+  permutation of its embedding table: three wrong loops -- the position moved by the kept count alone, the prompt's
+  attention cache not the one the verify steps read, a row that attends over the whole window -- kept every greedy token
+  and stayed inside the logits band at the published widths. Hold what such a loop gets wrong by what it is: the
+  position as an integer, the prompt byte for byte, the rejected rows by a second replay with other tokens behind the
+  kept ones. Each of the three lines fails one of those loops, and a host test on the tiny geometry cannot show that
+  the token line does not: there the same loops leave the band. Run the wrong loops where the gate runs.
+- A line that cannot fail by rounding is gated on every stack; one that can is gated where the two runs are one chain.
+  `position`, `prompt` and `rejected rows` compare integers, or two runs of the same kernels on the same rows. `bytes`
+  compares a verify step with decode steps: the same chain on the reference stack, other kernels for some blocks on a
+  provider stack -- gated on the first, `REPORTED` on the second, and never given a band of its own.
+- The greedy rule is part of the token line. A decode session that is fed the tokens a loop kept agrees with that loop
+  row by row, whatever the loop kept: a count taken from a schedule, or a drafted token that went out, passed a
+  comparison of logits alone. The line also holds that every window starts with the greedy token kept last and that
+  every kept drafted token is the greedy token in front of it.
+- A kernel on a view is another compiled form, under the same name. The decode entry's compile key holds the strides of
+  its history operand; token 0 of a pool of several tokens per sequence has the plain taps and another slot stride. A
+  device run showed that form byte-equal to the plain pool's, the rest of the pool untouched and the launch the same;
+  the kernel check cannot tell the two forms apart and has no need to. The adapter builds the form with the plan (the
+  plan's option says the state's tokens), or the first prompt step would compile it.
+- Hand a block the tensor its band was written for. Token 0 of the recurrent pool is handed over as the null slot and
+  the plain slots, not as the whole pool: the band of the fused step takes its share over the slots of the pool it is
+  handed, and the untouched slots of the later tokens would have made that share easier to reach.
+- The method that is called selects the plan of a step. A session with two plans looks a block up in the plan of the
+  step that is running, set where the step starts; the state says what layout it is, never which kind of step runs.
+  A decode step on a state that stands behind a verify step is a `ValueError` with its own sentence, where it was an
+  error of a tensor shape.
+- A replay starts from zero, so the record of a run holds everything its steps stand on. The verify steps of such a
+  session began on the state its prompt left: the session keeps the prompt whole, and replay, the block check, the
+  reference's pass and the traced pass feed it first. The traced window holds the verify steps alone -- the prompt
+  is replayed in front of the profiler, and the report's line says so.
+- One count for several sequences is exactly greedy only if it is the smallest of the set. The helper that counts
+  returns that one, and the method that takes the count says so.
