@@ -62,12 +62,13 @@ def test_native_forward_masks_nonfinite_kv(rubin):
 
 
 @pytest.mark.parametrize("lengths", [(32768,), (16385, 16386)])
-def test_bitmap_long_public_dispatch(rubin, lengths):
-    """Exercise the public long-row launcher with aligned and packed bitmaps."""
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_bitmap_long_public_dispatch(rubin, lengths, dtype):
+    """Exercise the public long-row launcher with aligned and packed bitmaps. FP16 takes the gathered body."""
     total = sum(lengths)
     torch.manual_seed(92)
-    q = torch.randn((total, 12, 256), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((total, 1, 256), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((total, 12, 256), device="cuda", dtype=dtype)
+    k = torch.randn((total, 1, 256), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
     first, last, origins, bases = [], [], [], []
     origin, base = 0, 0
@@ -119,13 +120,14 @@ def test_bitmap_long_public_dispatch(rubin, lengths):
         assert_close(outputs["lse"][:, row], scores.logsumexp(-1))
 
 
-def test_indexed_long_packed_workspace_and_replay(rubin, monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_indexed_long_packed_workspace_and_replay(rubin, monkeypatch, dtype):
     from cudnn.QSA.indexed.api import _plan
 
     total, boundary, width = 32771, 16385, 20
     torch.manual_seed(91)
-    q = torch.randn((total, 12, 256), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((total, 1, 256), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((total, 12, 256), device="cuda", dtype=dtype)
+    k = torch.randn((total, 1, 256), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
     rows = torch.arange(total, device="cuda", dtype=torch.int32)
     origins = torch.where(rows < boundary, 0, boundary).to(torch.int32)
@@ -136,7 +138,7 @@ def test_indexed_long_packed_workspace_and_replay(rubin, monkeypatch):
     indices = torch.where((groups[:, :, None] >= 0) & (tokens <= rows[:, None, None]), tokens, -1).reshape(total, width)
     original = indices.clone()
     outputs = qsa_indexed_forward(q, k, v, indices)
-    plan = _plan(total, width, q.device, "fprop")
+    plan = _plan(total, width, q.device, "fprop", dtype=dtype)
     # The scratch contract scales with selected groups, not the sequence squared.
     assert plan.scratch_workspace_bytes() <= total * (width + 24) + 6 * 256
     workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
