@@ -528,6 +528,10 @@ Rubin bf16 dense d192 x 128 causal chunks (MHA and GQA) from S_q 512 over a 32k 
 study sm107_dense_d192x128_long_cache_20261118, cuDNN 9.30.0.8: changed train cells 0.57-0.60, worst 0.785; holdout scored once
 0.647-0.783, worst 1.030); 256-query chunks lost up to 1.49. kimi_k2 / deepseek_v3 MHA and mimo GQA chunks over 64k-128k ran the
 backend at 2.0-2.4x. A table entry would drop the hand rule's other leads (S_q 16 MHA, 8k caches), so this extends the rule.
+Rubin bf16 dense d128 GQA causal chunks whose group the row packs whole lead up to 512 launch tiles from an 8k cache
+(``SM107_D128_WHOLE_PACK_*``; study sm107_dense_d128_longkv_v2_20261118, cuDNN 9.30.0.8: changed train cells 0.822, worst 1.027;
+holdout scored once 0.930 / 0.918, worst 0.993). Groups the row runs unpacked (3, 5, 6, 7) lost up to 2.0x past the 256-tile cap
+(sm107_dense_d128_longkv_20261117) and keep it.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
 pack, so the lead is the unpacked FROST plan; it leads the backend when the declaration admits no chunk over a longer
 cache (equal Q and KV extents and, with packed totals declared, equal totals), the declared cache holds at least 4096
@@ -579,6 +583,8 @@ SM107_D256_LONG_CHUNK_MIN_KV = 32768  # Rubin bf16 d256 GQA causal chunks lead p
 SM107_D256_LONG_CHUNK_MIN_S_Q = 256  # ... from the study's smallest S_q
 SM107_D192_LONG_CHUNK_MIN_KV = 32768  # Rubin bf16 d192 x 128 causal chunks lead past the tile cap from this cache (module docstring)
 SM107_D192_LONG_CHUNK_MIN_S_Q = 512  # ... from the study's smallest winning S_q (256 lost up to 1.49x)
+SM107_D128_WHOLE_PACK_MAX_Q_TILES = 512  # Rubin bf16 d128 GQA chunks the row packs whole lead up to this many tiles (module docstring)
+SM107_D128_WHOLE_PACK_MIN_KV = 8192  # ... from this cache
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
 NONPAGED_D256_THD_MIN_Q = 256  # nonpaged d256 THD lead: query tokens per request
@@ -1116,6 +1122,17 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
                 and facts.s_q >= SM107_D192_LONG_CHUNK_MIN_S_Q
                 and facts.s_kv >= SM107_D192_LONG_CHUNK_MIN_KV
             )
+            if (
+                d128
+                and facts.causal
+                and facts.h_q != facts.h_kv
+                and facts.s_kv >= SM107_D128_WHOLE_PACK_MIN_KV
+                and _q_tiles(facts) <= SM107_D128_WHOLE_PACK_MAX_Q_TILES
+            ):
+                from .heuristics import _pack_gqa_eligible, _pack_gqa_group
+
+                if _pack_gqa_group(caps, facts, 128, _pack_gqa_eligible(caps, facts, 128)) == facts.h_q // facts.h_kv:
+                    max_tiles = SM107_D128_WHOLE_PACK_MAX_Q_TILES
             if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and (long_d256 or long_d192 or _q_tiles(facts) <= max_tiles):
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
     if _sm107_paged_gqa_prefill(facts):

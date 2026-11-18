@@ -1098,7 +1098,8 @@ def test_sm107_dense_d128_chunks_lead_up_to_256_tiles():
     assert placement.SM107_D128_CHUNKED_MAX_Q_TILES == 256
     assert place() == placement.LEAD  # 256 tiles
     assert place(h_q=32, h_kv=4, s_q=1024) == placement.LEAD  # 256 tiles
-    assert place(s_q=1024) == placement.TRAIL  # 512 tiles
+    assert place(s_q=1024) == placement.LEAD  # 512 tiles: group 8 packs whole (sm107_dense_d128_longkv_v2_20261118)
+    assert place(h_q=56, s_q=1024) == placement.TRAIL  # 448 tiles: group 7 runs unpacked and keeps the cap
     assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL  # f16 keeps 128 tiles
     assert place(h_q=32, h_kv=4) == placement.LEAD  # 128 tiles, every width
     assert place(b=2, h_q=56, h_kv=8, s_q=192, s_kv=16384) == placement.TRAIL  # 224 tiles below S_q 256: the edge supplement lost 1.37x
@@ -1142,6 +1143,27 @@ def test_sm107_dense_d192x128_long_cache_chunks_lead_past_the_tile_cap(s_kv, hea
     assert place(s_q=512, s_kv=65536 + s_kv % 2) == placement.LEAD
     assert place(s_q=256, b=4) == placement.TRAIL  # below S_q 512, past the tile cap
     assert place(s_kv=16384 + s_kv % 2, b=4) == placement.TRAIL  # below the cache floor, past the tile cap
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm107_dense_d128_whole_pack_chunks_lead_to_512_tiles(s_kv):
+    """Study sm107_dense_d128_longkv_v2_20261118: Rubin bf16 dense d128 GQA causal chunks whose group the row packs whole lead up to 512
+    launch tiles from an 8k cache (llama3.1 chunks at b 1 over 8k-128k ran the backend at 1.12-1.52x); groups the row runs unpacked keep
+    the 256-tile cap (they lost up to 2.0x past it)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=64, h_kv=8, s_q=1024, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7))
+    base.update(device_sm_count=224, has_paged_kv=False, padded=False, page_size=0)
+    place = lambda **over: placement.place(spec, _facts(**{**base, **over}))
+    assert (placement.SM107_D128_WHOLE_PACK_MAX_Q_TILES, placement.SM107_D128_WHOLE_PACK_MIN_KV) == (512, 8192)
+    assert place() == placement.LEAD  # 512 tiles, group 8 packs whole
+    assert place(h_q=32, h_kv=4, s_q=2048) == placement.LEAD  # llama3.1-tp2
+    assert place(s_q=2048) == placement.TRAIL  # 1024 tiles
+    assert place(h_q=48) == placement.TRAIL  # group 6 runs unpacked: 384 tiles past the 256-tile cap
+    assert place(s_kv=4096 + s_kv % 2, s_q=1024) == placement.TRAIL  # below the cache floor
     assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
 
 
