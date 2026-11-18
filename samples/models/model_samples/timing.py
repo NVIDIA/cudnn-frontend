@@ -267,12 +267,12 @@ class Report:
         stated; and the traced-pass line says that the prompt was replayed in front of the traced steps.
 
         ``drafter``: such a session has a drafter, so its steps are whole steps of speculative decoding.  Its report then
-        has the acceptance lines (from ``kept``: the count every step kept; ``scheduled``: some step verified drafted
+        has the acceptance lines (from ``accepted``: the count every step kept; ``scheduled``: some step verified drafted
         tokens of its caller's, so nothing was measured), the bytes of such a step (``bytes`` at the step's tokens and
         ``pass_bytes``, a draft pass's), and says why no rate is printed while the drafter runs on reference blocks."""
         self.tag, self.reduced, self.tokens, self.draft_tokens = tag, reduced, tokens, draft_tokens
         self.drafter = drafter
-        self.kept: List[int] = []  # of every step: the drafted tokens it kept
+        self.accepted: List[int] = []  # of every step: the drafted tokens it kept
         self.scheduled = False
         self.pass_bytes: Dict[str, int] = {}  # the drafter's bytes_per_pass
         self.text_path: Dict[str, float] = {}
@@ -395,14 +395,14 @@ class Report:
         tokens the comparison accepted, 1 to ``tokens`` tokens: the mean over the steps, how many steps kept each number,
         and per drafted token how many of the steps that kept the one before it kept it too.  For a run whose steps
         verified drafted tokens of the caller's (a schedule) nothing was measured, and the line says that."""
-        steps, total = len(self.kept), self.tokens
+        steps, total = len(self.accepted), self.tokens
         if not steps:
             return ["acceptance            no step ran"]
-        counts = [sum(1 for kept in self.kept if kept == count) for count in range(total)]
+        counts = [sum(1 for kept in self.accepted if kept == count) for count in range(total)]
         by_kept = ", ".join(f"{count + 1}: {steps_at}" for count, steps_at in enumerate(counts))
         if self.scheduled:
             return [f"acceptance            scheduled, not measured (reduction): {steps} steps; kept {by_kept}"]
-        reached = [sum(1 for kept in self.kept if kept >= draft) for draft in range(total)]  # reached[j]: the steps that kept at least j drafted tokens
+        reached = [sum(1 for kept in self.accepted if kept >= draft) for draft in range(total)]  # reached[j]: the steps that kept at least j drafted tokens
         per_draft = ", ".join(f"{draft}: {reached[draft]} of {reached[draft - 1]}" for draft in range(1, total))
-        mean = f"kept tokens per step {1 + sum(self.kept) / steps:.2f} of {total} (1 + accepted drafted tokens / steps), {steps} steps"
+        mean = f"kept tokens per step {1 + sum(self.accepted) / steps:.2f} of {total} (1 + accepted drafted tokens / steps), {steps} steps"
         return [f"acceptance            {mean}; kept {by_kept}", f"                      accepted per draft: {per_draft}"]

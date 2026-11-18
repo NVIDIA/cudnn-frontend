@@ -544,14 +544,14 @@ class QwenDense:
         position, ``positions + tokens - 1``.
 
         * ``weights``: every weight the step reads in full, in its stored format (8-bit: 1 byte per element; 4-bit: 0.5 byte
-          per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per sequence;
+          per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per row of the step;
         * ``copies``: the same weights as a stack of this family reads them: a bf16 copy at 2 bytes per element -- but the
           weights of the blocks ``stored`` (the blocks of the stack's plan whose provider multiplies on the stored format:
           ``STORED_WEIGHTS``) on that format, as the loader kept them;
         * ``stored``: the part of ``copies`` that is read on a stored format (``stored_bytes``); 0 for a stack whose every
           multiply reads a copy;
         * ``state``: the recurrent state and the conv history of every linear-attention layer, read and written, and the
-          cached keys and values of every attention layer up to ``positions`` positions, read."""
+          cached keys and values of every attention layer over ``positions + tokens - 1`` positions, read."""
         g = self.geometry
         on_disk = copies = 0
         for spec in self.tensor_specs():

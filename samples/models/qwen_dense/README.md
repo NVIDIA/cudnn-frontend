@@ -815,8 +815,9 @@ the kernels that are to serve these blocks (`configs.DRAFT_PROJECTION_SITES`, `c
 prompt set, with no position of its own. The attention of a row reads every position of its sequence from 0 to its
 own, so a position in front that no pass wrote is read as those zeros and nothing refuses it: filling the cache over
 a prompt, one body pass per position, is the caller's. A session with the drafter does it in `prefill`. A step
-whose passes would write past the cache is refused before its first pass. With the copies and that cache, `drafter.memory_bytes(sequences, capacity)`
-is what a loaded drafter holds on the device besides the model's embedding table: 2.00 GiB at the published widths
+whose passes would write past the cache is refused before its first pass. With the copies and that cache,
+`drafter.memory_bytes(sequences, capacity)` is what a loaded drafter holds on the device besides the model's
+embedding table: 2.00 GiB at the published widths
 with 65,536 ids, one sequence and 2,051 positions. A pass on a load without its copies is an error that names
 `copies=True`.
 
@@ -1169,10 +1170,10 @@ these passes are in no section.
 ```python
 from model_samples import Session, sampling
 
-plain = Session(model, text, sequences=1, stack=stack, device=device, capacity=positions)
+plain = Session(model, text, sequences=1, stack=stack, device=device, capacity=positions, checkpoint=checkpoint)
 session = Session(model, text, sequences=1, stack=stack, device=device, capacity=positions, share=plain, draft_tokens=5, drafter=drafter)
-print(plain.plan_table([session]), file=sys.stderr)  # every plan of the run and one memory sentence, before any load
-plain.load()
+print(plain.plan_table([session]), file=sys.stderr)  # every plan resolved; the plain table, one memory sentence for the run
+plain.load()  # the model's weights are read here, once
 session.load()  # the drafter is loaded here, with the model's embedding table
 new = session.read(session.prefill([prompt]))  # the prompt: decode steps, and the drafter's passes over it; the first new token
 while len(new) < limit:
@@ -1183,11 +1184,19 @@ while len(new) < limit:
     new += greedy[: kept + 1]  # the tokens of this step: text can go out here, before the next launch
 ```
 
-These lines share one load between the two sessions -- the model's weights, read once -- and the session keeps the
-drafter's weights and its cache; `model`, `text` and `drafter` are those of the calls above (a described checkpoint
-with its drafter, or the seeded pair), `prompt` the ids of one prompt, `positions` at least the prompt, the new tokens
-and four more: the last window reaches that far. The loop reads the device once per step. `drafter=` needs
-`draft_tokens=`, and a session with a drafter serves one sequence: one request, as the drafter rows are for.
+These lines share one load between the two sessions: the plain session reads the model's weights, once, and is what
+the checks hold the loop against (`tie_out.speculative_checks`); the session with the drafter runs on them
+(`share=plain`) and keeps the drafter's weights and its cache. `checkpoint`, `model` and `drafter` are those of the
+loader's call in the section "The checkpoint's drafter". The session that loads is handed the checkpoint
+(`checkpoint=`): a session that is handed none draws seeded weights, and its drafter's with them -- `checkpoint` is
+`None` for the seeded pair (`QwenDenseDrafter.seeded(model)`). `text` is the tokenizer (`TextIO`), `stack` and
+`device` a session's, `sys` the standard module, `prompt` the ids of one prompt, `limit` the new tokens asked for,
+`positions` at least the prompt, the new tokens and four more: the last window reaches that far. The first
+`plan_table` resolves every plan of the run and prints the plain session's table and one memory sentence for the
+whole run, the drafter in it; `session.plan_table()` prints the session's own three tables. A session with a drafter
+stands alone as well, without `share=`: it then loads the model itself. The loop reads the device once per step.
+`drafter=` needs `draft_tokens=`, and a session with a drafter serves one sequence: one request, as the drafter rows
+are for.
 
 A step, in order. `speculate` hands the drafter what the step before left on the state: every final-norm row of
 that step, by reference (`state.hidden`), and the greedy token after each (`state.greedy`); the position of its first
@@ -1205,17 +1214,19 @@ in the place of the drafter's: the drafter runs all the same, and its own propos
 (`session.record.proposals`). On a session with a drafter `verify` is refused: a verify step without the passes in
 front of it would leave the drafter's cache without its positions.
 
-The plan table of such a session has a third table under one line -- "the drafter: 18 block calls a pass; the first
-pass of a step behind a verify step runs at S x T rows, every other pass and every pass over the prompt at S rows;
-every row of this table serves any row count" -- and the one memory sentence counts the drafter: what its load and
-its cache hold (`memory_bytes`) and the working memory of a pass on reference blocks, which is twice the largest
-product a reference multiply accumulates at a time (`working_bytes`: 1.33 GiB at the published widths). At the
+The plan table of such a session (`session.plan_table()`) has a third table under one line -- "the drafter: 18
+block calls a pass; the first pass of a step behind a verify step runs at S x T rows, every other pass and every
+pass over the prompt at S rows; every row of this table serves any row count" -- and the one memory sentence counts
+the drafter: what its load and its cache hold (`memory_bytes`) and the working memory of a pass on reference blocks,
+an allowance of twice the largest chunk of a weight a reference multiply converts to fp64 at a time
+(`working_bytes`: 1.33 GiB at the published widths). At the
 published widths with 65,536 ids and 2,051 positions the drafter adds 3.3 GiB: a run of a plain session and such a
 session asks for about 43.6 GiB on `native` and about 61.2 GiB on `fe-cublas`, where the same run without a drafter
 asks for about 40.2 and 57.9 GiB. These are arithmetic on stated facts; a measured run is below.
 
-**The checks of a speculative step.** Every block of the drafter is the reference chain, so the block check judges
-none of them. `tie_out.speculative_checks` holds a session with a drafter by two more lines. Beside its replay it
+**The checks of a speculative step.** Every block of the drafter but its embedding lookup is a reference chain, so
+the block check judges none of them. `tie_out.speculative_checks` holds a session with a drafter by two more lines.
+Beside its replay it
 writes the drafter's passes out a second time, at one row per call, from books of its own: the kept tokens of the
 run in order and, per kept position, the model's final-norm row of it. A position gets its pass when the token that
 follows it is known; the passes of a step are then the head on the last of those rows and, for every later draft,
@@ -1229,9 +1240,9 @@ checks replay the run with the passes and hold the proposals beside the ids and 
 holds whole steps as `speculate` runs them, fed the recorded drafted tokens: the sites of such a step are, for every
 pass, the drafter's wiring with the pass's number in the place of the layer, then the model's, and the kernel check
 holds the embedding lookups in that order -- every pass's, then the model's -- attributes everything else a pass
-launches to the drafter's fallback rows, and holds the model's part to the verify plan and its census section as before. Of the
-passes it prints "kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and
-the output head behind it; no section holds a draft pass)".
+launches to the drafter's fallback rows, and holds the model's part to the verify plan and its census section as
+before. Of the passes it prints "kernel identity of the drafter's passes: not stated (the kernel census holds the
+verify step and the output head behind it; no section holds a draft pass)".
 
 The report of such a session has two acceptance lines: `kept tokens per step X.XX of 6 (1 + accepted drafted tokens /
 steps), n steps; kept 1: .., .. 6: ..` and `accepted per draft: 1: x of n, 2: y of x, ..` -- per drafted token the
@@ -1256,7 +1267,7 @@ behind `reset(fresh=False)` gave the ids, the kept counts and the proposals of t
 passed and the run ended in `RAN`. One, three and seven drafted tokens and the four-layer model passed on `native`
 as well.
 
-In one process on `native`, seventeen runs with one thing wrong each, between two runs of the tree as it is. A
+In one process on `native`, twenty-one runs with one thing wrong each, between two runs of the tree as it is. A
 first pass one position off, the pass of one prompt position left out, a drafted token where the kept one belongs
 and the rows of an older step each failed `drafter cache`; the row select at row 0, a later pass fed the model's row
 again, fed the proposal of two passes before, or one position off each failed `draft proposals` and passed
@@ -1264,7 +1275,11 @@ again, fed the proposal of two passes before, or one position off each failed `d
 second lookup in the model's table inside a pass, a copy between two exact rows of the model and the pair read
 twice each failed the kernel check with its own sentence. A forgotten kept count, a position moved by the count
 alone, a row that attends over the whole window and a count taken from the schedule failed the lines that are there
-for them, as they do without a drafter. A drafted token emitted by the caller failed no line of the comparison --
+for them, as they do without a drafter. So did three ways of feeding the prompt to something the verify steps do
+not stand on -- a state of its own for the model's layers, another attention cache, another view of the history
+columns: each failed `prompt` and passed `drafter cache` and `draft proposals`. With the whole state apart, the rows
+a drafter reads among it, the session was refused at its load, by name: its warm-up step found no row behind its
+prompt step. A drafted token emitted by the caller failed no line of the comparison --
 the window of the next step is the session's -- and showed in the ids against the plain run's. A replay without the
 prompt was refused by name: such a session has no step in front of its prompt.
 
@@ -1312,8 +1327,8 @@ only"). The rows therefore gate no batch invariance on this block; a run with mo
 the bytes were equal and, beside it, this statement.
 
 **What is not here.** A script that drafts: the speculative step is reached from the library. Kernels for the
-drafter: every block of its passes is a reference chain, so no rate is printed for such a run and the kernel census
-holds no draft pass. A drafter at more than one sequence. Without a drafter nothing decides how many tokens to keep:
+drafter: every block of its passes but the embedding lookup is a reference chain, so no rate is printed for such a
+run and the kernel census holds no draft pass. A drafter at more than one sequence. Without a drafter nothing decides how many tokens to keep:
 the caller says it. One count
 per step for all sequences: a step that keeps another number of tokens per sequence needs a position per sequence
 in the attention blocks, which is not built. A decode step behind a keep: a session built with `draft_tokens=`
@@ -1323,7 +1338,8 @@ and says of three lines that they are not stated -- the first-token line (nothin
 steps), the rate (a step is not one token), and the bytes of a step (the family's arithmetic is the decode step's:
 one embedding row, one recurrent state and three history columns per sequence). A session built with `draft_tokens=`
 states its first-token line and prints no rate -- its drafted tokens are its caller's -- and the bytes of a step of
-such a session are not stated either. With a drafter it states the bytes of its step and its acceptance. The kernel check and the coverage line of such a session are about its verify
+such a session are not stated either. With a drafter it states the bytes of its step and its acceptance. The
+kernel check and the coverage line of such a session are about its verify
 steps: the decode steps of its prompt are replayed in front of the traced window and their kernels are not observed,
 which the run says beside its kernel verdict; what they launch was compared with a plain session's step in the runs
 above, by the driver of those runs. The attention layers'

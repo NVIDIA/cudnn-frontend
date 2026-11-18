@@ -1708,6 +1708,51 @@ def test_the_models_stored_forms_and_the_drafter_loaded_together(tmp_path):
     disk.close()
 
 
+def test_the_readmes_speculative_loop_runs_on_the_checkpoint_the_loaders_call_described(tmp_path):
+    """The speculative loop of the family README, as it is written, with the names of the loader's call above it --
+    ``checkpoint``, ``model``, ``drafter`` -- for a checkpoint on disk that is generated here.  The session that loads
+    is handed the checkpoint, so the table the loop runs on and the drafter's weights are the file's, and the loop's
+    tokens are a plain session's on that checkpoint.  With ``checkpoint`` ``None`` -- what the sentence under the loop
+    says of the seeded pair -- a session draws seeded weights, and its drafter's with them."""
+    pytest.importorskip("safetensors")
+    from model_samples import Checkpoint, TextIO
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+
+    tiny = _tiny_model()
+    directory = _write_checkpoint(tmp_path / "tiny-checkpoint", _disk_tensors(tiny, QwenDenseDrafter.seeded(tiny, seed=5), 5), _config(tiny.geometry))
+    (tmp_path / "ids.json").write_text(json.dumps(list(range(0, 272, 3))))
+    checkpoint = Checkpoint.describe(str(directory))  # the call of the loader, as the README writes it
+    model = QwenDense.describe(checkpoint)
+    drafter = QwenDenseDrafter.describe(checkpoint, model, draft_vocab=str(tmp_path / "ids.json"))
+    part = README.read_text().split("**The speculative step.**", 1)[1].split("**Memory.** The memory sentence of a verify plan", 1)[0]
+    (code,) = re.findall(r"```python\n(.*?)```", part, flags=re.S)
+    prompt = torch.randint(0, 272, (5,), generator=torch.Generator().manual_seed(1))
+    names = dict(model=model, text=TextIO.synthetic(272), drafter=drafter, stack="reference", device="cpu", sys=sys, prompt=prompt)
+
+    def run(handed):
+        scope = dict(names, checkpoint=handed, positions=5 + 24 + 4, limit=24)
+        exec(compile(code, "the README's speculative loop", "exec"), scope)
+        return scope["plain"], scope["session"], scope["new"]
+
+    plain, session, new = run(checkpoint)
+    table = checkpoint.load("embed_tokens.weight", "cpu")
+    own = drafter.load(checkpoint, "cpu", embedding=table)  # the drafter as the loader's call loads it
+    assert plain.checkpoint is checkpoint and torch.equal(session.weights.embedding, table), "the loop ran on the file's weights"
+    assert session.draft_weights.embedding is session.weights.embedding and torch.equal(session.draft_weights.fc.codes, own.fc.codes)
+    assert torch.equal(session.draft_weights.head.codes, own.head.codes) and session.draft_weights.head_ids.tolist() == list(range(0, 272, 3))
+    ids = plain.prefill([prompt])
+    stream = plain.read(ids)
+    while len(stream) < len(new):
+        ids = plain.step(ids)
+        stream += plain.read(ids)
+    assert len(new) >= 24 and new == stream, "the tokens of the loop are a plain session's on that checkpoint"
+    # handed no checkpoint, the same lines run on seeded weights: another table, and another drafter
+    seeded_plain, seeded, _ = run(None)
+    assert seeded_plain.checkpoint.synthetic_weights and not torch.equal(seeded.weights.embedding, table)
+    assert seeded.draft_weights.embedding is seeded.weights.embedding and not torch.equal(seeded.draft_weights.fc.codes, own.fc.codes)
+    checkpoint.close()
+
+
 def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     """The sentences of the family README's section on the drafter that state a count, a figure or a behaviour of the
     draft pass, each against the code: the calls of a pass, its call sites, the rule of the row quantiser, what a load
@@ -1744,6 +1789,8 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "so a position in front that no pass wrote is read as those zeros and nothing refuses it: filling the cache over a prompt, "
         "one body pass per position, is the caller's.",
         "A step whose passes would write past the cache is refused before its first pass.",
+        # ... and who fills it over a prompt (held by the test of the speculative step: the cache behind the prompt of a session)
+        "A session with the drafter does it in `prefill`.",
     )
     assert [sentence for sentence in said if sentence not in section] == []
     gone = (
@@ -1761,6 +1808,8 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "the step a session makes of it and the drafter's passes (**The speculative step**, below). No script runs either yet:",
         "how many were kept; handed the drafter, the session drafts them itself (**The speculative step**, below).",
         "**What is not here.** A script that drafts: the speculative step is reached from the library.",
+        "Kernels for the drafter: every block of its passes but the embedding lookup is a reference chain, so no rate is printed for such a run "
+        "and the kernel census holds no draft pass.",
         "Without a drafter nothing decides how many tokens to keep: the caller says it.",
     )
     assert [sentence for sentence in elsewhere if sentence not in whole] == []

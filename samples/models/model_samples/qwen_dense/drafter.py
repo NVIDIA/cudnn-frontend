@@ -134,7 +134,7 @@ BODY = (
     ("draft.final_norm", ""),
 )
 HEAD = (("draft.head.quantize", ""), ("draft.head", ""), ("draft.token_choice", ""))
-#: the weight rows a reference multiply accumulates at a time (``torch_ref.linear``): what bounds a pass's working memory
+#: the weight rows a reference multiply converts to fp64 at a time (``torch_ref.linear``): what a pass's working memory follows
 REFERENCE_CHUNK = 8192
 READS = "it reads a drafter stored in bf16, whose multiplies it quantises to 8 bits when it loads"
 RECIPE = 'samples/models/qwen_dense/README.md, "The checkpoint\'s drafter"'
@@ -500,9 +500,10 @@ class QwenDenseDrafter:
 
     def working_bytes(self) -> int:
         """What a pass on reference blocks needs on the device beyond what is held, in bytes: an allowance, not a bound.  A
-        reference multiply accumulates a chunk of ``REFERENCE_CHUNK`` weight rows in fp64, 8 bytes per element; the
-        allowance is the largest such chunk among the five weights and the listed head rows, twice -- the product
-        beside the chunk it was formed from, and the allocator's slack."""
+        reference multiply converts a chunk of ``REFERENCE_CHUNK`` weight rows to fp64, 8 bytes per element, and
+        multiplies on it; the allowance is the largest such chunk among the five weights and the listed head rows,
+        twice.  The factor two is the allowance: it stands for what the allocator keeps beside the chunk, and it is
+        held against a measured run, not derived."""
         specs = {spec.name: spec for spec in self.tensor_specs()}
         chunks = [min(REFERENCE_CHUNK, len(self.vocabulary.ids)) * self.geometry.hidden]
         for _, parts in MULTIPLIES:

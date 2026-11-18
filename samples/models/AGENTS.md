@@ -916,8 +916,27 @@ A session that is handed the drafter runs the whole step of speculative decoding
   published widths -- not a share of what the drafter holds. On the checkpoint the run asked for about 43.3 GiB,
   reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
 - The counts of a run live with its record. The comparison resets the session and puts its record back; the kept
-  counts of the acceptance lines are part of that record, so a report printed behind the comparison is still the
-  run's. Every step counts in full, the last one included, whose tokens behind an end token are not emitted.
+  counts of the acceptance lines are part of that record, so the acceptance lines of a report printed behind the
+  comparison are still the run's. Its bytes of a step are not: they follow where the session stands, and the
+  comparison leaves it at position 0 -- a run prints its report first. Every step counts in full, the last one
+  included, whose tokens behind an end token are not emitted.
 - No count of the launches of a pass is stated, in any text, while no census section holds a draft pass: the kernel
   check attributes them, the run says "kernel identity of the drafter's passes: not stated", and a count of block
   calls -- 18 a pass -- is the wiring's.
+- What a step hands on by reference is held by identity, where it is handed on. The session and the second run of
+  the comparison read the same attribute of the state, so a step that left another tensor of the same shape there --
+  the rows in front of the final norm, a layer's normed rows, a copy -- passed every line of both checks and every
+  host test. One test holds it through the session's tap: `state.hidden` is the tensor the final norm's call
+  returned, the one whose quantised rows the head read, and `state.greedy` the one the token choice returned.
+- A traced step is held to the recorded step, not to its shape alone. The kernel check reads no token value: a
+  traced step whose window began with another token, or whose passes drafted on an empty cache, passed it. The host
+  test with the stand-in for the profiler holds the window the traced verify step is fed and what its passes
+  propose against the record.
+- A refusal stands in front of everything the refused call would leave. A step asked for in front of the prompt was
+  refused by its passes, behind the mark of a launch on the report's clock: the read that ends the prompt was then
+  taken for a step's and the first-token line read 0.0 ms. And a refusal names the step of the session that was
+  asked: on a session with a drafter that is `speculate`, also where the session refuses a decode step or a count.
+- The names beside a snippet are run as the text says they may be. The README's loop said "a described checkpoint"
+  and built no session with it: a session that is not handed the checkpoint draws seeded weights, and the drafter's
+  with them, without a word. The loop is now run as written on the seeded pair and on a checkpoint a test
+  generates and describes, and the table it runs on is held against the file.

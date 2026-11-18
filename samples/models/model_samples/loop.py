@@ -109,9 +109,10 @@ class Record:
         self.logits = torch.zeros((steps, rows, vocab), dtype=torch.bfloat16, device=device)
         self.accepted: List[int] = []
         self.count = 0
-        #: of EVERY verify step of the run, recorded or not: the drafted tokens it kept, and how many steps verified drafted
-        #: tokens of the caller's in the place of a drafter's (``Session.speculate(force=)``) -- the report's acceptance lines
-        self.kept: List[int] = []
+        #: of EVERY verify step of the run, recorded or not, what ``accepted`` holds of the recorded ones -- the drafted tokens
+        #: it kept --, and how many steps verified drafted tokens of the caller's in the place of a drafter's
+        #: (``Session.speculate(force=)``): the report's acceptance lines
+        self.accepted_all: List[int] = []
         self.forced = 0
         #: the ids of a whole prompt ``[sequences, tokens]``, kept by a session that replays its prompt in front of its steps
         self.prompt: Optional[torch.Tensor] = None
@@ -535,7 +536,7 @@ class Session:
             self.state.clear()
             self.record.count = self.record.forced = 0
             self.record.accepted.clear()
-            self.record.kept.clear()
+            self.record.accepted_all.clear()
             if self.prompt_record is not None:
                 self.prompt_record.count, self.prompt_record.prompt = 0, None
         self._open = False
@@ -610,8 +611,8 @@ class Session:
     # ------------------------------------------------------------------ the drafter's passes
     def _draft_call(self, name: str, index: int, *operands):
         """One block call of a draft pass, served by the drafter's plan; ``index`` is the pass, where a step has the layer.
-        Not handed to ``tap``: every block of the drafter is the reference chain, and the tap of a run's checks is built
-        on the model's plans."""
+        Not handed to ``tap``: every block of the drafter but its embedding lookup is a reference chain, and the tap of a
+        run's checks is built on the model's plans."""
         self._calls += 1
         block = self.draft_plan[name]
         out = block(*operands)
@@ -636,11 +637,16 @@ class Session:
         prompt, ``tokens`` behind a verify step), the position of that step's first row, and how many drafted tokens the
         run kept of it -- one host integer, the row the passes go on from."""
         state, kept = self.state, self.state.accepted
-        if state.hidden is None:
-            raise ValueError("the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first (Session.prefill)")
+        self._behind_prompt()
         return self.drafter.draft(
             self._draft_call, self.draft_weights, state.draft, state.hidden, state.greedy, state.position - (kept + 1), kept, self.draft_tokens
         )
+
+    def _behind_prompt(self) -> None:
+        """A step of a session with a drafter stands behind its prompt: a ``ValueError`` in front of it, where no step has
+        left a final-norm row."""
+        if self.state.hidden is None:
+            raise ValueError("the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first (Session.prefill)")
 
     def _engine(self, force: Optional[torch.Tensor], accept: Optional[int]) -> torch.Tensor:
         """One step of speculative decoding: the drafter's passes; the window -- the greedy token the run kept last, then
@@ -701,6 +707,10 @@ class Session:
 
     def step(self, ids: torch.Tensor) -> torch.Tensor:
         """One decode step for every sequence: the ids to feed ``[sequences]`` -> the next ids ``[sequences]``, on the GPU."""
+        if self.drafter is not None:
+            raise ValueError(
+                "behind its prompt a session with a drafter runs steps of speculative decoding (Session.speculate); a decode step behind a keep is not built"
+            )
         if self.draft_tokens is not None:
             raise ValueError(
                 "behind its prompt a session built with draft_tokens= runs verify steps (Session.verify); a decode step behind a keep is not built"
@@ -723,7 +733,8 @@ class Session:
 
         On a session built with ``draft_tokens=`` the count may be left out: the step runs, the caller reads its greedy
         ids and says how many drafted tokens it keeps with ``accept``; the next ``verify`` before that is a ``ValueError``.
-        On a session built with ``tokens=`` the count is part of the step."""
+        On a session built with ``tokens=`` the count is part of the step.  A session with a drafter refuses this method
+        (a ``ValueError``): its step is ``speculate``, which runs the drafter's passes in front of the verify step."""
         if self.tokens == 1:
             raise ValueError("Session.verify is the step of a session built for several tokens per sequence (tokens=); this session's step is Session.step")
         if self.drafter is not None:
@@ -744,7 +755,7 @@ class Session:
         next_ids = self._advance(ids.to(torch.int32).reshape(-1), accept).view(self.sequences, self.tokens)
         self._open = waits
         if not waits:
-            self.record.kept.append(accept)
+            self.record.accepted_all.append(accept)
         return next_ids
 
     def speculate(self, force: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -771,8 +782,8 @@ class Session:
                 f"force is the drafted tokens of the step, int32 [{self.sequences}, {self.draft_tokens}] (sequences, draft tokens); "
                 f"got {force.dtype} {tuple(force.shape)}"
             )
-        if self.state.hidden is not None:  # (in front of the prompt the passes refuse the step by name)
-            self._fits(self.tokens)  # before the passes: a step past the capacity writes nothing, the drafter's cache included
+        self._behind_prompt()  # a refused step runs nothing and leaves nothing: no pass, no entry of the record, no mark on the report's clock
+        self._fits(self.tokens)  # before the passes: a step past the capacity writes nothing, the drafter's cache included
         self._report.clock.mark_launch()
         pair = self._engine(force, None)
         self._open = True
@@ -780,14 +791,16 @@ class Session:
         return pair
 
     def accept(self, count: int) -> None:
-        """Say how many drafted tokens the verify step that has just run keeps: one whole number, 0 .. tokens - 1, for the
-        fixed set of sequences.  The state then stands at that token and the record of the step holds the count.  It
-        launches nothing and copies nothing.
+        """Say how many drafted tokens the verify step that has just run keeps -- the step of ``verify`` given no count, or of
+        ``speculate`` --: one whole number, 0 .. tokens - 1, for the fixed set of sequences.  The state then stands at
+        that token and the record of the step holds the count.  It launches nothing and copies nothing.
 
         One count for several sequences is exactly greedy for every sequence only if it is the smallest count of the
         set -- a larger one keeps a token some sequence did not accept -- and that is the count ``sampling.accepted``
         returns from the host read of the step.  ``ValueError`` when no step waits for a count (``verify`` was given
-        one, or has not run)."""
+        one, or no step has run)."""
+        if not self._open and self.drafter is not None:  # the step such a session was asked for is speculate
+            raise ValueError("no step of this session waits for its kept count: Session.accept follows a Session.speculate (a session with a drafter)")
         if not self._open:
             raise ValueError(
                 "no verify step of this session waits for its kept count: Session.accept follows a Session.verify that was given none "
@@ -799,10 +812,11 @@ class Session:
             self.record.accepted[self.record.count - 1] = count
         self.state.accept(count)
         self._open = False
-        self.record.kept.append(count)
+        self.record.accepted_all.append(count)
 
     def read(self, ids: torch.Tensor) -> List[int]:
-        """The one host read of a step: the chosen ids, 4 bytes per sequence."""
+        """The one host read of a step: the chosen ids, 4 bytes per sequence -- or the pair of a step of speculative decoding
+        (``speculate``), 8 bytes per token of a sequence."""
         tokens = ids.tolist()
         if not self._report.clock.ids and not self._report.clock.launch:
             self._report.prefill_seconds = now() - self._prefill_start
@@ -896,7 +910,7 @@ class Session:
         row, one recurrent state and three history columns per sequence): a session of several tokens per sequence states
         none, and its report says so, as it does of the first-token line and of the rate (``timing.Report``).  A session
         with a drafter states the bytes of its step -- the verify step's arithmetic at its tokens per sequence and a draft
-        pass's, ``draft_tokens`` times -- and the counts its steps kept (``Report.kept``; ``Report.scheduled``: some step
+        pass's, ``draft_tokens`` times -- and the counts its steps kept (``Report.accepted``; ``Report.scheduled``: some step
         verified drafted tokens of the caller's), as the record of the run has them."""
         if self.drafter is not None and self.state is not None:
             # the weights a block of the verify plan multiplies on the stored format are read there, not as a copy
@@ -904,7 +918,7 @@ class Session:
             read = {"stored": stored} if stored else {}
             self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position, tokens=self.tokens, **read)
             self._report.pass_bytes = self.drafter.bytes_per_pass(self.state.position)
-            self._report.kept, self._report.scheduled = list(self.record.kept), bool(self.record.forced)
+            self._report.accepted, self._report.scheduled = list(self.record.accepted_all), bool(self.record.forced)
         if hasattr(self.model, "bytes_per_step") and self.state is not None and self.tokens == 1:
             # a block of this session's plan that multiplies on the stored format reads its weight there, not as a copy
             # (asked of a family's model only where the plan has such a block)
