@@ -1099,6 +1099,7 @@ def build_recompute(
         str(seed_indices.dtype) if seed_indices is not None else "none",
         str(final_indices.dtype) if final_indices is not None else "none",
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         str(transition.dtype) if transition is not None else "none",
         item_limit_word is not None,
         (

@@ -3633,7 +3633,7 @@ def test_bwd_same_graph_two_streams(backend, variant, dtype):
 # ---------------------------------------------------------------------------
 
 RELOAD_CHILD = r"""
-import json, sys
+import hashlib, json, sys
 from pathlib import Path
 import torch, cudnn
 from linear_attention.test_la import make_case, op, op_tail, random_state, summary_bwd_inputs, thd_tensors
@@ -3644,10 +3644,11 @@ d_o, _, d_final = summary_bwd_inputs(case)
 seed = random_state(case).requires_grad_(True)
 leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
 o, fs = op(variant)(*leaves, *op_tail(case), initial_state=seed, output_final_state=True, plan_name=f"{variant}_frost")
-sums = [o.double().sum().item(), fs.double().sum().item()]
+tensors = [o, fs]
 if phase != "forward":
-    sums += [g.double().sum().item() for g in torch.autograd.grad([o, fs], leaves + [seed], [d_o, d_final])]
-Path(result_path).write_text(json.dumps(sums))
+    tensors += torch.autograd.grad([o, fs], leaves + [seed], [d_o, d_final])
+digests = [hashlib.sha256(t.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for t in tensors]
+Path(result_path).write_text(json.dumps(digests))
 """
 
 
@@ -6564,6 +6565,47 @@ def test_state_indices_graph_declines_wrong_table_shape(backend):
             if "gdn_frost" in plan_names:
                 graph.select_plan(plan_names.index("gdn_frost"))
             graph.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("node", ["bwd", "summary_bwd"])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_bwd_graph_declines_do_dtype_other_than_io(backend, variant, node):
+    """A hand-built backward or summary-backward graph gets the FROST plan with ``dO`` declared at the io dtype, as the
+    ops declare it, and no FROST plan with ``dO`` at the other half dtype."""
+    case = make_case(variant, torch.bfloat16, T=256, lo=0.99)
+    leaves = dict(zip(LEAF_NAMES[variant], op_args(case)))
+    if node == "summary_bwd":
+        leaves = {name: leaves[name] for name in ("q", "k", "g", "beta") if name in leaves}
+    inputs = dict(leaves, cu_seqlens=case.cu, dO=summary_bwd_inputs(case)[0])
+    attrs = {"output_transition": True} if node == "summary_bwd" else {}
+    if variant in NO_BETA_VARIANTS:
+        inputs.update(a=case.gates["A"], dt_bias=case.gates["dt_bias"])
+    else:
+        attrs["scale"] = 1.0 / math.sqrt(case.K)
+    if variant in HOUSEHOLDER_VARIANTS:
+        attrs["num_householder"] = case.n
+    out_dtypes = [torch.float32] * 2 if node == "summary_bwd" else [t.dtype for t in leaves.values()]
+    plan_name = f"{variant}_summary_frost" if node == "summary_bwd" else f"{variant}_frost"
+
+    def plans(do_dtype):
+        graph = cudnn.pygraph()
+        ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[do_dtype if name == "dO" else t.dtype], name=name) for name, t in inputs.items()}
+        outs = getattr(graph, f"{variant}_{node}")(**ports, **attrs, name=node)
+        for port, dtype in zip(outs, out_dtypes):
+            port.set_output(True).set_data_type(CUDNN_DTYPE[dtype])
+        graph.validate()
+        graph.build_operation_graph()
+        try:
+            graph.create_execution_plans([cudnn.heur_mode.A])
+        except cudnn.cudnnGraphNotSupportedError:
+            return []
+        return [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+
+    if plan_name not in plans(torch.bfloat16):
+        pytest.skip(f"no {plan_name} plan for this graph")
+    assert plan_name not in plans(torch.float16), f"{plan_name} serves a bf16 graph whose dO is fp16"
 
 
 # ---------------------------------------------------------------------------
