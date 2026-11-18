@@ -1279,6 +1279,36 @@ def test_sm107_paged_wide_head_verify_entries_lead(d, heads, s_qs):
 
 
 @pytest.mark.L0
+def test_sm107_paged_window_entries_follow_the_study():
+    """Study sm107_window_gaps_20261118 (Rubin, the inference benchmark's windowed paged generation graph): windowed paged d192 x 192 and
+    d256 lead at S_q 1 through prefill, d64 up to S_q 45, d128 MTP (whole-pack groups) on caches up to 32k. Windowed d128 verify
+    and the unpacked d128 MTP classes have no entry, as do f16 and another part."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def windowed(**over):
+        base = dict(b=16, h_q=64, h_kv=4, s_q=4, s_kv=131072, d_qk=192, d_v=192, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=(10, 7), has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for s_q in (1, 4, 8, 1024):
+        assert pt.lookup(row, windowed(s_q=s_q)) is True, s_q
+        assert pt.lookup(row, windowed(s_q=s_q, d_qk=256, d_v=256, h_q=16, h_kv=8, window_left=1023)) is True, s_q
+        assert pt.matched_entry(row, windowed(s_q=s_q)).study == "sm107_window_gaps_20261118"
+    d64 = dict(d_qk=64, d_v=64, h_q=128, h_kv=16, window_left=2047)
+    assert pt.lookup(row, windowed(**d64, s_q=4)) is True
+    assert pt.lookup(row, windowed(**d64, s_q=16)) is True  # `le q 5.5`: log2 S_q, so up to S_q 45
+    assert pt.lookup(row, windowed(**d64, s_q=128)) is False  # longer prefill keeps the backend
+    d128 = dict(d_qk=128, d_v=128, h_q=64, h_kv=8)
+    assert pt.lookup(row, windowed(**d128, s_kv=16384)) is True
+    assert pt.lookup(row, windowed(**d128, s_kv=131072)) is False
+    assert pt.lookup(row, windowed(**d128, s_q=8)) is None  # windowed d128 verify: no entry
+    assert pt.lookup(row, windowed(**{**d128, "h_q": 80})) is None  # group 10 runs unpacked: no entry
+    assert pt.lookup(row, windowed(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, windowed(device_cc=(10, 3))) is None
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [(512, 512), (576, 512)], ids=["d512", "d576"])
 @pytest.mark.parametrize("h_kv", [1, 2])
 def test_sm107_paged_mla_single_row_decode_follows_the_q1_study(d, h_kv):

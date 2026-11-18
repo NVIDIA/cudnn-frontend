@@ -1063,8 +1063,8 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
 )
 def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_kv, dtype, page, verdict, replay):
     """FlashInfer's paged decode graph at ``q_len_per_req`` 2-4 (the bottom-right causal diagonal with the padding mask) on cc 10.7 is
-    placed by study sm107_paged_mtp_20261110, the same verdict in both regimes; without the diagonal or with a window (no sink) the
-    graph is another class with no entry and keeps the backend first, as does f16."""
+    placed by study sm107_paged_mtp_20261110, the same verdict in both regimes; without the diagonal the graph is another class with no
+    entry and keeps the backend first, as does f16. With a window (no sink) the bf16 graph is study sm107_window_gaps_20261118's class."""
     from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -1078,7 +1078,11 @@ def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_k
     if entry is not None:
         assert entry.study == "sm107_paged_mtp_20261110"
     assert placement.place(spec, _sm107_paged_d256_decode_facts(**shape)) == placement.TRAIL
-    assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)) == placement.TRAIL
+    windowed = _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)
+    off_tile = s_kv % 128 != 0  # the off-tile class leads from cost 2**29: the 125 / 133-key rows trail
+    assert placement.place(spec, windowed) == (placement.TRAIL if dtype == cudnn.data_type.HALF or off_tile else placement.LEAD)
+    if dtype != cudnn.data_type.HALF:
+        assert placement_table.matched_entry(spec.name, windowed).study == "sm107_window_gaps_20261118"
 
 
 @pytest.mark.L0
@@ -1128,7 +1132,8 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     study sm107_paged_prefill_20261109 leads: on this dense-Q graph FROST measured 0.03-0.61 of the backend's plan at s_q 5 / 8 / 16 (216
     cells, d256 and D192xV128, 208-SM cc 10.7, cuDNN 9.30.0.2), as on the THD prefill graph the study fit. Without the diagonal the
     graph is the mask-free paged prefill class: study sm107_thd_prefill_20261111 leads d256 there and has no D192 entry (the backend
-    failed to build it), which keeps the backend first; with a window it keeps the backend first too."""
+    failed to build it), which keeps the backend first. With a window, d256 is study sm107_window_gaps_20261118's class (LEAD) and
+    D192xV128 has no entry (the backend first)."""
     from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -1138,7 +1143,9 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     mask_free = _sm107_paged_d256_decode_facts(**shape)
     assert placement.place(spec, mask_free) == (placement.LEAD if d == (256, 256) else placement.TRAIL)
     assert (placement_table.matched_entry(spec.name, mask_free) is None) == (d != (256, 256))
-    assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)) == placement.TRAIL
+    windowed = _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)
+    assert placement.place(spec, windowed) == (placement.LEAD if d == (256, 256) else placement.TRAIL)
+    assert (placement_table.matched_entry(spec.name, windowed) is None) == (d != (256, 256))
 
 
 @pytest.mark.L0
@@ -1160,7 +1167,6 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
         dict(wants_stats=True),
         dict(has_sink=True),
         dict(causal=True, bottom_right=True),
-        dict(window_left=128, causal=True, bottom_right=True),
         dict(right_band_widening=True, right_bound=8),
         dict(attn_scale_prefolded=True),
         dict(has_epilogue_gate=True),
@@ -1183,7 +1189,6 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
         "stats",
         "sink",
         "causal",
-        "swa",
         "right_band",
         "prefolded",
         "gate",
@@ -1206,6 +1211,8 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
     assert placement.place(spec, _sm107_paged_d256_decode_facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
     if outside is None:
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, s_q=2, causal=True, bottom_right=True)) == placement.LEAD  # the MTP rows (table)
+        # a window leaves the shard: study sm107_window_gaps_20261118 (table) leads windowed paged d256 decode
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, window_left=128, causal=True, bottom_right=True)) == placement.LEAD
         # dense K/V leaves the shard: study sm107_decode_q1_20261112 (table) leads this cell
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, has_paged_kv=False, page_size=0, padded=False)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64)) == placement.LEAD  # group 32 inside its band (64 units x 8k)

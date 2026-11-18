@@ -633,6 +633,40 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm107_paged_wide_gaps_20261118"
     ),
+    # study sm107_window_gaps_20261118 (208-SM Rubin, cuDNN 9.30.0.8; the inference benchmark's windowed paged generation graph, page 16,
+    # bottom-right causal; mean of 100 cold launches under 1 ms; 2914 train cells at GQA 2-16, S_q 1-1024, windows 512-4096 + a 288-cell
+    # holdout at fresh head pairs and windows, scored once (changed 0.12-0.89 of the default); vr200 run-561 gate: 44 rows at 0.266,
+    # worst 0.642. Windowed d128 verify / prefill and the d192 x 128 sink classes changed no holdout cell or failed one twin: no entry)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "le", 5.5, "sm107_window_gaps_20261118", "q"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "le", 5.5, "sm107_window_gaps_20261118", "q"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", False): Entry(
+        "le", 15.0, "sm107_window_gaps_20261118", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 33.293, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm107_window_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm107_window_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 29.0, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm107_window_gaps_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry("ge", 29.0, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
     # study sm107_thd_prefill_20261111 (208-SM Rubin, cuDNN 9.30.0.3; FlashInfer's cudnn path, recorded graph facts; bf16 HND
     # paged page 16/64 and ragged THD, d64/d128 all masks, D192xV128 / d256 ragged all masks and paged mask-free (paged causal
     # D192/D256 is sm107_paged_prefill_20261109's); short-Q, chunks, squares; GQA groups 3-12 incl. 8/1 and 12/1, MHA 16-128.
