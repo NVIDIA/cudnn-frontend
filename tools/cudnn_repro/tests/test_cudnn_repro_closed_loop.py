@@ -85,6 +85,7 @@ def _target_tests():
                 *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test{i}]" for i in range(1, 11)),
                 *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_ragged_L0[test{i}]" for i in range(1, 11)),
                 *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test{i}]" for i in range(1, 6)),
+                *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mixed_seq_len_forms_L0[{side}]" for side in ("cu_q", "cu_kv_brcm")),
             ]
         )
     return [item.strip() for item in raw.split(",") if item.strip()]

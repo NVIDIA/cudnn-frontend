@@ -318,3 +318,49 @@ def test_build_mxfp8_forward_command_preserves_mxfp8_fields():
     assert "'with_unfuse_fma': True" in command
     assert "'rescale_threshold': 4.0" in command
     assert "torch.bfloat16" in command
+
+
+@pytest.mark.parametrize(("mxfp8", "stats"), [(False, False), (False, True), (True, True)])
+def test_fp8_cumulative_sequence_lengths(mxfp8, stats):
+    payload = _fp8_fwd_payload(mxfp8=mxfp8, ragged=True)
+    payload["nodes"][0]["generate_stats"] = stats
+    if not stats:
+        payload["nodes"][0]["outputs"].pop("Stats", None)
+    inputs = payload["nodes"][0]["inputs"]
+    inputs.pop("SEQ_LEN_Q", None)
+    inputs.pop("SEQ_LEN_KV", None)
+    inputs.update(CU_SEQ_LEN_Q=51, CU_SEQ_LEN_KV=52)
+    payload["tensors"].extend([{"uid": 51, "pass_by_value": [0, 5, 8]}, {"uid": 52, "pass_by_value": [0, 17, 17]}])
+    cfg = sdpa_fp8_fwd.build_cfg("", payload)
+    metadata = sdpa_fp8_fwd.extract_seq_and_ragged(payload, seed=0)
+    assert cfg["is_cu_seq_len"] and cfg["is_padding"] and cfg["is_ragged"] and cfg["fwd_stats"] is stats
+    assert cfg["seq_len_q"] == metadata["seq_len_q"] == [5, 3]
+    assert cfg["seq_len_kv"] == metadata["seq_len_kv"] == [17, 0]
+    inputs["SEQ_LEN_KV"] = inputs.pop("CU_SEQ_LEN_KV")
+    with pytest.raises(NotImplementedError, match="both Q and KV"):
+        sdpa_fp8_fwd.build_cfg("", payload)
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_fp8_dense_cumulative_ports_exceed_replay_harness(mxfp8):
+    payload = _fp8_fwd_payload(mxfp8=mxfp8)
+    payload["nodes"][0]["inputs"].update(CU_SEQ_LEN_Q=51, CU_SEQ_LEN_KV=52)
+    with pytest.raises(NotImplementedError, match="ragged storage"):
+        sdpa_fp8_fwd.build_cfg("", payload)
+
+
+def test_mxfp8_ragged_statsless_exceeds_replay_harness():
+    payload = _fp8_fwd_payload(mxfp8=True, ragged=True)
+    payload["nodes"][0]["generate_stats"] = False
+    payload["nodes"][0]["outputs"].pop("Stats")
+    with pytest.raises(NotImplementedError, match="always generates Stats"):
+        sdpa_fp8_fwd.build_cfg("", payload)
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_fp8_dense_forward_replays_without_stats(mxfp8):
+    payload = _fp8_fwd_payload(mxfp8=mxfp8)
+    payload["nodes"][0]["generate_stats"] = False
+    payload["nodes"][0]["outputs"].pop("Stats")
+    cfg = sdpa_fp8_fwd.build_cfg("", payload)
+    assert cfg["fwd_stats"] is False

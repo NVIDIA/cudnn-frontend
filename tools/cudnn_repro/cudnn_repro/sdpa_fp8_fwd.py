@@ -32,8 +32,6 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     v_entry = utils.tensor_entry(tensors, inputs.get("V"))
     o_entry = utils.tensor_entry(tensors, outputs.get("O"))
     stats_entry = utils.tensor_entry(tensors, outputs.get("Stats"))
-    seq_q_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))
-    seq_kv_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))
 
     shape_q = utils.shape(q_entry)
     shape_k = utils.shape(k_entry)
@@ -51,8 +49,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     if not is_paged:
         shape_k, stride_k = utils.normalize_k_layout(shape_k, stride_k)
 
-    seq_len_q = utils.seq_len(seq_q_entry)
-    seq_len_kv = utils.seq_len(seq_kv_entry)
+    seq_len_q, seq_len_kv, cu_sides = utils.forward_seq_lengths(tensors, inputs)
 
     batches = shape_q[0] if shape_q else None
     h_q = shape_q[1] if shape_q else None
@@ -81,10 +78,20 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["rng_data_seed"] = seed if seed is not None else utils.sha1_seed(raw_line)
     cfg["is_alibi"] = node.get("alibi_mask")
     cfg["is_infer"] = True
+    if "generate_stats" in node:
+        cfg["fwd_stats"] = node["generate_stats"]
+        if is_mxfp8 and is_ragged and cfg["fwd_stats"] is False:
+            raise NotImplementedError("The ragged MXFP8 replay harness always generates Stats")
+    if cu_sides:
+        if cu_sides != "both":
+            raise NotImplementedError("The FP8/MXFP8 replay harness requires cumulative lengths on both Q and KV")
+        if not is_ragged:
+            raise NotImplementedError("The FP8/MXFP8 replay harness requires ragged storage for cumulative lengths")
+        cfg["is_cu_seq_len"] = True
     cfg["is_paged"] = is_paged
     cfg["is_bias"] = utils.bool_from_inputs(inputs, "BIAS")
     cfg["is_block_mask"] = utils.bool_from_inputs(inputs, "BLOCK_MASK")
-    cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
+    cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv or cu_sides)
     cfg["is_ragged"] = is_ragged
     cfg["is_dropout"] = dropout_prob > 0.0
     cfg["is_determin"] = None
@@ -152,9 +159,10 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
     v_entry = utils.tensor_entry(tensors, inputs.get("V"))
     ragged_q_entry = utils.tensor_entry(tensors, ragged_offset_q) or utils.ragged_offset_entry(tensors, q_entry)
     ragged_kv_entry = utils.tensor_entry(tensors, ragged_offset_kv) or utils.ragged_offset_entry(tensors, k_entry, v_entry)
+    seq_len_q, seq_len_kv, _ = utils.forward_seq_lengths(tensors, inputs)
     return {
-        "seq_len_q": utils.seq_len(utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))),
-        "seq_len_kv": utils.seq_len(utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))),
+        "seq_len_q": seq_len_q,
+        "seq_len_kv": seq_len_kv,
         "ragged_offset_q": utils.seq_len(ragged_q_entry),
         "ragged_offset_kv": utils.seq_len(ragged_kv_entry),
         "rng_data_seed": seed,
