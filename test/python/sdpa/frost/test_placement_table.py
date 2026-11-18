@@ -1397,6 +1397,31 @@ def test_sm100_paged_d192x128_context_entries_follow_the_study(device_cc):
 
 
 @pytest.mark.L0
+def test_sm90_d192x128_verify_entries_follow_the_study():
+    """Study sm90_d192x128_verify_20261118 (H100): mimo d192 x 128 spec-decode verify. Dense full cache leads on the KV tile past a cost
+    floor and always off it; paged leads with the full cache and with a window + sink on and off the tile; dense window + sink failed
+    its holdout and keeps no verify entry."""
+    row = "sdpa_fwd_prefill_sm90"
+
+    def g(**over):
+        base = dict(b=128, h_q=64, h_kv=4, s_q=8, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(9, 0), has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    study = "sm90_d192x128_verify_20261118"
+    assert pt.class_key(row, g())[4] == "verify"
+    assert pt.lookup(row, g()) is True and pt.matched_entry(row, g()).study == study
+    assert pt.lookup(row, g(b=1, h_q=16, h_kv=1, s_q=5, s_kv=2048)) is False  # below the on-tile dense cost floor
+    assert pt.lookup(row, g(b=1, h_q=16, h_kv=1, s_q=5, s_kv=2049)) is True  # off the tile: always
+    paged = dict(has_paged_kv=True, page_size=16, padded=True)
+    for kv in (131072, 131073):
+        assert pt.lookup(row, g(**paged, b=1, h_q=16, h_kv=1, s_kv=kv)) is True
+        assert pt.matched_entry(row, g(**paged, window_left=127, has_sink=True, b=1, h_q=16, h_kv=2, s_kv=kv)).study == study
+    dense_sink = pt.matched_entry(row, g(window_left=127, has_sink=True, h_q=64, h_kv=8))
+    assert dense_sink is None or dense_sink.study != study
+
+
+@pytest.mark.L0
 def test_sm90_d64_sink_mtp_entries_follow_the_study():
     """Study sm90_d64_sink_mtp_20261118 (H100): gpt-oss paged d64 MTP with a sink, which SM90 runs unpacked, leads with a window always
     and with the full cache up to 2^4.5 parallel tiles, on and off the KV tile."""

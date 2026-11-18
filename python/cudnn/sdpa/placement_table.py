@@ -1712,6 +1712,28 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", True): Entry(
         "always", None, "sm100_d128_window_prefill_unpacked_20261118"
     ),
+    # study sm90_d192x128_verify_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 900 train + 648 off-tile train cells, 120 holdout
+    # cells at fresh head pairs scored once): mimo d192 x 128 spec-decode verify. Dense full cache from cost 2^28.1 on the tile (holdout
+    # 0.312), always off it (0.309); paged always (full cache 0.201 / 0.206, window + sink 0.418 / 0.461). Dense window + sink failed
+    # its on-tile holdout (1.189): no entry
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 28.114, "sm90_d192x128_verify_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm90_d192x128_verify_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm90_d192x128_verify_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm90_d192x128_verify_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", False): Entry(
+        "always", None, "sm90_d192x128_verify_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", True): Entry(
+        "always", None, "sm90_d192x128_verify_20261118"
+    ),
     # study sm90_d64_sink_mtp_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 813 + 318 off-tile train cells, 60 holdout cells at
     # fresh head pairs scored once): gpt-oss paged d64 MTP with a sink, which the row runs unpacked. Full cache leads up to 2^4.5 parallel
     # tiles (holdout 0.771 / 0.775 on / off the tile); with a window always (0.768 / 0.664)
