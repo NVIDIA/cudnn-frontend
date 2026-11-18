@@ -2705,6 +2705,41 @@ def _sm80_window_split_cap(facts, tile_m: Optional[int], tile_n: Optional[int], 
     return cap
 
 
+SM107_WINDOW_SPLIT_MIN_TILES = 5  # a window issuing fewer KV tiles per Q tile runs unsplit (sm107_swa_split_v3_20261118)
+SM107_WINDOW_SPLIT_MAX_UNITS = 96  # so does a launch of this many (Q tile, head group, batch) units
+SM107_WINDOW_SPLIT_CAP_FACTOR = 4  # elsewhere at most this many splits per window tile (power of two at or above)
+
+
+def _sm107_window_decode(caps: Capabilities, facts) -> bool:
+    """Rubin half sliding-window decode on a paged cache with padded Q, S_q <= 16: the domain of _sm107_window_split, the range
+    its study timed."""
+    return (
+        caps.sm_lo == 107
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.window_left is not None
+        and facts.has_paged_kv
+        and not facts.thd
+        and facts.s_q <= 16
+    )
+
+
+def _sm107_window_split(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, split: int) -> int:
+    """The shared model counts the whole cache, but the Rubin kernels cut only the clipped window into SPLIT_KV chunks, and any split
+    costs a fixed 1.3-1.8x at the low end (split 2 never led). Over a narrow window or a wide grid the unsplit kernel leads; elsewhere
+    the model's split leads up to a few chunks per window tile (study sm107_swa_split_v2_20261118: 128-key windows ran unsplit at
+    0.40-0.75 of the shipped split)."""
+    launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g, split_kv=2)
+    rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=2)
+    tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
+    if tiles < SM107_WINDOW_SPLIT_MIN_TILES or launch.q_tiles * launch.heads_q * facts.b >= SM107_WINDOW_SPLIT_MAX_UNITS:
+        return 1
+    cap = 1
+    while cap < tiles:
+        cap *= 2
+    return min(split, SM107_WINDOW_SPLIT_CAP_FACTOR * cap)
+
+
 def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
     """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
     return (
@@ -2958,6 +2993,8 @@ def _split_points(
     split = _sm80_paged_d256_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_paged_d256_split(caps, facts, tile_m) else _choose(physical=True)
     if _sm80_window_decode(caps, facts):
         split = min(split, _sm80_window_split_cap(facts, tile_m, tile_n, pack_g))
+    if _sm107_window_decode(caps, facts):
+        split = _sm107_window_split(caps, facts, tile_m, tile_n, cga, pack_g, split)
     if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
         # The physical CTA count is a one-sided correction: every measured win of
         # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,

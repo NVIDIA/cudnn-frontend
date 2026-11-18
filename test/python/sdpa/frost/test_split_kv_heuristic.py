@@ -1573,3 +1573,47 @@ def test_sm80_window_decode_split_cap(layout, d, b, h_q, h_kv, s_q, s_kv, window
         device_cc=(8, 0),
     )
     assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+@pytest.mark.parametrize(
+    "d,b,h_q,h_kv,s_q,s_kv,window,split",
+    [
+        # Rubin, new / shipped split time (study sm107_swa_split_v3_20261118; v2's forced-split sweep and the vr200 run-561 rows):
+        (128, 1, 16, 2, 1, 131072, 512, 32),  # 64 -> 32, capped at 4x the window's tiles: 0.982
+        (128, 128, 16, 2, 8, 131072, 512, 1),  # 4 -> 1, a wide grid: 0.573
+        (64, 128, 16, 2, 1, 131072, 2048, 1),  # 4 -> 1, a wide grid: 0.758
+        (128, 16, 128, 16, 1, 42752, 256, 1),  # 4 -> 1, a 256-key window (holdout): 0.647
+        (128, 1, 16, 2, 1, 8192, 128, 1),  # 16 -> 1, a 128-key window: 0.71
+        # Not binding: a 2048-key window on a small grid keeps the shipped split.
+        (128, 1, 16, 2, 1, 8192, 2048, 16),
+        (64, 1, 16, 2, 4, 131072, 2048, 64),
+    ],
+)
+def test_sm107_window_decode_split(d, b, h_q, h_kv, s_q, s_kv, window, split):
+    """Rubin windowed paged decode runs unsplit over a narrow window or a wide grid and otherwise caps the shared model's split at 4x
+    the window's KV tiles: the kernels cut only the clipped window, and any split pays a fixed combine cost."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_sm107_d128_multi_q")
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_paged_kv=True,
+        page_size=16,
+        padded=True,
+        window_left=window - 1,
+        device_sm_count=224,
+        device_cc=(10, 7),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
