@@ -69,7 +69,7 @@ FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_
 | Ampere A100 (cc 8.0) | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 256 (d_qk = 192, d_vo = 128) |
 | Ampere GA10x (cc 8.6)⁷ | Yes | d &lt;= 128 | d &lt;= 128 | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop d &lt;= 128 |
 | Ada AD10x (cc 8.9)⁷ | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop as cc 8.0 (`sdpa_bwd_sm89`) |
-| Hopper (cc 9.0) | Yes | No | No | Fprop (d &gt; 64) | Fprop (d &gt; 64) | d &lt;= 512 |
+| Hopper (cc 9.0) | Yes | d = 64, 128 (opt-in)¹⁰ | d = 64, 128 (opt-in)¹⁰ | Fprop (d &gt; 64) | Fprop (d &gt; 64) | Fprop d &lt;= 512; bprop d = 64, 128 |
 | Blackwell B200 / B300 (cc 10.0, 10.3)⁸ | Yes | Yes | Yes | Fprop | Fprop; bprop d &gt;= 128 (deterministic: d_qk &gt;= 192) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
 | Thor (SM110, cc 11.0)⁹ | Yes | Yes | Yes | Fprop | As cc 10.0 / 10.3 | As cc 10.0 / 10.3 |
 | SM107 (cc 10.7)⁸ | Yes | Yes | d &lt;= 128 (d_qk = 192, d_vo = 128) | Fprop | Fprop; bprop d &lt;= 256 (deterministic: d_qk = 192, d_vo = 128) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
@@ -82,6 +82,8 @@ FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_
 ⁸ The cc 10.x FROST bprop rows take BSHD-physical Q / K / V / O / dO / dQ / dK / dV (BHSD-physical only through the d = 512 row) and do not serve `use_padding_mask` with dense inputs. The ragged (192, 128) rows (`sdpa_bwd_sm100_d192`, `sdpa_bwd_sm107_d192`) are opt-in (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`).
 
 ⁹ Thor is served by the SM100-line rows (the kernels compile for `sm_110a`); they rank after the backend plans.
+
+¹⁰ `sdpa_bwd_sm90` is offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: exact (64, 64) and (128, 128), FP16 / BF16, dense compact BSHD storage, no padding mask or THD. The default and the deterministic request run the same chain and return identical bytes.
 
 ### Glossary
 ¹ Interleaved q,k,v tensors. Generally they have layouts as BS3HD, B3SHD.
