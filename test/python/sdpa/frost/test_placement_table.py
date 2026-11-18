@@ -452,6 +452,27 @@ def test_sm80_decode_gaps_follow_their_study(s_kv):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
+def test_sm80_paged_d256_single_row_decode_follows_its_study(s_kv):
+    """sm80_paged_d256_q1_v3_pcie_20261118 (A100 80GB PCIe): after the paged d256 split rule, single-row decode on the tile leads from
+    cost 2^24.511 (the qwen3.5 / qwen3.6 b 1 single-KV-head rows over 131k keys included); off the tile the gaps study's floor stays."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=8, h_kv=1, s_q=1, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    if s_kv % 128 == 0:
+        assert pt.matched_entry(row, f()).study == "sm80_paged_d256_q1_v3_pcie_20261118"
+        assert pt.lookup(row, f()) is True
+        assert pt.lookup(row, f(s_kv=1024)) is False  # cost 2^24
+    else:
+        assert pt.matched_entry(row, f()).study == "sm80_decode_gaps_20261117"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm80_paged_wide_head_verify_follows_its_study(s_kv):
     """Study sm80_paged_wide_verify_20261117 (A100): paged d192 x V128 speculative decode at s_q 2-16 leads (FROST 0.13-0.20 of the
     backend). Its d512 / D576 verify twins are retired (a short-cache supplement lost 1.10-1.16x); windowed graphs and f16 are other

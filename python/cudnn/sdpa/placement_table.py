@@ -902,7 +902,12 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_decode_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 31.5, "sm80_decode_gaps_20261117"),
+    # study sm80_paged_d256_q1_v3_pcie_20261118 (A100 80GB PCIe, after the 82nd commit's split): paged d256 single-row decode on the tile
+    # leads from cost 2^24.511 (was 2^31.5). Fit in v2 (80 cells), confirmed once on 24 fresh cells: 19 changed at 0.802, worst 1.012;
+    # the nightly's qwen rows move at 0.874. Off the tile the gaps study's entry stays (v1 / v2 fits failed there at a 1k-key cache).
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry(
+        "ge", 24.511, "sm80_paged_d256_q1_v3_pcie_20261118"
+    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 31.001, "sm80_decode_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("le", 6.5, "sm80_decode_gaps_20261117", "tiles"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("le", 32.001, "sm80_decode_gaps_20261117"),
