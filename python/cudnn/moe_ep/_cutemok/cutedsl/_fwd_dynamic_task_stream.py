@@ -6,9 +6,9 @@
 
 """Forward communication prefix: the dynamic task stream of X pulls (dispatch) and Y pushes (combine).
 
-Private device module of ``_persistent_bf16_fwd_mega``.  The slot pool and the primitives are shared with
+Private device module of ``_persistent_bf16_fwd_mega``.  The warp slots and the primitives are shared with
 the backward (``_dynamic_task_stream``; read its docstring first); this module supplies the forward stream, the
-task description and the load / store addresses.
+task description and the load / store addresses (``_prepare``).
 
 The stream (``_stream_task``: task number -> (direction, macrobatch, tile row)), in dependency order:
     pulls of the last macrobatch (processed first; nothing to wait for)
@@ -24,21 +24,23 @@ the ring for the backward.
 With the combine in the routed Down epilogue (``epilogue_combine``) the stream keeps its pulls only, in the same order
 (``_pull_stream_task``): the epilogue stores every finished row into the source rank's combine buffer itself.
 
-Protocol (one warp of COMM_WARPS per communication CTA):
-    task = warp x comm SMs + CTA                   # the first task is dealt statically
+Protocol (warp w of the COMM_WARPS of a communication CTA; it owns slot w and holds one tile at a time):
+    task = w x comm SMs + CTA                      # the first task is dealt statically
     while task < tasks:
         direction, macro, row = _stream_task(task)
         if not ready(task):                        # routed Down of the minibatch it depends on
-            store(prev); release; flush arrive; wait (holding no slot)
+            flush arrive; wait
         for col_block in 0 .. col_blocks-1:
-            slot = acquire(pool)                   # first come; blocks only while holding no slot
-            load(row, col_block -> slot); store(prev); release(prev)
-        task = atomic_add(head, 1) + COMM_WARPS x comm SMs     # the next number of the stream
-    store(prev); release; flush arrive
+            prepare(row, col_block)                # every read of the tile, while the previous store is in flight
+            wait slot w read; load(-> slot w); count (deferred); issue store(slot w)
+        task = atomic_add(head, 1) + COMM_WARPS x comm SMs     # the next number, while the store is in flight
+    flush arrive
 
 * The head is the word after y_routed_done's 128-row blocks (zero at launch).
 * Arrivals are batched per arrive unit (pull: minibatch; push: 128-row block, the granularity of
-  y_routed_done): the count is released when the unit of the finished tile changes.
+  y_routed_done): the count is released when the unit of the finished tile changes; a pull count after
+  the warp's writes are complete, a push count after its stores have read the slot (y_routed_done gates
+  the reuse of the local Y rows, which the load already read; the peers read the combine after the kernel).
 * A task that is not ready stays with the warp that took it: every task depends only on tasks with
   smaller numbers (and on the compute of those), so the smallest unfinished task is always ready.
 
@@ -49,24 +51,22 @@ import dataclasses
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64
 
-from . import _dynamic_task_stream as pool
+from . import _dynamic_task_stream as comm
 from ._fwd_device_helpers import _ceil_div_i32, _peer_address
-from ._tma_1d import tma_load_1d_raw, tma_store_1d_raw, zero_shared_bulk
 from .persistent_bf16_fwd_contract import CLUSTER_SIZE, COMM_TILE_SHAPES, MLP_TILE_COLUMNS, MLP_TILE_ROWS
 
-PULL = pool.PULL
-PUSH = pool.PUSH
+PULL = comm.PULL
+PUSH = comm.PUSH
 DONE_BLOCK_ROWS = MLP_TILE_ROWS // CLUSTER_SIZE  # y_routed_done granularity (128 rows)
 assert all(DONE_BLOCK_ROWS % shape.rows == 0 for shape in COMM_TILE_SHAPES)  # a tile counts toward one block
 
 # Interface read by the mega kernel: shared memory of the communication CTA.  The tile shape
-# (``SlotPool.shape``, compile time) also sizes the readiness counts the compute CTAs wait for: one arrival
-# per tile (``pool.row_tiles`` x ``pool.column_blocks``).
-ARENA_BYTES = pool.ARENA_BYTES
-MBARRIERS = pool.MBARRIERS
-SCRATCH_WORDS = pool.SCRATCH_WORDS
+# (``CommSlots.shape``, compile time) also sizes the readiness counts the compute CTAs wait for: one arrival
+# per tile (``comm.row_tiles`` x ``comm.column_blocks``).
+ARENA_BYTES = comm.ARENA_BYTES
+MBARRIERS = comm.MBARRIERS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,118 +150,63 @@ def _arrive_unit(direction: Int32, macro: Int32, row_start: Int32, macrobatch_si
 
 
 @cute.jit
-def _arrive_address(args: FwdCommArgs, tile: pool.InFlightTile) -> Int64:
+def _arrive_address(args: FwdCommArgs, direction: Int32, macro: Int32, row: Int32) -> Int64:
     """Counter word a finished tile counts toward (0: nobody waits): PULL x_routed_ready[unit],
     PUSH y_routed_done[unit] (``_arrive_unit``)."""
-    unit = _arrive_unit(tile.task, tile.batch, tile.row, args.macrobatch_size, args.minibatch_size)
+    unit = _arrive_unit(direction, macro, row, args.macrobatch_size, args.minibatch_size)
     address = Int64(0)
-    if tile.task == Int32(PULL):
-        address = pool.counter_address(args.x_routed_ready, unit)
+    if direction == Int32(PULL):
+        address = comm.counter_address(args.x_routed_ready, unit)
     else:
-        address = pool.counter_address(args.y_routed_done, unit)
+        address = comm.counter_address(args.y_routed_done, unit)
     return address
 
 
-# ---------------------------------------------------------------- load / store (lanes)
+# ---------------------------------------------------------------- prepare (lanes)
 
 
 @cute.jit
-def _load(args: FwdCommArgs, slot_pool: pool.SlotPool, tile: pool.InFlightTile) -> None:
-    """load: arm the slot's mbarrier and issue this lane's row load: PULL from the peer X row, PUSH from
-    the local Y row (unrouted rows, and the lanes past the tile's rows, load nothing)."""
+def _prepare(args: FwdCommArgs, slots: comm.CommSlots, direction: Int32, macro: Int32, row: Int32, col_block: Int32) -> comm.TileCopy:
+    """This lane's copy of the tile (row ``row`` of ``macro``, column block ``col_block``), every read of its load
+    and store done here, while the warp's previous store is in flight.  PULL: from the peer X row (the route's
+    token) into the local X ring (an unrouted row is zeroed); PUSH: from the local Y row to the peer combine
+    buffer (an unrouted row moves nothing).  The lanes past the tile's rows move nothing."""
     lane_idx = Int32(cute.arch.lane_idx())
-    tile_bytes = slot_pool.tile_bytes(args.hidden_size, tile.col_block)
-    schedule_row = tile.batch * args.macrobatch_size + tile.row + lane_idx
-    row_chunk = slot_pool.row_chunk(tile.slot, lane_idx)
-    mbarrier = slot_pool.mbarriers + tile.slot
-    peer_rank = slot_pool.lane_entry(args.schedule_peer_rank, schedule_row, lane_idx)
+    row_bytes = slots.tile_bytes(args.hidden_size, col_block)
+    column = Int64(col_block) * Int64(slots.shape.row_chunk_bytes)
+    schedule_row = macro * args.macrobatch_size + row + lane_idx
+    peer_rank = slots.lane_entry(args.schedule_peer_rank, schedule_row, lane_idx)
     routed = Int32(cute.arch.popc(cute.arch.vote_ballot_sync(peer_rank >= Int32(0))))
-    with cute.arch.elect_one():
-        cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, routed * tile_bytes)
-    cute.arch.sync_warp()
-    if peer_rank >= Int32(0):
-        source = (
-            args.y_routed.iterator.toint()
-            + Int64(tile.row + lane_idx) * Int64(args.hidden_size) * Int64(2)
-            + Int64(tile.col_block) * Int64(slot_pool.shape.row_chunk_bytes)
-        )
-        if tile.task == Int32(PULL):
-            route_index = args.schedule_peer_token_idx[schedule_row]
-            source = (
-                _peer_address(args.x_peer_table, peer_rank)
-                + Int64(route_index // args.topk) * Int64(args.hidden_size) * Int64(2)
-                + Int64(tile.col_block) * Int64(slot_pool.shape.row_chunk_bytes)
-            )
-        tma_load_1d_raw(row_chunk, source, mbarrier, tile_bytes)
-
-
-@cute.jit
-def _store_row(
-    args: FwdCommArgs,
-    slot_pool: pool.SlotPool,
-    tile: pool.InFlightTile,
-    lane_idx: Int32,
-    schedule_row: Int32,
-    peer_rank: Int32,
-    row_chunk: cute.Pointer,
-    tile_bytes: Int32,
-) -> None:
-    """One lane's part of ``_store``, after the slot's loads arrived: store this lane's row chunk and wait for
-    the store."""
-    if tile.task == Int32(PULL):
-        if peer_rank < Int32(0):
-            # one st.bulk per lane (word-by-word stores would hit one bank for all lanes)
-            zero_shared_bulk(row_chunk, slot_pool.shape.row_chunk_bytes)
-            cute.arch.fence_proxy("async.shared", space="cta")
-        destination = (
-            args.x_routed.iterator.toint()
-            + Int64(tile.row + lane_idx) * Int64(args.hidden_size) * Int64(2)
-            + Int64(tile.col_block) * Int64(slot_pool.shape.row_chunk_bytes)
-        )
-        tma_store_1d_raw(destination, row_chunk, tile_bytes)
-        cute.arch.cp_async_bulk_commit_group()
-        cute.arch.cp_async_bulk_wait_group(0)  # x_routed_ready may be released after this tile
+    ring_row = Int64(row + lane_idx) * Int64(args.hidden_size) * Int64(2) + column
+    source = Int64(0)
+    destination = Int64(0)
+    zero = Int32(0)
+    wait_writes = Int32(0)  # PUSH: y_routed_done gates the reuse of the local Y rows
+    if direction == Int32(PULL):
+        wait_writes = Int32(1)  # Gate/Up reads the x_routed rows
+        if slots.owns_row(lane_idx) != Int32(0):
+            destination = args.x_routed.iterator.toint() + ring_row
+            if peer_rank >= Int32(0):
+                route_index = args.schedule_peer_token_idx[schedule_row]
+                source = _peer_address(args.x_peer_table, peer_rank) + Int64(route_index // args.topk) * Int64(args.hidden_size) * Int64(2) + column
+            else:
+                zero = Int32(1)
     else:
         if peer_rank >= Int32(0):
             route_index = args.schedule_peer_token_idx[schedule_row]
-            destination = (
-                _peer_address(args.combine_peer_table, peer_rank)
-                + Int64(route_index) * Int64(args.hidden_size) * Int64(2)
-                + Int64(tile.col_block) * Int64(slot_pool.shape.row_chunk_bytes)
-            )
-            tma_store_1d_raw(destination, row_chunk, tile_bytes)
-            cute.arch.cp_async_bulk_commit_group()
-        cute.arch.cp_async_bulk_wait_group(0, read=True)
-
-
-@cute.jit
-def _store(args: FwdCommArgs, slot_pool: pool.SlotPool, tile: pool.InFlightTile, slot_phase: Int32) -> None:
-    """store: wait for the slot's loads, then PULL: store the row into the local X ring (unrouted rows
-    zero) and wait for the store; PUSH: store the row to the peer combine buffer and wait until
-    the slot has been read.  The slot is reusable when this returns: the whole warp waits for the loads and
-    syncs after the stores, the lanes past the tile's rows store nothing in between."""
-    lane_idx = Int32(cute.arch.lane_idx())
-    tile_bytes = slot_pool.tile_bytes(args.hidden_size, tile.col_block)
-    schedule_row = tile.batch * args.macrobatch_size + tile.row + lane_idx
-    row_chunk = slot_pool.row_chunk(tile.slot, lane_idx)
-    peer_rank = slot_pool.lane_entry(args.schedule_peer_rank, schedule_row, lane_idx)
-    cute.arch.mbarrier_wait(slot_pool.mbarriers + tile.slot, slot_phase)
-    if cutlass.const_expr(slot_pool.shape.rows == pool.WARP_LANES):
-        _store_row(args, slot_pool, tile, lane_idx, schedule_row, peer_rank, row_chunk, tile_bytes)
-    else:
-        if lane_idx < Int32(slot_pool.shape.rows):
-            _store_row(args, slot_pool, tile, lane_idx, schedule_row, peer_rank, row_chunk, tile_bytes)
-    cute.arch.sync_warp()
-
-
-@cute.jit
-def _finish(args: FwdCommArgs, slot_pool: pool.SlotPool, tile: pool.InFlightTile, batch: pool.ArriveBatch) -> pool.ArriveBatch:
-    """store(tile); release(tile.slot); count the tile toward its counter (the batch is released
-    when the counter changes)."""
-    slot_phase = pool.phase(slot_pool, tile.slot)
-    _store(args, slot_pool, tile, slot_phase)
-    pool.release(slot_pool, tile.slot, slot_phase)
-    return batch.add(_arrive_address(args, tile))
+            source = args.y_routed.iterator.toint() + ring_row
+            destination = _peer_address(args.combine_peer_table, peer_rank) + Int64(route_index) * Int64(args.hidden_size) * Int64(2) + column
+    return comm.TileCopy(
+        source=source,
+        destination=destination,
+        zero=zero,
+        row_bytes=row_bytes,
+        tx_bytes=routed * row_bytes,
+        side_address=Int64(0),
+        side_value=Float32(0.0),
+        arrive=_arrive_address(args, direction, macro, row),
+        wait_writes=wait_writes,
+    )
 
 
 # ---------------------------------------------------------------- the stream
@@ -368,71 +313,60 @@ def _wait_index(args: FwdCommArgs, direction: Int32, macro: Int32, row: Int32, l
 
 
 @cute.jit
-def run_comm_prefix(args: FwdCommArgs, slot_pool: pool.SlotPool, comm_cta: Int32, num_comm_sms: Int32, epilogue_combine: cutlass.Constexpr = False) -> None:
+def run_comm_prefix(args: FwdCommArgs, slots: comm.CommSlots, comm_cta: Int32, num_comm_sms: Int32, epilogue_combine: cutlass.Constexpr = False) -> None:
     """The dynamic task stream (module docstring): each of the COMM_WARPS warps takes its first task statically
     (warp x comm SMs + CTA) and every later one with an atomic add on the head, so a warp that finishes early takes
-    more; a warp waits, holding no slot, for a taken task that is not ready.  ``epilogue_combine`` (compile time): the
-    routed Down epilogue pushes the combine, the stream moves its pulls only."""
-    pool.init(slot_pool)
+    more; a warp waits for a taken task that is not ready, then moves its tiles one at a time through its own
+    slot.  ``epilogue_combine`` (compile time): the routed Down epilogue pushes the combine, the stream moves its
+    pulls only."""
+    comm.init(slots)
 
     num_tokens = args.num_tokens
     macrobatch_size = args.macrobatch_size
     last_macro = _ceil_div_i32(num_tokens, macrobatch_size) - Int32(1)
-    last_tiles = pool.row_tiles(slot_pool.shape, _macro_rows(last_macro, num_tokens, macrobatch_size))
-    full_tiles = pool.row_tiles(slot_pool.shape, macrobatch_size)
-    mini_tiles = pool.row_tiles(slot_pool.shape, args.minibatch_size)
+    last_tiles = comm.row_tiles(slots.shape, _macro_rows(last_macro, num_tokens, macrobatch_size))
+    full_tiles = comm.row_tiles(slots.shape, macrobatch_size)
+    mini_tiles = comm.row_tiles(slots.shape, args.minibatch_size)
     if last_macro == Int32(0):
         mini_tiles = full_tiles  # one macrobatch: minibatches in order (_reverse_tile is then the identity)
     if cutlass.const_expr(epilogue_combine):
         tasks = last_tiles + last_macro * full_tiles
     else:
         tasks = Int32(2) * (last_tiles + last_macro * full_tiles)
-    col_blocks = pool.column_blocks(slot_pool.shape, args.hidden_size)
+    col_blocks = comm.column_blocks(slots.shape, args.hidden_size)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-    warps_total = Int32(pool.COMM_WARPS) * num_comm_sms
-    head_address = pool.counter_address(args.y_routed_done, args.y_routed_done.shape[0] - Int32(1))
-    prev = pool.no_tile()  # the tile whose store is not finished yet
-    batch = pool.no_arrivals()  # finished tiles not yet released
-    if warp_idx < Int32(pool.COMM_WARPS):
+    warps_total = Int32(comm.COMM_WARPS) * num_comm_sms
+    head_address = comm.counter_address(args.y_routed_done, args.y_routed_done.shape[0] - Int32(1))
+    slot_phase = Int32(0)  # the phase of the warp's slot mbarrier
+    batch = comm.no_arrivals()  # finished tiles not yet arrived
+    if warp_idx < Int32(comm.COMM_WARPS):
         task = warp_idx * num_comm_sms + comm_cta
         while task < tasks:
             if cutlass.const_expr(epilogue_combine):
                 direction, macro, tile_row = _pull_stream_task(task, last_macro, last_tiles, full_tiles, mini_tiles)
             else:
                 direction, macro, tile_row = _stream_task(task, last_macro, last_tiles, full_tiles, mini_tiles)
-            row = tile_row * Int32(slot_pool.shape.rows)
+            row = tile_row * Int32(slots.shape.rows)
             target = _wait_index(args, direction, macro, row, last_macro)
             if target >= Int32(0):
                 required = _down_tiles(target, args.num_tokens, args.minibatch_size, args.hidden_size, args.has_tail)
-                if pool.reached(args.y_routed_ready, target, required) == Int32(0):
-                    # not ready: release what we hold, then wait
-                    if prev.slot >= Int32(0):
-                        batch = _finish(args, slot_pool, prev, batch)
-                        prev = prev.stored()
+                if comm.reached(args.y_routed_ready, target, required) == Int32(0):
+                    # not ready: arrive what we finished, then wait
                     batch = batch.flush()
-                    pool.wait(args.y_routed_ready, target, required)
+                    comm.wait(args.y_routed_ready, target, required)
             for col_block in cutlass.range(col_blocks):
-                # acquire: block only while holding no slot
-                slot = pool.acquire(slot_pool, Int32(0))
-                if slot < Int32(0):
-                    if prev.slot >= Int32(0):
-                        batch = _finish(args, slot_pool, prev, batch)
-                        prev = prev.stored()
-                    slot = pool.acquire(slot_pool, Int32(1))
-                tile = pool.InFlightTile(slot=slot, task=direction, batch=macro, row=row, col_block=col_block)
-                _load(args, slot_pool, tile)
-                if prev.slot >= Int32(0):
-                    batch = _finish(args, slot_pool, prev, batch)
-                prev = tile
-            # the next task of the stream after the statically dealt first ones
+                # every read of the tile while the previous store is in flight, then the load at once
+                copy = _prepare(args, slots, direction, macro, row, col_block)
+                comm.wait_slot_read()  # the previous tile's stores have read slot w
+                batch = comm.move(slots, copy, warp_idx, slot_phase, batch)
+                slot_phase = slot_phase ^ Int32(1)
+            # the next task of the stream after the statically dealt first ones (the last stores are in flight)
             taken = Int32(0)
             if cute.arch.lane_idx() == Int32(0):
                 head = cute.make_ptr(Int32, head_address, cute.AddressSpace.gmem, assumed_align=4)
                 taken = cute.arch.atomic_add(head, Int32(1), sem="relaxed", scope="gpu")
             task = cute.arch.shuffle_sync(taken, 0) + warps_total
-        if prev.slot >= Int32(0):
-            batch = _finish(args, slot_pool, prev, batch)
         batch.flush()
-    # in-flight peer stores must complete before the CTA exits
+    # in-flight stores (the last ones of every warp, and those of tiles nobody waits for) complete before the CTA exits
     cute.arch.cp_async_bulk_wait_group(0)
     cute.arch.sync_threads()

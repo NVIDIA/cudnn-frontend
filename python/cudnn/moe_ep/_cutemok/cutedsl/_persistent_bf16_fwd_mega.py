@@ -145,7 +145,7 @@ TASK_INFO_WORDS = 16  # 64 B per stage, 16-byte aligned
 TASK_INFO_CONSUMER_WARPS = WARPS_PER_CTA - 1
 assert len(TASK_INFO_FIELDS) == len(set(TASK_INFO_FIELDS)) <= TASK_INFO_WORDS
 _TI = {name: index for index, name in enumerate(TASK_INFO_FIELDS)}
-# Communication CTAs run the dynamic task stream prefix (_fwd_dynamic_task_stream); its slot pool aliases the
+# Communication CTAs run the dynamic task stream prefix (_fwd_dynamic_task_stream); its warp slots alias the
 # compute CTAs' GEMM arena.
 GEMM_ARENA_BYTES = GEMM_A_BYTES + GEMM_B_BYTES + GEMM_D_BYTES
 REUSABLE_ARENA_BYTES = max(_fwd_dynamic_task_stream.ARENA_BYTES, GEMM_ARENA_BYTES)
@@ -227,10 +227,8 @@ class _PersistentSharedStorage:
     tmem_dealloc_mbarrier: cutlass.Int64
     tmem_holding_buffer: cutlass.Int32
 
-    # Communication CTAs: one transaction barrier per pool slot and the pool's scratch words
-    # (slot bitmap, per-slot phases).  The slots alias the arena.
+    # Communication CTAs: one transaction barrier per warp slot.  The slots alias the arena.
     comm_mbarriers: cute.struct.MemRange[cutlass.Int64, _fwd_dynamic_task_stream.MBARRIERS]
-    comm_scratch: cute.struct.MemRange[cutlass.Int32, _fwd_dynamic_task_stream.SCRATCH_WORDS]
     # expert_cu_end[g] = routed row blocks (MLP_TILE_ROWS each) of local experts
     # 0 .. min((g + 1) * stride, E) - 1: inclusive prefix over groups of stride experts
     # (group 0 starts at 0, so no leading slot), g < expert_groups = ceil(E / stride)
@@ -1825,13 +1823,9 @@ class _PersistentBf16FwdMega:
         smem = utils.SmemAllocator()
         storage = smem.allocate(_PersistentSharedStorage)
         # CuTe DSL 4.5.2 cannot carry a user-defined shared-storage object
-        # through a dynamic region.  Materialize only the three communication
+        # through a dynamic region.  Materialize only the two communication
         # leaves used by that region before entering the role predicate.
         comm_mbarriers = storage.comm_mbarriers.data_ptr()
-        comm_scratch = cute.make_tensor(
-            storage.comm_scratch.data_ptr(),
-            cute.make_layout((_fwd_dynamic_task_stream.SCRATCH_WORDS,)),
-        )
         comm_arena = storage.arena.data_ptr()
         clc_response_ptr = storage.clc_response.data_ptr()
         # Per-CTA shared cu_end table for the compile-time decode method (no-op for LINEAR_SCAN).
@@ -1855,10 +1849,10 @@ class _PersistentBf16FwdMega:
                 topk=Int32(topk),
                 has_tail=self.has_tail,
             )
-            slot_pool = _dynamic_task_stream.SlotPool(mbarriers=comm_mbarriers, scratch=comm_scratch, arena=comm_arena, shape=self.comm_tile_shape)
+            comm_slots = _dynamic_task_stream.CommSlots(mbarriers=comm_mbarriers, arena=comm_arena, shape=self.comm_tile_shape)
             _fwd_dynamic_task_stream.run_comm_prefix(
                 comm_args,
-                slot_pool,
+                comm_slots,
                 cluster_index * Int32(CLUSTER_SIZE) + cta_rank,
                 Int32(num_comm_sms),
                 self.epilogue_combine,

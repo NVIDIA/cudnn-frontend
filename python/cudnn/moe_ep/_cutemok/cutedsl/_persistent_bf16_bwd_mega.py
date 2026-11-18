@@ -303,9 +303,8 @@ class _PersistentBwdSharedStorage:
     gemm_acc_mbarriers: cute.struct.MemRange[cutlass.Int64, 2 * MLP_ACC_STAGES]
     tmem_dealloc_mbarrier: cutlass.Int64
     tmem_holding_buffer: cutlass.Int32
-    # Communication CTAs: one transaction barrier per pool slot and the pool's scratch words.
+    # Communication CTAs: one transaction barrier per warp slot.
     comm_mbarriers: cute.struct.MemRange[cutlass.Int64, _bwd_dynamic_task_stream.MBARRIERS]
-    comm_scratch: cute.struct.MemRange[cutlass.Int32, _bwd_dynamic_task_stream.SCRATCH_WORDS]
     # Compute CTAs: paired Gate/Up replay pipeline (AB stages) and its accumulator stage.
     paired_gate_up_mbarriers: cute.struct.MemRange[cutlass.Int64, 2 * PAIRED_GATE_UP_STAGES + 2 * PAIRED_ACC_STAGES]
     # Decoded-task records (TASK_INFO_FIELDS) with their full/empty barrier pair per stage.
@@ -2201,7 +2200,6 @@ class _PersistentBf16BwdMega:
         routed_buffers_done: cute.Tensor,
         wgrad_read_consumed: cute.Tensor,
         comm_mbarriers,
-        comm_scratch: cute.Tensor,
         arena,
         cluster_index: Int32,
         cta_rank: Int32,
@@ -2241,8 +2239,8 @@ class _PersistentBf16BwdMega:
             has_tail=self.has_tail,
             recompute_forward_context=self.recompute_forward_context,
         )
-        slot_pool = _dynamic_task_stream.SlotPool(mbarriers=comm_mbarriers, scratch=comm_scratch, arena=arena, shape=self.comm_tile_shape)
-        _bwd_dynamic_task_stream.run_comm_prefix(args, slot_pool, cluster_index * Int32(CLUSTER_SIZE) + cta_rank, num_comm_sms)
+        comm_slots = _dynamic_task_stream.CommSlots(mbarriers=comm_mbarriers, arena=arena, shape=self.comm_tile_shape)
+        _bwd_dynamic_task_stream.run_comm_prefix(args, comm_slots, cluster_index * Int32(CLUSTER_SIZE) + cta_rank, num_comm_sms)
 
     @cute.jit
     def _wait_gemm_inputs(
@@ -4892,7 +4890,6 @@ class _PersistentBf16BwdMega:
         tmem_dealloc_mbarrier_ptr = storage.tmem_dealloc_mbarrier.ptr
         tmem_holding_buffer_ptr = storage.tmem_holding_buffer.ptr
         comm_mbarriers_ptr = storage.comm_mbarriers.data_ptr()
-        comm_scratch = cute.make_tensor(storage.comm_scratch.data_ptr(), cute.make_layout((_bwd_dynamic_task_stream.SCRATCH_WORDS,)))
         paired_gate_up_mbarriers_ptr = storage.paired_gate_up_mbarriers.data_ptr()
         task_info_mbarriers_ptr = storage.task_info_mbarriers.data_ptr()
         task_info_ptr = storage.task_info.data_ptr()
@@ -4955,7 +4952,6 @@ class _PersistentBf16BwdMega:
                 routed_buffers_done,
                 wgrad_read_consumed,
                 comm_mbarriers_ptr,
-                comm_scratch,
                 arena,
                 cluster_index,
                 cta_rank,
