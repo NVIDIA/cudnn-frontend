@@ -1421,6 +1421,8 @@ def _sm100_paged_d128_prefix(facts) -> bool:
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice, sm100_paged_tail_split_domain
 
+    if facts.device_cc == (11, 0):
+        return TRAIL  # Thor: offered after the backend plans
     # The prepared single-CTA split removes the underfilled paged D128 launch, and the packed split the underfilled
     # D64 / D256 one. Placement and the concrete split share one bounded rule.
     if paged_thd_split_choice(caps, facts)[0] > 1:

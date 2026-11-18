@@ -200,7 +200,7 @@ def declaration(case, role):
     return (b, h, s, width), (s * h * width, width, h * width, 1)
 
 
-def make_adapter(case, api_type=None, *, tile_m=None, tile_n=None):
+def make_api(case, api_type=None, *, tile_m=None, tile_n=None):
     from cudnn.api_base import TensorDesc
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
@@ -231,6 +231,11 @@ def make_adapter(case, api_type=None, *, tile_m=None, tile_n=None):
         thd_stats_head_stride=case.head_pitch if case.stats_layout == "HN" else None,
         thd_ragged_offsets=case.offset_declarations,
     )
+    return api
+
+
+def make_adapter(case, api_type=None, *, tile_m=None, tile_n=None):
+    api = make_api(case, api_type, tile_m=tile_m, tile_n=tile_n)
     assert api.check_support()
     api.compile()
     assert api._prepared.native is not None

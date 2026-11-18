@@ -30,7 +30,8 @@ def test_rows_preserve_the_sm80_domain_with_fixed_ada_owners(name, engine_id):
 
     sm80, sm89 = _spec("sdpa_bwd_sm80").capabilities, _spec(name).capabilities
     assert (sm89.sm_lo, sm89.sm_hi) == (89, 89)
-    ownership = {"sm_lo", "sm_hi", "implementation", "select_implementation", "delegated"}
+    ownership = {"sm_lo", "sm_hi", "sm_extra", "implementation", "select_implementation", "delegated"}
+    assert sm89.sm_extra == frozenset()
     assert {f: getattr(sm89, f) for f in sm89.__dataclass_fields__ if f not in ownership} == {
         f: getattr(sm80, f) for f in sm80.__dataclass_fields__ if f not in ownership
     }

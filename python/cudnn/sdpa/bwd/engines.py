@@ -231,7 +231,8 @@ _BLACKWELL_GEFORCE = (120, 129)
 # The SM100 line as fwd/engines.py spells it, and the Rubin (sm107) rows' tile
 # of it: 107 up to the line's end, so the part that ships next is not declined.
 _BLACKWELL = (100, 119)
-_RUBIN = (107, _BLACKWELL[1])
+_RUBIN = (107, 109)  # Thor (sm110) is an SM100-class part: the SM100 rows name it in ``sm_extra``
+_THOR = 110
 
 
 @dataclass(frozen=True)
@@ -446,6 +447,8 @@ class Capabilities:
     # Bodies a row has handed to explicit engines (:func:`explicit_engine`). A graph selecting one is
     # declined here, so neither an automatic route nor an old record reaches the row for it.
     delegated: frozenset[str] = frozenset()
+    # cc codes outside [sm_lo, sm_hi] the row also serves (Thor on the SM100-line rows, cc 8.6 / 8.9 on the SM80 row).
+    sm_extra: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         """Single normalization layer: legacy mask flags -> canonical band set."""
@@ -523,8 +526,9 @@ def _declared_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", r
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
-    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
-        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi or sm in capabilities.sm_extra):
+        extra = "".join(f" or SM{code}" for code in sorted(capabilities.sm_extra))
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}{extra}; current device is {cc}"
     installed, version = cutedsl_state()
     if not installed:
         # Said HERE, not when lowering imports the adapter: a decline at build
@@ -1232,8 +1236,9 @@ def _sm80_spec() -> EngineSpec:
     native eight-aligned head-dim envelopes, declared data strides, per-shape
     kernel caching, and the dedicated plain-dense d=64 fast path. The whole
     chain is compiled at plan time. Knob domains are empty
-    (no tunables wired).  sm80 exactly: the kernels assume the A100's 164 KiB
-    opt-in SMEM, which the sm86/sm89 parts do not have.
+    (no tunables wired).  cc 8.6 / 8.9 run the same sm_80 kernels: the adapter
+    fits the shared pipeline into their 99 KiB per-CTA budget (the Q / dO ring
+    depth and the dQ staging tile) and declines the envelopes that cannot fit.
 
     THD / ragged: served on the packed ``[1, T, H, D]`` path (BSHD ports each
     at its own token and head stride -- a K/V slice of an interleaved record
@@ -1256,6 +1261,7 @@ def _sm80_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=80,
             sm_hi=80,
+            sm_extra=frozenset({86}),  # cc 8.9 backward has its own rows (_sm89_spec)
             d=frozenset({256}),
             d_envelope=True,  # flavor envelopes; masked native loads
             d_pad_multiple=8,
@@ -1317,6 +1323,7 @@ def _sm89_spec(*, d64=False) -> EngineSpec:
             implementation=name,
             select_implementation=_sm89_implementation,
             delegated=frozenset(),
+            sm_extra=frozenset(),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM89),
         policy="sdpa_bwd_sm89",
@@ -1414,6 +1421,7 @@ def _sm100_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=100,
             sm_hi=103,
+            sm_extra=frozenset({_THOR}),
             d=frozenset({512}),
             d_envelope=True,
             d_pad_multiple=8,
@@ -2160,7 +2168,9 @@ def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
 def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     if _d192_accumulation_serves(facts):
         return None
-    return "the d192 accumulation row serves dense MHA (192, 128) without windows on cc 10.0 / 10.3"
+    from .d128_contract import ACCUMULATION_PARTS
+
+    return f"the d192 accumulation row serves dense MHA (192, 128) without windows on {ACCUMULATION_PARTS}"
 
 
 def _sm100_d192_fp8_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
@@ -2200,6 +2210,7 @@ def _sm100_d256_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=100,
             sm_hi=106,
+            sm_extra=frozenset({_THOR}),
             d=frozenset({128, *range(192, 257, 8)}),
             dqk_ge_dv=True,
             declaration_check=_sm100_d256_head_mismatch,
@@ -2432,13 +2443,14 @@ def _sm100_d128_spec() -> EngineSpec:
     takes the dK/dV + dQ kernel pair under the accumulation gates on the pair's parts (``d128_contract.PAIR_CCS``); dense
     MHA falls back to the one-launch recompute body elsewhere.
     """
-    from .d128_contract import DENSE_SM_RANGE
+    from .d128_contract import DENSE_EXTRA_SMS, DENSE_SM_RANGE
 
     return EngineSpec(
         name="sdpa_bwd_sm100_d128",
         capabilities=Capabilities(
             sm_lo=DENSE_SM_RANGE[0],
             sm_hi=DENSE_SM_RANGE[1],
+            sm_extra=DENSE_EXTRA_SMS,
             d=frozenset({64, 128}),
             causal=True,
             swa=True,
@@ -2471,6 +2483,7 @@ def _sm100_d128_accumulation_two_cta_spec() -> EngineSpec:
         _sm100_d128_spec(),
         TWO_CTA_OWNER,
         partial(lower_dsl_bwd, api_type=_SM100_D128_ACCUMULATION_TWO_CTA),
+        sm_extra=frozenset(),
         d=frozenset({128}),
         dtypes=frozenset({cudnn.data_type.BFLOAT16}),
         deterministic=False,
@@ -2501,6 +2514,7 @@ def _sm100_d128_pair_spec() -> EngineSpec:
         PAIR_OWNER,
         partial(lower_dsl_bwd, api_type=_SM100_D128_PAIR),
         sm_hi=103,
+        sm_extra=frozenset(),
         thd=False,
         thd_declared_totals=False,
         thd_ragged_offsets=False,
@@ -2617,7 +2631,9 @@ def _sm100_d192_half_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
     if (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
         return "d192 THD requires MHA with exact (192, 128) head dimensions"
     if facts.device_cc not in ACCUMULATION_CCS:
-        return "d192 THD requires SM100 or SM103 (cc 10.0 / 10.3)"
+        from .d128_contract import ACCUMULATION_PARTS
+
+        return f"d192 THD requires {ACCUMULATION_PARTS}"
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
         return f"d192 THD requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
@@ -2651,6 +2667,7 @@ def _sm100_d192_spec() -> EngineSpec:
         capabilities=Capabilities(
             sm_lo=100,
             sm_hi=106,
+            sm_extra=frozenset({_THOR}),
             d=frozenset({128, 192}),
             dqk_ge_dv=True,
             declaration_check=_sm100_d192_half_mismatch,

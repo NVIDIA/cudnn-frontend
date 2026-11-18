@@ -758,15 +758,8 @@ def sdpa_bwd_wrapper_dsl_sm120(
 
 _SM80_BWD_KERNEL_MOD = {}
 
-_SM80_BWD_FLAVOR_DIMS = {
-    name: (cfg.D_QK, cfg.D_V)
-    for name, cfg in (
-        ("gptoss", _fwd_config_sm80.GPTOSS_CFG),
-        ("llama", _fwd_config_sm80.LLAMA_CFG),
-        ("dsv3", _fwd_config_sm80.DSV3_CFG),
-        ("qwen", _fwd_config_sm80.QWEN_CFG),
-    )
-}
+from cudnn.sdpa.bwd.config_sm80 import BWD_FLAVOR_DIMS as _SM80_BWD_FLAVOR_DIMS
+
 _SM80_BWD_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
 
 
@@ -1394,7 +1387,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
-        self._check_native_device((major, minor), device)
+        self._device_cc = (int(major), int(minor))
+        self._check_native_device(self._device_cc, device)
         self._check_native_tiles()
 
         self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v, self._native_flavor_dims)
@@ -1459,6 +1453,22 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         if self._lse_stride is not None or self.thd:
             self._use_d64 = False  # preserve the dense, packed-Stats selection boundary
+        self._smem_levers = None
+        from cudnn.sdpa.native_sm80 import smem_budget_bytes
+
+        budget = smem_budget_bytes(self._device_cc)
+        if budget is not None and not self._use_d64 and "qo_stages" not in dict(getattr(self, "_native_template_overrides", ())):
+            from cudnn.sdpa.bwd.config_sm80 import default_levers, levers_within_budget, pipeline_smem_bytes
+
+            levers = levers_within_budget(self.flavor_d_qk, self.flavor_d_v, budget, has_rope=self._has_rope)
+            self._not_implemented_error_if(
+                levers is None,
+                f"SM80 backward at D_QK={self.flavor_d_qk}/D_V={self.flavor_d_v} needs "
+                f"{pipeline_smem_bytes(self.flavor_d_qk, self.flavor_d_v, 1, False, has_rope=self._has_rope)} bytes of shared memory per CTA; "
+                f"cc {self._device_cc[0]}.{self._device_cc[1]} provides {budget}",
+            )
+            if levers != default_levers(self.flavor_d_qk):
+                self._smem_levers = levers
         from .prepared_sm80 import native_decline_reason
 
         reason = native_decline_reason(self)
@@ -1470,8 +1480,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         return True
 
     def _check_native_device(self, capability, device):
-        major, minor = capability
-        self._value_error_if(capability != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
+        from cudnn.sdpa.native_sm80 import SM80_BACKWARD_PARTS, part_mismatch
+
+        reason = part_mismatch(capability, "SdpaBwdDslSm80", SM80_BACKWARD_PARTS)
+        self._value_error_if(reason is not None, f"{reason} on {device}")
 
     _native_flavor_dims = _SM80_BWD_FLAVOR_DIMS
 
@@ -1515,6 +1527,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             deterministic=self.deterministic,
             thd_varlen=self.thd,
             sched_policy=sched,
+            **({"qo_stages": self._smem_levers[0], "dq_smem_coalesce": self._smem_levers[1]} if self._smem_levers else {}),
             **dict(getattr(self, "_native_template_overrides", ())),
         )
         # RoPE preconditions the old backward() asserted (the params validator
@@ -1887,9 +1900,9 @@ DQ_SINGLE_LAUNCH: bool = True
 # CALL time (``compile``), not a knob and not an env var: it must never differ per plan.
 THD_STAGE3_TRIM: bool = True
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
-# The Rubin line as ``engines._RUBIN`` spells it (cc 10.7 up to the SM100 line's end): the 2x2 twin's ring levers
-# (8 chunk stages / 2 cast stages / 325 KiB) follow the line, not the one cc that exists today.
-_RUBIN_SM = (107, 119)
+# The Rubin line as ``engines._RUBIN`` spells it: the 2x2 twin's ring levers (8 chunk stages / 2 cast stages / 325 KiB)
+# follow the line.  Thor (cc 11.0) is an SM100-class part and takes the SM100 levers.
+_RUBIN_SM = (107, 109)
 
 
 def _rubin_line(sm: int) -> bool:
