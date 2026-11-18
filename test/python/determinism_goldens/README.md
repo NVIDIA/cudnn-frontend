@@ -160,6 +160,13 @@ declarations are unchanged.
 
 ### Fixed D256 and D192 half backward implementations (2026-11-15)
 
+`test_sdpa_bwd_d256_chunk_grid.py` covers the shared host's final GEMM
+batch/head launch limit for half, FP8 and MXFP8 declarations. Its native
+SM100 half cases check all three gradients against FP64, retained capture
+with changed upstream gradients, THD rebatching that removes empty neighbors,
+and dense batch chunks that preserve a whole GQA group. The byte checks do
+not extend the general batch-invariance or cross-architecture guarantees below.
+
 The SM107 native D256 and shared SM100/SM107 two-by-two bodies now have
 explicit implementation directories and hosts. Engine 20632 fixes the native
 SM107 body; opt-in 20633 fixes the dense Rubin interleaved profile. SM100

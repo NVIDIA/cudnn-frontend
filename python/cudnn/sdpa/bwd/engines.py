@@ -1801,6 +1801,7 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107",
         capabilities=Capabilities(
+            declaration_check=_sm107_chunk_launch_mismatch,
             select_implementation=_sm107_d256_half.select_implementation,
             delegated=frozenset({_sm107_d256_half.NATIVE, _sm107_d256_half.TWO_BY_TWO}),
             zero_scale=True,
@@ -2007,7 +2008,7 @@ def _sm107_fp8_spec() -> EngineSpec:
             sm_hi=_RUBIN[1],
             d=frozenset({128, 192, 256}),
             dqk_ge_dv=True,
-            declaration_check=_native_d256_head_mismatch,
+            declaration_check=_native_d256_launch_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             is_fp8=True,
@@ -2104,6 +2105,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
         name="sdpa_bwd_sm107_mxfp8",
         capabilities=Capabilities(
             implementation="sdpa_bwd_sm107_mxfp8",
+            declaration_check=_sm107_chunk_launch_mismatch,
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -2150,6 +2152,27 @@ def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts", ccs=None, deterministi
     )
 
 
+def _sm107_chunk_launch_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    from .chunk_grid import GRID_Z_MAX, launch_error
+
+    group = facts.h_q // max(facts.h_kv, 1)
+    quantized = facts.is_fp8 or facts.is_mxfp8
+    subgroups = False
+    # Only the SM100 BF16 dense adapter has the qualified subgroup path.
+    # Consult its existing host switch only at the boundary that needs it;
+    # ordinary declarations do not import the adapter through this check.
+    cc = facts.device_cc[0] * 10 + facts.device_cc[1]
+    if group > GRID_Z_MAX and not facts.thd and not quantized and 100 <= cc <= 106 and facts.dtype == cudnn.data_type.BFLOAT16:
+        from .api_dsl_sm107 import DQ_SINGLE_LAUNCH
+
+        subgroups = DQ_SINGLE_LAUNCH
+    return launch_error(facts.b, group, thd=facts.thd, batch_chunking=not quantized, allow_subgroups=subgroups)
+
+
+def _native_d256_launch_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    return _native_d256_head_mismatch(facts, version) or _sm107_chunk_launch_mismatch(facts, version)
+
+
 def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     pair = (facts.d_qk, facts.d_v)
     if pair == (256, 256):
@@ -2168,6 +2191,10 @@ def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
     if facts.thd:
         return "the D256 head-pair envelope is dense BSHD only; THD serves the exact (256, 256) and (192, 128) pairs"
     return None
+
+
+def _sm100_d256_launch_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    return _sm100_d256_head_mismatch(facts, version) or _sm107_chunk_launch_mismatch(facts, version)
 
 
 def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
@@ -2218,7 +2245,7 @@ def _sm100_d256_spec() -> EngineSpec:
             sm_extra=frozenset({_THOR}),
             d=frozenset({128, *range(192, 257, 8)}),
             dqk_ge_dv=True,
-            declaration_check=_sm100_d256_head_mismatch,
+            declaration_check=_sm100_d256_launch_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
@@ -2251,7 +2278,7 @@ def _sm107_d192_spec() -> EngineSpec:
             sm_hi=_RUBIN[1],
             d=frozenset({128, 192}),
             dqk_ge_dv=True,
-            declaration_check=_native_d256_head_mismatch,
+            declaration_check=_native_d256_launch_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
