@@ -65,7 +65,7 @@ def grouped_facts(*, thd, packing="TH1", **overrides):
 def test_grouped_declaration_declines_before_ranking(thd, overrides, token):
     value = grouped_facts(thd=thd, **overrides)
     assert token.lower() in reason(value).lower()
-    assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []
+    assert recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630}) == []
 
 
 @pytest.mark.parametrize("side", ["s_q", "s_kv"])
@@ -106,7 +106,10 @@ def test_grouped_packed_layout_uses_each_ports_head_count(packing):
         (True, (10, 0), None, "4.8.0", True),
         (False, (10, 0), 0.125, "4.8.0", True),
         (False, (10, 3), 0.125, "4.8.0", True),
+        (True, (10, 7), None, "4.8.0", True),
+        (False, (10, 7), 0.125, "4.8.0", True),
         (False, (10, 1), 0.125, "4.8.0", False),
+        (True, (11, 0), 0.125, "4.8.0", False),
         (True, (10, 0), -0.125, "4.8.0", False),
         (False, (10, 0), 1e-100, "4.8.0", False),
         (True, (10, 0), 0.125, "4.7.4", False),
@@ -122,7 +125,7 @@ def test_grouped_dense_stats_int32_boundary(monkeypatch, batch, accepted):
     value = grouped_facts(thd=False, b=batch, h_q=2, h_kv=1, s_q=32768, s_kv=128)
     if not accepted:
         assert "Stats/Delta span" in reason(value)
-        assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []
+        assert recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630}) == []
     _assert_grouped_graph_and_standalone_gate(monkeypatch, value, "4.8.0", accepted)
 
 
@@ -187,14 +190,15 @@ def test_real_grouped_graph_accepts(monkeypatch, thd, heads, dtype, causal):
     value = ga.analyze(graph)
     assert value is not None and value.h_q != value.h_kv and value.thd == thd
     assert reason(value) is None
-    assert [plan.engine_id for plan in recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})] == [20609]
+    assert [plan.engine_id for plan in recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})] == [20630]
 
 
 @pytest.mark.parametrize(
     "thd,cc,kwargs,token",
     [
-        (False, (10, 1), {}, "cc 10.0 / 10.3"),
-        (True, (10, 1), {}, "cc 10.0 / 10.3"),
+        (False, (10, 1), {}, "cc 10.0 / 10.3 / 10.7"),
+        (True, (10, 1), {}, "cc 10.0 / 10.3 / 10.7"),
+        (True, (11, 0), {}, "SM100-107"),  # past the row's range: the range decline fires before the part check
         (False, (10, 0), {"scale": -0.125}, "positive"),
         (True, (10, 0), {"scale": -0.125}, "positive"),
         (False, (10, 0), {"sq": 129}, "multiples of 128"),
@@ -211,7 +215,7 @@ def test_real_grouped_graph_declines(monkeypatch, thd, cc, kwargs, token):
     value = ga.analyze(graph)
     assert value is not None
     assert token.lower() in reason(value).lower()
-    assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []
+    assert recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630}) == []
 
 
 @pytest.mark.parametrize(
@@ -253,8 +257,8 @@ def test_real_grouped_thd_declared_capacity_and_head_major_stats(monkeypatch, he
     assert value is not None and value.thd
     observed = reason(value)
     assert observed is None if token is None else token in observed
-    plans = recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})
-    assert (len(plans) == 1 and plans[0].engine_id == 20609) == (token is None)
+    plans = recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})
+    assert (len(plans) == 1 and plans[0].engine_id == 20630) == (token is None)
 
 
 @pytest.mark.parametrize("thd", [False, True])
@@ -278,8 +282,8 @@ def test_fp16_grouped_declines_while_mha_remains_supported(monkeypatch, thd, cau
     accepted = heads[0] == heads[1]
     observed = reason(value)
     assert observed is None if accepted else "BF16 grouped attention only" in observed
-    plans = recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})
-    assert (len(plans) == 1 and plans[0].engine_id == 20609) == accepted
+    plans = recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})
+    assert (len(plans) == 1 and plans[0].engine_id == 20630) == accepted
     geometry = {name.lower(): (dim, stride) for name, dim, stride in value.port_layouts}
     geometry["stats"] = value.stats_t.get_dim(), value.stats_t.get_stride()
     samples = {

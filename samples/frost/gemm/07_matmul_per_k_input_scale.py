@@ -55,10 +55,12 @@ def _time_ms(fn, repeats):
 
 def main(M=512, N=512, K=264, repeats=100, side="ab"):
     if not torch.cuda.is_available():
-        raise SystemExit("This sample requires a Blackwell-family GPU (100 <= SM < 120).")
+        print("[07-per-k] SKIP  needs a CUDA GPU")
+        return
     major, minor = torch.cuda.get_device_capability()
     if not 100 <= major * 10 + minor < 120:
-        raise SystemExit("This sample requires a Blackwell-family GPU (100 <= SM < 120).")
+        print("[07-per-k] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
     fused, (a, b, sa, sb, y) = _plan(M, N, K, side)
     plain, (pa, pb, _, _, py) = _plan(M, N, K, "")
     torch.manual_seed(0)

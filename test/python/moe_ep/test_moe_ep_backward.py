@@ -782,13 +782,27 @@ def test_phase_kernel_config_factories_bind_launch_count_and_phase(
     ) == expected_flags
 
 
-@pytest.mark.L0
-def test_vendored_dgrad_config_preserves_moe_ep_legacy_defaults():
-    from cudnn.moe_ep._megamoe_backend.cutedsl_src.dgrad_config import (
-        resolve_dgrad_config,
+def _vendored_dgrad_kernel_class():
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
+        require_rubin_cutedsl,
     )
 
-    resolved = resolve_dgrad_config(
+    try:
+        require_rubin_cutedsl()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel import (
+        Sm107MegaMoEMxfp8DgluKernel,
+    )
+
+    return Sm107MegaMoEMxfp8DgluKernel
+
+
+@pytest.mark.L0
+def test_vendored_dgrad_resolver_preserves_moe_ep_legacy_defaults():
+    kernel_class = _vendored_dgrad_kernel_class()
+
+    resolved = kernel_class._resolve_tuning(
         {},
         {
             "load_balance_mode": "static",
@@ -811,10 +825,8 @@ def test_vendored_dgrad_config_preserves_moe_ep_legacy_defaults():
 
 
 @pytest.mark.L0
-def test_vendored_dgrad_config_preserves_ds3_preset_and_overrides():
-    from cudnn.moe_ep._megamoe_backend.cutedsl_src.dgrad_config import (
-        resolve_dgrad_config,
-    )
+def test_vendored_dgrad_resolver_preserves_ds3_preset_and_overrides():
+    kernel_class = _vendored_dgrad_kernel_class()
 
     problem = {
         "world_size": 4,
@@ -847,7 +859,7 @@ def test_vendored_dgrad_config_preserves_ds3_preset_and_overrides():
         "enable_dgrad_optimizations": True,
     }
 
-    resolved = resolve_dgrad_config(problem, implementation)
+    resolved = kernel_class._resolve_tuning(problem, implementation)
     assert resolved["dgrad_optimization_profile"] == "ds3_ep4_v1"
     assert resolved["dgrad_optimization_overrides"] == {}
     assert (
@@ -866,12 +878,27 @@ def test_vendored_dgrad_config_preserves_ds3_preset_and_overrides():
         "rank",
     )
 
-    custom = resolve_dgrad_config(
+    custom = kernel_class._resolve_tuning(
         problem,
         {**implementation, "use_scaled_cvt": False},
     )
     assert custom["dgrad_optimization_profile"] == "ds3_ep4_v1_custom"
     assert custom["dgrad_optimization_overrides"] == {"use_scaled_cvt": False}
+
+    expanded = kernel_class._resolve_tuning(
+        {
+            **problem,
+            "world_size": 8,
+            "expert_count": 64,
+            "topk": 2,
+            "max_tokens_per_rank": 128,
+            "max_recv_size_per_rank": 2048,
+            "hidden_size": 1024,
+            "intermediate_gateup_size": 256,
+        },
+        implementation,
+    )
+    assert expanded["dgrad_optimization_profile"] == "ds3_ep4_v1"
 
 
 def _qualified_ds3_training_config(
@@ -903,7 +930,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
         _dgrad_selector_kwargs,
     )
 
-    tunings = {name: MoeEpTuningConfig(dgrad_optimization=name) for name in ("baseline", "rolling", "ds3_ep4_v1")}
+    tunings = {name: MoeEpTuningConfig(dgrad_optimization=name) for name in ("baseline", "rolling", "ds3_ep4_pattern")}
     configs = {
         name: Mxfp8KernelConfig.for_training_backward(
             _qualified_ds3_training_config(tuning),
@@ -914,7 +941,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
 
     baseline = configs["baseline"]
     rolling = configs["rolling"]
-    ds3 = configs["ds3_ep4_v1"]
+    ds3 = configs["ds3_ep4_pattern"]
     assert (
         baseline.load_balance_mode,
         baseline.num_sched_stages,
@@ -938,7 +965,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
     assert {name: config.effective_config()["dgrad_optimization"] for name, config in configs.items()} == {
         "baseline": "baseline",
         "rolling": "rolling",
-        "ds3_ep4_v1": "ds3_ep4_v1",
+        "ds3_ep4_pattern": "ds3_ep4_pattern",
     }
     assert {name: _dgrad_selector_kwargs(config) for name, config in configs.items()} == {
         "baseline": {
@@ -949,7 +976,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
             "enable_dgrad_optimizations": False,
             "dgrad_schedule": "optimized",
         },
-        "ds3_ep4_v1": {
+        "ds3_ep4_pattern": {
             "enable_dgrad_optimizations": True,
             "dgrad_schedule": None,
         },
@@ -958,7 +985,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
     assert len(compile_keys) == 3
 
     ds3_resolved = _qualified_ds3_training_config(
-        tunings["ds3_ep4_v1"],
+        tunings["ds3_ep4_pattern"],
     )
     forward = Mxfp8KernelConfig.for_training_forward(
         ds3_resolved,
@@ -978,13 +1005,50 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
 
 
 @pytest.mark.L0
+def test_ds3_public_config_accepts_upstream_expanded_topology_and_shape():
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _dgrad_selector_kwargs,
+    )
+
+    resolved = _training_config(
+        num_experts=16,
+        hidden_size=1024,
+        intermediate_size=256,
+        top_k=2,
+        max_tokens_per_rank=128,
+        physical_recv_pool_rows=4096,
+        combine_format="mxfp8",
+        ep_size=2,
+        ep_global_ranks=(0, 1),
+        experts_per_rank=8,
+        training_backward_tuning=MoeEpTuningConfig(
+            dgrad_optimization="ds3_ep4_pattern",
+        ),
+    )
+    config = Mxfp8KernelConfig.for_training_backward(
+        resolved,
+        launch_cluster_count=106,
+    )
+
+    assert config.world_size == 2
+    assert config.num_experts == 8
+    assert config.hidden == 1024
+    assert config.intermediate == 256
+    assert _dgrad_selector_kwargs(config) == {
+        "enable_dgrad_optimizations": True,
+        "dgrad_schedule": None,
+    }
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("physical_pool", (131072, 131840))
 def test_ds3_rejects_undersized_public_physical_pool(physical_pool):
     from cudnn import MoeEpTuningConfig
 
     with pytest.raises(ValueError, match="padded full-topology capacity"):
         _qualified_ds3_training_config(
-            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
             physical_recv_pool_rows=physical_pool,
         )
 
@@ -994,7 +1058,7 @@ def test_ds3_accepts_overprovisioned_exact_physical_pool():
     from cudnn import MoeEpTuningConfig
 
     config = _qualified_ds3_training_config(
-        MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+        MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
         physical_recv_pool_rows=132096,
     )
     forward = Mxfp8KernelConfig.for_training_forward(
@@ -1019,16 +1083,16 @@ def test_automatic_col_quant_grid_is_scoped_to_ds3():
         _training_config(),
         launch_cluster_count=16,
     )
-    with pytest.raises(ValueError, match="requires ds3_ep4_v1"):
+    with pytest.raises(ValueError, match="requires ds3_ep4_pattern"):
         replace(baseline, col_quant_num_ctas=-1)
 
     ds3 = Mxfp8KernelConfig.for_training_backward(
         _qualified_ds3_training_config(
-            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
         ),
         launch_cluster_count=106,
     )
-    with pytest.raises(ValueError, match="requires ds3_ep4_v1"):
+    with pytest.raises(ValueError, match="requires ds3_ep4_pattern"):
         replace(ds3, dgrad_optimization="rolling")
 
 
@@ -1065,7 +1129,7 @@ def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
 
     ds3 = Mxfp8KernelConfig.for_training_backward(
         _qualified_ds3_training_config(
-            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
         ),
         launch_cluster_count=106,
     )
@@ -1107,7 +1171,7 @@ def test_training_graph_patterns_preserve_smoke_and_qualify_ds3():
         smoke.combine_format,
     ) == (8, 128, 256, 2, 8, 128, "bf16")
 
-    ds3 = _training_graph_pattern("ds3_ep4_v1", 4)
+    ds3 = _training_graph_pattern("ds3_ep4_pattern", 4)
     assert (
         ds3.num_experts,
         ds3.hidden_size,
@@ -1151,8 +1215,8 @@ def test_training_graph_patterns_preserve_smoke_and_qualify_ds3():
     )
 
     args = Namespace(
-        pattern="ds3_ep4_v1",
-        dgrad_optimization="ds3_ep4_v1",
+        pattern="ds3_ep4_pattern",
+        dgrad_optimization="ds3_ep4_pattern",
         physical_recv_pool_rows=None,
         expect_overflow_assert=False,
     )
@@ -1177,8 +1241,8 @@ def test_training_graph_patterns_preserve_smoke_and_qualify_ds3():
     assert rolling_capacity == 128
 
     with pytest.raises(ValueError, match="world_size=4"):
-        _training_graph_pattern("ds3_ep4_v1", 2)
-    with pytest.raises(ValueError, match="requires --pattern ds3_ep4_v1"):
+        _training_graph_pattern("ds3_ep4_pattern", 2)
+    with pytest.raises(ValueError, match="requires --pattern ds3_ep4_pattern"):
         _resolve_pattern_and_capacity(
             probe_args(pattern="smoke"),
             4,
@@ -1812,6 +1876,8 @@ def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
     _require_distributed_sm107(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH"))))
     probe = Path(__file__).with_name("probe_moe_ep_training_graph.py")
     result = subprocess.run(
         [
@@ -1845,6 +1911,8 @@ def test_training_graph_drop_mode_overflow_completes_forward_and_backward():
     _require_distributed_sm107(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH"))))
     probe = Path(__file__).with_name("probe_moe_ep_training_graph.py")
     result = subprocess.run(
         [
@@ -1901,7 +1969,7 @@ def test_ds3_prepares_qualified_upstream_kernel(
         context="backward test",
     )
     resolved = _qualified_ds3_training_config(
-        MoeEpTuningConfig(dgrad_optimization="ds3_ep4_v1"),
+        MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
         physical_recv_pool_rows=physical_recv_pool_rows,
         training_weight_storage_mode=weight_storage_mode,
     )
@@ -2505,6 +2573,56 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         captured_grouped = run_grouped(captured[3])
         torch.cuda.synchronize(device)
         assert_grouped_matches(captured_grouped, grouped_expected)
+
+
+@pytest.mark.L0
+def test_training_forward_in_kernel_topk_reduce_does_not_accumulate_across_calls():
+    from cudnn import MoeEpTuningConfig
+
+    device = _sm107_device()
+    base_args = make_forward_inputs(device)
+    args = (
+        base_args[0].dequantize(torch.bfloat16).contiguous(),
+        base_args[1],
+        base_args[2],
+        base_args[3],
+        base_args[4].float().contiguous(),
+    )
+    token_count = args[0].shape[0]
+    grad_output = _grad_output(device, token_count, seed=20260902)
+    expected = _fixed_training_reference(
+        args,
+        grad_output,
+        combine_format="bf16",
+        gate_up_clamp=None,
+        max_tokens_per_rank=token_count,
+        physical_recv_pool_rows=256,
+    )
+    source_weights = _fixed_training_weights(args)
+
+    # In-kernel top-k reduction needs BF16 combine and output, apply_topk_in_fc1 and token_back_mode="epi_warps".
+    with MoeEp(
+        _training_public_config(
+            top_k=args[3].shape[1],
+            max_tokens_per_rank=token_count,
+            physical_recv_pool_rows=256,
+            combine_format="bf16",
+            output_format="bf16",
+            apply_topk_in_fc1=True,
+            training_forward_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True),
+        )
+    ) as op:
+        requirements = op.prepare_training(device=device)
+        forward_staging, _ = _allocate_training_weight_staging(source_weights)
+        native_forward = op.pack_forward_weights(source_weights[0], out=forward_staging)
+        forward_out, _ = _allocate_stateless_training_outputs(requirements, device, op.training_symmetric_buffers())
+
+        def run():
+            return op.training_forward(args[0], args[3], args[4], weights=native_forward, out=forward_out)
+
+        # BF16 atomics make the reduction order-dependent: check each call against the reference, not against call 1.
+        _assert_matches_reference(run(), expected[0])
+        _assert_matches_reference(run(), expected[0])
 
 
 @pytest.mark.L1

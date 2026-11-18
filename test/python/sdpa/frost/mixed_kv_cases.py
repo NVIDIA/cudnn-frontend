@@ -8,7 +8,7 @@ import pytest
 import torch
 
 
-def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 0)):
+def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 0), head_dim=128, cga=1, engine_name=None):
     import cudnn
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd import engines
@@ -16,46 +16,77 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     io, kv = getattr(cudnn.data_type, qdtype), getattr(cudnn.data_type, kvdtype)
     graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    dim, stride = (2, 8, 256, 128), (256 * 8 * 128, 128, 8 * 128, 1)
+    d = head_dim
+    dim, stride = (2, 8, 256, d), (256 * 8 * d, d, 8 * d, 1)
     q, k, v = (graph.tensor(dim=dim, stride=stride, data_type=t) for t in (io, kv, kv))
     o, stats = graph.sdpa(q=q, k=k, v=v, generate_stats=True, attn_scale=128**-0.5, use_causal_mask=True)
     o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(io)
     stats.set_output(True).set_dim((2, 8, 256, 1)).set_stride((2048, 256, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
-    facts, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
+    default_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+    if engine_name is None and cc == (10, 7):
+        from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+
+        default_name = select_sm107_half_geometry(ga.analyze(graph), engines.SdpaFwdKnobs(cga=cga)).implementation
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == (engine_name or default_name))
+    facts, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
     assert reason is None, reason
     assert facts.kv_dtype == kv and facts.uniform_qo_dtype and not facts.uniform_dtype
     assert not facts.is_fp8 and not facts.is_mxfp8
     for changed, expected in ((v, io), (o, cudnn.data_type.FLOAT)):
         original = changed.get_data_type()
         changed.set_data_type(expected)
-        _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
-        assert reason and "dtypes" in reason
+        _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
+        assert reason and ("dtypes" in reason or reason == "requires SM107 and supported half small-head graph declarations"), reason
         changed.set_data_type(original)
     # Eight half elements align Q, but only sixteen FP8 elements align K.
-    k.set_stride((256 * 8 * 136, 136, 8 * 136, 1))
-    _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
+    k.set_stride((256 * 8 * (d + 8), d + 8, 8 * (d + 8), 1))
+    _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
     assert reason and "without a copy" in reason
+    return spec, facts
 
 
-def check_dense_paged_rebind_capture(qdtype, kvdtype, cga, layout, splits, entry, monkeypatch, cudnn_handle, engine_name="sdpa_fwd_prefill_sm100", pack=True):
+def check_dense_paged_rebind_capture(
+    qdtype,
+    kvdtype,
+    cga,
+    layout,
+    splits,
+    entry,
+    monkeypatch,
+    cudnn_handle,
+    engine_name="sdpa_fwd_prefill_sm100",
+    pack=True,
+    cpu_reference=False,
+    head_dim=128,
+    q_tokens=None,
+    heads=None,
+):
     import cudnn
     from cudnn.engines.manifest import family_for
     from cudnn.sdpa.fwd import api_dsl
 
+    native_sm107 = engine_name.endswith("sm107") or engine_name.startswith("sdpa_fwd_sm107_")
     loaded = []
-    original = api_dsl._load_sm100_kernel_module
+    original = api_dsl.load_template
 
     def load(*args, **kwargs):
         module = original(*args, **kwargs)
-        loaded.append(module)
+        if hasattr(module, "MIXED_FP8_KV"):
+            loaded.append(module)
         return module
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", load)
+    monkeypatch.setattr(api_dsl, "load_template", load)
+    if engine_name == "sdpa_fwd_prefill_sm100" and entry == "graph":
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
     paged = layout == "paged"
     hnd = kvdtype == torch.float8_e5m2
     page = 128 if hnd else 8
     b, sq, sk, hq, hk, d = (9, 17, 384 if hnd else 264, 16, 4, 128) if paged else (2, 193, 257, 8, 2, 128)
+    d = head_dim
+    if heads is not None:
+        hq, hk = heads
+    if q_tokens is not None:
+        sq = q_tokens
     blocks = sk // page if paged else 0
     pages = b * blocks
     initial_lengths = [257, 0, 145, 1, 129, 33, 257, 17, 65] if paged else [sk] * b
@@ -115,10 +146,16 @@ def check_dense_paged_rebind_capture(qdtype, kvdtype, cga, layout, splits, entry
                 )
             graph.validate()
             graph.build_operation_graph()
-            graph.create_execution_plan(
-                family_for(graph).offered_ids()[engine_name],
-                {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: splits},
-            )
+            record = {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: splits}
+            if engine_name == "sdpa_fwd_prefill_sm107":
+                from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+                from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+                from cudnn.sdpa.graph_analyzer import analyze
+
+                requested = SdpaFwdKnobs.from_public(record)
+                geometry = select_sm107_half_geometry(analyze(graph), requested)
+                engine_name, record = geometry.implementation, geometry.canonical_knobs(requested).to_public()
+            graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], record)
             graph.select_plan(0)
             graph.check_support()
             graph.build_plans()
@@ -138,9 +175,15 @@ def check_dense_paged_rebind_capture(qdtype, kvdtype, cga, layout, splits, entry
                 is_causal=True,
                 cga=cga,
                 pack_gqa=pack,
+                split_kv=splits,
             )
             api.check_support()
             api.compile()
+            assert api.split_kv == splits
+            if native_sm107 and head_dim == 512:
+                assert api.template_params().d_flavor == 512 and api.template_params().mma_2x2
+            if native_sm107 and head_dim == 256 and splits > 1:
+                assert api._fp32_partial_split()
             workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
 
             def execute(t):
@@ -148,30 +191,42 @@ def check_dense_paged_rebind_capture(qdtype, kvdtype, cga, layout, splits, entry
 
         assert loaded and loaded[-1].MIXED_FP8_KV
         expected_file = (
-            "sm100/decode_d128_f16.py"
-            if cga == 1 and not (engine_name.endswith("sm107") and paged)
-            else ("sm107/prefill_d128_f16.py" if engine_name.endswith("sm107") else "sm100/prefill_d128_f16.py")
+            "sm100/d128_f16_single_q/kernel.py"
+            if cga == 1 and not (native_sm107 and (paged or head_dim == 64))
+            else ("sm107/d128_f16_multi_q/kernel.py" if native_sm107 else "sm100/d128_f16_multi_q/kernel.py")
         )
+        if entry == "graph" and engine_name in ("sdpa_fwd_sm100_d128_single_q", "sdpa_fwd_sm100_d128_multi_q"):
+            expected_file = "sm100/d128_f16_single_q/kernel.py" if cga == 1 else "sm100/d128_f16_multi_q/kernel.py"
+        if native_sm107 and head_dim in (256, 512):
+            expected_file = "sm107/d256_f16_lookahead/kernel.py" if head_dim == 256 else "sm107/d512_f16_2x2/kernel.py"
+        if entry == "graph" and native_sm107:
+            expected_file = {
+                "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",
+                "sdpa_fwd_sm107_shared_single_q": "sm100/d128_f16_single_q/kernel.py",
+                "sdpa_fwd_sm107_d256_lookahead": "sm107/d256_f16_lookahead/kernel.py",
+                "sdpa_fwd_sm107_d512_2x2": "sm107/d512_f16_2x2/kernel.py",
+            }[engine_name]
         assert loaded[-1].__file__.endswith(expected_file)
         assert loaded[-1].CFG.CTA_MMA == cga and loaded[-1].KV_STORAGE_DTYPE.width == 8
 
         def verify(t, lengths):
+            ref_device = "cpu" if cpu_reference else "cuda"
             for batch, nk in enumerate(lengths):
-                q = t["q"][batch].double()
+                q = t["q"][batch].to(ref_device).double()
                 if paged:
-                    k = t["k"][t["kt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].double()
-                    v = t["v"][t["vt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].double()
+                    k = t["k"][t["kt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].to(ref_device).double()
+                    v = t["v"][t["vt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].to(ref_device).double()
                 else:
-                    k, v = t["k"][batch].double(), t["v"][batch].double()
+                    k, v = t["k"][batch].to(ref_device).double(), t["v"][batch].to(ref_device).double()
                 k, v = k.repeat_interleave(hq // hk, 0), v.repeat_interleave(hq // hk, 0)
                 scores = q @ k.transpose(-1, -2) / math.sqrt(d)
-                bound = torch.arange(sq, device="cuda")[:, None] + (nk - sq if paged else 0)
-                scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > bound, -torch.inf)
+                bound = torch.arange(sq, device=ref_device)[:, None] + (nk - sq if paged else 0)
+                scores.masked_fill_(torch.arange(nk, device=ref_device)[None, :] > bound, -torch.inf)
                 if paged:
-                    scores = torch.cat([scores, t["sink"].reshape(hq, 1, 1).double().expand(hq, sq, 1)], -1)
+                    scores = torch.cat([scores, t["sink"].reshape(hq, 1, 1).to(ref_device).double().expand(hq, sq, 1)], -1)
                 expected = scores.softmax(-1)[..., :nk] @ v
-                torch.testing.assert_close(t["o"][batch].double(), expected, atol=0.003, rtol=0.02)
-                torch.testing.assert_close(t["stats"][batch].double(), scores.logsumexp(-1, keepdim=True), atol=0.0006, rtol=0)
+                torch.testing.assert_close(t["o"][batch].to(ref_device).double(), expected, atol=0.003, rtol=0.02)
+                torch.testing.assert_close(t["stats"][batch].to(ref_device).double(), scores.logsumexp(-1, keepdim=True), atol=0.0006, rtol=0)
 
         def poison(t):
             t["o"].fill_(float("nan"))
@@ -223,6 +278,8 @@ def check_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle,
     pages = b * blocks
     hnd = kvdtype in (torch.float8_e5m2, torch.float16)
     splits = (5 if hnd else 2) if splits is None else splits
+    if engine_name == "sdpa_fwd_prefill_sm100" and entry == "graph":
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if splits > 1 and cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
     odtype = torch.int64 if hnd else torch.int32
     io = cudnn.data_type.BFLOAT16 if qdtype == torch.bfloat16 else cudnn.data_type.HALF
 
@@ -300,14 +357,16 @@ def check_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle,
             )
             graph.validate()
             graph.build_operation_graph()
-            graph.create_execution_plan(
-                family_for(graph).offered_ids()[engine_name],
-                {
-                    cudnn.knob_type.TILE_CGA_M: cga,
-                    cudnn.knob_type.PACK_GQA: 1,
-                    cudnn.knob_type.SPLIT_KV: splits,
-                },
-            )
+            record = {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.SPLIT_KV: splits}
+            if engine_name == "sdpa_fwd_prefill_sm107":
+                from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+                from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+                from cudnn.sdpa.graph_analyzer import analyze
+
+                requested = SdpaFwdKnobs.from_public(record)
+                geometry = select_sm107_half_geometry(analyze(graph), requested)
+                engine_name, record = geometry.implementation, geometry.canonical_knobs(requested).to_public()
+            graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], record)
             graph.select_plan(0)
             graph.check_support()
             graph.build_plans()
@@ -322,7 +381,7 @@ def check_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle,
                 from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
 
                 api = inspect.getclosurevars(compiled._compiled.default_stream).nonlocals["api"]
-                assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+                assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
                 assert not api.thd_decode_leg and api._thd_origin_specs is not None
                 assert isinstance(compiled._prepared, PreparedThdLaunch)
             workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")

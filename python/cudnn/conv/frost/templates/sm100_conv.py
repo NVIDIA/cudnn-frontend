@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Implicit-GEMM fprop convolution kernel for Blackwell B200.
+# Dynamic-geometry implicit-GEMM fprop convolution kernel for Blackwell B200.
 #
-# Maps a 3D convolution onto an implicit GEMM: M = N*Z*P*Q, N_gemm = K,
+# Maps a 3D convolution onto an implicit GEMM: M_gemm = N*Z*P*Q, N_gemm = K,
 # K_gemm = T*R*S*C. Warp-specialized with explicit roles (1 TMA producer warp,
 # 1 MMA consumer warp, 4 epilogue warps), mbarrier-based producer/consumer
 # synchronization, and a tcgen05.mma + tcgen05.commit handshake for the TMEM
@@ -188,14 +188,36 @@ def _select_epi_datapath(
 
 
 @cute.kernel
+def _scan_padded_filter_planes(weight: cute.Tensor, flags: cute.Tensor):
+    """Record 0*NaN/Inf contributions from the two fully padded C96 planes."""
+    lane, _, _ = cute.arch.thread_idx()
+    channel, _, _ = cute.arch.block_idx()
+    flat = cute.make_tensor(weight.iterator, cute.make_layout(96 * 3 * 3 * 3 * 96))
+    nonfinite = cutlass.Boolean(False)
+    for chunk in cutlass.range(54, unroll=1):
+        value = flat[channel * 2592 + chunk * 32 + lane].to(cutlass.Float32)
+        nonfinite = nonfinite | (value != value) | (value == cutlass.Float32(float("inf"))) | (value == cutlass.Float32(float("-inf")))
+    nonfinite = cute.arch.vote_any_sync(nonfinite)
+    if lane == 0:
+        flags[channel] = cutlass.Int32(nonfinite)
+
+
+_scan_padded_filter_planes.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
 def _kernel(
     # Persistent tile scheduler parameters
     tile_sched_params: utils.PersistentTileSchedulerParams,
     # Constexpr knobs
     mma_tiler: cutlass.Constexpr[Tuple[int, int, int]],
     mma_inst_shape_mnk: cutlass.Constexpr[Tuple[int, int, int]],
-    # GEMM-K tile count (= ceil_div(T*R*S*C, mma_tiler_k)), host-computed.
-    k_tile_cnt: cutlass.Constexpr[int],
+    # Channel/filter tile count for the temporal planes handled by the MMA loop.
+    k_tile_cnt: cutlass.Int32,
+    channel_tiles: cutlass.Int32,
+    m_tiles_per_work: cutlass.Constexpr[int],
+    first_filter_t: cutlass.Constexpr[int],
+    channel_first: cutlass.Constexpr[bool],
     num_ab_stage: cutlass.Constexpr[int],
     num_acc_stage: cutlass.Constexpr[int],
     num_c_stage: cutlass.Constexpr[int],
@@ -204,20 +226,21 @@ def _kernel(
     c_dtype: cutlass.Constexpr[Type[Numeric]],
     acc_dtype: cutlass.Constexpr[Type[Numeric]],
     # Conv geometry consumed by the im2col TMA producer / epilogue:
-    # zpq      = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q)
-    # trs      = filter spatial dims (T, R, S) used to decompose K-tile index
+    # zpq_divisors = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q), converted to FDDs on the host.
+    # trs = filter spatial dims (T, R, S) used to decompose K-tile index
     # lower_pad_dhw / stride_dhw / dilation_dhw = standard conv params
-    lower_pad_dhw: cutlass.Constexpr[Tuple[int, int, int]],
-    stride_dhw: cutlass.Constexpr[Tuple[int, int, int]],
-    dilation_dhw: cutlass.Constexpr[Tuple[int, int, int]],
-    zpq: cutlass.Constexpr[Tuple[int, int, int]],
-    trs: cutlass.Constexpr[Tuple[int, int, int]],
+    lower_pad_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    stride_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    dilation_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    zpq_divisors: Tuple[cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2],
+    trs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     # Host-built TMA descriptors, consumed by the device-side
     # prims.cp_async_bulk_tensor_* / prims.prefetch_tensormap calls.
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     epilogue_op: cutlass.Constexpr,
+    padded_plane_flags,
 ) -> None:
     """Implicit-GEMM fprop kernel: TMA load + tcgen05 MMA + TMA store."""
 
@@ -226,6 +249,12 @@ def _kernel(
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     tidx, _, _ = cute.arch.thread_idx()
     cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+
+    if cutlass.const_expr(first_filter_t == 2):
+        # Cache all 96 exception bits once per warp, before the persistent loop.
+        flag_word0 = cute.arch.vote_ballot_sync(padded_plane_flags[tidx % 32] != 0)
+        flag_word1 = cute.arch.vote_ballot_sync(padded_plane_flags[tidx % 32 + 32] != 0)
+        flag_word2 = cute.arch.vote_ballot_sync(padded_plane_flags[tidx % 32 + 64] != 0)
 
     # CTA-group geometry, threaded through every tcgen05 call site below.
     # _atom_thr = MMA-atom CTA count (2 for the 2-CTA tcgen05 group, else 1).
@@ -290,7 +319,7 @@ def _kernel(
     _m_per_cta = mma_tiler[0] // _atom_thr
     _n_per_cta = mma_tiler[1] // _atom_thr
     _k_tile = cute.size(mma_tiler, mode=[2])
-    _a_stage_bytes = _m_per_cta * _k_tile * (ab_dtype.width // 8)
+    _a_stage_bytes = _m_per_cta * _k_tile * (ab_dtype.width // 8) * m_tiles_per_work
     _b_stage_bytes = _n_per_cta * _k_tile * (ab_dtype.width // 8)
     # Epilogue C tile sizing (must match the device epilogue store path + the
     # host C descriptor). The datapath descriptor is the single source of truth
@@ -389,10 +418,11 @@ def _kernel(
     n_per_cta = mma_tiler[1] // (2 if use_2cta_instrs else 1)
     k_tile_size = cute.size(mma_tiler, mode=[2])
 
+    # Each AB stage holds one B tile and m_tiles_per_work A tiles.
     # Bytes-per-K-tile expectation. For the 2-CTA cluster the leader writes
     # expect_tx for both CTAs' loads (the peer slot is reached via the
     # mbarrier bit-24 clear inside the wrapper).
-    a_bytes_per_stage = mma_tiler_per_cta_m * k_tile_size * (ab_dtype.width // 8)
+    a_bytes_per_stage = mma_tiler_per_cta_m * k_tile_size * (ab_dtype.width // 8) * m_tiles_per_work
     b_bytes_per_stage = n_per_cta * k_tile_size * (ab_dtype.width // 8)
     num_tma_copy_bytes = a_bytes_per_stage + b_bytes_per_stage
     if cutlass.const_expr(use_2cta_instrs):
@@ -402,13 +432,13 @@ def _kernel(
     # Per-CTA unicast (no multicast_mask) prims.cp_async_bulk_tensor loads.
     # Im2col coords are decomposed from the linear M index:
     # m_off_cta -> (n, z, p, q); spatial anchors are then q*str_w-pad_w (etc).
-    # The filter coord (s, r, t) and C-element offset are loop-carried and
-    # advanced by a colexicographic carry (add + compare + conditional reset),
-    # so the loop body never divides the linear k by T*R*S.
+    # Filter and channel coordinates use loop-carried additions and resets.
+    # C96/K96 visits its three 32-channel tiles at each filter position;
+    # other shapes retain the original filter-first reduction order.
     if warp_idx == tma_warp_id:
         ab_stage_idx = 0
-        Z_out, P_out, Q_out = zpq
-        T_filt, R_filt, S_filt = trs
+        z_divisor, p_divisor, q_divisor = zpq_divisors
+        t_filt, r_filt, s_filt = trs
         pad_d, pad_h, pad_w = lower_pad_dhw
         str_d, str_h, str_w = stride_dhw
         dil_d, dil_h, dil_w = dilation_dhw
@@ -420,30 +450,35 @@ def _kernel(
                 cur_tile_coord[2],
             )
             # M index for this CTA's portion of the M-tile.
-            m_off_cta = mma_tile_coord_mnl[0] * mma_tiler[0] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
-            # Output (n, z, p, q) from linear M (col-major Q-fastest).
-            n_idx = m_off_cta // (Q_out * P_out * Z_out)
-            rem = m_off_cta % (Q_out * P_out * Z_out)
-            z_idx = rem // (Q_out * P_out)
-            rem = rem % (Q_out * P_out)
-            p_idx = rem // Q_out
-            q_idx = rem % Q_out
-            # Spatial anchors for im2col TMA: idx*stride - pad_lower.
-            w_anchor = q_idx * str_w - pad_w
-            h_anchor = p_idx * str_h - pad_h
-            d_anchor = z_idx * str_d - pad_d
+            m_off_cta = (
+                mma_tile_coord_mnl[0] * mma_tiler[0] * m_tiles_per_work + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
+            )
+            n_anchors = cutlass.Array(cutlass.Int32, m_tiles_per_work)
+            w_anchors = cutlass.Array(cutlass.Int32, m_tiles_per_work)
+            h_anchors = cutlass.Array(cutlass.Int32, m_tiles_per_work)
+            d_anchors = cutlass.Array(cutlass.Int32, m_tiles_per_work)
+            for output_tile in cutlass.range_constexpr(m_tiles_per_work):
+                m_offset = m_off_cta + output_tile * mma_tiler[0]
+                div, q_idx = divmod(m_offset, q_divisor)
+                div, p_idx = divmod(div, p_divisor)
+                n_idx, z_idx = divmod(div, z_divisor)
+                n_anchors[output_tile] = n_idx
+                w_anchors[output_tile] = q_idx * str_w - pad_w
+                h_anchors[output_tile] = p_idx * str_h - pad_h
+                d_anchors[output_tile] = z_idx * str_d - pad_d
             # B side: per-CTA N offset (KTRSC tiled descriptor consumes this).
             n_off_cta = mma_tile_coord_mnl[1] * mma_tiler[1] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * n_per_cta
 
-            # Filter coord (s, r, t) + C-chunk, carried across K-tiles and
-            # advanced colexicographically (s fastest). Reset to origin per
-            # work-tile since each tile sweeps GEMM-K from 0. The carry below
-            # replaces k // (T*R*S) style division.
+            # Reset the filter/channel coordinates for each output tile.
+            # Carry arithmetic below avoids division in the reduction loop.
             s_idx = 0
             r_idx = 0
-            t_idx = 0
+            t_idx = first_filter_t
             c_chunk_idx = 0
-            for k in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            # Initial C96/K96 frames benefit from issuing their three channel
+            # loads together.
+            producer_unroll = 3 if channel_first and first_filter_t == 2 else 1
+            for k in cutlass.range(0, k_tile_cnt, 1, unroll=producer_unroll):
                 mbar_full = ab_full_mbar_ptr.subview(ab_stage_idx)
                 mbar_empty = ab_empty_mbar_ptr.subview(ab_stage_idx)
 
@@ -477,15 +512,16 @@ def _kernel(
                         prims.mbarrier_arrive_expect_tx(mbar_full, num_tma_copy_bytes)
                     # Per-CTA unicast load; _cta_group selects the 1-/2-CTA
                     # tcgen05 group (identical coords/box on both paths).
-                    prims.cp_async_bulk_tensor_shared_cluster_global(
-                        sA_stage,
-                        tma_a_desc.get_ptr(),
-                        (c_off, w_anchor, h_anchor, d_anchor, n_idx),
-                        mbar_full,
-                        [s_off, r_off, t_off],
-                        mode=prims.TMALoadMode.IM2COL,
-                        group=_cta_group,
-                    )
+                    for output_tile in cutlass.range_constexpr(m_tiles_per_work):
+                        prims.cp_async_bulk_tensor_shared_cluster_global(
+                            sA_stage.subview(output_tile * (a_bytes_per_stage // m_tiles_per_work)),
+                            tma_a_desc.get_ptr(),
+                            (c_off, w_anchors[output_tile], h_anchors[output_tile], d_anchors[output_tile], n_anchors[output_tile]),
+                            mbar_full,
+                            [s_off, r_off, t_off],
+                            mode=prims.TMALoadMode.IM2COL,
+                            group=_cta_group,
+                        )
                     prims.cp_async_bulk_tensor_shared_cluster_global(
                         sB_stage,
                         tma_b_desc.get_ptr(),
@@ -500,19 +536,30 @@ def _kernel(
                     ab_stage_idx = 0
                     ab_empty_phase_bit = ab_empty_phase_bit ^ 1
 
-                # Colex carry of (s, r, t, c_chunk): bump s, ripple right on
-                # wrap. Nested single-compare ifs (no boolean-and on traced
-                # predicates) advance the coord over (S, R, T, *).
-                s_idx += 1
-                if s_idx == S_filt:
-                    s_idx = 0
-                    r_idx += 1
-                    if r_idx == R_filt:
-                        r_idx = 0
-                        t_idx += 1
-                        if t_idx == T_filt:
-                            t_idx = 0
-                            c_chunk_idx += 1
+                # Advance channels first for the C96/K96 path; preserve
+                # the filter-first order for previously supported shapes.
+                if cutlass.const_expr(channel_first):
+                    c_chunk_idx += 1
+                    if c_chunk_idx == channel_tiles:
+                        c_chunk_idx = 0
+                        s_idx += 1
+                        if s_idx == s_filt:
+                            s_idx = 0
+                            r_idx += 1
+                            if r_idx == r_filt:
+                                r_idx = 0
+                                t_idx += 1
+                else:
+                    s_idx += 1
+                    if s_idx == s_filt:
+                        s_idx = 0
+                        r_idx += 1
+                        if r_idx == r_filt:
+                            r_idx = 0
+                            t_idx += 1
+                            if t_idx == t_filt:
+                                t_idx = first_filter_t
+                                c_chunk_idx += 1
 
             # Advance to next persistent work-tile (static schedule).
             tile_sched.advance_to_next_work()
@@ -534,21 +581,20 @@ def _kernel(
 
         # tcgen05 SMEM descriptors for stage 0. tcgen05_mma encodes SMEM
         # addresses in 16-byte units, so per-stage / per-K-block increments
-        # are bytes >> 4. (leading=16, stride=1024, layout=2) is the 128B-swizzle
-        # K-major layout, matching cuda.TensorMapSwizzle.s128b on the A/B
-        # descriptors. sA/sB are flat cutlass.Arrays, so the SMEM base address is
-        # the array itself.
+        # are bytes >> 4. K-major stride spans eight rows: 512 bytes with
+        # 64B swizzle (layout=4), or 1024 bytes with 128B swizzle (layout=2).
+        # These must match the host-side A/B tensor-map swizzles.
         desc_a_base = prims.Tcgen05SmemDesc.build(
             sA,
             leading_byte_offset=16,
-            stride_byte_offset=1024,
-            layout=2,
+            stride_byte_offset=8 * k_tile_size * (ab_dtype.width // 8),
+            layout=4 if k_tile_size * (ab_dtype.width // 8) == 64 else 2,
         )
         desc_b_base = prims.Tcgen05SmemDesc.build(
             sB,
             leading_byte_offset=16,
-            stride_byte_offset=1024,
-            layout=2,
+            stride_byte_offset=8 * k_tile_size * (ab_dtype.width // 8),
+            layout=4 if k_tile_size * (ab_dtype.width // 8) == 64 else 2,
         )
 
         # Per-stage descriptor delta (one full AB stage in SMEM, in 16B units).
@@ -569,11 +615,9 @@ def _kernel(
         # Persistent loop: outer = work tiles (acc stages); inner = K-tiles.
         while work_tile.is_valid_tile:
             current_acc_stage = acc_stage_idx
-            acc_empty_mbar_ptr_stage = acc_empty_mbar_ptr.subview(current_acc_stage)
-            acc_full_mbar_ptr_stage = acc_full_mbar_ptr.subview(current_acc_stage)
             current_empty_phase_bit = acc_empty_phase_bit
 
-            acc_stage_idx += 1
+            acc_stage_idx += m_tiles_per_work
             if acc_stage_idx == num_acc_stage:
                 acc_stage_idx = 0
                 acc_empty_phase_bit = acc_empty_phase_bit ^ 1
@@ -583,12 +627,13 @@ def _kernel(
                 # released this acc stage). No elect_sync — every thread is fine.
                 # try_wait_parity is one non-blocking attempt; loop until it
                 # reports the phase advanced.
-                while not prims.mbarrier_try_wait_parity(
-                    acc_empty_mbar_ptr_stage,
-                    current_empty_phase_bit,
-                    time_limit=10000000,
-                ):
-                    pass
+                for output_tile in cutlass.range_constexpr(m_tiles_per_work):
+                    while not prims.mbarrier_try_wait_parity(
+                        acc_empty_mbar_ptr.subview(current_acc_stage + output_tile),
+                        current_empty_phase_bit,
+                        time_limit=10000000,
+                    ):
+                        pass
 
                 # Per-stage TMEM pointer. A TMEM Pointer holds a packed i32
                 # address token (col in bits [0:16), row in [16:32)); adding an
@@ -596,7 +641,6 @@ def _kernel(
                 # scaling. Each acc stage owns a full mma_tiler[1]-wide column
                 # band, so the per-stage stride is exactly mma_tiler[1] columns.
                 tmem_ptr_for_mma = tmem_ptr.data_ptr() + current_acc_stage * mma_tiler[1]
-                tmem_ptr_curr = cutlass.Array(tmem_ptr_for_mma, dtype=cutlass.Int32, addrspace=6)
 
                 # scale_d=False (overwrite) only on the very first MMA of this
                 # C-tile's K-loop; True (accumulate) for every subsequent MMA.
@@ -614,23 +658,26 @@ def _kernel(
                     while not prims.mbarrier_try_wait_parity(ab_full_mbar_ptr_stage, ab_full_phase_bit, time_limit=10000000):
                         pass
 
-                    # Issue all K-blocks for this AB stage.
-                    desc_a_cur_ = desc_a_cur
-                    desc_b_cur_ = desc_b_cur
-                    for kb_idx in cutlass.range_constexpr(num_k_blocks):
-                        scale_d_now = (k_idx > 0) | (kb_idx > 0)
-                        if prims.elect_sync():
-                            prims.tcgen05_mma(
-                                mma_kind,
-                                _cta_group,
-                                tmem_ptr_curr,
-                                desc_a_cur_,
-                                desc_b_cur_,
-                                idesc,
-                                scale_d_now,
-                            )
-                        desc_a_cur_ = desc_a_cur_ + increment
-                        desc_b_cur_ = desc_b_cur_ + increment
+                    for output_tile in cutlass.range_constexpr(m_tiles_per_work):
+                        tmem_ptr_output = cutlass.Array(tmem_ptr_for_mma + output_tile * mma_tiler[1], dtype=cutlass.Int32, addrspace=6)
+                        # Reuse B across the independent output accumulators.
+                        # Each output visits K blocks in the original order.
+                        desc_a_cur_ = desc_a_cur + output_tile * ((a_bytes_per_stage // m_tiles_per_work) >> 4)
+                        desc_b_cur_ = desc_b_cur
+                        for kb_idx in cutlass.range_constexpr(num_k_blocks):
+                            scale_d_now = (k_idx > 0) | (kb_idx > 0)
+                            if prims.elect_sync():
+                                prims.tcgen05_mma(
+                                    mma_kind,
+                                    _cta_group,
+                                    tmem_ptr_output,
+                                    desc_a_cur_,
+                                    desc_b_cur_,
+                                    idesc,
+                                    scale_d_now,
+                                )
+                            desc_a_cur_ = desc_a_cur_ + increment
+                            desc_b_cur_ = desc_b_cur_ + increment
 
                     # Advance AB stage state.
                     ab_stage_idx += 1
@@ -655,11 +702,12 @@ def _kernel(
                 if prims.elect_sync():
                     # K-tile loop done — signal accumulator full to epilogue
                     # warps (both CTAs of the group in 2cta; own CTA in 1cta).
-                    prims.tcgen05_commit(
-                        acc_full_mbar_ptr_stage,
-                        multicast_mask=_commit_mask,
-                        group=_cta_group,
-                    )
+                    for output_tile in cutlass.range_constexpr(m_tiles_per_work):
+                        prims.tcgen05_commit(
+                            acc_full_mbar_ptr.subview(current_acc_stage + output_tile),
+                            multicast_mask=_commit_mask,
+                            group=_cta_group,
+                        )
 
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
@@ -753,7 +801,7 @@ def _kernel(
         # uses zero corners, so output spatial coords are bare pixels (no pad
         # subtraction, no stride multiply). Decompose the linear per-CTA M index
         # into (n, z, p, q) per work-tile in the loop.
-        Z_out, P_out, Q_out = zpq
+        z_divisor, p_divisor, q_divisor = zpq_divisors
 
         # Allocator warp (epi 0) reserves 512 TMEM cols and stashes the pointer
         # in tmem_holding_buf. Every CTA allocates from its own 512-col bank;
@@ -775,203 +823,216 @@ def _kernel(
         acc_stage_idx = 0
         epi_stage_idx = 0
         while work_tile.is_valid_tile:
-            current_acc_stage = acc_stage_idx
-            acc_full_mbar_ptr_stage = acc_full_mbar_ptr.subview(current_acc_stage)
-            acc_empty_mbar_ptr_stage = acc_empty_mbar_ptr.subview(current_acc_stage)
-            current_full_phase_bit = acc_full_phase_bit
+            for output_tile in cutlass.range_constexpr(m_tiles_per_work):
+                current_acc_stage = acc_stage_idx
+                acc_full_mbar_ptr_stage = acc_full_mbar_ptr.subview(current_acc_stage)
+                acc_empty_mbar_ptr_stage = acc_empty_mbar_ptr.subview(current_acc_stage)
+                current_full_phase_bit = acc_full_phase_bit
 
-            acc_stage_idx += 1
-            if acc_stage_idx == num_acc_stage:
-                acc_stage_idx = 0
-                acc_full_phase_bit = acc_full_phase_bit ^ 1
+                acc_stage_idx += 1
+                if acc_stage_idx == num_acc_stage:
+                    acc_stage_idx = 0
+                    acc_full_phase_bit = acc_full_phase_bit ^ 1
 
-            cur_tile_coord = work_tile.tile_idx
-            mma_tile_coord_mnl = (
-                cur_tile_coord[0] // (2 if use_2cta_instrs else 1),
-                cur_tile_coord[1],
-                cur_tile_coord[2],
-            )
-
-            # Wait for MMA warp to commit acc_full for this stage.
-            # try_wait_parity is one non-blocking attempt; loop until the MMA
-            # warp's commit advances the phase.
-            while not prims.mbarrier_try_wait_parity(acc_full_mbar_ptr_stage, current_full_phase_bit, time_limit=10000000):
-                pass
-
-            # Per-stage TMEM column origin. Lower 16 bits of tmem_raw_addr is
-            # the column id; upper 16 bits is the row id (always 0 for warp 0).
-            base_col_id = (tmem_raw_addr & 0xFFFF) + (current_acc_stage * mma_tiler[1])
-
-            # Per-tile output (im2col store) spatial coords. The 2CTA cluster
-            # splits M (the NZPQ pixel axis) across the pair, so the spatial
-            # coords carry cta_rank. The K-out channel axis (GEMM N) is NOT
-            # split: each CTA's tcgen05 accumulator holds its own M-row band
-            # over the full N columns.
-            m_off_cta = mma_tile_coord_mnl[0] * mma_tiler[0] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
-            # Bare output pixels (col-major Q-fastest). No pad/stride: the C
-            # descriptor uses zero corners, so output has no halo concept.
-            n_out = m_off_cta // (Q_out * P_out * Z_out)
-            rem_m = m_off_cta % (Q_out * P_out * Z_out)
-            z_out = rem_m // (Q_out * P_out)
-            rem_m = rem_m % (Q_out * P_out)
-            p_out = rem_m // Q_out
-            q_out = rem_m % Q_out
-            # K-out channel base for this N-tile (no cta_rank, see above).
-            k_off_base = mma_tile_coord_mnl[1] * mma_tiler[1]
-
-            # Subtile loop on the N axis.
-            for subtile_idx in cutlass.range(subtile_cnt):
-                # Rotate through C SMEM stages so the previous TMA store can
-                # drain in parallel with the next t2r/r2s.
-                epi_stage_idx = (epi_stage_idx + 1) % num_c_stage
-
-                # TMEM -> RMEM: per-warp LDTM. The column origin advances ONLY by
-                # subtile_n and carries NO warp_n term: tcgen05_ld routes by the
-                # executing warp's sub-partition, so each warp lands on its own
-                # N-band without an explicit column add. An explicit warp_n column
-                # offset would over-shoot into unwritten TMEM (reading back zero).
-                # The global k128..255 offset is applied on the STORE side
-                # (band_smem_base + k_off), not here.
-                tmem = prims.make_tmem_ptr_from_warp_row_col(
-                    tmem_raw_addr,
-                    warp_m_idx,
-                    base_col_id + subtile_idx * subtile_n,
-                    cutlass.Float32,
+                cur_tile_coord = work_tile.tile_idx
+                mma_tile_coord_mnl = (
+                    cur_tile_coord[0] // (2 if use_2cta_instrs else 1),
+                    cur_tile_coord[1],
+                    cur_tile_coord[2],
                 )
-                # offset= is mandatory for 16x32bx2 (the fp8 column half-split)
-                # and rejected for every other shape, so pass it only for fp8.
-                t2r_rmem = prims.tcgen05_ld(
-                    t2r_inst_shape,
-                    tmem,
-                    num=t2r_inst_repx,
-                    offset=t2r_ld_offset if cutlass.const_expr(use_fp8_simt_epi) else None,
-                )
-                # Apply the user-supplied epilogue_op (constexpr fn) on the FP32
-                # accumulator before casting to the output dtype (defaults to
-                # identity).
-                t2r_rmem = epilogue_op(t2r_rmem)
 
-                # RMEM -> SMEM. sC is a flat cutlass.Array (c_dtype elements);
-                # per-stage stride = _c_tile_rows * _epi_subtile_n elems
-                # (_c_tile_rows = 128 for store_swizzled so cfgC's two N-bands
-                # both fit; = _epi_m=64 for cfgB stmatrix). Two paths, keyed on
-                # the datapath predicate (constexpr):
-                smem_tile_base = sC.subview(epi_stage_idx * (_c_tile_rows * _epi_subtile_n))
-                if cutlass.const_expr(use_fp8_simt_epi):
-                    # fp8 cfgB SIMT store. This thread holds 32 contiguous
-                    # channels of one M-row/half; final_offset is that row/half
-                    # base in the C SMEM. Write them in vsize-wide store_swizzled
-                    # chunks (fp8 vsize=16, so 2 stores). Same swizzle helper as
-                    # the host C descriptor so the two layouts match.
-                    for j in cutlass.range_constexpr(32 // vsize):
-                        vec_f32 = t2r_rmem[j * vsize : j * vsize + vsize]
-                        vec_io = vec_f32.to(c_dtype)
-                        smem_thr_ptr = smem_tile_base.subview(cutlass.Int32(final_offset) + j * vsize)
-                        smem_thr_ptr.data_ptr().store_swizzled(
-                            vec_io,
-                            alignment=64,
-                            swizzle=_c_smem_swizzle(c_dtype, subtile_n),
-                        )
-                elif cutlass.const_expr(not use_stmatrix_epi):
-                    # (4,1) path: 32x32b LDTM gives 1 contiguous row/thread. Each
-                    # lane writes vsize elements per (i, j); tiles cover
-                    # (t2r_inst_repx rows) x (subtile_n cols). The store_swizzled
-                    # pattern is derived from the output dtype (same helper as the
-                    # host C descriptor) so it matches for fp16/bf16 (s64b), fp32
-                    # (s128b) and fp8 at m128/m64+2cta (s32b, subtile_n=32).
-                    for i in cutlass.range_constexpr(t2r_inst_repx // 32):
+                # Wait for MMA warp to commit acc_full for this stage.
+                # try_wait_parity is one non-blocking attempt; loop until the MMA
+                # warp's commit advances the phase.
+                while not prims.mbarrier_try_wait_parity(acc_full_mbar_ptr_stage, current_full_phase_bit, time_limit=10000000):
+                    pass
+
+                # Per-stage TMEM column origin. Lower 16 bits of tmem_raw_addr is
+                # the column id; upper 16 bits is the row id (always 0 for warp 0).
+                base_col_id = (tmem_raw_addr & 0xFFFF) + (current_acc_stage * mma_tiler[1])
+
+                # Per-tile output (im2col store) spatial coords. The 2CTA cluster
+                # splits M (the NZPQ pixel axis) across the pair, so the spatial
+                # coords carry cta_rank. The K-out channel axis (GEMM N) is NOT
+                # split: each CTA's tcgen05 accumulator holds its own M-row band
+                # over the full N columns.
+                m_off_cta = (
+                    mma_tile_coord_mnl[0] * mma_tiler[0] * m_tiles_per_work + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
+                )
+                # Bare output pixels (col-major Q-fastest). No pad/stride: the C
+                # descriptor uses zero corners, so output has no halo concept.
+                m_off_cta += output_tile * mma_tiler[0]
+                div, q_out = divmod(m_off_cta, q_divisor)
+                div, p_out = divmod(div, p_divisor)
+                n_out, z_out = divmod(div, z_divisor)
+                # K-out channel base for this N-tile (no cta_rank, see above).
+                k_off_base = mma_tile_coord_mnl[1] * mma_tiler[1]
+
+                # Subtile loop on the N axis.
+                for subtile_idx in cutlass.range(subtile_cnt):
+                    # Rotate through C SMEM stages so the previous TMA store can
+                    # drain in parallel with the next t2r/r2s.
+                    epi_stage_idx = (epi_stage_idx + 1) % num_c_stage
+
+                    # TMEM -> RMEM: per-warp LDTM. The column origin advances ONLY by
+                    # subtile_n and carries NO warp_n term: tcgen05_ld routes by the
+                    # executing warp's sub-partition, so each warp lands on its own
+                    # N-band without an explicit column add. An explicit warp_n column
+                    # offset would over-shoot into unwritten TMEM (reading back zero).
+                    # The global k128..255 offset is applied on the STORE side
+                    # (band_smem_base + k_off), not here.
+                    tmem = prims.make_tmem_ptr_from_warp_row_col(
+                        tmem_raw_addr,
+                        warp_m_idx,
+                        base_col_id + subtile_idx * subtile_n,
+                        cutlass.Float32,
+                    )
+                    # offset= is mandatory for 16x32bx2 (the fp8 column half-split)
+                    # and rejected for every other shape, so pass it only for fp8.
+                    t2r_rmem = prims.tcgen05_ld(
+                        t2r_inst_shape,
+                        tmem,
+                        num=t2r_inst_repx,
+                        offset=t2r_ld_offset if cutlass.const_expr(use_fp8_simt_epi) else None,
+                    )
+                    # Apply the user-supplied epilogue_op (constexpr fn) on the FP32
+                    # accumulator before casting to the output dtype (defaults to
+                    # identity).
+                    if cutlass.const_expr(first_filter_t == 2):
+                        flag_word = flag_word2
+                        if subtile_idx == 0:
+                            flag_word = flag_word0
+                        elif subtile_idx == 1:
+                            flag_word = flag_word1
+                        corrected = cutlass.Array(cutlass.Float32, 32)
+                        corrected[0:32] = t2r_rmem
+                        for element in cutlass.range_constexpr(32):
+                            if (flag_word & cutlass.Uint32(1 << element)) != 0:
+                                corrected[element] = cutlass.Float32(float("nan"))
+                        t2r_rmem = corrected[0:32]
+                    t2r_rmem = epilogue_op(t2r_rmem)
+
+                    # RMEM -> SMEM. sC is a flat cutlass.Array (c_dtype elements);
+                    # per-stage stride = _c_tile_rows * _epi_subtile_n elems
+                    # (_c_tile_rows = 128 for store_swizzled so cfgC's two N-bands
+                    # both fit; = _epi_m=64 for cfgB stmatrix). Two paths, keyed on
+                    # the datapath predicate (constexpr):
+                    smem_tile_base = sC.subview(epi_stage_idx * (_c_tile_rows * _epi_subtile_n))
+                    if cutlass.const_expr(use_fp8_simt_epi):
+                        # fp8 cfgB SIMT store. This thread holds 32 contiguous
+                        # channels of one M-row/half; final_offset is that row/half
+                        # base in the C SMEM. Write them in vsize-wide store_swizzled
+                        # chunks (fp8 vsize=16, so 2 stores). Same swizzle helper as
+                        # the host C descriptor so the two layouts match.
                         for j in cutlass.range_constexpr(32 // vsize):
-                            vec_f32 = t2r_rmem[i * 32 + j * vsize : i * 32 + j * vsize + vsize]
+                            vec_f32 = t2r_rmem[j * vsize : j * vsize + vsize]
                             vec_io = vec_f32.to(c_dtype)
-                            # offset by elements then take .data_ptr() for the
-                            # cutlass.Pointer that exposes store_swizzled.
-                            smem_thr_ptr = smem_tile_base.subview((tidx + i * 128) * subtile_n + j * vsize)
+                            smem_thr_ptr = smem_tile_base.subview(cutlass.Int32(final_offset) + j * vsize)
                             smem_thr_ptr.data_ptr().store_swizzled(
                                 vec_io,
                                 alignment=64,
                                 swizzle=_c_smem_swizzle(c_dtype, subtile_n),
                             )
-                else:
-                    # per-CTA M=64 + 1cta: LDTM gives 2 interleaved rows/thread,
-                    # which is the 8x8 fragment layout stmatrix expects. One
-                    # stmatrix.8x8.x4 per thread writes a 16-byte fragment (4 i32)
-                    # = 8 f16 or 4 f32, so the per-thread element count tracks the
-                    # C dtype (= LDTM vector length = 128 // width). The C SMEM is
-                    # SW32 (s32b descriptor), so the destination address is
-                    # XOR-permuted by hand (store_swizzled cannot express the
-                    # stmatrix fragment shape). final_offset is hoisted above.
-                    _st_nelem = cutlass.const_expr(128 // c_dtype.width)
-                    acc_f16 = cutlass.Array(c_dtype, _st_nelem, alignment=32)
-                    acc_f16[0:_st_nelem] = t2r_rmem[0:_st_nelem].to(c_dtype)
-                    smem_thr_ptr = smem_tile_base.subview(cutlass.Int32(final_offset))
-                    smem_ptr_raw = smem_thr_ptr.data_ptr()
-                    smem_addr0 = cutlass.Int64(llvm.ptrtoint(cutlass.Int64.mlir_type, smem_ptr_raw))
-                    swz_addr0 = smem_addr0 ^ ((smem_addr0 & _swz_mask) >> _swz_shift)
-                    dst0 = llvm.inttoptr(llvm.PointerType.get(3), swz_addr0.ir_value())
-                    tmp_i32_0 = cutlass.Array(
-                        acc_f16.ir_value(),
-                        dtype=cutlass.Int32,
-                        shape=(4,),
-                        addrspace=acc_f16.space,
-                    )
-                    regs0 = tmp_i32_0[0:4]
-                    prims.stmatrix(
-                        dst0,
-                        [regs0[0], regs0[1], regs0[2], regs0[3]],
-                        stmatrix_layout,
-                        shape=stmatrix_shape,
-                    )
-
-                # Make swizzled SMEM stores visible to the TMA proxy.
-                cute.arch.fence_view_async_shared()
-                prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
-
-                # Band-leader warps issue the raw im2col TMA store. Coord order
-                # mirrors the A-load 5D layout (channel_off, spatial..., batch)
-                # = (k_off, q, p, z, n); see cuda.create_tensor_map_im2col_from_view
-                # docstring (stride-1 dim is the channel axis). The store op has
-                # NO im2col-offset operand, so (s,r,t) are NOT passed — output
-                # spatial offsets are baked into the descriptor's zero corners.
-                # k_off advances by subtile_n per N-subtile (matches the C
-                # descriptor's channels_per_pixel=subtile_n box).
-                #
-                # warp_m_idx==0 picks one leader per N-band: cfgA/cfgB (4,1) ->
-                # warp 0 only, stores all mma_tiler_per_cta_m rows; cfgC (2,2) ->
-                # warps 0 and 2, each stores its 64-row band from a per-band SMEM
-                # offset (warp_n_idx*64 rows) to a k_off shifted by the N-band
-                # width (warp_n_idx*128). The (q,p,z,n) pixel coords are shared by
-                # both bands (the (2,2) split is on the K-out channel axis only).
-                if warp_m_idx == 0:
-                    k_off = k_off_base + warp_n_idx * (mma_tiler[1] // warp_n_count) + subtile_idx * subtile_n
-                    band_smem_base = smem_tile_base.subview(warp_n_idx * mma_tiler_per_cta_m * subtile_n)
-                    if prims.elect_sync():
-                        prims.cp_async_bulk_tensor_global_shared_cta(
-                            tma_c_desc.get_ptr(),
-                            band_smem_base,
-                            (k_off, q_out, p_out, z_out, n_out),
-                            mode=prims.TMAStoreMode.IM2COL,
+                    elif cutlass.const_expr(not use_stmatrix_epi):
+                        # (4,1) path: 32x32b LDTM gives 1 contiguous row/thread. Each
+                        # lane writes vsize elements per (i, j); tiles cover
+                        # (t2r_inst_repx rows) x (subtile_n cols). The store_swizzled
+                        # pattern is derived from the output dtype (same helper as the
+                        # host C descriptor) so it matches for fp16/bf16 (s64b), fp32
+                        # (s128b) and fp8 at m128/m64+2cta (s32b, subtile_n=32).
+                        for i in cutlass.range_constexpr(t2r_inst_repx // 32):
+                            for j in cutlass.range_constexpr(32 // vsize):
+                                vec_f32 = t2r_rmem[i * 32 + j * vsize : i * 32 + j * vsize + vsize]
+                                vec_io = vec_f32.to(c_dtype)
+                                # offset by elements then take .data_ptr() for the
+                                # cutlass.Pointer that exposes store_swizzled.
+                                smem_thr_ptr = smem_tile_base.subview((tidx + i * 128) * subtile_n + j * vsize)
+                                smem_thr_ptr.data_ptr().store_swizzled(
+                                    vec_io,
+                                    alignment=64,
+                                    swizzle=_c_smem_swizzle(c_dtype, subtile_n),
+                                )
+                    else:
+                        # per-CTA M=64 + 1cta: LDTM gives 2 interleaved rows/thread,
+                        # which is the 8x8 fragment layout stmatrix expects. One
+                        # stmatrix.8x8.x4 per thread writes a 16-byte fragment (4 i32)
+                        # = 8 f16 or 4 f32, so the per-thread element count tracks the
+                        # C dtype (= LDTM vector length = 128 // width). The C SMEM is
+                        # SW32 (s32b descriptor), so the destination address is
+                        # XOR-permuted by hand (store_swizzled cannot express the
+                        # stmatrix fragment shape). final_offset is hoisted above.
+                        _st_nelem = cutlass.const_expr(128 // c_dtype.width)
+                        acc_f16 = cutlass.Array(c_dtype, _st_nelem, alignment=32)
+                        acc_f16[0:_st_nelem] = t2r_rmem[0:_st_nelem].to(c_dtype)
+                        smem_thr_ptr = smem_tile_base.subview(cutlass.Int32(final_offset))
+                        smem_ptr_raw = smem_thr_ptr.data_ptr()
+                        smem_addr0 = cutlass.Int64(llvm.ptrtoint(cutlass.Int64.mlir_type, smem_ptr_raw))
+                        swz_addr0 = smem_addr0 ^ ((smem_addr0 & _swz_mask) >> _swz_shift)
+                        dst0 = llvm.inttoptr(llvm.PointerType.get(3), swz_addr0.ir_value())
+                        tmp_i32_0 = cutlass.Array(
+                            acc_f16.ir_value(),
+                            dtype=cutlass.Int32,
+                            shape=(4,),
+                            addrspace=acc_f16.space,
                         )
-                    prims.cp_async_bulk_commit_group()
-                    # Keep at most num_c_stage-1 inflight so the next iteration
-                    # can reuse a drained SMEM stage.
-                    prims.cp_async_bulk_wait_group(num_c_stage - 1, read=True)
+                        regs0 = tmp_i32_0[0:4]
+                        prims.stmatrix(
+                            dst0,
+                            [regs0[0], regs0[1], regs0[2], regs0[3]],
+                            stmatrix_layout,
+                            shape=stmatrix_shape,
+                        )
 
-                prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
+                    # Make swizzled SMEM stores visible to the TMA proxy.
+                    cute.arch.fence_view_async_shared()
+                    prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
 
-            # Signal acc_empty back to the group leader's mbarrier. In 2cta the
-            # mbar lives in the even-rank leader's SMEM and arrive_count was set
-            # to (4 epi warps * 2 CTAs); the per-group leader rank is
-            # (rank // _atom_thr) * _atom_thr (degrades to 0 for the single
-            # group, 2 for group 1, etc.). In 1cta _atom_thr=1 so this is the
-            # CTA's own rank (count 4, own mbar).
-            if prims.elect_sync():
-                leader_cta_rank = (cta_rank_in_cluster // _atom_thr) * _atom_thr
-                mbar_cluster_ptr = prims.mapa(acc_empty_mbar_ptr_stage, leader_cta_rank)
-                prims.mbarrier_arrive(
-                    mbar_cluster_ptr,
-                    count=1,
-                    scope=prims.MemScope.CLUSTER,
-                )
+                    # Band-leader warps issue the raw im2col TMA store. Coord order
+                    # mirrors the A-load 5D layout (channel_off, spatial..., batch)
+                    # = (k_off, q, p, z, n); see cuda.create_tensor_map_im2col_from_view
+                    # docstring (stride-1 dim is the channel axis). The store op has
+                    # NO im2col-offset operand, so (s,r,t) are NOT passed — output
+                    # spatial offsets are baked into the descriptor's zero corners.
+                    # k_off advances by subtile_n per N-subtile (matches the C
+                    # descriptor's channels_per_pixel=subtile_n box).
+                    #
+                    # warp_m_idx==0 picks one leader per N-band: cfgA/cfgB (4,1) ->
+                    # warp 0 only, stores all mma_tiler_per_cta_m rows; cfgC (2,2) ->
+                    # warps 0 and 2, each stores its 64-row band from a per-band SMEM
+                    # offset (warp_n_idx*64 rows) to a k_off shifted by the N-band
+                    # width (warp_n_idx*128). The (q,p,z,n) pixel coords are shared by
+                    # both bands (the (2,2) split is on the K-out channel axis only).
+                    if warp_m_idx == 0:
+                        k_off = k_off_base + warp_n_idx * (mma_tiler[1] // warp_n_count) + subtile_idx * subtile_n
+                        band_smem_base = smem_tile_base.subview(warp_n_idx * mma_tiler_per_cta_m * subtile_n)
+                        if prims.elect_sync():
+                            prims.cp_async_bulk_tensor_global_shared_cta(
+                                tma_c_desc.get_ptr(),
+                                band_smem_base,
+                                (k_off, q_out, p_out, z_out, n_out),
+                                mode=prims.TMAStoreMode.IM2COL,
+                            )
+                        prims.cp_async_bulk_commit_group()
+                        # Keep at most num_c_stage-1 inflight so the next iteration
+                        # can reuse a drained SMEM stage.
+                        prims.cp_async_bulk_wait_group(num_c_stage - 1, read=True)
+
+                    prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
+
+                # Signal acc_empty back to the group leader's mbarrier. In 2cta the
+                # mbar lives in the even-rank leader's SMEM and arrive_count was set
+                # to (4 epi warps * 2 CTAs); the per-group leader rank is
+                # (rank // _atom_thr) * _atom_thr (degrades to 0 for the single
+                # group, 2 for group 1, etc.). In 1cta _atom_thr=1 so this is the
+                # CTA's own rank (count 4, own mbar).
+                if prims.elect_sync():
+                    leader_cta_rank = (cta_rank_in_cluster // _atom_thr) * _atom_thr
+                    mbar_cluster_ptr = prims.mapa(acc_empty_mbar_ptr_stage, leader_cta_rank)
+                    prims.mbarrier_arrive(
+                        mbar_cluster_ptr,
+                        count=1,
+                        scope=prims.MemScope.CLUSTER,
+                    )
 
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
@@ -1039,10 +1100,11 @@ def _check_tensor_alignment(
     if not aligned(ab_dtype, c) or not aligned(c_dtype, k):
         raise testing.CantImplementError(f"C={c} and K={k} must provide 16-byte channel rows")
 
-    # The producer advances filter coordinates once per complete mainloop K
-    # tile. A partial channel tile would need a distinct carry path; decline it
-    # until that path exists instead of skipping filter/channel contributions.
-    if c % channel_tile:
+    # The C96/K192 route keeps a 64-channel tile and compact storage.
+    # Both TMA maps zero-fill its final 32 lanes at each filter position.
+    # C96/K96 uses three full 32-channel tiles.
+    c96_remainder = ab_dtype is cutlass.BFloat16 and c_dtype is cutlass.BFloat16 and c == 96 and k in (96, 192) and channel_tile == 64
+    if c % channel_tile and not c96_remainder:
         raise testing.CantImplementError(f"C={c} must be a multiple of the {channel_tile}-element mainloop tile for {ab_dtype}")
 
 
@@ -1122,7 +1184,7 @@ def _compute_stages(
     """Compute the number of (ACC, A/B, C) stages from SMEM-capacity heuristics.
 
     Byte sizes per stage are passed in (computed by the caller as
-    ``per_cta_M * K_tile * dtype.width // 8``); the remaining SMEM after the
+    ``per_cta_M * k_tile * dtype.width // 8``); the remaining SMEM after the
     mbarrier reserve and the initial C budget is split into A/B stages, then
     leftover SMEM is folded back into extra C stages.
     """
@@ -1170,11 +1232,6 @@ class _PersistentConvSetup:
         self,
         acc_dtype: Type[Numeric],
         tile_config: ConvTileConfig,
-        filter_trs: Tuple[int, int, int],
-        upper_padding_dhw: Tuple[int, int, int],
-        lower_padding_dhw: Tuple[int, int, int],
-        stride_dhw: Tuple[int, int, int],
-        dilation_dhw: Tuple[int, int, int],
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
     ):
@@ -1209,13 +1266,6 @@ class _PersistentConvSetup:
         # --- preferred-cluster overrides ---
         self.preferred_cluster_shape_mn = cluster_shape_mn
         self.fallback_cluster_shape_mn = cluster_shape_mn
-
-        # --- conv parameters for im2col TMA ---
-        self.filter_trs = filter_trs
-        self.upper_padding_dhw = upper_padding_dhw
-        self.lower_padding_dhw = lower_padding_dhw
-        self.stride_dhw = stride_dhw
-        self.dilation_dhw = dilation_dhw
 
     def check_supported_dtypes(
         self,
@@ -1357,6 +1407,11 @@ class _PersistentConvSetup:
         k: int,
         ab_dtype: Type[Numeric],
         c_dtype: Type[Numeric],
+        upper_padding_dhw,
+        lower_padding_dhw,
+        stride_dhw,
+        dilation_dhw,
+        filter_trs,
     ) -> bool:
         """Determine if the given tensor configuration can be implemented."""
         try:
@@ -1378,11 +1433,11 @@ class _PersistentConvSetup:
             # Compute implicit GEMM M
             z, p, q = _compute_zpq(
                 ncdhw[2:],
-                self.filter_trs,
-                self.stride_dhw,
-                self.upper_padding_dhw,
-                self.lower_padding_dhw,
-                self.dilation_dhw,
+                filter_trs,
+                stride_dhw,
+                upper_padding_dhw,
+                lower_padding_dhw,
+                dilation_dhw,
             )
             _check_swizzle_size(
                 ncdhw[0] * z * p * q,
@@ -1471,28 +1526,22 @@ class _FpropKernel:
         self,
         acc_dtype: Type[Numeric],
         tile_config: ConvTileConfig,
-        filter_trs: Tuple[int, int, int],
-        upper_padding_dhw: Tuple[int, int, int],
-        lower_padding_dhw: Tuple[int, int, int],
-        stride_dhw: Tuple[int, int, int],
-        dilation_dhw: Tuple[int, int, int],
         swizzle_size: int = 1,
         raster_along: str = "m",
+        m_tiles_per_work: int = 1,
+        channel_first: bool = False,
     ):
+        self._m_tiles_per_work = m_tiles_per_work
+        self._channel_first = channel_first
         self._setup = _PersistentConvSetup(
             acc_dtype=acc_dtype,
             tile_config=tile_config,
-            filter_trs=filter_trs,
-            upper_padding_dhw=upper_padding_dhw,
-            lower_padding_dhw=lower_padding_dhw,
-            stride_dhw=stride_dhw,
-            dilation_dhw=dilation_dhw,
             swizzle_size=swizzle_size,
             raster_along=raster_along,
         )
 
-    def can_implement(self, ncdhw, k, ab_dtype, c_dtype) -> bool:
-        return self._setup.can_implement(ncdhw, k, ab_dtype, c_dtype)
+    def can_implement(self, ncdhw, k, ab_dtype, c_dtype, *geometry) -> bool:
+        return self._setup.can_implement(ncdhw, k, ab_dtype, c_dtype, *geometry)
 
     @cute.jit
     def __call__(
@@ -1502,23 +1551,37 @@ class _FpropKernel:
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream,
+        upper_padding_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        lower_padding_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        stride_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        dilation_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        padded_plane_flags=None,
     ):
         """Materialise kernel arguments from setup attrs and launch the device kernel."""
         p = self._setup
         # Derive the integer mma/stage/byte config.
         p._setup_conv_input_attrs(a, b, c)
         p._setup_attributes()
+        # Reuse each B tile across four adjacent output-M tiles. Keep four
+        # independent accumulators, so every output retains the original C32
+        # reduction order. Five AB stages leave room for all four A tiles.
+        # This schedule is qualified for the two-CTA C96/K96 BF16 geometry;
+        # single-frame outputs and other geometries retain one tile per work.
+        m_tiles_per_work = self._m_tiles_per_work
+        if cutlass.const_expr(m_tiles_per_work == 4):
+            p.num_ab_stage = 5
+            p.num_acc_stage = 4
 
         # Host TMA descriptors, built directly from the raw input tensors via
         # cuda.create_tensor_map_*.
-        T_filter, R_filter, S_filter = p.filter_trs
-        upad_d, upad_h, upad_w = p.upper_padding_dhw
-        lpad_d, lpad_h, lpad_w = p.lower_padding_dhw
-        dil_d, dil_h, dil_w = p.dilation_dhw
+        t_filter, r_filter, s_filter = b.shape[1:4]
+        upad_d, upad_h, upad_w = upper_padding_dhw
+        lpad_d, lpad_h, lpad_w = lower_padding_dhw
+        dil_d, dil_h, dil_w = dilation_dhw
         # Per-CTA M tile (use_2cta_instrs splits M between 2 CTAs along cluster_m).
         mma_tiler_per_cta_m = p.mma_tiler[0] // 2 if p.use_2cta_instrs else p.mma_tiler[0]
-        # mma_tiler[2] is a sub-tuple (K_tile,) after _setup_attributes.
+        # mma_tiler[2] is a sub-tuple (k_tile,) after _setup_attributes.
         k_tile = cute.size(p.mma_tiler, mode=[2])
         # Epilogue subtile width (K-mode of NZPQK), from the shared datapath
         # descriptor. Must match the device epilogue + the C descriptor swizzle
@@ -1546,25 +1609,25 @@ class _FpropKernel:
             global_strides=tuple(a.stride[i] * p.a_dtype.width // 128 for i in (3, 2, 1, 0)),
             lower_corner=[-lpad_w, -lpad_h, -lpad_d],
             upper_corner=[
-                upad_w - (S_filter - 1) * dil_w,
-                upad_h - (R_filter - 1) * dil_h,
-                upad_d - (T_filter - 1) * dil_d,
+                upad_w - (s_filter - 1) * dil_w,
+                upad_h - (r_filter - 1) * dil_h,
+                upad_d - (t_filter - 1) * dil_d,
             ],
             channels_per_pixel=k_tile,
             pixels_per_column=mma_tiler_per_cta_m,
-            traversal_strides=(1, p.stride_dhw[2], p.stride_dhw[1], p.stride_dhw[0], 1),
-            swizzle=cuda.TensorMapSwizzle.s128b,
+            traversal_strides=(1, stride_dhw[2], stride_dhw[1], stride_dhw[0], 1),
+            swizzle=cuda.TensorMapSwizzle.s64b if p.tile_config.cta_tile_k_bytes == 64 else cuda.TensorMapSwizzle.s128b,
         )
 
         # Filter B: KTRSC raw, tiled descriptor.
-        # box_dims is in tensor mode order (K, T, R, S, C). When C >= K_tile,
+        # box_dims is in tensor mode order (K, T, R, S, C). When C >= k_tile,
         # the GEMM-K tile fits inside C alone and (T,R,S) box dims are 1.
         n_per_cta = p.mma_tiler[1] // 2 if p.use_2cta_instrs else p.mma_tiler[1]
         tma_b_desc = cuda.create_tensor_map_tiled_from_view(
             b,
             box_dims=(n_per_cta, 1, 1, 1, k_tile),
             stride_order=(4, 3, 2, 1, 0),
-            swizzle=cuda.TensorMapSwizzle.s128b,
+            swizzle=cuda.TensorMapSwizzle.s64b if p.tile_config.cta_tile_k_bytes == 64 else cuda.TensorMapSwizzle.s128b,
         )
 
         # Output C: NZPQK raw, im2col store descriptor with zero corners.
@@ -1592,8 +1655,14 @@ class _FpropKernel:
         n_total = c.shape[4]
         cta_m = p.cta_tile_shape_mnk[0]
         cta_n = p.cta_tile_shape_mnk[1]
+        m_tile_count = (m_total + cta_m - 1) // cta_m
+        if cutlass.const_expr(m_tiles_per_work > 1):
+            # A work item is one two-CTA group covering four M tiles. Round
+            # the tail to a complete group; TMA zero-fills/drops OOB lanes.
+            rows_per_work = cta_m * 2 * m_tiles_per_work
+            m_tile_count = ((m_total + rows_per_work - 1) // rows_per_work) * 2
         num_ctas_mnl = (
-            (m_total + cta_m - 1) // cta_m,
+            m_tile_count,
             (n_total + cta_n - 1) // cta_n,
             1,
         )
@@ -1611,23 +1680,34 @@ class _FpropKernel:
             256 // p.a_dtype.width,
         )
 
-        # GEMM-K tile count: GEMM-K = T*R*S*C, tiled by mma_tiler_k.
+        # The producer visits each selected filter/channel-tile combination.
+        # Round C before multiplying by TRS: a partial channel tile is padded
+        # independently at every filter position by TMA's out-of-bounds fill.
         mma_tiler_k = cute.size(p.mma_tiler, mode=[2])
-        gemm_k = T_filter * R_filter * S_filter * a.shape[4]
-        k_tile_cnt = (gemm_k + mma_tiler_k - 1) // mma_tiler_k
+        channel_tiles = (a.shape[4] + mma_tiler_k - 1) // mma_tiler_k
+        # The scan evaluates the nonfinite effect of every skipped zero product.
+        # It runs on every execute, including changed-weight graph replays.
+        first_filter_t = 2 if cutlass.const_expr(padded_plane_flags is not None) else 0
+        k_tile_cnt = (t_filter - first_filter_t) * r_filter * s_filter * channel_tiles
 
         # Output spatial dims for the im2col producer/epilogue coord decode.
         # c.shape = (N, Z, P, Q, K); filter_trs / padding / stride / dilation
-        # live on the PersistentConvSetup instance.
-        zpq = (c.shape[1], c.shape[2], c.shape[3])
+        # come from runtime arguments and tensor metadata.
+        zpq_divisors = tuple(cute.fast_divmod_create_divisor_v2(x) for x in (c.shape[1:4]))
 
         # Launch the kernel (argument order matches the device kernel
         # signature).
+        if cutlass.const_expr(padded_plane_flags is not None):
+            _scan_padded_filter_planes(b, padded_plane_flags).launch(grid=(96, 1, 1), block=(32, 1, 1), stream=stream)
         _kernel(
             tile_sched_params,
             p.mma_tiler,
             mma_inst_shape_mnk,
             k_tile_cnt,
+            channel_tiles,
+            m_tiles_per_work,
+            first_filter_t,
+            self._channel_first,
             p.num_ab_stage,
             p.num_acc_stage,
             p.num_c_stage,
@@ -1635,15 +1715,16 @@ class _FpropKernel:
             p.a_dtype,
             p.c_dtype,
             p.acc_dtype,
-            p.lower_padding_dhw,
-            p.stride_dhw,
-            p.dilation_dhw,
-            zpq,
-            p.filter_trs,
+            lower_padding_dhw,
+            stride_dhw,
+            dilation_dhw,
+            zpq_divisors,
+            (t_filter, r_filter, s_filter),
             tma_a_desc,
             tma_b_desc,
             tma_c_desc,
             epilogue_op,
+            padded_plane_flags,
         ).launch(
             grid=grid,
             block=[p.threads_per_cta, 1, 1],
@@ -1668,28 +1749,41 @@ _DEFAULT_DILATION: Tuple[int, int, int] = (1, 1, 1)
 _DEFAULT_DTYPE: Type[Numeric] = cutlass.BFloat16
 
 
-def _dense_config_violation(tile_config: ConvTileConfig, channel_bytes: int) -> str | None:
+def _dense_config_violation(tile_config: ConvTileConfig, channel_bytes: int, *, allow_c96: bool = False) -> str | None:
     """Return why a tile cannot implement dense convolution, if anything."""
-    if tile_config.cta_tile_k_bytes != 128:
+    if tile_config.cta_tile_k_bytes != 128 and not (allow_c96 and tile_config.cta_tile_k_bytes == 64):
         return f"CTA K must be 128 bytes, got {tile_config.cta_tile_k_bytes}"
     if channel_bytes <= 0:
         return f"channel_bytes must be positive, got {channel_bytes}"
-    if channel_bytes % tile_config.cta_tile_k_bytes:
+    if channel_bytes % tile_config.cta_tile_k_bytes and not allow_c96:
         return f"channel_bytes={channel_bytes} must be divisible by CTA K={tile_config.cta_tile_k_bytes} bytes"
     if tile_config.cta_tile_m == 64 and tile_config.cta_group == 2 and tile_config.cta_tile_n % 64:
         return f"M=64 2-CTA requires CTA N divisible by 64, got {tile_config.cta_tile_n}"
     return None
 
 
-def _is_dense_selection_candidate(tile_config: ConvTileConfig, implicit_m: int, output_n: int, channel_bytes: int) -> bool:
+def _is_dense_selection_candidate(tile_config: ConvTileConfig, implicit_m: int, output_n: int, channel_bytes: int, *, allow_c96: bool = False) -> bool:
     """Apply dense compatibility plus the automatic-selection axes."""
-    n_choices = (128, 256) if output_n >= 512 else (32, 64, 128, 256)
+    # C96 uses an exact K96/K192 output tile to avoid unused MMA columns.
+    n_choices = (output_n,) if allow_c96 else ((128, 256) if output_n >= 512 else (32, 64, 128, 256))
     return (
-        _dense_config_violation(tile_config, channel_bytes) is None
+        _dense_config_violation(tile_config, channel_bytes, allow_c96=allow_c96) is None
+        and tile_config.cta_tile_k_bytes == (64 if allow_c96 and output_n == 96 else 128)
         and tile_config.cta_tile_m == 128
         and tile_config.cta_group == (2 if implicit_m > 128 else 1)
         and tile_config.cta_tile_n in n_choices
     )
+
+
+@dataclass(frozen=True)
+class _PaddedFrameConv:
+    """Scan and convolution artifact; all mutable flags belong to the caller."""
+
+    launch: object
+    workspace_bytes: int = 96 * 4
+
+    def __call__(self, image, weight, output, stream, upper_padding_dhw, lower_padding_dhw, stride_dhw, dilation_dhw, flags):
+        self.launch(image, weight, output, stream, upper_padding_dhw, lower_padding_dhw, stride_dhw, dilation_dhw, flags)
 
 
 def compile(
@@ -1705,24 +1799,65 @@ def compile(
     c_dtype: Type[Numeric] = _DEFAULT_DTYPE,
     tile_config: ConvTileConfig | None = None,
 ):  # noqa: A001
-    """Compile the SM100 fprop kernel for the requested convolution.
+    """Select a tile and compile a convolution artifact with runtime geometry.
 
-    The shape is explicit because im2col TMA descriptors bake it into the
-    artifact. Padding, stride, and dilation are likewise plan-time
-    specializations. Input/output storage dtypes and an explicitly supplied
-    ``tile_config`` are specialized independently; when no config is supplied,
-    the shared predicate-based selector chooses one from the implicit-GEMM
-    shape. The accumulator remains FP32. Each build device compiles its own
-    artifact for its own target (``_cutedsl.build_target``).
+    Shapes, padding, stride, and dilation select the tile but do not specialize
+    the artifact. Dtypes, epilogue, resolved tile, build device, and GPU target
+    define the compile-cache key. C96 additionally specializes its channel sizes,
+    grouped-output schedule, and padded-plane scan. Graph geometry is validated
+    by the engine.
     """
+    N, C, D, H, W = ncdhw
+    K, T, R, S = ktrs
+    Z, P, Q = _compute_zpq((D, H, W), (T, R, S), stride_dhw, upper_padding_dhw, lower_padding_dhw, dilation_dhw)
+    implicit_m = N * Z * P * Q
+    implicit_k = T * R * S * C
+    channel_bytes = C * ab_dtype.width // 8
+    allow_c96 = ab_dtype is cutlass.BFloat16 and c_dtype is cutlass.BFloat16 and C == 96 and K in (96, 192)
+    if tile_config is None:
+        tile_config = _get_config(
+            implicit_m,
+            K,
+            implicit_k,
+            predicate=lambda config: _is_dense_selection_candidate(config, implicit_m, K, channel_bytes, allow_c96=allow_c96),
+        )
+    else:
+        violation = _dense_config_violation(tile_config, channel_bytes, allow_c96=allow_c96)
+        if violation is not None:
+            raise ValueError(f"dense convolution config {tile_config.name} is incompatible: {violation}")
+
+    fprop_op = _FpropKernel(cutlass.Float32, tile_config)
+    if not fprop_op.can_implement(ncdhw, K, ab_dtype, c_dtype, upper_padding_dhw, lower_padding_dhw, stride_dhw, dilation_dhw, ktrs[1:]):
+        raise testing.CantImplementError(
+            f"Config {tile_config.name} not implementable: ncdhw={ncdhw}, ktrs={ktrs}, upper_padding_dhw={upper_padding_dhw}, "
+            f"lower_padding_dhw={lower_padding_dhw}, stride_dhw={stride_dhw}, dilation_dhw={dilation_dhw}"
+        )
+    use_padded_plane_scan = (
+        allow_c96
+        and K == 96
+        and D == Z == 1
+        and (T, R, S) == (3, 3, 3)
+        and lower_padding_dhw == (2, 1, 1)
+        and upper_padding_dhw == (0, 1, 1)
+        and stride_dhw == dilation_dhw == (1, 1, 1)
+        and epilogue == "identity"
+        and tile_config.cta_tile_m == 128
+        and tile_config.cta_tile_n == 96
+    )
+    m_tiles_per_work = 1
+    if (
+        allow_c96
+        and K == 96
+        and Z > 1
+        and tile_config.cta_tile_m == 128
+        and tile_config.cta_tile_n == 96
+        and tile_config.cta_tile_k_bytes == 64
+        and tile_config.cta_group == 2
+        and tile_config.cluster_shape_mn == (2, 1)
+    ):
+        m_tiles_per_work = 4
     device, gpu_arch = build_target()
     return _compile_cached(
-        ncdhw,
-        ktrs,
-        upper_padding_dhw,
-        lower_padding_dhw,
-        stride_dhw,
-        dilation_dhw,
         epilogue,
         epilogue_attrs,
         ab_dtype,
@@ -1730,70 +1865,70 @@ def compile(
         tile_config,
         device=device,
         gpu_arch=gpu_arch,
+        c96_output_channels=K if allow_c96 else 0,
+        m_tiles_per_work=m_tiles_per_work,
+        use_padded_plane_scan=use_padded_plane_scan,
     )
 
 
 @lru_cache(maxsize=None)
 def _compile_cached(
-    ncdhw: Tuple[int, int, int, int, int],
-    ktrs: Tuple[int, int, int, int],
-    upper_padding_dhw: Tuple[int, int, int],
-    lower_padding_dhw: Tuple[int, int, int],
-    stride_dhw: Tuple[int, int, int],
-    dilation_dhw: Tuple[int, int, int],
     epilogue: str,
     epilogue_attrs: tuple[tuple[str, float], ...],
     ab_dtype: Type[Numeric],
     c_dtype: Type[Numeric],
-    tile_config: ConvTileConfig | None,
+    tile_config: ConvTileConfig,
     *,
     device: int,
     gpu_arch: str,
+    c96_output_channels: int = 0,
+    m_tiles_per_work: int = 1,
+    use_padded_plane_scan: bool = False,
 ):
-    acc_dtype = cutlass.Float32
-    epilogue_op = get_epilogue_op(epilogue, epilogue_attrs)
-
-    N, C, D, H, W = ncdhw
-    K, T, R, S = ktrs
-    Z, P, Q = _compute_zpq((D, H, W), (T, R, S), stride_dhw, upper_padding_dhw, lower_padding_dhw, dilation_dhw)
-    implicit_m = N * Z * P * Q
-    implicit_k = T * R * S * C
-    channel_bytes = C * ab_dtype.width // 8
-    if tile_config is None:
-        tile_config = _get_config(
-            implicit_m,
-            K,
-            implicit_k,
-            predicate=lambda config: _is_dense_selection_candidate(config, implicit_m, K, channel_bytes),
-        )
-    else:
-        violation = _dense_config_violation(tile_config, channel_bytes)
-        if violation is not None:
-            raise ValueError(f"dense convolution config {tile_config.name} is incompatible: {violation}")
-
-    # NDHWC + KTRSC + NZPQK fake tensors (channel/K-fastest, contiguous layout).
-    fake_a = make_fake_compact_tensor(ab_dtype, (N, D, H, W, C), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
-    fake_b = make_fake_compact_tensor(ab_dtype, (K, T, R, S, C), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
-    fake_c = make_fake_compact_tensor(c_dtype, (N, Z, P, Q, K), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
-
-    fprop_op = _FpropKernel(
-        acc_dtype=acc_dtype,
-        tile_config=tile_config,
-        filter_trs=ktrs[1:],
-        upper_padding_dhw=upper_padding_dhw,
-        lower_padding_dhw=lower_padding_dhw,
-        stride_dhw=stride_dhw,
-        dilation_dhw=dilation_dhw,
-    )
-    if not fprop_op.can_implement(ncdhw, ktrs[0], ab_dtype, c_dtype):
-        raise testing.CantImplementError(
-            f"Config {tile_config.name} not implementable: ncdhw={ncdhw}, ktrs={ktrs}, upper_padding_dhw={upper_padding_dhw}, "
-            f"lower_padding_dhw={lower_padding_dhw}, stride_dhw={stride_dhw}, dilation_dhw={dilation_dhw}"
-        )
-
-    cluster_size = tile_config.cluster_shape_mn[0] * tile_config.cluster_shape_mn[1]
+    """Reuse runtime geometry within each device, target, and C96 schedule variant."""
     with device_context(device):
+        epilogue_op = get_epilogue_op(epilogue, epilogue_attrs)
+        fprop_op = _FpropKernel(
+            cutlass.Float32,
+            tile_config,
+            m_tiles_per_work=m_tiles_per_work,
+            channel_first=c96_output_channels == 96,
+        )
+        cluster_size = tile_config.cluster_shape_mn[0] * tile_config.cluster_shape_mn[1]
+        fake_N = cute.sym_int()
+        # C96 can have a partial C64 tile; its channels must not inherit the
+        # generic full-channel-tile divisibility promise. Spatial axes stay dynamic.
+        fake_C = 96 if c96_output_channels else cute.sym_int(divisibility=tile_config.cta_tile_k(ab_dtype.width))
+        fake_K = c96_output_channels or cute.sym_int(divisibility=128 // c_dtype.width)
+        fake_ndhwc = (fake_N, cute.sym_int(), cute.sym_int(), cute.sym_int(), fake_C)
+        fake_ktrsc = (fake_K, cute.sym_int(), cute.sym_int(), cute.sym_int(), fake_C)
+        fake_nzpqk = (fake_N, cute.sym_int(), cute.sym_int(), cute.sym_int(), fake_K)
+
+        fake_a = make_fake_compact_tensor(ab_dtype, fake_ndhwc, stride_order=(4, 3, 2, 1, 0), assumed_align=16)
+        fake_b = make_fake_compact_tensor(ab_dtype, fake_ktrsc, stride_order=(4, 3, 2, 1, 0), assumed_align=16)
+        fake_c = make_fake_compact_tensor(c_dtype, fake_nzpqk, stride_order=(4, 3, 2, 1, 0), assumed_align=16)
+        runtime_tuple = (cutlass.Int32(0),) * 3
+
         max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        if use_padded_plane_scan:
+            flags = make_fake_compact_tensor(cutlass.Int32, (96,), assumed_align=16)
+            return _PaddedFrameConv(
+                cute.compile(
+                    fprop_op,
+                    fake_a,
+                    fake_b,
+                    fake_c,
+                    max_active_clusters,
+                    make_fake_stream(),
+                    runtime_tuple,
+                    runtime_tuple,
+                    runtime_tuple,
+                    runtime_tuple,
+                    epilogue_op,
+                    flags,
+                    options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+                )
+            )
         return cute.compile(
             fprop_op,
             fake_a,
@@ -1801,6 +1936,10 @@ def _compile_cached(
             fake_c,
             max_active_clusters,
             make_fake_stream(),
+            runtime_tuple,
+            runtime_tuple,
+            runtime_tuple,
+            runtime_tuple,
             epilogue_op,
             options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
         )

@@ -22,6 +22,7 @@ def _bind(monkeypatch, tensor, *, token_major, graph_storage=True, tokens=5):
     # kernel. Stop only after Stats has passed its shape/stride/capacity checks.
     api = object.__new__(api_dsl.SdpaFwdDslSm80)
     api.paged_page_size = 0
+    api.has_sink = False
     device = torch.device("cpu")
     for name in ("q", "k", "v", "o"):
         setattr(api, name + "_desc", SimpleNamespace(name=name, shape=(2, 2, 4, 8), stride=(64, 8, 16, 1), dtype=torch.float16, device=device))

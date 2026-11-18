@@ -58,10 +58,16 @@ def test_missing_required_host_argument_still_rejects(slot):
 
 
 @pytest.mark.L0
-def test_sm107_dense_only_host_cannot_bind_paged_plan():
+@pytest.mark.parametrize("slot", ["block_table_ptr", "table_strides"])
+def test_sm107_dense_only_host_cannot_bind_paged_plan(slot):
     s, _, _, _ = _prefill_fixture(256, 256, False, 1, "bfloat16", arch="sm107")
+    # The shared host now also serves paged D128. Model a host missing a
+    # required page-table argument instead of assuming this flavor lacks it.
+    pos = s.order.index(slot)
+    s.order.pop(pos)
+    s.template.pop(pos)
     s.paged = True
-    with pytest.raises(ValueError, match="no argument block_table_ptr"):
+    with pytest.raises(ValueError, match="no argument " + slot):
         cudnn._pybind_module._SdpaDenseBinder(s)
 
 

@@ -258,6 +258,14 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
 
 
 def main() -> None:
+    if not torch.cuda.is_available():
+        print("[06] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[06] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     _dense_case()
     _block_scale_case("nvfp4")
     _block_scale_case("mxfp8")

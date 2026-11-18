@@ -1,0 +1,1340 @@
+{
+  "backend_revision": "189b7430650dba30f036afbcaa0f83eaef8a6632",
+  "source": "scripts/levels.layer",
+  "source_sha256": "15b0bd87c29fb1854ae78f1616d7ee7b4b565610d3b504465f6ac2a43f584140",
+  "active_checkout_named_cases": 58,
+  "cases": [
+    {
+      "name": "L1_causal_conv1d_fwd_fp32",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2173,
+      "definition": "\"L1_causal_conv1d_fwd_fp32\"  = L1_req * R:causalconv1d * P:s * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_fp32",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 10,
+      "min_device_version": 0,
+      "source_line": 2174,
+      "definition": "\"L3_causal_conv1d_fwd_fp32\"  = L3_req * R:causalconv1d * P:s * n:64 * c:768 * w:256 * r:7 * N:10 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_fwd_fp64",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2177,
+      "definition": "\"L1_causal_conv1d_fwd_fp64\"  = L1_req * R:causalconv1d * P:d * n:2 * c:8 * w:32 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_fwd_fp16",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2180,
+      "definition": "\"L1_causal_conv1d_fwd_fp16\"  = L1_req * R:causalconv1d * Pin:h * Pcomp:s * Pout:h * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_fp16",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 10,
+      "min_device_version": 0,
+      "source_line": 2181,
+      "definition": "\"L3_causal_conv1d_fwd_fp16\"  = L3_req * R:causalconv1d * Pin:h * Pcomp:s * Pout:h * n:64 * c:768 * w:256 * r:7 * N:10 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_fwd_bf16",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2184,
+      "definition": "\"L1_causal_conv1d_fwd_bf16\"  = L1_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_bf16",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 10,
+      "min_device_version": 0,
+      "source_line": 2185,
+      "definition": "\"L3_causal_conv1d_fwd_bf16\"  = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:7 * N:10 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_k4",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        4096
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2188,
+      "definition": "\"L3_causal_conv1d_fwd_k4\"   = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:4096 * r:4 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_k3",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2189,
+      "definition": "\"L3_causal_conv1d_fwd_k3\"   = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:4096 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_k8",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 8,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2190,
+      "definition": "\"L3_causal_conv1d_fwd_k8\"   = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:4096 * r:8 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_fwd_silu_fp32",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2193,
+      "definition": "\"L1_causal_conv1d_fwd_silu_fp32\" = L1_req * R:causalconv1d * P:s * n:64 * c:768 * w:256 * r:4 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_fwd_silu_bf16",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2194,
+      "definition": "\"L1_causal_conv1d_fwd_silu_bf16\" = L1_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:4 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_fwd_silu_fp64",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2195,
+      "definition": "\"L1_causal_conv1d_fwd_silu_fp64\" = L1_req * R:causalconv1d * P:d * n:2 * c:8 * w:32 * r:4 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_fp32",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2198,
+      "definition": "\"L1_causal_conv1d_bwd_fp32\"  = L1_req * R:causalconv1dbwd * P:s * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_fp32",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 10,
+      "min_device_version": 0,
+      "source_line": 2199,
+      "definition": "\"L3_causal_conv1d_bwd_fp32\"  = L3_req * R:causalconv1dbwd * P:s * n:64 * c:768 * w:256 * r:7 * N:10 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_fp64",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2202,
+      "definition": "\"L1_causal_conv1d_bwd_fp64\"  = L1_req * R:causalconv1dbwd * P:d * n:2 * c:8 * w:32 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_fp16",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2205,
+      "definition": "\"L1_causal_conv1d_bwd_fp16\"  = L1_req * R:causalconv1dbwd * Pin:h * Pcomp:s * Pout:h * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_fp16",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 10,
+      "min_device_version": 0,
+      "source_line": 2206,
+      "definition": "\"L3_causal_conv1d_bwd_fp16\"  = L3_req * R:causalconv1dbwd * Pin:h * Pcomp:s * Pout:h * n:64 * c:768 * w:256 * r:7 * N:10 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_bf16",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2209,
+      "definition": "\"L1_causal_conv1d_bwd_bf16\"  = L1_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_bf16",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 10,
+      "min_device_version": 0,
+      "source_line": 2210,
+      "definition": "\"L3_causal_conv1d_bwd_bf16\"  = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:7 * N:10 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_k4",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        4096
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2213,
+      "definition": "\"L3_causal_conv1d_bwd_k4\"   = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:4096 * r:4 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_k3",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2214,
+      "definition": "\"L3_causal_conv1d_bwd_k3\"   = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:4096 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_k8",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 8,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2215,
+      "definition": "\"L3_causal_conv1d_bwd_k8\"   = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:4096 * r:8 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_silu_fp32",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2218,
+      "definition": "\"L1_causal_conv1d_bwd_silu_fp32\" = L1_req * R:causalconv1dbwd * P:s * n:64 * c:768 * w:256 * r:4 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_silu_bf16",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2219,
+      "definition": "\"L1_causal_conv1d_bwd_silu_bf16\" = L1_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:4 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_bwd_silu_fp64",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2220,
+      "definition": "\"L1_causal_conv1d_bwd_silu_fp64\" = L1_req * R:causalconv1dbwd * P:d * n:2 * c:8 * w:32 * r:4 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_cuhyena1",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        1024,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2227,
+      "definition": "\"L3_causal_conv1d_fwd_cuhyena1\" = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:8192 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_cuhyena1",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        1024,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2228,
+      "definition": "\"L3_causal_conv1d_bwd_cuhyena1\" = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:8192 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_cuhyena2",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        1024,
+        510
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2231,
+      "definition": "\"L3_causal_conv1d_fwd_cuhyena2\" = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:510 * r:4 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_cuhyena2",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        1024,
+        510
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2232,
+      "definition": "\"L3_causal_conv1d_bwd_cuhyena2\" = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:510 * r:4 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_cuhyena3",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        4096,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2235,
+      "definition": "\"L3_causal_conv1d_fwd_cuhyena3\" = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:4096 * w:8192 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_cuhyena3",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        4096,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2236,
+      "definition": "\"L3_causal_conv1d_bwd_cuhyena3\" = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:4096 * w:8192 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_cuhyena4",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        2,
+        4096,
+        510
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2239,
+      "definition": "\"L3_causal_conv1d_fwd_cuhyena4\" = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:4096 * w:510 * r:4 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_cuhyena4",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        2,
+        4096,
+        510
+      ],
+      "width": 4,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2240,
+      "definition": "\"L3_causal_conv1d_bwd_cuhyena4\" = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:4096 * w:510 * r:4 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_fwd_cuhyena_benchmark",
+      "family": "ncw",
+      "direction": "forward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2243,
+      "definition": "\"L3_causal_conv1d_fwd_cuhyena_benchmark\" = L3_req * R:causalconv1d * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_bwd_cuhyena_benchmark",
+      "family": "ncw",
+      "direction": "backward",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2244,
+      "definition": "\"L3_causal_conv1d_bwd_cuhyena_benchmark\" = L3_req * R:causalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:64 * c:768 * w:256 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_nwh_fwd_cuhyena1",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        1024,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2367,
+      "definition": "\"L3_causal_conv1d_nwh_fwd_cuhyena1\" = L3_req * R:causalconv1dnwh * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:8192 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_nwh_bwd_cuhyena1",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        1024,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2368,
+      "definition": "\"L3_causal_conv1d_nwh_bwd_cuhyena1\" = L3_req * R:causalconv1dnwhbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:8192 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_fp32",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2371,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_fp32\" = L1_req * R:causalconv1dnwh * P:s * n:2 * c:64 * w:256 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_fp32",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2372,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_fp32\" = L1_req * R:causalconv1dnwhbwd * P:s * n:2 * c:64 * w:256 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_silu_fp32",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2373,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_silu_fp32\" = L1_req * R:causalconv1dnwh * P:s * n:2 * c:64 * w:256 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_silu_fp32",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2374,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_silu_fp32\" = L1_req * R:causalconv1dnwhbwd * P:s * n:2 * c:64 * w:256 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_fp64",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2377,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_fp64\" = L1_req * R:causalconv1dnwh * P:d * n:2 * c:8 * w:32 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_fp64",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2378,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_fp64\" = L1_req * R:causalconv1dnwhbwd * P:d * n:2 * c:8 * w:32 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_silu_fp64",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2379,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_silu_fp64\" = L1_req * R:causalconv1dnwh * P:d * n:2 * c:8 * w:32 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_silu_fp64",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        8,
+        32
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float64",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2380,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_silu_fp64\" = L1_req * R:causalconv1dnwhbwd * P:d * n:2 * c:8 * w:32 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_fp16",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2383,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_fp16\" = L1_req * R:causalconv1dnwh * Pin:h * Pcomp:s * Pout:h * n:2 * c:64 * w:256 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_fp16",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2384,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_fp16\" = L1_req * R:causalconv1dnwhbwd * Pin:h * Pcomp:s * Pout:h * n:2 * c:64 * w:256 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_bf16",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2387,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_bf16\" = L1_req * R:causalconv1dnwh * Pin:g * Pcomp:s * Pout:g * n:2 * c:64 * w:256 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_bf16",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2388,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_bf16\" = L1_req * R:causalconv1dnwhbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:64 * w:256 * r:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_fwd_silu_bf16",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2389,
+      "definition": "\"L1_causal_conv1d_nwh_fwd_silu_bf16\" = L1_req * R:causalconv1dnwh * Pin:g * Pcomp:s * Pout:g * n:2 * c:64 * w:256 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_bwd_silu_bf16",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2390,
+      "definition": "\"L1_causal_conv1d_nwh_bwd_silu_bf16\" = L1_req * R:causalconv1dnwhbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:64 * w:256 * r:3 * mode:1 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_nwh_fwd_k7",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        768,
+        539
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2393,
+      "definition": "\"L3_causal_conv1d_nwh_fwd_k7\" = L3_req * R:causalconv1dnwh * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:539 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_nwh_fwd_k16",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 16,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2394,
+      "definition": "\"L3_causal_conv1d_nwh_fwd_k16\" = L3_req * R:causalconv1dnwh * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:256 * r:16 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_causal_conv1d_nwh_bwd_k7",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        2,
+        768,
+        539
+      ],
+      "width": 7,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2395,
+      "definition": "\"L3_causal_conv1d_nwh_bwd_k7\" = L3_req * R:causalconv1dnwhbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:539 * r:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_seqpar_fwd_fp32_k16",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        1,
+        64,
+        539
+      ],
+      "width": 16,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 800,
+      "source_line": 2400,
+      "definition": "\"L1_causal_conv1d_nwh_seqpar_fwd_fp32_k16\" = L1_req * R:causalconv1dnwh * P:s * n:1 * c:64 * w:539 * r:16 * N:1 * gpuRef: * minDevVer:800"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_seqpar_bwd_silu_fp32_k16",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        1,
+        64,
+        539
+      ],
+      "width": 16,
+      "mixer_width": null,
+      "dtype": "float32",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 800,
+      "source_line": 2401,
+      "definition": "\"L1_causal_conv1d_nwh_seqpar_bwd_silu_fp32_k16\" = L1_req * R:causalconv1dnwhbwd * P:s * n:1 * c:64 * w:539 * r:16 * mode:1 * N:1 * gpuRef: * minDevVer:800"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_seqpar_fwd_fp16_k32",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        1,
+        64,
+        539
+      ],
+      "width": 32,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 800,
+      "source_line": 2402,
+      "definition": "\"L1_causal_conv1d_nwh_seqpar_fwd_fp16_k32\" = L1_req * R:causalconv1dnwh * Pin:h * Pcomp:s * Pout:h * n:1 * c:64 * w:539 * r:32 * N:1 * gpuRef: * minDevVer:800"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_seqpar_bwd_silu_fp16_k32",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        1,
+        64,
+        539
+      ],
+      "width": 32,
+      "mixer_width": null,
+      "dtype": "float16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 800,
+      "source_line": 2403,
+      "definition": "\"L1_causal_conv1d_nwh_seqpar_bwd_silu_fp16_k32\" = L1_req * R:causalconv1dnwhbwd * Pin:h * Pcomp:s * Pout:h * n:1 * c:64 * w:539 * r:32 * mode:1 * N:1 * gpuRef: * minDevVer:800"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_seqpar_fwd_silu_bf16_k32",
+      "family": "nwh",
+      "direction": "forward",
+      "shape": [
+        1,
+        64,
+        539
+      ],
+      "width": 32,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": true,
+      "iterations": 1,
+      "min_device_version": 800,
+      "source_line": 2404,
+      "definition": "\"L1_causal_conv1d_nwh_seqpar_fwd_silu_bf16_k32\" = L1_req * R:causalconv1dnwh * Pin:g * Pcomp:s * Pout:g * n:1 * c:64 * w:539 * r:32 * mode:1 * N:1 * gpuRef: * minDevVer:800"
+    },
+    {
+      "name": "L1_causal_conv1d_nwh_seqpar_bwd_bf16_k32",
+      "family": "nwh",
+      "direction": "backward",
+      "shape": [
+        1,
+        64,
+        539
+      ],
+      "width": 32,
+      "mixer_width": null,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 800,
+      "source_line": 2405,
+      "definition": "\"L1_causal_conv1d_nwh_seqpar_bwd_bf16_k32\" = L1_req * R:causalconv1dnwhbwd * Pin:g * Pcomp:s * Pout:g * n:1 * c:64 * w:539 * r:32 * N:1 * gpuRef: * minDevVer:800"
+    },
+    {
+      "name": "L3_b2b_causal_conv1d_fwd_cuhyena1",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        1024,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": 3,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2412,
+      "definition": "\"L3_b2b_causal_conv1d_fwd_cuhyena1\" = L3_req * R:b2bcausalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:8192 * r:3 * s:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_b2b_causal_conv1d_bwd_cuhyena1",
+      "family": "b2b",
+      "direction": "backward",
+      "shape": [
+        2,
+        1024,
+        8192
+      ],
+      "width": 3,
+      "mixer_width": 3,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2413,
+      "definition": "\"L3_b2b_causal_conv1d_bwd_cuhyena1\" = L3_req * R:b2bcausalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:1024 * w:8192 * r:3 * s:3 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_fwd_fp32",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2416,
+      "definition": "\"L1_b2b_causal_conv1d_fwd_fp32\" = L1_req * R:b2bcausalconv1d * P:s * n:2 * c:64 * w:256 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_bwd_fp32",
+      "family": "b2b",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "float32",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2417,
+      "definition": "\"L1_b2b_causal_conv1d_bwd_fp32\" = L1_req * R:b2bcausalconv1dbwd * P:s * n:2 * c:64 * w:256 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_fwd_fp64",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        5,
+        32
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "float64",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2420,
+      "definition": "\"L1_b2b_causal_conv1d_fwd_fp64\" = L1_req * R:b2bcausalconv1d * P:d * n:2 * c:5 * w:32 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_bwd_fp64",
+      "family": "b2b",
+      "direction": "backward",
+      "shape": [
+        2,
+        5,
+        32
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "float64",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2421,
+      "definition": "\"L1_b2b_causal_conv1d_bwd_fp64\" = L1_req * R:b2bcausalconv1dbwd * P:d * n:2 * c:5 * w:32 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_fwd_fp16",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2424,
+      "definition": "\"L1_b2b_causal_conv1d_fwd_fp16\" = L1_req * R:b2bcausalconv1d * Pin:h * Pcomp:s * Pout:h * n:2 * c:64 * w:256 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_bwd_fp16",
+      "family": "b2b",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "float16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2425,
+      "definition": "\"L1_b2b_causal_conv1d_bwd_fp16\" = L1_req * R:b2bcausalconv1dbwd * Pin:h * Pcomp:s * Pout:h * n:2 * c:64 * w:256 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_fwd_bf16",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2428,
+      "definition": "\"L1_b2b_causal_conv1d_fwd_bf16\" = L1_req * R:b2bcausalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:64 * w:256 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L1_b2b_causal_conv1d_bwd_bf16",
+      "family": "b2b",
+      "direction": "backward",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 3,
+      "mixer_width": 7,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2429,
+      "definition": "\"L1_b2b_causal_conv1d_bwd_bf16\" = L1_req * R:b2bcausalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:64 * w:256 * r:3 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_b2b_causal_conv1d_fwd_k3_k16",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        768,
+        539
+      ],
+      "width": 3,
+      "mixer_width": 16,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2432,
+      "definition": "\"L3_b2b_causal_conv1d_fwd_k3_k16\" = L3_req * R:b2bcausalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:539 * r:3 * s:16 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_b2b_causal_conv1d_fwd_k4_k7",
+      "family": "b2b",
+      "direction": "forward",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 4,
+      "mixer_width": 7,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2433,
+      "definition": "\"L3_b2b_causal_conv1d_fwd_k4_k7\" = L3_req * R:b2bcausalconv1d * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:256 * r:4 * s:7 * N:1 * gpuRef:"
+    },
+    {
+      "name": "L3_b2b_causal_conv1d_bwd_k3_k16",
+      "family": "b2b",
+      "direction": "backward",
+      "shape": [
+        2,
+        768,
+        539
+      ],
+      "width": 3,
+      "mixer_width": 16,
+      "dtype": "bfloat16",
+      "silu": false,
+      "iterations": 1,
+      "min_device_version": 0,
+      "source_line": 2434,
+      "definition": "\"L3_b2b_causal_conv1d_bwd_k3_k16\" = L3_req * R:b2bcausalconv1dbwd * Pin:g * Pcomp:s * Pout:g * n:2 * c:768 * w:539 * r:3 * s:16 * N:1 * gpuRef:"
+    }
+  ]
+}

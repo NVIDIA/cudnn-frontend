@@ -322,6 +322,8 @@ def rms_norm(
     hidden_size = input.shape[-1]
     if hidden_size <= 0:
         raise ValueError(f"input's final dimension must be positive, got {hidden_size}")
+    if weight is None:
+        raise ValueError("rms_norm requires a weight tensor, got None")
     if tuple(weight.shape) != (hidden_size,):
         raise ValueError(f"weight must have shape ({hidden_size},), got {tuple(weight.shape)}")
     if weight.device != input.device or weight.dtype != input.dtype:

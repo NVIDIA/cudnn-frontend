@@ -20,12 +20,12 @@ def rubin(supported_gpu):
 
 def native_forward(inputs):
     import cutlass
-    from cudnn.QSA.api import _compact
+    from cudnn.QSA._metadata import compact
     from cudnn.QSA.kernels import fprop_n64_sm107
 
     q, k, v = (inputs[name] for name in ("q", "k", "v"))
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    ids, counts = _compact(inputs["sel_blocks"], inputs["lo"], inputs["hi"], inputs["block_first"], inputs["block_last"], 107, stream)
+    ids, counts = compact(inputs["sel_blocks"], inputs["lo"], inputs["hi"], inputs["block_first"], inputs["block_last"], 107, stream)
     outputs = (torch.empty_like(q), torch.empty_like(q, dtype=torch.float32), torch.empty((q.shape[1], q.shape[0]), device=q.device))
     kernel = fprop_n64_sm107.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], 107)
     fprop_n64_sm107.launch(

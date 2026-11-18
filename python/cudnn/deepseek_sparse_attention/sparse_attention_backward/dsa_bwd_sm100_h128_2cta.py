@@ -21,7 +21,20 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05, warp
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
+from ._rank_common_sm100 import _partial_cta_sync
 from .dsa_bwd_sm100_2cta_deterministic import TwoCTADeterministicReduction, ordered_dkv_quad
+from .dsa_bwd_sm100_2cta_rank_shard import (
+    RANK_CODE_INDIRECT,
+    RANK_CODE_STORE,
+    RANK_CODE_VALUE,
+    RANK_INTERLEAVE_MIN_PLANES,
+    RANK_STEP_BIAS,
+    RankShardReduction,
+    rank_reduce_f32x4,
+    rank_reduce_f32x4_stream,
+    rank_store_f32x4,
+    rank_store_f32x4_stream,
+)
 
 U64x4 = Tuple[cutlass.Uint64, cutlass.Uint64, cutlass.Uint64, cutlass.Uint64]
 F32x8 = Tuple[Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32]
@@ -96,6 +109,22 @@ def _dq_pack_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> cutlass.U
 
 
 @dsl_user_op
+def _bf16x2_to_f32x2(word: cutlass.Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Widen one BF16x2 word into its low and high logical values exactly."""
+    result_type = llvm.StructType.get_literal([T.f32(), T.f32()])
+    values = llvm.inline_asm(
+        result_type,
+        [cutlass.Uint32(word).ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b32 lo, hi;\nshl.b32 lo, $2, 16;\nand.b32 hi, $2, 0xFFFF0000;\nmov.b32 $0, lo;\nmov.b32 $1, hi;\n}",
+        "=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (Float32(llvm.extractvalue(T.f32(), values, [0], loc=loc, ip=ip)), Float32(llvm.extractvalue(T.f32(), values, [1], loc=loc, ip=ip)))
+
+
+@dsl_user_op
 def _dq_store_bf16x8_streaming(
     destination: cute.Pointer, packed01: cutlass.Uint32, packed23: cutlass.Uint32, packed45: cutlass.Uint32, packed67: cutlass.Uint32, *, loc=None, ip=None
 ) -> None:
@@ -134,6 +163,21 @@ def _prefetch_o_row_l2(source: cute.Pointer, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _prefetch_bulk_l2(source: cute.Pointer, size_bytes: Int32, *, loc=None, ip=None) -> None:
+    """Hint an asynchronous L2 prefetch of ``size_bytes`` (a multiple of 16) from a 16-byte aligned address."""
+    source_i64 = source.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [source_i64, Int32(size_bytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _load_o_bf16x16(source: cute.Pointer, *, loc=None, ip=None) -> U64x4:
     """Policy-neutral O load; pure because O is immutable during this kernel."""
     source_i64 = source.toint(loc=loc, ip=ip).ir_value()
@@ -142,6 +186,27 @@ def _load_o_bf16x16(source: cute.Pointer, *, loc=None, ip=None) -> U64x4:
         result_type,
         [source_i64],
         "ld.global.v4.u64 {$0, $1, $2, $3}, [$4];",
+        "=l,=l,=l,=l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return _extract_u64x4(value, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _load_o_bf16x16_read_once(source: cute.Pointer, *, loc=None, ip=None) -> U64x4:
+    """Read-once O load for the deterministic O*dO statistics; pure because O is immutable during this kernel.
+
+    Each O row is read exactly once, so it bypasses L1 and is the first L2 eviction candidate:
+    the KV rows, dense-plane rows and Q/dO round operands that later tiles and waves re-read stay.
+    """
+    source_i64 = source.toint(loc=loc, ip=ip).ir_value()
+    result_type = llvm.StructType.get_literal([T.i64()] * 4)
+    value = llvm.inline_asm(
+        result_type,
+        [source_i64],
+        "ld.global.nc.L1::no_allocate.L2::evict_first.v4.u64 {$0, $1, $2, $3}, [$4];",
         "=l,=l,=l,=l,l",
         has_side_effects=False,
         is_align_stack=False,
@@ -549,6 +614,21 @@ def _finite_residual_f32(value: Float32, high: Float32, *, loc=None, ip=None) ->
     )
 
 
+@dsl_user_op
+def _tcgen05_fence_before_thread_sync(*, loc=None, ip=None) -> None:
+    """Order this thread's prior tcgen05 operations before a following thread synchronization."""
+    llvm.inline_asm(None, [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def _tcgen05_fence_after_thread_sync(*, loc=None, ip=None) -> None:
+    """Order this thread's following tcgen05 operations after a preceding thread synchronization."""
+    llvm.inline_asm(None, [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+DQ_EPI_BATCH = 2
+
+
 class FlashAttentionDSABackwardSm100H128TwoCTA:
     """Two-CTA specialization for BF16 H128 D512.
 
@@ -594,6 +674,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     MMA_WARP = 16
     LOAD_WARP = 17
     RELAY_WARP = 18
+    SETUP_WARP = 19
     GATHER_THREADS = GATHER_WARPS * 32
     MATH_THREAD_BEGIN = MATH_WARP_BEGIN * 32
     MATH_THREADS = MATH_WARPS * 32
@@ -615,6 +696,13 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     TMEM_DQ1_OFFSET = 256
     TMEM_DKV0_OFFSET = 384
     TMEM_DKV1_OFFSET = 448
+    # D-round-0 dO^T operand of the dV products (128 D lanes x 128 heads as BF16 pairs) when ``DV0_TMEM_A``.
+    TMEM_A_OFFSET = 64
+    DV0_TMEM_A = False
+    # D-round-1 dO^T operand of the dV products, when ``DV1_TMEM_A`` (the dKV accumulator then holds one
+    # D-round at a time in the round-0 columns, so these columns are free).
+    TMEM_A1_OFFSET = 448
+    DV1_TMEM_A = False
     SCORE_DONE_STAGES = 2
     ROUND_GENS_PER_TILE = 8
     ROUND_STAGES = 2
@@ -628,8 +716,36 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     REDUCER_SETMAXREG = 88
     MATH_EPI_SETMAXREG = 200
     REDUCER_EPI_SETMAXREG = 24
+    # Widest top-k whose per-wave dKV records stay in L2 with default eviction priority (see ``_deposit_rank_panel``).
+    RANK_L2_RESIDENT_MAX_TOPK = 512
+    # Widest top-k whose dK/dV ring sweeps walk the head chunks in a runtime loop (see ``_issue_dkv_sweep_rolled``);
+    # two-tile (top-k 128) queries keep the unrolled sweeps.
+    ROLLED_SWEEP_MAX_TOPK = 512
     KDQ_REFETCH_HALF = False
+    # Narrowest top-k whose stationary Q/dO loads issue before the cluster rendezvous (see ``kernel``).
+    EARLY_STATIONARY_MIN_TOPK = 512
+    # Drains request the overflow-row offsets of all their indirect slots before resolving any (few-plane plans).
+    RANK_DRAIN_OVERLAP_LOOKUPS = False
+    # dV low-first plans (top-k >= ``DS2_MIN_TOPK``) keep the dS blocks of the dK products in their own buffer (``_use_ds2``).
+    DS2_ENABLED = True
+    # Widest top-k whose deterministic peer-half P_lo is staged in its own buffer (``p_lo_xchg``) instead of
+    # ds_image: the dS image (dQ operand) then waits for neither the P_lo landing nor the sweeps.
+    PLO_STAGING_MAX_TOPK = 0
+    # The relay sends a tile's dS block to the peer as soon as the P_lo blocks are released.
+    DS_RELAY_ON_RELEASE = False
+    # Overflow records of wide waves keep default L2 priority for the following tail (few-plane plans).
+    RANK_RECORDS_L2_DEFAULT = False
+    # Dedicated-dS plans with both dO^T operands in TMEM sweep the D-rounds in alternating order per tile
+    # (tile ``t`` takes D-round ``t % 2`` first): a tile's first Q^T group is the one its predecessor swept
+    # last, still in the ring, so each tile after the first streams one Q^T group instead of two.
+    ROUND_REUSE = False
+    # Narrowest top-k that alternates its D-rounds: every dedicated-dS width.
+    ROUND_REUSE_MIN_TOPK = 512
+    # Narrowest top-k of the dedicated-dS plans (``_use_ds2``): four 8 KiB ring stages, both dO^T operands in TMEM.
+    DS2_MIN_TOPK = 512
     deterministic = False
+    rank_shard = False
+    rank_fused = False
 
     def __init__(self, element_dtype: Type[cutlass.Numeric], head_dim: int, head_dim_v: int, block_tile: int, max_topk: int = 0):
         if element_dtype != BFloat16:
@@ -648,8 +764,20 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         self.same_hdim_kv = True
         self.block_tile = block_tile
         self.max_topk = max_topk
-        self.KDQ_REFETCH_HALF = max_topk >= 512
-        self.ROUND_K_HEADS = 64 if self.deterministic or max_topk <= 512 else 32
+        if self.deterministic:
+            # Every top-k width refetches only the peer CTA's rows for the dQ operand (the own rows stay in place).
+            self.KDQ_REFETCH_HALF = True
+            # TMEM chunks the math warps load per wait in their dQ epilogue round: the 120-register math budget
+            # of every top-k width holds a batch of DQ_EPI_BATCH chunks.
+            self.DQ_EPI_MATH_BATCH = DQ_EPI_BATCH
+            # dK/dV round stages: every accepted width streams four 8 KiB stages (32 heads each), which keeps
+            # more refills in flight; the dedicated-dS plans (``_use_ds2``) rely on exactly four stages. The dV
+            # passes interleave the high and residual-low P terms per stage, so dKV sums in a different (fixed)
+            # order than with 64-head stages.
+            self.ROUND_K_HEADS = 32
+        else:
+            self.KDQ_REFETCH_HALF = max_topk >= 512
+            self.ROUND_K_HEADS = 64 if max_topk <= 512 else 32
         assert self.H_TILE_CLUSTER % self.ROUND_K_HEADS == 0
         self.ROUND_TILER = (self.D_TILE_CLUSTER, self.N_TILE, self.ROUND_K_HEADS)
         self.ROUND_STAGE_ELEMENTS = self.D_TILE_CTA * self.ROUND_K_HEADS
@@ -658,7 +786,15 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         self.ROUND_GENS_PER_TILE = 4 * (self.H_TILE_CLUSTER // self.ROUND_K_HEADS)
         assert self.ROUND_STAGES in (2, 4, 8)
         assert self.ROUND_GENS_PER_TILE % (2 * self.ROUND_STAGES) == 0
-        if self.max_topk == 128:
+        if self.deterministic:
+            # Deterministic plans set each role's budget inside its own branch (see ``kernel``).
+            if self.max_topk >= 512:
+                # The utility warpgroup (MMA, load, relay, setup warps) fits 80 registers; the math warps take
+                # the released ones and stop spilling their softmax/dS state, the reducers keep 96.
+                self.UTILITY_SETMAXREG = 80
+                self.MATH_SETMAXREG = 120
+                self.REDUCER_SETMAXREG = 96
+        elif self.max_topk == 128:
             self.MATH_SETMAXREG = 104
             self.REDUCER_SETMAXREG = 96
         assert (
@@ -675,6 +811,54 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         self.gather_barrier = pipeline.NamedBarrier(barrier_id=5, num_threads=self.GATHER_THREADS)
         self.stats_odo_barrier = pipeline.NamedBarrier(barrier_id=6, num_threads=self.MATH_THREADS + self.REDUCE_THREADS)
         self.dsink_reducer_barrier = pipeline.NamedBarrier(barrier_id=7, num_threads=self.REDUCE_THREADS)
+
+    @cute.jit
+    def rank_wave_span(self, total_q: Int32, num_waves: Int32, wave_size: Int32, wave: Int32, interleaved: Int32):
+        """Return the first query and query count of wave ``wave`` (empty outside ``[0, num_waves)``).
+
+        Consecutive waves hold queries ``[wave * wave_size, (wave + 1) * wave_size)``; interleaved
+        waves (``interleaved != 0``) hold ``wave + j * num_waves``, so consecutive queries, whose
+        top-k rows often overlap, fall into different waves.
+        """
+        begin = wave * wave_size
+        size = max(min(wave_size, total_q - begin), Int32(0))
+        if interleaved != Int32(0):
+            begin = wave
+            size = (total_q - wave + num_waves - Int32(1)) // num_waves
+        if wave < Int32(0):
+            begin = Int32(0)
+            size = Int32(0)
+        if wave >= num_waves:
+            begin = Int32(0)
+            size = Int32(0)
+        return begin, size
+
+    @cute.jit
+    def _set_role_registers(self, count: cutlass.Constexpr[int]) -> None:
+        """Move this warpgroup's register budget from the 96-register launch value to ``count``."""
+        if cutlass.const_expr(count > 96):
+            cute.arch.setmaxregister_increase(count)
+        elif cutlass.const_expr(count < 96):
+            cute.arch.setmaxregister_decrease(count)
+
+    @cute.jit
+    def _visit_tile(self, order: Int32, tile_count: Int32, ascending: Int32) -> Int32:
+        """Return the tile visited ``order``-th: descending sweeps by default, ascending when ``ascending`` is 1.
+
+        Non-deterministic plans always sweep descending (``ascending`` is unused).
+        """
+        if cutlass.const_expr(not self.deterministic):
+            return tile_count - Int32(1) - order
+        return order + (Int32(1) - ascending) * (tile_count - Int32(1) - Int32(2) * order)
+
+    def _use_ds2(self) -> bool:
+        """Whether the dK products read dS from their own blocks (``ds2_blocks``) instead of the P_lo blocks.
+
+        Top-k >= ``DS2_MIN_TOPK`` plans (TMEM dO^T, four ring stages): the dS of a tile then reaches both CTAs
+        without waiting for the dV products to release the P_lo blocks, and the peer half of P_hi is
+        staged in the owner half of ``ds_image`` (its ``p_xchg`` buffer makes room for the dS blocks).
+        """
+        return bool(self.deterministic and self.DV0_TMEM_A and self.max_topk >= self.DS2_MIN_TOPK and self.DS2_ENABLED)
 
     def split_wg(self, t: cute.Tensor, num_warp_groups: int, wg_idx: int):
         ret = None
@@ -839,7 +1023,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
 
         The ring always holds ``ROUND_STAGES == H_TILE_CLUSTER //
         ROUND_K_HEADS`` generations, so the sweep index doubles as the ring
-        slot and the k-block order is identical for every ROUND_K_HEADS.
+        slot and the k-block order is identical for every ROUND_K_HEADS. (The
+        dV sweep interleaves the BF16 high and residual-low P passes per stage,
+        so there the stage size does set the FP32 accumulation order.)
         """
         round_slot_fragments = (
             round_fragment_0,
@@ -861,6 +1047,89 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             round_pipeline.consumer_release(round_consumer_state)
             round_consumer_state.advance()
         return round_consumer_state
+
+    @cute.jit
+    def _issue_dkv_sweep_rolled(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        round_staged: cute.Tensor,
+        high_staged: cute.Tensor,
+        low_staged: cute.Tensor,
+        first_accumulate: cutlass.Constexpr[bool],
+        use_low: cutlass.Constexpr[bool],
+        wait_low_on_first_chunk: cutlass.Constexpr[bool],
+        pds_pipeline,
+        pds_consumer_state: pipeline.PipelineState,
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
+    ):
+        """``_issue_dkv_sweep`` / ``_issue_dkv_sweep_hilo`` as one loop trip per ring stage.
+
+        The ring stage (A, its slot taken from the ring state) and the 64-head B block of every
+        head chunk are indexed at run time, so the issue code holds one chunk's products; the
+        products and their per-accumulator order are those of the unrolled sweeps.
+        """
+        k_blocks = self.ROUND_K_HEADS // 16
+        gens = self.H_TILE_CTA // self.ROUND_K_HEADS
+        for chunk in cutlass.range(0, self.ROUND_STAGES, unroll=1):
+            b_stage = chunk // Int32(gens)
+            b_k_base = chunk % Int32(gens) * Int32(k_blocks)
+            slot = round_consumer_state.index
+            round_pipeline.consumer_wait(round_consumer_state)
+            mma = dkv_tiled_mma.with_()
+            if cutlass.const_expr(first_accumulate):
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+            else:
+                mma.set(tcgen05.Field.ACCUMULATE, chunk > Int32(0))
+            for k_block in cutlass.range_constexpr(k_blocks):
+                cute.gemm(mma, t_dkv, round_staged[None, None, k_block, slot], high_staged[None, None, b_k_base + Int32(k_block), b_stage], t_dkv)
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+            if cutlass.const_expr(use_low):
+                if cutlass.const_expr(wait_low_on_first_chunk):
+                    if chunk == Int32(0):
+                        pds_pipeline.consumer_wait(pds_consumer_state)
+                mma = dkv_tiled_mma.with_()
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+                for k_block in cutlass.range_constexpr(k_blocks):
+                    cute.gemm(mma, t_dkv, round_staged[None, None, k_block, slot], low_staged[None, None, b_k_base + Int32(k_block), b_stage], t_dkv)
+            round_pipeline.consumer_release(round_consumer_state)
+            round_consumer_state.advance()
+        return round_consumer_state
+
+    @cute.jit
+    def _issue_dkv_sweep_reuse(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        round_fragment_0: cute.Tensor,
+        round_fragment_1: cute.Tensor,
+        round_fragment_2: cute.Tensor,
+        round_fragment_3: cute.Tensor,
+        b_fragment_0: cute.Tensor,
+        b_fragment_1: cute.Tensor,
+        round_pipeline,
+        generation_base: Int32,
+        wait_full: cutlass.Boolean,
+        release_empty: cutlass.Boolean,
+    ):
+        """``_issue_dkv_sweep`` (accumulating) over ring generations ``generation_base + chunk`` (``ROUND_REUSE``).
+
+        ``wait_full`` waits for each stage to land (a group the ring already holds skips it) and
+        ``release_empty`` frees each stage after its products (a group kept for the next tile skips it).
+        """
+        round_slot_fragments = (round_fragment_0, round_fragment_1, round_fragment_2, round_fragment_3)
+        for chunk in cutlass.range_constexpr(self.ROUND_STAGES):
+            head_base = chunk * self.ROUND_K_HEADS
+            b_fragment = b_fragment_0 if head_base < self.H_TILE_CTA else b_fragment_1
+            b_k_half = head_base % self.H_TILE_CTA // self.ROUND_K_HEADS
+            generation = generation_base + Int32(chunk)
+            stage_state = pipeline.PipelineState(self.ROUND_STAGES, generation, Int32(chunk), generation // Int32(self.ROUND_STAGES) & Int32(1))
+            if wait_full:
+                round_pipeline.consumer_wait(stage_state)
+            self._issue_dkv_pass(dkv_tiled_mma, t_dkv, round_slot_fragments[chunk], b_fragment, b_k_half, True)
+            if release_empty:
+                round_pipeline.consumer_release(stage_state)
 
     @cute.jit
     def _issue_dkv_pass(
@@ -926,10 +1195,18 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         mma = tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, False)
         k_blocks_per_chunk = cute.size(a_fragment, mode=[2])
-        for chunk in cutlass.range_constexpr(self.K_CHUNKS):
-            for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
-                cute.gemm(mma, accumulator, a_fragment[None, None, k_block, chunk], b_fragment[None, None, k_block, chunk], accumulator)
-                mma.set(tcgen05.Field.ACCUMULATE, True)
+        if cutlass.const_expr(self.deterministic):
+            # One loop trip per D128 chunk with its k-blocks unrolled: half the issue-loop code of the
+            # unrolled-chunk form and one branch per eight products.
+            for chunk in cutlass.range(0, self.K_CHUNKS, unroll=1):
+                for k_block in cutlass.range_constexpr(k_blocks_per_chunk):
+                    cute.gemm(mma, accumulator, a_fragment[None, None, k_block, chunk], b_fragment[None, None, k_block, chunk], accumulator)
+                    mma.set(tcgen05.Field.ACCUMULATE, True)
+        else:
+            for chunk in cutlass.range_constexpr(self.K_CHUNKS):
+                for k_block in cutlass.range(0, k_blocks_per_chunk, unroll=4):
+                    cute.gemm(mma, accumulator, a_fragment[None, None, k_block, chunk], b_fragment[None, None, k_block, chunk], accumulator)
+                    mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
     def _prefetch_tile_indices(
@@ -1108,6 +1385,17 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         dq_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype, self.element_dtype, OperandMajorMode.MN, OperandMajorMode.MN, self.acc_dtype, cg2, self.DQ_MMA_TILER[:2]
         )
+        # dV round 0 with its dO^T operand resident in TMEM (A from TMEM is K-major: heads along columns).
+        dkv_ts_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.element_dtype,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            self.acc_dtype,
+            cg2,
+            self.DKV_MMA_TILER[:2],
+            tcgen05.OperandSource.TMEM,
+        )
         score_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype, self.element_dtype, OperandMajorMode.K, OperandMajorMode.K, self.acc_dtype, cg2, score_tiler[:2]
         )
@@ -1184,9 +1472,72 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             # this stream order successive waves before the final reduction.
             num_q_waves = cute.ceil_div(problem_shape[0], self.max_query_pairs_per_wave)
             q_wave_size = cute.ceil_div(problem_shape[0], num_q_waves)
-            active_shards = q_wave_size + min(q_wave_size, Int32(self.split_wg_queries_per_wave))
-            mdKV_acc = self.make_dKV_accumulator(workspace_dKV, mKV.shape[0])
-            self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(grid=[cute.ceil_div(mKV.shape[0], 4), active_shards, 1], block=[128, 1, 1], stream=stream)
+            # Without per-query lengths every query spans the full top-k width, so conflict-rank plans
+            # with enough dense planes interleave their waves (see ``rank_wave_span``). Plans with
+            # lengths keep consecutive waves, whose similar lengths let short waves finish early,
+            # unless fewer than half a wave of dense planes exist: then the rows that neighbouring
+            # queries share would mostly overflow, and interleaving spreads those queries apart.
+            interleaved = Int32(0)
+            if cutlass.const_expr(self.rank_shard):
+                _, interleave_planes = self.rank_geometry(mKV.shape[0])
+                if interleave_planes >= Int32(RANK_INTERLEAVE_MIN_PLANES):
+                    if cutlass.const_expr(mTopkLength is None):
+                        interleaved = Int32(1)
+                    elif Int32(2) * interleave_planes < Int32(self.max_query_pairs_per_wave):
+                        interleaved = Int32(1)
+                    elif Int32(16 * self.max_topk) <= problem_shape[0]:
+                        # A top-k width small against the query count bounds any length ramp to a
+                        # few waves, so neighbouring queries' shared rows are spread over waves too.
+                        interleaved = Int32(1)
+            query_stride = Int32(1)
+            if interleaved != Int32(0):
+                query_stride = num_q_waves
+            if cutlass.const_expr(self.rank_shard):
+                active_shards = Int32(1)
+                mdKV_acc = self.make_rank_rows(workspace_dKV, mKV.shape[0])
+                self.launch_rank_init(mdKV_acc, mKV.shape[0], stream)
+                first_begin, first_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, Int32(0), interleaved)
+                second_begin, second_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, Int32(1), interleaved)
+                # Record wave 0's row ordinals. Fused plans also assign wave 0 and record wave 1 here,
+                # after which each main kernel's setup warp prepares the following wave; per-wave-setup
+                # plans run one setup launch before each main kernel (below).
+                self.launch_rank_wave_setup(
+                    mdKV_acc,
+                    mTopkIdxs,
+                    mTopkLength,
+                    mKV.shape[0],
+                    Int32(RANK_STEP_BIAS - 1),
+                    Int32(0),
+                    Int32(0),
+                    Int32(0),
+                    Int32(0),
+                    first_begin,
+                    first_size,
+                    Int32(1),
+                    query_stride,
+                    stream,
+                )
+                if cutlass.const_expr(self.rank_fused):
+                    self.launch_rank_wave_setup(
+                        mdKV_acc,
+                        mTopkIdxs,
+                        mTopkLength,
+                        mKV.shape[0],
+                        Int32(RANK_STEP_BIAS),
+                        Int32(0),
+                        Int32(0),
+                        first_begin,
+                        first_size,
+                        second_begin,
+                        second_size,
+                        Int32(1),
+                        query_stride,
+                        stream,
+                    )
+            else:
+                active_shards = q_wave_size + min(q_wave_size, Int32(self.split_wg_queries_per_wave))
+                mdKV_acc = self.make_dKV_accumulator(workspace_dKV, mKV.shape[0])
+                self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(grid=[cute.ceil_div(mKV.shape[0], 4), active_shards, 1], block=[128, 1, 1], stream=stream)
         else:
             mdKV_acc = cute.make_tensor(cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype), mdKV.layout)
             zero_grid_x = (mKV.shape[0] + self.ZERO_ROWS_PER_BLOCK - 1) // self.ZERO_ROWS_PER_BLOCK
@@ -1194,7 +1545,28 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 grid=[zero_grid_x, 1, problem_shape[3][1]], block=[self.ZERO_THREADS, 1, 1], stream=stream
             )
         if cutlass.const_expr(self.deterministic):
-            for token_begin in cutlass.range(0, problem_shape[0], q_wave_size):
+            for wave in cutlass.range(0, num_q_waves):
+                token_begin, wave_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, wave, interleaved)
+                previous_begin, previous_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, wave - Int32(1), interleaved)
+                next_begin, next_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, wave + Int32(1), interleaved)
+                after_begin, after_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, wave + Int32(2), interleaved)
+                if cutlass.const_expr(self.rank_shard and not self.rank_fused):
+                    self.launch_rank_wave_setup(
+                        mdKV_acc,
+                        mTopkIdxs,
+                        mTopkLength,
+                        mKV.shape[0],
+                        wave + Int32(RANK_STEP_BIAS),
+                        previous_begin,
+                        previous_size,
+                        token_begin,
+                        wave_size,
+                        next_begin,
+                        next_size,
+                        Int32(1) - min(wave, Int32(1)),
+                        query_stride,
+                        stream,
+                    )
                 self.kernel(
                     tma_atom_q,
                     tma_tensor_q,
@@ -1220,6 +1592,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     dp_tiled_mma,
                     dkv_tiled_mma,
                     dq_tiled_mma,
+                    dkv_ts_tiled_mma,
                     score_a_layout_staged,
                     score_b_layout_staged,
                     round_a_layout_staged,
@@ -1237,13 +1610,25 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     stationary_tiled_mma,
                     stationary_a_layout_staged,
                     token_begin,
+                    wave + Int32(RANK_STEP_BIAS + 1),
+                    token_begin,
+                    wave_size,
+                    next_begin,
+                    next_size,
+                    after_begin,
+                    after_size,
+                    wave + Int32(RANK_STEP_BIAS - 1),
+                    previous_begin,
+                    previous_size,
+                    query_stride,
                 ).launch(
-                    grid=(2 * min(q_wave_size, problem_shape[0] - token_begin), 1, problem_shape[3][1]),
+                    grid=(2 * wave_size, 1, problem_shape[3][1]),
                     block=[self.THREADS_PER_CTA, 1, 1],
                     cluster=self.CLUSTER_SHAPE_MNK,
                     smem=self.shared_storage_bytes,
                     stream=stream,
                     min_blocks_per_mp=1,
+                    use_pdl=self.rank_shard,
                 )
         else:
             self.kernel(
@@ -1271,6 +1656,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 dp_tiled_mma,
                 dkv_tiled_mma,
                 dq_tiled_mma,
+                dkv_ts_tiled_mma,
                 score_a_layout_staged,
                 score_b_layout_staged,
                 round_a_layout_staged,
@@ -1288,6 +1674,17 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 stationary_tiled_mma,
                 stationary_a_layout_staged,
                 Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(1),
             ).launch(
                 grid=(2 * problem_shape[0], 1, problem_shape[3][1]),
                 block=[self.THREADS_PER_CTA, 1, 1],
@@ -1300,7 +1697,69 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         self.num_threads_D_convert = 32
         self.num_threads_seq = 4 if self.max_topk == 2048 else self.block_seq
         convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
-        if cutlass.const_expr(self.deterministic):
+        if cutlass.const_expr(self.deterministic and self.rank_shard):
+            # The last wave's tail runs with the dSink partials, then the used-plane fold.
+            last_wave = num_q_waves - Int32(1)
+            last_step = last_wave + Int32(RANK_STEP_BIAS)
+            last_begin, last_size = self.rank_wave_span(problem_shape[0], num_q_waves, q_wave_size, last_wave, interleaved)
+            if problem_shape[0] <= Int32(512):
+                self.postprocess_rank(
+                    mdKV_acc,
+                    mdKV,
+                    mKV.shape[0],
+                    mTopkIdxs,
+                    mTopkLength,
+                    last_step,
+                    last_begin,
+                    last_size,
+                    query_stride,
+                    sum_odo,
+                    scaled_lse,
+                    mAttnSink,
+                    mdSink,
+                    problem_shape,
+                    stream,
+                    2,
+                )
+            elif problem_shape[0] <= Int32(2048):
+                self.postprocess_rank(
+                    mdKV_acc,
+                    mdKV,
+                    mKV.shape[0],
+                    mTopkIdxs,
+                    mTopkLength,
+                    last_step,
+                    last_begin,
+                    last_size,
+                    query_stride,
+                    sum_odo,
+                    scaled_lse,
+                    mAttnSink,
+                    mdSink,
+                    problem_shape,
+                    stream,
+                    8,
+                )
+            else:
+                self.postprocess_rank(
+                    mdKV_acc,
+                    mdKV,
+                    mKV.shape[0],
+                    mTopkIdxs,
+                    mTopkLength,
+                    last_step,
+                    last_begin,
+                    last_size,
+                    query_stride,
+                    sum_odo,
+                    scaled_lse,
+                    mAttnSink,
+                    mdSink,
+                    problem_shape,
+                    stream,
+                    32,
+                )
+        elif cutlass.const_expr(self.deterministic):
             if problem_shape[0] <= Int32(512):
                 self.postprocess_deterministic(mdKV_acc, mdKV, mKV.shape[0], active_shards, sum_odo, scaled_lse, mAttnSink, mdSink, problem_shape, stream, 2)
             elif problem_shape[0] <= Int32(2048):
@@ -1448,7 +1907,12 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 r_topk[i] = Int32(-1)
         cute.copy(tiled_t2r_0, thread_source_0, thread_values_0)
         cute.arch.fence_view_async_tmem_load()
-        done_pipeline.consumer_release(release_state)
+        if cutlass.const_expr(self.deterministic):
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                done_pipeline.consumer_release(release_state)
+        else:
+            done_pipeline.consumer_release(release_state)
         release_state.advance()
         assert cute.size(thread_values_0) == self.N_TILE // 2
         sub_tile_idx_0 = rank
@@ -1499,7 +1963,12 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         wait_state.advance()
         cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
         cute.arch.fence_view_async_tmem_load()
-        done_pipeline.consumer_release(release_state)
+        if cutlass.const_expr(self.deterministic):
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                done_pipeline.consumer_release(release_state)
+        else:
+            done_pipeline.consumer_release(release_state)
         release_state.advance()
         if cutlass.const_expr(self.deterministic):
             kv_index = Int32(-1)
@@ -1546,8 +2015,154 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         return (wait_state, release_state)
 
     @cute.jit
+    def _deposit_rank_panel(self, values: cute.Tensor, r_dest: cute.Tensor, r_dense: cute.Tensor, mRows: cute.Tensor, sub_tile_idx: Int32, dp_idx: Int32):
+        """Add shared dense rows and store private overflow records for one D128 panel.
+
+        Waves wider than ``RANK_L2_RESIDENT_MAX_TOPK`` mark their records L2 evict-first.
+        """
+        for i in cutlass.range_constexpr(8):
+            coord_base = i * 2 - i % 2
+            if r_dest[i] >= Int32(0):
+                dkv_row = mRows[None, r_dest[i], (0, 0)]
+                tile_row = cute.flat_divide(dkv_row, (128,))
+                tile_row = tile_row[None, sub_tile_idx]
+                tile_row = cute.flat_divide(tile_row, (4,))
+                target = tile_row[None, dp_idx // 4]
+                if cutlass.const_expr(self.max_topk <= self.RANK_L2_RESIDENT_MAX_TOPK):
+                    # A narrow wave's records fit in L2 next to its streamed operands, and the next wave
+                    # touches the same plane rows: keep them resident (default eviction priority).
+                    if r_dense[i] != Int32(0):
+                        rank_reduce_f32x4(target.iterator, values[coord_base], values[coord_base + 2], values[coord_base + 16], values[coord_base + 18])
+                    else:
+                        rank_store_f32x4(target.iterator, values[coord_base], values[coord_base + 2], values[coord_base + 16], values[coord_base + 18])
+                elif r_dense[i] != Int32(0):
+                    rank_reduce_f32x4_stream(target.iterator, values[coord_base], values[coord_base + 2], values[coord_base + 16], values[coord_base + 18])
+                elif cutlass.const_expr(self.RANK_RECORDS_L2_DEFAULT):
+                    # Few-plane plans: the next setup launch's tail reads these records back right after the
+                    # wave, so they keep default L2 priority (the dense plane-0 adds stay evict-first).
+                    rank_store_f32x4(target.iterator, values[coord_base], values[coord_base + 2], values[coord_base + 16], values[coord_base + 18])
+                else:
+                    rank_store_f32x4_stream(target.iterator, values[coord_base], values[coord_base + 2], values[coord_base + 16], values[coord_base + 18])
+
+    @cute.jit
+    def _drain_dkv_rank(
+        self,
+        t_dkv_0: cute.Tensor,
+        t_dkv_1: cute.Tensor,
+        mRows: cute.Tensor,
+        index_row: cute.Tensor,
+        tile_index: Int32,
+        topk: Int32,
+        seqlen_kv: Int32,
+        rank_pitch: Int64,
+        rank_planes: Int32,
+        parity: Int32,
+        ordinal: Int32,
+        rtx: Int32,
+        rank: Int32,
+        done_pipeline,
+        wait_state: pipeline.PipelineState,
+        release_state: pipeline.PipelineState,
+        offsets_base: Optional[cute.Pointer] = None,
+        record_base: Optional[Int32] = None,
+        round_swap: Int32 = 0,
+    ):
+        """Drain FP32 TMEM accumulators to conflict-rank destination records.
+
+        ``round_swap`` 1 marks a tile whose first accumulator round holds D-round 1 (``ROUND_REUSE``).
+
+        Each destination record has one writer in the wave, so warp groups and
+        lane groups write concurrently.
+        """
+        dp_idx = rtx % Int32(self.MATH_THREADS_PER_CTA)
+        wg_idx = rtx // Int32(self.MATH_THREADS_PER_CTA)
+        t_dkv_core_0 = t_dkv_0[(None, None), 0, 0]
+        t_dkv_core_1 = t_dkv_1[(None, None), 0, 0]
+        tmem_load_atom = cute.make_copy_atom(tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)), self.acc_dtype)
+        tiled_t2r_0 = tcgen05.make_tmem_copy(tmem_load_atom, t_dkv_core_0)
+        thread_t2r_0 = tiled_t2r_0.get_slice(dp_idx)
+        tiled_t2r_1 = tcgen05.make_tmem_copy(tmem_load_atom, t_dkv_core_1)
+        thread_t2r_1 = tiled_t2r_1.get_slice(dp_idx)
+        c_dkv = cute.make_identity_tensor((self.D_TILE_CTA, self.N_TILE))
+        thread_coordinates = self.split_wg(thread_t2r_0.partition_D(c_dkv), 2, wg_idx)
+        thread_source_0 = self.split_wg(thread_t2r_0.partition_S(t_dkv_core_0), 2, wg_idx)
+        thread_source_1 = self.split_wg(thread_t2r_1.partition_S(t_dkv_core_1), 2, wg_idx)
+        thread_values_0 = cute.make_rmem_tensor(thread_coordinates.shape, self.acc_dtype)
+        thread_values_1 = thread_values_0
+        tile_base = tile_index * Int32(self.N_TILE)
+        r_dest = cute.make_rmem_tensor((8,), cutlass.Int32)
+        r_dense = cute.make_rmem_tensor((8,), cutlass.Int32)
+        r_row = cute.make_rmem_tensor((8,), cutlass.Int32)
+        r_code = cute.make_rmem_tensor((8,), cutlass.Int32)
+        # Every tile slot is below the top-k width, so the index and code loads of all eight slots
+        # issue together; only the overflow offsets depend on them.
+        for i in cutlass.range_constexpr(8):
+            coord_base = i * 2 - i % 2
+            slot = tile_base + Int32(cute.get(thread_coordinates[coord_base], mode=[1]))
+            r_row[i] = index_row[slot]
+            r_code[i] = self.rank_code(mRows, rank_pitch, rank_planes, parity, ordinal, slot)
+        if cutlass.const_expr(self.RANK_DRAIN_OVERLAP_LOOKUPS):
+            # Overflow codes name the j-th record of their row. Every indirect slot requests its row's offset
+            # (into its no longer needed row register) before any offset is used, so the dependent lookups
+            # of a tile overlap instead of following each other; destinations match ``rank_code_destination``.
+            # The per-kernel offsets and record bases come from the caller (computed once per kernel).
+            any_indirect = Int32(0)
+            for i in cutlass.range_constexpr(8):
+                coord_base = i * 2 - i % 2
+                slot = tile_base + Int32(cute.get(thread_coordinates[coord_base], mode=[1]))
+                row = r_row[i]
+                code = r_code[i]
+                r_dest[i] = Int32(-1)
+                r_dense[i] = Int32(0)
+                if slot < topk and row >= Int32(0) and row < seqlen_kv:
+                    r_dest[i] = code & Int32(RANK_CODE_VALUE)
+                    if (code & Int32(RANK_CODE_STORE)) == Int32(0):
+                        r_dense[i] = Int32(1)
+                    if (code & Int32(RANK_CODE_INDIRECT)) != Int32(0):
+                        r_row[i] = cute.arch.load(offsets_base + Int64(row), Int32)
+                        any_indirect = Int32(1)
+            if any_indirect != Int32(0):
+                for i in cutlass.range_constexpr(8):
+                    if r_dest[i] >= Int32(0) and (r_code[i] & Int32(RANK_CODE_INDIRECT)) != Int32(0):
+                        r_dest[i] = record_base + r_row[i] + r_dest[i]
+        else:
+            for i in cutlass.range_constexpr(8):
+                coord_base = i * 2 - i % 2
+                slot = tile_base + Int32(cute.get(thread_coordinates[coord_base], mode=[1]))
+                row = r_row[i]
+                r_dest[i] = Int32(-1)
+                r_dense[i] = Int32(0)
+                if slot < topk and row >= Int32(0) and row < seqlen_kv:
+                    destination, dense = self.rank_code_destination(mRows, rank_pitch, rank_planes, parity, r_code[i], row)
+                    r_dest[i] = destination
+                    if dense:
+                        r_dense[i] = Int32(1)
+        done_pipeline.consumer_wait(wait_state)
+        wait_state.advance()
+        cute.copy(tiled_t2r_0, thread_source_0, thread_values_0)
+        cute.arch.fence_view_async_tmem_load()
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            done_pipeline.consumer_release(release_state)
+        release_state.advance()
+        assert cute.size(thread_values_0) == self.N_TILE // 2
+        self._deposit_rank_panel(thread_values_0, r_dest, r_dense, mRows, Int32(2) * round_swap + rank, dp_idx)
+        done_pipeline.consumer_wait(wait_state)
+        wait_state.advance()
+        cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
+        cute.arch.fence_view_async_tmem_load()
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            done_pipeline.consumer_release(release_state)
+        release_state.advance()
+        self._deposit_rank_panel(thread_values_1, r_dest, r_dense, mRows, Int32(2) - Int32(2) * round_swap + rank, dp_idx)
+        return (wait_state, release_state)
+
+    @cute.jit
     def _load_o_bf16x16(self, source: cute.Pointer):
-        """Load immutable O through the policy-neutral path."""
+        """Load immutable O: read-once (L1 bypass, L2 evict-first) when deterministic, else policy-neutral."""
+        if cutlass.const_expr(self.deterministic):
+            return _load_o_bf16x16_read_once(source)
         return _load_o_bf16x16(source)
 
     @cute.jit
@@ -1661,6 +2276,33 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     )
                 else:
                     self._zero_sparse_k_d128_row(destination_rows, local_n, index_in_group)
+
+    @cute.jit
+    def _load_prefetch_row(
+        self,
+        mTopkIdxs: cute.Tensor,
+        token_idx: Int32,
+        batch_idx: Int32,
+        order: Int32,
+        tile_count: Int32,
+        topk: Int32,
+        rank: Int32,
+        lane: Int32,
+        ascending: Int32 = 0,
+    ) -> Int32:
+        """Return this lane's rank-owned KV row of the tile visited ``order``-th (see ``_visit_tile``), or -1."""
+        row = Int32(-1)
+        if order < tile_count:
+            slot = self._visit_tile(order, tile_count, ascending) * Int32(self.N_TILE) + rank * Int32(self.N_TILE_CTA) + lane
+            if slot < topk:
+                row = mTopkIdxs[slot, (token_idx, batch_idx)]
+        return row
+
+    @cute.jit
+    def _prefetch_kv_row_l2(self, mKV: cute.Tensor, row: Int32, batch_idx: Int32) -> None:
+        """Hint one full D512 KV row into L2 ahead of its score gather (both K-dQ halves read it too)."""
+        if row >= Int32(0) and row < cute.size(mKV, mode=[0]):
+            _prefetch_bulk_l2(mKV.iterator + mKV.layout((row, Int32(0), (Int32(0), batch_idx))), self.D_HEAD * 2)
 
     @cute.jit
     def _prefetch_odo_rows(self, mOut: cute.Tensor, token_idx: Int32, batch_idx: Int32, rank: Int32, reducer_tidx: Int32) -> None:
@@ -1948,6 +2590,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         dp_tiled_mma: cute.TiledMma,
         dkv_tiled_mma: cute.TiledMma,
         dq_tiled_mma: cute.TiledMma,
+        dkv_ts_tiled_mma: cute.TiledMma,
         score_a_layout_staged: cute.ComposedLayout,
         score_b_layout_staged: cute.ComposedLayout,
         round_a_layout_staged: cute.ComposedLayout,
@@ -1965,20 +2608,52 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         stationary_tiled_mma: cute.TiledMma,
         stationary_a_layout_staged: cute.ComposedLayout,
         token_begin: Int32,
+        setup_step: Int32,
+        setup_prev_begin: Int32,
+        setup_prev_size: Int32,
+        setup_cur_begin: Int32,
+        setup_cur_size: Int32,
+        setup_next_begin: Int32,
+        setup_next_size: Int32,
+        tail_step: Int32,
+        tail_begin: Int32,
+        tail_size: Int32,
+        query_stride: Int32,
     ):
-        """Execute the FP32 five-GEMM two-CTA schedule."""
+        """Execute the FP32 five-GEMM two-CTA schedule.
+
+        Fused conflict-rank plans also run the next wave's setup phases on the
+        otherwise idle warp 19 (``setup_*`` describe that pass), and the reducer
+        warps add the previous wave's overflow records (``tail_*``) to plane 0
+        before draining; that wave's setup moved this wave's ranks of those rows
+        off plane 0.
+        """
         physical_x, _, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        use_ds2 = self._use_ds2()
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_coord_vmnk = cluster_layout_vmnk.get_flat_coord(rank)
         peer_rank = Int32(1) - rank
         token_idx = physical_x // self.CLUSTER_SHAPE_MNK[0]
         if cutlass.const_expr(self.deterministic):
+            # Wave ordinal ``query_shard`` is query ``token_begin + query_shard * query_stride``.
             query_shard = token_idx
-            token_idx += token_begin
-            mdKV_acc, split_wg_shard = self.select_dKV_accumulator(mdKV_acc, mKV.shape[0], query_shard, rank)
+            token_idx = token_begin + query_shard * query_stride
+            if cutlass.const_expr(self.rank_shard):
+                rank_parity = (tail_step + Int32(1)) % Int32(2)
+                split_wg_shard = cutlass.Boolean(False)
+            else:
+                mdKV_acc, split_wg_shard = self.select_dKV_accumulator(mdKV_acc, mKV.shape[0], query_shard, rank)
         is_leader_cta = rank == Int32(0)
+        # Conflict-rank waves alternate the tile sweep direction: the plane rows a wave deposits last are
+        # the rows the next wave deposits first, while they are still in L2.
+        # A K <= 128 wave's records fit in L2 whatever the order, so those waves keep descending sweeps; so do
+        # waves wider than RANK_L2_RESIDENT_MAX_TOPK, whose per-wave records far exceed L2 (evict-first deposits).
+        # Non-deterministic plans always sweep descending (``_visit_tile``).
+        sweep_ascending = Int32(0) if cutlass.const_expr(self.deterministic) else None
+        if cutlass.const_expr(self.deterministic and self.rank_shard and self.max_topk > 128 and self.max_topk <= self.RANK_L2_RESIDENT_MAX_TOPK):
+            sweep_ascending = (tail_step + Int32(1)) % Int32(2)
         if warp_idx == Int32(self.LOAD_WARP):
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_do)
@@ -1995,6 +2670,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         pds_ready_mbars = storage.pds_ready_mbars.data_ptr()
         p_ready_mbars = storage.p_ready_mbars.data_ptr()
         ds_local_ready_mbar = storage.ds_local_ready_mbar.data_ptr()
+        if cutlass.const_expr(self.deterministic):
+            ds_stage_free_mbar = storage.ds_stage_free_mbar.data_ptr()
+            dsq_ready_mbar = storage.dsq_ready_mbar.data_ptr()
+        plo_staging = self.deterministic and self.max_topk <= self.PLO_STAGING_MAX_TOPK
+        p_lo_xchg_ptr = storage.p_lo_xchg.data_ptr() if plo_staging else None
         stationary_q_raw = storage.stationary_q.data_ptr()
         stationary_do_raw = storage.stationary_do.data_ptr()
         round_buf_raw = storage.round_buf.data_ptr()
@@ -2075,7 +2755,22 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         p_block_raw_ptrs = (p_blocks_raw, p_blocks_raw + self.PDS_BLOCK_ELEMENTS)
         ds_block_raw_ptrs = (ds_blocks_raw, ds_blocks_raw + self.PDS_BLOCK_ELEMENTS)
         flat_pds_block_layout = cute.make_layout((self.PDS_BLOCK_ELEMENTS,), stride=(1,))
-        p_xchg_raw = storage.p_xchg.get_tensor(flat_pds_block_layout)
+        ds2_blocks = None
+        ds2_block_raw_ptrs = None
+        if cutlass.const_expr(use_ds2):
+            # The P_hi half sent to the peer is staged in the owner half of ds_image (P_lo's staging
+            # takes the peer half): both are rewritten only after the peer's P_lo landing (ds_stage_free).
+            p_xchg_raw = cute.make_tensor(ds_image_raw + rank * Int32(self.PDS_BLOCK_ELEMENTS), flat_pds_block_layout)
+            ds2_blocks_raw = storage.ds2_blocks.data_ptr()
+            ds2_blocks = (
+                cute.make_tensor(cute.recast_ptr(ds2_blocks_raw, dkv_b_layout_staged.inner, dtype=self.element_dtype), dkv_b_layout_staged.outer),
+                cute.make_tensor(
+                    cute.recast_ptr(ds2_blocks_raw + self.PDS_BLOCK_ELEMENTS, dkv_b_layout_staged.inner, dtype=self.element_dtype), dkv_b_layout_staged.outer
+                ),
+            )
+            ds2_block_raw_ptrs = (ds2_blocks_raw, ds2_blocks_raw + self.PDS_BLOCK_ELEMENTS)
+        else:
+            p_xchg_raw = storage.p_xchg.get_tensor(flat_pds_block_layout)
         softmax_stats = storage.stats.get_tensor(cute.make_layout((self.H_TILE_CTA, 2), stride=(1, self.H_TILE_CTA)))
         staged_indices = storage.tile_indices.get_tensor(cute.make_layout((self.N_TILE, 2), stride=(1, self.N_TILE)))
         g_q = cute.local_tile(tma_tensor_q, cute.select((self.H_TILE_CTA, self.N_TILE, self.D_HEAD), mode=[0, 2]), (None, None, (token_idx, batch_idx)))
@@ -2138,6 +2833,32 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 assert k_block_offset + k_block_cosize <= self.ROUND_STAGE_ELEMENTS
         p_fragments = (dkv_tiled_mma.make_fragment_B(p_blocks[0]), dkv_tiled_mma.make_fragment_B(p_blocks[1]))
         ds_fragments = (dkv_tiled_mma.make_fragment_B(ds_blocks[0]), dkv_tiled_mma.make_fragment_B(ds_blocks[1]))
+        ds2_fragments = (None, None)
+        if cutlass.const_expr(use_ds2):
+            ds2_fragments = (dkv_tiled_mma.make_fragment_B(ds2_blocks[0]), dkv_tiled_mma.make_fragment_B(ds2_blocks[1]))
+        rolled_fragments = None
+        if cutlass.const_expr(self.deterministic and self.max_topk > 128 and self.max_topk <= self.ROLLED_SWEEP_MAX_TOPK):
+            # Stage-indexed views of the contiguous ring stages and of the two P / dS blocks (same swizzle
+            # phase: every stage starts on a 1 KiB boundary) for the rolled dK/dV sweeps.
+            round_ring_layout = sm100_utils.make_smem_layout_a(dkv_tiled_mma, self.ROUND_TILER, self.element_dtype, self.ROUND_STAGES)
+            assert cute.cosize(round_ring_layout) == self.ROUND_STAGES * self.ROUND_STAGE_ELEMENTS
+            pds_pair_layout = sm100_utils.make_smem_layout_b(dkv_tiled_mma, self.DKV_MMA_TILER, self.element_dtype, 2)
+            assert cute.cosize(pds_pair_layout) == 2 * self.PDS_BLOCK_ELEMENTS
+            round_ring = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.element_dtype, round_buf_raw.toint(), round_buf_raw.memspace, assumed_align=1024),
+                    round_ring_layout.inner,
+                    dtype=self.element_dtype,
+                ),
+                round_ring_layout.outer,
+            )
+            p_pair = cute.make_tensor(cute.recast_ptr(p_blocks_raw, pds_pair_layout.inner, dtype=self.element_dtype), pds_pair_layout.outer)
+            ds_pair = cute.make_tensor(cute.recast_ptr(ds_blocks_raw, pds_pair_layout.inner, dtype=self.element_dtype), pds_pair_layout.outer)
+            rolled_fragments = (
+                dkv_tiled_mma.make_fragment_A(round_ring),
+                dkv_tiled_mma.make_fragment_B(p_pair),
+                dkv_tiled_mma.make_fragment_B(ds_pair),
+            )
         kv_copy_atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), self.element_dtype, num_bits_per_copy=128)
         kv_thread_copy = cute.make_tiled_copy_tv(kv_copy_atom, cute.make_layout((1,)), cute.make_layout((8,))).get_slice(0)
         if cutlass.const_expr(mTopkLength is not None):
@@ -2149,9 +2870,27 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         math_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.MATH_THREADS)
         gather_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.GATHER_THREADS)
         score_ready_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.GATHER_WARPS * 2)
-        reduce_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.REDUCE_THREADS)
-        pipe_s_done = self._make_umma_async_pipeline(self.SCORE_DONE_STAGES, leader_group, math_group, storage.s_done_mbars.data_ptr(), cluster_layout_vmnk)
-        pipe_dp_done = self._make_umma_async_pipeline(self.SCORE_DONE_STAGES, leader_group, math_group, storage.dp_done_mbars.data_ptr(), cluster_layout_vmnk)
+        if cutlass.const_expr(self.deterministic):
+            # The score/dP and dKV accumulators are released by one elected lane per consumer warp (after the warp's
+            # TMEM loads completed), so each release costs a few mbarrier arrivals instead of one per thread.
+            math_warp_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.MATH_WARPS)
+            reduce_warp_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.REDUCE_WARPS)
+        else:
+            reduce_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.REDUCE_THREADS)
+        pipe_s_done = self._make_umma_async_pipeline(
+            self.SCORE_DONE_STAGES,
+            leader_group,
+            math_warp_group if cutlass.const_expr(self.deterministic) else math_group,
+            storage.s_done_mbars.data_ptr(),
+            cluster_layout_vmnk,
+        )
+        pipe_dp_done = self._make_umma_async_pipeline(
+            self.SCORE_DONE_STAGES,
+            leader_group,
+            math_warp_group if cutlass.const_expr(self.deterministic) else math_group,
+            storage.dp_done_mbars.data_ptr(),
+            cluster_layout_vmnk,
+        )
         pipe_kscore = self._make_async_umma_pipeline(1, score_ready_group, leader_group, storage.kscore_mbars.data_ptr(), cluster_layout_vmnk)
         pipe_round = pipeline.PipelineTmaUmma.create(
             num_stages=self.ROUND_STAGES,
@@ -2164,12 +2903,38 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         )
         pds_commit_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size)
         pipe_pds = self._make_async_umma_pipeline(1, pds_commit_group, leader_group, storage.pds_mbars.data_ptr(), cluster_layout_vmnk)
-        pipe_dkv_done = self._make_umma_async_pipeline(self.MMA_DONE_STAGES, leader_group, reduce_group, storage.dkv_done_mbars.data_ptr(), cluster_layout_vmnk)
+        pipe_ds2 = None
+        if cutlass.const_expr(use_ds2):
+            pipe_ds2 = self._make_async_umma_pipeline(1, pds_commit_group, leader_group, storage.ds2_mbars.data_ptr(), cluster_layout_vmnk)
+        pipe_dkv_done = self._make_umma_async_pipeline(
+            self.MMA_DONE_STAGES,
+            leader_group,
+            reduce_warp_group if cutlass.const_expr(self.deterministic) else reduce_group,
+            storage.dkv_done_mbars.data_ptr(),
+            cluster_layout_vmnk,
+        )
         pipe_dq_done = self._make_umma_async_pipeline(1, leader_group, math_group, storage.dq_done_mbars.data_ptr(), cluster_layout_vmnk)
         pipe_dq0_done = self._make_umma_async_pipeline(1, leader_group, gather_group, storage.dq0_done_mbars.data_ptr(), cluster_layout_vmnk)
+        early_stationary = self.deterministic and self.max_topk >= self.EARLY_STATIONARY_MIN_TOPK
+        if cutlass.const_expr(early_stationary):
+            if warp_idx == Int32(self.LOAD_WARP):
+                # The stationary Q/dO loads depend on nothing but the token: the load warp initializes their
+                # CTA-local barriers itself and issues both before the cluster rendezvous, so they land while
+                # thread 0 initializes the remaining barriers.
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(stationary_tma_mbars, 1)
+                    cute.arch.mbarrier_init(stationary_tma_mbars + 1, 1)
+                    cute.arch.mbarrier_init_fence()
+                cute.arch.fence_view_async_shared()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars, score_a_stage_bytes * self.K_CHUNKS)
+                    cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars + 1, score_a_stage_bytes * self.K_CHUNKS)
+                cute.copy(tma_atom_q, t_q_gmem[None, rank, 0], t_q_smem[None, 0], tma_bar_ptr=stationary_tma_mbars)
+                cute.copy(tma_atom_do, t_do_gmem[None, rank, 0], t_do_smem[None, 0], tma_bar_ptr=stationary_tma_mbars + 1)
         if tidx == Int32(0):
-            cute.arch.mbarrier_init(stationary_tma_mbars, 1)
-            cute.arch.mbarrier_init(stationary_tma_mbars + 1, 1)
+            if cutlass.const_expr(not early_stationary):
+                cute.arch.mbarrier_init(stationary_tma_mbars, 1)
+                cute.arch.mbarrier_init(stationary_tma_mbars + 1, 1)
             cute.arch.mbarrier_init(stationary_ready_mbar, 2)
             cute.arch.mbarrier_init(stationary_ready_mbar + 1, 2)
             cute.arch.mbarrier_init(landing_mbars, 1)
@@ -2178,9 +2943,23 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             cute.arch.mbarrier_init(relay_mbars + 1, 2)
             cute.arch.mbarrier_init(pds_ready_mbars, self.MATH_WARPS)
             cute.arch.mbarrier_init(p_ready_mbars, self.MATH_WARPS)
-            cute.arch.mbarrier_init(ds_local_ready_mbar, 2)
+            if cutlass.const_expr(use_ds2):
+                # Dedicated-dS plans: every math warp of both CTAs reports its dS image directly.
+                cute.arch.mbarrier_init(ds_local_ready_mbar, 2 * self.MATH_WARPS)
+            else:
+                cute.arch.mbarrier_init(ds_local_ready_mbar, 2)
+            if cutlass.const_expr(self.deterministic):
+                cute.arch.mbarrier_init(ds_stage_free_mbar, 1)
+                cute.arch.mbarrier_init(dsq_ready_mbar, self.MATH_WARPS)
+            if cutlass.const_expr(self.DV0_TMEM_A):
+                # One arrival per CTA once its math warps stored the D-round-0 dO^T lanes.
+                cute.arch.mbarrier_init(storage.dot_tmem_ready_mbar.data_ptr(), 2)
         cute.arch.fence_view_async_shared()
-        pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False)
+        # The cluster rendezvous only publishes the barrier initializations (fence.mbarrier_init inside the
+        # arrive helper): a relaxed arrive does not wait for this thread's in-flight global loads (the
+        # top-k length above), which a release arrive would drain first in every warp of both CTAs.
+        # Non-deterministic plans keep the release arrive.
+        pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=self.deterministic)
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
         tmem = TmemAllocator(
             tmem_holding_buf_ptr,
@@ -2201,6 +2980,28 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         t_dp_pp = cute.make_tensor(tmem_ptr + self.TMEM_DP1_OFFSET, score_c_layout)
         t_dq = (cute.make_tensor(tmem_ptr + self.TMEM_DQ0_OFFSET, dq_c_layout), cute.make_tensor(tmem_ptr + self.TMEM_DQ1_OFFSET, dq_c_layout))
         t_dkv = (cute.make_tensor(tmem_ptr + self.TMEM_DKV0_OFFSET, dkv_c_layout), cute.make_tensor(tmem_ptr + self.TMEM_DKV1_OFFSET, dkv_c_layout))
+        dot_tmem_fragment = None
+        t_dot_fill = None
+        if cutlass.const_expr(self.DV0_TMEM_A):
+            dot_tmem_layout = cute.slice_(
+                sm100_utils.make_smem_layout_a(dkv_ts_tiled_mma, (self.D_TILE_CLUSTER, self.N_TILE, self.H_TILE_CLUSTER), self.element_dtype, 1),
+                (None, None, None, 0),
+            )
+            t_dot_tmem = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.TMEM_A_OFFSET, dtype=self.element_dtype), dot_tmem_layout.outer)
+            # make_fragment_A addresses a TMEM operand from column 0: keep its layout on this operand's own columns.
+            dot_tmem_fragment = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.TMEM_A_OFFSET, dtype=self.element_dtype), dkv_ts_tiled_mma.make_fragment_A(t_dot_tmem).layout
+            )
+            # FP32 view of the same columns (lane = D row of this CTA, column = head pair) for the fill.
+            t_dot_fill = cute.make_tensor(tmem_ptr + self.TMEM_A_OFFSET, dkv_c_layout)
+        dot_tmem_fragment_1 = None
+        t_dot_fill_1 = None
+        if cutlass.const_expr(self.DV1_TMEM_A):
+            t_dot_tmem_1 = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.TMEM_A1_OFFSET, dtype=self.element_dtype), dot_tmem_layout.outer)
+            dot_tmem_fragment_1 = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.TMEM_A1_OFFSET, dtype=self.element_dtype), dkv_ts_tiled_mma.make_fragment_A(t_dot_tmem_1).layout
+            )
+            t_dot_fill_1 = cute.make_tensor(tmem_ptr + self.TMEM_A1_OFFSET, dkv_c_layout)
         topk = raw_topk
         if topk > Int32(mTopkIdxs.shape[0]):
             topk = Int32(mTopkIdxs.shape[0])
@@ -2208,29 +3009,43 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             topk = Int32(0)
         tile_count = (topk + Int32(self.N_TILE - 1)) // Int32(self.N_TILE)
         tile_count = cute.arch.make_warp_uniform(tile_count)
-        if warp_idx < Int32(self.MATH_WARP_BEGIN):
-            cute.arch.setmaxregister_decrease(self.GATHER_SETMAXREG)
-        elif warp_idx >= Int32(self.MMA_WARP):
-            if cutlass.const_expr(self.UTILITY_SETMAXREG > 96):
-                cute.arch.setmaxregister_increase(self.UTILITY_SETMAXREG)
-            elif cutlass.const_expr(self.UTILITY_SETMAXREG < 96):
-                cute.arch.setmaxregister_decrease(self.UTILITY_SETMAXREG)
-        elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
-            if cutlass.const_expr(self.MATH_SETMAXREG > 96):
-                cute.arch.setmaxregister_increase(self.MATH_SETMAXREG)
-            elif cutlass.const_expr(self.MATH_SETMAXREG < 96):
-                cute.arch.setmaxregister_decrease(self.MATH_SETMAXREG)
-        elif cutlass.const_expr(self.REDUCER_SETMAXREG > 96):
-            cute.arch.setmaxregister_increase(self.REDUCER_SETMAXREG)
-        elif cutlass.const_expr(self.REDUCER_SETMAXREG < 96):
-            cute.arch.setmaxregister_decrease(self.REDUCER_SETMAXREG)
+        # Register budgets: non-deterministic plans set every role's budget in this leading branch chain.
+        # Deterministic plans set each role's budget at the top of its own branch below (the utility
+        # warpgroup before its role split): ptxas sizes each code region for the budget that dominates
+        # it, so a budget set in the leading chain caps every role region at the smallest one (88).
+        if cutlass.const_expr(not self.deterministic):
+            if warp_idx < Int32(self.MATH_WARP_BEGIN):
+                cute.arch.setmaxregister_decrease(self.GATHER_SETMAXREG)
+            elif warp_idx >= Int32(self.MMA_WARP):
+                if cutlass.const_expr(self.UTILITY_SETMAXREG > 96):
+                    cute.arch.setmaxregister_increase(self.UTILITY_SETMAXREG)
+                elif cutlass.const_expr(self.UTILITY_SETMAXREG < 96):
+                    cute.arch.setmaxregister_decrease(self.UTILITY_SETMAXREG)
+            elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
+                if cutlass.const_expr(self.MATH_SETMAXREG > 96):
+                    cute.arch.setmaxregister_increase(self.MATH_SETMAXREG)
+                elif cutlass.const_expr(self.MATH_SETMAXREG < 96):
+                    cute.arch.setmaxregister_decrease(self.MATH_SETMAXREG)
+            elif cutlass.const_expr(self.REDUCER_SETMAXREG > 96):
+                cute.arch.setmaxregister_increase(self.REDUCER_SETMAXREG)
+            elif cutlass.const_expr(self.REDUCER_SETMAXREG < 96):
+                cute.arch.setmaxregister_decrease(self.REDUCER_SETMAXREG)
         if warp_idx < Int32(self.GATHER_WARPS):
+            if cutlass.const_expr(self.deterministic):
+                self._set_role_registers(self.GATHER_SETMAXREG)
             gather_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
             dq0_done_gather_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             gather_kd_rows_0 = self._kd_round_rows(kdq_loan[0])
             gather_kd_rows_1 = self._kd_round_rows(kdq_loan[1])
             if tile_count > Int32(0):
-                self._prefetch_tile_indices(mTopkIdxs, staged_indices, token_idx, batch_idx, tile_count - Int32(1), Int32(0), tidx)
+                if cutlass.const_expr(self.deterministic):
+                    # Gather warp 0 keeps the rank-owned rows of a later tile warming in L2 (row ids load early, hints issue later).
+                    pf_row = Int32(-1)
+                    if tidx < Int32(32):
+                        pf_row = self._load_prefetch_row(mTopkIdxs, token_idx, batch_idx, Int32(1), tile_count, topk, rank, tidx, sweep_ascending)
+                self._prefetch_tile_indices(
+                    mTopkIdxs, staged_indices, token_idx, batch_idx, self._visit_tile(Int32(0), tile_count, sweep_ascending), Int32(0), tidx
+                )
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.fence_view_async_shared()
@@ -2243,7 +3058,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     k_n,
                     token_idx,
                     batch_idx,
-                    tile_count - Int32(1),
+                    self._visit_tile(Int32(0), tile_count, sweep_ascending),
                     topk,
                     rank,
                     tidx,
@@ -2256,6 +3071,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 if tidx & Int32(31) == Int32(0):
                     pipe_kscore.producer_commit(gather_state)
                 gather_state.advance()
+                if cutlass.const_expr(self.deterministic):
+                    if tidx < Int32(32):
+                        self._prefetch_kv_row_l2(mKV, pf_row, batch_idx)
                 for score_iter in cutlass.range(Int32(0), tile_count):
                     index_slot = score_iter & Int32(1)
                     next_score_iter = score_iter + Int32(1)
@@ -2263,8 +3081,20 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     has_next_index_tile = score_iter != tile_count - Int32(1)
                     if has_next_index_tile:
                         self._prefetch_tile_indices(
-                            mTopkIdxs, staged_indices, token_idx, batch_idx, tile_count - Int32(1) - next_score_iter, next_index_slot, tidx
+                            mTopkIdxs,
+                            staged_indices,
+                            token_idx,
+                            batch_idx,
+                            self._visit_tile(next_score_iter, tile_count, sweep_ascending),
+                            next_index_slot,
+                            tidx,
                         )
+                    if cutlass.const_expr(self.deterministic):
+                        pf_row = Int32(-1)
+                        if tidx < Int32(32):
+                            pf_row = self._load_prefetch_row(
+                                mTopkIdxs, token_idx, batch_idx, score_iter + Int32(2), tile_count, topk, rank, tidx, sweep_ascending
+                            )
                     pipe_kscore.producer_acquire(gather_state)
                     self._gather_kdq_indexed(
                         mKV,
@@ -2274,7 +3104,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         gather_kd_rows_1,
                         token_idx,
                         batch_idx,
-                        tile_count - Int32(1) - score_iter,
+                        self._visit_tile(score_iter, tile_count, sweep_ascending),
                         topk,
                         rank,
                         tidx,
@@ -2288,6 +3118,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         pipe_kscore.producer_commit(gather_state)
                     gather_state.advance()
                     if score_iter != tile_count - Int32(1):
+                        if cutlass.const_expr(self.deterministic):
+                            if tidx < Int32(32):
+                                self._prefetch_kv_row_l2(mKV, pf_row, batch_idx)
                         self.gather_barrier.arrive_and_wait()
                         next_iter = score_iter + Int32(1)
                         pipe_kscore.producer_acquire(gather_state)
@@ -2298,7 +3131,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                             k_n,
                             token_idx,
                             batch_idx,
-                            tile_count - Int32(1) - next_iter,
+                            self._visit_tile(next_iter, tile_count, sweep_ascending),
                             topk,
                             rank,
                             tidx,
@@ -2319,7 +3152,17 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 dq0_done_gather_state.advance()
                 pipe_kscore.producer_tail(gather_state)
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
+            if cutlass.const_expr(self.deterministic):
+                self._set_role_registers(self.MATH_SETMAXREG)
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
+            if cutlass.const_expr(self.DV0_TMEM_A):
+                if tile_count > Int32(0):
+                    self._fill_dot_tmem(t_dot_fill, mdO, token_idx, batch_idx, rank, mtx)
+                    if cutlass.const_expr(self.DV1_TMEM_A):
+                        self._fill_dot_tmem(t_dot_fill_1, mdO, token_idx, batch_idx, rank, mtx, self.D_TILE_CLUSTER)
+                    _partial_cta_sync(self.math_barrier.barrier_id, self.math_barrier.num_threads)
+                    if mtx == Int32(0):
+                        cute.arch.mbarrier_arrive(storage.dot_tmem_ready_mbar.data_ptr(), Int32(0))
             if tile_count > Int32(0):
                 self.stats_lse_barrier.arrive_and_wait()
             else:
@@ -2327,6 +3170,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             s_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.SCORE_DONE_STAGES)
             dp_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.SCORE_DONE_STAGES)
             pds_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+            ds2_state = None
+            if cutlass.const_expr(use_ds2):
+                ds2_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
             dq_done_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             score_copy = tcgen05.make_tmem_copy(score_tmem_load, t_score)
             score_thread = score_copy.get_slice(mtx)
@@ -2367,9 +3213,36 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             t_rs_p_local_tile = t_rs_p_local[None, None, None, None, 0]
             t_rs_ds_local_tile = t_rs_ds_local[None, None, None, None, 0]
             t_rs_p_xchg_tile = t_rs_p_xchg[None, None, None, None, 0]
+            # The non-owner warps' P_lo staging: ds_image, or with ``plo_staging`` its own buffer.
+            t_rs_p_lo_xchg_tile = t_rs_ds_tile
+            if cutlass.const_expr(plo_staging):
+                aligned_p_lo_xchg_ptr = cute.make_ptr(
+                    self.element_dtype,
+                    p_lo_xchg_ptr.toint() - mtx // Int32(self.H_TILE_CTA) * Int32(self.PDS_BLOCK_BYTES),
+                    p_lo_xchg_ptr.memspace,
+                    assumed_align=16,
+                )
+                p_lo_xchg_store = cute.make_tensor(
+                    cute.recast_ptr(aligned_p_lo_xchg_ptr, score_store_layout.inner, dtype=self.element_dtype), score_store_domain
+                )
+                t_rs_p_lo_xchg = thread_copy_r2s.partition_D(p_lo_xchg_store)
+                assert cute.size(t_rs_p_lo_xchg, mode=[4]) == 1
+                t_rs_p_lo_xchg_tile = t_rs_p_lo_xchg[None, None, None, None, 0]
+            t_rs_ds2_local_tile = None
+            if cutlass.const_expr(use_ds2):
+                aligned_ds2_blocks_ptr = cute.make_ptr(self.element_dtype, ds2_blocks[0].iterator.toint(), ds2_blocks[0].memspace, assumed_align=16)
+                ds2_local_store = cute.make_tensor(
+                    cute.recast_ptr(aligned_ds2_blocks_ptr, score_store_layout.inner, dtype=self.element_dtype), score_store_domain
+                )
+                t_rs_ds2_local = thread_copy_r2s.partition_D(ds2_local_store)
+                assert cute.size(t_rs_ds2_local, mode=[4]) == 1
+                t_rs_ds2_local_tile = t_rs_ds2_local[None, None, None, None, 0]
             r_score = cute.make_rmem_tensor(score_coordinates.shape, self.acc_dtype)
             r_dp = cute.make_rmem_tensor(score_coordinates.shape, self.acc_dtype)
             r_p = cute.make_rmem_tensor(score_coordinates.shape, self.element_dtype)
+            if cutlass.const_expr(self.deterministic):
+                # Adjacent band pairs (i0 even, i1 = i0 + 1) share one BF16x2 word: one packed RN conversion each.
+                r_p_words = cute.recast_tensor(r_p, cutlass.Uint32)
             r_valid_band = cute.make_rmem_tensor((8,), cutlass.Boolean)
             r_ds = r_p
             r_delta = cute.make_rmem_tensor((4,), self.acc_dtype)
@@ -2380,23 +3253,42 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             hoist_band_n = [Int32(cute.get(score_coordinates[hoist_band_indices[0][band]], mode=[1])) for band in range(8)]
             hoist_lse = [softmax_stats[hoist_group_local_h[h_group], 0] for h_group in range(4)]
             math_owns_local_half = cute.arch.make_warp_uniform(mtx // Int32(self.H_TILE_CTA)) == rank
+            if cutlass.const_expr(self.deterministic):
+                math_index_row = mTopkIdxs[None, (token_idx, batch_idx)]
             for loop_iter in cutlass.range(tile_count):
+                if cutlass.const_expr(self.deterministic):
+                    # Score tiles visit the sparse row in the wave's sweep order. The band row ids come from the
+                    # immutable index row in global memory (issued before the score wait), so the math
+                    # warps never read the gather warps' cp.async index staging.
+                    tile_index = self._visit_tile(loop_iter, tile_count, sweep_ascending)
+                    for band in cutlass.range_constexpr(8):
+                        slot = tile_index * Int32(self.N_TILE) + hoist_band_n[band]
+                        r_valid_band[band] = False
+                        if slot < topk:
+                            row = math_index_row[slot]
+                            r_valid_band[band] = row >= Int32(0) and row < mKV.shape[0]
                 pipe_s_done.consumer_wait(s_state)
                 if s_state.index == Int32(0):
                     cute.copy(score_copy, score_source, r_score)
                 else:
                     cute.copy(score_copy_pp, score_source_pp, r_score)
                 cute.arch.fence_view_async_tmem_load()
-                pipe_s_done.consumer_release(s_state)
+                if cutlass.const_expr(self.deterministic):
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        pipe_s_done.consumer_release(s_state)
+                else:
+                    pipe_s_done.consumer_release(s_state)
                 s_state.advance()
-                # Score tiles visit the sparse row in reverse order.
-                tile_index = tile_count - Int32(1) - loop_iter
-                for band in cutlass.range_constexpr(8):
-                    slot = tile_index * Int32(self.N_TILE) + hoist_band_n[band]
-                    r_valid_band[band] = False
-                    if slot < topk:
-                        row = staged_indices[hoist_band_n[band], loop_iter & Int32(1)]
-                        r_valid_band[band] = row >= Int32(0) and row < mKV.shape[0]
+                if cutlass.const_expr(not self.deterministic):
+                    # Score tiles visit the sparse row in reverse order.
+                    tile_index = tile_count - Int32(1) - loop_iter
+                    for band in cutlass.range_constexpr(8):
+                        slot = tile_index * Int32(self.N_TILE) + hoist_band_n[band]
+                        r_valid_band[band] = False
+                        if slot < topk:
+                            row = staged_indices[hoist_band_n[band], loop_iter & Int32(1)]
+                            r_valid_band[band] = row >= Int32(0) and row < mKV.shape[0]
                 assert cute.size(r_score) == self.N_TILE_CTA
                 for h_group in cutlass.range_constexpr(4):
                     lse = hoist_lse[h_group]
@@ -2415,8 +3307,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                             v1 = Float32(0.0)
                         r_score[i0] = v0
                         r_score[i1] = v1
-                        r_p[i0] = self.element_dtype(v0)
-                        r_p[i1] = self.element_dtype(v1)
+                        if cutlass.const_expr(self.deterministic):
+                            r_p_words[i0 // 2] = _dq_pack_bf16x2(v0, v1)
+                        else:
+                            r_p[i0] = self.element_dtype(v0)
+                            r_p[i1] = self.element_dtype(v1)
                 pipe_pds.producer_acquire(pds_state)
                 r_p_store = thread_copy_r2s.retile(r_p)
                 assert t_rs_p_local_tile.shape == r_p_store.shape
@@ -2434,13 +3329,17 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         for pair in cutlass.range_constexpr(4):
                             i0 = hoist_band_indices[h_group][2 * pair]
                             i1 = hoist_band_indices[h_group][2 * pair + 1]
-                            r_p[i0] = self.element_dtype(_finite_residual_f32(r_score[i0], Float32(r_p[i0])))
-                            r_p[i1] = self.element_dtype(_finite_residual_f32(r_score[i1], Float32(r_p[i1])))
+                            high0, high1 = _bf16x2_to_f32x2(r_p_words[i0 // 2])
+                            r_p_words[i0 // 2] = _dq_pack_bf16x2(_finite_residual_f32(r_score[i0], high0), _finite_residual_f32(r_score[i1], high1))
                     r_p_low_store = thread_copy_r2s.retile(r_p)
                     if math_owns_local_half:
                         cute.copy(tiled_copy_r2s, r_p_low_store, t_rs_ds_local_tile)
                     else:
-                        cute.copy(tiled_copy_r2s, r_p_low_store, t_rs_ds_tile)
+                        if cutlass.const_expr(plo_staging):
+                            if loop_iter > Int32(0):
+                                # The previous tile's P_lo staging has landed in the peer (ds_stage_free).
+                                _mbarrier_wait_acquire_cluster(ds_stage_free_mbar, (loop_iter - Int32(1)) & Int32(1))
+                        cute.copy(tiled_copy_r2s, r_p_low_store, t_rs_p_lo_xchg_tile)
                     cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
@@ -2452,7 +3351,12 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 else:
                     cute.copy(dp_copy_pp, dp_source_pp, r_dp)
                 cute.arch.fence_view_async_tmem_load()
-                pipe_dp_done.consumer_release(dp_state)
+                if cutlass.const_expr(self.deterministic):
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        pipe_dp_done.consumer_release(dp_state)
+                else:
+                    pipe_dp_done.consumer_release(dp_state)
                 dp_state.advance()
                 if loop_iter == Int32(0):
                     self.stats_odo_barrier.arrive_and_wait()
@@ -2473,16 +3377,43 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         if cutlass.const_expr(self.deterministic and self.USE_DS_LOW):
                             r_dp[i0] = d0
                             r_dp[i1] = d1
-                        r_ds[i0] = self.element_dtype(d0)
-                        r_ds[i1] = self.element_dtype(d1)
-                if cutlass.const_expr(self.deterministic):
-                    pipe_pds.producer_acquire(pds_state)
+                        if cutlass.const_expr(self.deterministic):
+                            r_p_words[i0 // 2] = _dq_pack_bf16x2(d0, d1)
+                        else:
+                            r_ds[i0] = self.element_dtype(d0)
+                            r_ds[i1] = self.element_dtype(d1)
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
-                if math_owns_local_half:
-                    cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_local_tile)
                 assert t_rs_ds_tile.shape == r_ds_store.shape
-                cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_tile)
+                if cutlass.const_expr(self.deterministic):
+                    # The dQ operand (ds_image) goes out first: it only waits until the peer holds this
+                    # CTA's P_lo staging (none with ``plo_staging``), not for the hi/lo sweeps that still
+                    # read the dS blocks.
+                    if cutlass.const_expr(not plo_staging):
+                        _mbarrier_wait_acquire_cluster(ds_stage_free_mbar, loop_iter & Int32(1))
+                    cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_tile)
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_warp()
+                    if cutlass.const_expr(use_ds2):
+                        # The dQ products wait only for the dS images, not for the relay lane's P_lo hand-off.
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
+                    else:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(dsq_ready_mbar)
+                    if cutlass.const_expr(use_ds2):
+                        # Dedicated dS blocks: only the previous tile's dK products must be done.
+                        pipe_ds2.producer_acquire(ds2_state)
+                        if math_owns_local_half:
+                            cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds2_local_tile)
+                    else:
+                        pipe_pds.producer_acquire(pds_state)
+                        if math_owns_local_half:
+                            cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_local_tile)
+                else:
+                    if math_owns_local_half:
+                        cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_local_tile)
+                    cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_tile)
                 cute.arch.fence_view_async_shared()
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
@@ -2503,19 +3434,36 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(p_ready_mbars)
-                pds_state.advance()
+                if cutlass.const_expr(use_ds2):
+                    ds2_state.advance()
+                else:
+                    pds_state.advance()
+            if cutlass.const_expr(plo_staging and self.USE_P_LOW):
+                if tile_count > Int32(0):
+                    if not math_owns_local_half:
+                        # The peer's arrive for the last P_lo staging must land before this CTA exits.
+                        _mbarrier_wait_acquire_cluster(ds_stage_free_mbar, (tile_count - Int32(1)) & Int32(1))
             if tile_count > Int32(0):
                 pipe_dq_done.consumer_wait(dq_done_state)
-                cute.arch.setmaxregister_increase(self.MATH_EPI_SETMAXREG)
-                self._store_dq_epi_scalar_direct(
-                    t_dq[1], dq_tmem_load, rank_dq_coordinates, s_dq_epi, tma_atom_dq_epi, mdQ, 1, token_idx, batch_idx, rank, mtx, self.DQ_EPI_BATCH_CHUNKS
-                )
+                if cutlass.const_expr(self.deterministic):
+                    # DQ_EPI_MATH_BATCH-chunk batches fit the math register budget, so this round does not wait
+                    # for the reducers to retire their registers after the last drain.
+                    self._store_dq_epi_scalar_direct(
+                        t_dq[1], dq_tmem_load, rank_dq_coordinates, s_dq_epi, tma_atom_dq_epi, mdQ, 1, token_idx, batch_idx, rank, mtx, self.DQ_EPI_MATH_BATCH
+                    )
+                else:
+                    cute.arch.setmaxregister_increase(self.MATH_EPI_SETMAXREG)
+                    self._store_dq_epi_scalar_direct(
+                        t_dq[1], dq_tmem_load, rank_dq_coordinates, s_dq_epi, tma_atom_dq_epi, mdQ, 1, token_idx, batch_idx, rank, mtx, self.DQ_EPI_BATCH_CHUNKS
+                    )
                 pipe_dq_done.consumer_release(dq_done_state)
                 dq_done_state.advance()
             else:
                 self._zero_dq(rank_dq_coordinates, mdQ, 0, token_idx, batch_idx, mtx)
                 self._zero_dq(rank_dq_coordinates, mdQ, 1, token_idx, batch_idx, mtx)
         elif warp_idx < Int32(self.MMA_WARP):
+            if cutlass.const_expr(self.deterministic):
+                self._set_role_registers(self.REDUCER_SETMAXREG)
             rtx = tidx - Int32(self.REDUCE_THREAD_BEGIN)
             if cutlass.const_expr(self.max_topk <= self.O_PREFETCH_MAX_TOPK):
                 self._prefetch_odo_rows(mOut, token_idx, batch_idx, rank, rtx)
@@ -2537,9 +3485,58 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             dkv_wait = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.MMA_DONE_STAGES)
             dkv_rel = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.MMA_DONE_STAGES)
             index_row = mTopkIdxs[None, (token_idx, batch_idx)]
+            if cutlass.const_expr(self.deterministic and self.rank_shard):
+                # Destination codes and dKV records belong to this wave's setup launch, which
+                # also waited for the previous main kernel; then release the next setup.
+                cute.arch.griddepcontrol_wait()
+                cute.arch.griddepcontrol_launch_dependents()
+                rank_pitch, rank_planes = self.rank_geometry(mKV.shape[0])
+                drain_offsets_base = None
+                drain_record_base = None
+                if cutlass.const_expr(self.RANK_DRAIN_OVERLAP_LOOKUPS):
+                    drain_offsets_base = self.rank_offsets_parity_base(mdKV_acc, rank_pitch, rank_planes, rank_parity)
+                    drain_record_base = rank_planes * Int32(rank_pitch) + self.rank_record_base(rank_parity)
+                if cutlass.const_expr(self.rank_fused):
+                    tail_grid_x, _, _ = cute.arch.grid_dim()
+                    self._rank_tail(
+                        mdKV_acc,
+                        mTopkIdxs,
+                        mTopkLength,
+                        mKV.shape[0],
+                        tail_step,
+                        tail_begin,
+                        tail_size,
+                        physical_x * Int32(self.REDUCE_WARPS) + (warp_idx - Int32(self.REDUCE_WARP_BEGIN)),
+                        tail_grid_x * Int32(self.REDUCE_WARPS),
+                        rtx % Int32(32),
+                        query_stride,
+                        Int32(0),
+                    )
             for loop_iter in cutlass.range(tile_count):
-                tile_index = tile_count - Int32(1) - loop_iter
-                if cutlass.const_expr(self.deterministic):
+                tile_index = self._visit_tile(loop_iter, tile_count, sweep_ascending)
+                if cutlass.const_expr(self.deterministic and self.rank_shard):
+                    dkv_wait, dkv_rel = self._drain_dkv_rank(
+                        t_dkv[0],
+                        t_dkv[1],
+                        mdKV_acc,
+                        index_row,
+                        tile_index,
+                        topk,
+                        mKV.shape[0],
+                        rank_pitch,
+                        rank_planes,
+                        rank_parity,
+                        query_shard,
+                        rtx,
+                        rank,
+                        pipe_dkv_done,
+                        dkv_wait,
+                        dkv_rel,
+                        drain_offsets_base,
+                        drain_record_base,
+                        loop_iter % Int32(2) if self.ROUND_REUSE else Int32(0),
+                    )
+                elif cutlass.const_expr(self.deterministic):
                     if cutlass.const_expr(self.split_wg_queries_per_wave > 0):
                         dkv_wait, dkv_rel = self._drain_dkv_deterministic(
                             t_dkv[0], t_dkv[1], mdKV_acc, index_row, tile_index, topk, batch_idx, rtx, rank, split_wg_shard, pipe_dkv_done, dkv_wait, dkv_rel
@@ -2553,255 +3550,475 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         t_dkv[0], t_dkv[1], mdKV_acc, index_row, tile_index, topk, batch_idx, rtx, rank, pipe_dkv_done, dkv_wait, dkv_rel
                     )
             cute.arch.setmaxregister_decrease(self.REDUCER_EPI_SETMAXREG)
-        elif warp_idx == Int32(self.MMA_WARP):
-            if is_leader_cta:
-                s_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.SCORE_DONE_STAGES)
-                dp_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.SCORE_DONE_STAGES)
-                kscore_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-                round_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ROUND_STAGES)
-                pds_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-                dkv_acq = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.MMA_DONE_STAGES)
-                dkv_com = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.MMA_DONE_STAGES)
-                dq_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-                dq0_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        else:
+            # Warps 16-19 form one warpgroup: one warpgroup-uniform budget before the role split.
+            if cutlass.const_expr(self.deterministic):
+                self._set_role_registers(self.UTILITY_SETMAXREG)
+            if warp_idx == Int32(self.MMA_WARP):
+                if is_leader_cta:
+                    s_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.SCORE_DONE_STAGES)
+                    dp_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.SCORE_DONE_STAGES)
+                    kscore_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+                    round_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ROUND_STAGES)
+                    pds_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+                    ds2_cons = None
+                    if cutlass.const_expr(use_ds2):
+                        ds2_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+                    dkv_acq = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.MMA_DONE_STAGES)
+                    dkv_com = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.MMA_DONE_STAGES)
+                    dq_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                    dq0_done_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                    if tile_count > Int32(0):
+                        _mbarrier_wait_acquire_cluster(stationary_ready_mbar, Int32(0))
+                        pipe_dq0_done.producer_acquire(dq0_done_prod)
+                    pipe_dq_done.producer_acquire(dq_done_prod)
+                    relay_phase = Int32(0)
+                    for loop_iter in cutlass.range(tile_count):
+                        pipe_kscore.consumer_wait(kscore_cons)
+                        s_prod = self._issue_score(score_tiled_mma, t_score, t_score_pp, score_q_fragment, score_k_fragment, pipe_s_done, s_prod)
+                        if loop_iter == Int32(0):
+                            _mbarrier_wait_acquire_cluster(stationary_ready_mbar + 1, Int32(0))
+                        dp_prod = self._issue_score(dp_tiled_mma, t_dp, t_dp_pp, score_do_fragment, dp_k_fragment, pipe_dp_done, dp_prod)
+                        if cutlass.const_expr(self.DV0_TMEM_A):
+                            if loop_iter == Int32(0):
+                                _mbarrier_wait_acquire_cluster(storage.dot_tmem_ready_mbar.data_ptr(), Int32(0))
+                                _tcgen05_fence_after_thread_sync()
+                        pipe_kscore.consumer_release(kscore_cons)
+                        kscore_cons.advance()
+                        dq_acc = loop_iter != Int32(0)
+                        if cutlass.const_expr(use_ds2):
+                            round_cons, kscore_cons, dkv_acq, dkv_com, pds_cons, ds2_cons = self._issue_grads_early_dq_hilo(
+                                dq_tiled_mma,
+                                dkv_tiled_mma,
+                                dkv_ts_tiled_mma,
+                                dot_tmem_fragment,
+                                t_dq[0],
+                                t_dq[1],
+                                t_dkv[0],
+                                t_dkv[1],
+                                dq_kd_fragment_a,
+                                dq_kd_fragment_b,
+                                dq_ds_fragment,
+                                round_fragments[0 % len(round_fragments)],
+                                round_fragments[1 % len(round_fragments)],
+                                round_fragments[2 % len(round_fragments)],
+                                round_fragments[3 % len(round_fragments)],
+                                round_fragments[4 % len(round_fragments)],
+                                round_fragments[5 % len(round_fragments)],
+                                round_fragments[6 % len(round_fragments)],
+                                round_fragments[7 % len(round_fragments)],
+                                p_fragments[0],
+                                p_fragments[1],
+                                ds_fragments[0],
+                                ds_fragments[1],
+                                dq_acc,
+                                relay_phase,
+                                relay_mbars,
+                                ds_local_ready_mbar,
+                                pipe_round,
+                                round_cons,
+                                pipe_kscore,
+                                kscore_cons,
+                                pipe_dq0_done,
+                                dq0_done_prod,
+                                pipe_dq_done,
+                                dq_done_prod,
+                                loop_iter == tile_count - Int32(1),
+                                pipe_pds,
+                                pds_cons,
+                                pipe_dkv_done,
+                                dkv_acq,
+                                dkv_com,
+                                None,
+                                pipe_ds2,
+                                ds2_cons,
+                                ds2_fragments[0],
+                                ds2_fragments[1],
+                                dot_tmem_fragment_1,
+                                loop_iter,
+                                tile_count,
+                            )
+                        elif cutlass.const_expr(self.deterministic):
+                            round_cons, kscore_cons, dkv_acq, dkv_com, pds_cons = self._issue_grads_early_dq_hilo(
+                                dq_tiled_mma,
+                                dkv_tiled_mma,
+                                dkv_ts_tiled_mma,
+                                dot_tmem_fragment,
+                                t_dq[0],
+                                t_dq[1],
+                                t_dkv[0],
+                                t_dkv[1],
+                                dq_kd_fragment_a,
+                                dq_kd_fragment_b,
+                                dq_ds_fragment,
+                                round_fragments[0 % len(round_fragments)],
+                                round_fragments[1 % len(round_fragments)],
+                                round_fragments[2 % len(round_fragments)],
+                                round_fragments[3 % len(round_fragments)],
+                                round_fragments[4 % len(round_fragments)],
+                                round_fragments[5 % len(round_fragments)],
+                                round_fragments[6 % len(round_fragments)],
+                                round_fragments[7 % len(round_fragments)],
+                                p_fragments[0],
+                                p_fragments[1],
+                                ds_fragments[0],
+                                ds_fragments[1],
+                                dq_acc,
+                                relay_phase,
+                                relay_mbars,
+                                ds_local_ready_mbar,
+                                pipe_round,
+                                round_cons,
+                                pipe_kscore,
+                                kscore_cons,
+                                pipe_dq0_done,
+                                dq0_done_prod,
+                                pipe_dq_done,
+                                dq_done_prod,
+                                loop_iter == tile_count - Int32(1),
+                                pipe_pds,
+                                pds_cons,
+                                pipe_dkv_done,
+                                dkv_acq,
+                                dkv_com,
+                                rolled_fragments,
+                            )
+                        else:
+                            round_cons, kscore_cons, dkv_acq, dkv_com, pds_cons = self._issue_grads_early_dq(
+                                dq_tiled_mma,
+                                dkv_tiled_mma,
+                                t_dq[0],
+                                t_dq[1],
+                                t_dkv[0],
+                                t_dkv[1],
+                                dq_kd_fragment_a,
+                                dq_kd_fragment_b,
+                                dq_ds_fragment,
+                                round_fragments[0 % len(round_fragments)],
+                                round_fragments[1 % len(round_fragments)],
+                                round_fragments[2 % len(round_fragments)],
+                                round_fragments[3 % len(round_fragments)],
+                                round_fragments[4 % len(round_fragments)],
+                                round_fragments[5 % len(round_fragments)],
+                                round_fragments[6 % len(round_fragments)],
+                                round_fragments[7 % len(round_fragments)],
+                                p_fragments[0],
+                                p_fragments[1],
+                                ds_fragments[0],
+                                ds_fragments[1],
+                                dq_acc,
+                                relay_phase,
+                                relay_mbars,
+                                ds_local_ready_mbar,
+                                pipe_round,
+                                round_cons,
+                                pipe_kscore,
+                                kscore_cons,
+                                pipe_dq0_done,
+                                dq0_done_prod,
+                                pipe_dq_done,
+                                dq_done_prod,
+                                loop_iter == tile_count - Int32(1),
+                                pipe_pds,
+                                pds_cons,
+                                pipe_dkv_done,
+                                dkv_acq,
+                                dkv_com,
+                            )
+                        if cutlass.const_expr(use_ds2):
+                            # The dS blocks are free once this tile's dK products are done.
+                            pipe_ds2.consumer_release(ds2_cons)
+                            ds2_cons.advance()
+                        else:
+                            pipe_pds.consumer_release(pds_cons)
+                            pds_cons.advance()
+                        relay_phase = Int32(1) - relay_phase
+                    if tile_count > Int32(0):
+                        dq0_done_prod.advance()
+                        dq_done_prod.advance()
+                        pipe_s_done.producer_tail(s_prod)
+                        pipe_dp_done.producer_tail(dp_prod)
+                        pipe_dkv_done.producer_tail(dkv_com)
+                        pipe_dq_done.producer_tail(dq_done_prod)
+                        pipe_dq0_done.producer_tail(dq0_done_prod)
+            elif warp_idx == Int32(self.LOAD_WARP):
+                if cutlass.const_expr(early_stationary):
+                    if tile_count == Int32(0):
+                        # The pre-rendezvous Q/dO loads still land in this CTA's shared memory before it exits.
+                        cute.arch.mbarrier_wait(stationary_tma_mbars, Int32(0))
+                        cute.arch.mbarrier_wait(stationary_tma_mbars + 1, Int32(0))
                 if tile_count > Int32(0):
-                    _mbarrier_wait_acquire_cluster(stationary_ready_mbar, Int32(0))
-                    pipe_dq0_done.producer_acquire(dq0_done_prod)
-                pipe_dq_done.producer_acquire(dq_done_prod)
-                relay_phase = Int32(0)
-                for loop_iter in cutlass.range(tile_count):
-                    pipe_kscore.consumer_wait(kscore_cons)
-                    s_prod = self._issue_score(score_tiled_mma, t_score, t_score_pp, score_q_fragment, score_k_fragment, pipe_s_done, s_prod)
-                    if loop_iter == Int32(0):
-                        _mbarrier_wait_acquire_cluster(stationary_ready_mbar + 1, Int32(0))
-                    dp_prod = self._issue_score(dp_tiled_mma, t_dp, t_dp_pp, score_do_fragment, dp_k_fragment, pipe_dp_done, dp_prod)
-                    pipe_kscore.consumer_release(kscore_cons)
-                    kscore_cons.advance()
-                    dq_acc = loop_iter != Int32(0)
+                    if cutlass.const_expr(not early_stationary):
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars, score_a_stage_bytes * self.K_CHUNKS)
+                            cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars + 1, score_a_stage_bytes * self.K_CHUNKS)
+                        cute.copy(tma_atom_q, t_q_gmem[None, rank, 0], t_q_smem[None, 0], tma_bar_ptr=stationary_tma_mbars)
+                        cute.copy(tma_atom_do, t_do_gmem[None, rank, 0], t_do_smem[None, 0], tma_bar_ptr=stationary_tma_mbars + 1)
+                    cute.arch.mbarrier_wait(stationary_tma_mbars, Int32(0))
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(stationary_ready_mbar, Int32(0))
+                    cute.arch.mbarrier_wait(stationary_tma_mbars + 1, Int32(0))
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(stationary_ready_mbar + 1, Int32(0))
+                    for loop_iter in cutlass.range(tile_count):
+                        gens_per_group = self.H_TILE_CLUSTER // self.ROUND_K_HEADS
+                        if cutlass.const_expr(self.deterministic):
+                            # With ``DV1_TMEM_A`` (which ``DV0_TMEM_A`` plans always set) both dO^T groups stay in
+                            # TMEM: the ring streams the two Q^T groups.
+                            skipped_gens = 2 * gens_per_group if cutlass.const_expr(self.DV1_TMEM_A) else 0
+                            ring_gens = self.ROUND_GENS_PER_TILE - skipped_gens
+                            for micro_gen in cutlass.range_constexpr(skipped_gens, self.ROUND_GENS_PER_TILE):
+                                tensor_kind = micro_gen // (2 * gens_per_group)
+                                grad_round = micro_gen // gens_per_group % 2
+                                h_half = micro_gen % gens_per_group
+                                ring_gen = micro_gen - skipped_gens
+                                round_slot = ring_gen % self.ROUND_STAGES
+                                round_count = loop_iter * Int32(ring_gens) + Int32(ring_gen)
+                                load_group = cutlass.Boolean(True)
+                                if cutlass.const_expr(self.ROUND_REUSE):
+                                    # Tile t sweeps D-rounds (t % 2, 1 - t % 2); after tile 0 its first Q^T group is
+                                    # still in the ring, so only the second loads (4 generations per group, one group
+                                    # block per tile plus tile 0's extra one).
+                                    group_index = ring_gen // gens_per_group
+                                    grad_round = (Int32(group_index) + loop_iter) % Int32(2)
+                                    round_count = Int32(gens_per_group) * (loop_iter + Int32(group_index)) + Int32(h_half)
+                                    if loop_iter > Int32(0) and group_index == 0:
+                                        load_group = cutlass.Boolean(False)
+                                if load_group:
+                                    round_acq = pipeline.PipelineState(
+                                        self.ROUND_STAGES,
+                                        round_count,
+                                        Int32(round_slot),
+                                        Int32(1) ^ (round_count // Int32(self.ROUND_STAGES) & Int32(1)),
+                                    )
+                                    pipe_round.producer_acquire(round_acq)
+                                    round_completion_mbar = pipe_round.producer_get_barrier(round_acq)
+                                    if cutlass.const_expr(tensor_kind == 0):
+                                        cute.copy(
+                                            round_tma_atom_dot,
+                                            t_dot_round_gmem[None, grad_round, h_half],
+                                            t_dot_round_smem[round_slot][None, 0],
+                                            tma_bar_ptr=round_completion_mbar,
+                                        )
+                                    else:
+                                        cute.copy(
+                                            round_tma_atom_qt,
+                                            t_qt_round_gmem[None, grad_round, h_half],
+                                            t_qt_round_smem[round_slot][None, 0],
+                                            tma_bar_ptr=round_completion_mbar,
+                                        )
+                        else:
+                            for micro_gen in cutlass.range_constexpr(self.ROUND_GENS_PER_TILE):
+                                tensor_kind = micro_gen // (2 * gens_per_group)
+                                grad_round = micro_gen // gens_per_group % 2
+                                h_half = micro_gen % gens_per_group
+                                round_slot = micro_gen % self.ROUND_STAGES
+                                round_acq = pipeline.PipelineState(
+                                    self.ROUND_STAGES,
+                                    loop_iter * Int32(self.ROUND_GENS_PER_TILE) + Int32(micro_gen),
+                                    Int32(round_slot),
+                                    Int32(1 ^ micro_gen // self.ROUND_STAGES & 1),
+                                )
+                                pipe_round.producer_acquire(round_acq)
+                                round_completion_mbar = pipe_round.producer_get_barrier(round_acq)
+                                if cutlass.const_expr(tensor_kind == 0):
+                                    cute.copy(
+                                        round_tma_atom_dot,
+                                        t_dot_round_gmem[None, grad_round, h_half],
+                                        t_dot_round_smem[round_slot][None, 0],
+                                        tma_bar_ptr=round_completion_mbar,
+                                    )
+                                else:
+                                    cute.copy(
+                                        round_tma_atom_qt,
+                                        t_qt_round_gmem[None, grad_round, h_half],
+                                        t_qt_round_smem[round_slot][None, 0],
+                                        tma_bar_ptr=round_completion_mbar,
+                                    )
                     if cutlass.const_expr(self.deterministic):
-                        round_cons, kscore_cons, dkv_acq, dkv_com, pds_cons = self._issue_grads_early_dq_hilo(
-                            dq_tiled_mma,
-                            dkv_tiled_mma,
-                            t_dq[0],
-                            t_dq[1],
-                            t_dkv[0],
-                            t_dkv[1],
-                            dq_kd_fragment_a,
-                            dq_kd_fragment_b,
-                            dq_ds_fragment,
-                            round_fragments[0 % len(round_fragments)],
-                            round_fragments[1 % len(round_fragments)],
-                            round_fragments[2 % len(round_fragments)],
-                            round_fragments[3 % len(round_fragments)],
-                            round_fragments[4 % len(round_fragments)],
-                            round_fragments[5 % len(round_fragments)],
-                            round_fragments[6 % len(round_fragments)],
-                            round_fragments[7 % len(round_fragments)],
-                            p_fragments[0],
-                            p_fragments[1],
-                            ds_fragments[0],
-                            ds_fragments[1],
-                            dq_acc,
-                            relay_phase,
-                            relay_mbars,
-                            ds_local_ready_mbar,
-                            pipe_round,
-                            round_cons,
-                            pipe_kscore,
-                            kscore_cons,
-                            pipe_dq0_done,
-                            dq0_done_prod,
-                            pipe_dq_done,
-                            dq_done_prod,
-                            loop_iter == tile_count - Int32(1),
-                            pipe_pds,
-                            pds_cons,
-                            pipe_dkv_done,
-                            dkv_acq,
-                            dkv_com,
+                        tail_gens = self.ROUND_GENS_PER_TILE - (2 * (self.H_TILE_CLUSTER // self.ROUND_K_HEADS) if cutlass.const_expr(self.DV1_TMEM_A) else 0)
+                        tail_count = tile_count * Int32(tail_gens)
+                        if cutlass.const_expr(self.ROUND_REUSE):
+                            # One Q^T group block per tile plus tile 0's first group.
+                            tail_count = Int32(self.H_TILE_CLUSTER // self.ROUND_K_HEADS) * (tile_count + min(tile_count, Int32(1)))
+                        round_tail = pipeline.PipelineState(
+                            self.ROUND_STAGES, tail_count, tail_count % Int32(self.ROUND_STAGES), Int32(1) ^ (tail_count // Int32(self.ROUND_STAGES) & Int32(1))
                         )
                     else:
-                        round_cons, kscore_cons, dkv_acq, dkv_com, pds_cons = self._issue_grads_early_dq(
-                            dq_tiled_mma,
-                            dkv_tiled_mma,
-                            t_dq[0],
-                            t_dq[1],
-                            t_dkv[0],
-                            t_dkv[1],
-                            dq_kd_fragment_a,
-                            dq_kd_fragment_b,
-                            dq_ds_fragment,
-                            round_fragments[0 % len(round_fragments)],
-                            round_fragments[1 % len(round_fragments)],
-                            round_fragments[2 % len(round_fragments)],
-                            round_fragments[3 % len(round_fragments)],
-                            round_fragments[4 % len(round_fragments)],
-                            round_fragments[5 % len(round_fragments)],
-                            round_fragments[6 % len(round_fragments)],
-                            round_fragments[7 % len(round_fragments)],
-                            p_fragments[0],
-                            p_fragments[1],
-                            ds_fragments[0],
-                            ds_fragments[1],
-                            dq_acc,
-                            relay_phase,
-                            relay_mbars,
-                            ds_local_ready_mbar,
-                            pipe_round,
-                            round_cons,
-                            pipe_kscore,
-                            kscore_cons,
-                            pipe_dq0_done,
-                            dq0_done_prod,
-                            pipe_dq_done,
-                            dq_done_prod,
-                            loop_iter == tile_count - Int32(1),
-                            pipe_pds,
-                            pds_cons,
-                            pipe_dkv_done,
-                            dkv_acq,
-                            dkv_com,
-                        )
-                    pipe_pds.consumer_release(pds_cons)
-                    pds_cons.advance()
-                    relay_phase = Int32(1) - relay_phase
-                if tile_count > Int32(0):
-                    dq0_done_prod.advance()
-                    dq_done_prod.advance()
-                    pipe_s_done.producer_tail(s_prod)
-                    pipe_dp_done.producer_tail(dp_prod)
-                    pipe_dkv_done.producer_tail(dkv_com)
-                    pipe_dq_done.producer_tail(dq_done_prod)
-                    pipe_dq0_done.producer_tail(dq0_done_prod)
-        elif warp_idx == Int32(self.LOAD_WARP):
-            if tile_count > Int32(0):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars, score_a_stage_bytes * self.K_CHUNKS)
-                    cute.arch.mbarrier_arrive_and_expect_tx(stationary_tma_mbars + 1, score_a_stage_bytes * self.K_CHUNKS)
-                cute.copy(tma_atom_q, t_q_gmem[None, rank, 0], t_q_smem[None, 0], tma_bar_ptr=stationary_tma_mbars)
-                cute.copy(tma_atom_do, t_do_gmem[None, rank, 0], t_do_smem[None, 0], tma_bar_ptr=stationary_tma_mbars + 1)
-                cute.arch.mbarrier_wait(stationary_tma_mbars, Int32(0))
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(stationary_ready_mbar, Int32(0))
-                cute.arch.mbarrier_wait(stationary_tma_mbars + 1, Int32(0))
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(stationary_ready_mbar + 1, Int32(0))
-                for loop_iter in cutlass.range(tile_count):
-                    gens_per_group = self.H_TILE_CLUSTER // self.ROUND_K_HEADS
-                    for micro_gen in cutlass.range_constexpr(self.ROUND_GENS_PER_TILE):
-                        tensor_kind = micro_gen // (2 * gens_per_group)
-                        grad_round = micro_gen // gens_per_group % 2
-                        h_half = micro_gen % gens_per_group
-                        round_slot = micro_gen % self.ROUND_STAGES
-                        round_acq = pipeline.PipelineState(
-                            self.ROUND_STAGES,
-                            loop_iter * Int32(self.ROUND_GENS_PER_TILE) + Int32(micro_gen),
-                            Int32(round_slot),
-                            Int32(1 ^ micro_gen // self.ROUND_STAGES & 1),
-                        )
-                        pipe_round.producer_acquire(round_acq)
-                        round_completion_mbar = pipe_round.producer_get_barrier(round_acq)
-                        if cutlass.const_expr(tensor_kind == 0):
-                            cute.copy(
-                                round_tma_atom_dot,
-                                t_dot_round_gmem[None, grad_round, h_half],
-                                t_dot_round_smem[round_slot][None, 0],
-                                tma_bar_ptr=round_completion_mbar,
-                            )
-                        else:
-                            cute.copy(
-                                round_tma_atom_qt,
-                                t_qt_round_gmem[None, grad_round, h_half],
-                                t_qt_round_smem[round_slot][None, 0],
-                                tma_bar_ptr=round_completion_mbar,
-                            )
-                round_tail = pipeline.PipelineState(self.ROUND_STAGES, tile_count * Int32(self.ROUND_GENS_PER_TILE), Int32(0), Int32(1))
-                pipe_round.producer_tail(round_tail)
-        elif warp_idx == Int32(self.RELAY_WARP):
-            relay_lane = tidx % Int32(32)
-            if relay_lane == Int32(0):
-                if cutlass.const_expr(self.deterministic):
-                    for loop_iter in cutlass.range(tile_count):
-                        p_phase = loop_iter & Int32(1)
-                        cute.arch.mbarrier_wait(p_ready_mbars, p_phase)
-                        cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
-                        if rank == Int32(0):
-                            _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[0], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
-                        else:
-                            _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
-                        cute.arch.mbarrier_wait(pds_ready_mbars, Int32(0))
-                        cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
-                        if rank == Int32(0):
-                            _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
-                        else:
-                            _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
-                        _mbarrier_wait_acquire_cluster(landing_mbars, p_phase)
-                        cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
-                        _mbarrier_wait_acquire_cluster(landing_mbars + 1, Int32(0))
-                        p_generation = loop_iter * Int32(2)
-                        p_commit = pipeline.PipelineState(1, p_generation, Int32(0), Int32(1) ^ p_generation & Int32(1))
-                        pipe_pds.producer_commit(p_commit)
-                        cute.arch.mbarrier_wait(pds_ready_mbars, Int32(1))
-                        cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
-                        cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
-                        if rank == Int32(0):
-                            _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
-                        else:
-                            _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
-                        if cutlass.const_expr(self.USE_DS_LOW):
-                            cute.arch.mbarrier_wait(p_ready_mbars, Int32(1))
+                        round_tail = pipeline.PipelineState(self.ROUND_STAGES, tile_count * Int32(self.ROUND_GENS_PER_TILE), Int32(0), Int32(1))
+                    pipe_round.producer_tail(round_tail)
+            elif warp_idx == Int32(self.RELAY_WARP):
+                relay_lane = tidx % Int32(32)
+                if relay_lane == Int32(0):
+                    if cutlass.const_expr(use_ds2):
+                        for loop_iter in cutlass.range(tile_count):
+                            p_phase = loop_iter & Int32(1)
+                            cute.arch.mbarrier_wait(p_ready_mbars, p_phase)
                             cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
                             if rank == Int32(0):
                                 _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[0], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
                             else:
                                 _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
-                            _mbarrier_wait_acquire_cluster(landing_mbars, Int32(1))
-                        ds_generation = p_generation + Int32(1)
-                        ds_commit = pipeline.PipelineState(1, ds_generation, Int32(0), Int32(1) ^ ds_generation & Int32(1))
-                        pipe_pds.producer_commit(ds_commit)
-                        _mbarrier_wait_acquire_cluster(landing_mbars + 1, Int32(1))
-                        cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
-                    if tile_count > Int32(0):
-                        tail_generation = tile_count * Int32(2)
-                        pds_tail = pipeline.PipelineState(1, tail_generation, Int32(0), Int32(1) ^ tail_generation & Int32(1))
-                        pipe_pds.producer_tail(pds_tail)
-                else:
-                    for loop_iter in cutlass.range(tile_count):
-                        cute.arch.mbarrier_wait(p_ready_mbars, loop_iter & Int32(1))
-                        cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
-                        if rank == Int32(0):
-                            _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[0], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
-                        else:
-                            _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
-                        _mbarrier_wait_acquire_cluster(landing_mbars, loop_iter & Int32(1))
-                        cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
-                        cute.arch.mbarrier_wait(pds_ready_mbars, loop_iter & Int32(1))
-                        cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
-                        cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
-                        if rank == Int32(0):
-                            _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
-                        else:
-                            _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
-                        pds_com = pipeline.PipelineState(1, loop_iter, Int32(0), Int32(1) ^ loop_iter & Int32(1))
-                        pipe_pds.producer_commit(pds_com)
-                        _mbarrier_wait_acquire_cluster(landing_mbars + 1, loop_iter & Int32(1))
-                        cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
-                    if tile_count > Int32(0):
-                        pds_tail = pipeline.PipelineState(1, tile_count, Int32(0), Int32(1) ^ tile_count & Int32(1))
-                        pipe_pds.producer_tail(pds_tail)
+                            # The high dV products need only P_hi: report its landing before waiting for P_lo.
+                            _mbarrier_wait_acquire_cluster(landing_mbars, p_phase)
+                            cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
+                            cute.arch.mbarrier_wait(pds_ready_mbars, Int32(0))
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if rank == Int32(0):
+                                _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            _mbarrier_wait_acquire_cluster(landing_mbars + 1, Int32(0))
+                            # The peer's P_hi and P_lo staging have landed here: its ds_image may now take dS.
+                            cute.arch.mbarrier_arrive(ds_stage_free_mbar, peer_rank)
+                            p_commit = pipeline.PipelineState(1, loop_iter, Int32(0), Int32(1) ^ loop_iter & Int32(1))
+                            pipe_pds.producer_commit(p_commit)
+                            cute.arch.mbarrier_wait(pds_ready_mbars, Int32(1))
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if rank == Int32(0):
+                                _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds2_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                _cpasync_bulk_s2cluster(ds_image_raw, ds2_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            ds2_commit = pipeline.PipelineState(1, loop_iter, Int32(0), Int32(1) ^ loop_iter & Int32(1))
+                            pipe_ds2.producer_commit(ds2_commit)
+                            _mbarrier_wait_acquire_cluster(landing_mbars + 1, Int32(1))
+                            cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
+                        if tile_count > Int32(0):
+                            pds_tail = pipeline.PipelineState(1, tile_count, Int32(0), Int32(1) ^ tile_count & Int32(1))
+                            pipe_pds.producer_tail(pds_tail)
+                            ds2_tail = pipeline.PipelineState(1, tile_count, Int32(0), Int32(1) ^ tile_count & Int32(1))
+                            pipe_ds2.producer_tail(ds2_tail)
+                    elif cutlass.const_expr(self.deterministic):
+                        for loop_iter in cutlass.range(tile_count):
+                            p_phase = loop_iter & Int32(1)
+                            cute.arch.mbarrier_wait(p_ready_mbars, p_phase)
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if rank == Int32(0):
+                                _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[0], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
+                            cute.arch.mbarrier_wait(pds_ready_mbars, Int32(0))
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if cutlass.const_expr(plo_staging):
+                                if rank == Int32(0):
+                                    _cpasync_bulk_s2cluster(p_lo_xchg_ptr, ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                                else:
+                                    _cpasync_bulk_s2cluster(p_lo_xchg_ptr, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                if rank == Int32(0):
+                                    _cpasync_bulk_s2cluster(
+                                        ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank
+                                    )
+                                else:
+                                    _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            _mbarrier_wait_acquire_cluster(landing_mbars, p_phase)
+                            cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
+                            _mbarrier_wait_acquire_cluster(landing_mbars + 1, Int32(0))
+                            # The peer's P_lo staging has landed here: its ds_image may now take dS.
+                            cute.arch.mbarrier_arrive(ds_stage_free_mbar, peer_rank)
+                            p_generation = loop_iter * Int32(2)
+                            p_commit = pipeline.PipelineState(1, p_generation, Int32(0), Int32(1) ^ p_generation & Int32(1))
+                            pipe_pds.producer_commit(p_commit)
+                            cute.arch.mbarrier_wait(dsq_ready_mbar, p_phase)
+                            cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
+                            ds_generation = p_generation + Int32(1)
+                            if cutlass.const_expr(self.DS_RELAY_ON_RELEASE):
+                                # The peer's dS block may land once the sweeps released the P_lo blocks of both
+                                # CTAs (the dS image is already in place): send it without waiting for the local
+                                # dS-block store, which the commit below still waits for.
+                                pipe_pds.producer_acquire(pipeline.PipelineState(1, ds_generation, Int32(0), Int32(1) ^ ds_generation & Int32(1)))
+                            else:
+                                cute.arch.mbarrier_wait(pds_ready_mbars, Int32(1))
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if rank == Int32(0):
+                                _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            if cutlass.const_expr(self.DS_RELAY_ON_RELEASE):
+                                cute.arch.mbarrier_wait(pds_ready_mbars, Int32(1))
+                            if cutlass.const_expr(self.USE_DS_LOW):
+                                cute.arch.mbarrier_wait(p_ready_mbars, Int32(1))
+                                cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                                if rank == Int32(0):
+                                    _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[0], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
+                                else:
+                                    _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
+                                _mbarrier_wait_acquire_cluster(landing_mbars, Int32(1))
+                            ds_commit = pipeline.PipelineState(1, ds_generation, Int32(0), Int32(1) ^ ds_generation & Int32(1))
+                            pipe_pds.producer_commit(ds_commit)
+                            _mbarrier_wait_acquire_cluster(landing_mbars + 1, Int32(1))
+                            cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
+                        if tile_count > Int32(0):
+                            tail_generation = tile_count * Int32(2)
+                            pds_tail = pipeline.PipelineState(1, tail_generation, Int32(0), Int32(1) ^ tail_generation & Int32(1))
+                            pipe_pds.producer_tail(pds_tail)
+                    else:
+                        for loop_iter in cutlass.range(tile_count):
+                            cute.arch.mbarrier_wait(p_ready_mbars, loop_iter & Int32(1))
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if rank == Int32(0):
+                                _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[0], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
+                            _mbarrier_wait_acquire_cluster(landing_mbars, loop_iter & Int32(1))
+                            cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
+                            cute.arch.mbarrier_wait(pds_ready_mbars, loop_iter & Int32(1))
+                            cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
+                            cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
+                            if rank == Int32(0):
+                                _cpasync_bulk_s2cluster(ds_image_raw + Int32(2048), ds_block_raw_ptrs[0], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            else:
+                                _cpasync_bulk_s2cluster(ds_image_raw, ds_block_raw_ptrs[1], landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_rank)
+                            pds_com = pipeline.PipelineState(1, loop_iter, Int32(0), Int32(1) ^ loop_iter & Int32(1))
+                            pipe_pds.producer_commit(pds_com)
+                            _mbarrier_wait_acquire_cluster(landing_mbars + 1, loop_iter & Int32(1))
+                            cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
+                        if tile_count > Int32(0):
+                            pds_tail = pipeline.PipelineState(1, tile_count, Int32(0), Int32(1) ^ tile_count & Int32(1))
+                            pipe_pds.producer_tail(pds_tail)
+            elif warp_idx == Int32(self.SETUP_WARP):
+                if cutlass.const_expr(self.deterministic and self.rank_shard and self.rank_fused):
+                    # These phases read the row state, plane-use and mark entries that the preceding launch
+                    # wrote (the previous main kernel's setup warp, or the leading setup launches).
+                    cute.arch.griddepcontrol_wait()
+                    setup_grid_x, _, _ = cute.arch.grid_dim()
+                    self._rank_setup_slots(
+                        mdKV_acc,
+                        mTopkIdxs,
+                        mTopkLength,
+                        mKV.shape[0],
+                        setup_step,
+                        setup_prev_begin,
+                        setup_prev_size,
+                        setup_cur_begin,
+                        setup_cur_size,
+                        setup_next_begin,
+                        setup_next_size,
+                        physical_x * Int32(32) + tidx % Int32(32),
+                        setup_grid_x * Int32(32),
+                        query_stride,
+                    )
         tmem.relinquish_alloc_permit()
         self.cta_barrier.arrive_and_wait()
-        cute.arch.cluster_arrive()
+        if cutlass.const_expr(self.deterministic):
+            # The exit rendezvous only guards shared and tensor memory lifetime: every remote mbarrier arrive,
+            # DSMEM copy and paired MMA that touches the peer's storage was already awaited by its receiver,
+            # so the arrive need not first drain this thread's outstanding global stores (relaxed arrive).
+            cute.arch.cluster_arrive_relaxed()
+        else:
+            cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         if warp_idx == Int32(self.MATH_WARP_BEGIN):
             cute.arch.dealloc_tmem(tmem_ptr, self.TMEM_COLUMNS, is_two_cta=True)
 
     @staticmethod
     def _make_umma_async_pipeline(num_stages, producer_group, consumer_group, barrier_storage, cluster_layout_vmnk):
-        """UMMA-producer pipeline whose consumer mask is cleared.
+        """UMMA-producer pipeline whose consumer releases target cluster rank 0.
 
-        Consumer-side arrivals stay CTA-local while the leader's commits
-        remain cluster-wide.
+        For thread arrivals the mask is the destination CTA rank: the consumers of both
+        CTAs release on the leader CTA's (rank 0) empty barrier, which its next paired MMA
+        acquires. The trace-time 0 replaces the leader rank ``create`` derives at run time.
+        The leader's commits keep the multicast mask that signals both CTAs.
         """
         pipe = pipeline.PipelineUmmaAsync.create(
             num_stages=num_stages,
@@ -2822,10 +4039,12 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
 
     @staticmethod
     def _make_async_umma_pipeline(num_stages, producer_group, consumer_group, barrier_storage, cluster_layout_vmnk):
-        """UMMA-consumer pipeline whose producer mask is cleared.
+        """UMMA-consumer pipeline whose producer commits target cluster rank 0.
 
-        Producer-side arrivals stay CTA-local while the leader's acquires
-        remain cluster-wide.
+        For thread arrivals the mask is the destination CTA rank: the producers of both
+        CTAs commit to the leader CTA's (rank 0) full barrier, on which its paired MMA
+        waits. The trace-time 0 replaces the leader rank ``create`` derives at run time.
+        The leader's releases keep the multicast mask that signals both CTAs.
         """
         pipe = pipeline.PipelineAsyncUmma.create(
             num_stages=num_stages,
@@ -2857,6 +4076,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         assert cute.cosize(dkv_b_layout_staged) <= 2048
         assert cute.cosize(dq_a_layout_staged) <= 8192
         assert cute.cosize(dq_b_layout_staged) <= 4096
+        deterministic = self.deterministic
+        plo_elements = self.PDS_BLOCK_ELEMENTS if self.deterministic and self.max_topk <= self.PLO_STAGING_MAX_TOPK else 8
+
+        if self._use_ds2():
+            return self._make_shared_storage_ds2(element_dtype)
+
+        # Fields under ``if deterministic`` exist only in the deterministic layouts (a class body records an
+        # annotation only when it executes), so the non-deterministic layout keeps its own field list.
 
         @cute.struct
         class SharedStorage:
@@ -2875,6 +4102,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             p_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             ds_local_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            if deterministic:
+                ds_stage_free_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+                dsq_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+                stationary_free_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+                dot_tmem_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             stationary_q: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
@@ -2885,6 +4117,50 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             p_xchg: cute.struct.Align[cute.struct.MemRange[element_dtype, 2048], 1024]
             ds_image: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
             ds_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
+            stats: cute.struct.Align[cute.struct.MemRange[Float32, 128], 1024]
+            tile_indices: cute.struct.Align[cute.struct.MemRange[Int32, 128], 16]
+            if deterministic:
+                # Peer-half P_lo staging (see ``PLO_STAGING_MAX_TOPK``); a stub otherwise.
+                p_lo_xchg: cute.struct.Align[cute.struct.MemRange[element_dtype, plo_elements], 1024]
+
+        assert SharedStorage.size_in_bytes() <= self.MAX_SMEM_BYTES
+        return SharedStorage
+
+    def _make_shared_storage_ds2(self, element_dtype):
+        """``_make_shared_storage`` with dedicated dS blocks (``ds2_blocks``) and their pipeline barriers, without ``p_xchg``."""
+
+        @cute.struct
+        class SharedStorage:
+            s_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            round_mbars: cute.struct.MemRange[cutlass.Int64, 16]
+            pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            ds2_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
+            dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            dq0_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            stationary_tma_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
+            pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
+            p_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
+            ds_local_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            ds_stage_free_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dsq_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            stationary_free_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dot_tmem_ready_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_dealloc_mbar: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+            stationary_q: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
+            stationary_do: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
+            score_kv: cute.struct.Align[cute.struct.MemRange[element_dtype, 16384], 1024]
+            round_buf: cute.struct.Align[cute.struct.MemRange[element_dtype, 16384], 1024]
+            p_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
+            ds_image: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
+            ds_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
+            ds2_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
             stats: cute.struct.Align[cute.struct.MemRange[Float32, 128], 1024]
             tile_indices: cute.struct.Align[cute.struct.MemRange[Int32, 128], 16]
 
@@ -3085,6 +4361,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
     FUSED_FOLD_MIN_ROWS = 1024
     USE_P_LOW = True
     USE_DS_LOW = False
+    # The reducers do not prefetch O ahead of the LSE fold.
+    O_PREFETCH_MAX_TOPK = 0
 
     def __init__(self, element_dtype: Type[cutlass.Numeric], head_dim: int, head_dim_v: int, block_tile: int, max_topk: int = 0):
         super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk)
@@ -3128,6 +4406,45 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
             self.fold_groups_convert_dkv_finalize_dSink_deterministic(mdKV_acc, mdKV, seqlen, active_groups, sum_odo, d_sink, problem_shape, chunk_size).launch(
                 grid=[seqlen, 1, 1], block=[32, 1, 1], stream=stream
             )
+
+    @cute.jit
+    def postprocess_rank(
+        self,
+        mRows: cute.Tensor,
+        mdKV: cute.Tensor,
+        seqlen: Int32,
+        mTopkIdxs: cute.Tensor,
+        mTopkLength: Optional[cute.Tensor],
+        last_step: Int32,
+        last_begin: Int32,
+        last_size: Int32,
+        last_stride: Int32,
+        sum_odo: cute.Tensor,
+        scaled_lse: cute.Tensor,
+        attn_sink: cute.Tensor,
+        d_sink: cute.Tensor,
+        problem_shape,
+        stream: cuda.CUstream,
+        chunk_size: cutlass.Constexpr[int],
+    ):
+        """Finish the last wave with the ordered dSink partials, then fold each row's used planes and finalize dSink."""
+        self.launch_rank_final(
+            mRows,
+            mTopkIdxs,
+            mTopkLength,
+            seqlen,
+            last_step,
+            last_begin,
+            last_size,
+            last_stride,
+            sum_odo,
+            scaled_lse,
+            attn_sink,
+            problem_shape,
+            stream,
+            chunk_size,
+        )
+        self.launch_rank_fold(mRows, mdKV, seqlen, sum_odo, d_sink, problem_shape, stream, chunk_size)
 
     @cute.kernel
     def zero_dKV_shards(self, mdKV_acc: cute.Tensor, seqlen: Int32):
@@ -3243,6 +4560,34 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         return cute.make_tensor(mdKV_acc.iterator, cute.make_layout((self.head_dim, seqlen, (1, 1)), stride=(1, Int64(self.head_dim), (0, 0))))
 
     @cute.jit
+    def _fill_dot_tmem(
+        self, t_dot_fill: cute.Tensor, mdO: cute.Tensor, token_idx: Int32, batch_idx: Int32, rank: Int32, mtx: Int32, d_round_base: cutlass.Constexpr[int] = 0
+    ):
+        """Store this CTA's D-round-0 dO^T rows into TMEM: lane = D row of the CTA's 128-row slice, column = head pair.
+
+        Column ``j`` packs heads ``2 j`` (low half) and ``2 j + 1`` (high half), the K-major BF16 layout of an
+        A operand read from tensor memory. The caller orders the stores before the MMA with a barrier.
+        """
+        t_fill_core = t_dot_fill[(None, None), 0, 0]
+        store_atom = cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.acc_dtype)
+        tiled_r2t = tcgen05.make_tmem_copy(store_atom, t_fill_core)
+        thread_r2t = tiled_r2t.get_slice(mtx)
+        fill_destination = thread_r2t.partition_D(t_fill_core)
+        fill_coordinates = thread_r2t.partition_S(cute.make_identity_tensor((self.D_TILE_CTA, self.N_TILE)))
+        fill_values = cute.make_rmem_tensor(fill_coordinates.shape, self.acc_dtype)
+        fill_words = cute.recast_tensor(fill_values, cutlass.Uint32)
+        d_base = rank * Int32(self.D_TILE_CTA) + Int32(d_round_base)
+        for i in cutlass.range_constexpr(cute.size(fill_values)):
+            d = d_base + Int32(cute.get(fill_coordinates[i], mode=[0]))
+            head = Int32(cute.get(fill_coordinates[i], mode=[1])) * Int32(2)
+            low = mdO[head, d, (token_idx, batch_idx)]
+            high = mdO[head + Int32(1), d, (token_idx, batch_idx)]
+            fill_words[i] = _dq_pack_bf16x2(Float32(low), Float32(high))
+        cute.copy(tiled_r2t, fill_values, fill_destination)
+        cute.arch.fence_view_async_tmem_store()
+        _tcgen05_fence_before_thread_sync()
+
+    @cute.jit
     def _issue_dkv_sweep_hilo(
         self,
         dkv_tiled_mma: cute.TiledMma,
@@ -3299,6 +4644,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         self,
         dq_tiled_mma: cute.TiledMma,
         dkv_tiled_mma: cute.TiledMma,
+        dkv_ts_tiled_mma: cute.TiledMma,
+        dot_tmem_fragment: Optional[cute.Tensor],
         t_dq_0: cute.Tensor,
         t_dq_1: cute.Tensor,
         t_dkv_0: cute.Tensor,
@@ -3336,62 +4683,155 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         dkv_done_pipeline,
         dkv_acquire_state: pipeline.PipelineState,
         dkv_commit_state: pipeline.PipelineState,
+        rolled_fragments=None,
+        ds2_pipeline=None,
+        ds2_consumer_state=None,
+        ds2_fragment_0=None,
+        ds2_fragment_1=None,
+        dot_tmem_fragment_1=None,
+        tile_iter=None,
+        tile_total=None,
     ):
-        """Accumulate high/residual P products for dV and BF16 dS products for dK into FP32 TMEM."""
+        """Accumulate high/residual P products for dV and BF16 dS products for dK into FP32 TMEM.
+
+        With ``rolled_fragments`` (stage-indexed ring, P and dS views) the ring sweeps run as loops
+        (``_issue_dkv_sweep_rolled``). With ``ds2_pipeline`` (``_use_ds2`` plans) the dK products
+        read the dedicated dS blocks; the P blocks (and the P staging in ``ds_image``) are released
+        once the dV and dQ products are done.
+        """
+        if cutlass.const_expr(ds2_pipeline is not None):
+            return self._issue_grads_ds2(
+                dq_tiled_mma,
+                dkv_tiled_mma,
+                dkv_ts_tiled_mma,
+                dot_tmem_fragment,
+                t_dq_0,
+                t_dq_1,
+                t_dkv_0,
+                t_dkv_1,
+                dq_kd_fragment_a,
+                dq_kd_fragment_b,
+                dq_ds_fragment,
+                round_fragment_0,
+                round_fragment_1,
+                round_fragment_2,
+                round_fragment_3,
+                p_fragment_0,
+                p_fragment_1,
+                ds_fragment_0,
+                ds_fragment_1,
+                ds2_fragment_0,
+                ds2_fragment_1,
+                dq_accumulate,
+                relay_phase,
+                relay_mbars,
+                ds_local_ready_mbar,
+                round_pipeline,
+                round_consumer_state,
+                kscore_pipeline,
+                kscore_consumer_state,
+                dq0_done_pipeline,
+                dq0_done_state,
+                dq1_done_pipeline,
+                dq1_done_state,
+                commit_final,
+                pds_pipeline,
+                pds_consumer_state,
+                ds2_pipeline,
+                ds2_consumer_state,
+                dkv_done_pipeline,
+                dkv_acquire_state,
+                dkv_commit_state,
+                dot_tmem_fragment_1,
+                tile_iter,
+                tile_total,
+            )
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_consumer_state = self._issue_dkv_sweep_hilo(
-            dkv_tiled_mma,
-            t_dkv_0,
-            round_fragment_0,
-            round_fragment_1,
-            round_fragment_2,
-            round_fragment_3,
-            round_fragment_4,
-            round_fragment_5,
-            round_fragment_6,
-            round_fragment_7,
-            p_fragment_0,
-            p_fragment_1,
-            ds_fragment_0,
-            ds_fragment_1,
-            False,
-            self.USE_P_LOW,
-            True,
-            pds_pipeline,
-            pds_consumer_state,
-            round_pipeline,
-            round_consumer_state,
-        )
+        if cutlass.const_expr(rolled_fragments is not None):
+            round_consumer_state = self._issue_dkv_sweep_rolled(
+                dkv_tiled_mma,
+                t_dkv_0,
+                rolled_fragments[0],
+                rolled_fragments[1],
+                rolled_fragments[2],
+                False,
+                self.USE_P_LOW,
+                True,
+                pds_pipeline,
+                pds_consumer_state,
+                round_pipeline,
+                round_consumer_state,
+            )
+        else:
+            round_consumer_state = self._issue_dkv_sweep_hilo(
+                dkv_tiled_mma,
+                t_dkv_0,
+                round_fragment_0,
+                round_fragment_1,
+                round_fragment_2,
+                round_fragment_3,
+                round_fragment_4,
+                round_fragment_5,
+                round_fragment_6,
+                round_fragment_7,
+                p_fragment_0,
+                p_fragment_1,
+                ds_fragment_0,
+                ds_fragment_1,
+                False,
+                self.USE_P_LOW,
+                True,
+                pds_pipeline,
+                pds_consumer_state,
+                round_pipeline,
+                round_consumer_state,
+            )
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_consumer_state = self._issue_dkv_sweep_hilo(
-            dkv_tiled_mma,
-            t_dkv_1,
-            round_fragment_0,
-            round_fragment_1,
-            round_fragment_2,
-            round_fragment_3,
-            round_fragment_4,
-            round_fragment_5,
-            round_fragment_6,
-            round_fragment_7,
-            p_fragment_0,
-            p_fragment_1,
-            ds_fragment_0,
-            ds_fragment_1,
-            False,
-            self.USE_P_LOW,
-            False,
-            pds_pipeline,
-            pds_consumer_state,
-            round_pipeline,
-            round_consumer_state,
-        )
+        if cutlass.const_expr(rolled_fragments is not None):
+            round_consumer_state = self._issue_dkv_sweep_rolled(
+                dkv_tiled_mma,
+                t_dkv_1,
+                rolled_fragments[0],
+                rolled_fragments[1],
+                rolled_fragments[2],
+                False,
+                self.USE_P_LOW,
+                False,
+                pds_pipeline,
+                pds_consumer_state,
+                round_pipeline,
+                round_consumer_state,
+            )
+        else:
+            round_consumer_state = self._issue_dkv_sweep_hilo(
+                dkv_tiled_mma,
+                t_dkv_1,
+                round_fragment_0,
+                round_fragment_1,
+                round_fragment_2,
+                round_fragment_3,
+                round_fragment_4,
+                round_fragment_5,
+                round_fragment_6,
+                round_fragment_7,
+                p_fragment_0,
+                p_fragment_1,
+                ds_fragment_0,
+                ds_fragment_1,
+                False,
+                self.USE_P_LOW,
+                False,
+                pds_pipeline,
+                pds_consumer_state,
+                round_pipeline,
+                round_consumer_state,
+            )
         pds_pipeline.consumer_release(pds_consumer_state)
         pds_consumer_state.advance()
-        pds_pipeline.consumer_wait(pds_consumer_state)
+        # Both CTAs' dS images (the dQ operand) are in place; the dS blocks follow for the dK sweeps.
         _mbarrier_wait_acquire_cluster(ds_local_ready_mbar, relay_phase)
         kscore_consumer_state = self._issue_dq_rounds_early(
             dq_tiled_mma,
@@ -3409,48 +4849,280 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
             dq1_done_state,
             commit_final,
         )
+        pds_pipeline.consumer_wait(pds_consumer_state)
         _mbarrier_wait_acquire_cluster(relay_mbars + 1, relay_phase)
-        round_consumer_state = self._issue_dkv_sweep(
+        if cutlass.const_expr(rolled_fragments is not None):
+            round_consumer_state = self._issue_dkv_sweep_rolled(
+                dkv_tiled_mma,
+                t_dkv_0,
+                rolled_fragments[0],
+                rolled_fragments[2],
+                rolled_fragments[2],
+                True,
+                False,
+                False,
+                pds_pipeline,
+                pds_consumer_state,
+                round_pipeline,
+                round_consumer_state,
+            )
+        else:
+            round_consumer_state = self._issue_dkv_sweep(
+                dkv_tiled_mma,
+                t_dkv_0,
+                round_fragment_0,
+                round_fragment_1,
+                round_fragment_2,
+                round_fragment_3,
+                round_fragment_4,
+                round_fragment_5,
+                round_fragment_6,
+                round_fragment_7,
+                ds_fragment_0,
+                ds_fragment_1,
+                True,
+                round_pipeline,
+                round_consumer_state,
+            )
+        cute.arch.fence_view_async_tmem_store()
+        dkv_done_pipeline.producer_commit(dkv_commit_state)
+        dkv_commit_state.advance()
+        if cutlass.const_expr(rolled_fragments is not None):
+            round_consumer_state = self._issue_dkv_sweep_rolled(
+                dkv_tiled_mma,
+                t_dkv_1,
+                rolled_fragments[0],
+                rolled_fragments[2],
+                rolled_fragments[2],
+                True,
+                False,
+                False,
+                pds_pipeline,
+                pds_consumer_state,
+                round_pipeline,
+                round_consumer_state,
+            )
+        else:
+            round_consumer_state = self._issue_dkv_sweep(
+                dkv_tiled_mma,
+                t_dkv_1,
+                round_fragment_0,
+                round_fragment_1,
+                round_fragment_2,
+                round_fragment_3,
+                round_fragment_4,
+                round_fragment_5,
+                round_fragment_6,
+                round_fragment_7,
+                ds_fragment_0,
+                ds_fragment_1,
+                True,
+                round_pipeline,
+                round_consumer_state,
+            )
+        cute.arch.fence_view_async_tmem_store()
+        dkv_done_pipeline.producer_commit(dkv_commit_state)
+        dkv_commit_state.advance()
+        return (round_consumer_state, kscore_consumer_state, dkv_acquire_state, dkv_commit_state, pds_consumer_state)
+
+    @cute.jit
+    def _issue_dv_tmem_round(
+        self,
+        dkv_ts_tiled_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        a_fragment: cute.Tensor,
+        high_fragment_0: cute.Tensor,
+        high_fragment_1: cute.Tensor,
+        low_fragment_0: cute.Tensor,
+        low_fragment_1: cute.Tensor,
+        pds_pipeline,
+        pds_consumer_state: pipeline.PipelineState,
+        wait_low: cutlass.Constexpr[bool],
+    ):
+        """One D-round of dV from its TMEM dO^T operand: the high chunks, then the residual-low chunks.
+
+        ``wait_low`` waits for the P_lo blocks before the low terms (the first D-round of a tile).
+        """
+        chunk_k_blocks = self.ROUND_K_HEADS // 16
+        for term in cutlass.range_constexpr(2):
+            if cutlass.const_expr(term == 1 and wait_low):
+                pds_pipeline.consumer_wait(pds_consumer_state)
+            for chunk in cutlass.range_constexpr(self.ROUND_STAGES):
+                head_base = chunk * self.ROUND_K_HEADS
+                b_fragment = high_fragment_0 if head_base < self.H_TILE_CTA else high_fragment_1
+                if cutlass.const_expr(term == 1):
+                    b_fragment = low_fragment_0 if head_base < self.H_TILE_CTA else low_fragment_1
+                b_k_block_offset = head_base % self.H_TILE_CTA // self.ROUND_K_HEADS * chunk_k_blocks
+                mma = dkv_ts_tiled_mma.with_()
+                mma.set(tcgen05.Field.ACCUMULATE, term > 0 or chunk > 0)
+                for k_block in cutlass.range_constexpr(chunk_k_blocks):
+                    cute.gemm(
+                        mma, t_dkv, a_fragment[None, None, chunk * chunk_k_blocks + k_block], b_fragment[None, None, b_k_block_offset + k_block, 0], t_dkv
+                    )
+                    mma.set(tcgen05.Field.ACCUMULATE, True)
+
+    @cute.jit
+    def _issue_grads_ds2(
+        self,
+        dq_tiled_mma: cute.TiledMma,
+        dkv_tiled_mma: cute.TiledMma,
+        dkv_ts_tiled_mma: cute.TiledMma,
+        dot_tmem_fragment_0: cute.Tensor,
+        t_dq_0: cute.Tensor,
+        t_dq_1: cute.Tensor,
+        t_dkv_0: cute.Tensor,
+        t_dkv_1: cute.Tensor,
+        dq_kd_fragment_a: cute.Tensor,
+        dq_kd_fragment_b: cute.Tensor,
+        dq_ds_fragment: cute.Tensor,
+        round_fragment_0: cute.Tensor,
+        round_fragment_1: cute.Tensor,
+        round_fragment_2: cute.Tensor,
+        round_fragment_3: cute.Tensor,
+        p_fragment_0: cute.Tensor,
+        p_fragment_1: cute.Tensor,
+        ds_fragment_0: cute.Tensor,
+        ds_fragment_1: cute.Tensor,
+        ds2_fragment_0: cute.Tensor,
+        ds2_fragment_1: cute.Tensor,
+        dq_accumulate: cutlass.Boolean,
+        relay_phase: Int32,
+        relay_mbars: cute.Pointer,
+        ds_local_ready_mbar: cute.Pointer,
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
+        kscore_pipeline,
+        kscore_consumer_state: pipeline.PipelineState,
+        dq0_done_pipeline,
+        dq0_done_state: pipeline.PipelineState,
+        dq1_done_pipeline,
+        dq1_done_state: pipeline.PipelineState,
+        commit_final: cutlass.Boolean,
+        pds_pipeline,
+        pds_consumer_state: pipeline.PipelineState,
+        ds2_pipeline,
+        ds2_consumer_state: pipeline.PipelineState,
+        dkv_done_pipeline,
+        dkv_acquire_state: pipeline.PipelineState,
+        dkv_commit_state: pipeline.PipelineState,
+        dot_tmem_fragment_1=None,
+        tile_iter=None,
+        tile_total=None,
+    ):
+        """``_issue_grads_early_dq_hilo`` for ``_use_ds2`` plans: both dO^T operands in TMEM, dK from the dS blocks.
+
+        Such plans hold the D-round-0 and D-round-1 dO^T operands in TMEM (``DV0_TMEM_A``,
+        ``DV1_TMEM_A``) and one dKV accumulator for both D-rounds, and alternate the D-round order per
+        tile (``ROUND_REUSE``): tile ``tile_iter`` sweeps D-round ``tile_iter % 2`` first. The tile's
+        first Q^T group is the one its predecessor swept last and is still in the ring (awaited only by
+        tile 0, released here); its second group is awaited and kept for the next tile (released only by
+        the last tile).
+
+        The first D-round (dV from TMEM, dQ, dK from the Q^T ring) is committed to the reducers; the
+        second then reacquires the same accumulator columns once they were loaded, adds its dV from TMEM
+        (the P phase is released after it) and its dK from the ring. Each accumulator keeps one fixed
+        FP32 order (dV high chunks, dV low chunks, dK chunks). The dS blocks (``ds2``) are released by
+        the caller after the dK products.
+        """
+        assert self.DV1_TMEM_A and self.ROUND_REUSE, "dedicated-dS plans hold both dO^T operands in TMEM and alternate the D-rounds"
+        _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
+        dkv_done_pipeline.producer_acquire(dkv_acquire_state)
+        dkv_acquire_state.advance()
+        if tile_iter % Int32(2) == Int32(0):
+            self._issue_dv_tmem_round(
+                dkv_ts_tiled_mma, t_dkv_0, dot_tmem_fragment_0, p_fragment_0, p_fragment_1, ds_fragment_0, ds_fragment_1, pds_pipeline, pds_consumer_state, True
+            )
+        else:
+            self._issue_dv_tmem_round(
+                dkv_ts_tiled_mma, t_dkv_0, dot_tmem_fragment_1, p_fragment_0, p_fragment_1, ds_fragment_0, ds_fragment_1, pds_pipeline, pds_consumer_state, True
+            )
+        # Both CTAs' dS images (the dQ operand) are in place.
+        _mbarrier_wait_acquire_cluster(ds_local_ready_mbar, relay_phase)
+        kscore_consumer_state = self._issue_dq_rounds_early(
+            dq_tiled_mma,
+            t_dq_0,
+            t_dq_1,
+            dq_kd_fragment_a,
+            dq_kd_fragment_b,
+            dq_ds_fragment,
+            dq_accumulate,
+            kscore_pipeline,
+            kscore_consumer_state,
+            dq0_done_pipeline,
+            dq0_done_state,
+            dq1_done_pipeline,
+            dq1_done_state,
+            commit_final,
+        )
+        ds2_pipeline.consumer_wait(ds2_consumer_state)
+        _mbarrier_wait_acquire_cluster(relay_mbars + 1, relay_phase)
+        # First Q^T group: generation block ``tile_iter``.
+        self._issue_dkv_sweep_reuse(
             dkv_tiled_mma,
             t_dkv_0,
             round_fragment_0,
             round_fragment_1,
             round_fragment_2,
             round_fragment_3,
-            round_fragment_4,
-            round_fragment_5,
-            round_fragment_6,
-            round_fragment_7,
-            ds_fragment_0,
-            ds_fragment_1,
-            True,
+            ds2_fragment_0,
+            ds2_fragment_1,
             round_pipeline,
-            round_consumer_state,
+            Int32(self.ROUND_STAGES) * tile_iter,
+            tile_iter == Int32(0),
+            True,
         )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
-        round_consumer_state = self._issue_dkv_sweep(
+        dkv_done_pipeline.producer_acquire(dkv_acquire_state)
+        dkv_acquire_state.advance()
+        if tile_iter % Int32(2) == Int32(0):
+            self._issue_dv_tmem_round(
+                dkv_ts_tiled_mma,
+                t_dkv_1,
+                dot_tmem_fragment_1,
+                p_fragment_0,
+                p_fragment_1,
+                ds_fragment_0,
+                ds_fragment_1,
+                pds_pipeline,
+                pds_consumer_state,
+                False,
+            )
+        else:
+            self._issue_dv_tmem_round(
+                dkv_ts_tiled_mma,
+                t_dkv_1,
+                dot_tmem_fragment_0,
+                p_fragment_0,
+                p_fragment_1,
+                ds_fragment_0,
+                ds_fragment_1,
+                pds_pipeline,
+                pds_consumer_state,
+                False,
+            )
+        pds_pipeline.consumer_release(pds_consumer_state)
+        pds_consumer_state.advance()
+        # Second Q^T group: generation block ``tile_iter + 1``, kept in the ring for the next tile.
+        self._issue_dkv_sweep_reuse(
             dkv_tiled_mma,
             t_dkv_1,
             round_fragment_0,
             round_fragment_1,
             round_fragment_2,
             round_fragment_3,
-            round_fragment_4,
-            round_fragment_5,
-            round_fragment_6,
-            round_fragment_7,
-            ds_fragment_0,
-            ds_fragment_1,
-            True,
+            ds2_fragment_0,
+            ds2_fragment_1,
             round_pipeline,
-            round_consumer_state,
+            Int32(self.ROUND_STAGES) * (tile_iter + Int32(1)),
+            True,
+            tile_iter == tile_total - Int32(1),
         )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
-        return (round_consumer_state, kscore_consumer_state, dkv_acquire_state, dkv_commit_state, pds_consumer_state)
+        return (round_consumer_state, kscore_consumer_state, dkv_acquire_state, dkv_commit_state, pds_consumer_state, ds2_consumer_state)
 
     @cute.jit
     def _drain_dkv_deterministic(
@@ -3503,7 +5175,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
                 r_topk[i] = Int32(-1)
         cute.copy(tiled_t2r_0, thread_source_0, thread_values_0)
         cute.arch.fence_view_async_tmem_load()
-        done_pipeline.consumer_release(release_state)
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            done_pipeline.consumer_release(release_state)
         release_state.advance()
         assert cute.size(thread_values_0) == self.N_TILE // 2
         sub_tile_idx_0 = rank
@@ -3539,7 +5213,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         wait_state.advance()
         cute.copy(tiled_t2r_1, thread_source_1, thread_values_1)
         cute.arch.fence_view_async_tmem_load()
-        done_pipeline.consumer_release(release_state)
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            done_pipeline.consumer_release(release_state)
         release_state.advance()
         kv_index = Int32(-1)
         owner_lane = Int32(0)
@@ -3702,3 +5378,70 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministic(TwoCTADeterministicR
         if seq_block == Int32(0):
             head = tidx + Int32(32) * tidy
             self._finalize_dSink_head_deterministic(sum_odo, d_sink, problem_shape, head, chunk_size)
+
+
+class FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShard(RankShardReduction, FlashAttentionDSABackwardSm100H128TwoCTADeterministic):
+    """The deterministic H128 D512 two-CTA kernel with conflict-rank dKV storage (``RankShardReduction``).
+
+    This class runs one setup launch before each main kernel. ``...RankShardFewPlanes`` is the same
+    plan with at most ``RANK_FEW_PLANES`` dense planes; ``...RankShardFused`` runs each wave's tail in
+    the next main kernel's reducer warps and the slot phases in its setup warp.
+
+    TMEM: S(t + 1) and dP(t + 1) issue only after the dS of tile t was read, so one score and one
+    dP buffer suffice (``SCORE_DONE_STAGES = 1``). Top-k 512 and wider hold the D-round-0 dO^T
+    operand of dV in the freed columns (``DV0_TMEM_A``) and read dK's dS from dedicated blocks
+    (``_use_ds2``); the dKV accumulator then keeps one D-round at a time (``MMA_DONE_STAGES = 1``),
+    the freed D-round-1 accumulator columns hold the D-round-1 dO^T (``DV1_TMEM_A``), the dK/dV
+    ring streams only Q^T, and tiles alternate their D-round order (``ROUND_REUSE``).
+    """
+
+    rank_record = 512
+    # The compiled workspace view is one record-pitched plane of dynamic extent.
+    num_dkv_shards = 1
+    # S(t + 1) and dP(t + 1) issue only after the dS of tile t was read, so one TMEM buffer each suffices; the
+    # freed columns hold the D-round-0 dO^T operand of dV, which then leaves the dK/dV ring stream.
+    SCORE_DONE_STAGES = 1
+    TMEM_S1_OFFSET = 0
+    TMEM_DP_OFFSET = 32
+    TMEM_DP1_OFFSET = 32
+    TMEM_A_OFFSET = 64
+    DV0_TMEM_A = True
+    PLO_STAGING_MAX_TOPK = 128
+
+    def __init__(self, element_dtype: Type[cutlass.Numeric], head_dim: int, head_dim_v: int, block_tile: int, max_topk: int = 0):
+        super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk)
+        self.num_dkv_shards = 1
+        self.split_wg_queries_per_wave = 0
+        if max_topk <= 128:
+            # Two-tile queries stream every round stage: staging dO^T in TMEM costs more per query than the
+            # four ring stages per tile it saves (the single-buffered score/dP accumulators stay).
+            self.DV0_TMEM_A = False
+            self.DS_RELAY_ON_RELEASE = True
+        if self._use_ds2():
+            assert self.ROUND_STAGES == 4, "dedicated-dS plans stream four ring stages per D-round group"
+            # Dedicated-dS plans hold both D-rounds' dO^T operands in TMEM: the dKV accumulator keeps one
+            # D-round at a time (D-round 1 reuses the round-0 columns once the reducers loaded them), so the
+            # D-round-1 dO^T takes the freed columns and the dK/dV ring streams only Q^T (8 stages a tile).
+            self.DV1_TMEM_A = True
+            self.MMA_DONE_STAGES = 1
+            self.TMEM_DKV1_OFFSET = self.TMEM_DKV0_OFFSET
+            # Alternate the D-round order per tile and keep the shared Q^T group in the ring.
+            self.ROUND_REUSE = max_topk >= self.ROUND_REUSE_MIN_TOPK
+
+
+class FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFewPlanes(FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShard):
+    """Per-wave-setup conflict-rank plan with at most ``RANK_FEW_PLANES`` (three) dense planes.
+
+    Most rows that several queries of a wave share overflow there, so most drained slots carry
+    indirect codes: the drain overlaps their overflow-offset lookups (``RANK_DRAIN_OVERLAP_LOOKUPS``).
+    """
+
+    rank_few_planes = True
+    RANK_DRAIN_OVERLAP_LOOKUPS = True
+    RANK_RECORDS_L2_DEFAULT = True
+
+
+class FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFused(FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShard):
+    """Conflict-rank storage whose wave tails run inside the next main kernel (no per-wave setup launch)."""
+
+    rank_fused = True

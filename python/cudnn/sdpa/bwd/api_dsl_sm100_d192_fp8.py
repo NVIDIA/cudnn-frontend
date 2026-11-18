@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import torch
 
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from .d128_contract import ACCUMULATION, select_implementation, validate_dense_bounds
+from .d128_contract import ACCUMULATION, D192_FP8_CCS, select_implementation, validate_dense_bounds
 
 FP8_AMAX = ("amax_dQ", "amax_dK", "amax_dV", "amax_dP")
 _GRAD_DTYPES = (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
@@ -110,7 +110,7 @@ class SdpaBwdDslSm100D192Fp8(SdpaBwdDsl):
         require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
-        require(100 <= cc[0] * 10 + cc[1] <= 106, f"requires SM100-106; got {cc}")
+        require(tuple(cc) in D192_FP8_CCS, f"requires a compute capability in {D192_FP8_CCS}; got {cc}")
         arch_error = cutedsl_arch_requirement_error(cc)
         require(arch_error is None, arch_error)
         require(not self.thd and not self._thd_ro_spec, "THD / ragged is not supported")
@@ -118,7 +118,6 @@ class SdpaBwdDslSm100D192Fp8(SdpaBwdDsl):
         require(not self.seq_q_lens_present and not self.seq_kv_lens_present, "padding masks are not supported")
         require(not self.causal_bottom_right, "bottom-right causal is not supported")
         require(self.window_size_left is None and self.window_size_right is None, "sliding windows are not supported")
-        require(not self.deterministic, "deterministic reductions are not supported")
         require(all(d is None for d in (self.sink_desc, self.dsink_desc, self.bias_desc, self.dbias_desc)), "sink / dSink and bias / dBias are not supported")
         require(self.tile_m is None and self.tile_n is None, "the kernel has fixed tile geometry")
         for role in ROLES[:9]:
@@ -155,7 +154,9 @@ class SdpaBwdDslSm100D192Fp8(SdpaBwdDsl):
         self.head_dim_qk, self.head_dim_v = D_QK, D_V
         self.scale_softmax = D_QK**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax > 0, "attn_scale must be finite and positive")
-        implementation = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=D_QK, d_v=D_V, input_bytes=1)
+        implementation = select_implementation(
+            cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=D_QK, d_v=D_V, input_bytes=1, ccs=D192_FP8_CCS
+        )
         require(implementation == ACCUMULATION, "the declaration is outside the accumulation envelope")
         self._implementation = ACCUMULATION
         self._is_supported = True

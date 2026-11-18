@@ -129,7 +129,6 @@ def frost_qsa_pack_bits(
     ranges: cute.Tensor,
     ids: cute.Tensor,
     counts: cute.Tensor,
-    vectorized: cutlass.Constexpr = False,
 ):
     tid = cute.arch.thread_idx()[0]
     row = Int64(cute.arch.block_idx()[0]) * 4 + tid // 32
@@ -160,7 +159,7 @@ def frost_qsa_pack_bits(
                                     word = word | mask
                 bits[row, Int64(word_index)] = word
         else:
-            _metadata._compact_row(sel, lo, hi, first, last, ids, counts, row, lane, vectorized)
+            _metadata._compact_row(sel, lo, hi, first, last, ids, counts, row, lane)
 
 
 frost_qsa_pack_bits.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -185,12 +184,11 @@ def prepare(
     ids,
     counts,
     stream: cuda.CUstream,
-    vectorized: cutlass.Constexpr = False,
 ):
     frost_qsa_scan_kv(k, v, partials).launch(grid=(cute.ceil_div(k.shape[0], 1024), 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_tile_bounds(lo, hi, partials, modes, ranges).launch(grid=(cute.ceil_div(lo.shape[0], TILE_M), 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_schedule(modes, ranges, order).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
-    frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts, vectorized).launch(
+    frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts).launch(
         grid=(cute.ceil_div(bits.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
     )
 

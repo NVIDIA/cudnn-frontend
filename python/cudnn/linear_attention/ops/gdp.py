@@ -15,7 +15,18 @@ from typing import Dict, Optional, Tuple
 import torch
 import cudnn
 
-from .common import execute_graph, make_execution_resources, make_summary_cache_key, select_plan, summary_backward, summary_setup_context, torch_dtype_to_cudnn
+from .common import (
+    check_composed_state,
+    check_composed_summaries,
+    check_context,
+    execute_graph,
+    make_execution_resources,
+    make_summary_cache_key,
+    select_plan,
+    summary_backward,
+    summary_setup_context,
+    torch_dtype_to_cudnn,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -69,6 +80,9 @@ def make_fprop_cache_key(
     overwrite_initial_state,
     state_pool_rows=None,
     beta_shape=None,
+    composed_rows=None,
+    checkpoint_after_block=False,
+    state_indices_dtype=None,
 ):
     return (
         "gdp_fprop",
@@ -104,6 +118,9 @@ def make_fprop_cache_key(
         bool(overwrite_initial_state),
         state_pool_rows,
         beta_shape,
+        composed_rows,
+        bool(checkpoint_after_block),
+        state_indices_dtype,
     )
 
 
@@ -140,6 +157,8 @@ def make_bprop_cache_key(
     device,
     plan_name,
     beta_shape=None,
+    composed_rows=None,
+    checkpoint_after_block=False,
 ):
     return (
         "gdp_bprop",
@@ -175,6 +194,8 @@ def make_bprop_cache_key(
         device,
         plan_name,
         beta_shape,
+        composed_rows,
+        bool(checkpoint_after_block),
     )
 
 
@@ -247,6 +268,10 @@ def build_fprop_graph(
     k_shape=None,
     v_shape=None,
     beta_shape=None,
+    composed_rows=None,
+    input_context=False,
+    checkpoint_after_block=False,
+    output_context=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -265,12 +290,18 @@ def build_fprop_graph(
     if state_indices_dtype is not None:
         state_indices_t = graph.tensor([N], data_type=state_indices_dtype, name="state_indices")
     pool_ports = {"state_indices": state_indices_t} if state_indices_t is not None else {}
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            preceding_state_update=graph.tensor([composed_rows, HO, V, K], data_type=cudnn.data_type.FLOAT, name="preceding_state_update"),
+            preceding_transition=graph.tensor([composed_rows, HO, K, K], data_type=cudnn.data_type.FLOAT, name="preceding_transition"),
+        )
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
     if dt_bias_dtype is not None:
         dt_bias_t = graph.tensor([HO], data_type=dt_bias_dtype, name="dt_bias")
-    O_t, fs_t, state_checkpoints_t = graph.gdp(
+    O_t, fs_t, state_checkpoints_t, composed_t = graph.gdp(
         q=q_t,
         k=k_t,
         v=v_t,
@@ -279,6 +310,7 @@ def build_fprop_graph(
         cu_seqlens=cu_t,
         initial_state=state0_t,
         **pool_ports,
+        **composed_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         num_householder=num_householder,
@@ -292,10 +324,15 @@ def build_fprop_graph(
         gate_domain=None if gate_domain == "log" else gate_domain,
         overwrite_initial_state=overwrite_initial_state or None,
         checkpoint_every_n_tokens=checkpoint,
+        input_context=input_context or None,
+        checkpoint_after_block=checkpoint_after_block or None,
+        output_context=output_context or None,
         name="gdp",
     )
     if state_checkpoints_t is not None:
-        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
+        state_checkpoints_t.set_data_type(torch_dtype_to_cudnn(checkpoint_dtype))
+    if composed_t is not None:
+        composed_t.set_data_type(cudnn.data_type.FLOAT)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -310,6 +347,8 @@ def build_fprop_graph(
         O=O_t,
         fs=fs_t,
         state_checkpoints=state_checkpoints_t,
+        composed_initial_state=composed_t,
+        **composed_ports,
     )
 
 
@@ -342,15 +381,28 @@ def run_gdp_fwd(
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+    checkpoint_after_block: bool = False,
+    output_context: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP forward over a cached single-node GDP pygraph in THD layout.
 
     Returns ``(o, final_state, state_checkpoints)``; ``final_state`` /
     ``state_checkpoints`` are zero-size tensors when ``output_final_state``
     is ``False`` / ``checkpoint_every_n_tokens`` is ``0``.
     ``final_state_out`` binds the final_state output to a caller buffer (the in-place op passes ``initial_state``);
-    ``state_indices`` (int32 ``[N]``) makes ``initial_state`` a pool whose row ``state_indices[i]`` seeds sequence ``i``
-    and receives its final state.
+    ``state_indices`` (int32 or int64 ``[N]``) makes ``initial_state`` a pool whose row ``state_indices[i]`` seeds sequence ``i``
+    and receives its final state.  ``preceding_state_update`` / ``preceding_transition`` (fp32 ``[P, HO, V, K]`` /
+    ``[P, HO, K, K]``, the forward summaries of the ``P`` preceding context-parallel ranks in rank order) are folded on
+    the device into the one-row ``composed_initial_state`` (fp32 ``[1, HO, V, K]``, the fourth output) that the first
+    local sequence starts from; the caller's ``initial_state`` row 0, when given, is the state beyond the farthest rank
+    and the other rows stay the other sequences' starts (zero without one).  Zero-size without summaries, as with an
+    empty ``P = 0`` pair.  ``context`` is the forward summary's context over the same tokens (``output_context``); a
+    zero-size tensor is none, and it requires ``use_qk_l2norm_in_kernel``.  ``output_context`` adds a fifth value, the
+    uint8 context this forward leaves for the backward of the same tokens (zero-size without it, or when the plan keeps
+    nothing).
     """
     total, H, K = q.shape
     n = int(num_householder)
@@ -371,6 +423,11 @@ def run_gdp_fwd(
     check_tma_strides("gated_delta_product", "v", v)
     N = cu_seqlens.shape[0] - 1
     device = q.device
+    has_context = context is not None and context.numel() > 0
+    if has_context and not use_qk_l2norm_in_kernel:
+        raise ValueError("gated_delta_product: context (the forward summary's normalized k rows) requires use_qk_l2norm_in_kernel")
+    if output_context and has_context:
+        raise ValueError("gated_delta_product: output_context cannot combine with context (one context per call)")
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"gated_delta_product: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
@@ -392,20 +449,24 @@ def run_gdp_fwd(
     if state_indices is not None:
         if initial_state is None:
             raise ValueError("gated_delta_product: state_indices selects rows of the initial_state pool, so initial_state is required")
-        check_dtype("state_indices", state_indices, torch.int32)
+        check_dtype("state_indices", state_indices, (torch.int32, torch.int64))
         if state_indices.dim() != 1 or state_indices.shape[0] != N:
             raise ValueError(f"gated_delta_product: state_indices must be [N] = [{N}]; got {tuple(state_indices.shape)}")
-        if int(checkpoint_every_n_tokens):
-            raise ValueError("gated_delta_product: state_indices cannot be combined with checkpoint_every_n_tokens")
+        state_strides = initial_state.stride()
+        state_align = 16 // initial_state.element_size()
         if (
-            tuple(initial_state.stride()[1:]) != (V * K, K, 1)
-            or initial_state.stride(0) < max(H, HV) * V * K
-            or initial_state.stride(0) % (16 // initial_state.element_size())
+            state_strides[3] != 1
+            or any(stride % state_align for stride in state_strides[:3])
+            or state_strides[2] < K
+            or state_strides[1] < V * state_strides[2]
+            or state_strides[0] < max(H, HV) * state_strides[1]
         ):
-            raise ValueError("gated_delta_product: state_indices requires a pool whose rows are dense [HO, V, K] blocks on a 16-byte aligned slot stride")
+            raise ValueError(
+                "gated_delta_product: state_indices requires a pool of [HO, V, K] rows with unit K stride and 16-byte aligned, non-overlapping row, head and slot strides"
+            )
         state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2))
         if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     for tensor_name, tensor in (
@@ -423,11 +484,29 @@ def run_gdp_fwd(
             raise ValueError(f"gated_delta_product: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     state_out_dtype = state0.dtype if state0 is not None else torch.float32
+    composed_rows = check_composed_summaries(
+        "gated_delta_product",
+        "preceding_state_update",
+        "preceding_transition",
+        preceding_state_update,
+        preceding_transition,
+        (max(H, HV), V, K),
+        (max(H, HV), K, K),
+        device,
+    )
+    composed = torch.empty(0, dtype=torch.float32, device=device)
+    if composed_rows:
+        if state_indices is not None or final_state_out is not None:
+            raise ValueError("gated_delta_product: preceding summaries cannot combine with state_indices or overwrite_initial_state")
+        composed = torch.empty(1, max(H, HV), V, K, dtype=torch.float32, device=device)
+    state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
-    if checkpoint_dtype not in (None, torch.float32, q.dtype):
+    if checkpoint_dtype not in (None, torch.float32, q.dtype, torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(f"gated_delta_product: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
     if checkpoint_dtype is None:
         checkpoint_dtype = q.dtype
+    if checkpoint_after_block and not checkpoint:
+        raise ValueError("gated_delta_product: checkpoint_after_block requires checkpoint_every_n_tokens > 0")
 
     from ..frost.common.host import family_slots
 
@@ -464,7 +543,10 @@ def run_gdp_fwd(
         final_state_out is not None,
         state_pool_rows,
         tuple(beta.shape),
-    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
+        composed_rows=composed_rows or None,
+        checkpoint_after_block=bool(checkpoint_after_block),
+        state_indices_dtype=state_indices.dtype if state_indices is not None else None,
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), has_context, bool(output_context))
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
             total,
@@ -498,6 +580,10 @@ def run_gdp_fwd(
             k_shape=tuple(k.shape),
             v_shape=tuple(v.shape),
             beta_shape=tuple(beta.shape),
+            composed_rows=composed_rows or None,
+            input_context=has_context,
+            checkpoint_after_block=bool(checkpoint_after_block),
+            output_context=bool(output_context),
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -518,6 +604,10 @@ def run_gdp_fwd(
         variant_pack[t["state0"]] = state0
     if state_indices is not None:
         variant_pack[t["state_indices"]] = state_indices
+    if composed_rows:
+        variant_pack[t["preceding_state_update"]] = preceding_state_update
+        variant_pack[t["preceding_transition"]] = preceding_transition
+        variant_pack[t["composed_initial_state"]] = composed
     if a_log is not None:
         variant_pack[t["a_log"]] = a_log
     if dt_bias is not None:
@@ -531,12 +621,14 @@ def run_gdp_fwd(
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
-        total_checkpoints = max(total * n // checkpoint + N, 1)
+        total_checkpoints = max(total * n // checkpoint + (0 if checkpoint_after_block else N), 1)
         state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
-    execute_graph(graph, variant_pack, workspace, handle)
-    return o, final_state, state_checkpoints
+    context = check_context("gated_delta_product", context, graph, device) if has_context else None
+    context_out = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
+    execute_graph(graph, variant_pack, workspace, handle, context_out if context_out.numel() else context)
+    return o, final_state, state_checkpoints, composed, context_out
 
 
 @torch.library.custom_op("cudnn::gated_delta_product_fwd", mutates_args=())
@@ -562,7 +654,12 @@ def gdp_fwd(
     checkpoint_every_n_tokens: int = 0,
     checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+    checkpoint_after_block: bool = False,
+    output_context: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional GDP forward: :func:`run_gdp_fwd` with fresh outputs; the autograd formula registers below."""
     return run_gdp_fwd(
         q=q,
@@ -586,6 +683,11 @@ def gdp_fwd(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
+        preceding_state_update=preceding_state_update,
+        preceding_transition=preceding_transition,
+        context=context,
+        checkpoint_after_block=checkpoint_after_block,
+        output_context=output_context,
     )
 
 
@@ -613,12 +715,14 @@ def gdp_fwd_overwrite_state(
     plan_name: Optional[str] = None,
     state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
+    context: Optional[torch.Tensor] = None,
+    checkpoint_after_block: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GDP forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 ``[N]``
+    """GDP forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 or int64 ``[N]``
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
     never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
-    o, _, state_checkpoints = run_gdp_fwd(
+    o, _, state_checkpoints, _, _ = run_gdp_fwd(
         q=q,
         k=k,
         v=v,
@@ -642,6 +746,8 @@ def gdp_fwd_overwrite_state(
         output_final_state=bool(output_final_state),
         final_state_out=initial_state if output_final_state else None,
         state_indices=state_indices,
+        context=context,
+        checkpoint_after_block=checkpoint_after_block,
     )
     return o, state_checkpoints
 
@@ -669,9 +775,16 @@ def gdp_fwd_fake(
     checkpoint_every_n_tokens=0,
     checkpoint_dtype=None,
     plan_name: Optional[str] = None,
+    preceding_state_update=None,
+    preceding_transition=None,
+    context=None,
+    checkpoint_after_block=False,
+    output_context=False,
 ):
     total, H, K = q.shape
     HK = k.shape[-2]
+    if context is not None and context.numel() > 0 and not use_qk_l2norm_in_kernel:
+        raise ValueError("gated_delta_product: context (the forward summary's normalized k rows) requires use_qk_l2norm_in_kernel")
     HV, V = v.shape[-2], v.shape[-1]
     if HK not in (H, HV):
         raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV})")
@@ -689,19 +802,24 @@ def gdp_fwd_fake(
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     o = q.new_empty(total, HO, V)
     state_dtype = initial_state.dtype if initial_state is not None else torch.float32
+    composed_rows = check_composed_summaries(
+        "gated_delta_product", "preceding_state_update", "preceding_transition", preceding_state_update, preceding_transition, (HO, V, K), (HO, K, K), q.device
+    )
+    composed = q.new_empty((1, HO, V, K) if composed_rows else (0,), dtype=torch.float32)
     final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
-        total_checkpoints = max(total * int(num_householder) // int(checkpoint_every_n_tokens) + N, 1)
+        total_checkpoints = max(total * int(num_householder) // int(checkpoint_every_n_tokens) + (0 if checkpoint_after_block else N), 1)
         state_checkpoints = q.new_empty(
             total_checkpoints,
             HO,
             V,
             K,
-            dtype=torch.float32 if checkpoint_dtype == torch.float32 else q.dtype,
+            dtype=q.dtype if checkpoint_dtype is None else checkpoint_dtype,
         )
     else:
         state_checkpoints = q.new_empty(0)
-    return o, final, state_checkpoints
+    context_out = q.new_empty(torch.library.get_ctx().new_dynamic_size() if output_context else 0, dtype=torch.uint8)
+    return o, final, state_checkpoints, composed, context_out
 
 
 @gdp_fwd_overwrite_state.register_fake
@@ -728,8 +846,10 @@ def gdp_fwd_overwrite_state_fake(
     plan_name=None,
     state_indices=None,
     output_final_state=True,
+    context=None,
+    checkpoint_after_block=False,
 ):
-    o, _, state_checkpoints = gdp_fwd_fake(
+    o, _, state_checkpoints, _, _ = gdp_fwd_fake(
         q=q,
         k=k,
         v=v,
@@ -751,6 +871,8 @@ def gdp_fwd_overwrite_state_fake(
         checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
+        context=context,
+        checkpoint_after_block=checkpoint_after_block,
     )
     return o, state_checkpoints
 
@@ -790,6 +912,11 @@ def build_bprop_graph(
     v_shape=None,
     beta_shape=None,
     checkpoint_dtype=None,
+    composed_rows=None,
+    has_composed_state=False,
+    input_context=False,
+    checkpoint_after_block=False,
+    context_from_forward=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -801,6 +928,7 @@ def build_bprop_graph(
     beta_t = graph.tensor(list(beta_shape) if beta_shape is not None else [expanded, HO], data_type=beta_dtype, name="beta")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     dO_t = graph.tensor([total, HO, V], data_type=io_dtype, name="dO")
+    composed_state_t = graph.tensor([1, HO, V, K], data_type=cudnn.data_type.FLOAT, name="composed_initial_state") if has_composed_state else None
     state0_t = None
     if state_dtype is not None:
         state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
@@ -810,6 +938,12 @@ def build_bprop_graph(
     checkpoints_t = None
     if checkpoint_rows is not None:
         checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            following_state_grad=graph.tensor([composed_rows, HO, V, K], data_type=cudnn.data_type.FLOAT, name="following_state_grad"),
+            following_transition=graph.tensor([composed_rows, HO, K, K], data_type=cudnn.data_type.FLOAT, name="following_transition"),
+        )
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
@@ -826,17 +960,22 @@ def build_bprop_graph(
         state_checkpoints=checkpoints_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         num_householder=num_householder,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens or None,
+        checkpoint_after_block=checkpoint_after_block or None,
         batch_invariant=batch_invariant,
         use_beta_sigmoid=use_beta_sigmoid or None,
         allow_neg_eigval=allow_neg_eigval or None,
         safe_gate=safe_gate or None,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        input_context=input_context or None,
+        context_from_forward=context_from_forward or None,
         name="gdp_bwd",
     )
     return graph, dict(
@@ -860,6 +999,8 @@ def build_bprop_graph(
         d_a_log=d_a_log_t,
         d_dt_bias=d_dt_bias_t,
         checkpoints=checkpoints_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
     )
 
 
@@ -892,6 +1033,12 @@ def gdp_bwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     plan_name: Optional[str] = None,
+    following_state_grad: Optional[torch.Tensor] = None,
+    following_transition: Optional[torch.Tensor] = None,
+    composed_initial_state: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+    checkpoint_after_block: bool = False,
+    context_from_forward: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP backward over a cached single-node GDP_BWD pygraph in THD layout.
 
@@ -900,6 +1047,15 @@ def gdp_bwd(
     when ``initial_state`` / ``a_log`` / ``dt_bias`` is ``None``. With
     ``use_beta_sigmoid_in_kernel``, ``beta`` is raw logits (float32 or the
     io dtype) and ``dbeta`` is the raw-logit gradient in ``beta``'s dtype.
+    ``following_state_grad`` / ``following_transition`` (fp32 ``[P, HO, V, K]`` / ``[P, HO, K, K]``, the backward summaries
+    of the ``P`` following context-parallel ranks in rank order) are folded on the device into a one-row gradient state
+    that the last local sequence starts from (the caller's ``d_final_state`` row, when given, is the gradient beyond the
+    farthest rank; every other sequence starts from its ``d_final_state`` row, or zero).  ``composed_initial_state`` (fp32
+    ``[1, HO, V, K]``, the forward's fourth output) is the first local sequence's initial state under context
+    parallelism, beside the caller's optional ``initial_state``.  ``context`` is the backward summary's context over the
+    same tokens (``output_context``), or with ``context_from_forward`` the one the forward of the same tokens left (its
+    ``output_context``, prepared at the forward's ``checkpoint_every_n_tokens`` and ``batch_invariant``, which this call
+    must be given); a zero-size tensor is none.
     """
     total, H, K = q.shape
     n = int(num_householder)
@@ -972,40 +1128,59 @@ def gdp_bwd(
 
     from ..frost.common.host import family_slots
 
-    cache_key = make_bprop_cache_key(
-        total,
-        N,
-        H,
-        HK,
-        HV,
-        K,
-        V,
-        n,
-        q.dtype,
-        dO.dtype,
-        g.dtype,
-        beta.dtype,
-        state0.dtype if state0 is not None else None,
-        dstate_in.dtype if dstate_in is not None else None,
-        tuple(k.shape),
-        tuple(v.shape),
-        cu_seqlens.dtype,
-        state_checkpoints.shape[0] if state_checkpoints is not None else None,
-        state_checkpoints.dtype if state_checkpoints is not None else None,
-        checkpoint_every_n_tokens,
-        scale,
-        use_qk_l2norm_in_kernel,
-        batch_invariant,
-        use_beta_sigmoid_in_kernel,
-        allow_neg_eigval,
-        safe_gate,
-        gate_domain,
-        a_log.dtype if a_log is not None else None,
-        dt_bias.dtype if dt_bias is not None else None,
+    composed_rows = check_composed_summaries(
+        "gated_delta_product",
+        "following_state_grad",
+        "following_transition",
+        following_state_grad,
+        following_transition,
+        (max(H, HV), V, K),
+        (max(H, HV), K, K),
         device,
-        plan_name,
-        tuple(beta.shape),
-    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
+    )
+    composed_state = check_composed_state("gated_delta_product", composed_initial_state, (max(H, HV), V, K), device)
+    has_context = context is not None and context.numel() > 0
+
+    cache_key = (
+        make_bprop_cache_key(
+            total,
+            N,
+            H,
+            HK,
+            HV,
+            K,
+            V,
+            n,
+            q.dtype,
+            dO.dtype,
+            g.dtype,
+            beta.dtype,
+            state0.dtype if state0 is not None else None,
+            dstate_in.dtype if dstate_in is not None else None,
+            tuple(k.shape),
+            tuple(v.shape),
+            cu_seqlens.dtype,
+            state_checkpoints.shape[0] if state_checkpoints is not None else None,
+            state_checkpoints.dtype if state_checkpoints is not None else None,
+            checkpoint_every_n_tokens,
+            scale,
+            use_qk_l2norm_in_kernel,
+            batch_invariant,
+            use_beta_sigmoid_in_kernel,
+            allow_neg_eigval,
+            safe_gate,
+            gate_domain,
+            a_log.dtype if a_log is not None else None,
+            dt_bias.dtype if dt_bias is not None else None,
+            device,
+            plan_name,
+            tuple(beta.shape),
+            composed_rows=composed_rows or None,
+            checkpoint_after_block=bool(checkpoint_after_block),
+        )
+        + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), composed_state is not None)
+        + (has_context, has_context and bool(context_from_forward))
+    )
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
             total,
@@ -1037,6 +1212,11 @@ def gdp_bwd(
             k_shape=tuple(k.shape),
             v_shape=tuple(v.shape),
             beta_shape=tuple(beta.shape),
+            composed_rows=composed_rows or None,
+            has_composed_state=composed_state is not None,
+            input_context=has_context,
+            checkpoint_after_block=bool(checkpoint_after_block),
+            context_from_forward=has_context and bool(context_from_forward),
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1070,6 +1250,11 @@ def gdp_bwd(
         variant_pack[t["dstate0"]] = dstate0
     if dstate_in is not None:
         variant_pack[t["dfs"]] = dstate_in
+    if composed_rows:
+        variant_pack[t["following_state_grad"]] = following_state_grad
+        variant_pack[t["following_transition"]] = following_transition
+    if composed_state is not None:
+        variant_pack[t["composed_initial_state"]] = composed_state
     if state_checkpoints is not None:
         variant_pack[t["checkpoints"]] = state_checkpoints
     d_a_log = torch.empty(0, dtype=torch.float32, device=device)
@@ -1083,7 +1268,8 @@ def gdp_bwd(
         variant_pack[t["dt_bias"]] = dt_bias
         variant_pack[t["d_dt_bias"]] = d_dt_bias
     workspace, handle = make_execution_resources(graph, device)
-    execute_graph(graph, variant_pack, workspace, handle)
+    context = check_context("gated_delta_product", context, graph, device) if has_context else None
+    execute_graph(graph, variant_pack, workspace, handle, context)
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
     # dk / dv / dbeta are dense in the expanded row order; the token-major input's shape is a free view of them
@@ -1114,6 +1300,12 @@ def gdp_bwd_fake(
     a_log=None,
     dt_bias=None,
     plan_name=None,
+    following_state_grad=None,
+    following_transition=None,
+    composed_initial_state=None,
+    context=None,
+    checkpoint_after_block=False,
+    context_from_forward=False,
 ):
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None and d_final_state.dtype != dstate_dtype:
@@ -1161,9 +1353,20 @@ def gdp_setup_context(ctx, inputs, output):
         checkpoint_every_n_tokens,
         checkpoint_dtype,
         plan_name,
+        preceding_state_update,
+        preceding_transition,
+        context,
+        checkpoint_after_block,
+        output_context,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
-    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0
+    ctx.checkpoint_reuse = (
+        checkpoint_every_n_tokens > 0
+        and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0
+        and output[2].numel() > 0
+        and not checkpoint_after_block
+        and checkpoint_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+    )
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1175,8 +1378,15 @@ def gdp_setup_context(ctx, inputs, output):
         saved.append(a_log)
     if ctx.has_dt_bias:
         saved.append(dt_bias)
+    ctx.context_from_forward = output[4].numel() > 0 and checkpoint_every_n_tokens == ctx.checkpoint_every_n_tokens
+    if ctx.context_from_forward:
+        saved.append(output[4])
     ctx.save_for_backward(*saved)
+    # under context parallelism the backward starts from the composed state, and the caller's initial_state (the
+    # state beyond the farthest preceding rank) gets no gradient
+    ctx.composed = output[3].numel() > 0
     ctx.initial_state = initial_state
+    ctx.composed_state = output[3] if ctx.composed else None
     ctx.num_householder = num_householder
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -1185,10 +1395,10 @@ def gdp_setup_context(ctx, inputs, output):
     ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
     ctx.allow_neg_eigval = bool(allow_neg_eigval)
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(output[2])
+    ctx.mark_non_differentiable(output[2], output[3], output[4])
 
 
-def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
+def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, d_context):
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
@@ -1200,6 +1410,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         gate_params = list(saved_tensors[6:])
     a_log = gate_params.pop(0) if ctx.has_a_log else None
     dt_bias = gate_params.pop(0) if ctx.has_dt_bias else None
+    context = gate_params.pop(0) if ctx.context_from_forward else None
     initial_state = ctx.initial_state
 
     if dO is None:
@@ -1217,6 +1428,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         ctx.scale,
         initial_state=initial_state,
         d_final_state=dstate_in,
+        composed_initial_state=ctx.composed_state,
         state_checkpoints=state_checkpoints,
         checkpoint_every_n_tokens=ctx.checkpoint_every_n_tokens,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
@@ -1228,6 +1440,8 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         a_log=a_log,
         dt_bias=dt_bias,
         plan_name=ctx.plan_name,
+        context=context,
+        context_from_forward=ctx.context_from_forward,
     )
     return (
         dq,
@@ -1238,7 +1452,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         None,
         None,
-        dstate0 if initial_state is not None else None,
+        dstate0 if initial_state is not None and not ctx.composed else None,
         None,
         None,
         None,
@@ -1248,6 +1462,11 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         d_a_log if ctx.has_a_log else None,
         d_dt_bias if ctx.has_dt_bias else None,
+        None,
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -1290,6 +1509,11 @@ def gated_delta_product(
     plan_name: Optional[str] = None,
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+    checkpoint_after_block: bool = False,
+    output_context: bool = False,
 ):
     """Gated DeltaProduct (GDP) linear attention.
 
@@ -1357,6 +1581,11 @@ def gated_delta_product(
             checkpoint on a real-token boundary.
         checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
             chunk cadence and regenerates the dense series from any other rows).
+        checkpoint_after_block: if ``True``, row ``j`` of a sequence holds the state after ``(j + 1) * n`` tokens
+            instead of the state before block ``j``: the incoming state is never stored, an aligned sequence end is
+            stored and equals ``final_state``, ``floor(L / n)`` rows per sequence and ``T // n`` rows in all (the
+            default series stores ``ceil(L / n)`` rows per sequence, row 0 the incoming state).  The backward does not
+            seed from after-block rows; it recomputes the series as it does without checkpoints.
         overwrite_initial_state: if ``True``, ``final_state`` is written
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the
@@ -1364,15 +1593,17 @@ def gated_delta_product(
             race-free.  Inference only: the in-place op has no autograd
             formula.
         plan_name: optionally pin one execution plan by name (``gdp_frost``).
-        state_indices: optional ``[N]`` int32 table making ``initial_state`` a
+        state_indices: optional ``[N]`` int32 or int64 table making ``initial_state`` a
             pool ``[N_pool, HO, V, K]``: sequence ``i`` reads row
             ``state_indices[i]`` and, under ``output_final_state``, writes its
             final state back to that row in place, so a serving stack keeps
             its paged state pool without a gather and scatter around the
-            call.  Implies ``overwrite_initial_state``.  Forward only; cannot
-            combine with ``checkpoint_every_n_tokens``.
+            call.  Implies ``overwrite_initial_state``.  Forward only.
 
-    Other arguments and returns match :func:`gated_delta_net`.
+    ``preceding_state_update`` / ``preceding_transition`` (context parallelism) and the fourth output
+    ``composed_initial_state`` they add follow :func:`gated_delta_net` as well, and so do ``context`` (the forward
+    summary's context) and ``output_context`` (the context this forward leaves for the backward; the normalized rows
+    at ``d_v = 64``).  Other arguments and returns match :func:`gated_delta_net`.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -1383,6 +1614,10 @@ def gated_delta_product(
     if overwrite_initial_state or state_indices is not None:
         if initial_state is None:
             raise ValueError("gated_delta_product: overwrite_initial_state requires initial_state")
+        if preceding_state_update is not None or preceding_transition is not None:
+            raise ValueError("gated_delta_product: preceding summaries cannot combine with overwrite_initial_state or state_indices")
+        if output_context:
+            raise ValueError("gated_delta_product: output_context cannot combine with overwrite_initial_state or state_indices (inference only)")
         o, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd_overwrite_state(
             q,
             k,
@@ -1406,10 +1641,12 @@ def gated_delta_product(
             plan_name=plan_name,
             state_indices=state_indices,
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
+            context=context,
+            checkpoint_after_block=bool(checkpoint_after_block),
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd(
+        o, final_state, state_checkpoints, composed_initial_state, context_out = torch.ops.cudnn.gated_delta_product_fwd(
             q,
             k,
             v,
@@ -1431,7 +1668,18 @@ def gated_delta_product(
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
             checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
+            preceding_state_update=preceding_state_update,
+            preceding_transition=preceding_transition,
+            context=context,
+            checkpoint_after_block=bool(checkpoint_after_block),
+            output_context=bool(output_context),
         )
+        if preceding_state_update is not None:
+            if output_context:
+                return o, final_state, state_checkpoints, composed_initial_state, context_out
+            return o, final_state, state_checkpoints, composed_initial_state
+        if output_context:
+            return (o, final_state, state_checkpoints, context_out) if checkpoint_every_n_tokens > 0 else (o, final_state, context_out)
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
     return o, final_state
@@ -1468,6 +1716,7 @@ def build_gdp_summary_graph(
     k_shape=None,
     v_shape=None,
     beta_shape=None,
+    output_context=False,
 ):
     graph = cudnn.pygraph()
     expanded = total * num_householder
@@ -1501,6 +1750,7 @@ def build_gdp_summary_graph(
         allow_neg_eigval=allow_neg_eigval or None,
         safe_gate=safe_gate or None,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        output_context=output_context or None,
         name="gdp_summary",
     )
     fs_t.set_data_type(cudnn.data_type.FLOAT)
@@ -1544,14 +1794,18 @@ def gdp_summary(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    output_context: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP summary over a cached single-node GDP_SUMMARY pygraph; k/v/beta on the expanded timeline, g and
-    cu_seqlens at the real tokens.  Returns ``(final_state, transition)`` float32, ``transition`` zero-size unless
-    ``output_transition``."""
+    cu_seqlens at the real tokens.  Returns ``(final_state, transition, context)``: the two float32 outputs,
+    ``transition`` zero-size unless ``output_transition``, and the uint8 context for the forward of the same tokens,
+    zero-size unless ``output_context`` and ``use_qk_l2norm_in_kernel``."""
     total, HO = g.shape[0], g.shape[1]
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary: num_householder must be a positive integer, got {num_householder}")
+    if output_context and not output_transition:
+        raise ValueError("gated_delta_product_summary: output_context requires output_transition")
     if 0 in k.stride():
         k = k.contiguous()
     if 0 in v.stride():
@@ -1636,7 +1890,7 @@ def gdp_summary(
         gate_domain=gate_domain,
         num_householder=n,
         beta_shape=tuple(beta.shape),
-    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), bool(output_context))
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdp_summary_graph(
             total,
@@ -1664,6 +1918,7 @@ def gdp_summary(
             k_shape=tuple(k.shape),
             v_shape=tuple(v.shape),
             beta_shape=tuple(beta.shape),
+            output_context=bool(output_context),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1689,8 +1944,9 @@ def gdp_summary(
         transition = torch.empty(N, HO, K, K, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
     workspace, handle = make_execution_resources(graph, device)
-    execute_graph(graph, variant_pack, workspace, handle)
-    return final_state, transition
+    context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
+    execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
+    return final_state, transition, context
 
 
 @gdp_summary.register_fake
@@ -1712,11 +1968,14 @@ def gdp_summary_fake(
     dt_bias=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    output_context=False,
 ):
     total, HO = g.shape[0], g.shape[1]
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary: num_householder must be a positive integer, got {num_householder}")
+    if output_context and not output_transition:
+        raise ValueError("gated_delta_product_summary: output_context requires output_transition")
     K = k.shape[-1]
     V = v.shape[-1]
     N = cu_seqlens.shape[0] - 1
@@ -1732,7 +1991,8 @@ def gdp_summary_fake(
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     final_state = k.new_empty((N, HO, V, K), dtype=torch.float32)
     transition = k.new_empty((N, HO, K, K) if output_transition else (0,), dtype=torch.float32)
-    return final_state, transition
+    context = k.new_empty(torch.library.get_ctx().new_dynamic_size() if output_context else 0, dtype=torch.uint8)
+    return final_state, transition, context
 
 
 # ---------------------------------------------------------------------------
@@ -1767,6 +2027,8 @@ def build_gdp_summary_bwd_graph(
     output_transition=False,
     k_shape=None,
     beta_shape=None,
+    output_context=False,
+    checkpoint_every_n_tokens=0,
 ):
     graph = cudnn.pygraph()
     expanded = total * num_householder
@@ -1803,6 +2065,8 @@ def build_gdp_summary_bwd_graph(
         allow_neg_eigval=allow_neg_eigval or None,
         safe_gate=safe_gate or None,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        output_context=output_context or None,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens or None,
         name="gdp_summary_bwd",
     )
     d_initial_state_t.set_data_type(cudnn.data_type.FLOAT)
@@ -1849,15 +2113,20 @@ def gdp_summary_bwd(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    output_context: bool = False,
+    checkpoint_every_n_tokens: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP backward summary over a cached single-node GDP_SUMMARY_BWD pygraph; k/beta on the expanded timeline,
     q, g, dO and cu_seqlens at the real tokens.  Returns ``d_initial_state`` float32 ``[N, HO, V, K]`` (``G`` with no
-    ``d_final_state``, the full ``dh0`` otherwise) and ``transition`` float32 ``[N, HO, K, K]`` in the backward's
-    stored-domain orientation (``M_buf^T``), zero-size unless ``output_transition``."""
+    ``d_final_state``, the full ``dh0`` otherwise), ``transition`` float32 ``[N, HO, K, K]`` in the backward's
+    stored-domain orientation (``M_buf^T``), zero-size unless ``output_transition``, and ``context``, the uint8 context
+    for the backward over the same tokens, zero-size unless ``output_context``."""
     total, HQ, K = q.shape
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary_bwd: num_householder must be a positive integer, got {num_householder}")
+    if output_context and not output_transition:
+        raise ValueError("gated_delta_product_summary_bwd: output_context requires output_transition")
     if 0 in k.stride():
         k = k.contiguous()
     if 0 in beta.stride():
@@ -1946,7 +2215,13 @@ def gdp_summary_bwd(
         do_shape=tuple(dO.shape),
         q_shape=tuple(q.shape),
         beta_shape=tuple(beta.shape),
-    ) + (family_slots(k, n, 3), 1, family_slots(beta, n, 2))
+    ) + (
+        family_slots(k, n, 3),
+        1,
+        family_slots(beta, n, 2),
+        bool(output_context),
+        int(checkpoint_every_n_tokens),
+    )
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdp_summary_bwd_graph(
             total,
@@ -1975,6 +2250,8 @@ def gdp_summary_bwd(
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             k_shape=tuple(k.shape),
             beta_shape=tuple(beta.shape),
+            output_context=bool(output_context),
+            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -2001,8 +2278,9 @@ def gdp_summary_bwd(
         transition = torch.empty(N, HO, K, K, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
     workspace, handle = make_execution_resources(graph, device)
-    execute_graph(graph, variant_pack, workspace, handle)
-    return d_initial_state, transition
+    context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
+    execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
+    return d_initial_state, transition, context
 
 
 @gdp_summary_bwd.register_fake
@@ -2026,6 +2304,8 @@ def gdp_summary_bwd_fake(
     dt_bias=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    output_context=False,
+    checkpoint_every_n_tokens=0,
 ):
     n = int(num_householder)
     if n < 1:
@@ -2044,9 +2324,12 @@ def gdp_summary_bwd_fake(
         raise ValueError("gated_delta_product_summary_bwd: gate_domain='linear' cannot combine with safe_gate=True")
     if d_final_state is not None and tuple(d_final_state.shape) != (N, HO, V, K):
         raise ValueError(f"gated_delta_product_summary_bwd: d_final_state must be [N, HO, V, K] = [{N}, {HO}, {V}, {K}]; got {tuple(d_final_state.shape)}")
+    if output_context and not output_transition:
+        raise ValueError("gated_delta_product_summary_bwd: output_context requires output_transition")
     d_initial_state = dO.new_empty((N, HO, V, K), dtype=torch.float32)
     transition = dO.new_empty((N, HO, K, K) if output_transition else (0,), dtype=torch.float32)
-    return d_initial_state, transition
+    context = dO.new_empty(torch.library.get_ctx().new_dynamic_size() if output_context else 0, dtype=torch.uint8)
+    return d_initial_state, transition, context
 
 
 # ---------------------------------------------------------------------------
@@ -2089,6 +2372,7 @@ def gated_delta_product_summary(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    output_context: bool = False,
 ):
     """Gated DeltaProduct (GDP) per-span summary for context parallelism: the state-only pass over each sequence, returning
     ``(H, M)`` float32 with ``H`` ``[N, HO, V, K]`` the final state under ``initial_state`` (zero when ``None``) and ``M``
@@ -2104,10 +2388,12 @@ def gated_delta_product_summary(
             default to unit amplitude / zero bias and require ``safe_gate=True``.
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]``, 1e-10 floor); not with ``safe_gate``.
         plan_name: pin one execution plan by name (e.g. ``gdp_summary_frost``).
+        output_context: also return the forward's context as a third value, for
+            ``gated_delta_product(..., context=context)``; zero-size without ``use_qk_l2norm_in_kernel``.
     """
     if k.dim() not in (3, 4):
         raise ValueError("expected THD [total_tokens * n, heads, dim] or token-major [total_tokens, n, heads, dim] tensors")
-    final_state, transition = torch.ops.cudnn.gated_delta_product_summary(
+    final_state, transition, context = torch.ops.cudnn.gated_delta_product_summary(
         k,
         v,
         g,
@@ -2125,7 +2411,10 @@ def gated_delta_product_summary(
         dt_bias=dt_bias,
         batch_invariant=bool(batch_invariant),
         plan_name=plan_name,
+        output_context=bool(output_context),
     )
+    if output_context:
+        return final_state, transition, context
     return final_state, transition
 
 
@@ -2150,6 +2439,8 @@ def gated_delta_product_summary_bwd(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    output_context: bool = False,
+    checkpoint_every_n_tokens: int = 0,
 ):
     """Gated DeltaProduct (GDP) per-span backward summary for context parallelism: the reverse state-gradient recurrence
     over each sequence, returning ``G`` ``[N, HO, V, K]`` float32, the incoming state gradient ``d_initial_state`` under
@@ -2168,12 +2459,15 @@ def gated_delta_product_summary_bwd(
             default to unit amplitude / zero bias and require ``safe_gate=True``.
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]``, 1e-10 floor); not with ``safe_gate``.
         plan_name: pin one execution plan by name (e.g. ``gdp_summary_frost``).
+        output_context: with ``output_transition``, also return the backward's context as a third value, for
+            ``torch.ops.cudnn.gated_delta_product_bwd(..., context=context)``; prepared at ``checkpoint_every_n_tokens``, which must
+            equal the backward's.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition = torch.ops.cudnn.gated_delta_product_summary_bwd(
+    d_initial_state, transition, context = torch.ops.cudnn.gated_delta_product_summary_bwd(
         dO,
         q,
         k,
@@ -2193,5 +2487,9 @@ def gated_delta_product_summary_bwd(
         batch_invariant=bool(batch_invariant),
         output_transition=bool(output_transition),
         plan_name=plan_name,
+        output_context=bool(output_context),
+        checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
     )
+    if output_context:
+        return d_initial_state, transition, context
     return (d_initial_state, transition) if output_transition else d_initial_state

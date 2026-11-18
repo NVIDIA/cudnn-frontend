@@ -11,8 +11,7 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import fp8_engine_names, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
@@ -49,6 +48,9 @@ def _case(
     sdpa_kwargs=None,
     heads=(4, 2),
     seq_lens=None,
+    independent_o_offsets=False,
+    record=None,
+    output_batch_stride=0,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -123,12 +125,18 @@ def _case(
         buffers["o_storage"] = storage
         o.set_stride(out.stride())
     if thd:
-        if dv == d:
+        if dv == d and not independent_o_offsets:
             o.set_ragged_offset(tensors["off_q"])
         else:
-            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_o")
+            offset_type = cudnn.data_type.INT64 if independent_o_offsets else cudnn.data_type.INT32
+            offset_dtype = torch.int64 if independent_o_offsets else torch.int32
+            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=offset_type, name="off_o")
             o.set_ragged_offset(off_o)
-            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=torch.int32) * sq * hq * dv
+            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=offset_dtype) * sq * hq * dv
+    if output_batch_stride:
+        assert not thd and not output_padding
+        out = torch.empty_strided((b, hq, sq, dv), (output_batch_stride, dv, hq * dv, 1), device="cuda", dtype=output_dtype)
+        o.set_stride(out.stride())
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
@@ -149,8 +157,11 @@ def _case(
         tensors["amax_o"], vp[am] = am, buffers["amax_o"]
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = select_engine(g, engine_name(arch=arch, fp8=True), **({"pack_gqa": False} if arch == "sm120" else {}))
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        g.create_execution_plan(*record)
+    chosen = select_engine(g, fp8_engine_names(arch), **({"pack_gqa": False} if arch == "sm120" else {}))
     if (chosen.knobs.split_kv or 1) != split_kv:
         from dataclasses import replace
 
@@ -164,7 +175,7 @@ def _case(
             from cudnn.sdpa import graph_analyzer as ga
             from cudnn.sdpa.fwd import engines
 
-            spec = next(s for s in engines.ENGINE_SPECS if s.name == engine_name(arch=arch, fp8=True))
+            spec = next(s for s in engines.ENGINE_SPECS if s.name == g.get_plan_name_at_index(g._plan_index).split("[")[0])
             domain = engines.effective_cgas(spec.capabilities, g._facts_for(ga.analyze), split_kv)
             if domain and knobs.cga not in domain:
                 knobs = replace(knobs, cga=min(domain))
@@ -418,7 +429,7 @@ def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv, thd=True):
     row_stride = 2**32 + 4 * dv
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("wide physical row-stride regression needs 9 GiB free")
-    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=thd, override=True, dtype=dtype, sq=1, skv=64)
+    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=thd, override=True, dtype=dtype, sq=1, skv=64, independent_o_offsets=thd)
     plan = g._compiled_plans[g._plan_index]
     assert plan._prepared is not None
     owner = plan._prepared.spec.owner
@@ -431,6 +442,9 @@ def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv, thd=True):
         # Numerical failures and launch errors remain outside this guard.
         pytest.skip("wide physical row-stride storage unavailable under current GPU memory pressure")
     vp[tensors["o"]] = bufs["o"]
+    if thd:
+        # Origins count physical elements; Q keeps its compact offsets when O moves.
+        vp[tensors["off_o"]] = torch.arange(3, device="cuda", dtype=torch.int64) * row_stride
     overrides = dict(
         override_uids=[tensors["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1] if thd else list(strides)]
     )
@@ -543,3 +557,66 @@ def test_fp8_output_pitch_requires_native_byte_alignment(output_dtype, padding, 
         captured.replay()
         _check(bufs, thd=False)
         assert torch.all(bufs["o_storage"][..., 128:] == 12)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("pack", [False, True])
+@pytest.mark.parametrize("b,batch_stride", [(2, 0), (4, 2**31 - 65536), (2, 2**32 + 65536)], ids=["compact", "wide_product", "wide_stride"])
+def test_decode_fp8_physical_output_strides_replay(dtype, output_dtype, pack, b, batch_stride):
+    """The actual swap-AB body addresses wide O pitches in elements for every scalar output type."""
+    import inspect
+
+    from determinism_utils import assert_bitwise, snapshot
+
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import NAME
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    knobs = SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, pack_gqa=pack, split_kv=1, sched_policy=0)
+    g, vp, ws, bufs, _ = _case(
+        b=b,
+        sq=1,
+        skv=128,
+        dtype=dtype,
+        output_dtype=output_dtype,
+        output_batch_stride=batch_stride,
+        record=(family.offered_ids()[NAME], knobs.to_public()),
+    )
+    assert g.selected_engine.name == NAME
+    compiled = g._compiled_plans[g._plan_index]._compiled
+    assert compiled.kernel_template == "decode_d128_fp8"
+    api = inspect.getclosurevars(compiled.default_stream).nonlocals["api"]
+    assert api._k_mod.__file__.endswith("/sm100/d128_fp8_swap_ab/kernel.py")
+    bufs["o"].fill_(11)
+    g.execute(vp, ws)
+    _check(bufs, thd=False, b=b, sq=1, skv=128)
+    baseline = snapshot({name: bufs[name] for name in ("o", "lse", "amax_o")})
+    original_v = bufs["v"].clone()
+    with _cuda_graph() as capture:
+        with torch.cuda.graph(capture):
+            previous = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                g.execute(vp, ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(previous)
+        capture.replay()
+        assert_bitwise({name: bufs[name] for name in baseline}, baseline, "unchanged wide-output replay")
+        bufs["v"].copy_((-0.5 * bufs["v"].float()).to(dtype))
+        bufs["descale_v"].fill_(0.3)
+        bufs["scale_o"].fill_(1.7)
+        bufs["o"].fill_(11)
+        bufs["lse"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
+        capture.replay()
+        _check(bufs, thd=False, b=b, sq=1, skv=128)
+        bufs["v"].copy_(original_v)
+        bufs["descale_v"].fill_(0.7)
+        bufs["scale_o"].fill_(1.3)
+        bufs["o"].fill_(11)
+        bufs["lse"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
+        capture.replay()
+        assert_bitwise({name: bufs[name] for name in baseline}, baseline, "restored wide-output replay")

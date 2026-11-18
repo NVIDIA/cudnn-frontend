@@ -3,7 +3,7 @@
 
 """``cudnn.sdpa.kernels._mxfp8_sf`` -- the ONE spelling of the MXFP8 scale-factor TMA descriptors (rowwise per-tile,
 columnwise D-plane-major) and of the cga2 peer split of an SF slab, lifted from the Rubin d=256 MXFP8 forward
-(``sm107/prefill_d256_mxfp8.py``) where the d192x128 forward carried a second and third copy.
+(``sm107/d256_mxfp8_single_q/kernel.py``) where the d192x128 forward carried a second and third copy.
 
 Pins: (1) the host-int geometry helpers (``sf_peer_split``, ``sf_tma_rows``) on the real slab sizes of the two forwards
 and their refusal of a non-divisible split; (2) both forwards import the module and carry NO private copy of the closure
@@ -70,7 +70,7 @@ def test_peer_split_refuses_a_split_that_is_not_whole_tma_rows(bad):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("rel", ["sm107/prefill_d256_mxfp8.py", "sm107/prefill_d192_d128_mxfp8.py"])
+@pytest.mark.parametrize("rel", ["sm107/d256_mxfp8_single_q/kernel.py", "sm107/d192_mxfp8_multi_q/kernel.py"])
 def test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module(rel):
     src = _kernel_source(rel)
     assert "from cudnn.sdpa.kernels._mxfp8_sf import" in src, f"{rel}: must import the shared SF module"
@@ -89,7 +89,7 @@ def test_d128_forward_takes_the_rowwise_sf_descriptor_from_the_shared_module():
     page_size / 128``).  A LIGHT pin: the kernel still carries its own cga2 peer-split arithmetic (``K_SF_BYTES_PER_PEER
     = SF_SMEM_SIZE_K // CFG.CTA_MMA`` and the module-level ``SF_TMA_ROW_BYTES``); lifting that onto ``sf_peer_split`` is a
     named follow-up with its own cubin gate, so this test does not join the full pin above yet."""
-    src = _kernel_source("sm107/prefill_d128_mxfp8.py")
+    src = _kernel_source("sm107/d128_mxfp8_multi_q/kernel.py")
     assert "from cudnn.sdpa.kernels._mxfp8_sf import" in src, "the d128 forward must import the shared SF module"
     assert "def _build_sf_desc(" not in src, "a private copy of the rowwise SF descriptor closure survives in the d128 forward"
     assert "build_rowwise_sf_desc(" in src

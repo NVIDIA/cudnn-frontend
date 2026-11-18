@@ -61,6 +61,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
     """First reason this engine cannot serve these facts, or None if it can."""
     if facts.invalid:
         return facts.invalid
+    reason = ga.rowwise_axes_mismatch(facts)
+    if reason is not None:
+        return reason
     if facts.extended_affine:
         from cudnn.norm.affine import mismatch as affine_mismatch
 

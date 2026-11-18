@@ -149,9 +149,12 @@ def test_unified_implementation_graph_helpers_and_decline_type_resolve():
 def test_dsl_gate_names_resolve_as_spelled():
     assert buffers.CUTEDSL_MIN_VERSION == (4, 7, 0)
     assert list(inspect.signature(buffers.cutedsl_state).parameters) == []
-    assert list(inspect.signature(buffers.cutedsl_too_old).parameters) == ["version"]
+    assert list(inspect.signature(buffers.cutedsl_too_old).parameters) == [
+        "version",
+        "floor",
+    ]  # `floor` appended (a kernel's own DSL floor); FlashInfer passes `version` positionally
     assert list(inspect.signature(buffers.cutedsl_arch_requirement_error).parameters) == ["device_cc"]
-    assert list(inspect.signature(buffers.cutedsl_requirement_error).parameters) == ["what"]
+    assert list(inspect.signature(buffers.cutedsl_requirement_error).parameters) == ["what", "floor"]  # `floor` appended, same contract
     installed, version = buffers.cutedsl_state()
     assert isinstance(installed, bool)
     assert version is None or (isinstance(version, tuple) and len(version) == 2)
@@ -198,7 +201,8 @@ def test_cutedsl_runtime_available_is_arch_aware(dsl_state, label, installed, ve
     probe = cudnn.frost.cutedsl_runtime_available
     assert probe() is blind, label
     assert probe(None) is blind, label
-    assert probe((8, 0)) is cc100, label  # no target gate below cc 10.7
+    assert probe((7, 5)) is False, label  # no DSL has a target below sm_80
+    assert probe((8, 0)) is cc100, label  # no target gate from cc 8.0 up to cc 10.7
     assert probe((10, 0)) is cc100, label
     assert probe((10, 7)) is cc107, label
     assert probe([10, 7]) is cc107, label  # a list spells the same part
@@ -211,6 +215,18 @@ def test_the_blind_spot_cell_cc107_with_a_47x_dsl(dsl_state):
     # The same install answers the engines' own gate the same way: the probe IS their decision.
     assert buffers.cutedsl_arch_requirement_error((10, 7)) is not None
     assert buffers.cutedsl_arch_requirement_error((10, 0)) is None
+
+
+@pytest.mark.parametrize("cc", [(7, 5), (7, 0), (6, 1)])
+def test_a_part_below_sm80_has_no_dsl_target(dsl_state, monkeypatch, cc):
+    """The DSL's Arch starts at sm_80: compiling for a Turing part raised ``KeyError: 'sm_75'`` inside the DSL. The gate
+    refuses it by name without asking the DSL, so callers with a fallback (packed LSE, varlen metadata) take it."""
+    dsl_state(True, (PUBLIC_DSL, "4.8.1"), True)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: pytest.fail("the DSL was asked about a part below sm_80"))
+    assert buffers.cutedsl_arch_requirement_error(cc) == f"the CuTe DSL has no target below SM80 (its Arch starts at sm_80); found cc {cc[0]}.{cc[1]}"
+    assert buffers.cutedsl_arch_requirement_error(list(cc)) is not None
+    assert cudnn.frost.cutedsl_runtime_available(cc) is False
+    assert buffers.cutedsl_arch_requirement_error((8, 0)) is None
 
 
 @pytest.mark.parametrize("bad", [(10, 7, 0), (10,), 107, "10.7", (10.5, 7)])

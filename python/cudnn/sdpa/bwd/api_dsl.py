@@ -35,7 +35,8 @@ from cudnn.sdpa.bwd.config_sm120 import (
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
-_SM120_KERNEL_FILE = "sm120/bprop_f16.py"
+from .kernels.sm120.f16_fused.contract import KERNEL_FILE as _SM120_KERNEL_FILE
+
 _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
@@ -186,6 +187,17 @@ class SdpaBwdDsl(APIBase):
         """Execute the compiled kernel chain using the common operand set."""
 
 
+def _with_ragged_offsets_signature(cls):
+    """Publish ``cls.__init__`` as the base constructor's signature plus ``thd_ragged_offsets`` (the lowering forwards
+    only the plan facts an adapter's constructor declares, read off its signature)."""
+    import inspect
+
+    base = inspect.signature(SdpaBwdDsl.__init__)
+    extra = inspect.Parameter("thd_ragged_offsets", inspect.Parameter.KEYWORD_ONLY, default=None)
+    cls.__init__.__signature__ = base.replace(parameters=[*base.parameters.values(), extra])
+    return cls
+
+
 class SdpaBwdDslSm120(SdpaBwdDsl):
     """Compile and execute fixed-length SM120/SM121 SDPA backward."""
 
@@ -234,6 +246,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         b, h_q, s_q, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         d_v = int(self.v_desc.shape[3])
+        from .launch_grid import yz_grid_mismatch
+
+        grid_reason = yz_grid_mismatch(b, h_q)
+        self._not_implemented_error_if(grid_reason is not None, grid_reason)
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
         self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
@@ -762,12 +778,12 @@ def _sm80_bwd_kernel_mod(key: str = "d64"):
     silently swallows every feature kwarg, so callers must never rely on the
     signature filter and only select it through
     :func:`_sm80_d64_fast_path_eligible`.  The GENERIC kernel
-    (``sm80/bprop_f16``) is a TemplateParams module loaded per-specialization
+    (``sm80/f16_two_subgroup/kernel.py``) is a TemplateParams module loaded per-specialization
     via :func:`_load_sm80_bwd_module` instead.
     """
     assert key == "d64", f"generic SM80 bwd kernels load via _load_sm80_bwd_module; got {key!r}"
     if key not in _SM80_BWD_KERNEL_MOD:
-        from .kernels.sm80 import bprop_d64_f16 as _mod
+        from .kernels.sm80.f16_d64 import kernel as _mod
 
         _SM80_BWD_KERNEL_MOD[key] = _mod
     return _SM80_BWD_KERNEL_MOD[key]
@@ -779,36 +795,37 @@ def _sm80_d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token,
     The perf variant computes a plain dense MHA backward and nothing else;
     every condition here guards a feature it would silently ignore.
     """
-    d64 = _sm80_bwd_kernel_mod("d64")
-    if (d_qk, d_v) != (64, 64) or h_q != h_kv:
-        return False
-    if s_q % d64.M_BLOCK != 0 or s_kv % d64.N_BLOCK != 0:
-        return False
-    if mask_token != "none" or right_bound != 0 or causal_bottom_right:
-        return False
-    for feature in ("seq_kv_lens", "seq_len_q", "bias", "sinks", "rope_freqs"):
-        if bw_kwargs.get(feature) is not None:
-            return False
-    if bw_kwargs.get("deterministic"):
-        return False
-    return True
+    from .kernels.sm80.half_contract import d64_fast_path_eligible
+
+    # One rule for the adapter and for graph ownership (sdpa_bwd_sm80_f16_d64).
+    return d64_fast_path_eligible(
+        d_qk=d_qk,
+        d_v=d_v,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        mask_token=mask_token,
+        right_bound=right_bound,
+        causal_bottom_right=causal_bottom_right,
+        bw_kwargs=bw_kwargs,
+    )
 
 
-def _sm80_bwd_pick_flavor(d_qk: int, d_v: int) -> str:
+def _sm80_bwd_pick_flavor(d_qk: int, d_v: int, flavor_dims=None) -> str:
     """Smallest BPROP flavor whose ``(D_QK, D_V)`` envelope covers
     ``(d_qk, d_v)`` (fdqk >= d_qk and fdv >= d_v); the user's heads are padded
     up to the flavor dim.  The kernel supports d_qk != d_v but requires the
     (padded) d_qk >= d_v — the flavor list guarantees this (every flavor has
     fdqk >= fdv, and a d_qk < d_v case lands on an equal-d flavor after pad)."""
-    for flavor in _SM80_BWD_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[flavor]
+    flavor_dims = _SM80_BWD_FLAVOR_DIMS if flavor_dims is None else flavor_dims
+    for flavor, (fdqk, fdv) in flavor_dims.items():
         if d_qk == fdqk and d_v == fdv:
             return flavor
-    for flavor in _SM80_BWD_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[flavor]
+    for flavor, (fdqk, fdv) in flavor_dims.items():
         if d_qk <= fdqk and d_v <= fdv:
             return flavor
-    raise ValueError(f"SM80 BPROP: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); " f"supported: {_SM80_BWD_FLAVOR_DIMS}.")
+    raise ValueError(f"SM80 BPROP: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); " f"supported: {flavor_dims}.")
 
 
 @lru_cache(maxsize=128)
@@ -1018,7 +1035,8 @@ def _sm80_thd_backward(
 _cache_of_objects: dict = {}
 
 
-_SM80_BWD_KERNEL_FILE = "sm80/bprop_f16.py"
+from .kernels.sm80.f16_two_subgroup.contract import KERNEL_FILE as _SM80_BWD_KERNEL_FILE  # noqa: E402
+
 # The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
 # decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
 from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _BWD_SCHED_LPT_L2  # noqa: E402
@@ -1041,9 +1059,9 @@ def _sm80_bwd_sched_policy(*, is_causal: bool, deterministic: bool, thd: bool = 
     work is uniform per kv-tile, so the plain 3-D grid stays; the deterministic
     relay REQUIRES the plain decode (kv_tile == blockIdx.x).
     """
-    if thd:
-        return _BWD_SCHED_NATURAL
-    return _BWD_SCHED_LPT_L2 if (is_causal and not deterministic) else _BWD_SCHED_NATURAL
+    from .kernels.sm80.half_contract import uses_flat_grid
+
+    return _BWD_SCHED_LPT_L2 if uses_flat_grid(is_causal=is_causal, deterministic=deterministic, thd=thd) else _BWD_SCHED_NATURAL
 
 
 def _load_sm80_bwd_module(params):
@@ -1244,6 +1262,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         _, _, _, d_v = self.v_desc.shape
+        from .kernels.sm80.half_contract import launch_grid_mismatch
+
+        grid_reason = launch_grid_mismatch(b, h_qo, is_causal=self.is_causal, deterministic=self.deterministic, thd=self.thd)
+        self._not_implemented_error_if(grid_reason is not None, grid_reason)
 
         self._check_tensor_shape(self.q_desc, (b, h_qo, s_qo, d_qk), name="Q")
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
@@ -1260,8 +1282,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
         # The covering flavor retains D_QK >= D_V for its MMA geometry;
         # logical Q/K and V widths are independently masked inside it.
-        max_dqk = max(fdqk for fdqk, _ in _SM80_BWD_FLAVOR_DIMS.values())
-        max_dv = max(fdv for _, fdv in _SM80_BWD_FLAVOR_DIMS.values())
+        max_dqk = max(fdqk for fdqk, _ in self._native_flavor_dims.values())
+        max_dv = max(fdv for _, fdv in self._native_flavor_dims.values())
         self._value_error_if(
             d_qk > max_dqk or d_v > max_dv,
             f"SM80 BPROP: head dim (D_QK={d_qk}, D_V={d_v}) exceeds supported " f"envelope (D_QK<={max_dqk}, D_V<={max_dv}); larger heads not yet ported.",
@@ -1372,15 +1394,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
-        self._value_error_if((major, minor) != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
+        self._check_native_device((major, minor), device)
+        self._check_native_tiles()
 
-        self._value_error_if(
-            self.tile_m is not None or self.tile_n is not None,
-            "SM80 BPROP wires no tile knobs; tile_m/tile_n must be unset",
-        )
-
-        self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v)
-        self.flavor_d_qk, self.flavor_d_v = _SM80_BWD_FLAVOR_DIMS[self.flavor]
+        self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v, self._native_flavor_dims)
+        self.flavor_d_qk, self.flavor_d_v = self._native_flavor_dims[self.flavor]
 
         # ---- mask token (same resolution as the forward adapter) ----------
         swa_left = -1 if self.window_size_left is None else int(self.window_size_left)
@@ -1451,6 +1469,18 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._logger.debug("check_support completed")
         return True
 
+    def _check_native_device(self, capability, device):
+        major, minor = capability
+        self._value_error_if(capability != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
+
+    _native_flavor_dims = _SM80_BWD_FLAVOR_DIMS
+
+    def _check_native_tiles(self):
+        self._value_error_if(self.tile_m is not None or self.tile_n is not None, "SM80 BPROP wires no tile knobs; tile_m/tile_n must be unset")
+
+    def _check_native_scale(self, scale):
+        pass
+
     # ------------------------------------------------------------------
     def compile(self) -> None:
         """Plan-time JIT: build the TemplateParams from the plan facts, load
@@ -1485,6 +1515,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             deterministic=self.deterministic,
             thd_varlen=self.thd,
             sched_policy=sched,
+            **dict(getattr(self, "_native_template_overrides", ())),
         )
         # RoPE preconditions the old backward() asserted (the params validator
         # covers d_qk <= 128; these two involve the shape, known only here).
@@ -1542,6 +1573,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm80 is not compiled")
+        self._check_native_scale(scale_softmax)
 
         # Init-time flags are compile-time facts; execute must match them
         # exactly, in both directions (Hard Rule 1).  Under THD the length
@@ -1816,12 +1848,12 @@ def sdpa_bwd_wrapper_sm80(
 _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 # Stage 2's descriptor scratch: Q / dO / K / V, clamped on device.
 _THD_STAGE2_DESC_SLOTS = 4
-_SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
+_SM100_STAGE2_FILE = "sm100/d512_f16_role_split/kernel.py"
 # The 2x2-datapath twin of stage 2: one fused cta_group::2 pipeline per pair (64 q rows per CTA, both BMMs on every
 # SM, S never leaves the lane's registers) inside the same (4,1,1) cluster, K / V shared across the two pairs by TMA
 # multicast.  Same host ABI, workspace format and LSE / do_dot contract as the role-split file; a SIBLING file so the
 # 4x1 rendering stays byte-identical (its own FROST_SOURCE_DIGEST, its own config record).
-_SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
+_SM100_STAGE2_FILE_2X2 = "sm100/d512_f16_2x2/kernel.py"
 # Which stage-2 datapath the SM100 d512 chain renders.  False = the cga4x1 role split (what ships).  True = the 2x2 twin
 # (the Rubin d512 bring-up vehicle; on SM100 the A/B gate for a default flip is >= +3 % stage-2 median on BOTH dense and
 # causal at B=1 H=128 S=8192 d=512 bf16, see the twin's docstring).  A module constant read at CALL time (``compile``),
@@ -1980,6 +2012,7 @@ def _sm100_head_chunk(b: int, h_q: int, s_q: int, s_kv: int, bpe: int, budget: i
     return 1
 
 
+@_with_ragged_offsets_signature
 class SdpaBwdDslSm100(SdpaBwdDsl):
     """d in (256, 512] backward on Blackwell, as do_dot -> S/dS -> three GEMMs.
 
@@ -1991,7 +2024,17 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
     Sub-512 head dims need no kernel change: the TMA descriptors carry the real
     ``d`` and a box reading past it is HW zero-filled, so the padded lanes
     contribute 0 to both BMMs. We pay the full 512-wide MMA for that.
+
+    THD ports may be bound with ragged offsets (``thd_ragged_offsets``: port -> ``(offset dtype, multiplier)``): each
+    such caller buffer is then addressed at its own per-sequence token origins instead of the packed length prefixes,
+    so storage gaps between sequences are never read or written.  Undeclared, the packed contract is unchanged.
     """
+
+    def __init__(self, *args, thd_ragged_offsets: Optional[dict] = None, **kwargs):
+        # Set before the base constructor: it runs `_initialize_implementation`.
+        self._thd_ro_spec = dict(thd_ragged_offsets or {})
+        self._thd_origins = self._thd_origin_dtypes = None
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     def _thd_total(capacity: int, declared: Optional[int]) -> int:
@@ -2154,7 +2197,15 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 bool(self._thd_lse_head_stride) and self._thd_lse_head_stride < self._t_q_cap,
                 f"SM100 bwd THD: Stats head stride {self._thd_lse_head_stride} must cover the packed " f"token total {self._t_q_cap}",
             )
+            if self._thd_ro_spec:
+                # Independent physical origins.  The offsets stay device operands; only the per-port declarations
+                # (integer width, multiplier, token stride) are plan facts.  Both stage-2 bodies (the 4x1 role split and
+                # the 2x2 twin) take the sequence-local input maps.
+                from .prepared_sm107 import check_thd_origins
+
+                check_thd_origins(self)
         else:
+            self._value_error_if(bool(self._thd_ro_spec), f"{self._NAME}: ragged offsets require a THD plan")
             self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: padding masks (seq lens) are not implemented")
         invalid = self._native_layout_errors()
         self._value_error_if(
@@ -2162,7 +2213,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             f"{self._NAME}: {', '.join(invalid)} requires "
             + ("compact BSHD-physical packed strides" if self.thd else "non-overlapping dense strides with D stride 1 and 16-byte outer pitches"),
         )
-        self._value_error_if(self.deterministic, "SM100 bwd: deterministic mode is not implemented")
         return True
 
     def scratch_workspace_bytes(self) -> int:
@@ -2179,7 +2229,12 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             delta = ws_align(self.h_q * (-(-self._t_q_cap // 128) * 128) * 4)
             ws = ws_align(self._qh_chunk * self._ws_rows_cap * self._skv_pad * self._bpe)
             meta = ws_align(THD_BWD_META_WORDS(self.batch_size) * 4)
-            desc = ws_align(_THD_STAGE2_DESC_SLOTS * 128) + ws_align((self.batch_size + 1) * 128)
+            if self._thd_ro_spec:
+                # Sequence-local maps: four input ports per sequence for stage 2, an output and an operand map per
+                # sequence for each GEMM.
+                desc = ws_align(_THD_STAGE2_DESC_SLOTS * self.batch_size * 128) + ws_align(2 * self.batch_size * 128)
+            else:
+                desc = ws_align(_THD_STAGE2_DESC_SLOTS * 128) + ws_align((self.batch_size + 1) * 128)
             total = delta + 2 * ws + meta + desc
         else:
             delta = ws_align(self.batch_size * self.h_q * (-(-self.s_q_max // 128) * 128) * 4)
@@ -2196,6 +2251,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # tokens become the declared packed total.
             _kv_rows = self._t_kv_cap if self.thd else self.batch_size * self.s_k_max
             total += 2 * ws_align(_kv_rows * self.h_q * self.head_dim_qk * self._bpe)
+        if self.thd and self._thd_ro_spec:
+            total += ws_align(9 * self.batch_size * 8)  # the Int64 [9, B] token origins the setup launch materializes
         return total
 
     # --- stage-2 template selection -------------------------------------------
@@ -2406,12 +2463,15 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         dsink_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
+        thd_ragged_offsets: Optional[dict] = None,
     ) -> None:
         # Declared so the shared lowering can pass them positionally/by keyword,
         # then refused: the Capabilities row does not claim any of them, so a
         # non-None here means the row and this method disagree.
         for _t_name, _t_val in (("sink", sink_tensor), ("dSink", dsink_tensor), ("bias", bias_tensor), ("dBias", dbias_tensor)):
             self._value_error_if(_t_val is not None, f"SM100 bwd: {_t_name} is not implemented")
+        offsets = dict(thd_ragged_offsets or {})
+        self._value_error_if(set(offsets) != set(self._thd_ro_spec), f"{self._NAME}: bind exactly the declared THD ragged-offset ports")
         if not self.thd:
             self._value_error_if(seq_q_lens is not None or seq_kv_lens is not None, "SM100 bwd: padding masks (seq lens) are not implemented")
 
@@ -2419,9 +2479,14 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self.compile()
         from .prepared_sm100 import execute_standalone
 
+        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens)
+        if self._thd_ro_spec:
+            from .d128_thd_contract import ORIGIN_PORTS
+
+            tensors += tuple(offsets.get(port) for port in ORIGIN_PORTS)
         return execute_standalone(
             self,
-            (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
+            tensors,
             workspace,
             current_stream,
             scale_softmax,

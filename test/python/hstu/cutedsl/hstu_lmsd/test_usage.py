@@ -136,6 +136,7 @@ def _metadata_only_apis(
     return fwd, bwd
 
 
+@pytest.mark.L0
 def test_launch_grids_follow_runtime_row_count():
     fwd = HSTULMSDFwdConfig.from_hidden_size(512)
     fwd_wide = HSTULMSDFwdConfig.from_hidden_size(960)

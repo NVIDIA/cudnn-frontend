@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100/SM103 blk128 BSA with and without kpage on layouts from open-source
-video sparse-attention systems (see kpage_layouts.py).
+"""SM100/SM103 and SM90 blk128 BSA with and without kpage on layouts from
+open-source video sparse-attention systems (see kpage_layouts.py).
 
     python benchmark_sm100_kpage.py                      # the eight layouts of kpage_layouts.BENCHMARK_LAYOUTS
     python benchmark_sm100_kpage.py --layouts ssta:1280x720x121:16 vsa:832x480x81:64:0.875:12 --check
@@ -12,7 +12,8 @@ is built once outside the timed region (its build time is reported
 separately).  The video layouts pad every 3-D tile on both the
 query and the key side, so the layout is built with q_block_sizes (padding
 query rows are skipped and written as zero); the base path has no query-side
-padding and computes those rows.
+padding and computes those rows.  On SM90 the kpage path runs the blk64 kernels
+on the metadata's 64-row halves (see "KPage" in docs/operations/sparse_attention/bsa.md).
 """
 
 import argparse
@@ -108,18 +109,18 @@ def run(layout, spec, args, gen):
     torch.cuda.synchronize()
     rec["kpage_layout_build_ms"] = (time.perf_counter() - t0) * 1e3
 
-    base_fwd = lambda: BSA.block_sparse_attention_forward(q, k, v, idx, None, bs, cnt)
-    kpage_fwd = lambda: BSA.block_sparse_attention_forward(q, k, v, idx, None, bs, cnt, kpage=page_layout)
+    base_fwd = lambda: BSA.block_sparse_attention_forward(q, k, v, idx, None, bs, cnt, sparse_block_size=BLOCK)
+    kpage_fwd = lambda: BSA.block_sparse_attention_forward(q, k, v, idx, None, bs, cnt, kpage=page_layout, sparse_block_size=BLOCK)
     rec["bsa_fwd_ms"] = event_ms(base_fwd, args.iters, args.warmup)
     rec["kpage_fwd_ms"] = event_ms(kpage_fwd, args.iters, args.warmup)
     rec["fwd_speedup"] = rec["bsa_fwd_ms"] / rec["kpage_fwd_ms"]
 
     if with_bwd:
         o, lse = kpage_fwd()
-        kpage_bwd = lambda: BSA.block_sparse_attention_backward(do, q, k, v, o, lse, idx, None, bs, cnt, kpage=page_layout)
+        kpage_bwd = lambda: BSA.block_sparse_attention_backward(do, q, k, v, o, lse, idx, None, bs, cnt, kpage=page_layout, sparse_block_size=BLOCK)
         rec["kpage_bwd_ms"] = event_ms(kpage_bwd, args.iters, args.warmup)
         ob, lseb = base_fwd()
-        base_bwd = lambda: BSA.block_sparse_attention_backward(do, q, k, v, ob, lseb, idx, None, bs, cnt)
+        base_bwd = lambda: BSA.block_sparse_attention_backward(do, q, k, v, ob, lseb, idx, None, bs, cnt, sparse_block_size=BLOCK)
         rec["bsa_bwd_ms"] = event_ms(base_bwd, args.iters, args.warmup)
         rec["fwd_bwd_speedup"] = (rec["bsa_fwd_ms"] + rec["bsa_bwd_ms"]) / (rec["kpage_fwd_ms"] + rec["kpage_bwd_ms"])
 
@@ -135,7 +136,7 @@ def run(layout, spec, args, gen):
             kpage_pad_rows_zero=bool((o_kp[0, :, ~valid] == 0).all()),
         )
         if with_bwd:
-            dq = BSA.block_sparse_attention_backward(do, q, k, v, o_kp, lse_kp, idx, None, bs, cnt, kpage=page_layout)["dq_tensor"]
+            dq = BSA.block_sparse_attention_backward(do, q, k, v, o_kp, lse_kp, idx, None, bs, cnt, kpage=page_layout, sparse_block_size=BLOCK)["dq_tensor"]
             rec["check"]["kpage_dq_max_abs_err"] = (dq[0, 0, rows].float() - dq_ref).abs().max().item()
     return rec
 
@@ -151,7 +152,7 @@ def main():
     parser.add_argument("--output", default="/tmp/bsa-sm100-kpage.json")
     args = parser.parse_args()
     major, _ = torch.cuda.get_device_capability()
-    assert major == 10, "kpage requires an SM100/SM103 GPU"
+    assert major in (9, 10), "blk128 kpage requires an SM90 or SM100/SM103 GPU"
 
     report = dict(
         gpu=torch.cuda.get_device_name(),

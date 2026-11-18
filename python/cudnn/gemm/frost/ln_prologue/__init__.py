@@ -180,7 +180,7 @@ class LnDualGemmParams:
     diag: str = ""
     pass_order: str = "major"
     pairing: str = "columns"
-    #: operand 0's GMEM major (:data:`A0_MAJORS`): "mn" = its rows are MN-major (the K3 ``y`` rows: the inner index contiguous), "k" = K-major.
+    #: operand 0's GMEM major (:data:`A0_MAJORS`): "mn" = its rows are MN-major (the accumulators arm's ``y`` rows: the inner index contiguous), "k" = K-major.
     a0_major: str = "k"
     #: the MN-major LayerNorm form (:data:`A0_PROLOGUES`; accumulators arm only).  Performance only: both forms compute the same function.
     a0_prologue: str = "mn_major"
@@ -641,7 +641,7 @@ def run_ln_dual_gemm_tail(
     stream,
     k_block: Optional[int] = None,  # k's per 256-row pair tile (row_block_geometry's rule when None; >= MIN_K_BLOCK_MN_MAJOR here; bitwise the same)
 ) -> RowBlockGeometry:
-    """Launch the accumulators arm (K3).  No allocation, no conversion; every check is cheap host arithmetic.  Returns the geometry."""
+    """Launch the accumulators arm.  No allocation, no conversion; every check is cheap host arithmetic.  Returns the geometry."""
     import torch
     from cuda.bindings import driver as cuda
 

@@ -170,7 +170,9 @@ def test_cudnn_all_excludes_module_implementation_helpers():
     ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
 )
 def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
 
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=discrete, b_major=b_major)
@@ -202,7 +204,9 @@ def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
 
 @pytest.mark.L0
 def test_grouped_gemm_dglu_class_bf16_rejects_single_group_runtime_offsets():
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
 
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
@@ -2462,7 +2466,9 @@ def test_grouped_gemm_dglu_bf16_rejects_sf_fp8_dtype_override():
     The None case matters as much as the rejection: it pins down that merely
     adding the parameter did not break BF16 dispatch.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
     kwargs = dict(
@@ -2785,7 +2791,9 @@ def test_grouped_gemm_dglu_deterministic_dprob_at_scale(request, use_dynamic_sch
 @torch_fork_set_rng(seed=29)
 def test_grouped_gemm_dglu_deterministic_unsupported(request):
     """Configurations the flag does not cover raise instead of silently running the atomic path."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
     with pytest.raises(NotImplementedError):
@@ -2820,7 +2828,9 @@ def test_grouped_gemm_dglu_dbias_init_on_launch_stream(request):
     """dbias must be zeroed on the launch stream. Keep torch's current stream busy and launch on
     another one: if the zero-fill is queued behind the busy stream, it lands after the kernel and
     wipes the result."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
     from cuda.bindings import driver as cuda
 
@@ -2840,7 +2850,9 @@ def test_grouped_gemm_dglu_dbias_init_on_launch_stream(request):
 def test_grouped_gemm_dglu_dbias_cache_keys_on_n(request, monkeypatch):
     """The compiled dbias descriptor bakes n, so under the default full-dynamic cache key a call
     with a new n must compile its own kernel instead of reusing the one built for another n."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
     from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
 

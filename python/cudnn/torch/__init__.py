@@ -3,11 +3,10 @@
 
 """PyTorch integration for the cuDNN frontend Python API.
 
-On PyTorch versions with ``torch.backends.cuda.enable_cudnn_sdp_python``,
+On PyTorch versions with ``torch.nn.attention.enable_cudnn_sdp_python``,
 that switch serves PyTorch's cuDNN SDPA ops from this package:
 
-    torch.backends.cuda.enable_cudnn_sdp_python(True)
-    # or TORCH_CUDNN_SDPA_USE_PYTHON=1 for an unmodified script
+    torch.nn.attention.enable_cudnn_sdp_python(True)
 
 It calls ``install_sdpa_overrides()`` and keeps the returned handle.
 
@@ -24,6 +23,12 @@ Either way, ``F.scaled_dot_product_attention`` under
 (pygraph + engine Router: FROST OSS kernels or cuDNN-backend engines), with
 hybrid fallback to the existing implementations for configurations the
 python path does not serve yet.
+
+On versions with varlen backend selection, Torch's public selector determines
+which calls can reach this provider. Installing it does not widen Torch's
+architecture, GQA or window rules. Some versions select a backend for varlen
+forward/backward but still expose a Flash-only ``varlen_attn_out``; that out
+entry point remains with Torch until its own schema supports backend selection.
 
 On torch < 2.13 (no registry, no varlen ops), ``cudnn.torch.install()``
 applies the ``F.scaled_dot_product_attention`` overrides directly.

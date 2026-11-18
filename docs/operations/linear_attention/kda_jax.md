@@ -1,6 +1,6 @@
 # Kimi Delta Attention in JAX
 
-`cudnn.jax.kimi_delta_attention` returns `(output, final_state_or_None)` and
+`cudnn.linear_attention.jax_api.kimi_delta_attention` returns `(output, final_state_or_None)` and
 supports `jax.jit` and first-order reverse-mode differentiation. It uses the
 existing Frost KDA kernels, including their backward, checkpoint recompute,
 split scheduler, gate gradients, and grouped-head reductions.
@@ -43,12 +43,6 @@ torch; this JAX API does not expose `state_indices` or `overwrite_initial_state`
 
 ## Usage
 
-Install GPU-enabled JAX and CuTeDSL separately from the framework-neutral package:
-
-```bash
-pip install 'jax[cuda13]' 'nvidia-cutlass-dsl[cu13]>=4.7.0'
-```
-
 Other GPUs may be visible. Concrete arrays run on the GPU that holds them, and all of
 them must be on one supported GPU. Under `jax.jit` the arrays are tracers with no
 device, so KDA targets JAX's default device (`jax.default_device(...)`, or the first
@@ -61,7 +55,7 @@ SM100; broader version/architecture qualification is still required.
 ```python
 import jax
 import jax.numpy as jnp
-from cudnn.jax import kimi_delta_attention as kda
+from cudnn.linear_attention.jax_api import kimi_delta_attention as kda
 
 q = jnp.full((32, 1, 64), 0.05, jnp.bfloat16)
 k, v = q, jnp.ones_like(q)

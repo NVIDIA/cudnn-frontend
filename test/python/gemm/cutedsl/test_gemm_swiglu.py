@@ -108,7 +108,9 @@ def test_gemm_swiglu_compile_execute(
 @pytest.mark.parametrize("tile", [(256, 256), (128, 128), (128, 64)], ids=["multi_group_tile", "persistent_tiles", "persistent_single_group"])
 def test_gemm_swiglu_retained_outputs_replay(dtype, tile):
     """Retain every launch's outputs so a later correct store cannot hide a race."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100 or newer")
     from cudnn import GemmSwigluSm100
     from cuda.bindings import driver as cuda

@@ -98,7 +98,10 @@ python/cudnn/_cutlass_helpers/ is adapted from the BSD-licensed CUTLASS example;
 its source header records the upstream commit and local changes. The upstream
 code retains BSD-3-Clause; local modifications are licensed under Apache-2.0.
 CUTLASS is also consumed at runtime as the nvidia-cutlass-dsl PyPI
-package (optional dependency).
+package (optional dependency). The decode-row SwiGLU kernel under
+python/cudnn/gemm/frost/swiglu_decode/ descends from the same block-scaled
+example through TensorRT-LLM and FlashInfer (entry 12); its source header
+records the chain.
 
 License: BSD 3-Clause License
 
@@ -282,7 +285,15 @@ b7643bd54521f563b839b98289b5cd048c062ba2:
 - python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head64.py
 - python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head128_small_topk.py
 
-The derived kernel files retain the upstream copyright notice.
+The SM90 sparse-prefill CuTe DSL kernel is adapted primarily from FlashMLA's
+Hopper sparse-prefill implementation, pinned to commit
+4f38f29ef6793c228363e4af5be66d44e81167ba:
+
+- python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm90.py
+
+The derived kernel files retain the upstream copyright notice. The SM90 port
+adds wider H coverage, arbitrary logical K boundary handling, bounded symbolic
+compilation, and an allocation-free CUDA Graph prepared-execution contract.
 
 License: MIT License
 
@@ -347,3 +358,41 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+12. FlashInfer (flashinfer-ai/flashinfer)
+    https://github.com/flashinfer-ai/flashinfer
+
+The FP8 split-K projection kernel for decode rows in
+python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py
+is derived from FlashInfer's cluster split-K dense GEMM kernel
+(flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py), pinned to
+flashinfer-python 0.7.2.post1 (commit beabf5004585b03da60e927bbb803acbaa62fe36).
+The derived file retains the upstream notice. The port replaces the BF16/FP16
+operands and the optional bias by FP8 E4M3 operands with a scalar FP32 scale and
+one BF16 cast, binds static shapes, reserves the shared memory the configuration
+uses, allocates the tensor-memory columns the accumulator needs, arms the
+cluster reduction barrier at the top of the epilogue role, offers an opt-in
+form that holds the tensor memory until the registers read from it are
+consumed, and adds the host entry with its typed declines and performance
+picks.
+
+The block-scaled FP4 gate / up kernel with a SwiGLU and block-quantising epilogue in
+python/cudnn/gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_nvfp4.py is derived from
+FlashInfer's persistent block-scaled dense GEMM kernel
+(flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100.py and
+dense_blockscaled_gemm_sm100_common.py), pinned to flashinfer-python 0.7.2.post1
+(commit beabf5004585b03da60e927bbb803acbaa62fe36). Both files carry NVIDIA's
+BSD-3-Clause notice (the text of entry 3); the first states that it was ported from
+TensorRT-LLM; the derived file retains that notice. The port replaces the store of the
+product by an epilogue that applies SiLU(gate) x up and writes packed FP4 codes with
+E4M3 block scales, stages the first weight tiles before the dependent-launch wait, and
+adds the host entry with its typed declines.
+
+FlashInfer's NOTICE:
+
+    FlashInfer
+    Copyright 2025-2026 NVIDIA
+    Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)

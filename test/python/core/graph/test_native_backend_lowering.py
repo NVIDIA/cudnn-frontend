@@ -44,6 +44,15 @@ def _bar_frost_norm(g):
     return g.deselect_engines([name for fam in MANIFEST if fam.name in ("frost_norm_fwd", "frost_norm_bwd") for name in fam.slots])
 
 
+def _bar_frost_sdpa_fwd(g):
+    """The FROST SDPA forward engines are default candidates too (the f16/bf16 prefill engines for cc 8.0, 9.0, 10.0, 10.3,
+    10.7 and 12.0). Where the heuristics rank one first (cc 10.3 and 12.0 for the causal f16 graph below), it claims the
+    graph: bar them by name, so the test keeps covering the lowering to the backend."""
+    from cudnn.engines.manifest import MANIFEST
+
+    return g.deselect_engines([name for fam in MANIFEST if fam.name == "frost_sdpa_fwd" for name in fam.slots])
+
+
 @pytest.mark.parametrize("implementation", [cudnn.attention_implementation.AUTO, cudnn.attention_implementation.UNIFIED])
 @pytest.mark.parametrize("opt_in", ["0", "1"])
 def test_sm10x_block_mask_requires_fixed_backend(cudnn_handle, monkeypatch, implementation, opt_in):
@@ -222,6 +231,7 @@ def test_native_moe_grouped_matmul_lowers_to_backend():
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
 
 
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 8, reason="cuDNN SDPA (FP16 / BF16) requires SM80 or newer")
 def test_native_sdpa_fwd_lowers_to_backend():
     """sdpa (captured-op family) -> cuDNN execution parity vs torch SDPA."""
     h = _handle()
@@ -240,7 +250,7 @@ def test_native_sdpa_fwd_lowers_to_backend():
     assert stats is None and O.dim == [B, Hh, S, D]
     O.set_output(True).set_data_type(cudnn.data_type.HALF)
 
-    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    _bar_frost_sdpa_fwd(g).build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({Q: q, K: k, V: v, O: o}, ws, handle=h)
     torch.cuda.synchronize()

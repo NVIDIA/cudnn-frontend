@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixed-owner deterministic SM100-family indexer dK accumulation."""
+"""Fixed-owner deterministic indexer dK accumulation for SM90 and SM100."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from cutlass import Float32, Int32
 from cudnn.api_base import ws_align
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor
 
 SUPPORTED_DK_PLANES = (96, 128, 148)
 DEFAULT_DK_PLANES = SUPPORTED_DK_PLANES[0]
@@ -25,7 +25,9 @@ DEFAULT_DK_PLANES = SUPPORTED_DK_PLANES[0]
 # inspect the default policy.
 NUM_DK_PRODUCER_CTAS = DEFAULT_DK_PLANES
 NUM_DK_PLANES = DEFAULT_DK_PLANES
-INDEXER_BACKWARD_SM100_CAPABILITIES = ((10, 0), (10, 3))
+# SM100, SM103 and SM107 (Rubin); SM107 also needs a DSL with the sm_107a target,
+# which IndexerBackward.check_support verifies (Rule 7).
+INDEXER_BACKWARD_SM100_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _compile_cache: dict = {}
 
 
@@ -63,9 +65,11 @@ def deterministic_dk_workspace_bytes(batch: int, seqlen_k: int, head_dim: int, n
 
 
 class DeterministicDkReduceSm100:
-    """Fold producer-private FP32 planes in numeric CTA order."""
+    """Fold producer-private FP32 planes in numeric CTA order.
 
-    arch = 100
+    The reducer uses only architecture-neutral scalar loads/adds/stores; the
+    historical class name remains for downstream import compatibility.
+    """
 
     def __init__(self, head_dim: int, num_planes: int):
         """Specialize the reducer for the contiguous dK row width."""
@@ -115,6 +119,27 @@ class DeterministicDkReduceSm100:
             mdK[dim_idx, row_idx] = mdK.element_type(acc)
 
 
+_TORCH_TO_CUTLASS_OUTPUT_DTYPE = {torch.bfloat16: cutlass.BFloat16, torch.float32: cutlass.Float32}
+
+
+def compile_reduce_deterministic_dk(head_dim: int, d_index_k_dtype: torch.dtype, num_planes: int):
+    """Compile (or reuse) the plane reduction for the current device, from fake operands (R11)."""
+    num_planes = validate_deterministic_dk_planes(num_planes)
+    key = (torch.cuda.current_device(), head_dim, d_index_k_dtype, num_planes)
+    fn = _compile_cache.get(key)
+    if fn is None:
+        kernel = DeterministicDkReduceSm100(head_dim, num_planes)
+        fn = cute.compile(
+            kernel,
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(_TORCH_TO_CUTLASS_OUTPUT_DTYPE[d_index_k_dtype], 3),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options("--opt-level 2"),
+        )
+        _compile_cache[key] = fn
+    return fn
+
+
 def reduce_deterministic_dk(
     d_index_k_planes: torch.Tensor,
     d_index_k: torch.Tensor,
@@ -126,16 +151,6 @@ def reduce_deterministic_dk(
     if d_index_k_planes.shape[0] != num_planes:
         raise ValueError(f"d_index_k_planes has {d_index_k_planes.shape[0]} planes, expected {num_planes}")
     stream = resolve_stream(current_stream)
-    key = (d_index_k.device, d_index_k.shape[-1], d_index_k.dtype, num_planes)
-    fn = _compile_cache.get(key)
-    if fn is None:
-        kernel = DeterministicDkReduceSm100(d_index_k.shape[-1], num_planes)
-        fn = cute.compile(
-            kernel,
-            to_cute_tensor(d_index_k_planes),
-            to_cute_tensor(d_index_k),
-            stream,
-            options=compile_options("--opt-level 2"),
-        )
-        _compile_cache[key] = fn
+    with torch.cuda.device(d_index_k.device):
+        fn = compile_reduce_deterministic_dk(d_index_k.shape[-1], d_index_k.dtype, num_planes)
     fn(d_index_k_planes, d_index_k, stream)

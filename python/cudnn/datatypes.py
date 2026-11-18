@@ -314,6 +314,11 @@ def _cudnn_to_torch_data_type(cudnn_data_type):
         for torch_type, cudnn_type in _torch_to_cudnn_data_type_dict.items():
             if cudnn_type == cudnn_data_type:
                 return torch_type
+        # torch.bool maps to BOOLEAN; a BYTE_BOOLEAN tensor (one byte per value) also has the storage of torch.bool.
+        if cudnn_data_type == _pybind_module.data_type.BYTE_BOOLEAN:
+            import torch
+
+            return torch.bool
     return None
 
 

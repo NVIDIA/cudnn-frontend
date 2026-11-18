@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import torch
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute

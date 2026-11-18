@@ -1,0 +1,140 @@
+{
+  "inputs": {
+    "a_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "2e13d8b43b2122f7edc6ddc9a5fa8130d0f5ae9ce4eb93509e7270fdfc69b9da",
+      "shape": [
+        512,
+        256
+      ]
+    },
+    "alpha_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "4cb040be550e406a6f3d5a28e8609d79deba49cabc1b1821ab72e8cff248ad76",
+      "shape": [
+        8
+      ]
+    },
+    "b_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "f00a008f15f0018e8a6d398bb01dd9e4fec9395d51d7f026880f6403fe27ffc6",
+      "shape": [
+        2,
+        512,
+        256
+      ]
+    },
+    "beta_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "80b8fd6d60fa85fd14a38b5295cb92abd80dfec5ca406c9f969609a79d36809d",
+      "shape": [
+        8
+      ]
+    },
+    "c_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "82060057f76ab1a3e699bb43a724989882536c07b0c865d5565da3339ac17a23",
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    "norm_const_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "0d66bd808e9247acb560fe33efaa62ad6f11ee6f85cc4f61bd17673263de04ee",
+      "shape": [
+        4
+      ]
+    },
+    "padded_offsets": {
+      "dtype": "torch.uint8",
+      "sha256": "6192e6ba8849ddb446c1d9d704988c537ff7ff21258de4016a62ef39e1286435",
+      "shape": [
+        8
+      ]
+    },
+    "prob_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "fcd9487b27f3bb4718e22adf0d4411703900437f7e7d7ca68d2131ae212d9a06",
+      "shape": [
+        2048
+      ]
+    },
+    "sfa_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "71cbdbeec021b7f441e73b1594b1a99d2366ffe2011bb71d9a0c256d616c34c3",
+      "shape": [
+        1,
+        4,
+        2,
+        32,
+        4,
+        4
+      ]
+    },
+    "sfb_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "7dc96599b6c8f64e73484ba4308cff5ba8b13d1f270e7327c085a32df559ebf8",
+      "shape": [
+        2,
+        4,
+        2,
+        32,
+        4,
+        4
+      ]
+    }
+  },
+  "outputs": {
+    "d_col_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "de7a0a2fe1f87f17bad723b3283a96b2a717309bdc53b4d9eb74fbb40c0dfed4",
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    "d_row_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "cfbfa99f17dde5e35694d316a967d0cda01f22e3843d86dbc96862d157e3de2c",
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    "sfd_col_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "8f414eb861da804fb982de38c1bc6ee5b891bf709e560a95ee5548eaa56580d5",
+      "shape": [
+        8192
+      ]
+    },
+    "sfd_row_tensor": {
+      "dtype": "torch.uint8",
+      "sha256": "c9bb2d07e45b5ca428158cf508f3cb43dd2c0fa6da1f31dcc36924ac225168dc",
+      "shape": [
+        1,
+        2,
+        8,
+        32,
+        4,
+        4
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13040,
+    "cudnn": 92801,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA GB200",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 152,
+    "torch": "2.15.0a0+875d815502.nv26.10",
+    "tvm_ffi": "0.1.16"
+  },
+  "schema": 1
+}

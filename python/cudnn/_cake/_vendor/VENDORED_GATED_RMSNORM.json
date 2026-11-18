@@ -1,0 +1,29 @@
+{
+  "repository": "https://github.com/radixark/miles-ext-kernels",
+  "commit": "f55fb99674be5edb0e1f6a0e4d6a911335da86ce",
+  "path": "miles_ext_kernels/cake/_vendor/cake_rmsnorm_silu_gate_det_train",
+  "files": {
+    "__init__.py": "7965b2a2672c6423f3aa87837b30e0fe3acd010c93f866afb1022ba4e144a0c5",
+    "build.json": "68965a2a5aa227f617df889a81c3536a71d2097d25bb908cdc560f37d0d00fcc",
+    "cake_build.py": "71186cd1cdf298d3bf15ef1b0d0d96c4d08980cfbf769dd3db2859a2ca854ae3",
+    "cake_jit.py": "df85bdc54235e6a89f6517baf223197c7b7da21c09aa5b5a8da247ad58303739",
+    "csrc/.clang-format": "b2ed4e41e9fea4114e3a58d923fdc1937915d9e6fb587978cc7f5577690afe36",
+    "csrc/cake_ffi_checks.h": "d2a086d2a519b04a4593f7e7a802dc2e5e6b6bdd74c531afb8d019727eae4272",
+    "csrc/cake_rmsnorm_silu_gate_det_train_3c1aaebdec47df0111e4_binding.cu": "77600ab717c7a9385e259bbef86ba3f30f8bf49a564bdc6e95ea206c10f734f4",
+    "csrc/cake_rmsnorm_silu_gate_det_train_3c1aaebdec47df0111e4_kernel.cu": "527404e498572cde3c090cb4e91630e5c43d12b79bee497e446a69ed69c571b3",
+    "csrc/cake_rmsnorm_silu_gate_det_train_47d2327da7f419fce725_binding.cu": "641820b04592062163aecff75b6bee084912886f78182b2bc5c2a01bef5bb42f",
+    "csrc/cake_rmsnorm_silu_gate_det_train_47d2327da7f419fce725_kernel.cu": "7fec6e81cb268a2ddedaf395bbc7a156188af9b363f5be663e1548e3cf23282d",
+    "csrc/cake_rmsnorm_silu_gate_det_train_7b7fac905aff1ddaa258_binding.cu": "ec6785d5ba44d4941ad0a279f0967d307895c7472798e0699afad9c42dbf0467",
+    "csrc/cake_rmsnorm_silu_gate_det_train_7b7fac905aff1ddaa258_kernel.cu": "1e134bcf38068068b9072ab2ca0c0e732be4b7db3fd906039866279751c95b1b",
+    "csrc/cake_rmsnorm_silu_gate_det_train_7f014401d5cc855ab883_binding.cu": "6d933c822b41230b419997dde1e18e6253b028d91430262f3ba1ecf3e9e600cd",
+    "csrc/cake_rmsnorm_silu_gate_det_train_7f014401d5cc855ab883_kernel.cu": "c412be8acb228272fb99ecc32920ec10a93eab41c1e8d732187b3b3d8e7b258e",
+    "csrc/cake_rmsnorm_silu_gate_det_train_87f0173e9583ad4fdd2a_binding.cu": "ed499ed2ec41d0ed4c19fa00903be2583dd103ed609ee5d6366e250416f07687",
+    "csrc/cake_rmsnorm_silu_gate_det_train_87f0173e9583ad4fdd2a_kernel.cu": "bedfcefd59e6bbafe07f696615719fd1d746ee67d076fa1fbf7edf5debf81cd7",
+    "csrc/cake_rmsnorm_silu_gate_det_train_9d6efc19ce4885c5a4d0_binding.cu": "3a6cc93181a1e7daa5ac2a8cbfcc5c2c0b5a584383e19a2ed0da70e231c29448",
+    "csrc/cake_rmsnorm_silu_gate_det_train_9d6efc19ce4885c5a4d0_kernel.cu": "3b9d9e5f644617142da0c053a5c09b71dfe062fb3d4a78bb32ba378d56bdea52",
+    "csrc/cake_rmsnorm_silu_gate_det_train_aeceb63b55b0c3368dc9_binding.cu": "cbf02d5df20ec0ed34ddd2d29b308564378246b75d28fe8ddeee66f9411a09f5",
+    "csrc/cake_rmsnorm_silu_gate_det_train_aeceb63b55b0c3368dc9_kernel.cu": "d8aac0b56f9409c19b2c324d34c9ebd51476306d3e622792ecc300aaecc622b5",
+    "csrc/cake_rmsnorm_silu_gate_det_train_de5df3c9a4a5a804fcf2_binding.cu": "863a7347c867796820822e74e68a027fcb24fdc3f1ed93d36240417ffafc9eea",
+    "csrc/cake_rmsnorm_silu_gate_det_train_de5df3c9a4a5a804fcf2_kernel.cu": "15db23678e0e500de3bb21cd79240539b449b4ddc92018792b0800755afd310f"
+  }
+}

@@ -280,6 +280,19 @@ _TILE_ROWS = {
     # d = 256 either, half the cluster tiles of the (256, 256) row, one 512-column accumulator (no double buffering:
     # 2 x 512 exceeds the TMEM), and a 512-row cluster M tile that is NOT causal-tight.  Kept so the wave-quantization
     # question (twice the tiles vs 25 % less L2 -> SMEM traffic per FLOP) is a one-constant A/B, not a rewrite.
+    (256, 192): _TileRow(
+        config="CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+        cgrp_tile_mn=(256, 192),
+        cta_tile_mn=(128, 96),
+        cluster_shape_mnk=(2, 1, 1),
+        ab_stages=6,
+        multicast_a=False,
+        a_mcast_k_major=(1, False),
+        a_mcast_m_major=(1, False),
+        mma_size_m=1,
+        acc_stages=2,
+        mixed_a_pattern_pref=1,
+    ),
     (512, 256): _TileRow(
         config="CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",
         cgrp_tile_mn=(512, 256),
@@ -306,7 +319,7 @@ _ROW = _TILE_ROWS[tuple(getattr(PARAMS, "cgrp_tile_mn", (512, 512)))]
 _K_STAGE_BYTES = 128
 _K_STAGE_ELEMS = _K_STAGE_BYTES // _AB_BPE
 _NATIVE_N192 = _ROW.cgrp_tile_mn == (128, 192)
-mma_inst_shape_mnk = (128, 192, 16) if _NATIVE_N192 else ((256, 256, 64) if _IS_FP8 else (256, 256, 16))
+mma_inst_shape_mnk = (128, 192, 16) if _NATIVE_N192 else (256, _ROW.cgrp_tile_mn[1] // _ROW.cluster_shape_mnk[1], 64 if _IS_FP8 else 16)
 mma_k_dim = 1 if _IS_FP8 else 0
 cta_group = 1 if _NATIVE_N192 else 2
 cgrp_tile_mnk = (_ROW.cgrp_tile_mn[0], _ROW.cgrp_tile_mn[1], _K_STAGE_ELEMS)
@@ -430,6 +443,9 @@ _MAJOR_CONSTS = {
 }[_AB_BPE]
 a_smem_desc_leading_byte_offset, a_smem_k_step_bytes, a_tma_group_elems = _MAJOR_CONSTS[a_is_m_major]
 b_smem_desc_leading_byte_offset, b_smem_k_step_bytes, b_tma_group_elems = _MAJOR_CONSTS[b_is_n_major]
+# An N-major B stage holds whole TMA groups; TMA zero-fills the columns past the head dim.
+_B_N_GROUPS = -(-cta_tile_mnk[1] // b_tma_group_elems) if b_is_n_major else 1
+_B_SMEM_N = _B_N_GROUPS * b_tma_group_elems if b_is_n_major else cta_tile_mnk[1]
 a_smem_desc_stride_byte_offset = 1024
 b_smem_desc_stride_byte_offset = 1024
 a_smem_m_step_bytes = 16384
@@ -606,7 +622,7 @@ def _smem_layout_bytes() -> dict:
     for i in range(num_a_operands):
         place(f"smem_a_{i}", cta_tile_mnk[0] * cta_tile_mnk[2] * ab_bpe * ab_stages, 1024)
     for j in range(num_b_operands):
-        place(f"smem_b_{j}", cta_tile_mnk[1] * cta_tile_mnk[2] * ab_bpe * ab_stages, 1024)
+        place(f"smem_b_{j}", _B_SMEM_N * cta_tile_mnk[2] * ab_bpe * ab_stages, 1024)
     place("smem_d", epi_stage_rows * epi_row_elems * epi_slot_widen * (cd_dtype.width // 8) * EPI_SMEM_STAGES, 1024)
     out["total"] = off
     return out
@@ -1140,7 +1156,7 @@ def _bprop_matmul_bh_sm100_kernel(
     )
 
     sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
-    sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
+    sB_elems = _B_SMEM_N * cta_tile_mnk[2]
     if cutlass.const_expr(_BLOCK_SCALE):
         # SMEM buffer table of the arm (declaration order == `_smem_layout_bytes`; the operand rings and the epilogue staging
         # keep the fork's rows):
@@ -1555,7 +1571,7 @@ def _bprop_matmul_bh_sm100_kernel(
                     elif cutlass.const_expr(multicast_b):
                         if pair_m_idx == 0:
                             if cutlass.const_expr(b_is_n_major):
-                                for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                                for n_group in cutlass.range_constexpr(_B_N_GROUPS):
                                     if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
@@ -1584,7 +1600,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                     )
                     else:
                         if cutlass.const_expr(b_is_n_major):
-                            for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                            for n_group in cutlass.range_constexpr(_B_N_GROUPS):
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),

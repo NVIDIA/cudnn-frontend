@@ -41,6 +41,7 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    frost_gemm_unsupported_reason,
     with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
@@ -504,6 +505,10 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
+        return 1
+    reason = frost_gemm_unsupported_reason()
+    if reason is not None:
+        print(reason)
         return 1
 
     keys = list(MODELS) if args.models.strip().lower() == "all" else [k.strip() for k in args.models.split(",")]

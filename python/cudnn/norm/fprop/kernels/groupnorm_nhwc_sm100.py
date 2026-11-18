@@ -43,7 +43,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count
+from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -423,11 +423,15 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, 
         # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
         # change epsilon without rebuilding the graph (it is a pass-by-value operand),
         # and a key without it silently replays the kernel compiled for the old value.
-        key = (params.io_dtype,) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2)) + ce
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_gn_fwd_nhwc_host, *args, *ce, fake_stream())
-            _KCACHE[key] = fn
+            with dsl_compile_lock():
+                fn = _KCACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_gn_fwd_nhwc_host, *args, *ce, fake_stream())
+                    _KCACHE[key] = fn
         fn(*args, cur_stream())
         return y, mean, rstd
 

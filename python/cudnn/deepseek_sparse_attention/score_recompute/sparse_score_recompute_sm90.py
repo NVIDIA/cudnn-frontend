@@ -18,6 +18,7 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.experimental import primitives as nvvm
 from cudnn._cutlass_compat import FastDivmodDivisor, LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
@@ -29,7 +30,6 @@ from cudnn.deepseek_sparse_attention.utils.sm90.mma import (
     mma_partition_fragment_AB,
 )
 from cudnn.deepseek_sparse_attention.utils.sm90.bwd_barriers import NamedBarrierBwd
-from .pack_gqa import PackGQA
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
 from cudnn.deepseek_sparse_attention.utils.sm90.bwd_tile_scheduler import (
     ParamsBase,
@@ -59,7 +59,6 @@ class SparseScoreRecomputeSm90:
         swap_AB: bool = True,
         topk_max: int = 512,
         is_index_scores: bool = True,  # index_scores or attention_scores
-        softmax_scale: float = 1.0,
         has_topk_length: bool = True,
         num_head_tiles: int = 1,  # >1 when qhead_per_kvhead > tile_m (head tiling)
         is_sparse: bool = True,  # kept for API compat; sparse kernel always True
@@ -75,7 +74,6 @@ class SparseScoreRecomputeSm90:
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_index_scores = is_index_scores
-        self.softmax_scale = softmax_scale
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_head_tiles = num_head_tiles
@@ -85,6 +83,8 @@ class SparseScoreRecomputeSm90:
         self.swap_AB = swap_AB
         self.arch = arch
         self.topk_max = topk_max
+        assert self.topk_max >= 128
+        assert self.topk_max % 128 == 0, "topk_max is a compile-time capacity bucket and must be a multiple of 128"
         self.weights_or_lse_dtype = self.dtype if self.is_index_scores else cutlass.Float32
         self.has_topk_length = has_topk_length
         self.output_log_probs = output_log_probs
@@ -176,9 +176,10 @@ class SparseScoreRecomputeSm90:
         mTopkIdxs: cute.Tensor = None,  # (batch, seqlen_q, topk_max) int32; None in dense mode
         stream: cuda.CUstream = None,
         mOut: cute.Tensor = None,  # (batch, seqlen_q, topk_max)
-        weights_or_lse: cute.Tensor = None,  # (batch, nheads, seqlen_q) Note: weights is half precision
+        weights_or_lse: cute.Tensor = None,  # (batch, seqlen_q, nheads); weights are half precision
         mTopkLength: cute.Tensor = None,  # (batch, seqlen_q) int32, per-q valid KV count
         mL1NormDenom: cute.Tensor = None,  # (batch, seqlen_q) float32, dense attn L1 norm denominator
+        softmax_scale: Float32 = 1.0,
     ):
         self._check_type(mQ.element_type, mKV.element_type, weights_or_lse.element_type)
 
@@ -205,25 +206,20 @@ class SparseScoreRecomputeSm90:
         layout_transpose = [1, 3, 2, 0]
         mQ, mKV = [sm90_ops.select(t, layout_transpose) for t in (mQ, mKV)]
 
-        mWeights_transpose_layout = [2, 1, 0]
+        # Public operands are (B, S, H). Select the native (S, H, B) view
+        # directly so prepared execution never materializes a BHS transpose.
+        mWeights_transpose_layout = [1, 2, 0]
         mWeights = sm90_ops.select(mWeights, mWeights_transpose_layout)
 
-        # PackGQA: reshape tensor layouts for packed M dimension
+        # Pack Q's sequence/head modes into the WGMMA M dimension. The auxiliary
+        # tensor stays in its native (S, H, B) view and is loaded explicitly.
         qhpkv = self.qhead_per_kvhead
-        num_head_kv = mKV.shape[2]  # num_head_kv is always 1 as PackGQA
+        num_head_kv = mKV.shape[2]
         mQ = cute.make_tensor(
             mQ.iterator,
             cute.make_layout(
                 ((qhpkv, mQ.shape[0]), mQ.shape[1], num_head_kv, *mQ.shape[3:]),
                 stride=((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * qhpkv, *mQ.stride[3:]),
-            ),
-        )
-
-        mWeights = cute.make_tensor(
-            mWeights.iterator,
-            cute.make_layout(
-                ((qhpkv, mWeights.shape[0]), num_head_kv, *mWeights.shape[2:]),  # 32 * seqlen, 1, bs
-                stride=((mWeights.stride[1], mWeights.stride[0]), mWeights.stride[1] * qhpkv, *mWeights.stride[2:]),
             ),
         )
 
@@ -278,7 +274,7 @@ class SparseScoreRecomputeSm90:
         qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         LOG2_E = math.log2(math.e)
-        softmax_scale_log2 = self.softmax_scale * LOG2_E
+        softmax_scale_log2 = softmax_scale * Float32(LOG2_E)
 
         self.kernel(
             tma_tensor_Q,
@@ -292,6 +288,7 @@ class SparseScoreRecomputeSm90:
             self.sKV_layout_staged,
             tiled_mma_QK,
             softmax_scale_log2,
+            softmax_scale,
             tile_sched_params,
             TileScheduler,
             SharedStorage,
@@ -318,6 +315,7 @@ class SparseScoreRecomputeSm90:
         sKV_layout_staged: cute.ComposedLayout = None,
         tiled_mma_QK: cute.TiledMma = None,
         softmax_scale_log2: Float32 = None,
+        softmax_scale: Float32 = None,
         tile_sched_params: ParamsBase = None,
         TileScheduler: cutlass.Constexpr[Callable] = None,
         SharedStorage: cutlass.Constexpr[Callable] = None,
@@ -345,8 +343,6 @@ class SparseScoreRecomputeSm90:
         sKV_1 = sKV_staged[None, None, 1]
 
         sWeights = storage.sWeights.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
-        if tidx == 0:
-            sWeights.fill(0.0)
 
         # Sparse path: one float per topk position, consumed by softmax_l1norm_parallel.
         sTopk_reduced = storage.sTopk_reduced.get_tensor(cute.make_layout((self.topk_max,), stride=(1,)))
@@ -397,11 +393,29 @@ class SparseScoreRecomputeSm90:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 softmax_scale_log2,
+                softmax_scale,
             )
 
     # =========================================================================
     # WG0 producer: loads Q + Weights + KV into SMEM, syncs with WG1
     # =========================================================================
+    @cute.jit
+    def load_aux_bsh(
+        self,
+        mAux_cur: cute.Tensor,
+        sAux: cute.Tensor,
+        m_block: Int32,
+        tidx: Int32,
+    ):
+        """Load one packed query/head tile from a native ``(S_q, H_q)`` view."""
+        # tile_m <= 64 < 128 producer threads: one row per thread, no overlap.
+        row = tidx
+        if row < self.tile_m:
+            idx = m_block * self.tile_m + row
+            m_idx = idx // self.qhead_per_kvhead
+            h_idx = idx - m_idx * self.qhead_per_kvhead
+            sAux[row] = mAux_cur[m_idx, h_idx]
+
     @cute.jit
     def producer_wg0(
         self,
@@ -437,8 +451,10 @@ class SparseScoreRecomputeSm90:
 
             if const_expr(self.has_topk_length):
                 topK = mTopkLength[batch_idx, m_block]
+                if topK > mTopkIdxs.shape[2]:
+                    topK = mTopkIdxs.shape[2]
             else:
-                topK = self.topk_max
+                topK = mTopkIdxs.shape[2]
             n_block_max = (topK + self.tile_n - 1) // self.tile_n
             topk_tail_rows = topK - (n_block_max - 1) * self.tile_n
 
@@ -448,9 +464,7 @@ class SparseScoreRecomputeSm90:
             mQ_cur = mQ[None, None, head_idx, batch_idx]
 
             # Weights setup (shared across head tiles)
-            mWeights_cur = mWeights[None, head_idx, batch_idx]
-            seqlen_q_packed = mWeights_cur.shape[0][1]
-            _pack_gqa = PackGQA(0, 0, False, self.qhead_per_kvhead)
+            mWeights_cur = mWeights[None, None, batch_idx]
 
             # === Head tile loop: iterate over head slices ===
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
@@ -465,30 +479,13 @@ class SparseScoreRecomputeSm90:
                     load_Q(tma_bar_ptr=mbar_Q_ptr)
 
                 # ---- Load Weights/LSE for this head tile ----
-                if const_expr(self.is_index_scores):
-                    _pack_gqa.load_Weights_packed(
-                        mWeights_cur.iterator.toint(),
-                        seqlen_q_packed,
-                        sWeights,
-                        eff_m_block,
-                        self.tile_m,
-                        wg_tidx,
-                    )
-                else:
-                    _pack_gqa.load_LSE_packed(
-                        mWeights_cur.iterator.toint(),
-                        seqlen_q_packed,
-                        sWeights,
-                        eff_m_block,
-                        self.tile_m,
-                        wg_tidx,
-                    )
+                self.load_aux_bsh(mWeights_cur, sWeights, eff_m_block, wg_tidx)
 
                 cute.arch.fence_view_async_shared()
                 # ---- Sync: Q+Weights ready (cross-WG) ----
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
@@ -500,9 +497,9 @@ class SparseScoreRecomputeSm90:
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.KVReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
 
                 # ---- Main pipeline: load next KV while WG1 computes ----
@@ -516,9 +513,9 @@ class SparseScoreRecomputeSm90:
                         cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
                     # Sync: WG0's load done + WG1's GEMM done
-                    cute.arch.barrier(
+                    nvvm.barrier_cta_sync(
                         barrier_id=int(NamedBarrierBwd.KVReady),
-                        number_of_threads=self.num_threads,
+                        thread_count=self.num_threads,
                     )
 
                     cur_buf = 1 - cur_buf
@@ -527,9 +524,9 @@ class SparseScoreRecomputeSm90:
             # === End head tile loop ===
 
             # ---- Wait for WG1's softmax to complete ----
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -553,6 +550,7 @@ class SparseScoreRecomputeSm90:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
     ):
         """WG1 consumer (tidx 128-255): WGMMA Q@K^T + postprocess + softmax + output.
         Runs in lockstep with producer_wg0 via named barriers.
@@ -595,8 +593,10 @@ class SparseScoreRecomputeSm90:
 
             if const_expr(self.has_topk_length):
                 topK = mTopkLength[batch_idx, m_block]
+                if topK > mTopkIdxs.shape[2]:
+                    topK = mTopkIdxs.shape[2]
             else:
-                topK = self.topk_max
+                topK = mTopkIdxs.shape[2]
             n_block_max = (topK + self.tile_n - 1) // self.tile_n
 
             mTopkIdxs_cur = mTopkIdxs[batch_idx, m_block, None]
@@ -605,9 +605,9 @@ class SparseScoreRecomputeSm90:
             # === Head tile loop: iterate over head slices ===
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 # ---- Sync: wait for Q+Weights from WG0 ----
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
@@ -616,9 +616,9 @@ class SparseScoreRecomputeSm90:
                 tWeightsrWeights = copy_ops.load_s2r(tWsWeights)
 
                 # ---- Sync: wait for KV prologue from WG0 ----
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.KVReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
 
                 # ---- Main pipeline: GEMM while WG0 loads next KV ----
@@ -637,6 +637,7 @@ class SparseScoreRecomputeSm90:
                         acc_S,
                         tWeightsrWeights,
                         softmax_scale_log2,
+                        softmax_scale,
                         LOG2_E,
                         n_block_base_row,
                         lane,
@@ -650,9 +651,9 @@ class SparseScoreRecomputeSm90:
                     )
 
                     # Sync: WG1's GEMM done + WG0's next load done
-                    cute.arch.barrier(
+                    nvvm.barrier_cta_sync(
                         barrier_id=int(NamedBarrierBwd.KVReady),
-                        number_of_threads=self.num_threads,
+                        thread_count=self.num_threads,
                     )
 
                     cur_buf = 1 - cur_buf
@@ -662,16 +663,16 @@ class SparseScoreRecomputeSm90:
             # === End head tile loop ===
 
             # ---- Softmax + output (WG1 only, 128 threads) ----
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.WG1_consumer_sync),
-                number_of_threads=self.num_threads_per_warp_group,
+                thread_count=self.num_threads_per_warp_group,
             )
-            self.softmax_l1norm_parallel(sTopk_reduced, topK, tidx, mTopkIdxs_cur, mOut_cur)
+            self.softmax_l1norm_parallel(sTopk_reduced, topK, mTopkIdxs.shape[2], tidx, mTopkIdxs_cur, mOut_cur)
 
             # ---- Signal WG0: tile complete ----
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -682,6 +683,7 @@ class SparseScoreRecomputeSm90:
         acc_S: cute.Tensor,
         tWeightsrWeights: cute.Tensor,
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         LOG2_E: Float32,
         n_block_base_row: Int32,
         lane: Int32,
@@ -723,8 +725,8 @@ class SparseScoreRecomputeSm90:
             # accumulation (`accumulate=True` branch). Attention path already
             # bakes softmax_scale into softmax_scale_log2 via the exp2 inside
             # the head loop, so it does not need an extra multiply here.
-            if const_expr(self.is_index_scores and self.softmax_scale != 1.0):
-                row_sum_cur_thread = row_sum_cur_thread * Float32(self.softmax_scale)
+            if const_expr(self.is_index_scores):
+                row_sum_cur_thread = row_sum_cur_thread * softmax_scale
             pos = n_block_base_row + r * 8 + (lane >> 2)
             if (lane & 3) == 0 and pos < topK:
                 if accumulate:
@@ -871,6 +873,7 @@ class SparseScoreRecomputeSm90:
         self,
         sTopk_reduced: cute.Tensor,
         cur_topk: Int32,
+        physical_topk: Int32,
         tidx: Int32,
         mTopkIdxs_cur: cute.Tensor,
         mOut_cur: cute.Tensor,
@@ -896,30 +899,32 @@ class SparseScoreRecomputeSm90:
             local_max = -Float32(float("inf"))
             for j in cutlass.range_constexpr(ELEMS_PER_THREAD):
                 idx = j * self.num_threads_per_warp_group + wg_tidx
-                val = sTopk_reduced[idx]
+                val = -Float32(float("inf")) if const_expr(self.output_log_probs) else Float32(0.0)
                 if idx < cur_topk:
+                    val = sTopk_reduced[idx]
                     if const_expr(not self.has_topk_length):
                         token_idx = mTopkIdxs_cur[idx]
                         if token_idx < 0:
                             val = -Float32(float("inf"))
                     local_max = cute.arch.fmax(local_max, val)
-                else:
-                    if const_expr(self.output_log_probs):
-                        val = -Float32(float("inf"))
-                    else:
-                        val = Float32(0.0)
                 rVals[j] = val
 
             # Phase 3: Intra-warp max reduce (butterfly shuffle, all lanes get result)
             for s in cutlass.range_constexpr(5):  # log2(32) = 5
                 local_max = cute.arch.fmax(local_max, cute.arch.shuffle_sync_bfly(local_max, offset=1 << s))
 
+            # Every warp must finish reading the input before any warp
+            # reuses its first four entries as cross-warp scratch.
+            nvvm.barrier_cta_sync(
+                barrier_id=softmax_barrier_id,
+                thread_count=self.num_threads_per_warp_group,
+            )
             # Phase 4: Cross-warp max reduce via sTopk_reduced[0..3] scratch
             if lane_id == 0:
                 sTopk_reduced[warp_id] = local_max
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=softmax_barrier_id,
-                number_of_threads=self.num_threads_per_warp_group,
+                thread_count=self.num_threads_per_warp_group,
             )
             cur_max = sTopk_reduced[0]
             cur_max = cute.arch.fmax(cur_max, sTopk_reduced[1])
@@ -930,10 +935,11 @@ class SparseScoreRecomputeSm90:
             if cur_max == -Float32(float("inf")):
                 for j in cutlass.range_constexpr(ELEMS_PER_THREAD):
                     idx = j * self.num_threads_per_warp_group + wg_tidx
-                    if const_expr(self.output_log_probs):
-                        mOut_cur[idx] = -Float32(float("inf"))
-                    else:
-                        mOut_cur[idx] = Float32(0.0)
+                    if idx < physical_topk:
+                        if const_expr(self.output_log_probs):
+                            mOut_cur[idx] = -Float32(float("inf"))
+                        else:
+                            mOut_cur[idx] = Float32(0.0)
             else:
                 # Phase 5: exp + local sum (from registers, no SMEM read needed)
                 local_sum = Float32(0.0)
@@ -955,9 +961,9 @@ class SparseScoreRecomputeSm90:
                 # Use [4..7] as scratch to avoid race with max scratch in [0..3]
                 if lane_id == 0:
                     sTopk_reduced[warp_id + 4] = local_sum
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=softmax_barrier_id,
-                    number_of_threads=self.num_threads_per_warp_group,
+                    thread_count=self.num_threads_per_warp_group,
                 )
                 cur_sum = sTopk_reduced[4] + sTopk_reduced[5] + sTopk_reduced[6] + sTopk_reduced[7]
 
@@ -968,7 +974,7 @@ class SparseScoreRecomputeSm90:
                         idx = j * self.num_threads_per_warp_group + wg_tidx
                         if idx < cur_topk:
                             mOut_cur[idx] = rVals[j] - lse
-                        else:
+                        elif idx < physical_topk:
                             mOut_cur[idx] = -Float32(float("inf"))
                 else:
                     inv_sum = Float32(1.0) / (cur_sum + epsilon)
@@ -976,7 +982,7 @@ class SparseScoreRecomputeSm90:
                         idx = j * self.num_threads_per_warp_group + wg_tidx
                         if idx < cur_topk:
                             mOut_cur[idx] = rVals[j] * inv_sum
-                        else:
+                        elif idx < physical_topk:
                             mOut_cur[idx] = Float32(0.0)
         else:
             # === L1 norm path ===
@@ -984,24 +990,28 @@ class SparseScoreRecomputeSm90:
             local_sum = Float32(0.0)
             for j in cutlass.range_constexpr(ELEMS_PER_THREAD):
                 idx = j * self.num_threads_per_warp_group + wg_tidx
-                val = sTopk_reduced[idx]
+                val = Float32(0.0)
                 if idx < cur_topk:
+                    val = sTopk_reduced[idx]
                     if const_expr(not self.has_topk_length):
                         token_idx = mTopkIdxs_cur[idx]
                         if token_idx < 0:
                             val = Float32(0.0)
                     local_sum += val
-                else:
-                    val = Float32(0.0)
                 rVals[j] = val
 
             # Phase 3: Cross-thread sum reduce
             local_sum = sm90_ops.warp_reduce(local_sum, operator.add, width=32)
+            # Other warps may still be reading these entries as input.
+            nvvm.barrier_cta_sync(
+                barrier_id=softmax_barrier_id,
+                thread_count=self.num_threads_per_warp_group,
+            )
             if lane_id == 0:
                 sTopk_reduced[warp_id] = local_sum
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=softmax_barrier_id,
-                number_of_threads=self.num_threads_per_warp_group,
+                thread_count=self.num_threads_per_warp_group,
             )
             cur_sum = sTopk_reduced[0] + sTopk_reduced[1] + sTopk_reduced[2] + sTopk_reduced[3]
 
@@ -1011,5 +1021,5 @@ class SparseScoreRecomputeSm90:
                 idx = j * self.num_threads_per_warp_group + wg_tidx
                 if idx < cur_topk:
                     mOut_cur[idx] = rVals[j] * inv_sum
-                else:
+                elif idx < physical_topk:
                     mOut_cur[idx] = Float32(0.0)

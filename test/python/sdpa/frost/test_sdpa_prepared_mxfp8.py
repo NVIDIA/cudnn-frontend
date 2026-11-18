@@ -8,8 +8,7 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine, mxfp8_engine_name
 from sdpa.frost.test_sdpa_prepared_fp8 import _cuda_graph
 
 pytestmark = [requires_dsl, requires_pre_rubin_blackwell]
@@ -37,6 +36,9 @@ def _case(
     explicit_plan=False,
     gate=None,
     padded_stats=False,
+    independent_o_offsets=False,
+    sink=None,
+    record=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -99,6 +101,10 @@ def _case(
             kwargs[("seq_len_" if arch == "sm120" else "cu_seq_len_") + name] = lens
         kwargs["use_padding_mask"] = True
     kwargs.update(sf_args)
+    if sink is not None:
+        sink_t = g.tensor_like(sink)
+        buffers["sinks"], tensors["sinks"], vp[sink_t] = sink, sink_t, sink
+        kwargs["sink_token"] = sink_t
     o, lse, am = g.sdpa_mxfp8(q=tensors["q"], k=tensors["k"], v=tensors["v"], attn_scale=1 / math.sqrt(d), generate_stats=stats, **kwargs)
     out_type = {
         torch.bfloat16: cudnn.data_type.BFLOAT16,
@@ -123,12 +129,14 @@ def _case(
         buffers["o_storage"] = storage
         o.set_stride(out.stride())
     if thd:
-        if dv == d:
+        if dv == d and not independent_o_offsets:
             o.set_ragged_offset(tensors["off_q"])
         else:
-            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_o")
+            offset_type = cudnn.data_type.INT64 if independent_o_offsets else cudnn.data_type.INT32
+            offset_dtype = torch.int64 if independent_o_offsets else torch.int32
+            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=offset_type, name="off_o")
             o.set_ragged_offset(off_o)
-            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=torch.int32) * sq * hq * dv
+            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=offset_dtype) * sq * hq * dv
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
@@ -149,13 +157,15 @@ def _case(
         tensors["amax_o"], vp[am] = am, buffers["amax_o"]
     g.validate()
     g.build_operation_graph()
-    if override or explicit_plan:
+    name = mxfp8_engine_name(arch, d, dv)
+    if record is not None:
+        g.create_execution_plan(*record)
+    elif override or explicit_plan:
         # Pin the executor under test. Unrelated backend heuristics can fail
         # before the physical-stride fixture reaches a FROST launch.
         from cudnn.engines import MANIFEST
         from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs
 
-        name = engine_name(arch=arch, mxfp8=True)
         family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
         caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
         cgas = dict(caps.cgas_by_d_shape).get((d, dv), caps.cgas)
@@ -169,7 +179,7 @@ def _case(
         g.create_execution_plan(family.offered_ids()[name], knobs)
     else:
         g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = select_engine(g, engine_name(arch=arch, mxfp8=True), **({"pack_gqa": False} if arch == "sm120" else {}))
+    chosen = select_engine(g, name, **({"pack_gqa": False} if arch == "sm120" else {}))
     if (chosen.knobs.split_kv or 1) != split_kv:
         from dataclasses import replace
 
@@ -198,6 +208,9 @@ def _check(bufs, *, thd, b=2, sq=128, skv=128):
     )
     scores = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
     ref, stats = scores.softmax(-1) @ v, scores.logsumexp(-1)
+    if "sinks" in bufs:
+        stats = torch.logaddexp(stats, bufs["sinks"].double().reshape(1, q.shape[1], 1))
+        ref = (scores - stats.unsqueeze(-1)).exp() @ v
     am = ref.abs().amax()
     if "gate" in bufs:
         ref *= torch.sigmoid(bufs["gate"].float())
@@ -295,12 +308,14 @@ def test_prepared_mxfp8_thd_output_stride_above_int32(dtype, d, dv):
     row_stride = 2**32 + 4 * dv
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("physical row-stride regression needs 9 GiB free")
-    g, vp, ws, bufs, ts = _case(thd=True, override=True, dtype=dtype, d=d, dv=dv, sq=1, skv=64)
+    g, vp, ws, bufs, ts = _case(thd=True, override=True, dtype=dtype, d=d, dv=dv, sq=1, skv=64, independent_o_offsets=True)
     try:
         bufs["o"] = torch.empty_strided((2, 4, dv), (row_stride, dv, 1), dtype=torch.bfloat16, device="cuda")
     except torch.OutOfMemoryError:
         pytest.skip("physical row-stride storage unavailable")
     vp[ts["o"]] = bufs["o"]
+    # A wider output pitch needs its own physical offsets, independent of Q.
+    vp[ts["off_o"]] = torch.arange(3, device="cuda", dtype=torch.int64) * row_stride
     overrides = dict(override_uids=[ts["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1]])
     owner = g._compiled_plans[g._plan_index]._prepared.spec.owner
     bufs["o"].fill_(float("nan"))

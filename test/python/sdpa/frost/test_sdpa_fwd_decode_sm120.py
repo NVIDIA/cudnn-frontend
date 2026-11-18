@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SM120 half DECODE tile (``sm120/decode_f16.py``, ``tile_m`` 16 / 32).
+"""The SM120 half DECODE tile (``sm120/decode_f16_key_group/kernel.py``, ``tile_m`` 16 / 32).
 
 KNOB ROUTE: the adapter runs the decode tile when the plan's ``tile_m`` names
 it, exactly as ``lower_dsl_prefill`` forwards a plan's knobs; the kernel tests
@@ -203,8 +203,11 @@ def _facts(**over):
 
 
 def _spec(name: str = _SM120_ROW):
-    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd import engines, heuristics
 
+    if name == _SM120_ROW:
+        # The row's policy domain: exact head-tile records are delegated to their TILE_M-named owners.
+        return heuristics.sm100_legacy_policy_spec(name)
     return next(s for s in engines.ENGINE_SPECS if s.name == name)
 
 
@@ -277,8 +280,14 @@ def test_sm120_tile_requests_the_kernels_cannot_serve_are_ineligible(facts_over,
     if knobs_over.get("sched_policy") == "lpt":
         knobs_over = dict(knobs_over, sched_policy=SCHED_LPT)
     knobs = replace(SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=False), **knobs_over)
-    got = mismatch(_spec().capabilities, _facts(**facts_over), knobs)
+    from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
+    from frost_test_utils import sm120_half_owner
+
+    facts = _facts(**facts_over)
+    # The kernel table's reason is the legacy policy domain's; the exact wide-head owner declines the same request.
+    got = mismatch(sm100_legacy_policy_spec(_SM120_ROW).capabilities, facts, knobs)
     assert got is not None and reason in got, got
+    assert mismatch(_spec(sm120_half_owner(facts.d_qk, facts.d_v, knobs.tile_m)).capabilities, facts, knobs) is not None
 
 
 @pytest.mark.L0
@@ -298,9 +307,12 @@ def test_sm120_knob_admission_for_the_decode_tile():
     assert mismatch(half, _facts(h_q=24, h_kv=4, d_qk=256, d_v=256), knobs(16, 16)) is None
     assert mismatch(half, _facts(h_q=64, h_kv=8, d_qk=64, d_v=64), knobs(32, 32)) is None
     assert mismatch(half, _facts(has_sink=True), knobs(16, 16, split=4)) is None
-    fp8 = next(s for s in _fp8_specs()).capabilities
+    # Unequal small widths can require a48-key stage, not only powers of two.
+    assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(16, 48, split=3)) is None
+    assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(64, 48)) is not None
     fp8_facts = _facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    assert "outside this engine's domain" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
+    fp8 = next(s.capabilities for s in _fp8_specs() if mismatch(s.capabilities, fp8_facts) is None)
+    assert "runs TILE_M in (64, 128)" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
 
 
 def _fp8_specs():
@@ -388,7 +400,7 @@ def test_decode_tile_plans_carry_the_split_choice(monkeypatch, over, chosen):
     monkeypatch.setattr(heuristics, "choose_sm120_decode_split_kv", recording)
     spec = _spec()
     facts = _facts(**over)
-    plans = heuristics.recommend("A", facts, {spec.name: 20504})
+    plans = heuristics.recommend("A", facts, {spec.name: 20504, "sdpa_fwd_sm120_d256_all_compute": 20537, "sdpa_fwd_sm120_decode_key_group": 20538})
     decode = [p.knobs for p in plans if sm120_decode_tile(spec.capabilities, p.knobs.tile_m)]
     assert decode and seen
     stage = decode_kv_stage(*head_tiles(facts.d_qk, facts.d_v, HEAD_TILE_GRANULE))
@@ -513,6 +525,7 @@ def test_decode_tile_matches_reference(h_q, h_kv, s_q, s_kv, d, tile_m, split, s
 @pytest.mark.parametrize(
     "d,d_v,split",
     [
+        pytest.param(24, 40, 3, marks=pytest.mark.L0),  # unequal tiles require a48-key K/V stage
         pytest.param(72, 72, 1, marks=pytest.mark.L0),  # head tile 80: TMA zero-fills the pad columns, one copy per swizzle chunk
         pytest.param(88, 88, 3, marks=pytest.mark.L1),  # head tile 96, 16-key stages
         pytest.param(128, 120, 2, marks=pytest.mark.L1),  # V envelope only
@@ -693,7 +706,7 @@ def test_decode_tile_graph_capture_reads_current_inputs_and_storage(split, sink,
     import cudnn
     import cutlass.cute as cute
 
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, engine_name
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from frost_test_utils import select_engine
 
     b, h_q, h_kv, s_kv, d = 2, 32, 8, 4133, 128
@@ -720,7 +733,9 @@ def test_decode_tile_graph_capture_reads_current_inputs_and_storage(split, sink,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    row = select_engine(g, engine_name(arch="sm120"))
+    from frost_test_utils import sm120_half_owner
+
+    row = select_engine(g, sm120_half_owner(d, d, 16))
     g.create_execution_plan(row.engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=16, cga=1, pack_gqa=True, split_kv=split))
     g.select_plan(len(g.plans) - 1)
     g.check_support()

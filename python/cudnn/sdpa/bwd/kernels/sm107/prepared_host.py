@@ -2068,7 +2068,7 @@ def host_mxfp8(
     stream: driver.CUstream,
     ds_sf_policy: cutlass.Constexpr = DS_SF_POLICY_DEFAULT,
 ):
-    """The MXFP8 row's chain (``sdpa_mxfp8_backward`` at d = 256 on Rubin; ``sm107/bprop_d256_mxfp8.py``) under the dS policy
+    """The MXFP8 row's chain (``sdpa_mxfp8_backward`` at d = 256 on Rubin; ``sm107/d256_mxfp8/kernel.py``) under the dS policy
     ``ds_sf_policy`` (appended, default ``DS_SF_POLICY_DEFAULT``; ``DS_SF_P_B`` = the block-scaled chain that ships, ``DS_SF_P_C`` = the
     bf16-dS oracle twin):
 
@@ -2607,7 +2607,7 @@ def host_mxfp8_thd(
 
 def _check_target(sm: int, lo: int = 107) -> None:
     # The fp8 body is a Rubin-line kernel (327 KiB SMEM carveout, 576 TMEM columns, the K=64 dense-FP8 MMA form): lo = 107.
-    # The half chain also runs the 2x2-datapath body (kernels/bprop_d256_2x2_f16.py: 512 TMEM columns, 210 KiB) on the
+    # The half chain also runs the 2x2-datapath body (kernels/sm100/d256_f16_2x2/kernel.py: 512 TMEM columns, 210 KiB) on the
     # SM100 line (sdpa_bwd_sm100_d256), so compile_host_f16 admits SM100-SM119; the 4x1 f16 body never reaches sm < 107
     # because its engine row declares sm_lo = 107.
     if not lo <= sm <= 119:

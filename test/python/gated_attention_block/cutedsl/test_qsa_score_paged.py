@@ -1139,6 +1139,16 @@ def test_e4m3_arm_smem_is_half_the_bf16_arms(units, want16, want8):
 # --------------------------------------------------------------------------------------------- the selector (cc 9.0+)
 
 
+def _skip_past_the_sm120_selector_cap(n_blocks_max):
+    """The selector runs the deterministic FP32 IndexerTopK, which on SM120 serves at most
+    _SM120_DETERMINISTIC_MAX_NUM_COLS columns and declines wider rows in check_support(); skip those cells there."""
+    from cudnn.deepseek_sparse_attention.indexer_top_k import api as topk_api
+
+    cap = topk_api._SM120_DETERMINISTIC_MAX_NUM_COLS[torch.float32]
+    if _cc() == (12, 0) and n_blocks_max > cap:
+        pytest.skip(f"deterministic IndexerTopK on SM120 serves at most {cap} columns; this cell selects over {n_blocks_max}")
+
+
 @needs_selector
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("rows", [1, 2, 3, 4])
@@ -1147,6 +1157,7 @@ def test_paged_selection_matches_the_fp64_topk_set_up_to_ties(n_blocks_max, rows
     """The standalone selector: every row's SET equals torch.topk of the fp64 reference up to ties, the ids ascending with -1 past
     block_lens = min(top_k, counts), the counts the oracle's count rule, the scores the reference scores of the selected ids; the
     identity region (fewer than top_k visible blocks) selects every visible block; two calls BITWISE."""
+    _skip_past_the_sm120_selector_cap(n_blocks_max)
     case = _Case(4, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows), seed=n_blocks_max + 11 * rows + page_size)
     # the capacity is passed where the table's reach (whole pages) exceeds it (8 blocks on a 16-row page); where it equals, the default is exercised
     cap = dict(n_blocks_max=n_blocks_max) if case.max_pages * case.rpp != n_blocks_max else {}
@@ -1180,6 +1191,7 @@ def test_paged_selection_on_the_e4m3_pair_is_the_selection_on_the_same_values_up
     """The selector on the e4m3 pair against the selector on the SAME e4m3 values upcast to bf16 (exact: e4m3 is a subset of bf16, so the
     two arms score the same numbers -- their fp32 accumulations differ by order only, and the two selections agree as SETS up to ties at
     the k-th boundary); each against the fp64 reference on those values; canonical order, two calls bitwise."""
+    _skip_past_the_sm120_selector_cap(n_blocks_max)
     case = _Case(3, rows, n_blocks_max, page_size, _step_kv_lens(n_blocks_max, rows, batch=3), seed=n_blocks_max + 13 * rows + page_size, cache_dtype=_E4M3)
     cap = dict(n_blocks_max=n_blocks_max) if case.max_pages * case.rpp != n_blocks_max else {}
     out8 = fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, seq_q=rows, **cap)

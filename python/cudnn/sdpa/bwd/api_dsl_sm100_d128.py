@@ -8,7 +8,16 @@ from contextlib import nullcontext
 import torch
 
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from .d128_contract import ACCUMULATION, RECOMPUTE, select_implementation, validate_dense_bounds, workspace_layout
+from .d128_contract import (
+    ACCUMULATION,
+    DENSE_SM_RANGE,
+    PAIR,
+    pair_split,
+    pair_workspace_layout,
+    select_implementation,
+    validate_dense_bounds,
+    workspace_layout,
+)
 
 
 class SdpaBwdDslSm100D128(SdpaBwdDsl):
@@ -23,11 +32,12 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # reaches it, and the compiled-plan cache keys the armed build apart.  Not a knob (it changes the function), never shipped armed.
     diag_delete_dq_reduce_add: bool = False
     # The per-S selector of the grouped THD route: which body serves a BF16 grouped THD request -- the one-CTA body
-    # (``bprop_d128_accum_grouped_f16``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
-    # (``bprop_d128_accum_grouped_2cta_stail_f16``, implementation ``accumulation_grouped_thd_2cta``; five launches either way).  A typed op-level
+    # (the grouped bodies of ``kernels/sm100/d128_f16_accum/kernel.py``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
+    # (the pair body of the same module, implementation ``accumulation_grouped_thd_2cta``; five launches either way).  A typed op-level
     # field (``d128_grouped_2cta_contract.CTA_PAIR_MODES``): "auto" = THE default = the per-S rule -- the pair iff both declared S_q and S_kv >=
-    # ``CTA_PAIR_MIN_SEQ`` (8192: the smallest S where the pair body won the measured backward step on cc 10.0), cc in ``CTA_PAIR_CCS`` (the
-    # SM100 line, cc 10.0 / 10.3; the compile target follows the device as for the one-CTA body), a cluster
+    # ``CTA_PAIR_MIN_SEQ[cc]`` (PART-KEYED; 8192 on every admitted part today: the smallest S where the pair body won the measured backward step
+    # on cc 10.0, carried to cc 10.3 and cc 10.7 until re-measured there), cc in ``CTA_PAIR_CCS`` (cc 10.0 / 10.3 / 10.7; the compile target
+    # follows the device as for the one-CTA body), a cluster
     # of two admitted by the device's occupancy query, and every support predicate of the pair body; else the one-CTA body.  "off" = the one-CTA
     # body always; "on" = the pair body at any S, declining BY NAME when a predicate fails.  Resolved once in ``check_support``
     # (``prepared_sm100_d128_grouped_2cta.resolve_cta_pair_body``) and recorded on the instance (``cta_pair_resolution``: the token
@@ -36,8 +46,9 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     cta_pair: str = "auto"
     # DIAGNOSTIC probes of the pair body: a ``CFG.DIAG_2CTA_NAMES`` name ("dq_reduce_add_off" = the store warp skips the four fp32 dQ reduce-add
     # issues; "exchange_off" = the dS exchange ship is skipped and its barrier armed with 0 bytes; "stats_one_chunk" = one stats / delta chunk per
-    # quarter reused for all; "sdq_sts_off" = the dQ staging STS skipped) or ``None`` = THE default (no probe; rendered PTX-identical, pinned).
-    # Every barrier arrive site stays (the barrier table is unchanged); the OUTPUT IS WRONG BY DESIGN -- a timing ceiling set on the adapter
+    # quarter reused for all; "sdq_sts_off" = the dQ staging STS skipped; "s_tail_wait_off" = the leader skips its s_tail_empty waits;
+    # "s_read_wait_off" = the leader skips its s_read wait; "s_tail_and_s_read_wait_off" = both) or ``None`` = THE default (no probe; rendered
+    # PTX-identical, pinned).  Every barrier arrive site stays (the barrier table is unchanged); the OUTPUT IS WRONG BY DESIGN -- a timing ceiling set on the adapter
     # INSTANCE by a probe driver, never a knob, never shipped armed, refused by the driver's `--validate`; read only on the 2-CTA route; typed
     # (ValueError by name); keyed apart in the plan cache.
     diag_2cta: "str | None" = None
@@ -54,7 +65,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # values straight; measured neutral against "fsel" on GB200 at 16K / 32K, kept selectable) | "diag_mask_off" (DIAGNOSTIC: the mask body
     # skipped on EVERY tile = the lever's ceiling; OUTPUT WRONG BY DESIGN on the diagonal / edge tiles, set on the adapter INSTANCE by a probe
     # driver, never a knob, never shipped armed, refused by the driver's `--validate`).  Bitwise on dQ / dK / dV between fsel and predicated (a
-    # masked P / dS cell is exactly 0 in both forms).  Typed (``config_sm100_d128_accum_2cta_stail.CFG.MASK_FORMS``); read only on the 2-CTA
+    # masked P / dS cell is exactly 0 in both forms).  Typed (``d128_f16_accum_2cta.config.CFG.MASK_FORMS``); read only on the 2-CTA
     # route; the compile key carries it.
     mask_form: "str | None" = None
     # How the GQA group's dK / dV are accumulated on the grouped THD chain -- "bf16_partials" (``None`` = the same, THE default: one bf16 partial
@@ -72,7 +83,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # straight from its registers and its lead warp ships; warps 8-11 become the REDUCE group (dQ readout + the fp32 slice rounds + the item-end
     # dV / dK staging); two barrier rows deleted, one added; measured slower on GB200 at 8K-64K).  Perf-only on dK / dV (bitwise under both
     # values: the same accumulation chain per GEMM); dQ by the fp64 gate.  Under "16w_fa4" ``debug_clk`` and ``dkv_accum = "fp32_reduce"``
-    # decline by name.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
+    # decline by name.  Typed (``d128_f16_accum_2cta.config.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
     warp_roles: "str | None" = None
     # The pair body's STATS FORM -- how the softmax gets each q tile's LSE / delta rows: "tma_ring" (``None`` = the same under the default role
     # shape; THE default since the day-4 measurement, +1.8 / +1.9 % at the step at 16K / 32K and +3.3 % on the graph replay against "ldg": the
@@ -81,9 +92,28 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # between the forms; the workspace carries the q-tile-padded pre-scaled stats for the LSE copy) | "ldg" (the previous default, selectable;
     # the form "16w_fa4" resolves to when unset: the softmax fetches them per tile with one global load per lane, scales, stores them into one
     # SMEM slab and fences the 8 warps with a named-barrier pair).  Perf-only; "tma_ring" NAMED declines by name under "16w_fa4"; served
-    # together with ``debug_clk``.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
+    # together with ``debug_clk``.  Typed (``d128_f16_accum_2cta.config.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
     # key carries it.
     stats_form: "str | None" = None
+    # The pair body's TMEM MAP, PART-KEYED -- "s_tail" (the dQ image in S^T's dead TMEM tail behind two LEADER barrier rows; the 512-column parts'
+    # rendering: ``None`` = the same on cc 10.0 / 10.3, byte-identical, pinned) | "dq_576" (the INDEPENDENT dQ image at TMEM columns [512, 576) of
+    # the 576-column carve, allocated exclusive on both CTAs; the two rows and their waits are gone, the image's reuse edge rides the epilogue's
+    # program order; selectable BY NAME on cc 10.7 only, NOT a default: the ceiling probe of the two rows read inside noise on cc 10.7 (2026-11-03),
+    # so the map is a neutral structural base for the two-stage staging arm and ``None`` = "s_tail" on every part until that arm's own row lands).
+    # Perf-only (dK / dV bitwise between the maps: the same accumulation chain per GEMM; dQ by the fp64 gate); SMEM and the
+    # workspace unchanged.  "dq_576" NAMED on a 512-column part is the engine's typed decline (NotImplementedError by name); under "16w_fa4" and
+    # with the three S-tail WAIT probes it declines by name too.  Typed (``d128_f16_accum_2cta.config.CFG.TMEM_MAPS``); read only on the
+    # 2-CTA route; the compile key carries it.
+    tmem_map: "str | None" = None
+    # The pair body's SMEM MAP, PART-KEYED -- "sm100" (the slab chain of the 232448-B opt-in cap: every part's rendering and default; ``None`` = the
+    # same, byte-identical, pinned) | "rubin_b2" (the 327 KiB oversized carveout of cc 10.7: sQ1 / sDO1 at two stages and the TWO-STAGE dS / exchange
+    # staging ring -- the epilogue stages dS(t) before it waits dQ(t-1) and the leader gates every dQ issue on the new LEADER row dq_read_done --
+    # 314368 B; selectable BY NAME on cc 10.7 together with ``tmem_map = "dq_576"`` under the default role shape and stats form; its A/B/A against
+    # "sm100" on that part measured a LOSS (2026-11-03, a Rubin class node: -2.5..-5.0 % step at 8K / 16K / 32K) -- no default flips).  Perf-only (dK / dV bitwise between the maps: the same
+    # accumulation chain per GEMM; dQ by the fp64 gate); the workspace unchanged.  "rubin_b2" NAMED on a 512-column part is the engine's typed decline
+    # (NotImplementedError by name); under "s_tail", "16w_fa4" or stats_form "ldg" it declines by name too.  Typed
+    # (``d128_f16_accum_2cta.config.CFG.SMEM_MAPS``); read only on the 2-CTA route; the compile key carries it.
+    smem_map: "str | None" = None
 
     def __init__(
         self,
@@ -152,16 +182,18 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     def _initialize_implementation(self):
         self._prepared = None
         self._implementation = None
+        self._pair_split = 1  # the pair's q-range split of the dK / dV kernel (d128_contract.pair_split)
         self._cta_pair = None  # the recorded per-S heuristic resolution (grouped THD only; prepared_sm100_d128_grouped_2cta.cta_pair_resolution)
 
     def _uses_grouped_heads(self):
         return self.q_desc.ndim == 4 and self.k_desc.ndim == 4 and self.q_desc.shape[1] != self.k_desc.shape[1]
 
-    def check_support(self):
-        if self._uses_grouped_heads():
-            from .prepared_sm100_d128_grouped_2cta import check_support_selected
+    def _pair_grouped(self):
+        return self._uses_grouped_heads() and bool(self.deterministic) and not self.thd
 
-            return check_support_selected(self)
+    def check_support(self):
+        if self._uses_grouped_heads() and not self._pair_grouped():
+            return self._check_grouped_implementation()
         from .d128_grouped_contract import DKV_ACCUM_DEFAULT, resolve_dkv_accum
         from .prepared_sm100_d128_grouped_2cta import cta_pair
 
@@ -181,7 +213,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
             raise NotImplementedError(f"{self._NAME}: ragged offsets require THD")
         from cudnn import _pybind_module
         from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
-        from cudnn.frost.device import compute_capability, resolve_device
+        from cudnn.frost.device import compute_capability, multiprocessor_count, resolve_device
         from .prepared import ROLES, _same_geometry
 
         def require(condition, reason):
@@ -192,7 +224,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
-        require(100 <= cc[0] * 10 + cc[1] <= 106, f"requires SM100-106; got {cc}")
+        require(DENSE_SM_RANGE[0] <= cc[0] * 10 + cc[1] <= DENSE_SM_RANGE[1], f"requires SM{DENSE_SM_RANGE[0]}-{DENSE_SM_RANGE[1]}; got {cc}")
         arch_error = cutedsl_arch_requirement_error(cc)
         require(arch_error is None, arch_error)
         binder = getattr(_pybind_module, "_SdpaBwdBinder", None)
@@ -214,7 +246,8 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         b, h, sq, d = self.q_desc.shape
         bk, hk, sk, dk = self.k_desc.shape
         require(d == dk and d in (64, 128), "D_QK and D_V must equal 64 or 128")
-        require(b == bk and h == hk, "Q and KV require equal batch and head counts (dense MHA)")
+        require(b == bk and hk > 0 and h % hk == 0, "Q and KV require equal batch counts and an integral head ratio")
+        require(h == hk or self.deterministic, "grouped heads take the dense route only under a deterministic request")
         try:
             validate_dense_bounds(b, h, sq, sk, self.window_size_left)
         except ValueError as error:
@@ -227,30 +260,59 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
                 require(tuple(desc.shape) == (b, h, sq, 1) and desc.dtype == torch.float32, "Stats must be FP32 (B, H, S_q, 1)")
                 require(desc.is_contiguous(), "Stats must be contiguous")
             else:
-                s = sk if role in ("k", "v", "dk", "dv") else sq
-                expected = (b, h, s, d)
+                kv = role in ("k", "v", "dk", "dv")
+                s = sk if kv else sq
+                expected = (b, hk if kv else h, s, d)
                 require(tuple(desc.shape) == expected and desc.dtype == self.dtype, f"{role} must have shape {expected} and Q's dtype")
-                require(_same_geometry((desc.shape, desc.stride), (expected, (s * h * d, d, h * d, 1))), f"{role} must use compact BSHD storage")
-        self.batch_size, self.h_q, self.h_kv = b, h, h
+                require(
+                    _same_geometry((desc.shape, desc.stride), (expected, (s * expected[1] * d, d, expected[1] * d, 1))), f"{role} must use compact BSHD storage"
+                )
+        self.batch_size, self.h_q, self.h_kv = b, h, hk
         self.s_q_max, self.s_k_max = sq, sk
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        window_in_envelope = self.window_size_left is None or (d == 64 and self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1)
-        self._implementation = (
-            RECOMPUTE
-            if self.deterministic or not window_in_envelope
-            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
-        )
+        self._implementation = self._choose_dense_implementation(cc, version)
+        require(h == hk or self._implementation == PAIR, "grouped deterministic backward requires the accumulation envelope on a measured part")
+        if self._implementation == PAIR:
+            masked = self.is_causal or self.window_size_left is not None
+            sms = 0 if masked else multiprocessor_count(resolve_device(self.q_desc.device))
+            self._pair_split = pair_split(int(b), int(hk), int(sk), int(sq), int(h) // int(hk), sms, masked)
         self._is_supported = True
         return True
 
-    def compile(self):
-        if self._uses_grouped_heads():
-            from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
+    def _choose_dense_implementation(self, cc, version):
+        from .d128_selection import default_dense_implementation
 
-            self._ensure_support_checked()  # resolves cta_pair and records the chosen body first
-            self._prepared = compile_plan_selected(self)
+        natural = select_implementation(
+            cc,
+            version,
+            int(self.batch_size),
+            int(self.h_q),
+            int(self.s_q_max),
+            int(self.s_k_max),
+            self.scale_softmax,
+            d_qk=int(self.head_dim_qk),
+            d_v=int(self.head_dim_v),
+        )
+        # Each kernel of the deterministic pair owns its output tiles. Outside
+        # its admitted parts and accumulation envelope, dense MHA uses recompute.
+        return default_dense_implementation(natural, cc, self.head_dim_qk, int(self.s_k_max), self.window_size_left, self.deterministic)
+
+    def _check_grouped_implementation(self):
+        from .prepared_sm100_d128_grouped_2cta import check_support_selected
+
+        return check_support_selected(self)
+
+    def _compile_grouped_implementation(self):
+        from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
+
+        return compile_plan_selected(self)
+
+    def compile(self):
+        if self._uses_grouped_heads() and not self._pair_grouped():
+            self._ensure_support_checked()
+            self._prepared = self._compile_grouped_implementation()
             self._compiled_kernel = self._prepared.artifact
             return
         if self.thd:
@@ -268,12 +330,14 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
 
     def scratch_workspace_bytes(self):
         self._ensure_support_checked()
-        if self.h_q != self.h_kv:
+        if self.h_q != self.h_kv and self._implementation != PAIR:
             return self._grouped_workspace_bytes
         if self.thd:
             return self._thd_workspace_bytes
         if self._implementation == ACCUMULATION:
             return workspace_layout(self.batch_size, self.h_q, self.s_q_max, self.head_dim_qk)[1]
+        if self._implementation == PAIR:
+            return pair_workspace_layout(self.batch_size, self.h_q, self.s_q_max, self._pair_split, self.h_kv, self.s_k_max, self.head_dim_qk)[1]
         return 0
 
     def execute(

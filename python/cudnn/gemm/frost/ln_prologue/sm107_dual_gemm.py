@@ -143,7 +143,7 @@ _LOG2_PASSES: int = _PASSES.bit_length() - 1  # the validator pins passes to a p
 matmul_b_batch = _PASSES
 _VALUE_BLOCK: int = 128  # value columns [0, 128) and gate columns [128, 256) of every 256-wide N tile
 _EPI_SUBTILES: int = _VALUE_BLOCK // epi_n  # 4 subtiles of 32 output channels per tile
-# The facts the arms stand on, checked against THIS rendering's constants (the K3 arm re-resolves the tile below, from the same base).
+# The facts the arms stand on, checked against THIS rendering's constants (the accumulators arm re-resolves the tile below, from the same base).
 if cta_group != 2 or cgrp_tile_mnk != (256, 256, 64) or cta_tile_mnk != (128, 128, 64) or cluster_shape_mnk != (2, 1, 1) or epi_dp22:
     raise ValueError(f"{__name__}: the LN-prologue dual GEMM is written for the cta_group::2 256x256x64 pair tile at cluster 2x1; re-render for another config")
 if cd_dtype is not cutlass.BFloat16 or ab_dtype is not cutlass.BFloat16 or epi_packed_lanes or mma_size_m != 1 or num_gemms != 1 or split_k_slices != 1:
@@ -180,7 +180,9 @@ if _DUAL:
     gemm_b_idx = (0, 1)
     ab_stages = (ab_stages * (A_STAGE_BYTES + B_STAGE_BYTES["columns"])) // (2 * A_STAGE_BYTES + 2 * B_STAGE_BYTES["accumulators"])
     if _K % cta_tile_mnk[2] != 0 or _NK > ab_stages:
-        raise ValueError(f"{__name__}: the K3 arm keeps every K stage of a tile resident: K={_K} must be a multiple of 64 and at most {64 * ab_stages}")
+        raise ValueError(
+            f"{__name__}: the accumulators arm keeps every K stage of a tile resident: K={_K} must be a multiple of 64 and at most {64 * ab_stages}"
+        )
 _A_LANDS_MN: tuple = tuple((i == 0 and PARAMS.a0_major == "mn") for i in range(num_a_operands))
 _A_MMA_MAJOR: tuple = tuple(1 if (_A_LANDS_MN[i] and not _A0_TRANSPOSE) else 0 for i in range(num_a_operands))
 _A_LBO: tuple = tuple(8192 if mj else a_smem_desc_leading_byte_offset for mj in _A_MMA_MAJOR)
@@ -368,9 +370,9 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     n: cutlass.Int64,
     k: cutlass.Int64,
     tma_a_desc_0: cutlass.GridConstant[_tma.TensorMap],
-    tma_a_desc_1: cutlass.GridConstant[_tma.TensorMap],  # K3: operand 1 (z rows); K1 passes operand 0's descriptor again (unused)
+    tma_a_desc_1: cutlass.GridConstant[_tma.TensorMap],  # accumulators arm: operand 1 (z rows); the columns arm passes operand 0's descriptor again (unused)
     tma_b_desc_0: cutlass.GridConstant[_tma.TensorMap],
-    tma_b_desc_1: cutlass.GridConstant[_tma.TensorMap],  # K3: the gate weights; K1 passes operand 0's descriptor again (unused)
+    tma_b_desc_1: cutlass.GridConstant[_tma.TensorMap],  # accumulators arm: the gate weights; the columns arm passes operand 0's descriptor again (unused)
     tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
     n_res: cutlass.Int32,  # inner row index extent (k < n_res is a valid row)
     bn: cutlass.Int32,  # outer row index extent (bi < bn)
@@ -379,12 +381,12 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     n_kb: cutlass.Int32,  # k blocks per bi row
     ln_w: cute.Tensor,  # [K] bf16 LayerNorm weight of operand 0
     ln_b: cute.Tensor,  # [K] bf16 LayerNorm bias of operand 0
-    ln_w1: Optional[cute.Tensor],  # [K] bf16 LayerNorm weight of operand 1 (K3); None in the single-operand arm
-    ln_b1: Optional[cute.Tensor],  # [K] bf16 LayerNorm bias of operand 1 (K3); None in the single-operand arm
+    ln_w1: Optional[cute.Tensor],  # [K] bf16 LayerNorm weight of operand 1 (accumulators arm); None in the single-operand arm
+    ln_b1: Optional[cute.Tensor],  # [K] bf16 LayerNorm bias of operand 1 (accumulators arm); None in the single-operand arm
     bias: Optional[cute.Tensor],  # [passes * 2 * c_out] bf16, interleaved like the weight rows; None iff not HAS_BIAS
     mask: Optional[cute.Tensor],  # [bn * n_res] bf16 per-row mask; None iff not HAS_MASK (every valid row counts as 1)
     stats: Optional[cute.Tensor],  # [bn * n_res * 2] fp32 (mean, rstd) of operand 0's LayerNorm; None iff not WANT_STATS
-    resid: Optional[cute.Tensor],  # [bn * n_res * c_out] bf16 pair-major residual added before the rounding (K3 fuse_residual); else None
+    resid: Optional[cute.Tensor],  # [bn * n_res * c_out] bf16 pair-major residual added before the rounding (accumulators arm, fuse_residual); else None
 ) -> None:
     tma_a_descs = [tma_a_desc_0, tma_a_desc_1][:num_a_operands]
     tma_b_descs = [tma_b_desc_0, tma_b_desc_1][:num_b_operands]
@@ -913,7 +915,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
                 # Locate this CTA's LayerNorm rows.
                 a_coord_k, a_coord_bi = _cta_box_origin(tile_m, n_kb, lkb, pair_member)
-                # K3 ARM: an MN-major operand lands as two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
+                # ACCUMULATORS ARM: an MN-major operand lands as two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
                 a_mn_k = []
                 a_mn_bi = []
                 for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
@@ -1752,7 +1754,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         ln_warp = warp_idx - ln_warp_base
         ln_lane = ln_tid & 31
         ln_swz = ln_tid & 7  # the SWIZZLE_128B chunk XOR of this row
-        _KOP = 1 if _DUAL else 0  # the K-MAJOR operand this thread normalises as a row: K3's operand 1 (z); K1's only operand
+        _KOP = 1 if _DUAL else 0  # the K-MAJOR operand this thread normalises as a row: the accumulators arm's operand 1 (z); the columns arm's only operand
         if cutlass.const_expr(_DUAL):
             _xw = (ln_tid >> 6) * 2048 + ((ln_tid & 63) >> 1)
             _xe = (ln_tid >> 6) * 4096 + (ln_tid & 63)
@@ -2342,11 +2344,11 @@ frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma.set_name_prefix("cudnn", remov
 @cute.jit
 def _host(
     geom: tuple,
-    a0: cute.Tensor,  # operand 0: K1 = z [bn * n_res * K] bf16 (pair-major rows); K3 = y [c * bn * n_pad] bf16 (channel-major, MN-major rows)
-    a1: Optional[cute.Tensor],  # operand 1 (K3): z [bn * n_res * K] bf16; None in the single-operand arm
-    w0: cute.Tensor,  # K1: [passes * 2 c_out * K] (per pass: rows interleaved per 128-channel block); K3: W_value [c_out * K]
-    w1: Optional[cute.Tensor],  # K3: W_gate [c_out * K]; None in the single-operand arm
-    out: cute.Tensor,  # K1: [passes * c_out * bn * n_pad] channel-major planes; K3: [bn * n_res * c_out] pair-major
+    a0: cute.Tensor,  # operand 0: columns arm = z [bn * n_res * K] bf16 (pair-major rows); accumulators arm = y [c * bn * n_pad] bf16 (channel-major, MN-major rows)
+    a1: Optional[cute.Tensor],  # operand 1 (accumulators arm): z [bn * n_res * K] bf16; None in the single-operand arm
+    w0: cute.Tensor,  # columns arm: [passes * 2 c_out * K] (per pass: rows interleaved per 128-channel block); accumulators arm: W_value [c_out * K]
+    w1: Optional[cute.Tensor],  # accumulators arm: W_gate [c_out * K]; None in the single-operand arm
+    out: cute.Tensor,  # columns arm: [passes * c_out * bn * n_pad] channel-major planes; accumulators arm: [bn * n_res * c_out] pair-major
     ln_w: cute.Tensor,
     ln_b: cute.Tensor,
     ln_w1: Optional[cute.Tensor],
@@ -2358,7 +2360,7 @@ def _host(
     stream: _cuda.CUstream,
 ) -> None:
     m_rows = geom[0]  # the caller's flat M: pair tiles x 256
-    n = geom[1]  # the GEMM N: K1 = 2 * c_out (value | gate interleaved), K3 = c_out per GEMM
+    n = geom[1]  # the GEMM N: columns arm = 2 * c_out (value | gate interleaved), accumulators arm = c_out per GEMM
     k_sym = geom[2]  # K
     batch = geom[3]  # passes
     # Select scheduler grid axes.
@@ -2382,7 +2384,7 @@ def _host(
             box_dims=[_MN_GROUP, 1, cta_tile_mnk[2]],
             swizzle=ab_tma_swizzle,
         )
-        # K3 operand 1: z viewed [bn][n_res][K] (channel, k, bi) -- the K-major box (64, kbc, rc) lands as the 128 x 64 stage (K1's A).
+        # accumulators arm, operand 1: z viewed [bn][n_res][K] (channel, k, bi) -- the K-major box (64, kbc, rc) lands as the 128 x 64 stage (the columns arm's A).
         tma_a_desc_1 = _tma.create_tensor_map_tiled(
             global_address=a1.iterator.toint(),
             dtype=ab_tma_dtype,
@@ -2422,7 +2424,7 @@ def _host(
     else:
         tma_b_desc_1 = tma_b_desc_0
     if cutlass.const_expr(_DUAL):
-        # C (K3): out viewed [bn][n_res][c_out] -- dims (channel, k, bi); the s64b box (32, kbc, rc) from the [128 rows][32 ch] swizzled staging.
+        # C (accumulators arm): out viewed [bn][n_res][c_out] -- dims (channel, k, bi); the s64b box (32, kbc, rc) from the [128 rows][32 ch] swizzled staging.
         tma_c_desc_0 = _tma.create_tensor_map_tiled(
             global_address=out.iterator.toint(),
             dtype=cutlass.BFloat16,

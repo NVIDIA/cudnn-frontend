@@ -23,6 +23,7 @@ import atexit
 import ctypes
 from dataclasses import dataclass
 import logging
+import numbers
 import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -30,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import cudnn
 from cudnn import _pybind_module
 
-from ._device import ensure_current_context
+from ._device import ensure_current_context, execution_context, execution_context_matches
 from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
@@ -80,6 +81,8 @@ atexit.register(_destroy_default_handles)
 
 
 _PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded", "adaptive"})
+# Integer python-only attributes whose 0 is the default (off): ``causal_exclude_own_block=0`` is plain causal.
+_PYTHON_ONLY_ZERO_OFF_ATTRS = frozenset({"causal_exclude_own_block"})
 
 
 def _python_only_attr_is_set(attr: str, value) -> bool:
@@ -92,6 +95,8 @@ def _python_only_attr_is_set(attr: str, value) -> bool:
         return False
     if attr in _PYTHON_ONLY_BOOL_ATTRS:
         return bool(value)
+    if attr in _PYTHON_ONLY_ZERO_OFF_ATTRS and isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value) != 0
     return True
 
 
@@ -163,6 +168,19 @@ def _in_axis_order_of(shape, stride, reference_stride):
     for rank, axis in enumerate(by_stride):
         permutation[reference[rank]] = axis
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
+
+
+def _nhwc_stride(dim):
+    """Mirror the C++ graph's packed NHWC output-layout inference."""
+    if len(dim) < 2:
+        return _row_major_stride(dim)
+    fastest_to_slowest = [1, *range(len(dim) - 1, 1, -1), 0]
+    stride = [0] * len(dim)
+    product = 1
+    for axis in fastest_to_slowest:
+        stride[axis] = product
+        product *= dim[axis]
+    return stride
 
 
 def _python_plan_deserialize_args(args: tuple, kwargs: Dict[str, Any]):
@@ -376,7 +394,7 @@ class pygraph:
             # recorded (engine_id, knobs) on a fresh graph.
             from .engines import manifest
 
-            engine = manifest.engine_for_id(engine_id)
+            engine = manifest.engine_for_id(engine_id, self)
             if engine is not None:
                 out.append(engine)
         return out
@@ -408,8 +426,9 @@ class pygraph:
         cuDNN backend serves the selected entry; otherwise ``.name`` is the
         engine's manifest name (``sdpa_fwd_prefill_sm100`` /
         ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
-        identifier -- manifest names and slots are append-only, never renamed
-        or reused -- so a caller may compare against one.
+        identifier for diagnostics and explicit selection. Execution capabilities
+        belong to the selected plan's ``get_behavior_notes()``; names do not
+        establish which runtime layouts or overrides a plan accepts.
         ``get_plan_name_at_index`` reports the same name with the plan's
         public knobs appended in brackets.
 
@@ -958,6 +977,25 @@ class pygraph:
         try:
             for node in self._nodes:
                 node.infer_properties(self._context)
+                if node.node_type == NodeType.CUSTOM_REDUCTION:
+                    reduction_dims = node.params["reduction_dims"]
+                    for i in range(node.params["_stream_count"]):
+                        input_tensor = node.inputs[f"X{i}"]
+                        output_tensor = node.outputs[f"Y{i}"]
+                        # The builder copied the input type. Copy it again, because the input type can change after
+                        # that, unless the caller set the output type.
+                        if not output_tensor.data_type_assigned and input_tensor.data_type is not None:
+                            output_tensor.data_type = input_tensor.data_type
+                        if not output_tensor.dim and input_tensor.dim:
+                            output_dim = list(input_tensor.dim)
+                            if all(0 <= dim < len(output_dim) for dim in reduction_dims):
+                                for dim in reduction_dims:
+                                    output_dim[dim] = 1
+                                output_tensor.dim = output_dim
+                        # The native node gets only an assigned stride and infers packed NHWC otherwise
+                        # (CustomReductionNode::infer_properties_node).
+                        if output_tensor.dim and not output_tensor.stride_assigned:
+                            output_tensor.stride = _nhwc_stride(output_tensor.dim)
                 # Table-driven shape inference, topologically: builder-time infer
                 # only sees graph-input dims; chained ops (e.g. conv on a virtual
                 # relu output) get their output dims here, once inputs are known.
@@ -1068,6 +1106,21 @@ class pygraph:
             return None
         facts = self._facts_for(analyzer)
         return None if facts is None else guard(self, facts)
+
+    def _backend_engine_exclusions(self) -> Dict[int, str]:
+        """Backend engines (global ids) a family keeps off this graph, each with the reason
+        (``manifest.EngineFamily.backend_engine_guard``). Planning drops their configs from the backend's list
+        (``backend_plan_entries``) and an explicit pin of one is a typed decline (``_append_backend_plan``)."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return {}
+        guard, analyzer = manifest.resolve_backend_engine_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return {}
+        facts = self._facts_for(analyzer)
+        return {} if facts is None else dict(guard(self, facts))
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
@@ -1242,7 +1295,7 @@ class pygraph:
         from .engines import manifest
 
         family = manifest.family_for(self)
-        if family is not None and family.offered_ids():
+        if family is not None and family.offered_ids(self):
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)
@@ -1284,7 +1337,7 @@ class pygraph:
         for node in self._nodes:
             if has_convolution and node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE and len(node.params.get("block_size") or ()) == 5:
                 return node
-            if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE):
+            if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE, NodeType.CUSTOM_REDUCTION):
                 continue
             spec_entry = _CAPTURED_BY_TYPE.get(node.node_type) or _STRUCTURED_BY_TYPE.get(node.node_type)
             if spec_entry is None:
@@ -1391,10 +1444,10 @@ class pygraph:
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
         # One entry per DISTINCT (engine, knobs). Graph::create_execution_plans
-        # checks override_heuristics_query() and returns before reading the mode
-        # -- deterministic SDPA backward and FP8 backward override -- so every
-        # per-mode call appends the same config. First index wins; it is the one
-        # whose mode span is real.
+        # enqueues a node's preferred config (INode::override_heuristics_query:
+        # the deterministic SDPA backward, half and FP8) ahead of each mode's
+        # configs, so every per-mode call appends it again. First index wins; it
+        # is the one whose mode span is real.
         entries, seen = [], set()
         for i in range(self._lowered_graph.get_execution_plan_count()):
             engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
@@ -1403,10 +1456,21 @@ class pygraph:
                 continue
             seen.add(key)
             entries.append(PlanConfig(engine_id, knobs, cpp_index=i, mode=self._mode_of_backend_plan(i)))
+        excluded = self._backend_engine_exclusions()
+        dropped = sorted({int(e.engine_id) for e in entries if int(e.engine_id) in excluded})
+        for engine in dropped:
+            _LOG.info("backend engine %d is not offered for this graph: %s", engine, excluded[engine])
+        entries = [e for e in entries if int(e.engine_id) not in excluded]
+        if dropped and not entries:
+            self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
-        if asked_oss or (not entries and self._lowered_graph.get_engine_count()):
+        # The delegating entry lets C++ pick from its own unfiltered list, so it would hand an excluded engine back:
+        # withheld whenever the guard dropped one.
+        if dropped and asked_oss:
+            _LOG.info("the OPENSOURCE delegating entry is withheld: its fallback list holds excluded engines %s", dropped)
+        if not dropped and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because
@@ -1542,7 +1606,11 @@ class pygraph:
         """The declared notes of a python plan; () for a backend entry, whose
         notes the backend owns and filters itself."""
         eng = self._engine_for(cfg)
-        return tuple(getattr(eng, f"{kind}_notes", ()) or ()) if eng is not None else ()
+        if eng is None:
+            return ()
+        if kind == "behavior":
+            return tuple(eng.get_behavior_notes(self, cfg) or ())
+        return tuple(getattr(eng, f"{kind}_notes", ()) or ())
 
     def _resolve_stream(self, handle: Any) -> Any:
         """Stream for a supplied handle (classic set_stream semantics). A failed
@@ -1726,6 +1794,9 @@ class pygraph:
         nor selected by the plain calls. Everything downstream therefore has to
         address it BY INDEX — which is why this returns one."""
         self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
+        reason = self._backend_engine_exclusions().get(int(engine_id))
+        if reason is not None:
+            raise cudnn_graph_not_supported(reason)
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})
@@ -1904,6 +1975,17 @@ class pygraph:
             return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index)
         return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
+    def get_context_size(self) -> int:
+        """Bytes of the selected plan's context: what a summary plan writes for the apply of the same tokens (a forward plan
+        for the backward), or what an apply plan reads; the caller allocates it like the workspace and passes it to
+        ``execute(context=...)`` of both.
+        0 for a plan without one (every backend plan)."""
+        if not self._is_built:
+            raise RuntimeError("Call build() first")
+        if self.selected_engine is not None:
+            return self._compiled_plans[self._plan_index].get_context_size()
+        return 0
+
     def get_workspace_size_plan_at_index(self, index: int, handle=None, override_uids=None, override_shapes=None, override_strides=None) -> int:
         """Workspace bytes for the plan at ``index`` in the ranked list."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
@@ -1976,11 +2058,11 @@ class pygraph:
         return (cfg.engine_id, dict(cfg.knobs) if cfg.knobs else {})
 
     def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
-        """Classic backend behaviour notes for the plan at ``index``.
+        """Declared behavior notes for this backend or Python plan.
 
-        Backend-only by construction: a python plan has no ``BehaviorNote_t``.
-        Saying so is better than forwarding the index and returning some other
-        plan's notes."""
+        Python engines answer for the graph and the indexed configuration;
+        capabilities are not inferred from an engine's name or provider.
+        """
         if not self._planning_done:
             return self._lowered_graph.get_behavior_notes_for_plan_at_index(index, *args, **kwargs)
         cfg = self._plans[self._check_plan_index(index)]
@@ -1992,8 +2074,11 @@ class pygraph:
         return self._lowered_graph.get_behavior_notes_for_plan_at_index(cfg.cpp_index, *args, **kwargs)
 
     def get_behavior_notes(self, *args, **kwargs):
-        """Classic behaviour notes for the SELECTED plan — backend-only, for the
-        same reason as the at-index query."""
+        """Declared behavior notes for the selected backend or Python plan.
+
+        Query after final plan selection when choosing an execution layout.
+        Absence of a capability note means the plan makes no such guarantee.
+        """
         eng = self.selected_engine
         if eng is not None:
             return list(self._notes_of(self._selected_plan_config, "behavior"))
@@ -2078,10 +2163,11 @@ class pygraph:
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             if tensor_uids is not None:
                 pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index)
+                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
             uid_to_data = self._uid_to_data(tensor_dict)
-            var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
+            var_pack, _ = self._native_var_pack(uid_to_data, None)
+            ws_ptr, ws_bytes = self._workspace_extent(workspace)
+            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         return self._execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, index=index, **kwargs)
 
@@ -2094,6 +2180,7 @@ class pygraph:
         override_shapes: Any = None,
         override_strides: Any = None,
         tensor_uids: Any = None,
+        context: Any = None,
     ) -> None:
         """Execute the selected plan.
 
@@ -2106,8 +2193,10 @@ class pygraph:
                          Must include both input and output tensors.
                          With ``tensor_uids``, a tuple/list of buffers instead.
                          No additional preparation call is required.
-            workspace: Workspace buffer (python engines receive it via the
-                       ExecutionContext; plans that need one require it)
+            workspace: Caller-owned contiguous scratch buffer. Its observed byte
+                       capacity must cover the selected plan's requirement for
+                       this call's shapes. Integer addresses have unknown capacity
+                       and remain the caller's responsibility.
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: runtime geometry for the backend or a
@@ -2120,8 +2209,14 @@ class pygraph:
                          auto-bound inputs. Metadata
                          is cached internally by value, while buffer observations,
                          workspace and the handle's stream remain per call.
+            context: the buffer of ``get_context_size()`` bytes a summary plan
+                     writes for the apply plan of the same tokens (a forward plan
+                     for the backward), or the one an apply plan reads; sized and
+                     owned like the workspace, kept between the two calls.  Python
+                     plans with one require it;
+                     every other plan rejects it.
         """
-        return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids)
+        return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids, context=context)
 
     def _execute(
         self,
@@ -2134,7 +2229,30 @@ class pygraph:
         tensor_uids=None,
         *,
         index=None,
+        context=None,
+        _context_bound=False,
     ):
+        h = handle if handle is not None else self._handle
+        if not _context_bound and isinstance(h, Handle):
+            stream, device = self._resolve_stream(h), h.device.ordinal
+            if not execution_context_matches(stream, device):
+                # Backend plans and Python plans share the handle's device and
+                # stream contract. Only a foreign/cold context takes this path;
+                # ordinary same-context calls keep their existing launch path.
+                with execution_context(stream, device):
+                    return self._execute(
+                        tensor_dict,
+                        workspace,
+                        handle,
+                        override_uids,
+                        override_shapes,
+                        override_strides,
+                        tensor_uids,
+                        index=index,
+                        context=context,
+                        _context_bound=True,
+                    )
+            _context_bound = True
         # Keep the caller's choice local across binding and launch. Temporarily
         # selecting/restoring an index lets overlapping callers run each other's
         # plan and can corrupt the selection left for ordinary execute().
@@ -2165,11 +2283,12 @@ class pygraph:
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
-            ensure_current_context(stream, h.device.ordinal if h is not None else None)
+            if not _context_bound:
+                ensure_current_context(stream, h.device.ordinal if h is not None else None)
             if index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
-                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
+                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context)
                 self._compiled_plans[index] = eng.build_plan(self, self._plans[index], ctx)
                 if not explicit_index:
                     self._is_built = True
@@ -2185,9 +2304,9 @@ class pygraph:
                 # A producer without the exchange protocol is observed once by
                 # the existing Python completion path, then uses the same plan.
                 pack = self._finish_ordered(schema, result, workspace, override_uids)
-                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace))
+                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context))
                 return
-            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
+            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context)
             # Overrides go INTO the pack rather than around it: they describe
             # what this execute runs, so an engine reading the pack agrees with
             # the backend without knowing they exist.
@@ -2210,6 +2329,8 @@ class pygraph:
                 plan.execute(self, uid_to_data, ctx)
             return
 
+        if context is not None:
+            raise ValueError("the backend's plans take no context (get_context_size() is 0); pass context= only to a python plan that reports one")
         variant_pack = None if ordered or overriding else self._normalize(uid_to_data, workspace)
 
         # Backend path. Address the plan the WALK built, not the backend's own
@@ -2237,7 +2358,11 @@ class pygraph:
                 return
             variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
-                variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
+                variant_pack.native,
+                variant_pack.workspace,
+                to_backend_handle(handle) or 0,
+                -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
@@ -2253,14 +2378,18 @@ class pygraph:
                 variant_pack.workspace,
                 to_backend_handle(handle) or 0,
                 -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
-        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        var_pack, _ = self._native_var_pack(uid_to_data, None)
+        ws_ptr, ws_bytes = self._workspace_extent(workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+            self._lowered_graph._execute_plan_at_index(
+                var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes
+            )
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
@@ -2351,6 +2480,14 @@ class pygraph:
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
         return workspace_ptr, _byte_size(workspace_tensor)
 
+    def _workspace_extent(self, workspace):
+        if workspace is None:
+            return 0, 0
+        extent = _pybind_module.read_buffer_extent(workspace)
+        # A byte count is a byte range only for dense storage. Fallback also
+        # preserves the unknown extent of a caller-sized integer pointer.
+        return self._workspace_extent_fallback(workspace) if extent is None else extent
+
     def _normalize_ordered(self, buffers, tensor_uids, workspace, override_uids=None, override_shapes=None, override_strides=None):
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
@@ -2440,15 +2577,7 @@ class pygraph:
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
-        workspace_ptr, workspace_bytes = 0, 0
-        if workspace is not None:
-            extent = _pybind_module.read_buffer_extent(workspace)
-            if extent is None:  # a bare address, a non-dense buffer, or no vtable
-                # An engine carves the workspace by byte offset, so a byte
-                # COUNT is only a byte RANGE when the buffer is dense.
-                workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
-            else:
-                workspace_ptr, workspace_bytes = extent
+        workspace_ptr, workspace_bytes = self._workspace_extent(workspace)
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
 
     def _declared_layout(self, order: List[int]):
@@ -2727,36 +2856,42 @@ class pygraph:
 
         tensor_map: Dict[int, Any] = {}
 
-        def lower_tensor(t: Tensor) -> Any:
-            if t.uid in tensor_map:
-                return tensor_map[t.uid]
-            if t.pass_by_value is not None and t.scalar_type is not None:
-                cpp = graph.tensor_scalar(t.pass_by_value, t.scalar_type)
-                cpp.set_uid(t.uid)
+        def tensor_lowerer(owner: Any) -> Any:
+            # Lowers IR tensors into `owner`, the C++ graph or a weak proxy to it.
+            def lower_tensor(t: Tensor) -> Any:
+                if t.uid in tensor_map:
+                    return tensor_map[t.uid]
+                if t.pass_by_value is not None and t.scalar_type is not None:
+                    cpp = owner.tensor_scalar(t.pass_by_value, t.scalar_type)
+                    cpp.set_uid(t.uid)
+                    tensor_map[t.uid] = cpp
+                    return cpp
+                mk_kwargs = dict(
+                    dim=t.dim,
+                    stride=t.stride,
+                    is_virtual=t.is_virtual,
+                    is_pass_by_value=t.is_pass_by_value,
+                    name=t.name,
+                    # Always propagate the IR uid so execute()'s variant pack (keyed
+                    # by IR uid) matches; otherwise cuDNN assigns its own and the
+                    # buffers never bind. IR uids are unique and positive.
+                    uid=t.uid,
+                )
+                if t.data_type is not None:  # else NOT_SET → cuDNN infers from the
+                    mk_kwargs["data_type"] = _library_type(t.data_type)  # graph intermediate default
+                if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
+                    mk_kwargs["reordering_type"] = t.reordering_type
+                if t.ragged_offset is not None:
+                    mk_kwargs["ragged_offset"] = lower_tensor(t.ragged_offset)
+                    if t.ragged_offset_multiplier not in (None, 1):  # non-default only
+                        mk_kwargs["ragged_offset_multiplier"] = t.ragged_offset_multiplier
+                cpp = owner._make_tensor(**mk_kwargs)
                 tensor_map[t.uid] = cpp
                 return cpp
-            mk_kwargs = dict(
-                dim=t.dim,
-                stride=t.stride,
-                is_virtual=t.is_virtual,
-                is_pass_by_value=t.is_pass_by_value,
-                name=t.name,
-                # Always propagate the IR uid so execute()'s variant pack (keyed
-                # by IR uid) matches; otherwise cuDNN assigns its own and the
-                # buffers never bind. IR uids are unique and positive.
-                uid=t.uid,
-            )
-            if t.data_type is not None:  # else NOT_SET → cuDNN infers from the
-                mk_kwargs["data_type"] = _library_type(t.data_type)  # graph intermediate default
-            if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
-                mk_kwargs["reordering_type"] = t.reordering_type
-            if t.ragged_offset is not None:
-                mk_kwargs["ragged_offset"] = lower_tensor(t.ragged_offset)
-                if t.ragged_offset_multiplier not in (None, 1):  # non-default only
-                    mk_kwargs["ragged_offset_multiplier"] = t.ragged_offset_multiplier
-            cpp = graph._make_tensor(**mk_kwargs)
-            tensor_map[t.uid] = cpp
-            return cpp
+
+            return lower_tensor
+
+        lower_tensor = tensor_lowerer(graph)
 
         def push_output_attrs(out_t: Tensor, cpp_t: Any) -> None:
             # Every attribute a user may set on an OP OUTPUT via the classic
@@ -2807,6 +2942,31 @@ class pygraph:
                 if node.compute_data_type is not None:
                     extra["compute_data_type"] = _library_type(node.compute_data_type)
                 cpp_out = getattr(graph, node.params["mode"])(*inputs, name=node.name, **extra)
+            elif node.node_type == NodeType.CUSTOM_REDUCTION:
+                stream_count = node.params["_stream_count"]
+                kwargs = dict(
+                    inputs=[tensor_map[node.inputs[f"X{i}"].uid] for i in range(stream_count)],
+                    # Keep the lowering adapter's graph reference weak while the native node retains the reducer.
+                    reducer=_custom_reduction_callback(node.params["reducer"], tensor_lowerer(weakref.proxy(graph))),
+                    reducer_semantic_key=node.params["reducer_semantic_key"],
+                    reduction_dims=node.params["reduction_dims"],
+                    identity_values=node.params["identity_values"],
+                    name=node.name,
+                )
+                compute_data_types = node.params.get("compute_data_types")
+                if compute_data_types is not None:
+                    kwargs["compute_data_types"] = [_library_type(data_type) for data_type in compute_data_types]
+                compute_data_type = node.params.get("compute_data_type")
+                if compute_data_type is not None:
+                    kwargs["compute_data_type"] = _library_type(compute_data_type)
+                cpp_outs = list(graph.custom_reduction(**kwargs))
+                if len(cpp_outs) != stream_count:
+                    raise RuntimeError(f"custom_reduction returned {len(cpp_outs)} outputs for {stream_count} input streams")
+                for i, cpp_t in enumerate(cpp_outs):
+                    out_t = node.outputs[f"Y{i}"]
+                    tensor_map[out_t.uid] = cpp_t
+                    push_output_attrs(out_t, cpp_t)
+                continue
             elif node.node_type in _CAPTURED_BY_TYPE:
                 # Captured op (sdpa family): rebuild the original kwargs —
                 # tensor ports (port == C++ kwarg) map through tensor_map,
@@ -2920,6 +3080,110 @@ class pygraph:
 
         self._cpp_tensors = tensor_map
         return graph
+
+
+class _CustomReductionOutput(Tensor):
+    """A custom-reduction output. validate() derives its type from the input type until the caller sets one."""
+
+    data_type_assigned = False
+
+    def set_data_type(self, dtype: Any) -> "Tensor":
+        super().set_data_type(dtype)
+        self.data_type_assigned = True
+        return self
+
+
+def _custom_reduction(
+    self,
+    inputs,
+    reducer,
+    reducer_semantic_key,
+    reduction_dims,
+    identity_values,
+    *,
+    compute_data_types=None,
+    compute_data_type=None,
+    name="",
+):
+    """Define a variadic reduction using a callback-built scalar subgraph.
+
+    ``reducer`` receives ``(child_graph, lhs, rhs)`` while the cuDNN
+    operation graph is built and must return one child tensor per
+    input stream. The child graph proxy is intended for callback-scoped graph
+    construction. A retained reference remains memory-safe, but do not edit
+    the child graph after the callback returns: the frontend does not check
+    such an edit, and the edit can reach the reducer body that cuDNN gets.
+    ``reducer_semantic_key`` participates in the graph key and must change
+    whenever callback behavior changes. ``compute_data_types`` sets one compute
+    type per stream and ``compute_data_type`` sets one type for every stream;
+    give at most one of them. With neither, each stream computes in its own type.
+    """
+    input_values = list(inputs)
+    identities = list(identity_values)
+    dimensions = list(reduction_dims)
+    compute_types = None if compute_data_types is None else list(compute_data_types)
+
+    if not input_values:
+        raise ValueError("custom_reduction requires at least one input stream")
+    if not callable(reducer):
+        raise TypeError("custom_reduction reducer must be callable")
+    if len(identities) != len(input_values):
+        raise ValueError("custom_reduction identity_values must contain one identity per input stream")
+    if compute_types is not None and len(compute_types) != len(input_values):
+        raise ValueError("custom_reduction compute_data_types must contain one type per input stream")
+    if compute_types is not None and compute_data_type is not None:
+        raise ValueError("custom_reduction takes compute_data_types or compute_data_type, not both")
+
+    name_ = self._get_name("custom_reduction", name)
+    node = Node(name_, NodeType.CUSTOM_REDUCTION)
+    node.params.update(
+        reducer=reducer,
+        reducer_semantic_key=reducer_semantic_key,
+        reduction_dims=dimensions,
+        identity_values=identities,
+        compute_data_types=compute_types,
+        compute_data_type=compute_data_type,
+        _stream_count=len(input_values),
+    )
+
+    outputs = []
+    for i, value in enumerate(input_values):
+        if value is None:
+            raise ValueError(f"custom_reduction input stream {i} is not set")
+        input_tensor = self._ensure_tensor(value, name=f"{name_}::X{i}")
+        node.inputs[f"X{i}"] = input_tensor
+
+        output = _CustomReductionOutput(name=f"{name_}::Y{i}", is_virtual=True, uid=self._alloc_uid())
+        output.data_type = input_tensor.data_type
+        if output.data_type is None:
+            output.data_type = self._context.intermediate_data_type if input_tensor.is_virtual else self._context.io_data_type
+        if input_tensor.dim and all(0 <= dim < len(input_tensor.dim) for dim in dimensions):
+            output.dim = list(input_tensor.dim)
+            for dim in dimensions:
+                output.dim[dim] = 1
+            output.stride = _nhwc_stride(output.dim)
+
+        node.outputs[f"Y{i}"] = output
+        self._register_tensor(output)
+        outputs.append(output)
+
+    self._nodes.append(node)
+    return outputs
+
+
+def _custom_reduction_callback(reducer, lower_tensor):
+    """_wrap_callback for a reducer, which can also return a captured parent tensor: lower the returned tensors too."""
+    wrapped = _wrap_callback(reducer, lower_tensor)
+
+    def callback(*args):
+        return [lower_tensor(value) if isinstance(value, Tensor) else value for value in wrapped(*args)]
+
+    return callback
+
+
+_custom_reduction.__name__ = "custom_reduction"
+_custom_reduction.__qualname__ = "pygraph.custom_reduction"
+setattr(pygraph, "custom_reduction", _custom_reduction)
 
 
 def _install_pointwise_builders() -> None:
@@ -3090,7 +3354,15 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
+    # capacity: ceil(L / n) rows per sequence for the pre-state series, floor(L / n) for the after-block series
+    slack = 0 if node.params.get("checkpoint_after_block") else cu[0] - 1
+    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + slack, 1), max(q[-2], v[-2]), v[-1], q[-1]]
+
+
+def _linear_attention_composed_state_dims(node):
+    """The one-row composed boundary state of a context-parallel forward: ``[1] + one row of preceding_state_update``."""
+    pre = node.inputs.get("preceding_state_update")
+    return [1] + list(pre.dim[1:]) if pre is not None and pre.dim else None
 
 
 def _linear_attention_o_dims(node):
@@ -3336,40 +3608,81 @@ _STRUCTURED_OPS = {
     # ---- linear attention ----------------------------------------------------
     "gdn": dict(
         node_type=NodeType.GDN,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "scale",
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
+            "output_context",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3393,7 +3706,16 @@ _STRUCTURED_OPS = {
     "gdn_summary": dict(
         node_type=NodeType.GDN_SUMMARY,
         inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "output_context",
+        ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
@@ -3402,7 +3724,18 @@ _STRUCTURED_OPS = {
     "gdn_summary_bwd": dict(
         node_type=NodeType.GDN_SUMMARY_BWD,
         inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
-        attrs=("output_transition", "scale", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
+        ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
@@ -3410,10 +3743,11 @@ _STRUCTURED_OPS = {
     ),
     "mamba2": dict(
         node_type=NodeType.MAMBA2,
-        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias", "d", "z", "state_indices"),
+        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias", "d", "z", "state_indices", "preceding_state_update", "preceding_transition"),
         attrs=(
             "output_final_state",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "dt_softplus",
             "dt_min",
             "dt_max",
@@ -3421,25 +3755,46 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
         ),
-        outputs=("O", "final_state", "state_checkpoints", "O_pre"),
+        outputs=("O", "final_state", "state_checkpoints", "O_pre", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
             "O_pre": lambda n: bool(n.params.get("output_pre_gate", False)) and "z" in n.inputs,
         },
         infer={
             "O": _linear_attention_o_dims,
             "final_state": _linear_attention_final_state_dims,
             "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
             "O_pre": _linear_attention_o_dims,
         },
         python_only=True,
     ),
     "mamba2_bwd": dict(
         node_type=NodeType.MAMBA2_BWD,
-        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "dt_bias", "d", "z", "O_pre"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "a",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "dt_bias",
+            "d",
+            "z",
+            "O_pre",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "dt_softplus",
             "dt_min",
             "dt_max",
@@ -3487,42 +3842,83 @@ _STRUCTURED_OPS = {
     ),
     "gdp": dict(
         node_type=NodeType.GDP,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "num_householder",
             "scale",
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
+            "output_context",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _gdp_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _gdp_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "gdp_bwd": dict(
         node_type=NodeType.GDP_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "num_householder",
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3546,7 +3942,17 @@ _STRUCTURED_OPS = {
     "gdp_summary": dict(
         node_type=NodeType.GDP_SUMMARY,
         inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("num_householder", "output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "num_householder",
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "output_context",
+        ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
@@ -3565,6 +3971,8 @@ _STRUCTURED_OPS = {
             "safe_gate",
             "gate_domain",
             "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -3573,12 +3981,26 @@ _STRUCTURED_OPS = {
     ),
     "kda": dict(
         node_type=NodeType.KDA,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "scale",
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3586,22 +4008,46 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "output_context",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3609,6 +4055,8 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3660,6 +4108,8 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -3668,12 +4118,27 @@ _STRUCTURED_OPS = {
     ),
     "gdn2": dict(
         node_type=NodeType.GDN2,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "w",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "scale",
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "beta_guard",
@@ -3682,22 +4147,47 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "output_context",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "w",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "beta_guard",
@@ -3706,6 +4196,8 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3760,6 +4252,8 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -4157,13 +4651,23 @@ _CAPTURED_OPS = {
         # The same two op attributes as "sdpa".  Without this entry a SET
         # softmax_precision would be forwarded to the C++ sdpa_mxfp8 (which has
         # no such argument) instead of keeping the node on the python engines.
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
+        # ``causal_exclude_own_block`` (int block size, None = off): the causal
+        # mask also drops the query's own aligned block of that many keys, so
+        # query i reads keys j < B * floor(i / B) only (rows 0 .. B-1 read none:
+        # O = 0, Stats = -inf, the FROST empty-row contract).  With B = 32, the
+        # MXFP8 V scale block, every V scale the kernel reads covers fully
+        # visible tokens only: the completed-block half of causal MXFP8
+        # attention whose PV stays MXFP8 (NVIDIA/TransformerEngine#3248); the
+        # caller adds the query's own block separately.  Numerics-changing,
+        # hence an op attribute; the backend has no field for it.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
+        # forward-only, see "sdpa_backward" and "sdpa_mxfp8"
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         pos=(
             "q",
             "q_T",

@@ -52,6 +52,26 @@ def fmax_f32(a, b, *, loc=None, ip=None):
     return Float32(result)
 
 
+def _target_lacks_redux_f32() -> bool:
+    """Whether the compile target cannot assemble ``redux.f32``: sm_110a (#1686) and sm_120a / sm_121a."""
+    from cudnn._cutlass_helpers.warp_reduce import target_needs_shuffle_amax
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    return target_needs_shuffle_amax() or int(CuTeDSL._get_dsl().get_arch_enum().major) == 12
+
+
+@cute.jit
+def _warp_fmax(value):
+    """Full-warp FP32 max: one ``redux.sync.max.f32`` where the target has it, else a five-step butterfly of ``max.f32``.
+    Both keep this kernel's ``max.f32`` semantics (no NaN propagation) and leave the result on every lane."""
+    if cutlass.const_expr(_target_lacks_redux_f32()):
+        for shift in cutlass.range_constexpr(5):
+            value = fmax_f32(value, shuffle_sync_bfly(value, offset=1 << shift))
+    else:
+        value = cute.arch.warp_redux_sync(value, "fmax")
+    return value
+
+
 @cute.jit
 def _row_tile(m: cute.Tensor, row: Int32, n: cutlass.Constexpr):
     """Row ``row`` of a compact row-major ``(M, n)`` tensor as a ``(1, n)`` tile (``m``'s own strides are not read).
@@ -231,7 +251,7 @@ class RMSNormRHTAmaxKernel:
             if row_idx < cfg.rows_per_cta - 1:
                 cute.arch.cp_async_wait_group(0)
 
-        warp_max = cute.arch.warp_redux_sync(running_max, "fmax")
+        warp_max = _warp_fmax(running_max)
         if lane_id == 0:
             amax_buffer[0, warp_id] = warp_max
         cute.arch.barrier()
@@ -239,7 +259,7 @@ class RMSNormRHTAmaxKernel:
         amax_val = cutlass.Float32(0.0)
         if lane_id < cfg.warps_per_row:
             amax_val = amax_buffer[0, lane_id]
-        cta_max = cute.arch.warp_redux_sync(amax_val, "fmax")
+        cta_max = _warp_fmax(amax_val)
         if tid == cutlass.Int32(0):
             m_amax[bid] = cta_max
 

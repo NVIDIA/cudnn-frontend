@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``sdpa_bwd_sm100``: the SM100 large-head-dim backward chain.
+"""The explicit SM100 D512 half owners and their shared backward chain.
 
 Every capability the row claims gets an ACCEPT test that runs the kernel against
 a torch reference, and every capability it declines gets a REJECT test that
@@ -26,7 +26,7 @@ import cudnn
 
 pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
-_ENGINE = "sdpa_bwd_sm100"
+_ENGINE = "sdpa_bwd_sm100_d512_role_split"
 _D = 512
 _TOL_COS = 0.9999
 _TOL_REL = 2e-2
@@ -104,7 +104,7 @@ def _reference(q, k, v, do, keep=None, group=1, scale=None):
     return o, lse, all_masked, dq, dk_q, dv_q
 
 
-def _build_graph(b, hq, hkv, sq, skv, d, scale, dt=torch.bfloat16, **sdpa_kwargs):
+def _build_graph(b, hq, hkv, sq, skv, d, scale, dt=torch.bfloat16, record=None, **sdpa_kwargs):
     io = _io_dtype(dt)
     g = cudnn.pygraph(
         io_data_type=io,
@@ -122,11 +122,15 @@ def _build_graph(b, hq, hkv, sq, skv, d, scale, dt=torch.bfloat16, **sdpa_kwargs
         out.set_output(True).set_data_type(io).set_stride(_bshd_stride(sh))
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        g.create_execution_plan(*record)
     return g, t, (dq, dk, dv)
 
 
-def _plan_index(g, name=_ENGINE):
+def _plan_index(g, name=None):
+    name = _ENGINE if name is None else name
     for i in range(g.get_execution_plan_count()):
         if name in g.get_plan_name_at_index(i):
             return i
@@ -188,11 +192,8 @@ _TWIN_WATCHDOG_S = 900.0
 
 @pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
 def stage2_datapath(request, monkeypatch):
-    """Both stage-2 datapaths of the chain: the cga4x1 role split (``bprop_d512_f16.py``, what ships) and the fused
-    2x2 twin (``bprop_d512_f16_2x2.py``, ``api_dsl.STAGE2_2X2``).  The twin is a module constant read at compile()
-    time, so flipping it here reaches every plan the test builds; the 4x1 arm runs with the constant at its default
-    (not merely unpatched) so the pair is a real A/B.  A spy on ``load_template`` records which stage-2 FILE served
-    the plan -- the two kernels share a symbol name, so the file is the only honest witness.
+    """Both explicit stage-2 owners, with the legacy switch opposing the selected body.
+    A spy on ``load_template`` records the file actually compiled for each plan.
 
     The 2x2 arm runs under a process watchdog (a wedged launch cannot be ended from Python): the twin's first wait form
     hung under GPU time-slicing (kernel docstring); the shipped form polls the cross-pair ring barriers and ran 12 fresh
@@ -204,21 +205,23 @@ def stage2_datapath(request, monkeypatch):
 
     from cudnn.sdpa.bwd import api_dsl
 
-    monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
+    owner = "sdpa_bwd_sm100_d512_2x2" if request.param else "sdpa_bwd_sm100_d512_role_split"
+    monkeypatch.setitem(globals(), "_ENGINE", owner)
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not request.param)
     served = []
     original = api_dsl.load_template
 
     def spy(path, params, tag="template"):
-        if tag == "sdpa_bwd_sm100_stage2":
-            served.append(path.rsplit("/", 1)[-1])
+        if tag == owner + "_stage2":
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
     guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
     with guard:
         yield request.param
-    want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
-    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
+    want = api_dsl._SM100_STAGE2_FILE_2X2 if request.param else api_dsl._SM100_STAGE2_FILE
+    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (owner={owner})"
 
 
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
@@ -555,8 +558,8 @@ def test_reject_bias():
     assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
-def test_reject_deterministic():
-    assert _decline_reason(use_deterministic_algorithm=True) is not None
+def test_accept_deterministic():
+    assert _decline_reason(use_deterministic_algorithm=True) is None
 
 
 def test_reject_padding_mask():
@@ -665,7 +668,7 @@ def test_unserved_band_graph_declines_as_not_supported():
 
     Regression test for the error TYPE, not the message. The C++ node admits
     d in (256, 512] so the FROST engine can claim it, but a graph in the band
-    that NO engine serves (here: deterministic, which this row declines and the
+    that NO engine serves (here: an ALiBi mask, which this row declines and the
     backend has no plan for) used to reach plan build via
     `override_heuristics_query()`, which pins a backend engine id and bypasses
     the heuristics query entirely. That pinned config then failed to finalize
@@ -680,7 +683,7 @@ def test_unserved_band_graph_declines_as_not_supported():
     """
     b, hq, sq, skv = 2, 2, 256, 256
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g = _build_graph_only(b, hq, hq, sq, skv, _D, 1.0 / math.sqrt(_D), use_deterministic_algorithm=True)
+        g = _build_graph_only(b, hq, hq, sq, skv, _D, 1.0 / math.sqrt(_D), use_alibi_mask=True)
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         g.check_support()
         g.build_plans()
@@ -708,8 +711,47 @@ def test_capabilities_match_what_is_implemented():
     assert not c.cu_seq_len, "sdpa_backward has no cu_seq_len_* port; no row can claim or test it"
     assert not c.padded, "DENSE padding masks: the kernel compiles a scalar length; THD carries its own"
     assert not c.bias and not c.dbias and not c.sink and not c.dsink
-    assert not c.deterministic
+    assert c.deterministic, "the chain has no atomics; a deterministic request is served as is"
     assert c.sm_lo == 100 and c.sm_hi == 103
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize(
+    "hq,hkv,causal,bottom_right", [(2, 2, False, False), (4, 2, True, False), (4, 1, True, True)], ids=["mha", "gqa-causal", "mqa-bottom-right"]
+)
+def test_deterministic_request_is_bitwise_across_launches(hq, hkv, causal, bottom_right, stage2_datapath):
+    """Under ``use_deterministic_algorithm=True`` three launches over poisoned outputs return identical bits."""
+    b, sq, skv, dt = 2, 384, 640, torch.bfloat16
+    q, do = _bshd(b, sq, hq, _D, dt=dt), _bshd(b, sq, hq, _D, dt=dt)
+    k, v = _bshd(b, skv, hkv, _D, dt=dt), _bshd(b, skv, hkv, _D, dt=dt)
+    keep = _causal_keep(sq, skv, bottom_right=bottom_right) if causal else None
+    o_ref, lse, all_masked, *_ = _reference(q, k, v, do, keep, hq // hkv)
+    o = _bshd(b, sq, hq, _D, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
+    kw = dict(use_causal_mask=causal and not bottom_right, use_causal_mask_bottom_right=bottom_right, use_deterministic_algorithm=True)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, _D, 1.0 / math.sqrt(_D), dt=dt, **kw)
+    idx = _plan_index(g)
+    assert idx is not None
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    dq, dk, dv = _bshd(b, sq, hq, _D, dt=dt, fill=False), _bshd(b, skv, hkv, _D, dt=dt, fill=False), _bshd(b, skv, hkv, _D, dt=dt, fill=False)
+    pack = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, dq_t: dq, dk_t: dk, dv_t: dv}
+    bits = None
+    for fill in (0xA5, 0x00, 0xFF):
+        ws.fill_(fill)
+        for out in (dq, dk, dv):
+            out.fill_(float("nan"))
+        g.execute(pack, ws)
+        torch.cuda.synchronize()
+        current = [out.clone() for out in (dq, dk, dv)]
+        assert all(torch.isfinite(c.float()).all() for c in current)
+        if bits is None:
+            bits = current
+        for name, a, c in zip(("dQ", "dK", "dV"), bits, current):
+            assert torch.equal(a.view(torch.int16), c.view(torch.int16)), f"{name}: changed across identical deterministic executions"
 
 
 def test_engine_is_registered_and_offered_by_default():
@@ -717,7 +759,7 @@ def test_engine_is_registered_and_offered_by_default():
 
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
-    # The cuDNN backend has no SM100 engine for d in (256, 512], so this row is the only provider there.
+    # The explicit D512 owners retain ordinary discovery for d in (256, 512].
     assert not fam.slots[_ENGINE].opt_in
 
 
@@ -874,6 +916,68 @@ def test_prepared_sm100_execute_has_no_tensor_wrapping(causal, hkv, monkeypatch)
     _check_prepared(case)
 
 
+@pytest.mark.parametrize("twin", [False, True], ids=["role_split", "2x2"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_fixed_d512_standalone_rebind_and_replay(twin, dtype, causal, monkeypatch):
+    """A fixed host keeps its body under the opposite legacy switch and rebinds current storage."""
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+    case = _prepared_case(dtype=dtype, causal=causal, hkv=2)
+    Adapter = SdpaBwdDslSm100D512TwoByTwo if twin else SdpaBwdDslSm100D512RoleSplit
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not twin)
+    served, original = [], api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == Adapter._STAGE2_TAG:
+            served.append(path.rsplit("/kernels/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    api = Adapter(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=causal, scale_softmax=512**-0.5)
+    assert api.check_support()
+    api.compile()
+    assert served == ["sm100/d512_f16_2x2/kernel.py" if twin else "sm100/d512_f16_role_split/kernel.py"]
+    tensors = {name: value.clone() for name, value in case.tensors.items()}
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+
+    def refresh():
+        tensors["q"].mul_(0.75)
+        tensors["do"].mul_(1.25)
+        o, stats, _, dq, dk, dv = _reference(*(tensors[name] for name in ("q", "k", "v", "do")), case.keep, case.group)
+        tensors["o"].copy_(o)
+        tensors["stats"].copy_(stats.unsqueeze(-1))
+        for name in ("dq", "dk", "dv"):
+            tensors[name].fill_(float("nan"))
+        workspace.fill_(0xBD)
+        return dq, dk, dv
+
+    def execute():
+        api.execute(**{name + "_tensor": value for name, value in tensors.items()}, workspace=workspace)
+
+    expected = refresh()
+    execute()
+    _check_prepared(case, tensors, expected)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            execute()
+        expected = refresh()
+        capture.replay()
+        _check_prepared(case, tensors, expected)
+        first = [tensors[name].clone() for name in ("dq", "dk", "dv")]
+        for name in ("dq", "dk", "dv"):
+            tensors[name].fill_(float("nan"))
+        workspace.fill_(0xBD)
+        capture.replay()
+        for name, want in zip(("dq", "dk", "dv"), first):
+            assert torch.equal(tensors[name].view(torch.int16), want.view(torch.int16)), name
+    finally:
+        capture.reset()
+
+
 @pytest.mark.parametrize("stride", [2**32 + 512, 2**30 + 512])
 @pytest.mark.parametrize("hkv", [4, 2])
 def test_prepared_sm100_retains_strided_stats_decline(stride, hkv):
@@ -948,7 +1052,7 @@ def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_p
 @pytest.mark.parametrize("route", ["dense_2x2", "thd_2x2"])
 def test_prepared_backward_artifact_reloads_in_fresh_process_2x2(route, tmp_path):
     """The twin's artifact (its own template digest, so its own cache entry) exports and reloads in a second process
-    with JIT forbidden; the child flips ``api_dsl.STAGE2_2X2`` before building the plan."""
+    with JIT forbidden; the child selects the explicit 2x2 owner with the legacy switch opposing it."""
     from prepared_bwd_cache_utils import check_backward_artifact_reload
 
     check_backward_artifact_reload("sm100", route, "bfloat16", tmp_path)
@@ -1093,7 +1197,7 @@ def test_stage2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     dump.mkdir()
     script = dump / "ptx_probe.py"
     script.write_text(_STAGE2_PTX_PROBE)
-    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/bprop_d512_f16.py", twin=False)
+    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/d512_f16_role_split/kernel.py", twin=False)
     proc = _subprocess.run([_sys.executable, str(script), str(dump), "sm_100a", _json.dumps(kw)], capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"sm_100a trace-compile of the 4x1 stage-2 {record} rendering failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CLUSTER_Q_ROWS", "DESC_VERSION")))
@@ -1165,7 +1269,7 @@ def test_stage2_2x2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     All debug levers are off; the armed-lever test below checks that instrumentation renders different code.
     Host trace-compile for sm_100a, no device."""
     want = _stage2_2x2_md5_want(record)
-    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True)
+    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True)
     got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_{record}", kw)
     assert out["CLUSTER_Q_ROWS"] == "256" and out["N_CHUNKS"] == "8"
     print(f"\nSM100 stage-2 2x2 {record}: PTX md5 {got} (record {want})")
@@ -1178,7 +1282,7 @@ def test_stage2_2x2_debug_clk_lever_renders_code(tmp_path, record):
     accumulators and the exit dump are real code), so a lever that leaked into the default rendering would trip the md5
     pin rather than ride along unnoticed."""
     want = _stage2_2x2_md5_want(record)
-    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
+    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
     got, _out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_clk_{record}", kw)
     assert got != want, f"{record}: the armed debug_clk lever rendered the SAME PTX as the default -- the lever traces no code"
 
@@ -1193,7 +1297,7 @@ def test_stage2_2x2_debug_clk_dump_accounts_the_waits(monkeypatch):
     from cuda.bindings import driver as cu
 
     from cudnn.sdpa.bwd import api_dsl
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16_2x2 as K2
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2 import kernel as K2
 
     b, hq, hkv, sq, skv, d, dt = 1, 4, 4, 1024, 1024, _D, torch.bfloat16
     torch.manual_seed(2026)
@@ -1214,7 +1318,7 @@ def test_stage2_2x2_debug_clk_dump_accounts_the_waits(monkeypatch):
     original = api_dsl.load_template
 
     def armed(path, params, tag="template"):
-        if tag == "sdpa_bwd_sm100_stage2":
+        if tag == "sdpa_bwd_sm100_d512_2x2_stage2":
             params = dataclasses.replace(params, **levers)
         return original(path, params, tag)
 
@@ -1274,7 +1378,9 @@ def test_stage2_4x1_debug_clk_lever_renders_code(tmp_path, record):
     have = " ".join(version) if version else None
     if dsl is not None and have != dsl:
         pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}")
-    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/bprop_d512_f16.py", twin=False, dbg=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
+    kw = dict(
+        _STAGE2_4X1_RECORDS[record], kernel_file="sm100/d512_f16_role_split/kernel.py", twin=False, dbg=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR
+    )
     got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_4x1_clk_{record}", kw)
     assert out["CLUSTER_Q_ROWS"] == "256"
     assert got != want[record], f"{record}: the armed 4x1 debug_clk lever rendered the SAME PTX as the shipped kernel -- the lever traces no code"
@@ -1292,7 +1398,7 @@ def test_stage2_4x1_debug_clk_dump_accounts_the_waits(monkeypatch):
 
     from cudnn.sdpa.bwd import api_dsl
     from cudnn.sdpa.bwd import config_sm100 as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16 as K1
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split import kernel as K1
 
     b, hq, hkv, sq, skv, d, dt = 1, 4, 4, 1024, 1024, _D, torch.bfloat16
     torch.manual_seed(2027)
@@ -1312,7 +1418,7 @@ def test_stage2_4x1_debug_clk_dump_accounts_the_waits(monkeypatch):
     original = api_dsl.load_template
 
     def armed(path, params, tag="template"):
-        if tag == "sdpa_bwd_sm100_stage2":
+        if tag == "sdpa_bwd_sm100_d512_role_split_stage2":
             params = cfgmod.TemplateParamsDbg(**dataclasses.asdict(params), debug_clk=1, debug_dump_addr=int(dp))
         return original(path, params, tag)
 
@@ -1357,22 +1463,23 @@ def test_stage2_4x1_debug_clk_dump_accounts_the_waits(monkeypatch):
 
 
 def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **sdpa_kwargs):
-    """Build + pin + execute with ``STAGE2_2X2 = twin``; return int16 views of dQ / dK / dV and of the S / dS workspace
+    """Build + pin + execute the explicit owner; return int16 views of dQ / dK / dV and of the S / dS workspace
     regions, plus the stage-2 file that served the plan."""
     from cudnn.sdpa.bwd import api_dsl
 
-    monkeypatch.setattr(api_dsl, "STAGE2_2X2", twin)
+    owner = "sdpa_bwd_sm100_d512_2x2" if twin else "sdpa_bwd_sm100_d512_role_split"
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not twin)
     served = []
     original = api_dsl.load_template
 
     def spy(path, params, tag="template"):
-        if tag == "sdpa_bwd_sm100_stage2":
-            served.append(path.rsplit("/", 1)[-1])
+        if tag == owner + "_stage2":
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
     g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, 1.0 / math.sqrt(d), dt=dt, **sdpa_kwargs)
-    idx = _plan_index(g)
+    idx = _plan_index(g, name=owner)
     assert idx is not None
     g.select_plan(idx)
     g.check_support()
@@ -1404,7 +1511,7 @@ def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **s
     delta = align(b * hq * (-(-sq // 128) * 128) * 4)
     region = align(b * qh_chunk * sq_pad * skv_pad * 2)
     s_ws, ds_ws = ws[delta : delta + region].clone(), ws[delta + region : delta + 2 * region].clone()
-    assert served == ["bprop_d512_f16_2x2.py" if twin else "bprop_d512_f16.py"], served
+    assert served == ["sm100/d512_f16_2x2/kernel.py" if twin else "sm100/d512_f16_role_split/kernel.py"], served
     return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)] + [s_ws, ds_ws]
 
 
@@ -1702,7 +1809,7 @@ def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
 
     masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256), "thd": dict(thd_varlen=True)}
-    params = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, **masks[arm])
+    params = dict(dtype_qkv=2, kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True, **masks[arm])
     if arch == "sm_107a":
         params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
     st, expect = _stage2_sass_probe(tmp_path, arch, params, tag=f"stage2_2x2_{arm}")
@@ -1735,11 +1842,12 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
     import torch
     import cudnn
     from cudnn.sdpa.bwd import api_dsl
-    api_dsl.STAGE2_2X2 = role == "twin"
+    owner = "sdpa_bwd_sm100_d512_2x2" if role == "twin" else "sdpa_bwd_sm100_d512_role_split"
+    api_dsl.STAGE2_2X2 = role != "twin"
     if levers:
         _orig = api_dsl.load_template
         def _load(path, params, tag="template"):
-            if tag == "sdpa_bwd_sm100_stage2":
+            if tag == owner + "_stage2":
                 params = dataclasses.replace(params, **levers)
             return _orig(path, params, tag)
         api_dsl.load_template = _load
@@ -1760,7 +1868,7 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
     for out in (tdq, tdk, tdv):
         out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(st_)
     g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])
-    idx = next(i for i in range(g.get_execution_plan_count()) if "sdpa_bwd_sm100" in g.get_plan_name_at_index(i))
+    idx = next(i for i in range(g.get_execution_plan_count()) if owner in g.get_plan_name_at_index(i))
     g.select_plan(idx); g.check_support(); g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     feed = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, tdq: dq, tdk: dk, tdv: dv}
@@ -1835,7 +1943,7 @@ def test_stage2_2x2_waits_for_delayed_empty_observer(tmp_path):
     """All CTA observers gate reuse, including a follower that does not issue this chunk's TMA."""
     from frost_test_utils import run_d512_delayed_observer
 
-    run_d512_delayed_observer(tmp_path, _ENGINE)
+    run_d512_delayed_observer(tmp_path, "sdpa_bwd_sm100_d512_2x2")
 
 
 # --------------------------------------------------------------------------- #
@@ -2093,7 +2201,7 @@ def test_ring_drain_walks_every_used_slot(stages):
     ``range_constexpr(STAGES_*)`` loop; the source pin below keeps the residual rule from coming back."""
     import inspect
 
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16_2x2 as K2
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2 import kernel as K2
 
     for total in range(0, 2 * stages + 2):
         assert not _ring_drain_model(total, stages, stages), f"total={total}: the full-ring walk left releases un-awaited"

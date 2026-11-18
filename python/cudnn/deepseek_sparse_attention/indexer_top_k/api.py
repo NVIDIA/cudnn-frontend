@@ -234,7 +234,7 @@ class IndexerTopK(APIBase):
             major < 9,
             f"IndexerTopK requires SM90+ compute capability, found SM{major}",
         )
-        if self.deterministic and (major, minor) == (12, 0):
+        if self.deterministic and (major, minor) in ((12, 0), (12, 1)):
             max_num_cols = _SM120_DETERMINISTIC_MAX_NUM_COLS[self.input_desc.dtype]
             self._runtime_error_if(
                 num_cols > max_num_cols,

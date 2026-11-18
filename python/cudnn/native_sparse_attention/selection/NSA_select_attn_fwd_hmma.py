@@ -811,12 +811,19 @@ class HopperSelectAttentionFwd:
             # predicates for GQA_group_size
             cLM = cute.make_identity_tensor((16, 1))
             cLM_thr = tiled_mma_QK.get_slice(tidx).partition_C(cLM)
+            # Selection is block-granular, so keys are masked at token level from
+            # key_end on. Without causal masking, key_end is the sequence length:
+            # the last block of a sequence whose length is not a multiple of
+            # block_size is partial, and the rest of its tile holds the next
+            # sequence's rows (or TMA zero fill past the end of K/V). With causal
+            # masking it is t + 1, which also masks the future tokens of the
+            # selected block that contains the current query.
+            cQK = cute.make_identity_tensor((16, self.block_size))
+            cQK_thr = tiled_mma_QK.get_slice(tidx).partition_C(cQK)
+            cQK_mn = self._make_acc_tensor_mn_view(cQK_thr)
+            key_end = seq_len
             if cutlass.const_expr(self.causal_within_selected_blocks):
-                # Selection is block-granular, so a selected block containing the
-                # current query still needs token-level causal masking.
-                cQK = cute.make_identity_tensor((16, self.block_size))
-                cQK_thr = tiled_mma_QK.get_slice(tidx).partition_C(cQK)
-                cQK_mn = self._make_acc_tensor_mn_view(cQK_thr)
+                key_end = t + 1
             gL_thr = tiled_mma_QK.get_slice(tidx).partition_C(gL)
             gM_thr = tiled_mma_QK.get_slice(tidx).partition_C(gM)
 
@@ -908,17 +915,15 @@ class HopperSelectAttentionFwd:
                 row_max_prev = cute.make_fragment_like(row_max, cutlass.Float32)
                 if is_not_first_n_block:  # not first n block
                     cute.basic_copy(row_max, row_max_prev)
-                if cutlass.const_expr(self.causal_within_selected_blocks):
-                    current_block = sIDX[K_tile_cnt - 1 - K_tile]
+                current_block = sIDX[K_tile_cnt - 1 - K_tile]
                 for r in cutlass.range_constexpr(cute.size(gL_thr.shape[0][1])):
                     if cute.elem_less(cLM_thr[(0, r), 0, 0][0], self.GQA_group_size):
                         # Mask scaled logits: scaling -inf by zero or a
                         # negative value would create NaN or +inf.
                         acc_QK_mn[r, None] = acc_QK_mn[r, None].load() * softmax_scale
-                        if cutlass.const_expr(self.causal_within_selected_blocks):
-                            for c in cutlass.range_constexpr(cute.size(acc_QK_mn, mode=[1])):
-                                if current_block * self.block_size + cQK_mn[r, c][1] > t:
-                                    acc_QK_mn[r, c] = -cutlass.Float32.inf
+                        for c in cutlass.range_constexpr(cute.size(acc_QK_mn, mode=[1])):
+                            if current_block * self.block_size + cQK_mn[r, c][1] >= key_end:
+                                acc_QK_mn[r, c] = -cutlass.Float32.inf
                         acc_QK_row = acc_QK_mn[r, None].load()
                         row_max_cur_row = acc_QK_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
                         row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row, mask=(1 << self.GQA_group_size) - 1)
@@ -929,11 +934,12 @@ class HopperSelectAttentionFwd:
 
                         # Keep the true max at -inf for an all-masked prefix, but
                         # center exponentiation at zero so -inf - -inf cannot
-                        # turn a future-only selected block into NaN probability.
+                        # turn a fully masked selected block (future-only, or
+                        # starting at or past the end of the sequence) into NaN
+                        # probability.
                         row_max_cur_row_safe = row_max_cur_row
-                        if cutlass.const_expr(self.causal_within_selected_blocks):
-                            if row_max_cur_row_safe == -cutlass.Float32.inf:
-                                row_max_cur_row_safe = cutlass.Float32(0.0)
+                        if row_max_cur_row_safe == -cutlass.Float32.inf:
+                            row_max_cur_row_safe = cutlass.Float32(0.0)
 
                         acc_QK_row_exp = cute.TensorSSA(  # e^{Sn-mn}
                             self._exp2f((acc_QK_row - row_max_cur_row_safe) * self.log2_e),

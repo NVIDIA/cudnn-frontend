@@ -39,7 +39,30 @@ pytestmark = [requires_dsl]
     ],
 )
 def test_paged_thd_origins_rebind_and_capture(
-    dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa, page_size=16, window_left=None, sink=None, kv_dtype_name=None
+    dim,
+    dtype_name,
+    pool_layout,
+    stats_layout,
+    cga,
+    splits,
+    pack_gqa,
+    page_size=16,
+    window_left=None,
+    sink=None,
+    kv_dtype_name=None,
+    tile_n=None,
+    sched_policy=None,
+    cpu_reference=False,
+    attention_scale=None,
+    bottom_right=True,
+    window_right=0,
+    kv_bound=None,
+    key_growth=1.0,
+    independent_table_strides=False,
+    single_q=False,
+    heads_override=None,
+    q_bound=None,
+    batch_override=None,
 ):
     import cudnn
     import torch
@@ -51,14 +74,27 @@ def test_paged_thd_origins_rebind_and_capture(
     rubin = torch.cuda.get_device_capability() == (10, 7)
     if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
         pytest.skip(reason)
-    native_rubin_shape = (dim == 128 and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
-    if rubin and (not native_rubin_shape or splits != 1):
-        pytest.skip("native SM107 paged origins: D128 CGA1/2 or D192/V128 CGA2, unsplit")
-    engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
-    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+    native_rubin_shape = (dim in (64, 128) and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
+    native_rubin_split = dim == 64 and cga == 1 and splits > 1
+    if rubin and not ((native_rubin_shape and splits == 1) or native_rubin_split):
+        pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2 unsplit, or D64 CGA1 split")
+    engine = "sdpa_fwd_sm107_d128_multi_q" if rubin else "sdpa_fwd_prefill_sm100"
+    if dim != 64 and cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    if not rubin and (d_qk, d_v) == (256, 256):
+        engine = "sdpa_fwd_sm100_d256_lookahead"
+    elif not rubin and (d_qk, d_v) == (192, 128):
+        engine = "sdpa_fwd_sm100_d192_multi_q"
+    elif not rubin and (d_qk, d_v) == (576, 512):
+        engine = "sdpa_fwd_sm100_d512_2x2"
+    elif not rubin and d_qk == d_v and d_qk in (32, 64, 128):
+        engine = (
+            "sdpa_fwd_sm100_d128_single_q"
+            if cga == 1 and (splits > 1 or single_q or (d_qk <= 64 and q_bound is not None and q_bound <= 128 and not pack_gqa))
+            else "sdpa_fwd_sm100_d128_multi_q"
+        )
     batch, heads, kv_heads, maximum, page, kv_max = (
         2,
         (24 if d_qk in (192, 576) else 16),
@@ -67,12 +103,22 @@ def test_paged_thd_origins_rebind_and_capture(
         page_size,
         (1024 if d_qk == 576 else 8192),
     )
+    if batch_override is not None:
+        assert batch_override == 1
+        batch = 1
+    if q_bound is not None:
+        maximum = q_bound
+    if kv_bound is not None:
+        kv_max = kv_bound
+    if heads_override is not None:
+        heads = heads_override
+    scale = d_qk**-0.5 if attention_scale is None else attention_scale
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
     kv_dtype = getattr(torch, kv_dtype_name) if kv_dtype_name is not None else dtype
     io_type = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     widths = {"q": torch.int64, "o": torch.int32, "stats": torch.int64}
-    multipliers = {"q": heads * (16 if d_qk in (192, 576) else d_qk), "o": d_v, "stats": 1}
+    multipliers = {"q": heads * (16 if d_qk in (192, 576) or tile_n == 64 else d_qk), "o": 16 if tile_n == 64 else d_v, "stats": 1}
     graph_ports = ("q", "k", "v", "o", "stats", "ql", "kl", "kt", "vt", "ro_q", "ro_o", "ro_stats")
     if sink is not None:
         graph_ports += ("sink",)
@@ -102,7 +148,7 @@ def test_paged_thd_origins_rebind_and_capture(
             result["v"] = torch.empty(page_count + 1, page, kv_heads, d_v, device="cuda", dtype=kv_dtype).transpose(1, 2)
         for name in ("kt", "vt"):
             result[name] = torch.empty(batch, 1, pages_per_sequence, 1, device="cuda", dtype=torch.int32)
-        if d_qk == 576:
+        if d_qk == 576 or independent_table_strides:
             # Independent table pitches must survive both binding and replay.
             # A shared/contiguous stride reads the poisoned padding pages.
             step = 3 if wide else 2
@@ -114,9 +160,10 @@ def test_paged_thd_origins_rebind_and_capture(
 
     def fill(values, shift, replay=False, keyless=False, empty=False):
         ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
-        kl = [kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max]
+        ql = [min(length, maximum) for length in ql[:batch]]
+        kl = ([kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max])[:batch]
         if keyless:
-            kl[1] = 0
+            kl[-1] = 0
         # shift=0 is the integration reproducer's shared [0,320,512] Q slots.
         # Subsequent bindings/replays also separate the three physical origins.
         starts = {
@@ -124,6 +171,7 @@ def test_paged_thd_origins_rebind_and_capture(
             "o": [shift + (16 if shift else 0), 320 + shift + (32 if shift else 0)],
             "stats": [shift + (32 if shift else 0), 320 + shift + (64 if shift else 0)],
         }
+        starts = {name: rows[:batch] for name, rows in starts.items()}
         for name, lengths in (("ql", ql), ("kl", kl)):
             values[name].copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32).view(batch, 1, 1, 1))
         for name in ("q", "o", "stats"):
@@ -145,6 +193,19 @@ def test_paged_thd_origins_rebind_and_capture(
         for name in ("kt", "vt"):
             # Page order is host test data; avoid an unrelated GPU radix sort.
             values[name].copy_(torch.randperm(page_count, dtype=torch.int32).view(batch, 1, pages_per_sequence, 1))
+        if key_growth != 1.0:
+            # Positive scores with increasing logical-key magnitudes force online
+            # max changes; physical page order remains independently randomized.
+            values["q"].abs_()
+            # Exactly representable, bounded V keeps this QK-rescale stress
+            # focused on the pipeline; ordinary cases retain normal random V.
+            # Leave the final poisoned page untouched.
+            values["v"][:-1].sign_()
+            for b in range(batch):
+                pages = values["kt"][b].flatten().long()
+                factors = key_growth ** (torch.arange(kv_max, device="cuda") // 64)
+                keys = values["k"][pages].abs() * factors.view(pages_per_sequence, 1, page, 1)
+                values["k"][pages] = keys.to(kv_dtype)
         return ql, kl, starts
 
     first = buffers()
@@ -157,13 +218,21 @@ def test_paged_thd_origins_rebind_and_capture(
     nodes = {name: graph.tensor_like(first[name]) for name in graph_ports if name not in ("q", "o", "stats")}
     nodes["q"] = graph.tensor(dim=(batch, heads, maximum, d_qk), stride=(maximum * heads * d_qk, d_qk, heads * d_qk, 1), data_type=io_type)
     nodes["q"].set_ragged_offset(nodes["ro_q"]).set_ragged_offset_multiplier(multipliers["q"])
+    mask_options = (
+        dict(use_causal_mask=not bottom_right, use_causal_mask_bottom_right=bottom_right)
+        if window_right == 0
+        else dict(
+            diagonal_band_right_bound=window_right,
+            diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT,
+        )
+    )
     nodes["o"], nodes["stats"] = graph.sdpa(
         q=nodes["q"],
         k=nodes["k"],
         v=nodes["v"],
         is_inference=False,
-        attn_scale=d_qk**-0.5,
-        use_causal_mask_bottom_right=True,
+        attn_scale=scale,
+        **mask_options,
         diagonal_band_left_bound=window_left,
         sink_token=nodes.get("sink"),
         use_padding_mask=True,
@@ -172,7 +241,7 @@ def test_paged_thd_origins_rebind_and_capture(
         paged_attention_k_table=nodes["kt"],
         paged_attention_v_table=nodes["vt"],
         paged_attention_max_seq_len_kv=kv_max,
-        max_total_seq_len_q=477,
+        max_total_seq_len_q=min(477, batch * maximum),
         stats_use_log2=stats_layout == "head",
     )
     nodes["o"].set_output(True).set_dim((batch, heads, maximum, d_v)).set_stride((maximum * heads * d_qk, d_qk, heads * d_qk, 1)).set_ragged_offset(
@@ -188,21 +257,55 @@ def test_paged_thd_origins_rebind_and_capture(
         graph.create_execution_plans([cudnn.heur_mode.A])
         graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(engine)))
     else:
-        graph.create_execution_plan(
-            family_for(graph).offered_ids()[engine],
-            {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)},
-        )
+        knobs = {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
+        if tile_n is not None:
+            knobs[cudnn.knob_type.TILE_N] = tile_n
+        if sched_policy is not None:
+            knobs[cudnn.knob_type.SCHED_POLICY] = sched_policy
+        if rubin and single_q:
+            engine = "sdpa_fwd_sm107_d256_lookahead"
+            knobs[cudnn.knob_type.WARP_SPEC_CFG] = 1
+        elif rubin:
+            from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+            from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+            from cudnn.sdpa.graph_analyzer import analyze
+
+            requested = SdpaFwdKnobs.from_public(knobs)
+            geometry = select_sm107_half_geometry(analyze(graph), requested)
+            engine, knobs = geometry.implementation, geometry.canonical_knobs(requested).to_public()
+        graph.create_execution_plan(family_for(graph).offered_ids()[engine], knobs)
         graph.select_plan(0)
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
+        plan = graph._compiled_plans[graph._plan_index]
+        decode_tile = splits > 1 or (cga != 2 and not pack_gqa and maximum <= 128)
+        expected_template = ("decode_d128_f16" if decode_tile else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
+        assert plan._compiled.kernel_template == expected_template
+        assert plan._prepared.spec.native is not None
+        assert plan._prepared.spec.origin_specs is not None
     if rubin:
         import inspect
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
-        assert api._k_mod.CFG.STAGES_KV == (2 if d_qk == 192 else 2 * cga)
+        expected_template = (
+            "sm100/d128_f16_single_q/kernel.py"
+            if native_rubin_split
+            else "sm107/d256_f16_lookahead/kernel.py" if single_q else "sm107/d128_f16_multi_q/kernel.py"
+        )
+        assert api._k_mod.__file__.endswith(expected_template)
+        assert api._k_mod.CFG.STAGES_KV == (3 if native_rubin_split else 4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
+        if tile_n is not None:
+            assert api._k_mod.CFG.TILE_N == tile_n
+            if native_rubin_split:
+                assert api._k_mod.CFG.S_SLOTS == 1 and api._k_mod.CFG.TILES_Q == 1
+                assert api._k_mod._FP32_PARTIALS and api._k_mod.SPLIT_KV == splits
+            elif single_q:
+                assert api._k_mod.PARAMS.s_slots == 2 and api._k_mod.CFG.TILES_Q == 1
+            else:
+                assert api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
         assert api._thd_origin_specs is not None
     print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -213,10 +316,16 @@ def test_paged_thd_origins_rebind_and_capture(
         workspace.fill_(255)
 
     def check(values, state):
+        # Keep sanitizer work focused on the attention execution, while still
+        # checking every live row against the same FP64 reference and tolerances.
+        if cpu_reference:
+            values = {name: tensor.cpu() for name, tensor in values.items()}
+        reference_device = values["q"].device
         ql, kl, starts = state
+        rescale_seen = False
         stats = values["stats"] if stats_layout == "token" else values["stats"].T
-        live_o = torch.zeros(values["o"].shape[0], device="cuda", dtype=torch.bool)
-        live_stats = torch.zeros(stats.shape[0], device="cuda", dtype=torch.bool)
+        live_o = torch.zeros(values["o"].shape[0], device=reference_device, dtype=torch.bool)
+        live_stats = torch.zeros(stats.shape[0], device=reference_device, dtype=torch.bool)
         for b, (nq, nk) in enumerate(zip(ql, kl)):
             if not nq:
                 continue
@@ -226,13 +335,20 @@ def test_paged_thd_origins_rebind_and_capture(
             for lo in range(0, nq, 32):
                 hi = min(lo + 32, nq)
                 q = values["q"][starts["q"][b] + lo : starts["q"][b] + hi].double().transpose(0, 1)
-                scores = q @ k.transpose(-1, -2) * d_qk**-0.5
-                scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None], -torch.inf)
+                scores = q @ k.transpose(-1, -2) * scale
+                diagonal = nk - nq if bottom_right else 0
+                query_positions = torch.arange(diagonal + lo, diagonal + hi, device=reference_device)
+                scores.masked_fill_(torch.arange(nk, device=reference_device)[None, :] > query_positions[:, None] + window_right, -torch.inf)
                 if window_left is not None:
                     scores.masked_fill_(
-                        torch.arange(nk, device="cuda")[None, :] <= torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None] - window_left,
+                        torch.arange(nk, device=reference_device)[None, :] <= query_positions[:, None] - window_left,
                         -torch.inf,
                     )
+                if key_growth != 1.0 and nk:
+                    maxima = torch.stack([scores[..., begin : begin + tile_n].amax(-1) for begin in range(0, nk, tile_n)], dim=-1)
+                    previous = maxima.cummax(-1).values[..., :-1]
+                    jumps_log2 = (maxima[..., 1:] - previous) * math.log2(math.e)
+                    rescale_seen |= bool(torch.any(torch.isfinite(previous) & (jumps_log2 > 8.0)))
                 if sink is not None:
                     scores = torch.cat((scores, values["sink"].reshape(heads, 1, 1).double().expand(heads, hi - lo, 1)), dim=-1)
                 expected = (scores.softmax(-1)[..., :nk] @ v).transpose(0, 1)
@@ -242,6 +358,8 @@ def test_paged_thd_origins_rebind_and_capture(
                 torch.testing.assert_close(stats[ss + lo : ss + hi].double(), expected_stats, atol=0.0006, rtol=0)
             live_o[starts["o"][b] : starts["o"][b] + nq] = True
             live_stats[starts["stats"][b] : starts["stats"][b] + nq] = True
+        if key_growth != 1.0 and any(nq and nk for nq, nk in zip(ql, kl)):
+            assert rescale_seen, "the stress data must cross the half-precision rescale threshold"
         assert torch.all(values["o"][~live_o] == -17)
         assert torch.all(stats[~live_stats] == -29)
         assert torch.all(values["backing_o"][..., d_v:] == -17)

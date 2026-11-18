@@ -60,6 +60,23 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+
+
+def requires_bwd_engine_row(name):
+    """``skipif`` off the sm range the named FROST backward engine row DECLARES (``Capabilities.sm_lo`` / ``sm_hi`` in
+    sdpa/bwd/engines.py), read from the row at import -- never a per-file copy of the range.  For the rows whose bodies are
+    compiled per device (the ``sdpa_bwd_sm100_d128`` family: ``--gpu-arch sm_{cc}a`` from the device cc, cc 10.0 / 10.3 and,
+    since the Rubin admission, cc 10.7) a suite gated on ``requires_pre_rubin_blackwell`` would skip exactly the lane that
+    needs to run; this marker follows the row instead."""
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    caps = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+    return pytest.mark.skipif(
+        _SM is None or not (caps.sm_lo <= _SM <= caps.sm_hi),
+        reason=f"needs a GPU in the {name} row's range (SM{caps.sm_lo}-{caps.sm_hi}), have " + ("none" if _SM is None else f"sm_{_SM}"),
+    )
+
+
 # Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
 # sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
 # marker mirrors that range rather than pinning (10, 7)).
@@ -128,11 +145,192 @@ def _dsl_installed() -> bool:
 def _is_plan_for(plan_name, engine) -> bool:
     """A plan reads ``<engine>[<knobs>]``: the heuristics name a concrete config
     for every entry, so match on the engine, not on the whole plan name."""
+    if isinstance(engine, tuple):
+        return any(_is_plan_for(plan_name, name) for name in engine)
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
+def mxfp8_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Allowed MXFP8 engines for feature tests that exercise default selection: the row and its exact owners."""
+    row = f"sdpa_fwd_prefill_{arch}_mxfp8"
+    if arch == "sm100":
+        return (
+            row,
+            "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+            "sdpa_fwd_sm100_d256_mxfp8_single_q",
+            "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+            "sdpa_fwd_sm100_d512_mxfp8_retained_p",
+        )
+    if arch == "sm107":
+        return (
+            row,
+            "sdpa_fwd_sm107_d128_mxfp8_multi_q",
+            "sdpa_fwd_sm107_d192_mxfp8_multi_q",
+            "sdpa_fwd_sm107_d256_mxfp8_single_q",
+            "sdpa_fwd_sm107_d512_mxfp8_role_split",
+        )
+    return (row,)
+
+
+def sm100_mxfp8_owner(d_qk, d_v, *, retained_p=False) -> str:
+    """The SM100 MXFP8 engine that serves these head dims (legality only); exact top-left SWA of one KV tile, unsplit, is retained P."""
+    if (d_qk, d_v) != (512, 512):
+        return mxfp8_engine_name("sm100", d_qk, d_v)
+    return "sdpa_fwd_sm100_d512_mxfp8_retained_p" if retained_p else "sdpa_fwd_sm100_d512_mxfp8_slice_recompute"
+
+
+def sm107_mxfp8_owner(d_qk, d_v) -> str:
+    """The SM107 MXFP8 engine that serves exact head dims: one body per native shape; the row keeps anything else."""
+    owners = {
+        (128, 128): "sdpa_fwd_sm107_d128_mxfp8_multi_q",
+        (192, 128): "sdpa_fwd_sm107_d192_mxfp8_multi_q",
+        (256, 256): "sdpa_fwd_sm107_d256_mxfp8_single_q",
+        (512, 512): "sdpa_fwd_sm107_d512_mxfp8_role_split",
+    }
+    return owners.get((d_qk, d_v), "sdpa_fwd_prefill_sm107_mxfp8")
+
+
+def half_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Allowed half engines for feature tests that exercise default selection.
+
+    Implementation/routing tests pin a single concrete name instead. This
+    list only follows ownership; it contains no shape or performance policy.
+    """
+    if arch == "sm100":
+        return (
+            "sdpa_fwd_prefill_sm100",
+            "sdpa_fwd_sm100_d128_multi_q",
+            "sdpa_fwd_sm100_d64_quadrant",
+            "sdpa_fwd_sm100_d192_multi_q",
+            "sdpa_fwd_sm100_d128_single_q",
+            "sdpa_fwd_sm100_d256_lookahead",
+            "sdpa_fwd_sm100_d256_swap_ab",
+            "sdpa_fwd_sm100_d512_role_split",
+            "sdpa_fwd_sm100_d512_2x2",
+        )
+    if arch == "sm107":
+        return (
+            "sdpa_fwd_prefill_sm107",
+            "sdpa_fwd_sm107_d128_multi_q",
+            "sdpa_fwd_sm107_small_batch_pair",
+            "sdpa_fwd_sm107_d192_multi_q",
+            "sdpa_fwd_sm107_d256_lookahead",
+            "sdpa_fwd_sm107_d256_swap_ab",
+            "sdpa_fwd_sm107_shared_single_q",
+            "sdpa_fwd_sm107_shared_d256_lookahead",
+            "sdpa_fwd_sm107_d512_role_split",
+            "sdpa_fwd_sm107_d512_2x2",
+        )
+    if arch == "sm120":
+        return (
+            "sdpa_fwd_prefill_sm120",
+            "sdpa_fwd_sm120_d512_paired",
+            "sdpa_fwd_sm120_d256_all_compute",
+            "sdpa_fwd_sm120_decode_key_group",
+            "sdpa_fwd_sm120_f16_general",
+        )
+    if arch == "sm90":
+        return ("sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg", "sdpa_fwd_sm90_d128_multi_q")
+    if arch == "sm80":
+        return ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative")
+    return (f"sdpa_fwd_prefill_{arch}",)
+
+
+def mxfp8_engine_name(arch, d_qk, d_v) -> str:
+    """Exact implementation owner for a block-scaled forward test declaration."""
+    if arch == "sm107":
+        return sm107_mxfp8_owner(d_qk, d_v)
+    if arch == "sm100":
+        owner = {
+            (64, 64): "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            (128, 128): "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            (192, 128): "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+            (256, 256): "sdpa_fwd_sm100_d256_mxfp8_single_q",
+            (512, 512): "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+        }.get((d_qk, d_v))
+        if owner is not None:
+            return owner
+    return sm120_owner(f"sdpa_fwd_prefill_{arch}_mxfp8", d_qk, d_v) if arch == "sm120" else f"sdpa_fwd_prefill_{arch}_mxfp8"
+
+
+def sm80_owner(d_qk, d_v):
+    """The SM80 forward engine that serves these head dims (legality only, no ranking)."""
+    from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as half
+
+    return half.implementation_for(d_qk, d_v) or half.LEGACY_ROW
+
+
+def sm120_owner(row, d_qk, d_v, tile_m=None):
+    """The SM120 forward engine that may serve these head dims for ``row``'s input type (legality only, no ranking).
+
+    Half head tiles and their envelopes have two owners named by TILE_M; without one, both are returned for a ranked pin."""
+    from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as exact
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as half
+    from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8
+    from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8
+
+    from types import SimpleNamespace
+
+    facts = SimpleNamespace(d_qk=d_qk, d_v=d_v)
+    shape = exact.padded_shape(facts)
+    if row == exact.LEGACY_ROW and shape is not None:
+        prefill = exact.ALL_COMPUTE if shape == exact.D256 else exact.GENERAL
+        if tile_m is None:
+            return (prefill, exact.KEY_GROUP)
+        return exact.KEY_GROUP if tile_m in exact.key_group.QUERY_TILES else prefill
+    from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as quant
+
+    if quant.padded_shape(facts) is not None:
+        general = {quant.fp8.LEGACY_ROW: quant.FP8, quant.mxfp8.LEGACY_ROW: quant.MXFP8}
+        if row in general:
+            return general[row]
+    wide = {half.LEGACY_ROW: half, fp8.LEGACY_ROW: fp8, mxfp8.LEGACY_ROW: mxfp8}.get(row)
+    return wide.NAME if wide is not None and wide.padded_shape(facts) is not None else row
+
+
+def sm90_half_owner(d_qk, d_v, *, paged=False) -> str:
+    if (d_qk, d_v) == (64, 64):
+        return "sdpa_fwd_sm90_f16_three_wg" if paged else "sdpa_fwd_sm90_d64_one_wg"
+    return "sdpa_fwd_sm90_f16_three_wg"
+
+
+def sm120_half_owner(d_qk, d_v, tile_m=None):
+    return sm120_owner("sdpa_fwd_prefill_sm120", d_qk, d_v, tile_m)
+
+
+def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Per-tensor FP8 owners for feature tests; routing tests pin one name."""
+    if arch == "sm100":
+        return (
+            "sdpa_fwd_prefill_sm100_fp8",
+            "sdpa_fwd_sm100_d512_fp8_role_split",
+            "sdpa_fwd_sm100_d256_fp8_single_q",
+            "sdpa_fwd_sm100_d192_fp8_multi_q",
+            "sdpa_fwd_sm100_d128_fp8_multi_q",
+            "sdpa_fwd_sm100_d128_fp8_dual_kv",
+            "sdpa_fwd_sm100_d128_fp8_swap_ab",
+        )
+    if arch == "sm120":
+        return ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_sm120_d512_fp8_paired", "sdpa_fwd_sm120_fp8_general")
+    if arch == "sm107":
+        return (
+            "sdpa_fwd_prefill_sm107_fp8",
+            "sdpa_fwd_sm107_d128_fp8_multi_q",
+            "sdpa_fwd_sm107_d128_fp8_swap_ab",
+            "sdpa_fwd_sm107_d192_fp8_multi_q",
+            "sdpa_fwd_sm107_d256_fp8_single_q",
+            "sdpa_fwd_sm107_d512_fp8_role_split",
+        )
+    return (f"sdpa_fwd_prefill_{arch}_fp8",)
+
+
+# The SM80 backward row's bodies; a pin to the pair takes whichever the graph selects.
+SM80_BWD_OWNERS = ("sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm80_f16_two_subgroup")
+
+
 def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
-    """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
+    """Pin the ranked entry for engine ``name`` (or an explicit tuple of names; graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 
@@ -561,8 +759,9 @@ def run_d512_delayed_observer(tmp_path, engine):
 
         def delayed(path, params, tag="template"):
             p = Path(path)
-            if p.name == "bprop_d512_f16_2x2.py":
-                assert p.parent.name == ("sm107" if engine == "sdpa_bwd_sm107_d512" else "sm100")
+            relative = p.relative_to(Path(api_dsl.__file__).parent / "kernels").as_posix()
+            expected = "sm107/d512_f16_2x2/kernel.py" if engine == "sdpa_bwd_sm107_d512" else "sm100/d512_f16_2x2/kernel.py"
+            if relative == expected:
                 source = p.read_text()
                 begin = source.index("def _ldg_kv_tile(")
                 end = source.index("\n@cute.jit\ndef _tmaldg_warp_group(", begin)

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <string>
 #include <numeric>
+#include <limits>
 
 namespace cudnn_frontend {
 
@@ -148,8 +149,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(error_code_t,
                                  {error_code_t::NVRTC_COMPILATION_FAILED, "NVRTC_COMPILATION_FAILED"},
                              })
 
-static inline std::ostream&
-operator<<(std::ostream& os, const error_code_t& mode) {
+static inline std::ostream &
+operator<<(std::ostream &os, const error_code_t &mode) {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     os << json{mode};
 #else
@@ -158,8 +159,8 @@ operator<<(std::ostream& os, const error_code_t& mode) {
     return os;
 }
 
-static inline std::ostream&
-operator<<(std::ostream& os, cudnn_frontend::error_object& err) {
+static inline std::ostream &
+operator<<(std::ostream &os, cudnn_frontend::error_object &err) {
     os << err.get_code() << err.get_message();
     return os;
 }
@@ -184,7 +185,7 @@ is_activation_backward_mode(PointwiseMode_t const mode) {
 // For example, if a is a 4D tensor with dimensions labeled NCHW, then strided(a, (3, 0, 2, 1)) produces
 // strides where the C dimension has a corresponding stride of one.
 inline std::vector<int64_t>
-generate_stride(std::vector<int64_t> const& dim, std::vector<int64_t> const& stride_order) {
+generate_stride(std::vector<int64_t> const &dim, std::vector<int64_t> const &stride_order) {
     size_t num_dims = dim.size();
     std::vector<int64_t> stride(num_dims);
 
@@ -206,6 +207,39 @@ generate_stride(std::vector<int64_t> const& dim, std::vector<int64_t> const& str
     }
 
     return stride;
+}
+
+// Infer only representable strides. The final product is not a stride and need
+// not fit: descriptors permit large extents and zero strides independently.
+inline error_t
+generate_stride_checked(std::vector<int64_t> const &dim,
+                        std::vector<int64_t> const &stride_order,
+                        std::vector<int64_t> &stride) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() != stride_order.size(),
+                                   error_code_t::SHAPE_DEDUCTION_FAILED,
+                                   "Stride order does not match tensor rank.");
+    std::vector<std::pair<int64_t, size_t>> ordered;
+    for (size_t i = 0; i < dim.size(); ++i) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            dim[i] < 0, error_code_t::INVALID_VALUE, "Cannot infer strides for a negative tensor extent.");
+        ordered.emplace_back(stride_order[i], i);
+    }
+    std::sort(ordered.begin(), ordered.end());
+    std::vector<int64_t> inferred(dim.size());
+    int64_t product = 1;
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        auto const index = ordered[i].second;
+        inferred[index]  = product;
+        if (i + 1 < ordered.size()) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                dim[index] != 0 && product > std::numeric_limits<int64_t>::max() / dim[index],
+                error_code_t::SHAPE_DEDUCTION_FAILED,
+                "Inferred tensor stride exceeds signed 64-bit storage.");
+            product *= dim[index];
+        }
+    }
+    stride = std::move(inferred);
+    return {error_code_t::OK, ""};
 }
 
 // Generate NHWC stride_order
@@ -274,10 +308,10 @@ generate_column_major_stride_order(int64_t const num_dims) {
  *   // If err == error_code_t::OK, result will be {3, 2, 4}
  */
 inline error_t
-compute_broadcast_shape(const std::vector<std::vector<int64_t>>& _shapes, std::vector<int64_t>& common_shape) {
+compute_broadcast_shape(const std::vector<std::vector<int64_t>> &_shapes, std::vector<int64_t> &common_shape) {
     // Filter out empty shapes
     std::vector<std::vector<int64_t>> shapes;
-    std::copy_if(_shapes.begin(), _shapes.end(), std::back_inserter(shapes), [](const std::vector<int64_t>& shape) {
+    std::copy_if(_shapes.begin(), _shapes.end(), std::back_inserter(shapes), [](const std::vector<int64_t> &shape) {
         return !shape.empty();
     });
 
@@ -288,7 +322,7 @@ compute_broadcast_shape(const std::vector<std::vector<int64_t>>& _shapes, std::v
     // Find the maximum dimension
     int64_t max_dim = std::max_element(shapes.begin(),
                                        shapes.end(),
-                                       [](const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+                                       [](const std::vector<int64_t> &a, const std::vector<int64_t> &b) {
                                            return a.size() < b.size();
                                        })
                           ->size();
@@ -296,7 +330,7 @@ compute_broadcast_shape(const std::vector<std::vector<int64_t>>& _shapes, std::v
     // Initialize common_shape with 1s
     common_shape.assign(max_dim, 1);
 
-    for (const auto& shape : shapes) {
+    for (const auto &shape : shapes) {
         for (int idx = -1; idx >= -static_cast<int>(shape.size()); --idx) {
             int64_t common_idx = common_shape.size() + idx;
             int64_t shape_idx  = shape.size() + idx;
@@ -324,9 +358,9 @@ compute_broadcast_shape(const std::vector<std::vector<int64_t>>& _shapes, std::v
  * @return std::vector<int64_t> The generated stride order
  */
 inline error_t
-generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride,
+generate_stride_order_preserving_format(const std::vector<int64_t> &input_stride,
                                         size_t output_dim_size,
-                                        std::vector<int64_t>& stride_order) {
+                                        std::vector<int64_t> &stride_order) {
     std::vector<int64_t> indices(input_stride.size());
     std::iota(indices.begin(), indices.end(), 0);
 
@@ -370,9 +404,9 @@ generate_stride_order_preserving_format(const std::vector<int64_t>& input_stride
  * @return error_t An error code indicating the result of the operation.
  */
 inline error_t
-generate_matmul_output_dim(const std::vector<int64_t>& a_dim,
-                           const std::vector<int64_t>& b_dim,
-                           std::vector<int64_t>& output_dim) {
+generate_matmul_output_dim(const std::vector<int64_t> &a_dim,
+                           const std::vector<int64_t> &b_dim,
+                           std::vector<int64_t> &output_dim) {
     // Ensure a_dim and b_dim have at least 2 dimensions
     if (a_dim.size() < 2 || b_dim.size() < 2) {
         return {error_code_t::SHAPE_DEDUCTION_FAILED, "Input tensors must have at least 2 dimensions for matmul."};
@@ -401,8 +435,8 @@ generate_matmul_output_dim(const std::vector<int64_t>& a_dim,
 }
 
 inline std::string
-to_hex(const void* data, size_t num_elements, size_t elem_size) {
-    const auto* bytes = static_cast<const unsigned char*>(data);
+to_hex(const void *data, size_t num_elements, size_t elem_size) {
+    const auto *bytes = static_cast<const unsigned char *>(data);
     std::stringstream ss;
     ss << "[";
     for (size_t i = 0; i < num_elements; ++i) {
@@ -413,13 +447,13 @@ to_hex(const void* data, size_t num_elements, size_t elem_size) {
                 ss << static_cast<unsigned>(bytes[i]);
                 break;
             case 2:
-                ss << *reinterpret_cast<const uint16_t*>(&bytes[i * 2]);
+                ss << *reinterpret_cast<const uint16_t *>(&bytes[i * 2]);
                 break;
             case 4:
-                ss << *reinterpret_cast<const uint32_t*>(&bytes[i * 4]);
+                ss << *reinterpret_cast<const uint32_t *>(&bytes[i * 4]);
                 break;
             case 8:
-                ss << *reinterpret_cast<const uint64_t*>(&bytes[i * 8]);
+                ss << *reinterpret_cast<const uint64_t *>(&bytes[i * 8]);
                 break;
             default:
                 ss << "?";
@@ -430,8 +464,8 @@ to_hex(const void* data, size_t num_elements, size_t elem_size) {
 }
 
 inline std::string
-to_decimal(const void* data, size_t num_elements, size_t elem_size) {
-    const auto* bytes = static_cast<const unsigned char*>(data);
+to_decimal(const void *data, size_t num_elements, size_t elem_size) {
+    const auto *bytes = static_cast<const unsigned char *>(data);
     std::stringstream ss;
     ss << "[";
     for (size_t i = 0; i < num_elements; ++i) {
@@ -441,13 +475,13 @@ to_decimal(const void* data, size_t num_elements, size_t elem_size) {
                 ss << static_cast<int>(bytes[i]);
                 break;
             case 2:
-                ss << *reinterpret_cast<const int16_t*>(&bytes[i * 2]);
+                ss << *reinterpret_cast<const int16_t *>(&bytes[i * 2]);
                 break;
             case 4:
-                ss << *reinterpret_cast<const int32_t*>(&bytes[i * 4]);
+                ss << *reinterpret_cast<const int32_t *>(&bytes[i * 4]);
                 break;
             case 8:
-                ss << *reinterpret_cast<const int64_t*>(&bytes[i * 8]);
+                ss << *reinterpret_cast<const int64_t *>(&bytes[i * 8]);
                 break;
             default:
                 ss << "?";
@@ -458,9 +492,9 @@ to_decimal(const void* data, size_t num_elements, size_t elem_size) {
 }
 
 inline std::string
-to_base64(const void* data, size_t total_bytes) {
+to_base64(const void *data, size_t total_bytes) {
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const auto* bytes         = static_cast<const unsigned char*>(data);
+    const auto *bytes         = static_cast<const unsigned char *>(data);
     std::string result;
     result.reserve(((total_bytes + 2) / 3) * 4);
     for (size_t i = 0; i < total_bytes; i += 3) {
@@ -477,8 +511,8 @@ to_base64(const void* data, size_t total_bytes) {
 
 inline error_t
 log_dump_tensor_content(int64_t uid,
-                        std::string const& name,
-                        void* ptr,
+                        std::string const &name,
+                        void *ptr,
                         size_t num_elements,
                         size_t elem_size,
                         char fmt,
@@ -517,7 +551,7 @@ log_dump_tensor_content(int64_t uid,
 }
 
 inline error_t
-log_variant_pack_memory_type(int64_t uid, void* ptr) {
+log_variant_pack_memory_type(int64_t uid, void *ptr) {
     if (!isLoggingEnabled()) return {error_code_t::OK, ""};
 
     cudaPointerAttributes attributes;
@@ -538,9 +572,9 @@ log_variant_pack_memory_type(int64_t uid, void* ptr) {
         }
     };
 
-    auto ptr_to_string = [](void* p) {
+    auto ptr_to_string = [](void *p) {
         std::stringstream ss;
-        ss << "0x" << std::hex << std::setw(sizeof(void*) * 2) << std::setfill('0') << reinterpret_cast<uintptr_t>(p);
+        ss << "0x" << std::hex << std::setw(sizeof(void *) * 2) << std::setfill('0') << reinterpret_cast<uintptr_t>(p);
         return ss.str();
     };
 
@@ -559,9 +593,9 @@ log_variant_pack_memory_type(int64_t uid, void* ptr) {
 
 class cudnnGraphNotSupportedException : public std::runtime_error {
    public:
-    cudnnGraphNotSupportedException(const char* message) throw() : std::runtime_error(message) {}
+    cudnnGraphNotSupportedException(const char *message) throw() : std::runtime_error(message) {}
 
-    virtual const char*
+    virtual const char *
     what() const throw() {
         return std::runtime_error::what();
     }

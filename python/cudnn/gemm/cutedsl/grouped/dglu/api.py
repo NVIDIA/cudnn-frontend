@@ -53,6 +53,7 @@ from cudnn.tensor_adapter import (
     default_stream,
     framework_dtype,
     get_compute_capability,
+    has_tcgen05,
     get_device,
     get_shape,
     get_strides,
@@ -1126,8 +1127,8 @@ def _normalize_dglu_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     capability = major * 10 + minor
-    if capability < 100:
-        raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+, found SM{capability}")
+    if not has_tcgen05(major):
+        raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
     return normalized, backend
 
 
@@ -1419,6 +1420,8 @@ def grouped_gemm_dglu_wrapper_sm100(
             glu_clamp_min=glu_clamp_min,
             generate_dbias=generate_dbias,
             sf_vec_size=sf_vec_size,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
         )
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and

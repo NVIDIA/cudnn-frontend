@@ -160,8 +160,9 @@ def grouped_gemm_quant_init(
     :return: Configuration dictionary
     """
     major, minor = torch.cuda.get_device_capability()
-    compute_capability = major * 10 + minor
-    if compute_capability < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
     nkl_str = request.config.getoption("--grouped-gemm-nkl", default=None)

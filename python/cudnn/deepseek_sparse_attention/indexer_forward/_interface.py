@@ -34,7 +34,7 @@ from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._support import (
     check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
-    resolve_m_block_size as _resolve_m_block_size,
+    validate_bf16_tile as _validate_bf16_tile,
     resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
@@ -116,7 +116,7 @@ def indexer_fwd(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     is_compressed_logits: bool = False,
     topk: int = 0,
     microbatch_rows: int = -1,
@@ -152,7 +152,7 @@ def indexer_fwd(
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` or THD
            ``(total_q, n_heads_q, head_dim)`` [BF16; E4M3 for "mxfp8";
-           ``float4_e2m1fn_x2`` with last dim ``head_dim // 2`` for "mxfp4"]
+           ``float4_e2m1fn_x2`` with last dim ``head_dim // 2`` for "mxfp4" and "nvfp4"]
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` or THD
            ``(total_k, n_heads_kv, head_dim)`` [same dtypes as q]
         w: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)``
@@ -170,9 +170,12 @@ def indexer_fwd(
              kept). Strided q/k/w/q_scale/k_scale are made contiguous here.
              ``_indexer_fwd_bound`` is the strict, allocation-free entry.
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0.
-        precision: ``"bf16"``, ``"mxfp8"`` or ``"mxfp4"``; the two SM100
-            block-scaled kernels differ only in the MMA (``kind::mxf4`` for MXFP4).
-        q_scale: blockscaled-packed E8M0 Q scales.
+        precision: ``"bf16"``, ``"mxfp8"``, ``"mxfp4"`` or ``"nvfp4"``; the SM100
+            block-scaled kernels differ only in the MMA (``kind::mxf4`` for MXFP4,
+            ``kind::mxf4nvf4`` for NVFP4) and the scale format.
+        q_scale: blockscaled-packed Q scales: E8M0 (MXFP8 / MXFP4) or non-negative
+            E4M3 (NVFP4; fold the product of its per-tensor global decode scales,
+            which multiply the block-scaled values back to real values, into ``sm_scale``).
         k_scale: blockscaled-packed K scales (same dtype as ``q_scale``).
         cu_seqlens_q_scale_padded: required THD prefix of the Q scale storage.
             Values are consumed as provided; each Q span must cover its logical
@@ -182,7 +185,8 @@ def indexer_fwd(
             Values are consumed as provided; each K span must cover its logical
             sequence and be a multiple of 128 tokens. Any span satisfying those
             requirements is valid. Both scale prefixes must be ``None`` for BSHD.
-        sf_vec_size: scale vector size for MXFP8 and MXFP4, currently must be 32.
+        sf_vec_size: scale vector size; ``None`` (default) selects the format's,
+            which is the only one supported: 32 for MXFP8 and MXFP4, 16 for NVFP4.
         q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
             Each entry is the global uncompressed token index for local q[0].
         block_table: optional int32 ``(batch, max_pages)`` CUDA tensor. When
@@ -209,7 +213,7 @@ def indexer_fwd(
         max_seqlen_k = int(block_table.shape[1]) * int(k.shape[1])
     if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
         raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
-    validate_sf_vec_size(precision, sf_vec_size)
+    sf_vec_size = validate_sf_vec_size(precision, sf_vec_size)
     if num_threads != 384:
         raise ValueError(f"SM100 indexer_fwd only supports num_threads=384, got {num_threads}")
     if q_stage != 2:
@@ -420,7 +424,7 @@ def _indexer_fwd_bound(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     block_table: Optional[torch.Tensor] = None,
     kv_lens: Optional[torch.Tensor] = None,
     current_stream=None,
@@ -448,7 +452,7 @@ def _indexer_fwd_bound(
             raise ValueError(f"q_scale, k_scale, and scale padded cu_seqlens are only valid with precision={BLOCK_SCALED_PRECISION_NAMES}")
     else:
         validate_block_scaled_inputs(precision, q, k, w, q_scale, k_scale)
-    validate_sf_vec_size(precision, sf_vec_size)
+    sf_vec_size = validate_sf_vec_size(precision, sf_vec_size)
 
     # The kernel addresses these natively through a unit innermost stride;
     # IndexerForward.check_support() declines anything else (Rule 2 / R5).
@@ -514,7 +518,7 @@ def _indexer_fwd_bound(
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if precision == "bf16":
-        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=False, path="SM100 indexer_fwd")
+        _validate_bf16_tile(m_block_size, head_dim, path="SM100 indexer_fwd")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
 
@@ -606,8 +610,6 @@ def _indexer_fwd_bound(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=64,
-                kv_stage=24,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,
@@ -678,7 +680,6 @@ def _indexer_fwd_bound(
         m_block_size,
         n_block_size,
         k_block_size,
-        kv_stage,
         num_threads,
         is_varlen,
         q_causal_offsets is not None,
@@ -703,7 +704,6 @@ def _indexer_fwd_bound(
             m_block_size=m_block_size,
             n_block_size=n_block_size,
             k_block_size=k_block_size,
-            kv_stage=kv_stage,
             ratio=ratio,
             is_varlen=is_varlen,
             compute_lse=False,

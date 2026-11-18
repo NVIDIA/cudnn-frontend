@@ -42,7 +42,8 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity
+from cudnn.norm.strided import fake_strided_vector
+from cudnn.norm.utils import ws_bytes, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity, dsl_compile_lock
 
 from .groupnorm_fast_sm100 import _gn_bwd_finalize_kernel, _vec_for, red_scratch_len
 
@@ -126,9 +127,9 @@ def _ffi_fakes(et):
         fake_rows(et, rows=io),
         fake_rows(et, rows=io),
         fake_rows(et, rows=io),
-        fake_rows(et, rows=g),
-        fake_rows(f32, rows=stat),
-        fake_rows(f32, rows=stat),
+        fake_strided_vector(et, rows=g),
+        fake_strided_vector(f32, rows=stat),
+        fake_strided_vector(f32, rows=stat),
         fake_rows(f32, rows=part),
         fake_rows(f32, rows=part),
         fake_rows(f32, rows=g),
@@ -447,8 +448,11 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_cga_host, *_ffi_fakes(et), *(cutlass.Int32(0),) * 3, *ce, fake_stream(), options="--enable-tvm-ffi")
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(_gn_bwd_cga_host, *_ffi_fakes(et), *(cutlass.Int32(0),) * 3, *ce, fake_stream(), options="--enable-tvm-ffi")
+                _KCACHE[key] = fn
     operands = (dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1), gamma, mean, rstd, dgp, dbp, dgamma, dbeta)
     fn(*(ffi(t) for t in operands), R, ncta_rows, nparts, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

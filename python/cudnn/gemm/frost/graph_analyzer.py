@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from math import isfinite, prod
+from operator import index
 from typing import Any
 
 import cudnn
@@ -25,6 +26,10 @@ from .fusion_ir import (
     Dtype,
     FusionChain,
     FusionOp,
+    Axis,
+    IndexExpr,
+    IndexMap,
+    OperandAccess,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -137,6 +142,9 @@ class _RecordedOp:
     group_offset: int | None = None
     permutation: tuple[int, ...] = ()
     reshape_mode: str = "VIEW_ONLY"
+    index_expr: IndexExpr | None = None
+    aux_input: int | None = None
+    aux_mapping: IndexMap | None = None
 
 
 @dataclass
@@ -156,6 +164,7 @@ class _TensorMeta:
     mn_transposed: bool | None = None  # None for ordinary bindings; bool for a normalized caller-axis view
     matrix_batch: tuple[int, ...] | None = None  # original leading axes before rank normalization
     operand_view: OperandView | None = None  # fixed source shape and ordered zero-copy operations
+    coordinate_aux: bool = False
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -471,7 +480,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         )
     if node_type == "POINTWISE":
         out = node.outputs["OUT_0"]
-        attrs = tuple(sorted((k, float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
+        attrs = tuple(sorted((k, int(v) if k == "axis" else float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
         return _RecordedOp(
             node.params.get("mode"),
             name,
@@ -1032,9 +1041,11 @@ def _build_epilogue_dag(
     for next_op in ordered_ops:
         if next_op.cudnn_name in _UNARY_OP_MAP:
             (parent_id,) = next_op.inputs
-            if next_op.cudnn_name == "gen_index" and dict(next_op.op_attrs).get("axis") not in (1, 2):
+            if next_op.cudnn_name == "gen_index" and next_op.index_expr is None and dict(next_op.op_attrs).get("axis") not in (1, 2):
                 raise NotImplementedError(f"gen_index {next_op.op_name!r}: only axis 1 (M) or 2 (N) is supported " "in cudnn.gemm.frost")
-            fop = FusionOp(op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs)
+            fop = FusionOp(
+                op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs, index_expr=next_op.index_expr
+            )
         elif next_op.cudnn_name in _BINARY_OP_MAP:
             inp0, inp1 = next_op.inputs
             in0, in1 = _is_in_chain(inp0), _is_in_chain(inp1)
@@ -1544,7 +1555,162 @@ def _build_multi_moe_chain(
     return chain, binding
 
 
-def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
+def matrix_axis_index(shape, axis):
+    """Map a logical rank-N matrix axis to folded (batch, M, N) coordinates.
+
+    Batch extents are prepared constants, matching the existing fixed-prefix
+    binding contract. Matrix coordinates remain dynamic; no M/N value is baked.
+    """
+    shape, axis = tuple(map(index, shape)), index(axis)
+    if len(shape) < 2 or any(d <= 0 for d in shape) or not 0 <= axis < len(shape):
+        raise ValueError(f"gen_index requires positive matrix dimensions and a valid logical axis; got shape={shape}, axis={axis}")
+    if max(prod(shape[:-2]), *shape) > (1 << 63) - 1:
+        raise ValueError("gen_index batch geometry exceeds Int64")
+    if axis == len(shape) - 2:
+        return IndexExpr.coordinate(Axis.M)
+    if axis == len(shape) - 1:
+        return IndexExpr.coordinate(Axis.N)
+    if shape[axis] == 1:
+        return IndexExpr.constant(0)
+    coordinate = IndexExpr.coordinate(Axis.BATCH).floor_div(prod(shape[axis + 1 : -2]))
+    # The leading batch axis has no higher digits to discard.
+    return coordinate if axis == 0 else coordinate.modulo(shape[axis])
+
+
+def _lower_matrix_indices(
+    ops: list[_RecordedOp], ranked_shapes: dict[int, tuple[int, ...]], producers: dict[int, _RecordedOp], matmul_output: int
+) -> list[_RecordedOp]:
+    """Lower graph index coordinates before matrix shapes are batch-folded.
+
+    This handles the plain pointwise/GEMM scope only: epilogue structural views
+    and reductions are excluded by the caller. Prepared batch extents are fixed,
+    while operands and GEMM descendants retain live matrix coordinates even
+    when prepared at extent one.
+    """
+
+    @lru_cache(maxsize=None)
+    def follows_matmul_shape(tid):
+        if tid == matmul_output:
+            return True
+        producer = producers.get(tid)
+        return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
+
+    operand_nodes = set()
+
+    def collect_operands(tid):
+        if tid in operand_nodes:
+            return
+        operand_nodes.add(tid)
+        producer = producers.get(tid)
+        if producer is not None:
+            for source in producer.inputs:
+                collect_operands(source)
+
+    for source in producers[matmul_output].inputs:
+        collect_operands(source)
+    lowered = []
+    for op in ops:
+        if op.cudnn_name == "gen_index" and op.index_expr is None:
+            source = op.inputs[0]
+            dim = ranked_shapes[source]
+            axis = dict(op.op_attrs).get("axis")
+            expr = matrix_axis_index(dim, axis)
+            # Consumer matrix coordinates -> singleton producer coordinates.
+            # Auxiliary-only branches keep their unit extents when broadcast;
+            # compose before codegen/dtype rounding, not as a kernel fixup.
+            if op.output not in operand_nodes and not follows_matmul_shape(source):
+                coordinates = tuple(matrix_axis_index(dim, i) for i in range(len(dim)))
+                expr = IndexMap.broadcast(dim, dim).apply(coordinates)[index(axis)]
+            op = replace(op, index_expr=expr)
+        lowered.append(op)
+    return lowered
+
+
+def _operand_view_index_map(shape, steps):
+    """Compose logical consumer-to-producer views independently of index axes."""
+    mapping = IndexMap.identity(shape)
+    for step in steps:
+        view = (
+            IndexMap.reshape(mapping.consumer_shape, step.argument) if step.kind == "reshape" else IndexMap.permutation(mapping.consumer_shape, step.argument)
+        )
+        mapping = mapping.compose(view)
+    return mapping
+
+
+def _matrix_map_coordinates(mapping):
+    """Bind a logical IndexMap once; users select indices or lower storage separately."""
+    coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
+    return mapping.apply(coordinates)
+
+
+def _operand_index_expression(mapping, axis):
+    """Select a producer axis and bind it to folded matrix coordinates."""
+    axis = index(axis)
+    if not 0 <= axis < len(mapping.producer_shape):
+        raise ValueError("gen_index requires a valid logical producer axis")
+    return _matrix_map_coordinates(mapping)[axis]
+
+
+def _legacy_operand_aux_inputs(ops, meta, aux_steps, io_dtype, intermediate_dtype, compute_dtype) -> set[int]:
+    """Choose one auxiliary ABI from all operand consumers, before rank folding.
+
+    Logical accesses are already prepared. Only auxiliaries whose every use
+    admits a legacy per-K view can discard those maps. Distinct orientations
+    retain distinct zero-copy bindings. Otherwise original storage and
+    per-consumer maps remain intact.
+    """
+    if not aux_steps:
+        return set()
+    from .kernel_registry import per_k_scale_reject
+
+    producers = {op.output: op for op in ops}
+    mm = next(op for op in ops if op.cudnn_name == "matmul")
+    users: dict[int, list[tuple[str, _RecordedOp]]] = {}
+
+    @lru_cache(maxsize=None)
+    def roots(tid, side) -> frozenset[int]:
+        op = producers.get(tid)
+        if op is None:
+            return frozenset((tid,))
+        if op.aux_input is not None:
+            users.setdefault(op.aux_input, []).append((side, op))
+            inputs = [i for i in op.inputs if i != op.aux_input]
+        else:
+            inputs = [i for i in op.inputs if not (meta[i].dim and all(d == 1 for d in meta[i].dim))]
+        return frozenset().union(*(roots(i, side) for i in inputs))
+
+    storage = {side: roots(tid, side) for side, tid in zip(("a", "b"), mm.inputs)}
+    operand_dtype = {side: _resolve_out_dtype(tid, meta[tid].tensor, io_dtype, intermediate_dtype, meta) for side, tid in zip(("a", "b"), mm.inputs)}
+
+    def eligible(side, op, aux) -> bool:
+        steps = aux_steps[op.output]
+        if len(storage[side]) != 1 or len(aux.dim) < 2 or any(step.kind == "reshape" for step in steps):
+            return False
+        source = meta[next(iter(storage[side]))]
+        k_axis = Axis.N if side == "a" else Axis.M
+        axes = frozenset().union(*(expr.axes for expr in _matrix_map_coordinates(op.aux_mapping)))
+        if axes != {k_axis} or any(d != 1 and st != 1 for d, st in zip(aux.dim, aux.stride)):
+            return False
+        return (
+            per_k_scale_reject(
+                op=_BINARY_OP_MAP[op.cudnn_name],
+                operand_dtype=operand_dtype[side],
+                load_dtype=source.dtype if source.dtype != operand_dtype[side] else None,
+                major="k" if source.stride[-1 if side == "a" else -2] == 1 else "mn",
+                scale_stride=1,
+                scale_dtype=aux.dtype,
+                compute_dtype=op.compute_dtype or compute_dtype,
+                out_dtype=_resolve_out_dtype(op.output, op.output_tensor, io_dtype, intermediate_dtype, meta),
+            )
+            is None
+        )
+
+    return {aux_id for aux_id, consumers in users.items() if all(eligible(side, op, meta[aux_id]) for side, op in consumers)}
+
+
+def _normalize_operand_views(
+    ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype, compute_dtype: Dtype
+) -> list[_RecordedOp]:
     """Project ordered operand views through pointwise DAGs, then fold matrix rank.
 
     One producer map and shape/dtype cache serve reshape and transpose. Geometry
@@ -1565,7 +1731,21 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         return ops
     mm = matmuls[0]
     producers = {op.output: op for op in ops}
-    used, projected_ops, input_views = set(), [], {}
+    operand_sides: dict[int, set[str]] = {}
+
+    def mark_operand(tid, side):
+        sides = operand_sides.setdefault(tid, set())
+        if side in sides:
+            return
+        sides.add(side)
+        node = producers.get(tid)
+        if node is not None:
+            for inp in node.inputs:
+                mark_operand(inp, side)
+
+    for tid, side in zip(mm.inputs, ("a", "b")):
+        mark_operand(tid, side)
+    used, projected_ops, input_views, aux_steps = set(), [], {}, {}
     names = {m.name for m in meta.values()}
 
     @lru_cache(maxsize=None)
@@ -1653,6 +1833,46 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         return id(result)
 
     @lru_cache(maxsize=None)
+    def operand_index_map(dim, steps):
+        # Analysis-local cache: axes on the same view chain share one map,
+        # without retaining graphs or geometry across compilation requests.
+        return _operand_view_index_map(dim, steps)
+
+    @lru_cache(maxsize=None)
+    def index_only(tid):
+        node = producers.get(tid)
+        return node is not None and (node.cudnn_name == "gen_index" or (node.cudnn_name in _UNARY_OP_MAP and index_only(node.inputs[0])))
+
+    def auxiliary(op, steps):
+        """Select a full-shape carrier and map a read-only graph-input aux.
+
+        Shape broadcasting and view composition share IndexMap. Aux storage is
+        never reshaped to the carrier layout; it retains its original rank.
+        Scalar accesses keep their existing ABI. Non-scalar accesses are first
+        mapped uniformly; legacy optimization is chosen across all consumers.
+        """
+        if op.cudnn_name not in _BINARY_OP_MAP:
+            return None
+        dim = shape(op.output)
+
+        # A full-shape pair can have either carrier. Prefer an existing DAG
+        # value, then operand dtype and a TMA-compatible contiguous matrix axis.
+        # This is a storage/rounding choice, not a broadcast-axis whitelist.
+        candidates = sorted(
+            (op.inputs, op.inputs[::-1]), key=lambda pair: (pair[0] not in producers, dtype(pair[0]) != dtype(op.output), 1 not in meta[pair[0]].stride[-2:])
+        )
+        for primary, other in candidates:
+            if shape(primary) != dim or other in producers or not meta[other].is_input or index_only(primary) or primary == other:
+                continue
+            aux_dim = shape(other)
+            broadcast = IndexMap.broadcast(aux_dim, dim)
+            if all(d == 1 for d in aux_dim):
+                return None  # constant-address scalar route already has no rank limit
+            mapping = broadcast.compose(operand_index_map(dim, steps))
+            return primary, other, mapping
+        return None
+
+    @lru_cache(maxsize=None)
     def project(tid, steps=()):
         op = producers.get(tid)
         if op is None:
@@ -1667,16 +1887,24 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
             used.add(tid)
             step = ViewStep("reshape", shape(tid), meta[tid].stride) if op.cudnn_name == "reshape" else ViewStep("transpose", op.permutation)
             return project(op.inputs[0], (step, *steps))
+        prepared_aux = auxiliary(op, steps)
+        if prepared_aux is not None:
+            primary, other, mapping = prepared_aux
+            carrier = project(primary, steps)
+            inputs = [carrier if i == primary else other for i in op.inputs]
+            output = alias(tid, steps, meta[carrier])
+            projected_ops.append(replace(op, inputs=inputs, output=output, aux_input=other, aux_mapping=mapping))
+            aux_steps[output] = steps
+            return output
         reshaped = any(step.kind == "reshape" for step in steps)
         primary = next((i for i in op.inputs if not all(d == 1 for d in shape(i))), op.inputs[0])
         if reshaped:
-            if op.cudnn_name == "gen_index":
-                raise ValueError("reshape operand producer 'gen_index' is unsupported")
             if any(not all(d == 1 for d in shape(i)) and shape(i) != shape(primary) for i in op.inputs):
                 raise ValueError("reshape fusion supports equal-shaped pointwise operands or scalar auxiliaries, not partial broadcasts")
         inputs = [i if reshaped and i != primary and all(d == 1 for d in shape(i)) else project(i, steps) for i in op.inputs]
         output = alias(tid, steps, meta[inputs[op.inputs.index(primary)]])
-        projected_ops.append(replace(op, inputs=inputs, output=output))
+        expr = _operand_index_expression(operand_index_map(shape(tid), steps), dict(op.op_attrs).get("axis")) if op.cudnn_name == "gen_index" else op.index_expr
+        projected_ops.append(replace(op, inputs=inputs, output=output, index_expr=expr))
         return output
 
     if structural:
@@ -1714,6 +1942,27 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
                         raise ValueError("shared reshape input has an observable branch in incompatible coordinates")
                     meta[tid] = replace(m, operand_view=input_views[id(m.tensor)])
             ops = [op for op in ops if op.output in live]
+    else:
+        # Plain rank-N graphs use the very same selection/map preparation,
+        # without projecting the carrier or creating identity operand views.
+        prepared = []
+        for op in ops:
+            access = auxiliary(op, ()) if op.output in operand_sides else None
+            prepared.append(replace(op, aux_input=access[1], aux_mapping=access[2]) if access is not None else op)
+            if access is not None:
+                aux_steps[op.output] = ()
+        ops = prepared
+    legacy_aux = _legacy_operand_aux_inputs(ops, meta, aux_steps, io_dtype, intermediate_dtype, compute_dtype)
+    prepared = []
+    for op in ops:
+        if op.aux_mapping is not None:
+            if op.aux_input in legacy_aux:
+                aux_id = project(op.aux_input, aux_steps[op.output]) if aux_steps[op.output] else op.aux_input
+                op = replace(op, inputs=[aux_id if i == op.aux_input else i for i in op.inputs], aux_input=aux_id, aux_mapping=None)
+            else:
+                meta[op.aux_input] = replace(meta[op.aux_input], coordinate_aux=True)
+        prepared.append(op)
+    ops = prepared
     if fold_batches:
         batch_shape = shape(mm.output)[:-2]
         ranked_shapes = {tid: shape(tid) for tid in meta}
@@ -1721,23 +1970,11 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         # Ordered reshape views already prove their own layout. Do not put
         # untouched rank-3 slots on the general batch-fold path.
         matrix_views_required = (bool(structural) and not has_reshape) or output_dim != (prod(batch_shape), *output_dim[-2:])
-        # Index attributes describe the original logical tensor, not the kernel
-        # ABI. Only the final two axes have a one-to-one folded coordinate.
-        normalized_ops = []
-        for op in ops:
-            if op.cudnn_name == "gen_index":
-                rank = len(ranked_shapes[op.inputs[0]])
-                axis = dict(op.op_attrs).get("axis")
-                if axis not in (rank - 2, rank - 1):
-                    raise NotImplementedError(
-                        f"gen_index {op.op_name!r}: batch axis {axis} is unsupported; "
-                        f"only logical matrix axes {rank - 2} (M) and {rank - 1} (N) are supported"
-                    )
-                attrs = tuple((key, axis - rank + 3 if key == "axis" else value) for key, value in op.op_attrs)
-                op = replace(op, op_attrs=attrs)
-            normalized_ops.append(op)
-        ops = normalized_ops
+
+        ops = _lower_matrix_indices(ops, ranked_shapes, producers, mm.output)
         for tid, m in list(meta.items()):
+            if m.coordinate_aux:
+                continue
             dim = ranked_shapes[tid]
             if len(dim) < 2:
                 continue  # rank-one/scalar auxiliary ABI is already supported
@@ -1775,7 +2012,7 @@ def _walk_mainloop_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk operand pointwise ops to a graph input (scalar aux, or per-K multiply on either operand)."""
+    """Lower one same-carrier operand DAG, including indices and scalar/per-K auxiliaries."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
@@ -1807,29 +2044,46 @@ def _walk_mainloop_chain(
         expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
         return m.dim == expected and source_dim[3 - k_axis] != 1
 
-    # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
-    steps: list[tuple] = []
-    cur = operand_id
-    while cur in op_by_output:
-        producer = op_by_output[cur]
+    fops: list[FusionOp] = []
+
+    @lru_cache(maxsize=None)
+    def index_branch(tid):
+        producer = op_by_output.get(tid)
+        if producer is None:
+            return False
+        return producer.cudnn_name == "gen_index" or (producer.cudnn_name in _UNARY_OP_MAP and index_branch(producer.inputs[0]))
+
+    @lru_cache(maxsize=None)
+    def visit(tid):
+        producer = op_by_output.get(tid)
+        if producer is None:
+            return tid, -1
+        if _is_output(meta, tid):
+            raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: materialized intermediate outputs cannot be absorbed")
+        allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
         if producer.cudnn_name == "gen_index":
-            raise ValueError(
-                f"matmul {label} operand producer {producer.op_name!r}: gen_index is unsupported in mainloop fusion (requires logical operand coordinates)"
-            )
-        if producer.cudnn_name in _UNARY_OP_MAP or producer.cudnn_name in _BINARY_OP_MAP:
-            allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
-            for key, value in producer.op_attrs:
-                if key not in allowed_attrs:
-                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
-                if not isfinite(value):
-                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+            allowed_attrs = frozenset(("axis",))
+        for key, value in producer.op_attrs:
+            if key not in allowed_attrs:
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
+            if not isfinite(value):
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+        expr = producer.index_expr
         if producer.cudnn_name in _UNARY_OP_MAP:
-            steps.append((producer.cudnn_name, False, None, True, producer))
-            (cur,) = producer.inputs
+            root, parent = visit(producer.inputs[0])
+            if producer.cudnn_name == "gen_index":
+                if expr is None:
+                    raise ValueError(f"matmul {label} gen_index requires normalized logical operand coordinates")
+                expr = expr.substitute({Axis.N if label == "A" else Axis.M: IndexExpr.coordinate(Axis.K)})
+            fop = FusionOp(op=_UNARY_OP_MAP[producer.cudnn_name], parent_idx=parent, index_expr=expr)
         elif producer.cudnn_name in _BINARY_OP_MAP:
             i0, i1 = producer.inputs
             s0, s1 = _is_scalar_input(i0), _is_scalar_input(i1)
-            if s0 and not s1:
+            if producer.aux_input is not None:
+                aux_id = producer.aux_input
+                chain_id = i1 if aux_id == i0 else i0
+                aux_on_rhs = aux_id == i1
+            elif s0 and not s1:
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif s1 and not s0:
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
@@ -1837,58 +2091,61 @@ def _walk_mainloop_chain(
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif producer.cudnn_name == "mul" and _is_per_k_input(i1, i0):
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif index_branch(i0) or index_branch(i1):
+                root, parent = visit(i0)
+                other_root, other = visit(i1)
+                if root != other_root:
+                    raise ValueError("mainloop index fan-in requires the same storage carrier on both branches")
+                fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], parent_idx=parent, parent_idx_b=other)
+                aux_id = None
             else:
                 raise ValueError(
-                    f"matmul {label} operand is produced by binary op "
-                    f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
-                    "fusion supports a binary op with exactly one SCALAR graph-input aux "
-                    "(e.g. A * alpha), or mul with an A-side [1,1,K] or B-side [1,K,1] scale"
+                    f"matmul {label} operand is produced by binary op {producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
+                    "fusion supports a binary op with exactly one SCALAR graph-input aux, per-K mul, or a same-carrier gen_index branch"
                 )
-            aux_meta = meta[aux_id]
-            if aux_id not in aux_seen:
-                aux_seen.add(aux_id)
-                scalar_aux = _is_scalar_input(aux_id)
-                aux_tensors.append(
-                    TensorRef(
-                        name=aux_meta.name,
-                        dim=aux_meta.dim,
-                        stride=aux_meta.stride,
-                        dtype=aux_meta.dtype,
-                        bcast_mode="scalar" if scalar_aux else "per_k",
-                        reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
+            if aux_id is not None:
+                root, parent = visit(chain_id)
+                aux_meta = meta[aux_id]
+                if aux_id not in aux_seen:
+                    aux_seen.add(aux_id)
+                    scalar_aux = _is_scalar_input(aux_id)
+                    mapped = producer.aux_mapping is not None
+                    aux_tensors.append(
+                        TensorRef(
+                            name=aux_meta.name,
+                            dim=aux_meta.dim,
+                            stride=aux_meta.stride,
+                            dtype=aux_meta.dtype,
+                            bcast_mode="per_elem" if mapped else "scalar" if scalar_aux else "per_k",
+                            reduction_axis=None if mapped or scalar_aux else (2 if label == "A" else 1),
+                            coordinate_mapped=mapped,
+                        )
                     )
-                )
-                aux_objs.append(aux_meta.tensor)
-            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs, producer))
-            cur = chain_id
+                    aux_objs.append(aux_meta.tensor)
+                fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], aux=aux_meta.name, aux_on_rhs=aux_on_rhs, parent_idx=parent)
+                if producer.aux_mapping is not None:
+                    mapping = producer.aux_mapping
+                    replacement = {Axis.N if label == "A" else Axis.M: IndexExpr.coordinate(Axis.K)}
+                    access = tuple(expr.substitute(replacement) for expr in _matrix_map_coordinates(mapping))
+                    dim = mapping.consumer_shape
+                    mn, k = dim[-2:] if label == "A" else dim[-2:][::-1]
+                    fop = replace(fop, operand_access=OperandAccess((prod(dim[:-2]), mn, k), access))
         else:
             raise ValueError(
-                f"matmul {label} operand is produced by op {producer.op_name!r} "
-                f"({producer.cudnn_name!r}) which is not a pointwise op — mainloop "
-                "fusion supports unary ops, scalar-aux binary ops and per-K mul"
+                f"matmul {label} operand is produced by op {producer.op_name!r} ({producer.cudnn_name!r}) which is not a pointwise op — mainloop fusion supports unary ops, scalar-aux binary ops and per-K mul"
             )
-    steps.reverse()
-    fops: list[FusionOp] = []
-    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs, producer) in enumerate(steps):
-        parent = idx - 1 if idx > 0 else -1
-        if is_binary:
-            fops.append(
-                FusionOp(
-                    op=_BINARY_OP_MAP[cudnn_name],
-                    aux=aux_name,
-                    aux_on_rhs=aux_on_rhs,
-                    parent_idx=parent,
-                )
+        fops.append(
+            replace(
+                fop,
+                attrs=producer.op_attrs,
+                compute_dtype=producer.compute_dtype or compute_dtype,
+                out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
             )
-        else:
-            fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
-        fops[-1] = replace(
-            fops[-1],
-            attrs=producer.op_attrs,
-            compute_dtype=producer.compute_dtype or compute_dtype,
-            out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
         )
-    return cur, fops
+        return root, len(fops) - 1
+
+    root, _ = visit(operand_id)
+    return root, fops
 
 
 def _build_multi_gemm_chain(
@@ -2212,7 +2469,7 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
     meta = dict(state["tensor_meta"])
-    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
+    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"], state["compute_dtype"])
     return _build_chain(
         ops,
         meta,

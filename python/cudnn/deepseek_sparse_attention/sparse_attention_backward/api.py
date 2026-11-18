@@ -24,6 +24,23 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
+from ._sm90_relay import (
+    SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    sm90_conflict_rank_relay_phases,
+    sm90_deterministic_relay_accumulator_elements,
+    sm90_deterministic_relay_indexing_error,
+    sm90_deterministic_relay_requirement_error,
+    sm90_physical_relay_cluster_size,
+)
+
+
+def _checked_deterministic_relay_cluster_size(value: Optional[int]) -> Optional[int]:
+    """Validate the public plan-time relay override without coercion."""
+    if value is None:
+        return None
+    if type(value) is not int or value not in (4, 8, 16, 32, 64):
+        raise ValueError(f"deterministic_relay_cluster_size must be one of {{4, 8, 16, 32, 64}} or None, got {value!r}")
+    return value
 
 
 class SparseAttentionBackward(APIBase):
@@ -45,6 +62,11 @@ class SparseAttentionBackward(APIBase):
         block_tile: int = 64,
         deterministic: bool = False,
         q_cluster_mode: str = "off",
+        deterministic_relay_cluster_size: Optional[int] = None,
+        deterministic_dkv_mode: str = "records",
+        *,
+        return_cli_target: bool = False,
+        cli_target_head_count: Optional[int] = None,
     ):
         """Capture the sample tensor contract and execution policy.
 
@@ -52,8 +74,54 @@ class SparseAttentionBackward(APIBase):
         graph-safe adjacent-query sharing plan; the default keeps the existing
         backend unchanged. H16 ``topk_max <= 256`` and H32 ``topk_max <= 128``
         accept the mode but retain the ordinary backend.
+
+        ``deterministic_relay_cluster_size`` optionally requests an exact
+        4-, 8-, 16-, 32-, or 64-CTA logical deterministic dKV relay. SM90
+        uses this relay only when the option is explicit; otherwise the default
+        ``'records'`` mode uses conflict-rank storage. SM100 generic-M64
+        large-context plans retain their automatic relay policy. The widest
+        launchable physical C16/C8/C4 cluster is selected for an SM90 relay;
+        wider logical relays use ordered same-stream phases. The logical choice
+        is compiled into the plan and changes its workspace requirement;
+        neither choice can change during CUDA Graph replay.
+
+        ``deterministic_dkv_mode`` selects the dKV storage of deterministic
+        SM90 plans and SM100 plans of the generic M64 kernel and H128 D512/D576
+        two-CTA kernels, and is compiled into the plan:
+
+        - ``'records'`` (default): conflict-rank storage. SM90 uses four dense
+          planes: ranks zero to three use separate planes and larger ranks
+          deterministically chain through plane zero. A prepared SM90 plan
+          divides each 128-query wave into cooperative power-of-two phases with
+          at most one CTA per device SM; this device choice is fixed before
+          execution and CUDA Graph capture. SM100 records plans put
+          rank ``k`` in dense plane ``k`` while it fits and use slot-private
+          overflow records otherwise; records and planes are combined in a
+          fixed order. Shapes whose conflict-rank workspace would exceed the
+          ``'shards'`` layout use that layout instead. H128 two-CTA plans use
+          their own conflict-rank storage where its workspace fits their
+          private-plane layout, and that layout elsewhere.
+        - ``'chain'``: the chain relay (every head block of a wave in one
+          launch; the CTAs sharing a plane row add along a per-row chain in a
+          fixed order) where its workspace fits, and the ``'records'`` rule
+          elsewhere.
+        - ``'shards'``: the bounded-wave shard layout, or the cluster relay
+          for large contexts, chosen from the query and KV extents alone; the
+          private-plane layout for every shape on the H128 two-CTA backends.
+
+        Each mode is bitwise reproducible from run to run; the modes round
+        differently from one another. Values other than the default require
+        ``deterministic=True``. ``'chain'`` is rejected on SM90 and on the
+        two-CTA backends, and cannot be combined with
+        ``deterministic_relay_cluster_size``; an explicit relay size selects
+        the SM90 cluster relay even when the requested mode is ``'records'``.
+        On SM100-family devices other than SM100/SM103, a
+        ``'records'`` plan runs the ``'shards'`` layouts and ``'chain'`` is
+        rejected.
         """
         super().__init__()
+        self.return_cli_target = bool(return_cli_target)
+        self.cli_target_head_count = cli_target_head_count
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
         self.kv_desc = self._make_tensor_desc(sample_kv, name="sample_kv")
         self.out_desc = self._make_tensor_desc(sample_out, name="sample_out")
@@ -66,6 +134,12 @@ class SparseAttentionBackward(APIBase):
         self.softmax_scale = softmax_scale
         self.deterministic = bool(deterministic)
         self.q_cluster_mode = q_cluster_mode
+        self.deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
+        self._sm90_deterministic_relay_cluster_size = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE
+        self._sm90_physical_relay_cluster_size = 1
+        self._sm90_conflict_rank_phases = None
+        self.deterministic_dkv_mode = deterministic_dkv_mode
+        self._dkv_mode = deterministic_dkv_mode
         self._backend = None
         self._backend_block_tile = None
         self._device_major = None
@@ -105,9 +179,11 @@ class SparseAttentionBackward(APIBase):
         capability = torch.cuda.get_device_capability(self.q_desc.device)
         major, _ = capability
         self._device_major = major
+        # Only SM90 and the SM100-family targets in _SM100_FAMILY_ARCH_FLAGS have a backward kernel. Any other part
+        # (cc 11.x, cc 12.x) would reach compile() as an "SM90" plan and then be dispatched to the SM100 launch.
         self._runtime_error_if(
-            major < 9,
-            f"SparseAttentionBackward requires SM90+, found SM{major}",
+            major != 9 and capability not in _iface_sm100._SM100_FAMILY_ARCH_FLAGS,
+            f"SparseAttentionBackward requires SM90 or compute capability in {tuple(_iface_sm100._SM100_FAMILY_ARCH_FLAGS)}, found {capability}",
         )
         self._value_error_if(
             self.q_desc.ndim != 3,
@@ -175,10 +251,40 @@ class SparseAttentionBackward(APIBase):
                 or not all(desc.is_contiguous() for desc in descriptors),
                 "q_cluster_mode='adaptive_pair' requires contiguous SM100 BF16 H16/H32 Dqk576 inputs, " "non-deterministic execution, and 1 <= topk <= 2048",
             )
+        mode_error = _iface_sm100.deterministic_dkv_mode_error(self.deterministic_dkv_mode, self.deterministic)
+        self._value_error_if(mode_error is not None, mode_error)
         self._value_error_if(
-            self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
-            f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
+            self.deterministic_dkv_mode == "chain" and self.deterministic_relay_cluster_size is not None,
+            "deterministic_dkv_mode='chain' cannot be combined with an explicit deterministic_relay_cluster_size",
         )
+        self._value_error_if(
+            self.deterministic and (major not in (9, 10) or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
+            f"deterministic DSA backward requires SM90/SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
+        )
+        self._value_error_if(
+            self.deterministic_relay_cluster_size is not None and not self.deterministic,
+            "deterministic_relay_cluster_size requires deterministic=True",
+        )
+        # SM90 plans have no generic M64 kernel: a chain request is rejected rather than ignored.
+        self._value_error_if(
+            major != 10 and self.deterministic_dkv_mode == "chain",
+            "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend",
+        )
+        # SM90 and SM100/SM103 provide conflict-rank dKV storage. Other SM100-family targets run 'records' as
+        # 'shards'. Every selection and sizing call of the plan uses the resolved mode.
+        self._dkv_mode = self.deterministic_dkv_mode
+        if major == 10:
+            mode_error = _iface_sm100.deterministic_dkv_mode_error(self.deterministic_dkv_mode, self.deterministic, device_capability=capability)
+            self._value_error_if(mode_error is not None, mode_error)
+            self._dkv_mode = _iface_sm100.effective_deterministic_dkv_mode(self.deterministic_dkv_mode, self.deterministic, capability)
+        if major == 9 and self.deterministic:
+            relay_requirement_error = sm90_deterministic_relay_requirement_error()
+            self._runtime_error_if(relay_requirement_error is not None, relay_requirement_error)
+            if self.deterministic_relay_cluster_size is not None:
+                self._dkv_mode = "shards"
+            self._sm90_deterministic_relay_cluster_size = (
+                SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE if self.deterministic_relay_cluster_size is None else self.deterministic_relay_cluster_size
+            )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
         # layout that indexes shared memory out of bounds and crashes.
@@ -186,6 +292,17 @@ class SparseAttentionBackward(APIBase):
             head_dim not in (512, 576),
             f"head_dim must be 512 or 576, got {head_dim}",
         )
+        if major == 9 and self.deterministic:
+            accumulator_elements = sm90_deterministic_relay_accumulator_elements(
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                num_heads,
+                self._sm90_deterministic_relay_cluster_size,
+                conflict_rank=self._dkv_mode == "records",
+            )
+            indexing_error = sm90_deterministic_relay_indexing_error(accumulator_elements)
+            self._value_error_if(indexing_error is not None, indexing_error)
         head_dim_v = 512 if head_dim == 576 else head_dim
         expected_o_shape = (total_s_q, num_heads, head_dim_v)
         self._value_error_if(
@@ -234,6 +351,10 @@ class SparseAttentionBackward(APIBase):
                 device_capability=capability,
                 deterministic=self.deterministic,
                 is_contiguous=all(desc.is_contiguous() for desc in descriptors),
+                total_s_q=total_s_q,
+                total_s_kv=self.kv_desc.shape[0],
+                deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
+                dkv_mode=self._dkv_mode,
             )
             self._wide_addressing = _iface_sm100._requires_wide_data_addressing(
                 total_s_q,
@@ -245,7 +366,12 @@ class SparseAttentionBackward(APIBase):
                 self.deterministic,
                 self._backend,
                 include_workspace=self._backend not in _iface_d576.BACKENDS,
+                deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
+                dkv_mode=self._dkv_mode,
             )
+        if major == 10:
+            mode_error = _iface_sm100.deterministic_dkv_mode_error(self._dkv_mode, self.deterministic, self._backend)
+            self._value_error_if(mode_error is not None, mode_error)
         if self.deterministic and self._backend == "generic_m64":
             # Resolve the shape-dependent policy during support checking so a
             # relay-only DSL requirement fails before compilation. Ordinary
@@ -257,7 +383,12 @@ class SparseAttentionBackward(APIBase):
                 self.kv_desc.shape[0],
                 head_dim,
                 num_heads,
+                self.deterministic_relay_cluster_size,
+                max_topk=self.topk_idxs_desc.shape[1],
+                dkv_mode=self._dkv_mode,
             )
+        elif major == 10 and self.deterministic_relay_cluster_size is not None:
+            raise ValueError("deterministic_relay_cluster_size is supported only by the deterministic SM100 generic_m64 backend")
         if self._backend in _iface_d576.BACKENDS:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
             if self.deterministic:
@@ -275,6 +406,31 @@ class SparseAttentionBackward(APIBase):
                     f"SparseAttentionBackward addresses only contiguous {name}; got shape {desc.shape} strides {desc.stride}",
                 )
 
+        if self.return_cli_target:
+            self._runtime_error_if(self._device_major != 9, "CLI teacher-target output requires SM90")
+            self._value_error_if(
+                self.q_desc.shape[1] != 64,
+                "CLI output requires one padded 64-head block",
+            )
+            self._value_error_if(
+                self.cli_target_head_count is None or not 0 < self.cli_target_head_count <= 64,
+                "cli_target_head_count must be in [1, 64]",
+            )
+        elif self.cli_target_head_count is not None:
+            self._value_error_if(True, "cli_target_head_count requires return_cli_target=True")
+
+        # Defer device scheduling queries until every inexpensive support check
+        # has passed.  Shards query cluster occupancy; records only read the SM
+        # count.  Both results belong to the prepared plan and are never
+        # recomputed by execute() or CUDA Graph replay.
+        if major == 9 and self.deterministic and self._dkv_mode == "shards":
+            self._sm90_physical_relay_cluster_size = sm90_physical_relay_cluster_size(
+                self._sm90_deterministic_relay_cluster_size,
+                self.q_desc.device,
+            )
+        elif major == 9 and self.deterministic and self._dkv_mode == "records" and self._sm90_conflict_rank_phases is None:
+            sm_count = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
+            self._sm90_conflict_rank_phases = sm90_conflict_rank_relay_phases(sm_count)
         self._is_supported = True
         return True
 
@@ -307,6 +463,8 @@ class SparseAttentionBackward(APIBase):
                 self._compiled_kernel = self._qcluster_plan
                 return
         if self._backend in _iface_d576.BACKENDS:
+            rank_args = (self.kv_desc.shape[0], self.topk_idxs_desc.shape[1], self.deterministic, self.q_desc.shape[1], self._dkv_mode)
+            rank_rounds = _iface_d576._rank_shard_rounds(*rank_args)
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_d576._compile_d576_2cta(
                     torch.cuda.get_device_capability(self.q_desc.device),
@@ -317,14 +475,16 @@ class SparseAttentionBackward(APIBase):
                     self.deterministic,
                     self.q_desc.shape[1],
                     (
-                        _iface_d576._deterministic_compact_slots(torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count)
+                        _iface_d576._deterministic_compact_slots(torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count, rank_rounds)
                         if self.deterministic
                         else 74
                     ),
                     self._wide_addressing,
+                    rank_rounds,
+                    _iface_d576._odo_precompute(*rank_args),
                 )
             return
-        if self.deterministic:
+        if self.deterministic and self._device_major == 10:
             total_s_q, num_heads, head_dim = self.q_desc.shape
             head_dim_v = self.out_desc.shape[2]
             kernel_cls = _iface_sm100._get_sm100_kernel_class(
@@ -334,9 +494,16 @@ class SparseAttentionBackward(APIBase):
                 self.kv_desc.shape[0],
                 head_dim,
                 num_heads,
+                self.deterministic_relay_cluster_size,
+                max_topk=self.topk_idxs_desc.shape[1],
+                dkv_mode=self._dkv_mode,
             )
             shards = kernel_cls.num_dkv_shards
             relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
+            dkv_layout = getattr(kernel_cls, "dkv_layout", "shards")
+            rank_wave, rank_mode = _iface_sm100._rank_plan_config(
+                kernel_cls, self._backend, num_heads, head_dim, self.topk_idxs_desc.shape[1], total_s_q, self.kv_desc.shape[0]
+            )
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_sm100._compile_deterministic_sm100(
                     self.q_desc.device.index,
@@ -351,6 +518,11 @@ class SparseAttentionBackward(APIBase):
                     shards,
                     relay_cluster_size,
                     self._wide_addressing,
+                    rank_fused=getattr(kernel_cls, "rank_fused", False),
+                    rank_few_planes=getattr(kernel_cls, "rank_few_planes", False),
+                    rank_wave=rank_wave,
+                    rank_mode=rank_mode,
+                    dkv_layout=dkv_layout,
                 )
             return
         if self._device_major == 10:
@@ -380,10 +552,25 @@ class SparseAttentionBackward(APIBase):
         or 128-plane FP32 dKV accumulator. Large-context plans that would
         exceed 16 GiB instead use 8, 16, or 32 planes plus packed row-relay
         masks; the eight-plane memory-first tier is selected when the preferred
-        relay would exceed 32 GiB. Deterministic H96/H128 D576 two-CTA plans use
-        the compact 96-plane capacity. The returned size is authoritative for
-        this plan; ``execute()`` accepts a larger contiguous uint8 buffer on the
-        plan device but never allocates one.
+        relay would exceed 32 GiB. An explicit relay cluster size reports that
+        exact specialization even when it exceeds the automatic budget. Without
+        one, generic deterministic plans use conflict-rank storage when it is
+        not larger than the shard or relay layout.
+        Deterministic H128 D512 and D576 two-CTA plans use conflict-rank dKV
+        storage when it fits their private-plane layout (128 D512 or 96 D576
+        FP32 planes) and that layout otherwise and under
+        ``deterministic_dkv_mode='shards'``; H96 D576 two-CTA plans use the
+        96-plane layout. The D576 conflict-rank size depends on the SM count of the plan
+        device (the cluster pairs each wave round launches), so query it for
+        the device that executes the plan: a size from a device with fewer SMs
+        can be too small, and ``execute()`` then rejects the workspace. On
+        SM90, conflict-rank storage uses four FP32 planes followed by two
+        128-bit selection bitmaps per KV row and query wave. An explicit
+        logical cluster size 4, 8, 16, 32, or 64 instead uses 32, 16, 8, 4, or
+        2 FP32 planes respectively, followed by packed relay-mask rows. The
+        returned size is authoritative for this plan; ``execute()`` accepts a
+        larger contiguous uint8 buffer on the plan device but never allocates
+        one.
         """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)
@@ -397,7 +584,22 @@ class SparseAttentionBackward(APIBase):
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
-            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(total_s_q, total_s_kv, head_dim, num_heads)
+            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(
+                total_s_q,
+                total_s_kv,
+                head_dim,
+                num_heads,
+                deterministic=self.deterministic,
+                deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
+                deterministic_dkv_mode=self._dkv_mode,
+            )
+        launch_pairs = None
+        if self.deterministic and self._backend in _iface_d576.BACKENDS:
+            # Conflict-rank slot regions follow the wave this device launches.
+            launch_pairs = _iface_d576._deterministic_compact_slots(
+                torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count,
+                _iface_d576._rank_shard_rounds(total_s_kv, self.topk_idxs_desc.shape[1], self.deterministic, self.q_desc.shape[1], self._dkv_mode),
+            )
         return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
             total_s_q,
             total_s_kv,
@@ -405,7 +607,42 @@ class SparseAttentionBackward(APIBase):
             num_heads,
             self.deterministic,
             backend=self._backend,
+            deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
+            max_topk=self.topk_idxs_desc.shape[1],
+            launch_pairs=launch_pairs,
+            dkv_mode=self._dkv_mode,
         )
+
+    def _deterministic_dkv_route(self) -> Optional[str]:
+        """Return the selected deterministic dKV reduction, or ``None`` where no route applies.
+
+        ``'chain'`` (chain relay), ``'records'`` (conflict-rank records) or ``'shards'`` (shard or
+        cluster-relay planes: ``deterministic_dkv_mode='shards'``, an explicit
+        ``deterministic_relay_cluster_size``, a shape whose conflict-rank workspace would be larger, or a
+        device without conflict-rank storage). SM90 reports ``'records'`` for its four-plane conflict-rank
+        path and ``'shards'`` for an explicit logical relay.
+        A ``deterministic_dkv_mode='chain'`` plan reports ``'chain'`` only where the chain relay applies.
+        """
+        self._ensure_support_checked()
+        major, _ = device_capability(self.q_desc.device)
+        if major == 9:
+            return self._dkv_mode if self.deterministic else None
+        if not self.deterministic or self._backend != "generic_m64":
+            return None
+        total_s_q, num_heads, head_dim = self.q_desc.shape
+        kernel_cls = _iface_sm100._get_sm100_kernel_class(
+            self._backend,
+            True,
+            total_s_q,
+            self.kv_desc.shape[0],
+            head_dim,
+            num_heads,
+            self.deterministic_relay_cluster_size,
+            max_topk=self.topk_idxs_desc.shape[1],
+            dkv_mode=self._dkv_mode,
+        )
+        layout = getattr(kernel_cls, "dkv_layout", "shards")
+        return layout if layout in ("records", "chain") else "shards"
 
     def execute(
         self,
@@ -424,6 +661,7 @@ class SparseAttentionBackward(APIBase):
         workspace: Optional[torch.Tensor] = None,
         *,
         d_sink: torch.Tensor,
+        cli_target: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dispatch one validated execution to the active GPU architecture.
 
@@ -435,11 +673,18 @@ class SparseAttentionBackward(APIBase):
         pairing makes its overlap decision on device and launches only stages
         compiled by ``compile()``, so replay needs no host branch or D2H read.
         SM100 runtime inputs must match the sample contract used to compile the
-        plan. SM90 retains its legacy first-execute compilation behavior.
+        plan. SM90 retains its legacy first-execute compilation behavior; after
+        one eager warm-up, its allocation-free execute path is CUDA Graph
+        capturable with fixed tensor addresses.
         Inputs, outputs, and the live workspace must not overlap; concurrent
         executions need distinct output and workspace storage.
         """
         self._ensure_support_checked()
+        if (cli_target is not None) != self.return_cli_target:
+            raise ValueError("cli_target presence must match the compiled return_cli_target plan")
+        if cli_target is not None:
+            if cli_target.shape != topk_idxs.shape or cli_target.dtype != torch.float32 or cli_target.device != q.device or not cli_target.is_contiguous():
+                raise ValueError("cli_target must be contiguous FP32 on Q's device with Top-K shape")
         for name, tensor in (("dq", dq), ("dkv", dkv), ("d_sink", d_sink)):
             if not isinstance(tensor, torch.Tensor):
                 raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
@@ -467,6 +712,7 @@ class SparseAttentionBackward(APIBase):
                 self._two_cta_split_count,
                 current_stream,
                 deterministic=self.deterministic,
+                dkv_mode=self._dkv_mode,
             )
         if self._qcluster_plan is not None:
             scale = 1.0 / math.sqrt(self.q_desc.shape[2]) if scale is None else scale
@@ -509,6 +755,13 @@ class SparseAttentionBackward(APIBase):
                     softmax_scale=scale,
                     topk_length=topk_length,
                     current_stream=current_stream,
+                    deterministic=self.deterministic,
+                    deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
+                    deterministic_dkv_mode=self._dkv_mode,
+                    cli_target=cli_target,
+                    cli_target_head_count=(self.cli_target_head_count if self.return_cli_target else 0),
+                    physical_relay_cluster_size=self._sm90_physical_relay_cluster_size,
+                    conflict_rank_phases=self._sm90_conflict_rank_phases,
                 )
             return _iface_sm100.flash_attn_bwd_sm100(
                 q,
@@ -527,6 +780,8 @@ class SparseAttentionBackward(APIBase):
                 workspace=workspace,
                 current_stream=current_stream,
                 _compiled_kernel=self._compiled_kernel,
+                deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
+                dkv_mode=self._dkv_mode,
             )
 
 
@@ -550,13 +805,18 @@ def sparse_attention_backward_wrapper(
     stream: Optional[cuda.CUstream] = None,
     workspace: Optional[torch.Tensor] = None,
     q_cluster_mode: str = "off",
+    deterministic_relay_cluster_size: Optional[int] = None,
+    deterministic_dkv_mode: str = "records",
+    *,
+    return_cli_target: bool = False,
+    cli_target_head_count: Optional[int] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
     Dispatches to SM90 or SM100 from the input device and tensor metadata. The
     returned ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
     ``deterministic=True`` for bitwise-reproducible
-    H16/H32/H64/H96/H128 gradients on SM100. The optional reusable uint8
+    H16/H32/H64/H96/H128 gradients on SM90 or SM100. The optional reusable uint8
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
 
@@ -571,11 +831,36 @@ def sparse_attention_backward_wrapper(
     ``topk_max <= 2048``, requires non-deterministic execution, and remains
     graph-capturable. Low-overlap pairs fall back on device; H16
     ``topk_max <= 256`` and H32 ``topk_max <= 128`` use the ordinary backend.
+    ``deterministic_dkv_mode`` is forwarded to ``SparseAttentionBackward``,
+    which resolves it for the input device.
     The wrapper stages strided inputs and outputs and allocates omitted outputs
     or workspace on the launch stream; the plan's ``execute()`` does neither.
+    ``deterministic_relay_cluster_size`` optionally fixes a deterministic
+    SM90 or SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or
+    64-CTA logical relay. SM90 uses the widest launchable C16/C8/C4 physical
+    cluster and ordered phases when necessary. ``None`` selects conflict-rank
+    records on SM90 and the automatic policy on SM100. An SM90 records plan
+    divides each 128-query wave into cooperative power-of-two phases with at
+    most one CTA per device SM. These plan-time choices change the required
+    workspace or launch schedule and remain fixed across every execution and
+    CUDA Graph replay of the cached plan.
     """
+    if return_cli_target and cli_target_head_count is None:
+        cli_target_head_count = q.shape[1]
+    if not return_cli_target and cli_target_head_count is not None:
+        raise ValueError("cli_target_head_count requires return_cli_target=True")
+    deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
+    if deterministic_relay_cluster_size is not None and not deterministic:
+        raise ValueError("deterministic_relay_cluster_size requires deterministic=True")
     if q_cluster_mode not in ("off", "adaptive_pair"):
         raise ValueError(f"q_cluster_mode must be 'off' or 'adaptive_pair', got {q_cluster_mode!r}")
+    # Like the relay width, the dKV mode is checked before any input is staged; check_support repeats these
+    # checks for direct plan construction and adds the architecture and backend checks.
+    mode_error = _iface_sm100.deterministic_dkv_mode_error(deterministic_dkv_mode, deterministic)
+    if mode_error is not None:
+        raise ValueError(mode_error)
+    if deterministic_dkv_mode == "chain" and deterministic_relay_cluster_size is not None:
+        raise ValueError("deterministic_dkv_mode='chain' cannot be combined with an explicit deterministic_relay_cluster_size")
     # The plan addresses contiguous tensors only (check_support declines the rest, R5).
     # The wrapper is the eager torch-op layer: it normalises strided inputs here, on the
     # launch stream, as it always did, and stages a strided caller output so the
@@ -601,7 +886,12 @@ def sparse_attention_backward_wrapper(
         softmax_scale,
         bool(deterministic),
         q_cluster_mode,
+        deterministic_relay_cluster_size,
     )
+    if deterministic_dkv_mode != "records":
+        key += (deterministic_dkv_mode,)
+    if return_cli_target:
+        key += ("cli_target", cli_target_head_count)
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
         obj = SparseAttentionBackward(
@@ -617,6 +907,10 @@ def sparse_attention_backward_wrapper(
             block_tile=block_tile,
             deterministic=deterministic,
             q_cluster_mode=q_cluster_mode,
+            deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+            deterministic_dkv_mode=deterministic_dkv_mode,
+            return_cli_target=return_cli_target,
+            cli_target_head_count=cli_target_head_count,
         )
         assert obj.check_support()
         obj.compile()
@@ -639,6 +933,7 @@ def sparse_attention_backward_wrapper(
             elif not dkv.is_contiguous():
                 dkv = torch.empty(dkv.shape, dtype=dkv.dtype, device=dkv.device)
             d_sink = torch.empty_like(attn_sink)
+            cli_target = torch.empty(topk_idxs.shape, dtype=torch.float32, device=q.device) if return_cli_target else None
 
     dq_out, dkv_out, d_sink_out = obj.execute(
         q,
@@ -655,6 +950,7 @@ def sparse_attention_backward_wrapper(
         workspace=workspace,
         current_stream=launch_stream,
         d_sink=d_sink,
+        cli_target=cli_target,
     )
     # Copy-back into the caller's strided outputs: the destination is recorded on the launch stream first (R1 staging).
     if dq_user is not None and dq_user is not dq_out:
@@ -663,4 +959,7 @@ def sparse_attention_backward_wrapper(
     if dkv_user is not None and dkv_user is not dkv_out:
         copy_into_on_stream(dkv_user, dkv_out, launch_stream, q.device)
         dkv_out = dkv_user
-    return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)
+    result = TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)
+    if return_cli_target:
+        result["cli_target"] = cli_target
+    return result

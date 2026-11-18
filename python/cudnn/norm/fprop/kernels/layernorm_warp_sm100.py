@@ -27,7 +27,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, smem_capacity
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity, dsl_compile_lock
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
@@ -499,22 +499,16 @@ _MBPM = 0
 # 8x collapses to 0.77x. For wn==1 (small C, cheap 1-2-ldg rows) latency is hidden by
 # raw occupancy, so fill the machine (mult=8; clamped to full_ctas for huge-N shapes).
 _CTAS_CAP = 0  # test override; 0 = use the formula
-_SM_COUNT = None
 
 
 def _persist_cap(full_ctas, block_threads, wn, ldgs):
-    global _SM_COUNT
     if _CTAS_CAP:
         return min(full_ctas, _CTAS_CAP)
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
     if wn > 1:
         mult = max(2, min(16, round(4096 / (block_threads * ldgs))))
     else:
         mult = 8
-    return min(full_ctas, _SM_COUNT * mult)
+    return min(full_ctas, sm_count() * mult)
 
 
 _KCACHE = {}
@@ -557,13 +551,8 @@ def _pipe_stages(C):
 
 
 def _pipe_cap(full_ctas, C):
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
     mult = max(2, min(6, round(16384 / C)))  # >6x overshoots at tiny C (qwen-2048)
-    return min(full_ctas, _SM_COUNT * mult)
+    return min(full_ctas, sm_count() * mult)
 
 
 def _pipe_eligible(C, wn, has_beta, eb):
@@ -615,10 +604,13 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params, out_y=None, out_mean=N
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(
-            _warp_fwd_host, *_fakes(et, C), cutlass.Int32(0), cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi"
-        )
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(
+                    _warp_fwd_host, *_fakes(et, C), cutlass.Int32(0), cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi"
+                )
+                _KCACHE[key] = fn
     fn(ffi(x2d), ffi(y), ffi(gamma), ffi(beta), ffi(mean), ffi(rstd), R, ctas, eps, cur_stream())
     return y, mean, rstd
 
@@ -662,9 +654,12 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta, out_y=
     key = ("pipe", params.io_dtype) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(
-            _warp_fwd_pipe_host, *_fakes(et, C), cutlass.Int32(0), cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi"
-        )
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(
+                    _warp_fwd_pipe_host, *_fakes(et, C), cutlass.Int32(0), cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi"
+                )
+                _KCACHE[key] = fn
     fn(ffi(x2d), ffi(y), ffi(gamma), ffi(beta), ffi(mean), ffi(rstd), R, ctas, eps, cur_stream())
     return y, mean, rstd

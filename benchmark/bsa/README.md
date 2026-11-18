@@ -5,7 +5,7 @@
 | `benchmark_sm90_blk128.py` | SM90: native blk128 vs. the same sparse graph expressed in blk64 |
 | `benchmark_sm120_blk128.py` | SM120: native blk128 BF16 forward |
 | `benchmark_sm120_fp8_blk128.py` | SM120: FP8 blk64 vs blk128, or blk128 per-16-token vs per-token K scaling |
-| `benchmark_sm100_kpage.py` | SM100/SM103: blk128 BSA with and without `kpage` on layouts from open-source video sparse-attention systems |
+| `benchmark_sm100_kpage.py` | SM100/SM103 and SM90: blk128 BSA with and without `kpage` on layouts from open-source video sparse-attention systems |
 
 ## SM120 per-token FP8 Q/K
 
@@ -78,3 +78,17 @@ One run on an SM103 GPU (148 SMs, CUDA 13.2, PyTorch 2.12.0a0, CuTe DSL 4.8.0, 1
 | vsa_wan_720p_81f_t64 | 184320 | 40 | 59.0 | 100.0 | 71.67 | 18.78 | 3.82 | 222.82 | 101.12 | 2.20 |
 
 `tokens` is the padded sequence length.
+
+The same run on an SM90 GPU (H100 SXM, 132 SMs, CUDA 13.4, PyTorch 2.14.0a0, CuTe DSL 4.8.0). The base path
+is the SM90 blk128 kernel, and KPage runs the blk64 kernels on the metadata's 64-row halves:
+
+| layout | tokens | H | pad% | part% | BSA fwd ms | KPage fwd ms | x | BSA f+b ms | KPage f+b ms | x |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ssta_hy15_480p_121f | 55168 | 16 | 10.0 | 18.3 | 17.90 | 13.64 | 1.31 | 53.17 | 45.49 | 1.17 |
+| ssta_hy15_480p_241f | 106368 | 16 | 8.5 | 15.5 | 56.25 | 45.66 | 1.23 | 166.14 | 144.99 | 1.15 |
+| ssta_hy15_720p_121f | 116864 | 16 | 4.2 | 12.2 | 41.20 | 33.72 | 1.22 | 122.57 | 110.68 | 1.11 |
+| ssta_hy15_720p_241f | 225664 | 16 | 2.5 | 9.1 | 128.19 | 106.43 | 1.20 | 386.43 | 359.43 | 1.08 |
+| sta_hy_720p_117f | 109056 | 24 | 0.7 | 5.9 | 142.45 | 117.44 | 1.21 | 428.69 | 393.08 | 1.09 |
+| vsa_wan_480p_81f_t64 | 79872 | 12 | 59.0 | 100.0 | 10.05 | 2.68 | 3.75 | 29.41 | 11.84 | 2.48 |
+| vsa_wan_720p_81f_t256 | 84480 | 40 | 10.5 | 16.7 | 38.42 | 27.72 | 1.39 | 118.84 | 99.88 | 1.19 |
+| vsa_wan_720p_81f_t64 | 184320 | 40 | 59.0 | 100.0 | 172.55 | 48.11 | 3.59 | 500.22 | 185.80 | 2.69 |

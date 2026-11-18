@@ -45,18 +45,26 @@ _BS_2 = [
     ("sm100_block_scale_matmul.py", 2),
     ("sm103_block_scale_matmul.py", 2),
 ]
-_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1)]
-_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2)]
+_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 1)]
+_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 2)]
 _MOE_BS_1 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 1),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 1),
 ]
 _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 2),
 ]
-_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1)]
-_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2)]
-_MOE_SWAP_1 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1)]
-_MOE_SWAP_2 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2)]
+_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 1)]
+_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 2)]
+_MOE_SWAP_1 = [
+    ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 1),
+]
+_MOE_SWAP_2 = [
+    ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 2),
+]
 
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
 # is no LDTM shape, no TMEM row base and no span list to share -- and its store
@@ -361,8 +369,11 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
             continue
 
-        # Dense block-scale's MMA warp tracks the raster for SFB sub-tiles too.
-        expected_count = 4 if path.name.startswith("sm103_") or path.name == "sm100_block_scale_matmul.py" else 3
+        # Dense block-scale's MMA warp tracks SFB sub-tiles; indexed mainloop
+        # transforms also track their own raster in addition to TMA/epilogue.
+        expected_count = (
+            1 if path.name == "sm100_matmul_mainloop.py" else 4 if path.name.startswith("sm103_") or path.name == "sm100_block_scale_matmul.py" else 3
+        )
         if len(calls) != expected_count:
             offenders.append(f"{path.name} (cta_group={cta_group}): expected {expected_count} L2-swizzle calls, found {len(calls)}")
         for call in calls:
@@ -707,7 +718,11 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
             offenders=offenders,
         )
 
-        l2_calls = [node for node in ast.walk(kernel) if _call_endswith(node, "_l2_swizzle_tile")]
+        coordinate_root = kernel
+        if path.name == "sm100_matmul_mainloop.py":
+            coordinate_root = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_decode_scheduled_tile")
+        coordinate_parents = _parents(coordinate_root)
+        l2_calls = [node for node in ast.walk(coordinate_root) if _call_endswith(node, "_l2_swizzle_tile")]
         coordinate_specs = (
             (0, "raw M", "m"),
             (1, "raw N", "n"),
@@ -726,16 +741,22 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
                     continue
                 target = argument.id
                 if index < 2:
-                    if target.startswith("init_"):
+                    if coordinate_root is not kernel:
+                        source = "block_m" if axis == "m" else "block_n"
+                    elif target.startswith("init_"):
                         source = "bidx" if axis == "m" else "bidy"
+                    elif target.startswith("ml_"):
+                        # The mainloop consumes its own CLC response, not the
+                        # TMA/epilogue warps' m_idx/n_idx bindings.
+                        source = "_m_idx" if axis == "m" else "_n_idx"
                     else:
                         source = "m_idx" if axis == "m" else "n_idx"
                 else:
                     source = "gridx" if axis == "m" else "gridy"
                 _check_preferred_fallback_pair(
                     path=path,
-                    kernel=kernel,
-                    parents=parents,
+                    kernel=coordinate_root,
+                    parents=coordinate_parents,
                     target=target,
                     preferred=f"{source} >> _preferred_cluster_{axis}_shift",
                     fallback=f"{source} >> _fallback_cluster_{axis}_shift",
@@ -842,3 +863,69 @@ def test_moe_block_scale_mailbox_acknowledgements_order_prior_reads(suffix):
             relaxed = next((kw.value for kw in call.keywords if kw.arg == "relaxed"), ast.Constant(False))
             assert isinstance(relaxed, ast.Constant) and relaxed.value is False, f"{path.name}:{call.lineno}: mailbox reuse needs release ordering"
     assert len(acknowledgements) == 6
+
+
+def test_mainloop_scheduled_tile_decoder_keeps_stage_local_inputs():
+    """One decode rule, four independently owned work coordinates and batch IDs."""
+    from collections import Counter
+
+    for path, _, source in _template_variants():
+        if path.name != "sm100_matmul_mainloop.py":
+            continue
+        tree = ast.parse(source)
+        kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
+        parents = _parents(kernel)
+        assignments = [node for node in ast.walk(kernel) if isinstance(node, ast.Assign) and _call_endswith(node.value, "_decode_scheduled_tile")]
+        assert len(assignments) == 4
+        sources = Counter(tuple(ast.unparse(arg) for arg in node.value.args) for node in assignments)
+        tail = ("gridx", "gridy", "cluster_m", "cluster_n", "swizzle_w")
+        assert sources == Counter({("bidx", "bidy", *tail): 1, ("m_idx", "n_idx", *tail): 2, ("_m_idx", "_n_idx", *tail): 1})
+        assert not any(_call_endswith(node, "_l2_swizzle_tile") for node in ast.walk(kernel))
+        for assignment in assignments:
+            source_m = ast.unparse(assignment.value.args[0])
+            owner = parents[assignment]
+            siblings = next(items for _, items in ast.iter_fields(owner) if isinstance(items, list) and assignment in items)
+            following = siblings[siblings.index(assignment) + 1]
+            assert isinstance(following, ast.Assign)
+            expected = {"bidx": ("init_tile_l", "bidz"), "m_idx": ("tile_l", "l_idx"), "_m_idx": ("tile_l", "_l_idx")}[source_m]
+            assert (ast.unparse(following.targets[0]), ast.unparse(following.value)) == expected
+            if source_m == "_m_idx":
+                assert isinstance(owner, ast.If) and ast.unparse(owner.test) == "cutlass.const_expr(mainloop_needs_coordinates)"
+
+
+def test_mainloop_scheduled_tile_decoder_matches_cluster_raster():
+    """Execute the exact integer helper on CPU against an enumerated raster.
+
+    This validates decoding only, not native CLC scheduling or synchronization.
+    """
+    from types import SimpleNamespace
+
+    tree = ast.parse(template_path("sm100_matmul_mainloop.py").read_text())
+    decoder = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_decode_scheduled_tile")
+    tree = ast.parse((pathlib.Path(cudnn.gemm.frost.__file__).parent / "tile_helpers.py").read_text())
+    raster = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "l2_swizzle_tile")
+    decoder.decorator_list = raster.decorator_list = []
+    module = compile(ast.Module(body=[raster, decoder], type_ignores=[]), "<scheduled-tile-decoder>", "exec")
+    for preferred, fallback in (((1, 1), None), ((2, 2), None), ((2, 2), (1, 1)), ((4, 2), (2, 1)), ((2, 4), (1, 2))):
+        for pinned in (0, 1):
+            namespace = {
+                "cutlass": SimpleNamespace(const_expr=bool, Int32=int, min=min),
+                "cluster_shape_mnk": (*preferred, 1),
+                "fallback_cluster_shape_mnk": None if fallback is None else (*fallback, 1),
+                "tile_swizzle_n": pinned,
+            }
+            for kind, shape in (("preferred", preferred), ("fallback", fallback or preferred)):
+                for axis, extent in zip(("m", "n"), shape):
+                    namespace[f"_{kind}_cluster_{axis}_shift"] = extent.bit_length() - 1
+            exec(module, namespace)
+            namespace["_l2_swizzle_tile"] = namespace["l2_swizzle_tile"]
+            for cluster_m, cluster_n in (preferred,) if fallback is None else (preferred, fallback):
+                for nt_m, nt_n in ((1, 1), (3, 7), (5, 2)):
+                    for width in (1, 2, 3, 8):
+                        effective = 1 if pinned == 1 else width
+                        order = [(m, n) for start in range(0, nt_n, effective) for m in range(nt_m) for n in range(start, min(start + effective, nt_n))]
+                        for block_n in range(nt_n * cluster_n):
+                            for block_m in range(nt_m * cluster_m):
+                                expected = order[(block_n // cluster_n) * nt_m + block_m // cluster_m]
+                                got = namespace["_decode_scheduled_tile"](block_m, block_n, nt_m * cluster_m, nt_n * cluster_n, cluster_m, cluster_n, width)
+                                assert got == expected

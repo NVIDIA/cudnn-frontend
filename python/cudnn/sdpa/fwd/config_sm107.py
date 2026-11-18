@@ -193,6 +193,7 @@ __all__ = [
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_FP8_SPLIT_SHAPES",
+    "SM107_MXFP8_SPLIT_SHAPES",
     "SM107_FP8_PACK_GQA_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
@@ -246,7 +247,7 @@ __all__ = [
 # and the d256/d512 flavors all depend on it.
 SMEM_CAP_BYTES = 327 * 1024
 
-# ...but the CAPACITY is not the budget. The shipped sm107/prefill_d128_fp8.py
+# ...but the CAPACITY is not the budget. The shipped sm107/d128_fp8_multi_q/kernel.py
 # sizes its own guard against 320 KiB ("327 KiB capacity minus reserves"), and
 # the kernels additionally spend ~2 KiB on barriers, the scheduler ring and the
 # TMEM pointer. Validating Q/K/V/O against the raw 327 KiB waves through an
@@ -298,6 +299,7 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
 SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+SM107_MXFP8_SPLIT_SHAPES = frozenset({(128, 128)})
 # Packing and splitting are separate domains; both graph and adapter read this one.
 SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
 
@@ -313,17 +315,17 @@ def supports_fp8_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
 # `_validate_params` already receives, so adding a ported flavor is one entry.
 _F16_THD_FLAVORS = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128", "sm107 d192xd128 paged", "sm107 d256", "sm107 d512"})
 
-# Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line uses the native half D128 and MXFP8 D128/D256
+# Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line uses native half D128, per-tensor FP8 D512 and MXFP8 D128/D256
 # K/V TMA-LDG sites. Half D256 prefill and the single-Q THD split retain their shared bodies. The page id is the TMA
 # batch coordinate; MXFP8 also indexes its SF descriptor by the page and tile-in-page. _validate_params declines
 # every other flavor, and each unwired MXFP8 kernel file refuses paged_kv at module scope as well. MXFP8 pages hold
 # whole 128-row F8_128x4 SF atom sets. Half pages instead use boxes of at least eight rows within each KV tile.
 # Two cc 10.7 HALF kernels read pools natively and validate their OWN records (neither passes through _validate_params,
-# so this set does not name them): sm107/decode_d256_f16.py (make_cfg_d256_decode -- the decode-shaped dense-Q d256
+# so this set does not name them): sm107/d256_f16_swap_ab/kernel.py (make_cfg_d256_decode -- the decode-shaped dense-Q d256
 # route, the SM100 decode record re-validated for Rubin) and sm107/sparse_d256_f16.py (make_cfg_d256_sparse -- the
 # index-list core's gather warps read K / V from the pools through the (B, max_pages) table; page_size a multiple of
 # the 4-token block).
-_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128", "sm107 d192xd128 paged", "sm107 d128 mxfp8", "sm107 d256 mxfp8"})
+_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128 paged", "sm107 d128 mxfp8", "sm107 d256 mxfp8", "sm107 d512"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
@@ -371,11 +373,11 @@ SM107_EPILOGUE_GATE_SHAPES = frozenset({(256, 256)})
 
 # Native half flavors whose Rubin PREFILL kernel stores the score side outputs (``score_max`` /
 # ``score_sum_exp``, see config_sm100.SM100_SCORE_STATS_SHAPES for the contract): the d128 file
-# (``sm107/prefill_d128_f16.py``) from its correction epilogue.  The engine row's
+# (``sm107/d128_f16_multi_q/kernel.py``) from its correction epilogue.  The engine row's
 # ``score_stats_d_shapes`` and the adapter's check_support read THIS set (rule 8b').
 SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 
-# Head-dim TILE widths of the Rubin f16/bf16 d128-family prefill kernel (``sm107/prefill_d128_f16.py`` at
+# Head-dim TILE widths of the Rubin f16/bf16 d128-family prefill kernel (``sm107/d128_f16_multi_q/kernel.py`` at
 # ``TemplateParams.d_flavor``): ``TILE_K = TILE_O`` in {32, 64, 128} is a Cfg field, not a fork.  A graph's head dim rides
 # the SMALLEST width covering max(d_qk, d_v): the TMA load box is the tile while the tensor extent is D, so the load
 # zero-fills the missing columns (exact zero terms in every QK^T dot product and in P.V's padded V columns), BMM1 runs
@@ -390,7 +392,7 @@ SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 # every requested feature must fit. Other legs retain the larger envelope.
 SM107_HEAD_DIM_TILE_WIDTHS = (32, 64, 128)
 SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
-SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA", "split-KV"})}
+SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA", "split-KV", "paged KV"})}
 # cga widths the small tiles are VALIDATED at (the engine row's ``cgas_by_d_shape`` reads this; the factory refuses a width
 # outside it).  cga1 is the default: the narrow slabs need no collective MMA to halve K/V, and a 512-row cga2 cluster wastes
 # 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for.  At TILE_O = 32 a cga2 V operand would be 16 columns
@@ -405,25 +407,65 @@ def supports_native_d192_paged(d_shape, *, device_cc, fp8, paged, cga=None, spli
 
 
 def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None, thd=False):
-    """Native half D64 packs dense splits and unsplit ragged queries."""
-    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and not paged and (not thd or split_kv == 1) and cga in (None, 1, 2)
+    """Native half D64 packing; THD splits use one CTA with either KV layout."""
+    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and (not thd or split_kv == 1 or cga in (None, 1)) and cga in (None, 1, 2)
+
+
+def supports_native_d128_single_q(
+    d_shape,
+    *,
+    device_cc,
+    half_precision,
+    thd,
+    paged,
+    cga,
+    split_kv=1,
+    pack_gqa=False,
+    tile_m=None,
+    tile_n=None,
+    has_bias=False,
+    has_kv_mask=False,
+    has_gate=False,
+    mixed_kv=False,
+):
+    """Explicit one-Q warp topology, shared by graph and standalone admission."""
+    return (
+        device_cc == (10, 7)
+        and d_shape == (128, 128)
+        and half_precision
+        and thd
+        and cga == 1
+        and split_kv == 1
+        and not pack_gqa
+        and tile_m in (None, 128)
+        and tile_n in (None, 128)
+        and not has_bias
+        and not has_kv_mask
+        and not has_gate
+        and not mixed_kv
+    )
 
 
 def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd, paged, cga, split_kv=1, has_bias=False, has_kv_mask=False):
     """Whether TILE_N=64 selects the native D128 two-score-slot pipeline.
 
-    Dense CGA1, paged and ragged split plans use different bodies. Keep the
+    Nonpaged dense CGA1 and ragged split plans use different bodies. Keep the
     explicit knob domain shared by graph validation and standalone lowering.
     """
     return (
         device_cc == (10, 7)
         and half_precision
         and d_shape == (128, 128)
-        and not paged
         and not has_bias
         and not has_kv_mask
-        and ((thd and split_kv == 1 and cga in (None, 1, 2)) or (not thd and cga in (None, 2)))
+        and (not thd or split_kv == 1)
+        and (cga in (None, 1, 2) if thd or paged else cga in (None, 2))
     )
+
+
+def supports_native_small_half_dense_paged(d_shape, *, device_cc, fp8, thd, paged):
+    """Dense half Q binds directly to the native D64/D128 page-table loader."""
+    return device_cc == (10, 7) and not fp8 and not thd and paged and d_shape in ((64, 64), (128, 128))
 
 
 def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, paged, cga):
@@ -436,9 +478,14 @@ def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, pag
     return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (128, 128) and cga in (None, 2)
 
 
+def supports_native_d256_dense_split(d_shape, *, device_cc, fp8, thd, paged, pack_gqa):
+    """Dense unpacked half D256 uses native prefill FP32 split partials."""
+    return device_cc == (10, 7) and not fp8 and not thd and not paged and not pack_gqa and d_shape == (256, 256)
+
+
 def supports_native_d512_dense_pack_split(d_shape, *, device_cc, fp8, thd, paged, cga):
-    """Dense half D512 uses the native 2x2 body for packed and split plans."""
-    return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (512, 512) and cga in (None, 2)
+    """Dense half D512/D576 uses the native 2x2 body for packed and split plans."""
+    return device_cc == (10, 7) and not fp8 and not thd and d_shape in ((512, 512), (576, 512)) and cga in (None, 2)
 
 
 def sm107_small_tile_leg(
@@ -876,7 +923,7 @@ _STAGES_KV_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 # (``sm107_bias_resident_tiles`` / ``sm107_bias_ring_stages``: the Q / O slabs and the bias block's rows both halve) and the kernel's
 # TMEM / grid derivations share (rule 8b').  A 64-row tile doubles the work items of a given q extent (the parallelism lever at small S)
 # and halves the MMA / softmax work per kv step; the kernel body renders it as a lane-mapping arm (``TILE_M64_LANE_FORM`` in
-# ``sm107/prefill_d128_f16.py``).  An A/B arm, never a plan path: the engine row's ``tile_ms`` stays {128} until the arm has a measured win.
+# ``sm107/d128_f16_multi_q/kernel.py``).  An A/B arm, never a plan path: the engine row's ``tile_ms`` stays {128} until the arm has a measured win.
 _TILE_M_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 # The Q tile heights the small-tile body is validated at.  The validator pins cfg.TILE_M to this set on the small tiles; every other
 # flavor keeps 128 (the d128 / d192 renderings and their committed records, the quantized siblings' SF geometry).
@@ -1557,7 +1604,7 @@ _MX_BLOCK = 32  # MXFP8: 32 elements share one E8M0 scale byte
 
 def _d256_mxfp8_sf_sizes(tile_m: int, tile_n: int, tile_k: int, tile_o: int) -> Tuple[int, int, int, int]:
     """(Q, K-per-stage, P, V-per-stage) scale-factor slab sizes in bytes, the
-    kernel's own formulas (``sm107/prefill_d256_mxfp8.py`` SF_SMEM_SIZE_*): a
+    kernel's own formulas (``sm107/d256_mxfp8_single_q/kernel.py`` SF_SMEM_SIZE_*): a
     128-row tile x ceil(D/128)*128 / 32 for the rowwise operands, TILE_N/32 x
     the 128-padded non-K extent for the BMM2 pair.  Full-size regardless of
     CTA_MMA (the cga2 peers multicast halves into the same slab)."""
@@ -1651,7 +1698,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
     ``split_wired`` identifies kernels with both SplitHelpers and FP32
-    partial-output stores: half and per-tensor FP8 D128/D192, plus per-tensor FP8 D256. The engine
+    partial-output stores: half and per-tensor FP8 D128/D192/D256. The engine
     row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
@@ -1659,10 +1706,18 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
-    if k.dtype_kv != -1 and not (flavor == "sm107 d128" and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
-        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D128 pipeline")
+    if k.dtype_kv != -1 and not (
+        flavor in ("sm107 d64", "sm107 d128", "sm107 d256", "sm107 d512")
+        and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16)
+        and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    ):
+        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D64/D128/D256/D512 pipeline")
+    if flavor == "sm107 d512" and k.dtype_kv != -1 and (not k.mma_2x2 or k.cta_mma != 2 or k.thd_varlen or k.epilogue_gate or k.d_flavor != 512):
+        raise ValueError("sm107 d512: independent FP8 KV requires exact D512 dense Q, the native 2x2 body and no gate")
+    if flavor == "sm107 d256" and k.dtype_kv != -1 and (k.cta_mma != 2 or k.thd_varlen or k.pack_gqa or k.epilogue_gate):
+        raise ValueError("sm107 d256: independent FP8 KV requires dense Q, two CTAs, no packing and no gate")
     if k.decode_q_tile:
-        # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
+        # The loader routes a decode_q_tile record to sm107/d256_f16_swap_ab/kernel.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template
         # must never consume one (the config_sm100 twin makes the same refusal).
         raise ValueError(f"{flavor}: decode_q_tile={k.decode_q_tile} selects the d256 decode tile; the prefill templates do not consume it")
@@ -1704,15 +1759,27 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # descriptors to a packed total), unsplit and unpacked, and a page is a whole number of 128-row F8_128x4 SF atom
     # sets (the SF pools page with K/V; a 64-row page cannot hold one).
     if k.paged_kv:
-        if flavor not in _PAGED_KV_FLAVORS_SM107:
+        if flavor not in _PAGED_KV_FLAVORS_SM107 and not (flavor == "sm107 d256" and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
             raise ValueError(
                 f"{flavor}: paged_kv is not wired on this Rubin flavor (the cc 10.7 PAGED_KV specialization lives in "
-                f"sm107/prefill_d128_f16.py, sm107/prefill_d128_mxfp8.py and sm107/prefill_d256_mxfp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
+                "sm107/d128_f16_multi_q/kernel.py, sm107/d128_mxfp8_multi_q/kernel.py, sm107/d256_mxfp8_single_q/kernel.py and per-tensor "
+                f"sm107/d512_fp8_role_split/kernel.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
             )
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
-        if flavor in ("sm107 d128", "sm107 d192xd128 paged"):
-            expected_d = 192 if flavor == "sm107 d192xd128 paged" else 128
+        if flavor == "sm107 d512":
+            half_2x2 = k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.mma_2x2 and k.cta_mma == 2
+            if (k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and not half_2x2) or k.thd_varlen:
+                raise ValueError(f"{flavor}: paged KV requires dense Q, with per-tensor FP8 or native two-CTA half 2x2 inputs")
+            p = k.page_size
+            if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
+                raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
+        elif flavor == "sm107 d256" and k.dtype_kv != -1:
+            p = k.page_size
+            if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
+                raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
+        elif flavor in ("sm107 d64", "sm107 d128", "sm107 d192xd128 paged"):
+            expected_d = {"sm107 d64": 64, "sm107 d128": 128, "sm107 d192xd128 paged": 192}[flavor]
             if k.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16) or k.d_flavor != expected_d:
                 raise ValueError(f"{flavor}: native paged half prefill requires half inputs and d_flavor={expected_d}")
             p = k.page_size
@@ -1977,6 +2044,8 @@ class CfgD256(_CfgSm107):
     """d_qk = d_v = 256. Q-union-O SMEM alias, single softmax warpgroup, a
     Q.K(i+1) -> S.V(i) lookahead MMA stream with two parity S_acc TMEM slots."""
 
+    DTYPE_KV: int = -1
+
 
 @dataclass(frozen=True)
 class CfgD512(_CfgSm107):
@@ -2087,7 +2156,7 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
     """Rubin d128-family ring depth.
 
     Per-tensor FP8 at d128/cga2 runs a **9-stage** ring: a Rubin-specific tuning
-    carried by the shipped ``sm107/prefill_d128_fp8.py`` (which previously spelled
+    carried by the shipped ``sm107/d128_fp8_multi_q/kernel.py`` (which previously spelled
     it as a post-hoc ``dataclasses.replace``), and the reason that kernel needs
     the oversized-SMEM launch mode.
 
@@ -2156,10 +2225,12 @@ def _validate_q_in_tmem(cfg, flavor: str) -> None:
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    # Per-tensor FP8 and half D64/D128/D192 share FP32 split partials.
-    # MXFP8 has no split loop yet.
-    split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(64, 64), (128, 128), (192, 128)}
-    split_wired = not mxfp8 and (tile_k, tile_o) in split_shapes
+    # Per-tensor FP8 D64/D128/D192, half D64/D128/D192 and MXFP8 D128 share FP32 split partials.
+    if mxfp8:
+        split_shapes = SM107_MXFP8_SPLIT_SHAPES
+    else:
+        split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(64, 64), (128, 128), (192, 128)}
+    split_wired = (tile_k, tile_o) in split_shapes
     # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128
@@ -2249,6 +2320,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"its 128-register softmax holds one 64-column chunk and the one-batch-entry paths hand-unroll two sub-tiles"
             )
     softmax_regs, correction_regs = _D128_REG_SPLIT[2 if softmax_wgs == 2 else (softmax_wgs, tile_k)]
+    if mxfp8:
+        softmax_regs, correction_regs = 184, 104
     total_warps = _d128_total_warps(softmax_wgs)
     corr_warp_base = softmax_wgs * _D128_SOFTMAX_WG_WARPS
     mma_warp_id = corr_warp_base + _D128_CORRECTION_WARPS
@@ -2291,11 +2364,18 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     if dead_subtile_quiet not in DEAD_SUBTILE_QUIET_FORMS:
         raise ValueError(f"{flavor}: dead_subtile_quiet must be 0 (the full body on a dead sub-tile) or 1 (the quiet body); got {dead_subtile_quiet}")
     if dead_subtile_quiet == 1 and (
-        bias_mode or pair or tile_k > 64 or mxfp8 or params.dtype_qkv <= _DTYPE_E5M2 or params.pack_gqa or params.thd_varlen or params.epilogue_gate
+        bias_mode
+        or pair
+        or tile_k > 64
+        or mxfp8
+        or params.dtype_qkv <= _DTYPE_E5M2
+        or params.pack_gqa
+        or (params.thd_varlen and (tile_k != 64 or params.paged_kv or (params.split_kv or 1) > 1))
+        or params.epilogue_gate
     ):
         raise ValueError(
             f"{flavor}: dead_subtile_quiet=1 (the dead-sub-tile quiet body) is wired on the f16/bf16 32- / 64-wide tiles' one-batch-entry item "
-            f"without a bias, PackGQA, THD or the gated epilogue only; got bias_mode={bias_mode}, n_chunk={n_chunk}, TILE_K={tile_k}, "
+            f"without a bias, PackGQA or the gated epilogue; THD requires non-paged, unsplit D64; got bias_mode={bias_mode}, n_chunk={n_chunk}, TILE_K={tile_k}, "
             f"dtype_qkv={params.dtype_qkv}, pack_gqa={params.pack_gqa}, thd_varlen={params.thd_varlen}, epilogue_gate={params.epilogue_gate}"
         )
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
@@ -2404,7 +2484,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
 
 
 def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
-    """The 32-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim
+    """The 32-wide head-dim tile of ``sm107/d128_f16_multi_q/kernel.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim
     <= 32 with D % 8 == 0 (8 / 16 / 24 / 32) by TMA zero fill; cga1 (SM107_SMALL_D_CGAS); dense / causal / bottom-right /
     SWA / padded / sink / GQA like d128.  THD, split-KV, paged KV, PackGQA and the score side outputs are NOT wired on the
     tile: the row routes a graph asking for them onto the d128 flavor (``engines.Capabilities.dense_only_d_shapes``), and this
@@ -2413,12 +2493,12 @@ def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
 
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
-    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``).
+    """The 64-wide head-dim tile of ``sm107/d128_f16_multi_q/kernel.py`` (``TemplateParams.d_flavor=64``).
 
     Half-precision dense plans use aligned logical widths up to 64 by TMA zero fill;
     native THD uses exact D64. Both CTA widths carry THD and PackGQA;
     dense split plans use FP32 partials and the shared sink-aware combine.
-    Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
+    Per-tensor FP8 uses the same native width in ``d128_fp8_multi_q/kernel.py``,
     including dense PackGQA and split-KV; its THD and paged forms remain unsupported.
     """
     if params.dtype_qkv <= _DTYPE_E5M2 and params.thd_varlen:
@@ -2498,10 +2578,12 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
     checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
-    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16)
     _validate_params(flavor, params, split_wired=split_wired)
     if (params.split_kv or 1) > 1 and params.thd_varlen:
-        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
+        raise ValueError(f"{flavor}: native split-KV is dense-only")
+    if (params.split_kv or 1) > 1 and params.pack_gqa and params.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16):
+        raise ValueError(f"{flavor}: native half prefill split is unpacked")
     if params.pack_gqa and not mxfp8:
         if params.thd_varlen:
             raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
@@ -2510,7 +2592,26 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
-    tile_k = tile_o = 256
+    # The explicit one-Q D128 topology reuses this family's parity pipeline.
+    single_q_d128 = params.softmax_wgs == 1
+    if single_q_d128 and not (
+        not mxfp8
+        and params.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16)
+        and params.d_flavor == 128
+        and params.cta_mma == 1
+        and params.thd_varlen
+        and not params.pack_gqa
+        and params.split_kv == 1
+        and params.tile_n == 128
+        and params.s_slots == 2
+        and not params.q_in_tmem
+        and not params.epilogue_gate
+        and not params.bias_mode
+        and not params.kv_mask_form
+        and params.dtype_kv == -1
+    ):
+        raise ValueError("single-Q D128 requires half THD CTA1 N128, unsplit/unpacked and two S slots")
+    tile_k = tile_o = 128 if single_q_d128 else 256
     tile_n = 128
     # STAGES_KV is a TUNING KNOB again (2..4), and the note that said otherwise
     # was WRONG about why.
@@ -2535,7 +2636,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
     # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
     # depth that fits SMEM is correct by construction. Do not re-literal it.
-    # (The per-tensor FP8 sibling `prefill_d256_fp8.py` carried a literal 0
+    # (The per-tensor FP8 sibling `sm107/d256_fp8_single_q/kernel.py` carried a literal 0
     # until the epilogue-gate PR ported the same `_needs_desc_v1` derivation;
     # at e4m3-O depth 4 its last V stage starts at exactly 262144, so the
     # literal was one depth away from the same wrap.)
@@ -2557,10 +2658,11 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     # not govern, so this vector budget is not the lever.  The split itself IS
     # applied (USETMAXREG.TRY_ALLOC / DEALLOC present in the sm_107a SASS).  Do
     # not retry the bump; see the REGISTER NOTE in
-    # sm107/prefill_d256_mxfp8.py's TMA-LDG warp for the levers not yet tried.
+    # sm107/d256_mxfp8_single_q/kernel.py's TMA-LDG warp for the levers not yet tried.
     other_regs = 40
 
     cfg = CfgD256(
+        DTYPE_KV=params.dtype_kv,
         TILE_M=128,
         TILE_N=tile_n,
         TILE_K=tile_k,
@@ -2695,7 +2797,8 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
 
 
 def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
-    return _make_cfg_d256_family(params, flavor="sm107 d256", mxfp8=False)
+    flavor = "sm107 d128" if params.softmax_wgs == 1 and params.paged_kv else "sm107 d256"
+    return _make_cfg_d256_family(params, flavor=flavor, mxfp8=False)
 
 
 def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
@@ -2793,6 +2896,8 @@ def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         SEQ_KV_LENS_PRESENT=1 if params.thd_varlen else int(params.seq_kv_lens_present),
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=params.page_size if params.paged_kv else 0,
         SCHEDULER_POLICY=params.sched_policy if params.sched_policy is not None else SCHED_NATURAL,
         BMM2_N_PER_CALL=256,
         BMM2_LOOP_N_BLOCKS=tile_o // 256,
@@ -2823,7 +2928,7 @@ def make_cfg_d512(params: TemplateParams):
     # The 2x2-datapath record (TemplateParams.mma_2x2, appended, default False) is read through getattr so a
     # record built before the field existed takes the role-split arm unchanged (the config_sm100 dispatch, mirrored).
     if getattr(params, "mma_2x2", False):
-        return make_cfg_d512_2x2(params)
+        return make_cfg_d512_2x2(params, cga_m=2 if params.d_flavor == 576 or params.dtype_kv != -1 else 4)
     return _make_cfg_d512_family(params, flavor="sm107 d512", mxfp8=False)
 
 
@@ -2832,7 +2937,7 @@ def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
 
 
 # ---------------------------------------------------------------------------
-# d512 flavor on the 2x2 DATAPATH -- d_qk = d_v = 512, Rubin, sm107/prefill_d512_f16_2x2.py
+# d512 flavor on the 2x2 DATAPATH -- d_qk = d_v = 512, Rubin, sm107/d512_f16_2x2/kernel.py
 #
 # The SM100 CfgD512X2 record (config_sm100: one pipeline per CTA on the
 # cta_group::2 M=128 atom, 64 Q rows per CTA, 12 warps, a (CGA_M, 1, 1)
@@ -2900,6 +3005,11 @@ def _validate_cfg_d512_2x2_sm107(cfg: CfgD512X2, flavor: str) -> None:
     _validate_dtype_k_step(cfg, flavor)
 
 
+@dataclass(frozen=True)
+class CfgD512Mixed(CfgD512X2):
+    DTYPE_KV: int = -1
+
+
 def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD512X2, TmaIters]:
     """The Rubin 2x2-datapath d512 configuration (``TemplateParams.mma_2x2``).
 
@@ -2912,9 +3022,20 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     # The Rubin record guard keys its THD allowlist by FLAVOR NAME (_F16_THD_FLAVORS holds "sm107 d512"): the 2x2 sibling
     # carries the same ported setup-kernel call sites as the role-split d512 body, so it is validated under that name.
     _validate_params("sm107 d512", params, split_wired=True)
-    # Share the d512/half/unpaged guards with SM100. This native twin additionally
-    # addresses packed subgroups and supports the pre-folded scale.
-    _validate_params_sm100("d512", params, scale_prefolded_wired=True, d512_partial_pack_wired=True)
+    # Share the half geometry guards with SM100. This native twin additionally
+    # supports paged 2x2 loads, packed subgroups and the pre-folded scale.
+    mixed_kv = params.dtype_kv != -1
+    if mixed_kv and cga_m != 2:
+        raise ValueError(f"{flavor}: mixed FP8 KV requires one CTA pair (CGA_M=2)")
+    # Apply the common half-geometry checks after the native storage contract
+    # above. This does not admit mixed storage in the SM100 kernel.
+    _validate_params_sm100(
+        "d512",
+        dataclasses_replace(params, dtype_kv=-1) if mixed_kv else params,
+        scale_prefolded_wired=True,
+        d512_partial_pack_wired=True,
+        d512_paged_2x2_wired=True,
+    )
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: BF16/FP16 inputs only")
     if params.cta_mma != 2:
@@ -2923,7 +3044,11 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     n_pairs = cga_m // CfgD512X2.CTA_MMA
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
-    base = CfgD512X2(
+    base = (CfgD512Mixed if mixed_kv else CfgD512X2)(
+        TILE_K=576 if params.d_flavor == 576 else 512,
+        N_BMM1_CHUNKS=3 if params.d_flavor == 576 else 2,
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -2958,6 +3083,8 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         QH_PER_KH=int(params.qh_per_kh),
         PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=True),
     )
+    if mixed_kv:
+        base = dataclasses_replace(base, DTYPE_KV=params.dtype_kv)
     # DESC_VERSION is DERIVED from the layout the fields above describe, never set by hand.
     cfg = dataclasses_replace(base, DESC_VERSION=_d512_2x2_desc_version_for(base))
     _validate_cfg_d512_2x2_sm107(cfg, flavor)
@@ -3697,7 +3824,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
 
 
 # ---------------------------------------------------------------------------
-# d256 DECODE flavor on Rubin -- the swap-AB decode tile (sm107/decode_d256_f16.py)
+# d256 DECODE flavor on Rubin -- the swap-AB decode tile (sm107/d256_f16_swap_ab/kernel.py)
 # ---------------------------------------------------------------------------
 # The decode tile's body is arch-agnostic (cta_group::1, 6 / 10 / 18 warps at N_Q = 16 / 32 /
 # 64, f16/bf16 TILE_K_HW = 16 on both arch lines, 4 x N_Q TMEM columns) and its record is the
@@ -3973,7 +4100,7 @@ def _validate_cfg_d256_decode_sm107(cfg: CfgD256Decode, flavor: str) -> None:
 
 
 def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIters]:
-    """Config for sm107/decode_d256_f16.py: the SM100 decode record (config_sm100.make_cfg_d256_decode,
+    """Config for sm107/d256_f16_swap_ab/kernel.py: the SM100 decode record (config_sm100.make_cfg_d256_decode,
     whose predicates are arch-neutral, built here over the Rubin width set _D256_DECODE_Q_TILES_SM107 --
     the SM100 pair plus the 64-column tile) re-validated against the Rubin SMEM carveout (standard or
     oversized) and the version-0 tcgen05 descriptor window.

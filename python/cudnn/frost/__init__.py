@@ -39,6 +39,7 @@ def cutedsl_runtime_available(device_cc=None) -> bool:
       part: cc 10.7 needs a DSL whose ``Arch`` has ``sm_107a`` (the public 4.8.0
       wheel is the first), so **the floor is 4.7.0 everywhere and 4.8.0 on
       cc 10.7** (:func:`cudnn.frost.buffers.cutedsl_arch_requirement_error`).
+      A part below cc 8.0 has no target in any DSL and reads False.
       This half imports the DSL once, on a cc 10.7 part only.
 
     A device-blind call (``device_cc=None``) answers the version half alone:

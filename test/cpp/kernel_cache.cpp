@@ -14,7 +14,29 @@
 #include <thread>
 #include <vector>
 
+namespace cudnn_frontend::graph {
+// Keep the ownership assertion internal rather than exposing a public accessor.
+struct KernelCacheTestAccess {
+    static auto const&
+    cache(Execution_plan_list const& plans) {
+        return plans.kernel_cache;
+    }
+};
+}  // namespace cudnn_frontend::graph
+
 namespace {
+
+class CacheProbeGraph : public cudnn_frontend::graph::Graph {
+   public:
+    auto const&
+    plan_cache() const {
+        return cudnn_frontend::graph::KernelCacheTestAccess::cache(plans);
+    }
+    auto const&
+    supplied_cache() const {
+        return kernel_cache;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Spin barrier: hold all N threads until all have arrived.
@@ -55,10 +77,11 @@ struct MatmulShape {
 // The tests never execute the graph, so no device memory is allocated and only
 // plan compilation costs anything.
 // ---------------------------------------------------------------------------
-std::shared_ptr<cudnn_frontend::graph::Graph>
+template <typename Graph = cudnn_frontend::graph::Graph>
+std::shared_ptr<Graph>
 setup_matmul_graph(std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr, MatmulShape shape = {}) {
     namespace fe = cudnn_frontend;
-    auto g       = std::make_shared<fe::graph::Graph>();
+    auto g       = std::make_shared<Graph>();
     g->set_io_data_type(fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT)
@@ -127,6 +150,70 @@ read_state(std::shared_ptr<cudnn_frontend::KernelCache> const& kc) {
 }
 
 }  // namespace
+
+TEST_CASE("Implicit kernel cache follows graph plan ownership", "[kernel_cache][lifetime]") {
+#if (CUDNN_VERSION < 90500)
+    SKIP("Implicit kernel cache ownership requires cuDNN >= 9.5 headers");
+#endif
+    namespace fe = cudnn_frontend;
+    if (fe::detail::get_backend_version() < 90500) {
+        SKIP("Requires cuDNN >= 9.5");
+    }
+    for (bool explicit_cache : {false, true}) {
+        DYNAMIC_SECTION((explicit_cache ? "caller-supplied cache" : "implicit static-graph cache")) {
+            cudnnHandle_t raw_handle{};
+            REQUIRE(cudnnCreate(&raw_handle) == CUDNN_STATUS_SUCCESS);
+            std::unique_ptr<cudnnContext, decltype(&cudnnDestroy)> handle(raw_handle, cudnnDestroy);
+            auto supplied = explicit_cache ? std::make_shared<fe::KernelCache>() : nullptr;
+            std::weak_ptr<fe::KernelCache> observed;
+            {
+                auto graph = setup_matmul_graph<CacheProbeGraph>(supplied);
+                graph->set_dynamic_shape_enabled(explicit_cache);
+                REQUIRE(graph->validate().is_good());
+                REQUIRE(graph->build_operation_graph(handle.get()).is_good());
+                if (!supplied) {
+                    // Directly covers fallback creation before execution-plan creation.
+                    REQUIRE(graph->plan_cache() != nullptr);
+                    CHECK(graph->plan_cache()->is_finalized());
+                    CHECK(graph->supplied_cache() == nullptr);
+                    observed = graph->plan_cache();
+                } else {
+                    observed = supplied;
+                }
+                REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+                // A null graph-level cache must not erase the implicit plan-list cache.
+                REQUIRE_FALSE(observed.expired());
+                CHECK(graph->plan_cache() == observed.lock());
+                CHECK(graph->supplied_cache() == supplied);
+            }
+            CHECK(observed.expired() == !supplied);
+            supplied.reset();
+            CHECK(observed.expired());
+        }
+    }
+}
+
+TEST_CASE("Static graph construction preserves header runtime compatibility", "[kernel_cache][header_compatibility]") {
+    namespace fe = cudnn_frontend;
+    cudnnHandle_t raw_handle{};
+    REQUIRE(cudnnCreate(&raw_handle) == CUDNN_STATUS_SUCCESS);
+    std::unique_ptr<cudnnContext, decltype(&cudnnDestroy)> handle(raw_handle, cudnnDestroy);
+    auto graph = setup_matmul_graph<CacheProbeGraph>();
+    graph->set_dynamic_shape_enabled(false);
+    REQUIRE(graph->validate().is_good());
+    auto status = graph->build_operation_graph(handle.get());
+    REQUIRE(status.is_good());
+    CHECK(graph->supplied_cache() == nullptr);
+#if (CUDNN_VERSION >= 90500)
+    bool const expect_cache = fe::detail::get_backend_version() >= 90500;
+#else
+    bool const expect_cache = false;
+#endif
+    CHECK(static_cast<bool>(graph->plan_cache()) == expect_cache);
+    status = graph->create_execution_plans({fe::HeurMode_t::A});
+    REQUIRE(status.is_good());
+    CHECK(static_cast<bool>(graph->plan_cache()) == expect_cache);
+}
 
 // ---------------------------------------------------------------------------
 // Test 1 — concurrent build() race

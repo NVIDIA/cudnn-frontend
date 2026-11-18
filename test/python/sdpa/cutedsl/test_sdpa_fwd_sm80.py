@@ -212,7 +212,7 @@ def test_sdpa_fwd_sm80_native_gqa_matches_expanded_bitwise(case, scheduler, d):
     offset, so every tile runs the same MMA/softmax sequence and only which
     CTA serves which tile changes.  Every scheduler is pinned, since LPT_L2
     packs H_q // H_kv Q heads into each (batch, KV head) group; d=128 and
-    d=256 cover both kernel files (prefill_f16 / prefill_d256_f16)."""
+    d=256 cover both kernel files (f16_k_prefetch / d256_kv_prefetch)."""
     name, b, h_q, h_kv, s_q, s_kv, feat = case
     if s_q is None:
         s_q = s_kv = _L2_SHORT_LAST_BLOCK_S[d]
@@ -294,18 +294,21 @@ def test_sdpa_fwd_sm80_padded_row_lse_trim(d, s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(640, 512), (576, 576)])
 @torch_fork_set_rng(seed=0)
-def test_sdpa_fwd_sm80_check_support_rejections():
-    """check_support rejects out-of-envelope heads and bad layouts eagerly."""
+def test_sdpa_fwd_sm80_check_support_rejections(d_qk, d_v):
+    """check_support rejects out-of-envelope heads and unsupported dtypes eagerly."""
     try:
         from cudnn.sdpa.fwd import SdpaFwdDslSm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
     b, h, s = 1, 4, 128
-    q = torch.zeros((b, s, h, 512), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    # QK supports up to 576 and V up to 512; reject each boundary independently.
+    q = torch.zeros((b, s, h, d_qk), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    v = torch.zeros((b, s, h, d_v), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
     lse = torch.zeros((b, h, s), dtype=torch.float32, device="cuda")
-    api = SdpaFwdDslSm80(sample_q=q, sample_k=q, sample_v=q, sample_o=q, sample_lse=lse)
+    api = SdpaFwdDslSm80(sample_q=q, sample_k=q, sample_v=v, sample_o=v, sample_lse=lse)
     with pytest.raises(ValueError, match="exceeds"):
         api.check_support()
 

@@ -25,6 +25,22 @@ from .backward import (
 )
 
 
+def row_major_view(tensor: torch.Tensor) -> torch.Tensor:
+    """A contiguous ``tensor`` with the row-major strides the backend compares exactly.
+
+    PyTorch leaves the stride of a size-1 dimension free: a ``[B, 1, D]`` tensor with strides ``(D, 1, 1)`` is contiguous, and
+    a channel-last ``[B, D, T]`` input with ``T == 1`` transposes to one.  Flattening and re-viewing gives the canonical strides
+    over the same storage, without a copy."""
+    expected = []
+    running = 1
+    for size in reversed(tensor.shape):
+        expected.append(running)
+        running *= max(size, 1)
+    if tuple(reversed(expected)) == tuple(tensor.stride()):
+        return tensor
+    return tensor.reshape(-1).view(tensor.shape)
+
+
 class _CausalConv1dBulkAutogradFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -80,11 +96,11 @@ class _CausalConv1dBulkAutogradFunction(torch.autograd.Function):
             saved_index += 1
         initial_state = saved_tensors[saved_index] if ctx.has_initial_state else None
         backend: CausalConv1dBulkBwdPrototype = ctx.backend
-        dy = dy.contiguous()
+        dy = row_major_view(dy.contiguous())
         if ctx.output_final_state:
             if d_final_state is None:
                 raise RuntimeError("autograd did not materialize the required d_final_state")
-            d_final_state = d_final_state.contiguous()
+            d_final_state = row_major_view(d_final_state.contiguous())
         elif d_final_state is not None:
             raise RuntimeError("received d_final_state for a forward without final-state output")
         dx = torch.empty_like(x, memory_format=torch.contiguous_format)

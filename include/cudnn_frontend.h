@@ -109,7 +109,9 @@
 
 #include "cudnn_frontend_Resample.h"
 
+#include "cudnn_frontend/node/custom_reduction.h"
 #include "cudnn_frontend/graph_interface.h"
+#include "cudnn_frontend/utils/reduction_modifiers.h"
 #include "cudnn_frontend/utils/serialize.h"
 #include "cudnn_frontend/backend/kernel_cache.h"
 #include "cudnn_frontend/utils/attn_score_modifiers.h"

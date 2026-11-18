@@ -212,6 +212,12 @@ class KdaHopperEngine(BaseEngine):
             raise NotImplementedError("KdaHopperEngine: state_indices (pool-addressed state) is unsupported")
         if facts.overwrite_initial_state:
             raise NotImplementedError("KdaHopperEngine: overwrite_initial_state is unsupported")
+        if facts.has_composed_summaries or facts.has_composed_state:
+            raise NotImplementedError(
+                "KdaHopperEngine: composed context-parallel summaries and the composed_initial_state row (the fold into the boundary state row) are FROST-only"
+            )
+        if facts.output_context or facts.input_context:
+            raise NotImplementedError("KdaHopperEngine: the summaries' context is FROST-only")
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias:
             raise NotImplementedError("KdaHopperEngine: the kernel takes log-space g directly; safe_gate/a_log/dt_bias are unsupported")
         if facts.use_beta_sigmoid:

@@ -3444,7 +3444,7 @@ class _SdpaBwdMxfp8(_Stage):
         return tuple(_MXFP8_SF_ROLES)
 
     def sf_shapes(self) -> dict:
-        """The seven scale-factor blobs' declared dims, in the kernel's documented shapes (``sm107/bprop_d256_mxfp8.py``, the
+        """The seven scale-factor blobs' declared dims, in the kernel's documented shapes (``sm107/d256_mxfp8/kernel.py``, the
         operand table): rowwise ``(B, H, ceil128(S), D / 32)`` for ``sf_q / sf_do / sf_k / sf_v``, columnwise ``(B, H, D / 32,
         ceil128(S))`` for ``sf_q_T / sf_do_T / sf_k_T`` -- the 128-row atom pad and the 32-element block from the adapter's own
         constants, never re-literalled.  The byte count of each is what the adapter checks at execute."""

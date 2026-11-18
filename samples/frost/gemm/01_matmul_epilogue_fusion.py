@@ -89,6 +89,14 @@ def _bias_gelu_tap_case(M: int, N: int, K: int) -> None:
 
 
 def main(M: int = 256, N: int = 256, K: int = 128) -> None:
+    if not torch.cuda.is_available():
+        print("[01] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[01] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     _relu_case(M, N, K)
     _bias_gelu_tap_case(M, N, K)
 

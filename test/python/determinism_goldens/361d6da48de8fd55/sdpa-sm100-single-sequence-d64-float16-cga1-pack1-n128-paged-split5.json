@@ -1,0 +1,88 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.float16",
+      "sha256": "8fa39ec94ac9fb80ff1913b5601f3126a4e398ff4ac8039f59dfab309a86feef",
+      "shape": [
+        4,
+        257,
+        2,
+        64
+      ]
+    },
+    "k_pages": {
+      "dtype": "torch.float16",
+      "sha256": "05823eb34d7556236463277768669571e4aa76e5d9fd0cc1285aa677849a0030",
+      "shape": [
+        69,
+        2,
+        16,
+        64
+      ]
+    },
+    "q": {
+      "dtype": "torch.float16",
+      "sha256": "6bdeec9d6e4137482d8e18970d0655726c7e8d26f76fa033b120048a509c0fd2",
+      "shape": [
+        4,
+        129,
+        8,
+        64
+      ]
+    },
+    "v": {
+      "dtype": "torch.float16",
+      "sha256": "0e1014013ae0aa800469b4ba73931cb051681446740d59f683e14e024a032b74",
+      "shape": [
+        4,
+        257,
+        2,
+        64
+      ]
+    },
+    "v_pages": {
+      "dtype": "torch.float16",
+      "sha256": "cc8f976bd0a2d5021c6d0f16837a6d2cf688430025032578fe1ca90914533520",
+      "shape": [
+        69,
+        2,
+        16,
+        64
+      ]
+    }
+  },
+  "outputs": {
+    "o": {
+      "dtype": "torch.float16",
+      "sha256": "6b0141cf313663c7a1883cefef50f7b072869eef3ca4d7aa9a14a092cbd46375",
+      "shape": [
+        129,
+        8,
+        64
+      ]
+    },
+    "stats": {
+      "dtype": "torch.float32",
+      "sha256": "9cb209d66f84407d6d9f4d2fff7e5f7c9558f7a39280afcb5f6eeaef80285e35",
+      "shape": [
+        129,
+        8
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

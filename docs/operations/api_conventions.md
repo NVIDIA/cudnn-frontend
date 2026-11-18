@@ -2,8 +2,8 @@
 
 These rules apply to every **new** public op API: any op name added to
 `test/python/api_index/api_index.txt`. The graph API (`cudnn.pygraph` and its
-enums) is out of scope. Existing names keep working; renaming them is part of
-the API pruning plan, not this document.
+enums) is out of scope. This page defines conventions for new names only; it
+does not announce renames or removals of existing names.
 
 ## Name pattern
 
@@ -50,7 +50,8 @@ Inside a family:
 - Do not nest families.
 
 Families: `dsa` (DeepSeek sparse attention, including the CSA/HCA compressor),
-`nsa` (native sparse attention) and `gnn`.
+`nsa` (native sparse attention), `mhc` (manifold-constrained hyper-connections)
+and `gnn`.
 
 ## Rules
 
@@ -67,8 +68,8 @@ Families: `dsa` (DeepSeek sparse attention, including the CSA/HCA compressor),
 5. **Ops live in `cudnn.ops`.** Do not add op APIs to the top-level `cudnn`
    package, `cudnn.torch`, `cudnn.jax`, or an op package such as `cudnn.gemm`; a
    JAX variant is marked by a `_jax` suffix, and a family is a subpackage of
-   `cudnn.ops`. Existing exports keep working until the API pruning plan
-   retires them.
+   `cudnn.ops`. Existing exports are unaffected by these naming rules; this page
+   does not define a deprecation or removal schedule.
 
 ## Examples
 

@@ -8,17 +8,36 @@ from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 
-def _packed_asm(src_dtype, out_dtype):
+def _packed_asm(src_dtype, out_dtype, *, global_src=False):
     # Packed widening preserves every finite FP8 value, including subnormals.
     # BF16 widening needs PTX 9.2, supplied by the supported DSL 4.7 compiler.
     # https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt
     src = "e4m3x2" if src_dtype == cutlass.Float8E4M3FN else "e5m2x2"
     dst = "bf16x2" if out_dtype == cutlass.BFloat16 else "f16x2"
+    # The SM120 global loader also supports the DSL's CUDA 12.9 compiler.
+    # Its PTX predates direct FP8 -> BF16 packed widening. Every finite FP8
+    # value is exactly representable in both half types, so widening through
+    # FP16 is exact (including subnormals and signed zero).
+    if global_src and out_dtype == cutlass.BFloat16:
+        convert = (
+            "{ .reg .b16 lo, hi; "
+            + " ".join(
+                f"cvt.rn.f16x2.{src} y{i}, p{i}; mov.b32 {{lo, hi}}, y{i}; " f"cvt.rn.bf16.f16 lo, lo; cvt.rn.bf16.f16 hi, hi; mov.b32 y{i}, {{lo, hi}};"
+                for i in range(4)
+            )
+            + " }"
+        )
+    else:
+        convert = " ".join(f"cvt.rn.{dst}.{src} y{i}, p{i};" for i in range(4))
     return (
         "{ .reg .b32 x0, x1, y0, y1, y2, y3; .reg .b16 p0, p1, p2, p3; "
-        "ld.shared.v2.b32 {x0, x1}, [$0]; "
-        "mov.b32 {p0, p1}, x0; mov.b32 {p2, p3}, x1; "
-        + " ".join(f"cvt.rn.{dst}.{src} y{i}, p{i};" for i in range(4))
+        + (
+            ".reg .pred live; setp.ne.u32 live, $2, 0; mov.b32 x0, 0; mov.b32 x1, 0; @live ld.global.v2.b32 {x0, x1}, [$0]; "
+            if global_src
+            else "ld.shared.v2.b32 {x0, x1}, [$0]; "
+        )
+        + "mov.b32 {p0, p1}, x0; mov.b32 {p2, p3}, x1; "
+        + convert
         + " st.shared.v4.b32 [$1], {y0, y1, y2, y3}; }"
     )
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The FROST SM100 d128 DECODE tile (``sm100/decode_d128_f16.py``).
+"""The FROST SM100 d128 DECODE tile (``sm100/d128_f16_single_q/kernel.py``).
 
 ``sdpa_fwd_prefill_sm100``'s (128, 128) f16/bf16 flavor has two tiles behind
 one knob: ``TILE_CGA_M=2`` is the prefill pipeline (512 Q rows per cga2
@@ -51,7 +51,9 @@ from frost_test_utils import launch_f16, offers_engine, requires_dsl, requires_p
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
 D = 128
-ENGINE = "sdpa_fwd_prefill_sm100"
+LEGACY_ENGINE = "sdpa_fwd_prefill_sm100"
+ENGINE = ("sdpa_fwd_sm100_d128_multi_q", "sdpa_fwd_sm100_d128_single_q", "sdpa_fwd_sm100_d64_quadrant", "sdpa_fwd_sm100_d256_swap_ab")
+OFFERED = dict(zip(ENGINE, (20535, 20532, 20536, 20520)))
 _SM100_ID = 20511  # FROST_SDPA_FWD_ID_BASE + manifest slot 11 (sdpa_fwd_prefill_sm100)
 
 
@@ -286,7 +288,7 @@ def _facts(**over):
 def _plans(facts):
     from cudnn.sdpa.fwd.heuristics import recommend
 
-    plans = recommend("A", facts, {ENGINE: _SM100_ID})
+    plans = recommend("A", facts, OFFERED)
     assert plans, "the SM100 f16 row must be eligible for these facts"
     return plans
 
@@ -340,7 +342,14 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     assert {p.knobs.cga for p in _plans(_facts(s_q=2048, causal=True, padded=False))} == {1, 2}
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9, has_paged_kv=True, page_size=16)) if p.knobs.pack_gqa)
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
+    # The dedicated small-head owners decline D256. Swap-AB intentionally
+    # serves both paged D128 and D256, so keep it out of this negative control.
+    from cudnn.sdpa.fwd.heuristics import recommend
+
+    d256 = _facts(h_q=32, h_kv=2, d_qk=256, d_v=256)
+    small_only = {name: engine_id for name, engine_id in OFFERED.items() if engine_id != 20520}
+    assert recommend("A", d256, small_only) == []
+    assert {plan.engine_id for plan in recommend("A", d256, OFFERED)} == {20520}
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
     # LPT_L2: one head's K+V here is 4096 * 256 * 2 B = 2 MiB, under the SM100 d128 row's 8 MiB floor for the L2 grouping,
     # heuristics._SM100_D128_LPT_L2_MIN_BYTES.)
@@ -367,12 +376,12 @@ def test_heuristics_decode_geometry_follows_the_selected_packing():
     assert legs[0][0] is True, legs
     assert (False, 1) in legs and (False, 2) not in legs and {(True, 1), (True, 2)} <= set(legs), legs
     assert {p.knobs.cga for p in _plans(_facts(s_q=129))} == {1, 2}, "129 rows overflow one tile unpacked too: both widths"
-    fallback = recommend("B", _facts(s_q=16), {ENGINE: _SM100_ID})
+    fallback = recommend("B", _facts(s_q=16), OFFERED)
     assert [(p.knobs.pack_gqa, p.knobs.cga) for p in fallback] == [(False, 1)], fallback
     # MHA has no group: one rule for the only leg.
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=64, h_q=8, h_kv=8)))
     assert {p.knobs.cga for p in _plans(_facts(s_q=129, h_q=8, h_kv=8))} == {1, 2}
-    caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == ENGINE).capabilities
+    caps = engines.sm100_legacy_policy_spec(LEGACY_ENGINE).capabilities
     for f in (_facts(s_q=16), _facts(s_q=9, causal=True, bottom_right=True)):
         for p in _plans(f):
             assert engines.mismatch(caps, f, p.knobs) is None, p.knobs
@@ -395,7 +404,7 @@ def test_heuristics_split_the_decode_tile_on_an_underfilled_launch():
 def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     from cudnn.sdpa.fwd import engines
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == ENGINE)
+    spec = engines.sm100_legacy_policy_spec(LEGACY_ENGINE)
     caps = spec.capabilities
     assert engines.mismatch(caps, _facts(), engines.SdpaFwdKnobs(cga=1)) is None
     assert engines.mismatch(caps, _facts(s_q=512, padded=False), engines.SdpaFwdKnobs(cga=1)) is None, "a pinned cga=1 is honored on any dense S_q"
@@ -404,7 +413,10 @@ def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     assert thd is not None and "decode tile" in thd and "THD" in thd
     assert engines.mismatch(caps, _facts(thd=True), engines.SdpaFwdKnobs(cga=2)) is None
     d256 = engines.mismatch(caps, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), engines.SdpaFwdKnobs(cga=1))
-    assert d256 is not None and "outside this engine's domain" in d256
+    assert d256 is not None and "cga=1 is outside this engine's domain [2]" in d256
+    registered = next(s for s in engines.ENGINE_SPECS if s.name == LEGACY_ENGINE)
+    delegated = engines.mismatch(registered.capabilities, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256))
+    assert delegated is not None and "owned by the explicit implementation engines" in delegated
     # Partial PackGQA rides the decode tile: a pinned cga=1 + PACK_GQA=1 on 96/8
     # (G=12 packs 4) is honored; on 24/8 (G=3, no common factor) it is declined.
     assert engines.mismatch(caps, _facts(h_q=96, h_kv=8), engines.SdpaFwdKnobs(cga=1, pack_gqa=True)) is None
@@ -423,7 +435,12 @@ def _load_decode(params, tag):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100", "decode_d128_f16.py")
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(api_dsl.__file__)),
+        "kernels",
+        "sm100",
+        "d64_f16_quadrant/kernel.py" if params.decode_quad else "d128_f16_single_q/kernel.py",
+    )
     return load_template(path, params, tag=tag)
 
 
@@ -456,7 +473,7 @@ def _run_kernel(
     quad=False,
     early_q=True,
 ):
-    """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
+    """Drive sm100/d128_f16_single_q/kernel.py directly (the split-KV suite's idiom).
 
     ``paged=False`` binds dense [B, S_kv, KH, d] K/V with per-batch KV lengths
     (the padded path) instead of pools + tables.  ``q_lens`` (per batch, <= s_q)
@@ -980,6 +997,7 @@ def _paged_graph(
     table_batch_stride=None,
     require_prepared=False,
     sink=None,
+    expected_template="decode_d128_f16",
 ):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
@@ -1045,7 +1063,9 @@ def _paged_graph(
         assert all(
             g.plans[i].knobs.cga != pin_cga for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(ENGINE)
         ), "cga already proposed; pin is moot"
-        g.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=pin_cga, pack_gqa=plan.knobs.pack_gqa, split_kv=1))
+        g.create_execution_plan(
+            20535 if pin_cga == 2 else 20532, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=pin_cga, pack_gqa=plan.knobs.pack_gqa, split_kv=1)
+        )
         g.select_plan(len(g.plans) - 1)
         plan = g.plans[len(g.plans) - 1]
     g.check_support()
@@ -1054,7 +1074,7 @@ def _paged_graph(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
 
         compiled = g._compiled_plans[g._plan_index]
-        assert compiled._compiled.kernel_template == "decode_d128_f16"
+        assert compiled._compiled.kernel_template == expected_template
         assert isinstance(compiled._prepared, PreparedDenseLaunch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
@@ -1094,7 +1114,7 @@ def _paged_graph(
 def test_graph_decode_prepared_keeps_int64_page_table_batch_stride():
     """A singleton table's unused batch stride must not narrow at the pointer ABI.
     B=1 keeps the valid allocation small while a stride over 2**31 catches int32 fakes."""
-    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True)
+    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True, expected_template="decode_d256_f16")
 
 
 @pytest.mark.L0
@@ -1234,7 +1254,7 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     assert offers_engine(g, ENGINE)
     # SM100 admits the two-slab single-CTA prefill body; SM103 keeps its existing domain.
     g2 = _build()
-    g2.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
+    g2.create_execution_plan(20535, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
     g2.select_plan(0)
     if torch.cuda.get_device_capability() == (10, 0):
         g2.check_support()
@@ -1323,7 +1343,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
 
     specs = list(engines.ENGINE_SPECS.values()) if isinstance(engines.ENGINE_SPECS, dict) else list(engines.ENGINE_SPECS)
-    caps = next(s for s in specs if s.name == ENGINE).capabilities
+    caps = engines.sm100_legacy_policy_spec(LEGACY_ENGINE).capabilities
     leg = _ragged_paged_facts()
     assert _thd_decode_leg(caps, leg)
     assert _thd_decode_leg_divisors(leg) == (64 * 128, 64 * 128, 64) and not _thd_decode_leg_int64(leg)
@@ -1696,7 +1716,9 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.CGA_TILE_M == 128 and api._k_mod.CFG.TILES_Q == 1, "cga=1 must have loaded the decode tile"
+    mod = api._k_mod
+    assert mod.__file__.endswith("sm100/d256_f16_swap_ab/kernel.py"), "the short paged D128 graph must load the swap-AB decode tile"
+    assert mod.CFG.TILE_K == mod.CFG.TILE_O == 128 and mod.N_Q == 16 and mod.COLS == 8
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):

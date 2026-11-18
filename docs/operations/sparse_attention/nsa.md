@@ -57,9 +57,20 @@ from the base installation, so the base install does not enable NSA there.
 
 ## API Usage
 
+### Functions
+
+The PyTorch functions are exported from `cudnn.ops.nsa`, next to their [JAX variants](#jax):
+
+| PyTorch function | Same function as |
+| --- | --- |
+| `cudnn.ops.nsa.selection_attention_forward` | `NSA.selection_attention_wrapper` |
+| `cudnn.ops.nsa.compression_attention_forward` | `NSA.compression_attention_wrapper` |
+| `cudnn.ops.nsa.sliding_window_attention_forward` | `NSA.sliding_window_attention_wrapper` |
+| `cudnn.ops.nsa.top_k_reduction_forward` | `NSA.topk_reduction_wrapper` |
+
 ### NSA Namespace
 
-All NSA components are accessible through the `NSA` namespace:
+The class APIs, and the original wrapper names, are accessible through the `NSA` namespace:
 
 ```python
 from cudnn import NSA
@@ -113,12 +124,12 @@ $$
 With `is_causal=True`, selected tokens with $k > q$ are masked. This includes
 future tokens in the selected block that contains the current query.
 
-#### High-level Wrapper
+#### Function
 
 ```python
-from cudnn import NSA
+from cudnn.ops import nsa
 
-result = NSA.selection_attention_wrapper(
+result = nsa.selection_attention_forward(
     q_tensor=q,
     k_tensor=k,
     v_tensor=v,
@@ -229,12 +240,12 @@ $$
 
 where $\alpha_q$, $\alpha_k$, $\alpha_v$, $\alpha_o$ are optional scaling factors for quantized inputs.
 
-#### High-level Wrapper
+#### Function
 
 ```python
-from cudnn import NSA
+from cudnn.ops import nsa
 
-result = NSA.compression_attention_wrapper(
+result = nsa.compression_attention_forward(
     q_tensor=q,
     k_tensor=k,
     v_tensor=v,
@@ -347,12 +358,12 @@ $$
 
 where $L$ is `left_bound` and $R$ is `right_bound`.
 
-#### High-level Wrapper
+#### Function
 
 ```python
-from cudnn import NSA
+from cudnn.ops import nsa
 
-result = NSA.sliding_window_attention_wrapper(
+result = nsa.sliding_window_attention_forward(
     q_tensor=q,
     k_tensor=k,
     v_tensor=v,
@@ -462,12 +473,12 @@ $$
 \text{topk\_indices}[q] = \text{argtop}_K(\text{block\_score}[q, :])
 $$
 
-#### High-level Wrapper
+#### Function
 
 ```python
-from cudnn import NSA
+from cudnn.ops import nsa
 
-result = NSA.topk_reduction_wrapper(
+result = nsa.top_k_reduction_forward(
     q_tensor=q,
     k_tensor=k,
     lse_tensor=lse,
@@ -550,6 +561,35 @@ topk.execute(
 
 ---
 
+## JAX
+
+The `cudnn.ops.nsa` family runs the selection, compression and top-k kernels
+on JAX arrays, eagerly or under `jax.jit`, without PyTorch:
+
+| JAX op | PyTorch function |
+| --- | --- |
+| `cudnn.ops.nsa.selection_attention_forward_jax` | `cudnn.ops.nsa.selection_attention_forward` |
+| `cudnn.ops.nsa.compression_attention_forward_jax` | `cudnn.ops.nsa.compression_attention_forward` (with LSE) |
+| `cudnn.ops.nsa.top_k_reduction_forward_jax` | `cudnn.ops.nsa.top_k_reduction_forward` |
+
+Each returns a dict with the PyTorch function's keys. The JAX ops take packed (T, H, D)
+inputs only, compute in FP32, and take `max_s_q` / `max_s_k` as static
+per-sequence maxima, because they never read sequence offsets on the host.
+Compression always returns the LSE, stored head-major as top-k reads it.
+Selection runs on SM90/SM100/SM103; compression and top-k on SM100/SM103.
+Sliding window attention runs on the cuDNN graph API and has no JAX op here; use
+JAX's cuDNN attention (`jax.nn.dot_product_attention(..., implementation="cudnn",
+local_window_size=...)`).
+
+```python
+import jax
+from cudnn.ops import nsa
+
+cmp = jax.jit(nsa.compression_attention_forward_jax)(q, k_cmp, v_cmp, cu_q, cu_k)
+topk = jax.jit(lambda *a: nsa.top_k_reduction_forward_jax(*a, max_s_q, max_s_k))(q, k_cmp, cmp["lse_tensor"], cu_q, cu_k)
+sel = jax.jit(lambda *a: nsa.selection_attention_forward_jax(*a, max_s_q, block_size))(q, k, v, block_indices, block_counts, cu_q)
+```
+
 ## Tensor Formats
 
 ### Supported Layouts
@@ -616,7 +656,7 @@ For complete usage examples and tests, see:
 
 ```python
 import torch
-from cudnn import NSA
+from cudnn.ops import nsa
 import math
 
 # Configuration
@@ -642,7 +682,7 @@ k = torch.randn(T, h_kv, head_dim, dtype=dtype, device=device)
 v = torch.randn(T, h_kv, head_dim, dtype=dtype, device=device)
 
 # Step 1: Compression Attention
-o_cmp, lse_cmp = NSA.compression_attention_wrapper(
+o_cmp, lse_cmp = nsa.compression_attention_forward(
     q_tensor=q,
     k_tensor=k,
     v_tensor=v,
@@ -653,7 +693,7 @@ o_cmp, lse_cmp = NSA.compression_attention_wrapper(
 )
 
 # Step 2: Top-K Reduction to find important blocks (uses LSE from compression)
-topk_scores, topk_indices = NSA.topk_reduction_wrapper(
+topk_scores, topk_indices = nsa.top_k_reduction_forward(
     q_tensor=q,
     k_tensor=k,
     lse_tensor=lse_cmp,
@@ -668,7 +708,7 @@ topk_scores, topk_indices = NSA.topk_reduction_wrapper(
 # Step 3: Selection Attention for important blocks
 block_counts = torch.full((T, h_kv), k_value, dtype=torch.int32, device=device)
 
-o_sel, l_sel, m_sel = NSA.selection_attention_wrapper(
+o_sel, l_sel, m_sel = nsa.selection_attention_forward(
     q_tensor=q,
     k_tensor=k,
     v_tensor=v,
@@ -680,7 +720,7 @@ o_sel, l_sel, m_sel = NSA.selection_attention_wrapper(
 )
 
 # Step 4: Sliding Window Attention for local context
-o_swa, stats_swa = NSA.sliding_window_attention_wrapper(
+o_swa, stats_swa = nsa.sliding_window_attention_forward(
     q_tensor=q,
     k_tensor=k,
     v_tensor=v,

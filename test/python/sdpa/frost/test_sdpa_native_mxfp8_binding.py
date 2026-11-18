@@ -3,6 +3,7 @@
 """Opaque MXFP8 scale storage has one native contract for dense and THD."""
 
 import sdpa_binding_reference as binding_reference
+from frost_test_utils import mxfp8_engine_name
 
 import ast
 from pathlib import Path
@@ -35,7 +36,7 @@ def _fixture(thd=False, d=128, dv=128, split=1, output="bfloat16", carrier="uint
     old = dict(zip(s.order, s.template))
     path = Path(prep.__file__).parent / "kernels/_mxfp8_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
-    s.order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    s.order = [a.arg for a in host.args.args if a.annotation is None or "Constexpr" not in ast.unparse(a.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [old.get(name) for name in s.order]
     sizes = ((d + 127) // 128 * 512,) * 2 + ((dv + 127) // 128 * 512,)
@@ -200,7 +201,7 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     g.build_operation_graph()
     # The cc 10.7 row serves the same pool contract on d128 (cga2) / d256 (cga1): separate V table, batch-innermost
     # tables, e4m3 O, Stats, CUDA-graph replay after mutating the SF bytes, native-binder-only execution.
-    name = engine_name(arch="sm107" if rubin else "sm100", mxfp8=True)
+    name = mxfp8_engine_name("sm107" if rubin else "sm100", d, d)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     cga = max(dict(caps.cgas_by_d_shape).get((d, d), caps.cgas))

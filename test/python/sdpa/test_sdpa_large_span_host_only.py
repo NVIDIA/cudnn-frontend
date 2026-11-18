@@ -26,7 +26,7 @@ pytestmark = pytest.mark.L0
 
 _SM120_BWD_PROBE = textwrap.dedent("""
     import sys
-    from cudnn.sdpa.bwd.kernels.sm120 import bprop_f16 as m
+    from cudnn.sdpa.bwd.kernels.sm120.f16_fused import kernel as m
     b, s, h, kvh = (int(x) for x in sys.argv[1:5])
     m.compile((12, 0), b=b, qh=h, sq=s, skv=s, d_qk=128, kvh=kvh)
 """)
@@ -44,6 +44,8 @@ def _lower_sm120_bwd(b, s, h, kvh):
         )
         run = subprocess.run([sys.executable, "-c", _SM120_BWD_PROBE, *map(str, (b, s, h, kvh))], env=env, capture_output=True, text=True)
         if run.returncode != 0:
+            # A failing project import fails the test; only a missing compiler target is a skip.
+            assert "ImportError" not in run.stderr and "ModuleNotFoundError" not in run.stderr, run.stderr[-2000:]
             pytest.skip(f"the installed CuTe DSL cannot lower sm_120a here: {run.stderr[-300:]}")
         texts = []
         for path in glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True):
@@ -108,6 +110,12 @@ def test_flex_varlen_declines_int32_span(tokens, limit_ok):
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("cudnn.flex_attention supports SM90 and newer")
     from cudnn.flex_attention.plan.validation import validate_create_mask_plan_inputs
+    from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
+
+    major, minor = torch.cuda.get_device_capability()
+    if limit_ok and major * 10 + minor not in SUPPORTED_ARCHES:
+        # The span decline comes first and holds on any part; an in-limit span goes on to the arch check (SM12x is not served).
+        pytest.skip(f"cudnn.flex_attention serves SM{', SM'.join(map(str, SUPPORTED_ARCHES))}; this device is SM{major}{minor}")
 
     heads, dim = 8, 128  # 2**21 * 8 * 128 = 2**31 elements, one past INT32_MAX
     q = None

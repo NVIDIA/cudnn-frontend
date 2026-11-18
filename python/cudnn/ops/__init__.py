@@ -15,6 +15,40 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "dense_indexer_kl_forward": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl_forward"),
+    "simplified_sparse_attention_forward": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_forward"),
+    "simplified_sparse_attention_forward_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_forward_jax"),
+    "SimplifiedSparseAttentionMetadata": ("cudnn.simplified_sparse_attention.api", "SimplifiedSparseAttentionMetadata"),
+    "simplified_sparse_attention_reserve": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_reserve"),
+    "ragged_grouped_gemm_forward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_forward"),
+    "ragged_grouped_gemm_backward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_backward"),
+    "dense_gemm_forward": ("cudnn.gemm.cake.dense", "dense_gemm_forward"),
+    "dense_gemm_backward": ("cudnn.gemm.cake.dense", "dense_gemm_backward"),
+    "swiglu_quantize_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "swiglu_quantize_forward"),
+    "swiglu_quantize_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "swiglu_quantize_backward"),
+    "gated_rmsnorm_forward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_forward"),
+    "gated_rmsnorm_backward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_backward"),
+    "zero_centered_rmsnorm_forward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_forward"),
+    "zero_centered_rmsnorm_backward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_backward"),
+    "gqa_attention_forward": ("cudnn.sdpa.cake.api", "gqa_attention_forward"),
+    "gqa_attention_backward": ("cudnn.sdpa.cake.api", "gqa_attention_backward"),
+    "gqa_attention_workspace_size": ("cudnn.sdpa.cake.api", "gqa_attention_workspace_size"),
+    "dsa_sparse_forward": ("cudnn.deepseek_sparse_attention.cake.sparse", "dsa_sparse_forward"),
+    "dsa_sparse_backward": ("cudnn.deepseek_sparse_attention.cake.sparse", "dsa_sparse_backward"),
+    "dsa_sparse_workspace_size": ("cudnn.deepseek_sparse_attention.cake.sparse", "dsa_sparse_workspace_size"),
+    "dsa_prepare_segments": ("cudnn.deepseek_sparse_attention.cake.deterministic", "dsa_prepare_segments"),
+    "dsa_det_workspace_size": ("cudnn.deepseek_sparse_attention.cake.deterministic", "dsa_det_workspace_size"),
+    "dsa_det_forward": ("cudnn.deepseek_sparse_attention.cake.deterministic", "dsa_det_forward"),
+    "dsa_det_backward": ("cudnn.deepseek_sparse_attention.cake.deterministic", "dsa_det_backward"),
+    "dsa_indexer_logits": ("cudnn.deepseek_sparse_attention.cake.deterministic", "dsa_indexer_logits"),
+    "dsa_indexer_backward": ("cudnn.deepseek_sparse_attention.cake.deterministic", "dsa_indexer_backward"),
+    "LmHeadLogprobPlan": ("cudnn.lm_head", "LmHeadLogprobPlan"),
+    "lm_head_logprob_jax": ("cudnn.lm_head.jax_api", "lm_head_logprob_jax"),
+    "lm_head_logprob_forward_jax": ("cudnn.lm_head.jax_api", "lm_head_logprob_forward_jax"),
+    "lm_head_logprob_backward_jax": ("cudnn.lm_head.jax_api", "lm_head_logprob_backward_jax"),
+    "prepare_mok_training": ("cudnn.moe_ep.cake", "prepare_mok_training"),
+    "create_mok_workspace": ("cudnn.moe_ep.cake", "create_mok_workspace"),
+    "quantize_mok_weights": ("cudnn.moe_ep.cake", "quantize_mok_weights"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
@@ -34,18 +68,38 @@ _LAZY_EXPORTS = {
     "block_sparse_attention_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_backward"),
     "block_sparse_attention_fp8_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_fp8_forward"),
+    "block_sparse_attention_backward_metadata": ("cudnn.block_sparse_attention", "block_sparse_attention_backward_metadata"),
     "kpage_prepare_layout": ("cudnn.block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": ("cudnn.block_sparse_attention", "KPageLayout"),
+    "BsaBackwardMetadata": ("cudnn.block_sparse_attention", "BsaBackwardMetadata"),
     "kimi_delta_attention_forward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_fwd"),
     "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
     "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
     "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
+    "hstu_attention_forward": ("cudnn.hstu.hstu_attention", "hstu_attention_forward"),
+    "hstu_attention_backward": ("cudnn.hstu.hstu_attention", "hstu_attention_backward"),
+    "hstu_lmsd_forward": ("cudnn.hstu.hstu_lmsd", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward": ("cudnn.hstu.hstu_lmsd", "hstu_lmsd_backward"),
+    "hstu_attention_forward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_forward"),
+    "hstu_attention_backward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_backward"),
+    "hstu_lmsd_forward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_backward"),
+    "layer_norm_forward_jax": ("cudnn.norm.jax_api", "layer_norm_forward_jax"),
+    "rms_norm_forward_jax": ("cudnn.norm.jax_api", "rms_norm_forward_jax"),
 }
 
-__all__ = list(_LAZY_EXPORTS)
+# Op families are subpackages; they resolve lazily like the ops above.
+_FAMILIES = ("dsa", "mhc", "nsa")
+
+__all__ = [*_LAZY_EXPORTS, *_FAMILIES]
 
 
 def __getattr__(name: str) -> Any:
+    if name in _FAMILIES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+
     target = _LAZY_EXPORTS.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

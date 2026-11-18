@@ -17,11 +17,13 @@ from __future__ import annotations
 import contextlib
 import functools
 import importlib
+import itertools
 import math
 import os
 import threading
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -55,7 +57,10 @@ BETA_VARIANTS = ("gdn", "kda", "gdn2", "gdp")  # the beta modes, the safe gate a
 SUMMARY_VARIANTS = BETA_VARIANTS  # the matrix-transition summaries (H, M, G); Mamba-2's scalar-transition summaries have their own tests
 DEFAULT_V = {"mamba2": 64}  # the Mamba-2 kernels pin d_v = 64 (every other family defaults to 128)
 STATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
-SPLIT_T = 4096
+FP8_STATE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)  # forward only: a saturating cast at the state load and store
+FP8_TOL_SCALE = 5  # fp8 states: a serving stack's atol 1e-1 on the state over the bf16 state tolerance 2e-2
+FP8_MAX = {torch.float8_e4m3fn: 448.0, torch.float8_e5m2: 57344.0}  # the saturating cast's bounds
+LONG_T = 4096
 HOUSEHOLDER = 3
 CHUNK = {"gdn": 64, "kda": 16, "gdn2": 16, "gdp": 64, "mamba2": 128}
 LEAF_NAMES = {
@@ -117,7 +122,7 @@ STRESS_SHAPES = [
 ]
 SEED = 888
 
-DTYPE_IDS = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
+DTYPE_IDS = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32", torch.float8_e4m3fn: "e4m3", torch.float8_e5m2: "e5m2"}
 OP_NAMES = {"gdn": "gated_delta_net", "kda": "kimi_delta_attention", "gdn2": "gated_delta_net_v2", "gdp": "gated_delta_product", "mamba2": "mamba2"}
 PARAM_NAMES = {"mamba2": ("A", "dt_bias")}  # per-head parameters a family passes after cu_seqlens (not THD leaves)
 
@@ -215,14 +220,15 @@ def waive_declined(what):
 def frost_la_unavailable():
     """Why no FROST linear-attention engine can serve this process, or ``None``:
     the device and CuTe DSL half of ``frost_la_gate``, read without a graph."""
-    from cudnn.frost import buffers
+    if not torch.cuda.is_available():
+        return "the FROST engines need a GPU"
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((10, 0), (10, 3), (10, 7)):
+        return f"the FROST engines need SM100 / SM103 / SM107 (found {cc})"
+    from cudnn.frost import cutedsl_runtime_available
 
-    sm = buffers.current_sm()
-    if sm is None or not (100 <= sm <= 103 or sm == 107):
-        return f"the FROST engines need SM100 / SM103 / SM107 (found {sm})"
-    installed, version = buffers.cutedsl_state()
-    if not installed or buffers.cutedsl_too_old(version):
-        return f"the FROST engines need nvidia-cutlass-dsl >= {'.'.join(map(str, buffers.CUTEDSL_MIN_VERSION))} (found {version})"
+    if not cutedsl_runtime_available(cc):
+        return "the FROST engines need a newer nvidia-cutlass-dsl"
     return None
 
 
@@ -364,6 +370,9 @@ def mamba2_la_op(
     D=None,
     z=None,
     checkpoint_dtype=None,
+    checkpoint_after_block=False,
+    dt_min=0.0,
+    dt_max=None,
 ):
     """``mamba2`` behind the suite's delta-rule calling convention: ``q`` = C, ``k`` = B, ``v`` = x, ``g`` = raw dt;
     the per-head ``A`` and ``dt_bias`` follow ``cu_seqlens``.  ``scale`` (the suite's ``1 / sqrt(K)`` default) and the
@@ -393,6 +402,9 @@ def mamba2_la_op(
         overwrite_initial_state=overwrite_initial_state,
         plan_name=plan_name,
         checkpoint_dtype=checkpoint_dtype,
+        checkpoint_after_block=checkpoint_after_block,
+        dt_min=dt_min,
+        dt_max=dt_max,
     )
 
 
@@ -419,7 +431,7 @@ def case_tensors(case):
 
 
 def thd_tensors(case, window=None):
-    """Fresh THD copies of the leaf tensors, cut to the real-token window ``(t0, t1)`` of the packed batch when given."""
+    """Fresh THD copies of the leaf tensors, sliced to the real-token window ``(t0, t1)`` of the packed batch when given."""
     out = []
     for name, t in case_tensors(case).items():
         t = to_thd(t)
@@ -465,15 +477,21 @@ def op_args(case, cu=None, window=None):
 def window(case, t0, t1):
     """The tokens ``[t0, t1)`` of every row of a dense case (or of the packed batch) as a case of their own."""
 
-    def cut(name, t):
+    def crop(name, t):
         scale = case.n if name in EXPANDED_LEAVES else 1
         return t[:, t0 * scale : t1 * scale].contiguous()
 
     T = t1 - t0
     cu = torch.arange(0, case.B + 1, dtype=case.cu.dtype, device="cuda") * T
     params = PARAM_NAMES.get(case.variant, ())
-    gates = {name: (t if name in params else cut(name, t)) for name, t in case.gates.items()}
-    return case.clone(q=cut("q", case.q), k=cut("k", case.k), v=cut("v", case.v), gates=gates, cu=cu, T=T, N=case.B)
+    gates = {name: (t if name in params else crop(name, t)) for name, t in case.gates.items()}
+    return case.clone(q=crop("q", case.q), k=crop("k", case.k), v=crop("v", case.v), gates=gates, cu=cu, T=T, N=case.B)
+
+
+def sequence_window(case, s0, s1):
+    """The sequences ``[s0, s1)`` of a packed case as a case of their own."""
+    cu = (case.cu[s0 : s1 + 1] - case.cu[s0]).contiguous()
+    return window(case, int(case.cu[s0]), int(case.cu[s1])).clone(cu=cu, N=s1 - s0)
 
 
 def random_state(case, *, scale=0.05, seed=SEED + 1, dtype=torch.float32):
@@ -582,16 +600,14 @@ def test_default_engine_is_frost(variant):
     major, minor = torch.cuda.get_device_capability()
     if not (major == 10 and minor in (0, 3, 7)):
         pytest.skip("FROST LA serves SM100 / SM103 / SM107 only")
-    from cudnn.linear_attention.ops import gdn, kda
-
-    cache = {"gdn": gdn, "kda": kda}[variant].fprop_cache
     clear_caches()
     try:
         case = make_case(variant, torch.bfloat16, T=4 * CHUNK[variant])
         with waive_declined(f"default {variant}"):
-            op(variant)(*op_args(case))
-        ((graph, *_),) = cache.values()
-        assert graph.selected_engine.name == f"{variant}_frost"
+            default = op(variant)(*op_args(case))
+        pinned = pinned_op(Backend("frost"), variant)(*op_args(case))
+        for name, got, want in zip(("o", "final_state"), default, pinned):
+            assert_bitwise(f"default engine {name}", got, want)
     finally:
         clear_caches()
 
@@ -700,19 +716,19 @@ def test_fwd_initial_state(backend, variant, T):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_fwd_split_initial_state(backend, variant):
-    """With an initial state at a split-inducing length, the default schedule and
-    the uncut batch-invariant schedule agree with each other and with the reference."""
-    case = make_case(variant, torch.bfloat16, B=1, T=SPLIT_T)
+def test_fwd_long_initial_state_matches_invariant(backend, variant):
+    """With an initial state on a long single sequence, the default call and its ``batch_invariant`` run agree with each
+    other and with the reference."""
+    case = make_case(variant, torch.bfloat16, B=1, T=LONG_T)
     set_seed(SEED + 1)
     state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
-    o_split, fs_split = run_fwd(backend, case, initial_state=state0, output_final_state=True)
-    o_uncut, fs_uncut = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
-    assert_rms_close("o split-vs-uncut", o_split, o_uncut.float(), FWD_TOL[torch.bfloat16])
-    assert_rms_close("final_state split-vs-uncut", fs_split, fs_uncut.float(), STATE_TOL[torch.bfloat16])
+    o_default, fs_default = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_inv, fs_inv = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
+    assert_rms_close("o default-vs-invariant", o_default, o_inv.float(), FWD_TOL[torch.bfloat16])
+    assert_rms_close("final_state default-vs-invariant", fs_default, fs_inv.float(), STATE_TOL[torch.bfloat16])
     o_ref, fs_ref = reference(case, initial_state=state0)
-    assert_rms_close("o vs reference", o_split, o_ref, FWD_TOL[torch.bfloat16])
-    assert_rms_close("final_state vs reference", fs_split, fs_ref, STATE_TOL[torch.bfloat16])
+    assert_rms_close("o vs reference", o_default, o_ref, FWD_TOL[torch.bfloat16])
+    assert_rms_close("final_state vs reference", fs_default, fs_ref, STATE_TOL[torch.bfloat16])
 
 
 @pytest.mark.parametrize("T1,T2", [(128, 128), (64, 192), (192, 121)])
@@ -1027,7 +1043,7 @@ def test_bwd_skip_gate(backend, variant, per_channel, with_z):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", ["mamba2"])
 def test_bwd_z_gate_strided_views_bitwise(backend, variant):
-    """z and dO handed in as head-padded views (stride-1 innermost dim, wider outer strides) give o, dz and the data
+    """z and dO intermediates in as head-padded views (stride-1 innermost dim, wider outer strides) give o, dz and the data
     gradients bitwise equal to their dense copies: the z-gate backward reads every tensor through its own strides."""
     case = make_case(variant, torch.bfloat16, B=2, T=320)
     tensors = case_tensors(case)
@@ -1107,41 +1123,38 @@ def test_bwd_initial_state(backend, variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_split_initial_state(backend, variant):
-    """Backward over a cut work-item table with an initial state matches the
-    uncut (batch-invariant) table."""
-    case = make_case(variant, torch.bfloat16, B=1, T=SPLIT_T)
+def test_bwd_long_initial_state_matches_invariant(backend, variant):
+    """Backward on a long single sequence with an initial state matches the ``batch_invariant`` run."""
+    case = make_case(variant, torch.bfloat16, B=1, T=LONG_T)
     set_seed(SEED + 1)
     state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
     tensors = case_tensors(case)
     dO, grads = None, {}
-    for tag, kw in (("split", {}), ("uncut", {"batch_invariant": True})):
+    for tag, kw in (("default", {}), ("invariant", {"batch_invariant": True})):
         leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors.values()]
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):
             o, _ = pinned_op(backend, variant)(*leaves, *op_tail(case), initial_state=s0, output_final_state=True, **kw)
             if dO is None:
                 dO = torch.randn_like(o)
-            # Inside the waiver, matching test_bwd_split_d_final_state: a
+            # Inside the waiver, matching test_bwd_long_d_final_state_matches_invariant: a
             # forward-only backend (hopper) serves the forward and declines the
             # backward, which is a waive, not a failure.
             grads[tag] = torch.autograd.grad([o], leaves + [s0], [dO])
-    for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
-        assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
+    for name, got, want in zip(list(tensors) + ["initial_state"], grads["default"], grads["invariant"]):
+        assert_rms_close(f"d{name} default-vs-invariant", got, want.float(), BWD_TOL[torch.bfloat16])
 
 
 @pytest.mark.parametrize("V", [128, 64])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_split_d_final_state(backend, variant, V):
-    """Backward over a cut work-item table with a final-state gradient matches
-    the uncut (batch-invariant) table; only the piece owning the sequence end
-    seeds from d_final_state."""
-    case = make_case(variant, torch.bfloat16, B=1, T=SPLIT_T, V=V)
+def test_bwd_long_d_final_state_matches_invariant(backend, variant, V):
+    """Backward on a long single sequence with a final-state gradient matches the ``batch_invariant`` run."""
+    case = make_case(variant, torch.bfloat16, B=1, T=LONG_T, V=V)
     set_seed(SEED + 1)
     state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
     tensors = case_tensors(case)
     dO, dFinal, grads = None, None, {}
-    for tag, kw in (("split", {}), ("uncut", {"batch_invariant": True})):
+    for tag, kw in (("default", {}), ("invariant", {"batch_invariant": True})):
         leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors.values()]
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):
@@ -1150,8 +1163,8 @@ def test_bwd_split_d_final_state(backend, variant, V):
                 dO = torch.randn_like(o)
                 dFinal = torch.randn_like(final_state) * 0.05
             grads[tag] = torch.autograd.grad([o, final_state], leaves + [s0], [dO, dFinal])
-    for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
-        assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
+    for name, got, want in zip(list(tensors) + ["initial_state"], grads["default"], grads["invariant"]):
+        assert_rms_close(f"d{name} default-vs-invariant", got, want.float(), BWD_TOL[torch.bfloat16])
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -1251,10 +1264,10 @@ def assert_bitwise(name, got, want):
 
 
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
-@pytest.mark.parametrize("T", [128, SPLIT_T])
+@pytest.mark.parametrize("T", [128, LONG_T])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_gate_16bit(backend, variant, T, gate_dtype):
-    """SPLIT_T also drives the 16-bit gate through the split-K chunk scan."""
+    """LONG_T also drives the 16-bit gate through the long-sequence path."""
     narrow, wide = gate_dtype_pair(variant, gate_dtype, T=T, H=2)
     assert narrow.gates["g"].dtype == gate_dtype
     o16, fs16 = run_fwd(backend, narrow, output_final_state=True)
@@ -1395,6 +1408,42 @@ def test_fwd_state_dtype(backend, variant, state_dtype):
     """A bf16 or fp16 initial_state; final_state comes back in initial_state's
     dtype and matches the reference."""
     assert_fwd_parity(backend, make_case(variant, torch.bfloat16, T=256), use_initial_state=True, state_dtype=state_dtype)
+
+
+@pytest.mark.parametrize("K,V", [(64, 128), (128, 64), (128, 128)])
+@pytest.mark.parametrize("state_dtype", FP8_STATE_DTYPES, ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_fwd_state_dtype_fp8(backend, variant, state_dtype, K, V):
+    """An fp8 initial_state (e4m3fn or e5m2): final_state comes back in the same dtype and matches the fp64 reference's final
+    state rounded to that format within the fp8 tolerance; o matches at the io tolerance; a backward with an fp8 state is
+    declined."""
+    case = make_case(variant, torch.bfloat16, T=256, K=K, V=DEFAULT_V.get(variant, V))
+    state0 = random_state(case, dtype=state_dtype)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_ref, fs_ref = reference(case, initial_state=state0)
+    assert fs.dtype == state_dtype, f"final_state is {fs.dtype}, initial_state is {state_dtype}"
+    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype])
+    bound = FP8_MAX[state_dtype]
+    assert_rms_close("final_state (both in fp8)", fs.float(), fs_ref.clamp(-bound, bound).to(state_dtype).float(), STATE_TOL[case.dtype] * FP8_TOL_SCALE)
+    args = thd_tensors(case)
+    leaves = [args[0].requires_grad_(True)]
+    with pytest.raises((TypeError, cudnn.cudnnGraphNotSupportedError)):
+        out = pinned_op(backend, variant)(*args, *op_tail(case), initial_state=state0, output_final_state=True)
+        torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
+
+
+@pytest.mark.parametrize("state_dtype", FP8_STATE_DTYPES, ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_fwd_long_state_dtype_fp8(backend, variant, state_dtype):
+    """An fp8 initial_state on a long single sequence: o and final_state match the reference as in the short case."""
+    case = make_case(variant, torch.bfloat16, B=1, T=LONG_T)
+    state0 = random_state(case, dtype=state_dtype)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_ref, fs_ref = reference(case, initial_state=state0)
+    assert fs.dtype == state_dtype, f"final_state is {fs.dtype}, initial_state is {state_dtype}"
+    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype])
+    bound = FP8_MAX[state_dtype]
+    assert_rms_close("final_state (both in fp8)", fs.float(), fs_ref.clamp(-bound, bound).to(state_dtype).float(), STATE_TOL[case.dtype] * FP8_TOL_SCALE)
 
 
 @pytest.mark.parametrize(
@@ -1683,7 +1732,7 @@ TIGHT_VARLEN_RECIPES = {
 def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
     """Varlen lengths whose packed entries fill the capacity bound exactly; every
     entry matches the fp64 recurrence and its sequence's solo prefix run, and
-    the chunk-cadence backward reuse matches the recompute path bitwise."""
+    the chunk-cadence backward reuse matches the no-checkpoint backward bitwise."""
     ckpt = CHUNK[variant]
     seq_lens = TIGHT_VARLEN_RECIPES[recipe](ckpt)
     counts = [(sl - 1) // ckpt + 1 if sl > 0 else 0 for sl in seq_lens]
@@ -1716,7 +1765,7 @@ def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
             dO = torch.randn_like(out[0])
             grads_by_mode.append(torch.autograd.grad([out[0]], leaves, [dO]))
     for gr, gc in zip(grads_by_mode[0], grads_by_mode[1]):
-        assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the recompute path"
+        assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the no-checkpoint backward"
 
 
 @pytest.mark.parametrize("rows", ["fp32", "io"])
@@ -1743,6 +1792,177 @@ def test_checkpoints_coarse_cadence(backend, variant, K, V, ckpt_mult, rows):
         with waive_unsupported(backend, variant):
             _, fs_p = pinned_op(backend, variant)(*op_args(case, window=(0, n)), output_final_state=True)
         assert_rms_close(f"state_checkpoints[{j}]", state_checkpoints[j], fs_p[0], STATE_TOL[case.dtype])
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints after each block (checkpoint_after_block)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("batch_invariant", [True, False], ids=["invariant", "default"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_after_block_shift(backend, variant, batch_invariant):
+    """With ``checkpoint_after_block`` row j is the state after block j: the default series shifted by one row, the
+    aligned end included and equal to ``final_state``, floor(L / ckpt) rows, capacity T // ckpt.  With ``batch_invariant`` the shared
+    rows are bitwise; the default run is compared within the state tolerance."""
+    ckpt = CHUNK[variant]
+    T = 5 * ckpt
+    case = make_case(variant, torch.bfloat16, T=T)
+    kw = dict(output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n, batch_invariant=batch_invariant)
+    _, fs, default = run_fwd(backend, case, **kw)
+    _, fs_a, after = run_fwd(backend, case, checkpoint_after_block=True, **kw)
+    valid = T // ckpt
+    assert after.shape == (valid, case.HO, case.V, case.K)
+    assert after.dtype == case.dtype
+    assert_bitwise("final_state", fs_a, fs)
+    for j in range(valid - 1):
+        if batch_invariant:
+            assert_bitwise(f"after[{j}] vs default[{j + 1}]", after[j], default[j + 1])
+        else:
+            assert_rms_close(f"after[{j}] vs default[{j + 1}]", after[j], default[j + 1].float(), STATE_TOL[case.dtype])
+    assert_bitwise("after[last] vs final_state", after[valid - 1], fs[0].to(after.dtype))
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_after_block_varlen(backend, variant):
+    """Rows pack per sequence in order, floor(L / ckpt) each (none for a sequence shorter than ckpt or empty); each row is its
+    sequence's truncated prefix final state and an aligned end is that sequence's final state."""
+    ckpt = CHUNK[variant]
+    seq_lens = [3 * ckpt + 5, ckpt - 1, 0, 2 * ckpt]
+    case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
+    _, fs, after = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n, checkpoint_after_block=True)
+    counts = [sl // ckpt for sl in seq_lens]
+    assert counts == [3, 0, 0, 2]
+    assert after.shape[0] == max(sum(seq_lens) // ckpt, 1)
+    bounds = case.cu.tolist()
+    base = 0
+    for n, count in enumerate(counts):
+        for j in range(count):
+            n0 = bounds[n]
+            with waive_unsupported(backend, variant):
+                _, fs_p = pinned_op(backend, variant)(*op_args(case, window=(n0, n0 + (j + 1) * ckpt)), output_final_state=True)
+            assert_rms_close(f"after[seq {n}][{j}]", after[base + j], fs_p[0], STATE_TOL[case.dtype])
+        if count and seq_lens[n] % ckpt == 0:
+            assert_bitwise(f"seq {n} aligned end", after[base + count - 1], fs[n].to(after.dtype))
+        base += count
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_after_block_tight_capacity(backend, variant):
+    """Aligned lengths whose rows fill the T // ckpt capacity exactly, seeded: every row within tolerance of the fp64
+    recurrence over its prefix, the last row of every sequence bitwise that sequence's final state."""
+    ckpt = CHUNK[variant]
+    seq_lens = [2 * ckpt, 3 * ckpt, ckpt]
+    case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
+    state0 = random_state(case)
+    _, fs, after = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n, checkpoint_after_block=True)
+    counts = [sl // ckpt for sl in seq_lens]
+    assert after.shape[0] == sum(counts) == sum(seq_lens) // ckpt
+    bounds = case.cu.tolist()
+    base = 0
+    for n, count in enumerate(counts):
+        for j in range(count):
+            prefix = window(case, bounds[n], bounds[n] + (j + 1) * ckpt)
+            _, fs_ref = reference(prefix, initial_state=state0[n : n + 1])
+            assert_rms_close(f"after[seq {n}][{j}] vs fp64", after[base + j], fs_ref[0], STATE_TOL[case.dtype])
+        assert_bitwise(f"seq {n} end", after[base + count - 1], fs[n].to(after.dtype))
+        base += count
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_after_block_requires_cadence(backend, variant):
+    """The convention flag without a cadence is a ValueError at the op."""
+    case = make_case(variant, torch.bfloat16, T=2 * CHUNK[variant])
+    with pytest.raises(ValueError, match="checkpoint_after_block"):
+        run_fwd(backend, case, checkpoint_after_block=True)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_fp32_checkpoints_after_block(backend, variant):
+    """fp32 after-block rows round to the io rows bitwise and the aligned end is the fp32 final state bitwise."""
+    ckpt = CHUNK[variant]
+    case = make_case(variant, torch.bfloat16, T=4 * ckpt)
+    kw = dict(output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n, checkpoint_after_block=True, batch_invariant=True)
+    _, fs, rows32 = run_fwd(backend, case, checkpoint_dtype=torch.float32, **kw)
+    _, _, rows16 = run_fwd(backend, case, **kw)
+    assert rows32.dtype == torch.float32
+    assert_bitwise("io rows round from fp32 rows", rows16, rows32.to(case.dtype))
+    assert_bitwise("aligned end", rows32[-1], fs[0])
+
+
+@pytest.mark.parametrize("K,V", [(64, 128), (128, 64), (128, 128)])
+@pytest.mark.parametrize("after_block", [False, True], ids=["pre_state", "after_block"])
+@pytest.mark.parametrize("row_dtype", FP8_STATE_DTYPES, ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_fp8_checkpoint_rows(backend, variant, row_dtype, after_block, K, V):
+    """fp8 checkpoint rows (e4m3fn, e5m2) in both conventions: every row is the fp32 row rounded to nearest and saturated at
+    the format's maximum (the e4m3 pre-state cells seed row 0 past 448); K = 64 covers the 64-byte fp8 row."""
+    ckpt = CHUNK[variant]
+    case = make_case(variant, torch.bfloat16, T=4 * ckpt, K=K, V=DEFAULT_V.get(variant, V))
+    state0 = random_state(case, scale=600.0)
+    kw = dict(initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n, checkpoint_after_block=after_block, batch_invariant=True)
+    _, fs, rows32 = run_fwd(backend, case, checkpoint_dtype=torch.float32, **kw)
+    _, fs8, rows8 = run_fwd(backend, case, checkpoint_dtype=row_dtype, **kw)
+    assert rows8.dtype == row_dtype and rows8.shape == rows32.shape
+    assert_bitwise("final_state", fs8, fs)
+    bound = FP8_MAX[row_dtype]
+    valid = (case.T // ckpt) if after_block else ((case.T - 1) // ckpt + 1)
+    if row_dtype == torch.float8_e4m3fn and not after_block:
+        assert (rows32[:valid].abs() > bound).any(), "the seeded state must drive entries past the e4m3 maximum"
+    assert_bitwise("fp8 rows", rows8[:valid], rows32[:valid].clamp(-bound, bound).to(row_dtype))
+
+
+@pytest.mark.parametrize("rows", ["io", "fp32"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_after_block_matches_no_checkpoint_backward(backend, variant, rows):
+    """A forward with after-block rows backpropagates bitwise like the forward without checkpoints: the rows seed nothing."""
+    ckpt = CHUNK[variant]
+    case = make_case(variant, torch.bfloat16, T=4 * ckpt)
+    row_dtype = dict(checkpoint_dtype=torch.float32) if rows == "fp32" else {}
+    grads = []
+    for kw in ({}, dict(checkpoint_every_n_tokens=ckpt * case.n, checkpoint_after_block=True, **row_dtype)):
+        args = thd_tensors(case)
+        leaves = [args[0].requires_grad_(True), args[3].requires_grad_(True)]
+        with waive_unsupported(backend, variant):
+            out = pinned_op(backend, variant)(*args, *op_tail(case), output_final_state=True, **kw)
+            set_seed(SEED + 5)
+            d_o = torch.randn_like(out[0])
+            grads.append(torch.autograd.grad([out[0]], leaves, [d_o]))
+    for name, g_ref, g_after in zip(("q", "g"), *grads):
+        assert_bitwise(f"d{name}", g_after, g_ref)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("shape", ["long_ragged", "half_sm", "near_half_sm"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_after_block_shapes(backend, variant, shape):
+    """The after-block series on a long ragged batch, at half the SM count and just under it: the row count of the
+    ``batch_invariant`` run, the half-SM rows bitwise its rows, the others within LONG_FWD_TOL of them, and the aligned end of
+    every sequence bitwise its final state."""
+    checkpoint = 2 * CHUNK[variant]
+    case = {
+        "long_ragged": lambda: long_case(variant, LONG_RAGGED, H=4),
+        "half_sm": lambda: half_sm_case(variant),
+        "near_half_sm": lambda: near_half_sm_case(variant),
+    }[shape]()
+    state0 = random_state(case)
+    kw = dict(initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint, checkpoint_after_block=True)
+    _, fs, series = run_fwd(backend, case, **kw)
+    _, _, series_u = run_fwd(backend, case, batch_invariant=True, **kw)
+    assert series.shape == series_u.shape
+    row = 0
+    for n, length in enumerate(case.cu.diff().tolist()):
+        rows = length * case.n // checkpoint
+        for r in range(rows):
+            if shape == "half_sm":
+                assert_bitwise(f"seq {n} row {r}", series[row + r], series_u[row + r])
+            else:
+                assert_rms_close(f"seq {n} row {r}", series[row + r], series_u[row + r].float(), LONG_FWD_TOL)
+        if rows and (length * case.n) % checkpoint == 0:
+            assert_bitwise(f"seq {n} aligned end", series[row + rows - 1], fs[n].to(series.dtype))
+        row += rows
+    assert row <= series.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1824,11 +2044,11 @@ def test_safe_gate_forward_parity(backend, variant):
 def test_safe_gate_head_switch_same_process(backend, variant):
     """Head counts are runtime values of one compiled host, so the second head configuration of a process reuses the host
     the first one compiled; the per-head safe-gate parameters (a_log, dt_bias) ride along as placeholders of every
-    launcher.  Five configurations in one process through the warmup and chain forwards, the standalone summary and the
+    launcher.  Five configurations in one process through 256-token and 4096-token forwards, the standalone summary and the
     backward, with explicit parameters and then with a_log absent, each forward against the fp64 reference."""
     configs = ((2, 2, 2), (4, 1, 1), (3, 3, 3), (1, 2, 2), (2, 2, 4))
     for i, (H, HK, HV) in enumerate(configs):
-        for T in ((256, SPLIT_T) if i < 2 else (256,)):
+        for T in ((256, LONG_T) if i < 2 else (256,)):
             case, kw, oracle = gate_mode_case(make_case(variant, torch.bfloat16, T=T, H=H, HK=HK, HV=HV), "safe", params="random", seed=SEED + 31 + i)
             o, fs = run_fwd(backend, case, output_final_state=True, **kw)
             o_ref, fs_ref = reference(case, **oracle)
@@ -1972,12 +2192,12 @@ def test_safe_gate_backward_param_16bit(backend, variant, K, param_dtype):
 
 
 @pytest.mark.parametrize("arm", ABSENT_ARMS)
-@pytest.mark.parametrize("T", [256, SPLIT_T])
+@pytest.mark.parametrize("T", [256, LONG_T])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_safe_gate_absent_params_fwd_bitwise(backend, variant, T, arm):
     """An absent a_log is unit amplitude and an absent dt_bias is zero bias; o
-    and final_state are bitwise the explicit-zero-tensor run (SPLIT_T also
-    drives the split-K chunk scan, whose plan key carries the params)."""
+    and final_state are bitwise the explicit-zero-tensor run (LONG_T also
+    drives the long-sequence path, whose plan key carries the params)."""
     raw_case, kw_ref, _ = gate_mode_case(make_case(variant, torch.bfloat16, T=T), "safe", params="random", arm=arm, seed=SEED + 21)
     kw_abs = dict(kw_ref, **{name: None for name in ABSENT_PARAMS[arm]})
     o_ref, fs_ref = run_fwd(backend, raw_case, output_final_state=True, **kw_ref)
@@ -2241,9 +2461,9 @@ def test_beta_guard_bwd_initial_state(backend, variant):
 
 
 @pytest.mark.parametrize("variant", BETA_GUARD_VARIANTS)
-def test_beta_guard_recompute_matches_checkpoints(backend, variant):
-    """Prefill (checkpoint dump) and recompute apply the same guard; the gradient
-    gap between the checkpoint-reuse and recompute backward paths with the
+def test_beta_guard_no_checkpoints_matches_checkpoints(backend, variant):
+    """The forward with checkpoints and the backward without them apply the same guard; the gradient
+    gap between the checkpoint and no-checkpoint backwards with the
     guard on stays at the scale of the guard-off gap."""
     case = make_case(variant, torch.bfloat16, T=256)
     tensors = case_tensors(case).values()
@@ -2380,9 +2600,8 @@ def test_scalar_gate_head_tiling(backend, variant, H):
 
 
 def steep_gate(case, pattern):
-    """A copy of the case whose log-decay on a few key channels drops far below the 16-token-tile range the
-    exp2(g) / exp2(-g) operand split can represent (the in-tile log2 prefix below -126, i.e. a tile sum of g
-    below -87.3).  Edits are relative to each sequence start, where the kernel tiles begin."""
+    """A copy of the case whose log-decay on a few key channels drops far below what fp32 can represent across a
+    16-token tile (a tile sum of g below -87.3).  Edits are relative to each sequence start, where the tiles begin."""
     g = case.gates["g"].clone()  # [B, T, HO, K], natural log
     if case.varlen:
         spans = [(0, s, e) for s, e in zip(case.cu[:-1].tolist(), case.cu[1:].tolist())]
@@ -2419,10 +2638,10 @@ def steep_gate(case, pattern):
 
 STEEP_VARIANTS = ("gdn2", "kda")
 STEEP_PATTERNS = ("steady", "spike", "huge_spike", "two_spikes", "offset_window", "extreme", "all_channels", "alternating")
-STEEP_SHAPES = {  # token geometry per schedule; two heads
-    "prep": dict(seq_lens=[517, 0, 91, 128, 1], H=2),
-    "uncut": dict(seq_lens=[96, 32, 160, 1], H=2),
-    "chain": dict(seq_lens=[2048], H=2),
+STEEP_SHAPES = {  # token geometry; two heads
+    "ragged5": dict(seq_lens=[517, 0, 91, 128, 1], H=2),
+    "ragged4": dict(seq_lens=[96, 32, 160, 1], H=2),
+    "long": dict(seq_lens=[2048], H=2),
 }
 
 
@@ -2491,7 +2710,7 @@ def test_steep_channel_decay_fp16(backend, shape, K, variant):
     assert_bwd_parity(backend, case, l2norm=True)
 
 
-@pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=["fp32", "bf16", "fp16"])
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES + FP8_STATE_DTYPES, ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", STEEP_VARIANTS)
 def test_steep_channel_decay_overwrite_initial_state(backend, state_dtype, variant):
@@ -2514,7 +2733,7 @@ def test_steep_channel_decay_backward_overwrite_initial_state(backend, state_dty
     case = steep_gate(make_case(variant, torch.bfloat16, B=8, T=512, H=4), "spike")
     state0 = random_state(case, dtype=state_dtype)
     d_final = random_state(case, scale=0.1, seed=SEED + 3, dtype=state_dtype)
-    _, _, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, batch_invariant=True)
+    _, _, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final, batch_invariant=True)
     names = LEAF_NAMES[variant]
     inputs = dict(zip(names, op_args(case)[: len(names)]))
     inputs.update(cu_seqlens=case.cu, dO=dO, initial_state=state0, d_final_state=d_final)
@@ -2557,9 +2776,9 @@ def test_steep_read_only_state_pool(backend, K, steep, variant):
         case = steep_gate(case, "spike")
     state0 = random_state(case)
     o_ref, _ = run_fwd(backend, case, initial_state=state0, output_final_state=False, batch_invariant=True)
-    pool, slots, _ = state_pool(case, state0, padded=True)
+    pool, indices, _ = state_pool(case, state0, padded=True)
     pool_before = pool.clone()
-    o, final_state = run_fwd(backend, case, initial_state=pool, state_indices=slots, output_final_state=False, batch_invariant=True)
+    o, final_state = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=False, batch_invariant=True)
     assert final_state.numel() == 0
     assert_bitwise("output", o, o_ref)
     assert_bitwise("read-only pool", pool, pool_before)
@@ -2614,9 +2833,9 @@ def test_steep_multiple_channels_repeatable(backend, K, shape, variant):
     case = steep_gate(make_case(variant, torch.bfloat16, K=K, **STEEP_SHAPES[shape]), "all_channels")
     state0 = random_state(case)
     d_final = random_state(case, seed=SEED + 3)
-    o_ref, fs_ref, grads_ref, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o_ref, fs_ref, grads_ref, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
     for _ in range(8):
-        o, fs, grads, _, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, dO=dO)
+        o, fs, grads, _, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final, dO=dO)
         assert_bitwise("output", o, o_ref)
         assert_bitwise("final_state", fs, fs_ref)
         for name in grads_ref:
@@ -2715,8 +2934,8 @@ def test_steep_fp16_large_final_state_gradient(backend, K, T, key_value, V, vari
     state0 = random_state(case, scale=50.0)
     d_final = torch.full_like(state0, 70000.0)
     d_o = torch.zeros(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
-    _, _, got, _, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, dO=d_o, batch_invariant=True)
-    expected = chain_reference_grads(case, state0, d_o, d_final)
+    _, _, got, _, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final, dO=d_o, batch_invariant=True)
+    expected = long_reference_grads(case, state0, d_o, d_final)
     for name in expected:
         assert_rms_close(f"large final-state seed d{name}", got[name], expected[name], BWD_TOL[case.dtype])
     summary = run_summary_bwd(case, d_o, d_final_state=d_final, batch_invariant=True)
@@ -2744,8 +2963,8 @@ def test_steep_fp16_large_state_gradient_carry(backend, K, V, variant):
     state0 = torch.zeros_like(random_state(case))
     d_o = torch.zeros(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
     d_o[16:].fill_(60000.0)
-    _, _, got, _, _ = chain_grads(backend, case, initial_state=state0, dO=d_o, batch_invariant=True)
-    expected = chain_reference_grads(case, state0, d_o, torch.zeros_like(state0))
+    _, _, got, _, _ = long_grads(backend, case, initial_state=state0, dO=d_o, batch_invariant=True)
+    expected = long_reference_grads(case, state0, d_o, torch.zeros_like(state0))
     for name in expected:
         assert_rms_close(f"large inter-tile carry d{name}", got[name], expected[name], BWD_TOL[case.dtype])
     summary = run_summary_bwd(case, d_o, batch_invariant=True)
@@ -2802,6 +3021,67 @@ def test_steep_narrow_gate_ragged_tail(backend, dtype, gate_dtype, K, variant):
     """Low-precision gate loads and padded scan rows share the exact-path contract."""
     case = steep_gate(make_case(variant, dtype, K=K, gate_dtype=gate_dtype, seq_lens=[17, 0, 33, 1]), "steady")
     assert_bwd_parity(backend, case, use_initial_state=True, use_dfs=True, l2norm=True)
+
+
+# ---------------------------------------------------------------------------
+# FP32 projection residual (GDN-2: Y = W .* V - K_decay @ S formed in fp32, rounded once)
+# ---------------------------------------------------------------------------
+
+
+def gdn2_residual_cancellation_case(K, V, active):
+    """One active token whose fp32 projection ``beta k . S = 0.5 + 1/512`` is a bf16 midpoint: rounding it before the
+    subtraction gives ``Y = 1 - 0.5`` and a final state of ``seed + k * 0.5``; the fp32 residual gives
+    ``Y = 0.5 - 1/512`` and ``seed + k * (0.5 - 1/512)``, both exactly representable.  Every other token has a zero
+    key, so the chunk inverse is the identity and nothing else moves the state."""
+    tokens = 33
+    q = torch.zeros(tokens, 1, K, dtype=torch.bfloat16, device="cuda")
+    q[..., 0] = 1
+    k = torch.zeros_like(q)
+    k[active, :, 0], k[active, :, 1] = 1, 1 / 256
+    v = torch.zeros(tokens, 1, V, dtype=torch.bfloat16, device="cuda")
+    v[active] = 1
+    w = torch.ones(tokens, 1, V, dtype=torch.bfloat16, device="cuda")
+    g = torch.zeros(tokens, 1, K, dtype=torch.float32, device="cuda")
+    beta = torch.full((tokens, 1, K), 0.5, dtype=torch.bfloat16, device="cuda")
+    cu = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+    seed = torch.zeros(1, 1, V, K, device="cuda")
+    seed[..., :2] = 1
+    expected = seed.double().clone()
+    expected[..., 0] += 0.5 - 1 / 512
+    expected[..., 1] += (0.5 - 1 / 512) / 256
+    return (q, k, v, g, beta, w, cu), seed, expected
+
+
+@pytest.mark.parametrize("active", [0, 16], ids=["initial", "steady"])
+@pytest.mark.parametrize("dims", HEAD_DIMS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdn2_projection_residual_cancellation(backend, dims, active):
+    """The Y operand keeps the fp32 projection residual: the final state carries the exact ``-k / 512`` correction
+    that the bf16-rounded projection lost (the first chunk with an initial state, and a later chunk).  The summary is not
+    a case: its H starts from a zero state and the initial state enters through the transition, so nothing cancels there."""
+    args, seed, expected = gdn2_residual_cancellation_case(*dims, active)
+    with waive_unsupported(backend, "gdn2"):
+        _, actual = pinned_op(backend, "gdn2")(*args, initial_state=seed, output_final_state=True, batch_invariant=True)
+    torch.testing.assert_close(actual.double()[..., :2], expected[..., :2], rtol=0, atol=1e-7)
+    assert torch.count_nonzero(actual[..., 2:]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdn2_checkpoint_and_regenerate_backward_agree(backend, dtype):
+    """Both backward entry paths (saved checkpoints, Y regeneration) rebuild Y with the forward's precision rule."""
+    case = make_case("gdn2", dtype, T=65, H=2, K=64, V=64)
+    dO = torch.randn(case.T, case.HO, case.V, dtype=dtype, device="cuda")
+    results = []
+    for checkpoint in (0, 16):
+        leaves = [t.detach().clone().requires_grad_(True) for t in thd_tensors(case)]
+        with waive_unsupported(backend, "gdn2"):
+            o = pinned_op(backend, "gdn2")(*leaves, *op_tail(case), batch_invariant=True, checkpoint_every_n_tokens=checkpoint)[0]
+        results.append((o, torch.autograd.grad(o, leaves, dO)))
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
+    for name, got, want in zip(LEAF_NAMES["gdn2"], results[0][1], results[1][1]):
+        relative_l2 = (got.double() - want.double()).norm() / want.double().norm().clamp_min(1e-20)
+        assert relative_l2 < 0.003, f"d{name}: checkpoint / regenerate relative L2 {relative_l2}"
 
 
 # ---------------------------------------------------------------------------
@@ -2897,11 +3177,17 @@ def test_gate_domain_invalid_args_raise(backend, variant):
 
 
 # ---------------------------------------------------------------------------
-# Determinism (contract held by the FROST backend)
+# Determinism (contract held by FROST; checked on the cuTile fallback too)
+#
+# cuTile serves the same ops where FROST does not, so the same checks run on
+# it. A variant cuTile has no kernel for is waived; a cuTile failure here means
+# the fallback is not bitwise repeatable.
 # ---------------------------------------------------------------------------
 
+# The determinism tests run on every backend of the ``backend`` fixture (the cuTile and Hopper rows waive where they have
+# no plan).
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_fwd(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
@@ -2911,7 +3197,8 @@ def test_determinism_fwd(backend, variant):
         o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
         return o, fs
 
-    runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    with waive_unsupported(backend, variant):
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
     torch.cuda.synchronize()
     for out in runs[0]:
         assert torch.isfinite(out.float()).all(), f"{variant} fwd: non-finite output in run 0"
@@ -2920,7 +3207,6 @@ def test_determinism_fwd(backend, variant):
             assert_bitwise(f"{variant} fwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_bwd(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
@@ -2942,7 +3228,6 @@ def test_determinism_bwd(backend, variant):
                 assert_bitwise(f"{variant} bwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_multi_tile_fwd(backend, variant):
     """Multi-tile grid (B*H >> SM count) with an initial state is bitwise
@@ -2954,7 +3239,8 @@ def test_determinism_multi_tile_fwd(backend, variant):
         o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
         return o, fs
 
-    runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    with waive_unsupported(backend, variant):
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
     torch.cuda.synchronize()
     for out in runs[0]:
         assert torch.isfinite(out.float()).all(), f"{variant} multi-tile fwd: non-finite output in run 0"
@@ -2963,7 +3249,6 @@ def test_determinism_multi_tile_fwd(backend, variant):
             assert_bitwise(f"{variant} multi-tile fwd output {i} run {r}", b, a)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_multi_tile_bwd(backend, variant):
     case = make_case(variant, torch.bfloat16, B=8, T=192, H=64)
@@ -2985,6 +3270,230 @@ def test_determinism_multi_tile_bwd(backend, variant):
                 assert_bitwise(f"{variant} multi-tile bwd output {i} run {r}", b, a)
 
 
+@pytest.mark.parametrize("mode", ["log", "safe"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_determinism_bwd_all_grads(backend, variant, mode):
+    """Every differentiable input's gradient is bitwise repeatable, not only dq and dk.
+
+    The gate, beta, state and (safe-gate mode) a_log / dt_bias gradients reduce across chunks and heads, which is where
+    an unordered accumulation would show up."""
+    case, kw, _ = gate_mode_case(make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253]), mode, params="random")
+    state0 = (torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05).requires_grad_(True)
+    args = thd_tensors(case)
+    leaves = [tensor.requires_grad_(True) for tensor in args] + [state0]
+    names = [*LEAF_NAMES[variant], "initial_state"]
+    if mode == "safe":
+        leaves += [kw["a_log"].requires_grad_(True), kw["dt_bias"].requires_grad_(True)]
+        names += ["a_log", "dt_bias"]
+    with waive_unsupported(backend, variant):
+        o, fs = pinned_op(backend, variant)(*args, *op_tail(case), initial_state=state0, output_final_state=True, **kw)
+        seeds = [torch.randn_like(o), torch.randn_like(fs)]
+
+        def launch():
+            return torch.autograd.grad([o, fs], leaves, seeds, retain_graph=True, allow_unused=True)
+
+        runs = [launch() for _ in range(DETERMINISM_REPEATS)]
+    torch.cuda.synchronize()
+    assert all(grad is not None for grad in runs[0][:3]), f"{variant} {mode}: dq / dk / dv missing"
+    for name, want in zip(names, runs[0]):
+        assert want is None or torch.isfinite(want.float()).all(), f"{variant} {mode} d{name}: non-finite gradient"
+    for r, grads in enumerate(runs[1:], start=1):
+        for name, got, want in zip(names, grads, runs[0]):
+            if want is None:
+                assert got is None, f"{variant} {mode} d{name} run {r}: gradient appeared"
+            else:
+                assert_bitwise(f"{variant} {mode} d{name} run {r}", got, want)
+
+
+class Picking:
+    """A stand-in for ``exhaustive_search`` that forces candidate ``index`` instead of timing the candidates.
+
+    The real tuner compiles and launches every candidate and drops the ones that fail, so a candidate the compiler
+    rejects (cuda-tile 1.4.0 on SM100 rejects occupancy 8 for ``recompute_w_u_fwd_kda_kernel``) can never become its
+    pick. The stand-in applies the same filter: it launches the forced candidate once and, if that raises, steps down to
+    the nearest lower candidate that runs; candidate 0 is the kernel's default and must run. ``forced`` records, per
+    kernel, the candidates that were in fact exercised and ``excluded`` the ones the compiler rejected, so a compile
+    exclusion is reported apart from a byte mismatch."""
+
+    def __init__(self, index):
+        self.index = index
+        self.forced = {}
+        self.excluded = set()
+        self.domain = {}  # kernel name -> number of candidates of its launch
+
+    @property
+    def covered(self):
+        """Whether every launch seen so far has a candidate at ``index``; False once ``index`` passes every domain."""
+        return any(size > self.index for size in self.domain.values())
+
+    def __call__(self, configs, stream, grid_fn, kernel, args_fn, hints_fn):
+        from cudnn.linear_attention.cutile.kernels import common
+
+        name = getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
+        self.domain[name] = len(configs)
+        for i in range(min(self.index, len(configs) - 1), -1, -1):
+            cfg = configs[i]
+            try:
+                hints = hints_fn(cfg)  # empty for the BV sweep, whose candidates differ in grid and args only
+                common.ct.launch(stream, grid_fn(cfg), kernel.replace_hints(**hints) if hints else kernel, args_fn(cfg))
+            except Exception as error:
+                assert i > 0, f"{name}: the default candidate {vars(cfg)} does not run: {error!r}"
+                self.excluded.add((name, tuple(sorted(vars(cfg).items()))))
+                continue
+            self.forced.setdefault(name, set()).add(i)
+            return SimpleNamespace(best=SimpleNamespace(config=cfg))
+        raise AssertionError(f"{name}: no candidate ran")  # unreachable: the default candidate asserts above
+
+
+class Failing:
+    """A stand-in for ``exhaustive_search`` that raises, so every launch takes the tuning-failure fallback."""
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError("autotune failed on purpose")
+
+
+@pytest.fixture
+def tune_cache():
+    """An empty in-process launch-hint cache before and after the test, so every round tunes (or is handed a pick)."""
+    from cudnn.linear_attention.cutile.kernels import common
+
+    common.launch_hint_cache.clear()
+    yield common.launch_hint_cache.clear
+    common.launch_hint_cache.clear()
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+def test_determinism_cutile_autotune_configs(backend, variant, tune_cache):
+    """Each autotune candidate repeats itself, and so does the tuning-failure fallback.
+
+    The pick is timing-based, so two runs can settle on different candidates, and candidates need not agree with each
+    other (the worker-warp count changes the summation tree of a kernel that reduces with ``ct.sum``). What a pinned
+    pick relies on is that every candidate replays its own bytes: force each candidate in turn instead of timing them
+    and run it twice. A run whose tuning raises or times out launches the first candidate's hints
+    (``autotuned_launch``), so the fallback round must replay too."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+    forced, excluded = {}, set()
+
+    def run_picking(pick):
+        tune_cache()
+        with patch.object(common, "exhaustive_search", pick), patch.object(kda, "exhaustive_search", pick):
+            outputs = stress_round(backend, variant, shape)
+        for name, indices in getattr(pick, "forced", {}).items():
+            forced.setdefault(name, set()).update(indices)
+        excluded.update(getattr(pick, "excluded", ()))
+        return outputs
+
+    def check(label, pick, want):
+        for name, a, b in zip(stress_names(variant), run_picking(pick), want):
+            assert_bitwise(f"{variant} autotune pick {label} repeat {name}", a, b)
+
+    with waive_unsupported(backend, variant):
+        first = run_picking(Picking(0))
+    check("0", Picking(0), first)
+    # every launch has its own domain (occupancy x worker warps, as its call site sweeps it): walk the indices until
+    # the largest domain is exhausted, so every executable candidate of every launch is forced at least once
+    index = 1
+    while True:
+        pick = Picking(index)
+        want = run_picking(pick)
+        if not pick.covered:
+            break
+        check(str(index), pick, want)
+        index += 1
+    check("fallback", Failing(), run_picking(Failing()))
+    domain = pick.domain
+    assert all(
+        len(forced[name]) + sum(k == name for k, _ in excluded) >= size for name, size in domain.items()
+    ), f"{variant}: not every candidate ran or was excluded: forced {forced}, excluded {sorted(excluded)}, domain {domain}"
+    # the comparison means something only if a candidate other than the default ran somewhere
+    assert any(indices - {0} for indices in forced.values()), f"{variant}: no autotune candidate beyond the default ran; excluded {sorted(excluded)}"
+    if excluded:
+        print(f"{variant}: the compiler rejected {sorted(excluded)}; the tuner never picks them, so they are not compared")
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", ["kda"])
+def test_determinism_cutile_kda_bv_candidates_agree(backend, variant, tune_cache):
+    """Every BV candidate of the KDA state kernel writes the same bytes, so its sweep needs no host pin.
+
+    ``kda.autotuned_launch_bv`` times the V-tile width BV of ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` outside
+    the host hooks, so two processes can settle on different widths. BV only partitions the V axis across CTAs (the K
+    axis is always reduced in fixed 64-wide blocks), so unlike the worker-warp count it must not change a single
+    summation: force each BV in turn, with every hooked launch held at its first candidate, and compare the bytes
+    against BV candidate 0, not only against a repeat of the same width."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+
+    def run_bv(index):
+        tune_cache()
+        pick = Picking(index)
+        with patch.object(common, "exhaustive_search", Picking(0)), patch.object(kda, "exhaustive_search", pick):
+            return pick, stress_round(backend, variant, shape)
+
+    with waive_unsupported(backend, variant):
+        first_pick, first = run_bv(0)
+    assert first_pick.domain, f"{variant}: no launch took the BV sweep"
+    index, forced = 1, set()
+    while True:
+        pick, outputs = run_bv(index)
+        if not pick.covered:
+            break
+        for name, a, b in zip(stress_names(variant), first, outputs):
+            assert_bitwise(f"{variant} BV candidate {index} against candidate 0: {name}", a, b)
+        forced.update(i for indices in pick.forced.values() for i in indices)
+        index += 1
+    assert forced - {0}, f"{variant}: no BV candidate beyond the default ran; excluded {sorted(pick.excluded)}"
+    print(f"{variant}: BV candidates {sorted(forced)} of {first_pick.domain} agree byte for byte")
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+def test_determinism_cutile_autotune_host_hooks(backend, variant, tune_cache):
+    """A host pins the pick: ``record_hint`` sees every timed winner, and under ``select_hints`` the search never runs
+    and the bytes are the chosen candidate's, so a host that records a table and pins from it replays across runs.
+
+    The hooks receive the kernel and the caller's shape key (no device in it), so a table keyed by kernel name and
+    shape matches on every rank."""
+    from cudnn.linear_attention.cutile.kernels import common, kda
+
+    shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
+
+    def run(pick, kda_pick=None, **hooks):
+        """``pick`` stands in for the hinted search of ``autotuned_launch``; ``kda_pick`` for KDA's BV-width search
+        (``autotuned_launch_bv``), which the hooks do not cover because BV never changes the numerics."""
+        tune_cache()
+        with patch.multiple(common, exhaustive_search=pick, **hooks), patch.object(kda, "exhaustive_search", kda_pick or pick):
+            return stress_round(backend, variant, shape)
+
+    recorded = {}
+
+    def record(kernel, key, config):
+        assert all(isinstance(part, (int, str)) for part in key), f"{common.kernel_name(kernel)}: shape key {key!r}"
+        recorded[(common.kernel_name(kernel), key)] = vars(config)
+
+    with waive_unsupported(backend, variant):
+        run(Picking(0), record_hint=record)
+        # the host's own errors reach the caller instead of being taken for a tuning failure
+        with pytest.raises(RuntimeError, match="the host could not record"):
+            run(Picking(0), record_hint=Mock(side_effect=RuntimeError("the host could not record")))
+    assert recorded, f"{variant}: no timed winner was recorded"
+    assert all(config == vars(common.launch_hint_configs((1,))[0]) for config in recorded.values()), recorded
+
+    # pin every launch to its second candidate: the search must not run, and the bytes are candidate 1's
+    searched = Mock(side_effect=RuntimeError("the timed search ran under a host pick"))
+    second = lambda kernel, key, configs: configs[1]  # noqa: E731
+    pinned = run(searched, kda_pick=Picking(1), select_hints=second)
+    searched.assert_not_called()
+    for name, a, b in zip(stress_names(variant), pinned, run(searched, kda_pick=Picking(1), select_hints=second)):
+        assert_bitwise(f"{variant} host pick repeat {name}", a, b)
+    for name, a, b in zip(stress_names(variant), pinned, run(Picking(1))):
+        assert_bitwise(f"{variant} host pick vs forced candidate 1 {name}", a, b)
+
+
 # ---------------------------------------------------------------------------
 # Stress: repeated execution, and several live graphs, in one process
 # ---------------------------------------------------------------------------
@@ -3000,16 +3509,20 @@ def assert_stress_stable(backend, variant, shapes):
             if si not in ref:
                 ref[si] = [t.detach().clone() for t in got]
                 continue
-            for name, want, have in zip(("o", "final_state", "dq", "dk"), ref[si], got):
+            for name, want, have in zip(stress_names(variant), ref[si], got):
                 assert torch.equal(want, have), f"shape {si} round {rnd}: {name} drifted between executions"
 
 
+def stress_names(variant):
+    """Names of what :func:`stress_round` returns: the outputs, then one gradient per tensor input."""
+    return ("o", "final_state", *(f"d{leaf}" for leaf in LEAF_NAMES[variant]))
+
+
 def stress_round(backend, variant, shape):
-    """One fwd+bwd on freshly allocated operands; returns the outputs."""
+    """One fwd+bwd on freshly allocated operands; returns the outputs and every input's gradient."""
     case = make_case(variant, torch.bfloat16, **shape)
-    args = thd_tensors(case)
-    leaves = [args[0].requires_grad_(True), args[1].requires_grad_(True)]
-    o, fs = pinned_op(backend, variant)(*args, *op_tail(case), output_final_state=True)
+    leaves = [tensor.requires_grad_(True) for tensor in thd_tensors(case)]
+    o, fs = pinned_op(backend, variant)(*leaves, *op_tail(case), output_final_state=True)
     # ones rather than randn so the grad seed does not depend on global RNG ordering
     grads = torch.autograd.grad([o, fs], leaves, [torch.ones_like(o), torch.ones_like(fs)])
     torch.cuda.synchronize()
@@ -3024,7 +3537,6 @@ def test_replay_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES[:1])
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_multi_graph_stress(backend, variant):
     """Several distinct LA graphs live at once, executed round robin; every
@@ -3033,11 +3545,12 @@ def test_multi_graph_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_two_streams(backend, variant):
     """Two concurrent instances on separate streams; every repeat matches its
-    own single-stream baseline bitwise."""
+    own single-stream baseline bitwise. The serial baselines also warm the
+    cuTile launch-hint cache, so the concurrent repeats never tune."""
     case_a = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], seed=SEED)
     case_b = make_case(variant, torch.bfloat16, B=2, T=512, seed=SEED + 1)
     launch_a = lambda: run_fwd(backend, case_a, output_final_state=True)  # noqa: E731
@@ -3046,7 +3559,7 @@ def test_determinism_two_streams(backend, variant):
     # order the side streams behind the input generation (default stream)
     torch.cuda.synchronize()
 
-    with torch.cuda.stream(s1):
+    with waive_unsupported(backend, variant), torch.cuda.stream(s1):
         base_a = launch_a()
     torch.cuda.synchronize()
     with torch.cuda.stream(s2):
@@ -3063,12 +3576,12 @@ def test_determinism_two_streams(backend, variant):
                 assert torch.equal(bits(x), bits(y)), f"stream {label} output {i} differs on concurrent run {r}"
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("variant", ["kda", "mamba2"])
-def test_bwd_same_graph_two_streams(backend, variant, dtype, monkeypatch):
-    """Two backwards of one variant use distinct caller-owned scratch and stay bitwise stable."""
-    module = importlib.import_module(f"cudnn.linear_attention.ops.{variant}")
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_same_graph_two_streams(backend, variant, dtype):
+    """Two backwards of one variant on two streams stay bitwise stable under repeated overlap, for every variant
+    and both engines that serve it."""
     case_a = make_case(variant, dtype, T=512, seed=SEED)
     case_b = make_case(variant, dtype, T=512, seed=SEED + 1)
     leaves_a = [tensor.requires_grad_(True) for tensor in thd_tensors(case_a)]
@@ -3100,32 +3613,12 @@ def test_bwd_same_graph_two_streams(backend, variant, dtype, monkeypatch):
             baseline_b = backward(o_b, leaves_b, dO_b)
         torch.cuda.synchronize()
 
-        assert len(module.bprop_cache) == 1, "the two launches must exercise one cached backward graph"
-        graph = next(iter(module.bprop_cache.values()))[0]
-        execute_graph = module.execute_graph
-        workspace_records = []
-
-        def record_workspace(graph_arg, variant_pack, workspace, handle):
-            """Record the launch stream and scratch address before real execution."""
-            if graph_arg is graph:
-                # Retain both tensors until the paired launches complete, so
-                # allocator reuse cannot obscure whether they overlap.
-                workspace_records.append((int(torch.cuda.current_stream().cuda_stream), workspace))
-            return execute_graph(graph_arg, variant_pack, workspace, handle)
-
-        monkeypatch.setattr(module, "execute_graph", record_workspace)
-
         for repeat in range(4):
-            workspace_records.clear()
             with torch.cuda.stream(s1):
                 grads_a = backward(o_a, leaves_a, dO_a)
             with torch.cuda.stream(s2):
                 grads_b = backward(o_b, leaves_b, dO_b)
             torch.cuda.synchronize()
-            assert len(workspace_records) == 2
-            workspace_by_stream = dict(workspace_records)
-            assert set(workspace_by_stream) == {int(s1.cuda_stream), int(s2.cuda_stream)}
-            assert workspace_by_stream[int(s1.cuda_stream)].data_ptr() != workspace_by_stream[int(s2.cuda_stream)].data_ptr()
             for label, baseline, grads in (("A", baseline_a, grads_a), ("B", baseline_b, grads_b)):
                 for name, want, got in zip(LEAF_NAMES[variant], baseline, grads):
                     assert_bitwise(f"stream {label} d{name} repeat {repeat}", got, want)
@@ -3181,7 +3674,7 @@ def test_batch_invariance_bwd(backend, variant):
 def test_bwd_checkpoint_reuse(backend, variant, K):
     """With chunk-cadence checkpoints (the chunk in kernel rows: for a sub-token family that is
     64 expanded rows, not a real-token boundary) the backward consumes the forward's series
-    instead of recomputing it; the grads match the recompute path bitwise."""
+    instead of rebuilding it; the grads match the no-checkpoint backward bitwise."""
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     grads_by_mode = []
     for ckpt in (0, CHUNK[variant]):
@@ -3194,16 +3687,16 @@ def test_bwd_checkpoint_reuse(backend, variant, K):
             dO = torch.randn_like(o)
             grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
     for gr, gc in zip(grads_by_mode[0], grads_by_mode[1]):
-        assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the recompute path"
+        assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the no-checkpoint backward"
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("rows", ["fp32", "io"])
 @pytest.mark.parametrize("K,ckpt_mult", [(128, 2), (128, 3), (64, 2)])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K, rows):
-    """With a coarse checkpoint cadence the backward reconstructs the dense series by recompute started from the coarse
-    rows: from io-dtype rows (the default) the grads track the recompute path from a zero initial state within 2e-3, from
+def test_bwd_coarse_checkpoint_seeded(backend, variant, ckpt_mult, K, rows):
+    """With a coarse checkpoint cadence the backward rebuilds the dense series from the coarse
+    rows: from io-dtype rows (the default) the grads track the no-checkpoint backward from a zero initial state within 2e-3, from
     fp32 rows (``checkpoint_dtype``) they match it bitwise; both arms batch-invariant."""
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     row_dtype = dict(checkpoint_dtype=torch.float32) if rows == "fp32" else {}
@@ -3302,11 +3795,11 @@ def test_execute_from_a_thread_with_no_cuda_context(backend, variant):
     def run_on_cold_thread():
         seen["before"] = int(drv.cuCtxGetCurrent()[1])
         try:
-            # batch_invariant skips the split-K table launch that would bind a context first
+            # batch_invariant: the op itself is the first launch that binds a context
             o, _ = pinned_op(backend, variant)(*args, *op_tail(case), batch_invariant=True)
             seen["o"] = o.detach().clone()
             seen["grads"] = torch.autograd.grad([o], leaves, [dO])
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             seen["exc"] = exc
         seen["after"] = int(drv.cuCtxGetCurrent()[1])
 
@@ -3406,7 +3899,7 @@ def run_hang_stress(backend, case, *, use_initial_state=False, fwd_each_iter=Fal
     heartbeat = [time.monotonic()]
     with waive_unsupported(backend, case.variant):
         fn = pinned_op(backend, case.variant)
-        # compile on a single-wave case (one tile per CTA cannot wedge) so the real case runs under the tight watchdog
+        # compile on a small case first so the real case runs under the tight watchdog
         tiny = make_case(case.variant, case.dtype, T=64, H=16)
         tiny_leaves, tiny_state0 = build_inputs(tiny)
         with wedge_watchdog(f"{label} (compile warmup)", heartbeat, capfd=capfd, timeout=HANG_STRESS_COMPILE_TIMEOUT):
@@ -3472,7 +3965,7 @@ def test_hang_stress_initial_state_boundaries(backend, variant, capfd):
 
 
 # ---------------------------------------------------------------------------
-# Reserved tail wave under concurrent SM occupancy (#1032)
+# Concurrent SM occupancy (#1032)
 # ---------------------------------------------------------------------------
 
 SM_BLOCKER_SOURCE = r"""
@@ -3506,7 +3999,7 @@ void block_sms(torch::Tensor smids, int64_t cycles) {
 }
 """
 
-TAIL_WAVE_SEQ_LENS = [248] * 31 + [247, 247, 10]
+OCCUPANCY_SEQ_LENS = [248] * 31 + [247, 247, 10]
 
 
 @pytest.fixture(scope="module")
@@ -3531,31 +4024,30 @@ def sm_blocker():
     )
 
 
-def tail_wave_case(variant, schedule):
-    """``uncut``: 34 sequences at 64 heads, 2176 backward tiles, a partial last wave of the persistent CTAs on 148 or 152 SMs
-    (GDP at V=64 so its own backward kernel runs); ``chain``: one 32768-token sequence at 8 heads, 16 pieces x 8 heads = 128
-    tiles, a single partial wave that is all tail for the chain backward kernels.  Where either count is a whole multiple of
-    the SM count the head count steps up by one so the last wave stays partial."""
-    if schedule == "chain":
+def occupancy_case(variant, shape):
+    """34 sequences of 248 tokens on 64 heads (2176 backward items, not a multiple of 148 or 152 SMs; GDP at V=64 so its own
+    backward kernel runs), or one 32768-token sequence on 8 heads (128 items).  Where a count is a whole multiple of the SM
+    count the head count steps up by one."""
+    if shape == "1x32768_h8":
         heads = 8 if (16 * 8) % sm_count() else 9
-        return chain_case(variant, [32768], H=heads, HV=heads)
-    heads = 64 if (len(TAIL_WAVE_SEQ_LENS) * 64) % sm_count() else 65
-    return make_case(variant, torch.bfloat16, seq_lens=TAIL_WAVE_SEQ_LENS, H=heads, V=64 if variant in HOUSEHOLDER_VARIANTS else 128)
+        return long_case(variant, [32768], H=heads, HV=heads)
+    heads = 64 if (len(OCCUPANCY_SEQ_LENS) * 64) % sm_count() else 65
+    return make_case(variant, torch.bfloat16, seq_lens=OCCUPANCY_SEQ_LENS, H=heads, V=64 if variant in HOUSEHOLDER_VARIANTS else 128)
 
 
 @pytest.mark.L0
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-@pytest.mark.parametrize("schedule", ["uncut", "uncut_bi", "chain"])
+@pytest.mark.parametrize("shape", ["34x248_h64", "34x248_h64_invariant", "1x32768_h8"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_tail_wave_under_sm_occupancy(backend, variant, schedule, sm_blocker):
-    """The backward's last partial wave must not depend on which SM runs a persistent CTA (#1032): with 32 SMs held by
-    another stream, every gradient is written and bitwise the unblocked run's."""
-    case = tail_wave_case(variant, schedule)
+def test_bwd_under_sm_occupancy(backend, variant, shape, sm_blocker):
+    """Work counts that do not divide the SM count must not make results depend on which SM runs what (#1032): with 32 SMs
+    held by another stream, every gradient is written and bitwise the unblocked run's."""
+    case = occupancy_case(variant, shape)
     leaves = dict(zip(LEAF_NAMES[variant], (t.requires_grad_(True) for t in thd_tensors(case))))
     with waive_unsupported(backend, variant):
-        o = pinned_op(backend, variant)(*leaves.values(), *op_tail(case), batch_invariant=schedule == "uncut_bi")[0]
+        o = pinned_op(backend, variant)(*leaves.values(), *op_tail(case), batch_invariant=shape == "34x248_h64_invariant")[0]
     set_seed(SEED + 7)
     dO = torch.randn_like(o) * 0.01
     targets = list(leaves.values())
@@ -3610,7 +4102,7 @@ def test_fwd_householder_count(backend, variant, dtype, n):
 @pytest.mark.parametrize("V", [128, 64])
 @pytest.mark.parametrize("variant", HOUSEHOLDER_VARIANTS)
 def test_bwd_householder_count(backend, variant, V, n, l2norm):
-    """n = 4 divides the 64-row chunk, so the final-slot run lands at a different phase than n = 3."""
+    """n = 4 divides the 64-row chunk, so the final sub-token run lands at a different phase than n = 3."""
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128, V=V, n=n), l2norm=l2norm)
 
 
@@ -3654,23 +4146,23 @@ def test_gdp_summary_bwd_compact_qdo_matches_port(backend, V, n, l2norm):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("n", (2, 3))
-def test_gdp_piece_chain_bwd_compact_summary(backend, l2norm, n):
-    """The GDP backward chain at d_v = 128 (the main bprop on the expanded pack, its G summary on compact q / dO,
-    an expanded l2norm q read through the strided descriptor) matches the batch run whole."""
-    case = make_case("gdp", torch.bfloat16, seq_lens=[2048, 1000], H=2, n=n, lo=0.99)
+def test_gdp_long_bwd_compact_summary(backend, l2norm, n):
+    """The GDP backward at d_v = 128 on a long ragged batch (expanded sub-token rows, compact q / dO, an expanded l2norm q)
+    matches the ``batch_invariant`` run."""
+    case = make_case("gdp", torch.bfloat16, seq_lens=[3096, 1000], H=2, n=n, lo=0.99)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
     kw = dict(initial_state=state0, d_final_state=d_final, use_qk_l2norm_in_kernel=l2norm)
-    _, _, grads, dO, _ = chain_grads(backend, case, **kw)
-    _, _, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, dO=dO, **kw)
-    assert_chain_grads_close(grads, grads_uncut)
+    _, _, grads, dO, _ = long_grads(backend, case, **kw)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO, **kw)
+    assert_long_grads_close(grads, grads_inv)
 
 
-def token_major_views(case, pad=24, return_buffers=False):
+def token_major_views(case, pad=24):
     """The case's expanded k / v / beta as the per-token column slices of a joint projection buffer: ``[T, pad | n*HV*V |
     n*HK*K | H*K | pad]`` viewed ``[T, n, HV, V]`` / ``[T, n, HK, K]`` with the joint token stride, beta from a ``[T, pad |
     n*HO | pad]`` buffer viewed ``[T, n, HO]``.  Same bytes as the expanded leaves, a different row convention.
-    ``return_buffers`` adds the two joint buffers and the column slices of v, k and beta (to differentiate through the
-    buffers: a clone of a strided view is contiguous, so a leaf must be the buffer itself)."""
+    Also returns the two joint buffers and the column slices of v, k and beta (to differentiate through the buffers: a
+    clone of a strided view is contiguous, so a leaf must be the buffer itself)."""
     tokens, n = case.T * case.B, case.n
     k, v, beta = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"])
     widths = (n * case.HV * case.V, n * case.HK * case.K, case.H * case.K)
@@ -3686,9 +4178,7 @@ def token_major_views(case, pad=24, return_buffers=False):
     beta_tm = beta_joint[:, beta_cols].view(tokens, n, case.HO)
     beta_tm.copy_(beta.view(tokens, n, case.HO))
     assert not (k_tm.is_contiguous() or v_tm.is_contiguous() or beta_tm.is_contiguous())
-    if return_buffers:
-        return k_tm, v_tm, beta_tm, joint, beta_joint, k_cols, v_cols, beta_cols
-    return k_tm, v_tm, beta_tm
+    return k_tm, v_tm, beta_tm, joint, beta_joint, k_cols, v_cols, beta_cols
 
 
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
@@ -3699,7 +4189,7 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
     """Token-major k / v / beta (the column slices of a joint projection buffer, the joint token stride) give o, the final
     state and every gradient bitwise equal to the expanded rows, differentiated through the joint buffers themselves (the
     gradients land in the slices, the padding columns stay zero), ragged batch with a zero-length sequence included.  n = 1
-    is the GDN case, a singleton slot axis whose own stride is not the token stride.  At n = 3 (Megatron's default) the
+    is the GDN case, a singleton sub-token axis whose own stride is not the token stride.  At n = 3 (Megatron's default) the
     dense token-major views of the expanded rows and the mixed form (strided k / v with the expanded beta) are checked too.
     Every form runs twice; the second call replays the plans the first one built and must reproduce it bitwise."""
     case = make_case("gdp", torch.bfloat16, seq_lens=[100, 333, 0, 64], V=V, n=n)
@@ -3707,7 +4197,7 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
     tokens = case.T * case.B
     q_e, g_e = to_thd(case.q), to_thd(case.gates["g"])
     k_e, v_e, beta_e = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"])
-    _, _, _, joint, beta_joint, k_cols, v_cols, beta_cols = token_major_views(case, return_buffers=True)
+    _, _, _, joint, beta_joint, k_cols, v_cols, beta_cols = token_major_views(case)
     set_seed(SEED + 2)
     dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
     dFS = torch.randn(case.N, case.HO, case.V, case.K, device="cuda") * 0.1
@@ -3784,7 +4274,7 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
 def test_gdp_summary_token_major_bitwise(backend, n):
     """The GDP summaries (H, M and the backward G) read token-major k / v / beta bitwise like the expanded rows."""
     case = make_case("gdp", torch.bfloat16, seq_lens=[100, 333, 64], n=n)
-    k_tm, v_tm, beta_tm = token_major_views(case)
+    k_tm, v_tm, beta_tm, *_ = token_major_views(case)
     k, v, beta, g, q = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"]), to_thd(case.gates["g"]), to_thd(case.q)
     set_seed(SEED + 2)
     dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
@@ -3803,10 +4293,10 @@ def test_gdp_summary_token_major_bitwise(backend, n):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_gdp_token_major_rejects_misaligned_and_malformed(backend):
     """A token-major slice whose column offset is not 16-byte aligned is refused (TMA needs aligned outer strides), as is
-    a token-major tensor whose slot count is not num_householder."""
+    a token-major tensor whose sub-token count is not num_householder."""
     case = make_case("gdp", torch.bfloat16, T=128, n=3)
     args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
-    k_tm, v_tm, beta_tm = token_major_views(case, pad=3)
+    k_tm, v_tm, beta_tm, *_ = token_major_views(case, pad=3)
     with pytest.raises(ValueError, match="16-byte aligned"):
         pinned_op(backend, "gdp")(args[0], k_tm, args[2], args[3], args[4], case.cu, 3)
     with pytest.raises(ValueError, match="token-major k must be"):
@@ -3904,7 +4394,7 @@ def run_frost(case, **kw):
     try:
         return op(case.variant)(*op_args(case), **kw)
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost engine declined: {e}")
 
 
 def m_twin(case):
@@ -3923,7 +4413,7 @@ def run_summary(case, *, initial_state=None, **kw):
     try:
         return fn(*op_args(case)[1:], initial_state=initial_state, **kw)
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost summary engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost summary engine declined: {e}")
 
 
 def kernel_m(case, producer="prefill", **kw):
@@ -4036,7 +4526,7 @@ def grads_via_port(case, d_o, d_final, *, seed=SEED + 11, **op_kw):
             **op_kw,
         )
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost engine declined: {e}")
     outputs, grad_outputs = [o], [d_o]
     if d_final is not None:
         outputs.append(fs)
@@ -4100,7 +4590,7 @@ def test_layout_pin_one_token(backend, variant):
 @pytest.mark.L0
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
-@pytest.mark.parametrize("length", [1, 63, 64, 65, 257, 1024])
+@pytest.mark.parametrize("length", [1, 63, 64, 65, 257, 2048])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_m_matches_oracle_lengths(backend, variant, length, producer):
     case = make_case(variant, torch.bfloat16, T=length)
@@ -4285,51 +4775,23 @@ def test_gate_domain_summary_linear(backend, variant):
 
 
 # ---------------------------------------------------------------------------
-# Piece chain (long sequences cut into pieces)
+# Long sequences on few heads: the default call against its batch_invariant run and the fp64 reference
 # ---------------------------------------------------------------------------
 
-CHAIN_RAGGED = [497, 16, 1, 480, 0, 253, 4096]
-CHAIN_SHAPES = [([4096], 4), ([4096], 37), (CHAIN_RAGGED, 4)]
-CHAIN_SHAPE_IDS = ["1x4096x4", "1x4096x37", "ragged"]
-MANY_SLOT_LENGTHS = [16256, 128]
-CHAIN_VS_UNCUT_TOL = 1e-2
-CHAIN_GATE_GRAD_TOL = 2e-2
-CHAIN_FWD_TOL = 2e-2
-CHAIN_BWD_TOL = 4e-2
-CHAIN_STATE_GRAD_TOL = 6e-2
-PIECE_TOKENS = 8192
-CHAIN_GATE_MODES = ("l2norm", "safe", "sigmoid_beta", "neg_eigval", "beta_guard")
+LONG_RAGGED = [497, 16, 1, 480, 0, 253, 4096]
+LONG_SHAPES = [([4096], 4), ([4096], 37), (LONG_RAGGED, 4), ([32768], 2)]
+LONG_SHAPE_IDS = ["1x4096x4", "1x4096x37", "ragged", "1x32768x2"]
+LONG_SHORT_LENGTHS = [16256, 128]
+INVARIANT_TOL = 1e-2
+LONG_GATE_GRAD_TOL = 2e-2
+LONG_FWD_TOL = 2e-2
+LONG_BWD_TOL = 4e-2
+LONG_STATE_GRAD_TOL = 6e-2
+INVARIANT_SPAN_TOKENS = 8192
+LONG_GATE_MODES = ("l2norm", "safe", "sigmoid_beta", "neg_eigval", "beta_guard")
 
 
-@pytest.fixture(autouse=True)
-def open_chain_floor(request, monkeypatch):
-    """``test_piece_chain_*`` and the ``schedule="chain"`` cases test the chain itself, so they chain wherever the slot
-    budget allows, below the KDA ``chain_min_tokens`` floor too."""
-    callspec = getattr(request.node, "callspec", None)
-    if request.node.originalname.startswith("test_piece_chain_") or (callspec is not None and callspec.params.get("schedule") == "chain"):
-        from cudnn.linear_attention.frost.common import piece_chain
-
-        monkeypatch.setattr(piece_chain, "chain_min_tokens", lambda **_: 0)
-
-
-def test_chain_min_tokens_floor():
-    """Below ``min_tokens`` the plan does not chain; the batch-invariant length rule ignores the floor."""
-    from cudnn.linear_attention.frost.common.piece_chain import chain_min_tokens, choose_pieces
-
-    def pieces(total, *, reverse, batch_invariant=False, compose_tail=False):
-        kw = dict(num_seqs=1, heads_out=32, num_sm=148, b_t=16, cadence_tokens=0, expand_num=1)
-        return choose_pieces(
-            total_tokens=total, batch_invariant=batch_invariant, reverse=reverse, compose_tail=compose_tail, min_tokens=chain_min_tokens(reverse=reverse), **kw
-        )[0]
-
-    assert pieces(1023, reverse=False) == 0
-    assert pieces(1024, reverse=False) == 4
-    assert pieces(191, reverse=True) == 0
-    assert pieces(192, reverse=True) == 3
-    assert pieces(512, reverse=False, batch_invariant=True, compose_tail=True) == 1
-
-
-def chain_case(variant, seq_lens, *, H=4, HK=None, HV=None, K=128, V=None, cu_dtype=torch.int32, seed=SEED):
+def long_case(variant, seq_lens, *, H=4, HK=None, HV=None, K=128, V=None, cu_dtype=torch.int32, seed=SEED):
     """A bf16 case with alpha in (0.99, 1), so long spans keep a live state; a sub-token family takes ``H // n``
     heads (at least 2) so its fp64 reference over the expanded rows stays within memory; ``V`` defaults to the
     family's head dim (64 for Mamba-2)."""
@@ -4341,9 +4803,9 @@ def chain_case(variant, seq_lens, *, H=4, HK=None, HV=None, K=128, V=None, cu_dt
     return make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=H, HK=HK, HV=HV, K=K, V=V, lo=0.99, cu_dtype=cu_dtype, seed=seed)
 
 
-def chain_grads(backend, case, *, batch_invariant=False, checkpoint=0, initial_state=None, d_final_state=None, dO=None, cu=None, params=(), **kw):
+def long_grads(backend, case, *, batch_invariant=False, checkpoint=0, initial_state=None, d_final_state=None, dO=None, cu=None, params=(), **kw):
     """(o, final_state, grads by leaf name, dO, outputs) of one pinned forward + backward on fresh leaves;
-    ``params`` are extra (name, tensor) leaves handed to the op as keywords."""
+    ``params`` are extra (name, tensor) leaves intermediates to the op as keywords."""
     leaves = dict(zip(LEAF_NAMES[case.variant], (t.requires_grad_(True) for t in thd_tensors(case))))
     extra = {name: t.detach().clone().requires_grad_(True) for name, t in params}
     state0 = initial_state.detach().clone().requires_grad_(True) if initial_state is not None else None
@@ -4372,17 +4834,17 @@ def chain_grads(backend, case, *, batch_invariant=False, checkpoint=0, initial_s
     return o, fs, grads, dO, out
 
 
-def assert_chain_grads_close(got, want, label="chain-vs-uncut"):
+def assert_long_grads_close(got, want, label="default-vs-invariant"):
     for name, g in got.items():
-        tol = CHAIN_GATE_GRAD_TOL if name in ("g", "beta", "w", "a_log", "dt_bias") else CHAIN_VS_UNCUT_TOL
+        tol = LONG_GATE_GRAD_TOL if name in ("g", "beta", "w", "a_log", "dt_bias") else INVARIANT_TOL
         assert_rms_close(f"d{name} {label}", g, want[name].float(), tol)
 
 
-def chain_reference_grads(case, state0, dO, d_final, *, head_chunk_size=4):
+def long_reference_grads(case, state0, dO, d_final, *, head_chunk_size=4):
     """fp64 gradients with bounded recurrent autograd storage for independent heads.
 
     The production case still uses every head at once. Only its reference is
-    split: retaining a K x V state per token and head can otherwise exhaust
+    chunked: retaining a K x V state per token and head can otherwise exhaust
     device memory when the reverse-band case scales H with the SM count.
     Grouped heads retain the whole reference so shared-input reductions keep
     their original order.
@@ -4390,7 +4852,7 @@ def chain_reference_grads(case, state0, dO, d_final, *, head_chunk_size=4):
     tensors = case_tensors(case)
     chunk = head_chunk_size if case.H == case.HK == case.HV == case.HO else case.HO
     dO = dO.reshape(case.B, case.T, case.HO, case.V)
-    pieces = []
+    parts = []
     for start in range(0, case.HO, chunk):
         end = min(start + chunk, case.HO)
         ref_leaves = {name: t[:, :, start:end].detach().double().requires_grad_(True) for name, t in tensors.items()}
@@ -4402,23 +4864,23 @@ def chain_reference_grads(case, state0, dO, d_final, *, head_chunk_size=4):
             list(ref_leaves.values()) + [state0_ref],
             [dO[:, :, start:end].double(), d_final[:, start:end].double()],
         )
-        pieces.append(dict(zip(list(ref_leaves) + ["initial_state"], grads)))
-    if len(pieces) == 1:
-        return pieces[0]
-    return {name: torch.cat([part[name] for part in pieces], dim=1 if name == "initial_state" else 2) for name in pieces[0]}
+        parts.append(dict(zip(list(ref_leaves) + ["initial_state"], grads)))
+    if len(parts) == 1:
+        return parts[0]
+    return {name: torch.cat([part[name] for part in parts], dim=1 if name == "initial_state" else 2) for name in parts[0]}
 
 
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("grouped", [False, True], ids=["independent", "grouped"])
-def test_chain_reference_head_chunks_match_whole(variant, grouped):
+def test_long_reference_head_chunks_match_whole(variant, grouped):
     """Preserve every fp64 gradient, including empty sequences and a partial head chunk."""
     n = HOUSEHOLDER if variant in HOUSEHOLDER_VARIANTS else 1
     heads = dict(H=10, HK=2, HV=2) if grouped else dict(H=10 * n)
-    case = chain_case(variant, [17, 0, 23], K=8, V=16, **heads)
+    case = long_case(variant, [17, 0, 23], K=8, V=16, **heads)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
     dO = torch.randn(case.B * case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
-    whole = chain_reference_grads(case, state0, dO, d_final, head_chunk_size=case.HO)
-    chunked = chain_reference_grads(case, state0, dO, d_final)
+    whole = long_reference_grads(case, state0, dO, d_final, head_chunk_size=case.HO)
+    chunked = long_reference_grads(case, state0, dO, d_final)
     assert chunked.keys() == whole.keys()
     for name in whole:
         torch.testing.assert_close(chunked[name], whole[name], rtol=1e-10, atol=1e-12, msg=lambda msg: f"d{name}: {msg}")
@@ -4426,51 +4888,51 @@ def test_chain_reference_head_chunks_match_whole(variant, grouped):
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("state_dtype", [None, torch.float32, torch.bfloat16], ids=["no_state", "fp32_state", "bf16_state"])
-@pytest.mark.parametrize("seq_lens,H", CHAIN_SHAPES, ids=CHAIN_SHAPE_IDS)
+@pytest.mark.parametrize("seq_lens,H", LONG_SHAPES, ids=LONG_SHAPE_IDS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_fwd_matches_uncut_and_reference(backend, variant, seq_lens, H, state_dtype):
-    """o and final_state of a long batch on few tiles against the batch run whole and, with an fp32 state, the fp64
+def test_long_fwd_matches_invariant_and_reference(backend, variant, seq_lens, H, state_dtype):
+    """o and final_state of a long batch on few tiles against the ``batch_invariant`` run and, with an fp32 state, the fp64
     reference; an empty sequence passes its initial state through bitwise."""
-    case = chain_case(variant, seq_lens, H=H)
+    case = long_case(variant, seq_lens, H=H)
     state0 = random_state(case, dtype=state_dtype) if state_dtype is not None else None
-    o_chain, fs_chain = run_fwd(backend, case, initial_state=state0, output_final_state=True)
-    o_uncut, fs_uncut = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
-    assert fs_chain.dtype == fs_uncut.dtype == (state_dtype or torch.float32)
-    assert_rms_close("o chain-vs-uncut", o_chain, o_uncut.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("final_state chain-vs-uncut", fs_chain, fs_uncut.float(), CHAIN_VS_UNCUT_TOL)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_inv, fs_inv = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
+    assert fs.dtype == fs_inv.dtype == (state_dtype or torch.float32)
+    assert_rms_close("o default-vs-invariant", o, o_inv.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_inv.float(), INVARIANT_TOL)
     if state_dtype is torch.float32:
         o_ref, fs_ref = reference(case, initial_state=state0)
-        assert_rms_close("o vs fp64", o_chain, o_ref, CHAIN_FWD_TOL)
-        assert_rms_close("final_state vs fp64", fs_chain, fs_ref, CHAIN_FWD_TOL)
+        assert_rms_close("o vs fp64", o, o_ref, LONG_FWD_TOL)
+        assert_rms_close("final_state vs fp64", fs, fs_ref, LONG_FWD_TOL)
     for n, length in enumerate(seq_lens):
         if length == 0:
-            want = state0[n] if state0 is not None else torch.zeros_like(fs_chain[n])
-            assert_bitwise(f"empty sequence {n} final_state passthrough", fs_chain[n], want)
+            want = state0[n] if state0 is not None else torch.zeros_like(fs[n])
+            assert_bitwise(f"empty sequence {n} final_state passthrough", fs[n], want)
 
 
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_reverse_band_matches_uncut_and_reference(backend, variant):
-    """One sequence on half the SMs; o, final_state and every gradient against the batch run whole and the fp64
+def test_long_half_sm_bwd_matches_invariant_and_reference(backend, variant):
+    """One sequence on half the SMs; o, final_state and every gradient against the ``batch_invariant`` run and the fp64
     reference."""
-    case = chain_case(variant, [4096], H=sm_count() // 2)
+    case = long_case(variant, [4096], H=sm_count() // 2)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    o, fs, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
-    o_u, fs_u, grads_u, _, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
-    assert_rms_close("o chain-vs-uncut", o, o_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("final_state chain-vs-uncut", fs, fs_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_chain_grads_close(grads, grads_u)
-    for name, want in chain_reference_grads(case, state0, dO, d_final).items():
-        assert_rms_close(f"d{name} vs fp64", grads[name], want, CHAIN_STATE_GRAD_TOL if name == "initial_state" else CHAIN_BWD_TOL)
+    o, fs, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o_u, fs_u, grads_u, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_rms_close("o default-vs-invariant", o, o_u.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_u.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_u)
+    for name, want in long_reference_grads(case, state0, dO, d_final).items():
+        assert_rms_close(f"d{name} vs fp64", grads[name], want, LONG_STATE_GRAD_TOL if name == "initial_state" else LONG_BWD_TOL)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_deterministic(backend, variant):
-    """Forward, checkpoint series and every gradient of a cut sequence are bitwise repeatable."""
-    case = chain_case(variant, [4096], H=4)
+def test_long_deterministic(backend, variant):
+    """Forward, checkpoint series and every gradient of a long sequence are bitwise repeatable."""
+    case = long_case(variant, [4096], H=4)
     state0 = random_state(case)
     checkpoint = CHUNK[variant]
     rows = sum((length * case.n - 1) // checkpoint + 1 for length in case.cu.diff().tolist() if length > 0)
@@ -4480,9 +4942,9 @@ def test_piece_chain_deterministic(backend, variant):
         assert_bitwise("o run-to-run", again[0], first[0])
         assert_bitwise("final_state run-to-run", again[1], first[1])
         assert_bitwise("state_checkpoints run-to-run", again[2][:rows], first[2][:rows])
-    first_grads = chain_grads(backend, case, initial_state=state0)
+    first_grads = long_grads(backend, case, initial_state=state0)
     for _ in range(2):
-        again_grads = chain_grads(backend, case, initial_state=state0, dO=first_grads[3])
+        again_grads = long_grads(backend, case, initial_state=state0, dO=first_grads[3])
         for name in first_grads[2]:
             assert_bitwise(f"d{name} run-to-run", again_grads[2][name], first_grads[2][name])
 
@@ -4490,12 +4952,12 @@ def test_piece_chain_deterministic(backend, variant):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("state_dtype", [None, torch.float32, torch.bfloat16], ids=["no_state", "fp32_state", "bf16_state"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_fwd_batch_invariant_length_rule_bitwise(backend, variant, state_dtype):
+def test_long_fwd_batch_invariant_bitwise(backend, variant, state_dtype):
     """Under batch_invariant a sequence's o and final_state are bitwise the same alone and inside a long batch; an
     empty sequence passes its initial state through."""
     seq_lens = [20000, 3000, 0, 17000]
-    assert max(seq_lens) > 2 * PIECE_TOKENS and min(length for length in seq_lens if length) < PIECE_TOKENS
-    case = chain_case(variant, seq_lens, H=2, K=64, V=64)
+    assert max(seq_lens) > 2 * INVARIANT_SPAN_TOKENS and min(length for length in seq_lens if length) < INVARIANT_SPAN_TOKENS
+    case = long_case(variant, seq_lens, H=2, K=64, V=64)
     state0 = random_state(case, dtype=state_dtype) if state_dtype is not None else None
     o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
     for n, length in enumerate(seq_lens):
@@ -4515,17 +4977,17 @@ def test_piece_chain_fwd_batch_invariant_length_rule_bitwise(backend, variant, s
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_bwd_batch_invariant_length_rule_bitwise(backend, variant, state_dtype):
+def test_long_bwd_batch_invariant_bitwise(backend, variant, state_dtype):
     """Every gradient of a sequence, d_initial_state included, is bitwise the same alone and inside a long batch."""
     seq_lens = [17000, 3000]
-    case = chain_case(variant, seq_lens, H=2, K=64, V=64)
+    case = long_case(variant, seq_lens, H=2, K=64, V=64)
     state0, d_final = random_state(case, dtype=state_dtype), random_state(case, scale=0.1, seed=SEED + 3, dtype=state_dtype)
-    _, _, grads, dO, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final)
+    _, _, grads, dO, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final)
     for n in range(case.N):
         s, e = int(case.cu[n]), int(case.cu[n + 1])
         alone = window(case, s, e)
         clear_caches()
-        _, _, grads_alone, _, _ = chain_grads(
+        _, _, grads_alone, _, _ = long_grads(
             backend,
             alone,
             batch_invariant=True,
@@ -4542,23 +5004,23 @@ def test_piece_chain_bwd_batch_invariant_length_rule_bitwise(backend, variant, s
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_odd_piece_boundary_bitwise(backend, variant):
-    """A summary CTA that finishes an odd-chunk piece and continues with another work item keeps every ping-pong warp
-    on its ring parity: o, final_state and every gradient are bitwise the same alone and packed (the T=16224 hang)."""
-    seq_lens = [16224, 16224] if CHUNK[variant] != 128 else [15968, 15968]  # 127 or 125 chunks: an odd piece either way
-    piece_chunks = [-(-(-(-length // CHUNK[variant])) // 2) for length in seq_lens]
-    assert all(PIECE_TOKENS < length < 2 * PIECE_TOKENS for length in seq_lens) and all(chunks % 2 == 1 for chunks in piece_chunks)
-    case = chain_case(variant, seq_lens, H=128)
+def test_long_odd_chunk_count_batch_invariant_bitwise(backend, variant):
+    """Two sequences between one and two batch-invariant spans long with an odd chunk count: o, final_state and every
+    gradient are bitwise the same alone and packed (the T=16224 hang)."""
+    seq_lens = [16224, 16224] if CHUNK[variant] != 128 else [15968, 15968]  # 127 or 125 chunks: odd either way
+    span_chunks = [-(-(-(-length // CHUNK[variant])) // 2) for length in seq_lens]
+    assert all(INVARIANT_SPAN_TOKENS < length < 2 * INVARIANT_SPAN_TOKENS for length in seq_lens) and all(chunks % 2 == 1 for chunks in span_chunks)
+    case = long_case(variant, seq_lens, H=128)
     if 2 * case.HO <= torch.cuda.get_device_properties(0).multi_processor_count:
         pytest.skip("needs more summary work items than SMs")
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    o, fs, grads, dO, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final)
+    o, fs, grads, dO, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final)
     assert torch.isfinite(o).all() and torch.isfinite(fs).all()
     for n in range(case.N):
         s, e = int(case.cu[n]), int(case.cu[n + 1])
         alone = window(case, s, e)
         clear_caches()
-        o_alone, fs_alone, grads_alone, _, _ = chain_grads(
+        o_alone, fs_alone, grads_alone, _, _ = long_grads(
             backend,
             alone,
             batch_invariant=True,
@@ -4576,9 +5038,9 @@ def test_piece_chain_odd_piece_boundary_bitwise(backend, variant):
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_int64_cu_seqlens(backend, variant):
+def test_long_int64_cu_seqlens(backend, variant):
     """int64 cu_seqlens is bitwise the int32 run: forward, checkpoint series and every gradient."""
-    case = chain_case(variant, CHAIN_RAGGED, H=2, K=64, V=64)
+    case = long_case(variant, LONG_RAGGED, H=2, K=64, V=64)
     state0 = random_state(case)
     checkpoint = CHUNK[variant]
     wide = case.cu.to(torch.int64)
@@ -4588,8 +5050,8 @@ def test_piece_chain_int64_cu_seqlens(backend, variant):
     assert_bitwise("o", o64, o32)
     assert_bitwise("final_state", fs64, fs32)
     assert_bitwise("state_checkpoints", series64[:rows], series32[:rows])
-    _, _, grads32, dO, _ = chain_grads(backend, case, initial_state=state0)
-    _, _, grads64, _, _ = chain_grads(backend, case, cu=wide, initial_state=state0, dO=dO)
+    _, _, grads32, dO, _ = long_grads(backend, case, initial_state=state0)
+    _, _, grads64, _, _ = long_grads(backend, case, cu=wide, initial_state=state0, dO=dO)
     for name in grads32:
         assert_bitwise(f"d{name}", grads64[name], grads32[name])
 
@@ -4597,102 +5059,101 @@ def test_piece_chain_int64_cu_seqlens(backend, variant):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("cadence", [1, 2], ids=["chunk", "two_chunks"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_checkpoint_series_layout_matches_uncut(backend, variant, cadence):
-    """The checkpoint series of a cut batch has the unsplit layout: same row count, row 0 per sequence bitwise the
+def test_long_checkpoint_series_layout_matches_invariant(backend, variant, cadence):
+    """The checkpoint series of a long ragged batch has the ``batch_invariant`` run's layout: same row count, row 0 per sequence bitwise the
     entering state, every row the state at the same token boundary, no rows for an empty sequence."""
     checkpoint = cadence * CHUNK[variant]
-    case = chain_case(variant, CHAIN_RAGGED, H=4)
+    case = long_case(variant, LONG_RAGGED, H=4)
     state0 = random_state(case)
-    _, _, series_chain = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
-    _, _, series_uncut = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True, checkpoint_every_n_tokens=checkpoint)
-    assert series_chain.shape == series_uncut.shape
+    _, _, series = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
+    _, _, series_inv = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True, checkpoint_every_n_tokens=checkpoint)
+    assert series.shape == series_inv.shape
     row = 0
     for n, length in enumerate(case.cu.diff().tolist()):
         rows = (length * case.n - 1) // checkpoint + 1 if length > 0 else 0
         if rows:
-            assert_bitwise(f"seq {n} row 0", series_chain[row], state0[n].to(series_chain.dtype))
+            assert_bitwise(f"seq {n} row 0", series[row], state0[n].to(series.dtype))
             for r in range(rows):
-                assert_rms_close(f"seq {n} row {r}", series_chain[row + r], series_uncut[row + r].float(), CHAIN_FWD_TOL)
+                assert_rms_close(f"seq {n} row {r}", series[row + r], series_inv[row + r].float(), LONG_FWD_TOL)
         row += rows
-    assert row <= series_chain.shape[0]
+    assert row <= series.shape[0]
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("cadence", [0, 1, 3], ids=["no_series", "dense_series", "coarse_series"])
-@pytest.mark.parametrize("seq_lens,H", CHAIN_SHAPES, ids=CHAIN_SHAPE_IDS)
+@pytest.mark.parametrize("seq_lens,H", LONG_SHAPES, ids=LONG_SHAPE_IDS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_bwd_matches_uncut_and_reference(backend, variant, seq_lens, H, cadence):
+def test_long_bwd_matches_invariant_and_reference(backend, variant, seq_lens, H, cadence):
     """The three backward checkpoint cases with a nonzero initial_state and d_final_state; every gradient against
-    the batch run whole, and without a series against the fp64 reference (the cadence does not enter the reference)."""
+    the ``batch_invariant`` run, and without a series against the fp64 reference (the cadence does not enter the reference)."""
     checkpoint = cadence * CHUNK[variant]
-    case = chain_case(variant, seq_lens, H=H)
+    case = long_case(variant, seq_lens, H=H)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    _, _, grads, dO, _ = chain_grads(backend, case, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final)
-    _, _, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final, dO=dO)
-    assert_chain_grads_close(grads, grads_uncut)
+    _, _, grads, dO, _ = long_grads(backend, case, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
     if cadence == 0:
-        for name, want in chain_reference_grads(case, state0, dO, d_final).items():
-            assert_rms_close(f"d{name} vs fp64", grads[name], want, CHAIN_STATE_GRAD_TOL if name == "initial_state" else CHAIN_BWD_TOL)
+        for name, want in long_reference_grads(case, state0, dO, d_final).items():
+            assert_rms_close(f"d{name} vs fp64", grads[name], want, LONG_STATE_GRAD_TOL if name == "initial_state" else LONG_BWD_TOL)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", ["mamba2"])
-def test_piece_chain_many_slots_matches_uncut(backend, variant):
-    """An uneven two-sequence batch on one head: the one-wave budget is 16 slots per sequence and the long sequence takes
-    most of the wave, more slots than one burst of the scalar chain; o, final_state and every gradient against the batch
-    run whole."""
-    case = chain_case(variant, MANY_SLOT_LENGTHS, H=1)
+def test_long_short_pair_matches_invariant(backend, variant):
+    """An uneven two-sequence batch on one head (16256 and 128 tokens): o, final_state and every gradient against the
+    ``batch_invariant`` run."""
+    case = long_case(variant, LONG_SHORT_LENGTHS, H=1)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    o, fs, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
-    o_uncut, fs_uncut, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
-    assert_rms_close("o chain-vs-uncut", o, o_uncut.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("final_state chain-vs-uncut", fs, fs_uncut.float(), CHAIN_VS_UNCUT_TOL)
-    assert_chain_grads_close(grads, grads_uncut)
+    o, fs, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o_inv, fs_inv, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_rms_close("o default-vs-invariant", o, o_inv.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_inv.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_inv)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_bwd_without_states(backend, variant):
+def test_long_bwd_without_states(backend, variant):
     """No initial_state, no d_final_state, no series (the plain training step)."""
-    case = chain_case(variant, CHAIN_RAGGED, H=4)
-    _, _, grads, dO, _ = chain_grads(backend, case)
-    _, _, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, dO=dO)
-    assert_chain_grads_close(grads, grads_uncut)
+    case = long_case(variant, LONG_RAGGED, H=4)
+    _, _, grads, dO, _ = long_grads(backend, case)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_bwd_bf16_state_pair(backend, variant):
+def test_long_bwd_bf16_state_pair(backend, variant):
     """With a bf16 initial_state / d_final_state, final_state and d_initial_state come back in the state dtype and
-    every gradient tracks the batch run whole."""
-    case = chain_case(variant, [4096], H=4)
+    every gradient tracks the ``batch_invariant`` run."""
+    case = long_case(variant, [4096], H=4)
     state0, d_final = random_state(case, dtype=torch.bfloat16), random_state(case, scale=0.1, seed=SEED + 3, dtype=torch.bfloat16)
-    _, fs, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    _, fs, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
     assert fs.dtype == torch.bfloat16 and grads["initial_state"].dtype == torch.bfloat16
-    _, _, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
-    assert_chain_grads_close(grads, grads_uncut)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("H,HK,HV", [(4, 1, 1), (1, 2, 2), (2, 2, 4)], ids=["fold_dk_dv", "fold_dq", "gva"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_head_folds_and_l2norm(backend, variant, H, HK, HV, l2norm):
-    """GQA / GVA head folds and the in-kernel qk l2norm on a cut sequence."""
+def test_long_head_folds_and_l2norm(backend, variant, H, HK, HV, l2norm):
+    """GQA / GVA head folds and the in-kernel qk l2norm on a long sequence."""
     if not grouped_bc_supported(variant, H, HK, HV):
         pytest.skip(f"{variant} groups B and C together and x carries every head")
-    case = chain_case(variant, [2048], H=H, HK=HK, HV=HV, K=64, V=128)
-    o, _, grads, dO, _ = chain_grads(backend, case, use_qk_l2norm_in_kernel=l2norm)
-    o_u, _, grads_u, _, _ = chain_grads(backend, case, batch_invariant=True, dO=dO, use_qk_l2norm_in_kernel=l2norm)
-    assert_rms_close("o chain-vs-uncut", o, o_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_chain_grads_close(grads, grads_u)
+    case = long_case(variant, [2048], H=H, HK=HK, HV=HV, K=64, V=128)
+    o, _, grads, dO, _ = long_grads(backend, case, use_qk_l2norm_in_kernel=l2norm)
+    o_u, _, grads_u, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO, use_qk_l2norm_in_kernel=l2norm)
+    assert_rms_close("o default-vs-invariant", o, o_u.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_u)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_cuda_graph_replay(backend, variant):
-    """A cut forward + backward captured into a CUDA graph replays bitwise the eager run."""
-    case = chain_case(variant, [4096], H=4)
+def test_long_cuda_graph_replay(backend, variant):
+    """A long sequence's forward + backward captured into a CUDA graph replays bitwise the eager run."""
+    case = long_case(variant, [4096], H=4)
     leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
     state0 = random_state(case).requires_grad_(True)
     d_final = random_state(case, scale=0.1, seed=SEED + 3)
@@ -4726,17 +5187,17 @@ def test_piece_chain_cuda_graph_replay(backend, variant):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("dims", [(64, 128), (128, 64)], ids=["k64_v128", "k128_v64"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_rectangular(backend, variant, dims):
-    """A rectangular state on a cut sequence; forward and backward against the batch run whole and the fp64
+def test_long_rectangular(backend, variant, dims):
+    """A rectangular state on a long sequence; forward and backward against the ``batch_invariant`` run and the fp64
     reference."""
     K, V = dims
-    case = chain_case(variant, [2048], H=4, K=K, V=V)
+    case = long_case(variant, [2048], H=4, K=K, V=V)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    o, fs, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
-    o_u, fs_u, grads_u, _, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
-    assert_rms_close("o chain-vs-uncut", o, o_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("final_state chain-vs-uncut", fs, fs_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_chain_grads_close(grads, grads_u)
+    o, fs, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o_u, fs_u, grads_u, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_rms_close("o default-vs-invariant", o, o_u.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_u.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_u)
     o_ref, fs_ref = reference(case, initial_state=state0)
     assert_rms_close("o vs fp64", o, o_ref, FWD_TOL[case.dtype])
     assert_rms_close("final_state vs fp64", fs, fs_ref, STATE_TOL[case.dtype])
@@ -4744,38 +5205,38 @@ def test_piece_chain_rectangular(backend, variant, dims):
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_zero_length_sequences_pass_through(backend, variant):
-    """Empty sequences inside a cut batch: final_state = initial_state and d_initial_state = d_final_state bitwise,
-    the other outputs track the batch run whole."""
-    case = chain_case(variant, [0, 4000, 0, 100, 0], H=2, K=64, V=64)
+def test_long_zero_length_sequences_pass_through(backend, variant):
+    """Empty sequences inside a long batch: final_state = initial_state and d_initial_state = d_final_state bitwise,
+    the other outputs track the ``batch_invariant`` run."""
+    case = long_case(variant, [0, 4000, 0, 100, 0], H=2, K=64, V=64)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    o, fs, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o, fs, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
     for n in (0, 2, 4):
         assert_bitwise(f"empty seq {n} final_state", fs[n], state0[n])
         assert_bitwise(f"empty seq {n} d_initial_state", grads["initial_state"][n], d_final[n])
-    _, fs_uncut, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
-    assert_rms_close("final_state chain-vs-uncut", fs, fs_uncut.float(), CHAIN_VS_UNCUT_TOL)
-    assert_chain_grads_close(grads, grads_uncut)
+    _, fs_inv, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_inv.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_inv)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-@pytest.mark.parametrize("mode", CHAIN_GATE_MODES)
+@pytest.mark.parametrize("mode", LONG_GATE_MODES)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_piece_chain_gate_modes_match_uncut(backend, variant, mode):
+def test_long_gate_modes_match_invariant(backend, variant, mode):
     """The fused l2norm, raw gates through the safe gate with a_log / dt_bias, beta logits through the in-kernel
-    sigmoid (with and without allow_neg_eigval) and the beta guard on a cut sequence; outputs and every gradient,
-    the parameter gradients included, track the batch run whole."""
+    sigmoid (with and without allow_neg_eigval) and the beta guard on a long sequence; outputs and every gradient,
+    the parameter gradients included, track the ``batch_invariant`` run."""
     case, kw, _ = gate_mode_case(
-        chain_case(variant, [2048], H=4), "sigmoid_beta" if mode == "neg_eigval" else mode, params="random", gate_lower_bound=-0.02, seed=SEED + 5
+        long_case(variant, [2048], H=4), "sigmoid_beta" if mode == "neg_eigval" else mode, params="random", gate_lower_bound=-0.02, seed=SEED + 5
     )
     if mode == "neg_eigval":
         kw["allow_neg_eigval"] = True
     params = tuple((name, kw.pop(name)) for name in ("a_log", "dt_bias") if name in kw)
-    o, fs, grads, dO, _ = chain_grads(backend, case, params=params, **kw)
-    o_u, fs_u, grads_u, _, _ = chain_grads(backend, case, batch_invariant=True, dO=dO, params=params, **kw)
-    assert_rms_close(f"o {mode} chain-vs-uncut", o, o_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close(f"final_state {mode} chain-vs-uncut", fs, fs_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_chain_grads_close(grads, grads_u, label=f"{mode} chain-vs-uncut")
+    o, fs, grads, dO, _ = long_grads(backend, case, params=params, **kw)
+    o_u, fs_u, grads_u, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO, params=params, **kw)
+    assert_rms_close(f"o {mode} default-vs-invariant", o, o_u.float(), INVARIANT_TOL)
+    assert_rms_close(f"final_state {mode} default-vs-invariant", fs, fs_u.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_u, label=f"{mode} default-vs-invariant")
 
 
 # ---------------------------------------------------------------------------
@@ -4952,7 +5413,7 @@ def run_summary_bwd(case, d_o, *, d_final_state=None, **kw):
     try:
         return fn(args[0], args[1], args[3], args[4], d_o, *tail, d_final_state=d_final_state, **kw)
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost summary engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost summary engine declined: {e}")
 
 
 @pytest.mark.L0
@@ -5117,11 +5578,10 @@ def test_summary_bwd_sigmoid_beta_bitwise_vs_port(backend, variant, beta_dtype):
 
 
 # ---------------------------------------------------------------------------
-# Piece chain: summary
+# Summaries of long ragged batches
 # ---------------------------------------------------------------------------
 
-STATE_CHAIN_TOL = 1e-2
-STATE_CHAIN_RAGGED = [497, 16, 1, 480, 0, 253, 4096]
+SUMMARY_TOL = 1e-2
 
 
 @pytest.fixture()
@@ -5134,7 +5594,7 @@ def summary_caches():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
-@pytest.mark.parametrize("seq_lens", [[4096], STATE_CHAIN_RAGGED], ids=["1x4096", "ragged"])
+@pytest.mark.parametrize("seq_lens", [[4096], LONG_RAGGED], ids=["1x4096", "ragged"])
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_chain_matches_oracle(backend, variant, seq_lens, with_state, summary_caches):
@@ -5179,7 +5639,7 @@ def test_summary_chain_batch_invariant_length_rule_bitwise(backend, variant, wit
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_chain_affine_contract(backend, variant, summary_caches):
-    """final_state(S0) == X0 @ M_buf + H_buf on a cut batch, two-sided against the fp64 oracle."""
+    """final_state(S0) == X0 @ M_buf + H_buf on a long ragged batch, two-sided against the fp64 oracle."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     s0 = random_state(case, seed=SEED + 5)
     direct = run_summary(case, initial_state=s0)[0]
@@ -5196,7 +5656,7 @@ def test_summary_chain_affine_contract(backend, variant, summary_caches):
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_chain_cuda_graph_replay(backend, variant, summary_caches):
-    """The summary of a cut batch captured into a CUDA graph replays bitwise the eager run."""
+    """The summary of a long ragged batch captured into a CUDA graph replays bitwise the eager run."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     s0 = random_state(case, seed=SEED + 5)
 
@@ -5226,7 +5686,7 @@ def test_summary_chain_cuda_graph_replay(backend, variant, summary_caches):
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_chain_rectangular(backend, variant, dims, summary_caches):
-    """A rectangular state on a cut batch; M is (K, K) while H is (V, K), both against the oracles."""
+    """A rectangular state on a long ragged batch; M is (K, K) while H is (V, K), both against the oracles."""
     dim_k, dim_v = dims
     case = soften(make_case(variant, torch.bfloat16, T=2048, K=dim_k, V=dim_v, lo=0.99))
     s0 = random_state(case, seed=SEED + 5)
@@ -5237,11 +5697,11 @@ def test_summary_chain_rectangular(backend, variant, dims, summary_caches):
 
 
 # ---------------------------------------------------------------------------
-# Piece chain: summary bwd
+# Backward summaries of long ragged batches
 # ---------------------------------------------------------------------------
 
 
-def gradient_chain_inputs(case, seed=SEED + 31):
+def summary_bwd_inputs(case, seed=SEED + 31):
     """(d_o in the io dtype, its fp32 (B, T, HO, V) source, d_final_state) for a summary-bwd case."""
     N, HO, K, V = case.N, case.HO, case.K, case.V
     set_seed(seed)
@@ -5267,22 +5727,22 @@ def adjoint_d_initial_state(case, d_o_full, d_final_state=None):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
-@pytest.mark.parametrize("seq_lens", [[4096], STATE_CHAIN_RAGGED], ids=["1x4096", "ragged"])
+@pytest.mark.parametrize("seq_lens", [[4096], LONG_RAGGED], ids=["1x4096", "ragged"])
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_bwd_chain_matches_adjoint(backend, variant, seq_lens, with_seed, summary_caches):
     """d_initial_state of a long batch on few tiles against the fp64 adjoint; an
     empty sequence passes d_final_state through (zero without one)."""
     case = soften(make_case(variant, torch.bfloat16, seq_lens=seq_lens, lo=0.99))
-    d_o, d_o_full, d0 = gradient_chain_inputs(case)
+    d_o, d_o_full, d0 = summary_bwd_inputs(case)
     seed = d0 if with_seed else None
-    x_chain = run_summary_bwd(case, d_o, d_final_state=seed)
+    x_op = run_summary_bwd(case, d_o, d_final_state=seed)
     for n, s_len in enumerate(seq_lens):
         if s_len == 0:
-            expect = d0[n] if with_seed else torch.zeros_like(x_chain[n])
-            assert torch.equal(x_chain[n], expect), f"empty sequence {n} must pass d_final_state through"
+            expect = d0[n] if with_seed else torch.zeros_like(x_op[n])
+            assert torch.equal(x_op[n], expect), f"empty sequence {n} must pass d_final_state through"
     x_ref = adjoint_d_initial_state(case, d_o_full, seed)
-    assert_state_close(f"dh0[{variant}] chain vs adjoint", x_chain.double(), x_ref, G_TOL)
+    assert_state_close(f"dh0[{variant}] op vs adjoint", x_op.double(), x_ref, G_TOL)
 
 
 @pytest.mark.L0
@@ -5293,7 +5753,7 @@ def test_summary_bwd_chain_batch_invariant_length_rule_bitwise(backend, variant,
     """Under batch_invariant a sequence's d_initial_state is bitwise the same alone and in a batch."""
     seq_lens = [20000, 3000]
     case = soften(make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=1, lo=0.99))
-    d_o, _, d0 = gradient_chain_inputs(case)
+    d_o, _, d0 = summary_bwd_inputs(case)
     seed = d0 if with_seed else None
     x = run_summary_bwd(case, d_o, d_final_state=seed, batch_invariant=True)
     for n in range(len(seq_lens)):
@@ -5308,10 +5768,10 @@ def test_summary_bwd_chain_batch_invariant_length_rule_bitwise(backend, variant,
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_bwd_chain_affine_contract(backend, variant, summary_caches):
-    """dh0(dht = D0) == D0 @ M_buf^T + G_buf with all three legs on a cut batch,
+    """dh0(dht = D0) == D0 @ M_buf^T + G_buf with all three legs on a long ragged batch,
     two-sided against the fp64 adjoint."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
-    d_o, d_o_full, d0 = gradient_chain_inputs(case)
+    d_o, d_o_full, d0 = summary_bwd_inputs(case)
     direct = run_summary_bwd(case, d_o, d_final_state=d0)
     g_buf = run_summary_bwd(case, d_o)
     m_buf = run_summary(case)[1]
@@ -5320,16 +5780,16 @@ def test_summary_bwd_chain_affine_contract(backend, variant, summary_caches):
     err_direct = max(rms_ratio(direct, oracle), 1e-6)
     err_composed = rms_ratio(composed, oracle)
     assert err_composed <= AFFINE_KAPPA * err_direct, f"composed d_initial_state {err_composed:.4g} vs direct {err_direct:.4g} exceeds kappa {AFFINE_KAPPA}"
-    assert_state_close(f"bwd affine[{variant}]", composed.float(), direct.double(), STATE_CHAIN_TOL)
+    assert_state_close(f"bwd affine[{variant}]", composed.float(), direct.double(), SUMMARY_TOL)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_bwd_chain_cuda_graph_replay(backend, variant, summary_caches):
-    """The backward summary of a cut batch captured into a CUDA graph replays bitwise the eager run."""
+    """The backward summary of a long ragged batch captured into a CUDA graph replays bitwise the eager run."""
     case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
-    d_o, _, d0 = gradient_chain_inputs(case)
+    d_o, _, d0 = summary_bwd_inputs(case)
 
     def launch():
         return run_summary_bwd(case, d_o, d_final_state=d0)
@@ -5387,7 +5847,7 @@ def build_and_pin(graph, plan_name):
 def test_graph_api_summary_node_matches_op(backend, variant, with_state, summary_caches):
     """The family's summary node built through cudnn.pygraph returns
     final_state and transition bitwise the summary op's."""
-    case = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99))
+    case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     s0 = random_state(case, seed=SEED + 5) if with_state else None
     h_op, m_op = run_summary(case, initial_state=s0)
     args = op_args(case)[1:]
@@ -5404,7 +5864,7 @@ def test_graph_api_summary_node_matches_op(backend, variant, with_state, summary
     attrs = dict(output_transition=True)
     if variant in HOUSEHOLDER_VARIANTS:
         attrs["num_householder"] = case.n
-    fs_t, transition_t = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
+    fs_t, transition_t, *_ = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
     fs_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     build_and_pin(graph, f"{variant}_summary_frost")
@@ -5426,8 +5886,8 @@ def test_graph_api_summary_node_matches_op(backend, variant, with_state, summary
 def test_graph_api_summary_bwd_node_matches_op(backend, variant, with_seed, summary_caches):
     """The family's summary-bwd node built through cudnn.pygraph returns
     d_initial_state and transition bitwise the summary-bwd op's."""
-    case = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99))
-    d_o, _, d0 = gradient_chain_inputs(case)
+    case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
+    d_o, _, d0 = summary_bwd_inputs(case)
     seed = d0 if with_seed else None
     x_op, transition_op = run_summary_bwd(case, d_o, d_final_state=seed, output_transition=True)
     args = op_args(case)
@@ -5440,7 +5900,7 @@ def test_graph_api_summary_bwd_node_matches_op(backend, variant, with_seed, summ
     attrs = dict(scale=1.0 / math.sqrt(K), output_transition=True)
     if variant in HOUSEHOLDER_VARIANTS:
         attrs["num_householder"] = case.n
-    x_t, transition_t = getattr(graph, f"{variant}_summary_bwd")(**ports, **attrs, name="summary_bwd")
+    x_t, transition_t, *_ = getattr(graph, f"{variant}_summary_bwd")(**ports, **attrs, name="summary_bwd")
     x_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     build_and_pin(graph, f"{variant}_summary_frost")
@@ -5462,7 +5922,7 @@ def test_graph_api_summary_bwd_node_matches_op(backend, variant, with_seed, summ
 TRANSITION_FP32_TOL = 1e-4
 TWO_TIER_TOL = 2e-2
 TWO_TIER_STATE_TOL = 6e-2
-TWO_TIER_BOUNDS = [0, 512, 1024, 1536, 2048]
+TWO_TIER_BOUNDS = [0, 1024, 2048, 3072, 4096]
 
 
 def family_forward_backward(case, s0, d_o, d_final):
@@ -5473,7 +5933,7 @@ def family_forward_backward(case, s0, d_o, d_final):
     try:
         o, fs = op(case.variant)(*leaves.values(), *op_tail(case), initial_state=seed, output_final_state=True, plan_name=f"{case.variant}_frost")
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost engine declined: {e}")
     grads = torch.autograd.grad([o, fs], list(leaves.values()) + [seed], [d_o, d_final])
     named = dict(zip(list(leaves) + ["initial_state"], grads))
     return o.detach(), fs.detach(), named
@@ -5488,28 +5948,23 @@ def compose_spans(seed, h, m):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("cut", ["whole", "one_piece", "chain"])
+@pytest.mark.parametrize("length", [64, 1024, 4096])
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_summary_bwd_transition_orientation(backend, variant, cut, summary_caches):
-    """The gradient op's transition is the forward summary's transition transposed: bitwise where
-    one piece is walked (a span short enough to walk whole, and a one-piece batch-invariant chain),
-    fp32-close over a many-piece chain (the products associate in opposite order)."""
-    if cut == "whole":
-        case, kw = soften(make_case(variant, torch.bfloat16, T=64, lo=0.99)), {}
-    elif cut == "one_piece":
-        case, kw = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99)), dict(batch_invariant=True)
-    else:
-        case, kw = soften(make_case(variant, torch.bfloat16, T=4096, lo=0.99)), {}
-    d_o, _, _ = gradient_chain_inputs(case)
+def test_summary_bwd_transition_orientation(backend, variant, length, summary_caches):
+    """The gradient op's transition is the forward summary's transition transposed: bitwise at 64 tokens and at 1024 tokens
+    under ``batch_invariant``, fp32-close at 4096 tokens (the products associate in opposite order)."""
+    case = soften(make_case(variant, torch.bfloat16, T=length, lo=0.99))
+    kw = dict(batch_invariant=True) if length == 1024 else {}
+    d_o, _, _ = summary_bwd_inputs(case)
     m_fwd = run_summary(case, **kw)[1]
     _, t_bwd = run_summary_bwd(case, d_o, output_transition=True, **kw)
     want = m_fwd.transpose(-1, -2)
     assert t_bwd.shape == want.shape and t_bwd.dtype == torch.float32
-    if cut == "chain":
-        assert_state_close(f"transition[{variant}, {cut}]", t_bwd, want, TRANSITION_FP32_TOL)
+    if length == 4096:
+        assert_state_close(f"transition[{variant}, {length}]", t_bwd, want, TRANSITION_FP32_TOL)
     else:
-        assert torch.equal(t_bwd, want), f"transition[{variant}, {cut}] is not bitwise the forward transition transposed"
+        assert torch.equal(t_bwd, want), f"transition[{variant}, {length}] is not bitwise the forward transition transposed"
 
 
 @pytest.mark.L0
@@ -5520,7 +5975,7 @@ def test_summary_bwd_transition_orientation_dims(backend, variant, dims, summary
     """The transposed-transition identity at every (K, V) on a whole-walked span."""
     dim_k, dim_v = dims
     case = soften(make_case(variant, torch.bfloat16, T=64, K=dim_k, V=dim_v, lo=0.99))
-    d_o, _, _ = gradient_chain_inputs(case)
+    d_o, _, _ = summary_bwd_inputs(case)
     m_fwd = run_summary(case)[1]
     _, t_bwd = run_summary_bwd(case, d_o, output_transition=True)
     assert t_bwd.shape[-2:] == (dim_k, dim_k)
@@ -5540,7 +5995,7 @@ def test_two_tier_forward_assembles_whole_sequence(backend, variant, summary_cac
     h, m = run_summary(spans)
     x = compose_spans(s0[0], h, m)
     o_spans, fs_spans = run_frost(spans, initial_state=torch.stack(x[:-1]), output_final_state=True)[:2]
-    assert_rms_close(f"o[{variant}, two-tier]", o_spans, o_whole, CHAIN_FWD_TOL)
+    assert_rms_close(f"o[{variant}, two-tier]", o_spans, o_whole, LONG_FWD_TOL)
     assert_state_close(f"final_state[{variant}, two-tier]", fs_spans[-1:], fs_whole, H_TOL[torch.bfloat16])
     assert_state_close(f"composed final_state[{variant}, two-tier]", x[-1][None], fs_whole, H_TOL[torch.bfloat16])
 
@@ -5555,7 +6010,7 @@ def test_two_tier_backward_assembles_whole_sequence(backend, variant, summary_ca
     case = soften(make_case(variant, torch.bfloat16, T=TWO_TIER_BOUNDS[-1], lo=0.99))
     spans = case.clone(cu=torch.tensor(TWO_TIER_BOUNDS, dtype=case.cu.dtype, device="cuda"), N=len(TWO_TIER_BOUNDS) - 1, varlen=True)
     s0 = random_state(case, seed=SEED + 5)
-    d_o, _, d_final = gradient_chain_inputs(case)
+    d_o, _, d_final = summary_bwd_inputs(case)
     _, _, grads_whole = family_forward_backward(case, s0, d_o, d_final)
     h, m = run_summary(spans)
     x = compose_spans(s0[0], h, m)
@@ -5570,30 +6025,31 @@ def test_two_tier_backward_assembles_whole_sequence(backend, variant, summary_ca
             assert_state_close(f"d_initial_state[{variant}, two-tier]", grads_spans[name][:1], whole, TWO_TIER_STATE_TOL)
         else:
             assert_rms_close(f"d{name}[{variant}, two-tier]", grads_spans[name], whole, TWO_TIER_TOL)
-    assert_state_close(f"composed span state gradients[{variant}]", torch.stack(dx[:-1]), grads_spans["initial_state"], STATE_CHAIN_TOL)
+    assert_state_close(f"composed span state gradients[{variant}]", torch.stack(dx[:-1]), grads_spans["initial_state"], SUMMARY_TOL)
 
 
 # ---------------------------------------------------------------------------
 # Mamba-2 summaries (scalar transition: log2 of the span's decay product)
 # ---------------------------------------------------------------------------
 MAMBA2_SPAN_BOUNDS = [0, 1024, 1536, 2560, 3000]
+MAMBA2_LONG_SPAN_BOUNDS = [0, 2048, 3072, 6144, 7000]
 
 
-def mamba2_summary(case, *, initial_state=None):
+def mamba2_summary(case, *, initial_state=None, **kw):
     """``(final_state, transition)`` of a Mamba-2 case through the summary op, pinned to the FROST summary engine."""
     q, k, v, g, cu, A, dt_bias = op_args(case)
     with waive_engine_less("mamba2 frost summary engine"):
-        return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
+        return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost", **kw)
 
 
-def mamba2_summary_bwd(case, dO, *, d_final_state=None):
+def mamba2_summary_bwd(case, dO, *, d_final_state=None, **kw):
     """``(d_initial_state, transition)`` of a Mamba-2 case through the backward summary op."""
     q, k, v, g, cu, A, dt_bias = op_args(case)
     scale = 1.0 / math.sqrt(case.K)
     q = (q.float() * scale).to(q.dtype)  # the suite's forward adapter pre-scales C the same way
     with waive_engine_less("mamba2 frost summary engine"):
         return la_ops.mamba2_summary_bwd(
-            dO, g, A, q, cu, d_final_state=d_final_state, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost"
+            dO, g, A, q, cu, d_final_state=d_final_state, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost", **kw
         )
 
 
@@ -5610,7 +6066,7 @@ def mamba2_log2_transition(case):
 @pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_mamba2_summary_matches_prefill(backend, variant, state_dtype, seq_lens):
-    """The summary's final_state is bitwise the uncut prefill's (one state chain, no output side), float32 like the
+    """The summary's final_state is bitwise the ``batch_invariant`` forward's final state, float32 like the
     sibling summaries' (the op takes an fp32 initial_state; other dtypes bind at the graph level); its transition is the
     fp64 log2 decay product."""
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
@@ -5634,7 +6090,7 @@ def test_mamba2_summary_bwd_matches_backward(backend, variant, with_dfs, seq_len
     dO and d_final_state; its transition is the fp64 log2 decay product."""
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
     s0 = random_state(case)
-    d_o, _, d_final = gradient_chain_inputs(case)
+    d_o, _, d_final = summary_bwd_inputs(case)
     d_final = d_final if with_dfs else None
     _, _, grads = family_forward_backward(case, s0, d_o, d_final if with_dfs else torch.zeros_like(s0))
     d_initial, transition = mamba2_summary_bwd(case, d_o, d_final_state=d_final)
@@ -5653,12 +6109,12 @@ def test_mamba2_summary_graph_mixed_state_dtypes(backend, variant, shape):
     output equals the fp32 op's output rounded to that dtype, bitwise.  Forward and backward summaries, a zero-length
     sequence in the varlen case."""
     if shape == "dense":
-        case = make_case(variant, torch.bfloat16, T=1024, lo=0.99)
+        case = make_case(variant, torch.bfloat16, T=2048, lo=0.99)
     else:
         case = make_case(variant, torch.bfloat16, seq_lens=[100, 0, 156], lo=0.99)
     q, k, v, g, cu, A, dt_bias = op_args(case)
     q = (q.float() / math.sqrt(case.K)).to(q.dtype)
-    d_o, _, _ = gradient_chain_inputs(case)
+    d_o, _, _ = summary_bwd_inputs(case)
     with waive_engine_less("mamba2 frost summary engine"):
         fs_op, transition_op = la_ops.mamba2_summary(v, g, A, k, cu, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
         dstate0_op, transition_bwd_op = la_ops.mamba2_summary_bwd(d_o, g, A, q, cu, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
@@ -5699,23 +6155,24 @@ def test_mamba2_summary_graph_mixed_state_dtypes(backend, variant, shape):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("bounds", [MAMBA2_SPAN_BOUNDS, MAMBA2_LONG_SPAN_BOUNDS], ids=["short", "long"])
 @pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_mamba2_two_tier_assembles_whole_sequence(backend, variant):
+def test_mamba2_two_tier_assembles_whole_sequence(backend, variant, bounds):
     """Per-span final states composed through the scalar transitions, X_{j+1} = exp2(tr_j) X_j + H_j, seed each span's
     forward and reproduce the whole-sequence forward; per-span G composed in reverse, dX_j = exp2(tr_{j+1}) dX_{j+1} +
     G_{j+1}, seeds each span's backward and reproduces every gradient of the whole-sequence backward."""
-    case = make_case(variant, torch.bfloat16, T=MAMBA2_SPAN_BOUNDS[-1], lo=0.99)
-    spans = case.clone(cu=torch.tensor(MAMBA2_SPAN_BOUNDS, dtype=case.cu.dtype, device="cuda"), N=len(MAMBA2_SPAN_BOUNDS) - 1, varlen=True)
+    case = make_case(variant, torch.bfloat16, T=bounds[-1], lo=0.99)
+    spans = case.clone(cu=torch.tensor(bounds, dtype=case.cu.dtype, device="cuda"), N=len(bounds) - 1, varlen=True)
     s0 = random_state(case, seed=SEED + 5)
-    d_o, _, d_final = gradient_chain_inputs(case)
+    d_o, _, d_final = summary_bwd_inputs(case)
     o_whole, fs_whole, grads_whole = family_forward_backward(case, s0, d_o, d_final)
     h, tr = mamba2_summary(spans)
     x = [s0[0]]
     for j in range(spans.N):
         x.append(torch.exp2(tr[j])[:, None, None] * x[-1] + h[j])
     o_spans, fs_spans = run_fwd(backend, spans, initial_state=torch.stack(x[:-1]), output_final_state=True)
-    assert_rms_close(f"o[{variant}, two-tier]", o_spans, o_whole, CHAIN_FWD_TOL)
+    assert_rms_close(f"o[{variant}, two-tier]", o_spans, o_whole, LONG_FWD_TOL)
     assert_state_close(f"final_state[{variant}, two-tier]", fs_spans[-1:], fs_whole, H_TOL[torch.bfloat16])
     assert_state_close(f"composed final_state[{variant}, two-tier]", x[-1][None], fs_whole, H_TOL[torch.bfloat16])
     g_spans, t_spans = mamba2_summary_bwd(spans, d_o)
@@ -5729,42 +6186,79 @@ def test_mamba2_two_tier_assembles_whole_sequence(backend, variant):
             assert_state_close(f"d_initial_state[{variant}, two-tier]", grads_spans[name][:1], whole, TWO_TIER_STATE_TOL)
         else:
             assert_rms_close(f"d{name}[{variant}, two-tier]", grads_spans[name], whole, TWO_TIER_TOL)
-    assert_state_close(f"composed span state gradients[{variant}]", torch.stack(dx[:-1]), grads_spans["initial_state"], STATE_CHAIN_TOL)
+    assert_state_close(f"composed span state gradients[{variant}]", torch.stack(dx[:-1]), grads_spans["initial_state"], SUMMARY_TOL)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("schedule", ["chain", "uncut"])
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_mamba2_summary_batch_invariant_bitwise(backend, variant, with_state, summary_caches):
+    """Under batch_invariant a sequence's final_state and transition are bitwise the same alone and in a batch."""
+    seq_lens = [20000, 3000]
+    case = make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=1, lo=0.99)
+    s0 = random_state(case, seed=SEED + 5) if with_state else None
+    h, tr = mamba2_summary(case, initial_state=s0, batch_invariant=True)
+    for n in range(len(seq_lens)):
+        alone = window(case, int(case.cu[n]), int(case.cu[n + 1]))
+        clear_caches()
+        h_alone, tr_alone = mamba2_summary(alone, initial_state=s0[n : n + 1].clone() if with_state else None, batch_invariant=True)
+        assert torch.equal(h[n], h_alone[0]), f"seq {n} final_state is not bitwise its own run"
+        assert torch.equal(tr[n], tr_alone[0]), f"seq {n} transition is not bitwise its own run"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_mamba2_summary_bwd_batch_invariant_bitwise(backend, variant, with_seed, summary_caches):
+    """Under batch_invariant a sequence's d_initial_state and transition are bitwise the same alone and in a batch."""
+    seq_lens = [20000, 3000]
+    case = make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=1, lo=0.99)
+    d_o, _, d0 = summary_bwd_inputs(case)
+    x, tr = mamba2_summary_bwd(case, d_o, d_final_state=d0 if with_seed else None, batch_invariant=True)
+    for n in range(len(seq_lens)):
+        s, e = int(case.cu[n]), int(case.cu[n + 1])
+        alone = window(case, s, e)
+        clear_caches()
+        x_alone, tr_alone = mamba2_summary_bwd(alone, d_o[s:e].contiguous(), d_final_state=d0[n : n + 1].clone() if with_seed else None, batch_invariant=True)
+        assert torch.equal(x[n], x_alone[0]), f"seq {n} d_initial_state is not bitwise its own run"
+        assert torch.equal(tr[n], tr_alone[0]), f"seq {n} transition is not bitwise its own run"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["1x4096_h4", "8x2048_h16_invariant"])
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_overwrite_initial_state_fwd_bitwise(backend, variant, schedule):
+def test_overwrite_initial_state_fwd_bitwise(backend, variant, shape):
     """With ``overwrite_initial_state`` the final state lands in the ``initial_state`` buffer, bitwise the separate-buffer
-    run's: a chain keeps its schedule; a batch the split-K cut would have served runs uncut, which is the
-    ``batch_invariant`` run's schedule."""
-    case = chain_case(variant, [4096], H=4) if schedule == "chain" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
+    run's, on a long single sequence and on a dense batch under ``batch_invariant``."""
+    case = long_case(variant, [4096], H=4) if shape == "1x4096_h4" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
     state0 = random_state(case)
-    kw = {"batch_invariant": True} if schedule == "uncut" else {}
+    kw = {"batch_invariant": True} if shape == "8x2048_h16_invariant" else {}
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0.clone(), output_final_state=True, **kw)
     state = state0.clone()
     o, fs = run_fwd(backend, case, initial_state=state, output_final_state=True, overwrite_initial_state=True)
     assert fs is state
-    assert_bitwise(f"o[{variant}, {schedule}]", o, o_ref)
-    assert_bitwise(f"final_state[{variant}, {schedule}]", state, fs_ref)
+    assert_bitwise(f"o[{variant}, {shape}]", o, o_ref)
+    assert_bitwise(f"final_state[{variant}, {shape}]", state, fs_ref)
     with pytest.raises(ValueError):
         run_fwd(backend, case, output_final_state=True, overwrite_initial_state=True)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("schedule", ["chain", "uncut"])
+@pytest.mark.parametrize("shape", ["1x4096_h4", "8x2048_h16_invariant"])
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_overwrite_initial_state_bwd_graph_bitwise(backend, variant, schedule):
+def test_overwrite_initial_state_bwd_graph_bitwise(backend, variant, shape):
     """The family's bwd node with ``overwrite_initial_state`` writes ``d_initial_state`` into the ``d_final_state`` buffer,
-    every gradient bitwise the op's separate-buffer backward (the uncut batch against its ``batch_invariant`` run)."""
-    case = chain_case(variant, [4096], H=4) if schedule == "chain" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
+    every gradient bitwise the op's separate-buffer backward, on a long single sequence and on a dense batch under
+    ``batch_invariant``."""
+    case = long_case(variant, [4096], H=4) if shape == "1x4096_h4" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
     state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
-    kw = {"batch_invariant": True} if schedule == "uncut" else {}
+    kw = {"batch_invariant": True} if shape == "8x2048_h16_invariant" else {}
     scale = 1.0 if variant in NO_BETA_VARIANTS else 1.0 / math.sqrt(case.K)  # the Mamba-2 node has no scale: unscaled q both ways
-    _, _, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, scale=scale, **kw)
+    _, _, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final, scale=scale, **kw)
     names = LEAF_NAMES[variant]
     inputs = dict(zip(names, op_args(case)[: len(names)]))
     inputs.update(cu_seqlens=case.cu, dO=dO, initial_state=state0, d_final_state=d_final)
@@ -5795,68 +6289,122 @@ def test_overwrite_initial_state_bwd_graph_bitwise(backend, variant, schedule):
     graph.execute(pack, torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda"))
     torch.cuda.synchronize()
     for name in names:
-        assert_bitwise(f"d{name}[{variant}, {schedule}]", got[name], grads[name])
-    assert_bitwise(f"d_initial_state[{variant}, {schedule}]", d_state, grads["initial_state"])
+        assert_bitwise(f"d{name}[{variant}, {shape}]", got[name], grads[name])
+    assert_bitwise(f"d_initial_state[{variant}, {shape}]", d_state, grads["initial_state"])
 
 
-def state_pool(case, packed, spare_rows=5, fill=3.14159, padded=False):
+def state_pool(case, packed, spare_rows=5, fill=3.14159, padded=False, head_padded=False, index_dtype=torch.int32):
     """``packed`` ``[N, ...]`` scattered into a ``[N + spare_rows, ...]`` pool at a seeded permutation of its rows;
-    ``(pool, slots, spare)`` with every row outside ``slots`` holding ``fill``.  ``padded`` widens the slot stride by 512
-    elements past a row, the way a serving stack packs other per-slot data next to the state."""
+    ``(pool, indices, spare)`` with every row outside ``indices`` holding ``fill``.  ``padded`` widens the row stride by 512
+    elements past a row, the way a serving stack packs other per-row data next to the state; ``head_padded`` pads the head
+    stride by 64 elements and the ``V`` stride by 16 elements as well (16-byte multiples, unit ``K`` stride)."""
     rows = case.N + spare_rows
     order = torch.randperm(rows, generator=torch.Generator().manual_seed(SEED + 7))
-    slots = order[: case.N].to(device="cuda", dtype=torch.int32)
+    indices = order[: case.N].to(device="cuda", dtype=index_dtype)
     spare = order[case.N :].to(device="cuda")
     row = packed[0].numel()
-    if padded:
+    if head_padded:
+        v_stride = case.K + 16
+        head_stride = case.V * v_stride + 64
+        row_stride = case.HO * head_stride + 512
+        storage = torch.full((rows * row_stride,), fill, device="cuda", dtype=packed.dtype)
+        pool = storage.as_strided((rows,) + tuple(packed.shape[1:]), (row_stride, head_stride, v_stride, 1))
+    elif padded:
         storage = torch.full((rows, row + 512), fill, device="cuda", dtype=packed.dtype)
         pool = storage.as_strided((rows,) + tuple(packed.shape[1:]), (row + 512,) + tuple(packed.stride()[1:]))
     else:
         pool = torch.full((rows,) + tuple(packed.shape[1:]), fill, device="cuda", dtype=packed.dtype)
-    pool[slots.long()] = packed
-    return pool, slots, spare
+    pool[indices.long()] = packed
+    return pool, indices, spare
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("schedule", ["chain", "uncut"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize("padded,head_padded", [(False, False), (True, False), (True, True)], ids=["dense", "row_pad", "head_v_pad"])
+@pytest.mark.parametrize("shape", ["1x4096_h4", "8x2048_h16_invariant"])
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_state_indices_fwd_bitwise(backend, variant, schedule, padded):
+def test_state_indices_fwd_bitwise(backend, variant, shape, padded, head_padded, index_dtype):
     """``state_indices`` reads and writes the caller's pool through permuted, sparse rows: output and final states bitwise
-    the packed run's (the pool implies ``overwrite_initial_state``, so a batch the split-K cut would serve runs uncut, the
-    ``batch_invariant`` run's schedule), rows outside the table untouched, the pool handed back as ``final_state``; a
-    padded slot stride reads and writes the same rows."""
-    case = chain_case(variant, [4096], H=4) if schedule == "chain" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
+    the packed run's (the pool implies ``overwrite_initial_state``; the dense batch runs under ``batch_invariant``), rows
+    outside the table untouched, the pool intermediates back as ``final_state``; a padded row stride reads and writes the
+    same rows."""
+    case = long_case(variant, [4096], H=4) if shape == "1x4096_h4" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
     packed = random_state(case)
-    kw = {"batch_invariant": True} if schedule == "uncut" else {}
+    kw = {"batch_invariant": True} if shape == "8x2048_h16_invariant" else {}
     o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True, **kw)
-    pool, slots, spare = state_pool(case, packed, padded=padded)
-    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=slots, output_final_state=True)
+    pool, indices, spare = state_pool(case, packed, padded=padded, head_padded=head_padded, index_dtype=index_dtype)
+    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
     assert fs is pool
-    assert_bitwise(f"o[{variant}, {schedule}]", o, o_ref)
-    assert_bitwise(f"final_state[{variant}, {schedule}]", pool[slots.long()], fs_ref)
+    assert_bitwise(f"o[{variant}, {shape}]", o, o_ref)
+    assert_bitwise(f"final_state[{variant}, {shape}]", pool[indices.long()], fs_ref)
+    assert (pool[spare] == 3.14159).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_state_indices_dtype_cache_separation(backend, variant):
+    """int32 and int64 ``state_indices`` inside one process: each call reads and writes the rows its own table names."""
+    case = long_case(variant, [4096], H=4)
+    packed = random_state(case)
+    o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True)
+    for index_dtype in (torch.int32, torch.int64):
+        pool, indices, _ = state_pool(case, packed, index_dtype=index_dtype)
+        o, _ = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
+        assert_bitwise(f"o[{variant}, {index_dtype}]", o, o_ref)
+        assert_bitwise(f"final_state[{variant}, {index_dtype}]", pool[indices.long()], fs_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("rows", ["io", "fp32"])
+@pytest.mark.parametrize("after_block", [False, True], ids=["pre_state", "after_block"])
+@pytest.mark.parametrize("shape", ["1x4096_h4", "8x2048_h16_invariant"])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_state_indices_with_checkpoints(backend, variant, shape, after_block, rows):
+    """A state pool together with checkpoints: the rows follow ``cu_seqlens`` and the pool only the state read and write,
+    so output, pool rows and the checkpoint series are bitwise the packed run's, in both conventions and both row dtypes."""
+    case = long_case(variant, [4096], H=4) if shape == "1x4096_h4" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
+    packed = random_state(case)
+    checkpoint = 2 * CHUNK[variant]
+    kw = dict(output_final_state=True, checkpoint_every_n_tokens=checkpoint, checkpoint_after_block=after_block)
+    if rows == "fp32":
+        kw["checkpoint_dtype"] = torch.float32
+    if shape == "8x2048_h16_invariant":
+        kw["batch_invariant"] = True
+    o_ref, fs_ref, series_ref = run_fwd(backend, case, initial_state=packed.clone(), **kw)
+    pool, indices, spare = state_pool(case, packed)
+    kw.pop("batch_invariant", None)
+    o, fs, series = run_fwd(backend, case, initial_state=pool, state_indices=indices, **kw)
+    assert fs is pool
+    valid = sum(
+        (length * case.n) // checkpoint if after_block else ((length * case.n - 1) // checkpoint + 1 if length else 0) for length in case.cu.diff().tolist()
+    )
+    assert_bitwise("o", o, o_ref)
+    assert_bitwise("final_state", pool[indices.long()], fs_ref)
+    assert_bitwise("state_checkpoints", series[:valid], series_ref[:valid])
     assert (pool[spare] == 3.14159).all()
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_state_indices_split_graph_bitwise(backend, padded):
-    """A GDN graph binding ``state_indices`` with a distinct final-state pool keeps the split-K schedule: output and final
-    states bitwise the packed split run, the final states at the table's rows of the output pool, the input pool untouched."""
+def test_state_indices_distinct_pool_graph_bitwise(backend, padded):
+    """A GDN graph binding ``state_indices`` with a distinct final-state pool: output and final states bitwise the packed
+    run, the final states at the table's rows of the output pool, the input pool untouched."""
     case = make_case("gdn", torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
     packed = random_state(case)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True)
-    pool, slots, spare = state_pool(case, packed, padded=padded)
+    pool, indices, spare = state_pool(case, packed, padded=padded)
     pool_before = pool.clone()
     final_pool = torch.full_like(pool, -2.5)
     names = LEAF_NAMES["gdn"]
     inputs = dict(zip(names, op_args(case)[: len(names)]))
-    inputs.update(cu_seqlens=case.cu, initial_state=pool, state_indices=slots)
+    inputs.update(cu_seqlens=case.cu, initial_state=pool, state_indices=indices)
     graph = cudnn.pygraph()
     ports = {name: graph.tensor(list(t.shape), stride=list(t.stride()), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
-    o_port, fs_port, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
+    o_port, fs_port, _, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
     o = torch.empty_like(o_ref)
     o_port.set_output(True).set_data_type(CUDNN_DTYPE[o.dtype])
     fs_port.set_output(True).set_data_type(CUDNN_DTYPE[final_pool.dtype])
@@ -5866,8 +6414,8 @@ def test_state_indices_split_graph_bitwise(backend, padded):
     pack[fs_port] = final_pool
     graph.execute(pack, torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda"))
     torch.cuda.synchronize()
-    assert_bitwise("o[gdn, split]", o, o_ref)
-    assert_bitwise("final_state[gdn, split]", final_pool[slots.long()], fs_ref)
+    assert_bitwise("o[gdn, pool]", o, o_ref)
+    assert_bitwise("final_state[gdn, pool]", final_pool[indices.long()], fs_ref)
     assert torch.equal(pool, pool_before)
     assert (final_pool[spare] == -2.5).all()
 
@@ -5877,31 +6425,29 @@ def test_state_indices_split_graph_bitwise(backend, padded):
 def test_state_indices_rejects_unsupported(backend):
     """Every unsupported combination raises instead of handing back a state the caller would misread."""
     case = make_case("gdn", torch.bfloat16, seq_lens=[64, 128])
-    slots = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
     pool = torch.zeros(4, case.HO, case.V, case.K, device="cuda", dtype=torch.float32)
     kw = dict(output_final_state=True)
     with pytest.raises(ValueError, match="initial_state is required"):
-        run_fwd(backend, case, state_indices=slots, **kw)
+        run_fwd(backend, case, state_indices=indices, **kw)
     with pytest.raises(TypeError):
-        run_fwd(backend, case, initial_state=pool, state_indices=slots.long(), **kw)
+        run_fwd(backend, case, initial_state=pool, state_indices=indices.float(), **kw)
     with pytest.raises(ValueError, match="state_indices must be"):
-        run_fwd(backend, case, initial_state=pool, state_indices=slots[:1], **kw)
-    with pytest.raises(ValueError, match="checkpoint_every_n_tokens"):
-        run_fwd(backend, case, initial_state=pool, state_indices=slots, checkpoint_every_n_tokens=64, **kw)
-    with pytest.raises(ValueError, match="dense"):
-        run_fwd(backend, case, initial_state=pool.transpose(2, 3), state_indices=slots, **kw)
+        run_fwd(backend, case, initial_state=pool, state_indices=indices[:1], **kw)
+    with pytest.raises(ValueError, match="unit K stride"):
+        run_fwd(backend, case, initial_state=pool.transpose(2, 3), state_indices=indices, **kw)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("shape", ["varlen_zero_length", "chain"])
+@pytest.mark.parametrize("shape", ["varlen_zero_length", "dense_2048"])
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_summary_graph_mixed_state_dtypes(backend, variant, shape):
     """A summary graph may bind ``final_state`` and ``transition`` in different dtypes: every store converts the fp32 state to
     its own output's dtype, so each output equals the fp32 op's output rounded to that dtype, bitwise.  The varlen case
-    carries a zero-length sequence (the identity fill of an empty item) on the uncut table; the dense case chains."""
-    if shape == "chain":
-        case = soften(make_case(variant, torch.bfloat16, T=1024, lo=0.99))
+    carries a zero-length sequence (the identity fill of an empty sequence); the dense case is one 2048-token sequence."""
+    if shape == "dense_2048":
+        case = soften(make_case(variant, torch.bfloat16, T=2048, lo=0.99))
     else:
         case = make_case(variant, torch.bfloat16, seq_lens=[100, 0, 156], lo=0.99)
     h_op, m_op = run_summary(case)
@@ -5918,7 +6464,7 @@ def test_summary_graph_mixed_state_dtypes(backend, variant, shape):
         attrs = dict(output_transition=True)
         if variant in HOUSEHOLDER_VARIANTS:
             attrs["num_householder"] = case.n
-        fs_t, transition_t = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
+        fs_t, transition_t, *_ = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
         fs_t.set_output(True).set_data_type(CUDNN_DTYPE[fs_dtype])
         transition_t.set_output(True).set_data_type(CUDNN_DTYPE[transition_dtype])
         build_and_pin(graph, f"{variant}_summary_frost")
@@ -5937,7 +6483,7 @@ def test_summary_graph_mixed_state_dtypes(backend, variant, shape):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_state_indices_graph_declines_wrong_table_shape(backend):
     """A hand-built graph whose ``state_indices`` tensor is not ``[num_seqs]`` is declined before any plan builds: the
-    table addresses one pool slot per sequence, and the graph path checks the declared shape like the op path does."""
+    table addresses one pool row per sequence, and the graph path checks the declared shape like the op path does."""
     case = make_case("gdn", torch.bfloat16, seq_lens=[64, 128], lo=0.99)
     pool = random_state(case.clone(N=4), seed=SEED + 3)
     names = LEAF_NAMES["gdn"]
@@ -5947,7 +6493,7 @@ def test_state_indices_graph_declines_wrong_table_shape(backend):
         graph = cudnn.pygraph()
         ports = {name: graph.tensor(list(t.shape), stride=list(t.stride()), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
         ports["state_indices"] = graph.tensor(list(bad.shape), stride=list(bad.stride()), data_type=CUDNN_DTYPE[bad.dtype], name="state_indices")
-        o_port, fs_port, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
+        o_port, fs_port, _, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
         o_port.set_output(True).set_data_type(CUDNN_DTYPE[torch.bfloat16])
         fs_port.set_output(True).set_data_type(CUDNN_DTYPE[torch.float32])
         graph.validate()
@@ -5961,38 +6507,34 @@ def test_state_indices_graph_declines_wrong_table_shape(backend):
 
 
 # ---------------------------------------------------------------------------
-# d_v split: two uncut CTAs per (sequence, head) tile, each owning half of d_v
+# Heads at half the SM count: the default call against its batch_invariant run and the fp64 reference
 # ---------------------------------------------------------------------------
-PREP_VARIANTS = ("kda", "gdn2")
+NEAR_HALF_SM_VARIANTS = ("kda", "gdn2")
 
 
-def dv_split_case(variant, seq_lens=(4096,), heads=None, HK=None, HV=None):
-    """A batch of ``num_sm // 2`` (sequence, head) tiles, the top of the tile counts where every tile runs as two CTAs each
-    owning half of d_v (above the prep rule's break-even, so every family runs the compute path there); a sub-token family
-    keeps the head count (its fp64 reference over 3 x 4096 rows fits)."""
+def half_sm_case(variant, seq_lens=(4096,), heads=None, HK=None, HV=None):
+    """A batch of ``num_sm // 2`` (sequence, head) pairs at 4096 tokens; a sub-token family keeps the head count (its fp64
+    reference over 3 x 4096 rows fits)."""
     heads = sm_count() // 2 // len(seq_lens) if heads is None else heads
-    return chain_case(variant, list(seq_lens), H=heads, HK=heads if HK is None else HK, HV=heads if HV is None else HV)
+    return long_case(variant, list(seq_lens), H=heads, HK=heads if HK is None else HK, HV=heads if HV is None else HV)
 
 
-def prep_case(variant, seq_lens=(4096,), heads=None, HK=None, HV=None):
-    """A batch of ``num_sm // 2 - 12`` (sequence, head) tiles at 4096 tokens: inside the d_v split and under the prep rule's
-    break-even for both prep families, so a ``PREP_VARIANTS`` family runs the prep path (its records in place of the uncut
-    arithmetic)."""
+def near_half_sm_case(variant, seq_lens=(4096,), heads=None, HK=None, HV=None):
+    """A batch of ``num_sm // 2 - 12`` (sequence, head) pairs at 4096 tokens."""
     heads = (sm_count() // 2 - 12) // len(seq_lens) if heads is None else heads
-    return chain_case(variant, list(seq_lens), H=heads, HK=heads if HK is None else HK, HV=heads if HV is None else HV)
+    return long_case(variant, list(seq_lens), H=heads, HK=heads if HK is None else HK, HV=heads if HV is None else HV)
 
 
-def assert_dv_split_matches_uncut(backend, case, state0):
-    """o and final_state of the split batch bitwise the batch-invariant run's (one CTA per tile at the full d_v) and, with a
-    state, within the fp64 reference's tolerance."""
+def assert_half_sm_matches_invariant(backend, case, state0):
+    """o and final_state bitwise the ``batch_invariant`` run's and, with a state, within the fp64 reference's tolerance."""
     o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
     o_u, fs_u = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
-    assert_bitwise("o dv_split-vs-uncut", o, o_u)
-    assert_bitwise("final_state dv_split-vs-uncut", fs, fs_u)
+    assert_bitwise("o default-vs-invariant", o, o_u)
+    assert_bitwise("final_state default-vs-invariant", fs, fs_u)
     if state0 is not None:
         o_ref, fs_ref = reference(case, initial_state=state0)
-        assert_rms_close("o vs fp64", o, o_ref, CHAIN_FWD_TOL)
-        assert_rms_close("final_state vs fp64", fs, fs_ref, CHAIN_FWD_TOL)
+        assert_rms_close("o vs fp64", o, o_ref, LONG_FWD_TOL)
+        assert_rms_close("final_state vs fp64", fs, fs_ref, LONG_FWD_TOL)
     return o, fs
 
 
@@ -6000,44 +6542,44 @@ def assert_dv_split_matches_uncut(backend, case, state0):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("state_dtype", [None, torch.float32], ids=["no_state", "fp32_state"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_dv_split_fwd_matches_uncut_and_reference(backend, variant, state_dtype):
-    """One sequence on half the SMs: o and final_state bitwise the batch-invariant run's and within the fp64 tolerance."""
-    case = dv_split_case(variant)
-    assert_dv_split_matches_uncut(backend, case, random_state(case) if state_dtype is not None else None)
+def test_half_sm_fwd_matches_invariant_and_reference(backend, variant, state_dtype):
+    """One sequence on half the SMs: o and final_state bitwise the ``batch_invariant`` run's and within the fp64 tolerance."""
+    case = half_sm_case(variant)
+    assert_half_sm_matches_invariant(backend, case, random_state(case) if state_dtype is not None else None)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("fold", ["v_heads", "q_heads"])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_dv_split_head_folds(backend, variant, fold):
-    """Head folds on the split: half the v heads (one v head serves two output heads, four half-d_v tiles) or half the q
-    heads; o and final_state bitwise the batch-invariant run's and within the fp64 tolerance."""
+def test_half_sm_head_folds(backend, variant, fold):
+    """Head folds at half the SM count: half the v heads (one v head serves two output heads) or half the q heads; o and
+    final_state bitwise the ``batch_invariant`` run's and within the fp64 tolerance."""
     heads = sm_count() // 2
-    case = dv_split_case(variant, HV=heads // 2) if fold == "v_heads" else dv_split_case(variant, heads=heads // 2, HK=heads, HV=heads)
+    case = half_sm_case(variant, HV=heads // 2) if fold == "v_heads" else half_sm_case(variant, heads=heads // 2, HK=heads, HV=heads)
     if not grouped_bc_supported(variant, case.H, case.HK, case.HV):
         pytest.skip("Mamba-2 groups B and C together and x carries every head")
-    assert_dv_split_matches_uncut(backend, case, random_state(case))
+    assert_half_sm_matches_invariant(backend, case, random_state(case))
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_dv_split_zero_length_sequence_passes_through(backend, variant):
-    """Two sequences on the split, one empty: the empty sequence's initial state passes through bitwise and the other is
-    bitwise the batch-invariant run's."""
-    case = dv_split_case(variant, seq_lens=(4096, 0))
+def test_half_sm_zero_length_sequence_passes_through(backend, variant):
+    """Two sequences, one empty: the empty sequence's initial state passes through bitwise and the other is bitwise the
+    ``batch_invariant`` run's."""
+    case = half_sm_case(variant, seq_lens=(4096, 0))
     state0 = random_state(case)
-    o, fs = assert_dv_split_matches_uncut(backend, case, state0)
+    o, fs = assert_half_sm_matches_invariant(backend, case, state0)
     assert_bitwise("empty sequence final_state passthrough", fs[1], state0[1])
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_dv_split_checkpoint_series_bitwise(backend, variant):
-    """The checkpoint series of a split batch is bitwise the batch-invariant run's."""
-    case = dv_split_case(variant)
+def test_half_sm_checkpoint_series_bitwise(backend, variant):
+    """The checkpoint series is bitwise the ``batch_invariant`` run's."""
+    case = half_sm_case(variant)
     state0 = random_state(case)
     checkpoint = 2 * CHUNK[variant]
     rows = (case.T * case.n - 1) // checkpoint + 1
@@ -6052,93 +6594,117 @@ def test_dv_split_checkpoint_series_bitwise(backend, variant):
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_dv_split_state_indices_bitwise(backend, variant, padded):
-    """``state_indices`` on a split batch (the pool implies ``overwrite_initial_state``): output and pool rows bitwise the
-    packed run's, spare rows untouched, the pool handed back as ``final_state``."""
-    case = dv_split_case(variant)
+def test_half_sm_state_indices_bitwise(backend, variant, padded):
+    """``state_indices`` (the pool implies ``overwrite_initial_state``): output and pool rows bitwise the packed run's, spare
+    rows untouched, the pool intermediates back as ``final_state``."""
+    case = half_sm_case(variant)
     packed = random_state(case)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True)
-    pool, slots, spare = state_pool(case, packed, padded=padded)
-    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=slots, output_final_state=True)
+    pool, indices, spare = state_pool(case, packed, padded=padded)
+    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
     assert fs is pool
     assert_bitwise("o", o, o_ref)
-    assert_bitwise("final_state", pool[slots.long()], fs_ref)
+    assert_bitwise("final_state", pool[indices.long()], fs_ref)
     assert (pool[spare] == 3.14159).all()
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "seeded"])
-@pytest.mark.parametrize("variant", ("gdn", "gdp"))
-def test_dv_split_summary_bitwise(backend, variant, with_state):
-    """The summary of a split batch: H is bitwise the prefill's final state (the same two-CTA schedule) and the transition M
-    is bitwise the batch-invariant run's."""
-    case = dv_split_case(variant)
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+def test_half_sm_summary_bitwise(backend, variant, with_state):
+    """The summary: the transition M is bitwise the ``batch_invariant`` run's; H is bitwise the forward's final state
+    (GDN / GDP) or matches the ``batch_invariant`` run's H, bitwise from a zero seed and within tolerance from a seed
+    (KDA / GDN-2)."""
+    case = half_sm_case(variant)
     state0 = random_state(case) if with_state else None
     h, m = run_summary(case, initial_state=state0)
-    final_state = run_fwd(backend, case, initial_state=state0, output_final_state=True)[1]
-    m_u = run_summary(case, initial_state=state0, batch_invariant=True)[1]
-    assert_bitwise("H vs prefill final_state", h, final_state.float())
-    assert_bitwise("M dv_split-vs-uncut", m, m_u)
+    h_u, m_u = run_summary(case, initial_state=state0, batch_invariant=True)
+    if variant in ("gdn", "gdp"):
+        final_state = run_fwd(backend, case, initial_state=state0, output_final_state=True)[1]
+        assert_bitwise("H vs prefill final_state", h, final_state.float())
+    elif with_state:
+        assert_rms_close("H default-vs-invariant", h, h_u, INVARIANT_TOL)
+    else:
+        assert_bitwise("H default-vs-invariant", h, h_u)
+    assert_bitwise("M default-vs-invariant", m, m_u)
 
 
-def assert_prep_matches_uncut(backend, case, state0):
-    """o and final_state of the prep-path batch within the chain tolerance of the batch-invariant run's (one CTA per tile
-    at the full d_v; the prep's records stand in for the uncut arithmetic) and, with a state, within the fp64 reference's
-    tolerance."""
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "seeded"])
+@pytest.mark.parametrize("variant", NEAR_HALF_SM_VARIANTS)
+def test_near_half_sm_summary_matches_invariant_and_reference(backend, variant, with_state):
+    """The summary of one sequence on heads just under half the SM count: H within the long-sequence tolerance of the
+    ``batch_invariant`` run's and, from a seed, of the fp64 reference; M within the fp64 product oracle's tolerance on a
+    quarter of the length."""
+    case = near_half_sm_case(variant)
+    state0 = random_state(case) if with_state else None
+    h, m = run_summary(case, initial_state=state0)
+    h_u, m_u = run_summary(case, initial_state=state0, batch_invariant=True)
+    assert_rms_close("H default-vs-invariant", h, h_u, INVARIANT_TOL)
+    if with_state:
+        assert_rms_close("H vs fp64", h, reference(case, initial_state=state0)[1], LONG_FWD_TOL)
+    short = near_half_sm_case(variant, seq_lens=(1024,))
+    assert_state_close("M vs fp64", run_summary(short)[1], oracle_m(short), M_TOL[short.dtype])
+
+
+def assert_near_half_sm_matches_invariant(backend, case, state0):
+    """o and final_state within the long-sequence tolerance of the ``batch_invariant`` run's and, with a state, within the
+    fp64 reference's tolerance."""
     o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
     o_u, fs_u = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
-    assert_rms_close("o prep-vs-uncut", o, o_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("final_state prep-vs-uncut", fs, fs_u.float(), CHAIN_VS_UNCUT_TOL)
+    assert_rms_close("o default-vs-invariant", o, o_u.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_u.float(), INVARIANT_TOL)
     if state0 is not None:
         o_ref, fs_ref = reference(case, initial_state=state0)
-        assert_rms_close("o vs fp64", o, o_ref, CHAIN_FWD_TOL)
-        assert_rms_close("final_state vs fp64", fs, fs_ref, CHAIN_FWD_TOL)
+        assert_rms_close("o vs fp64", o, o_ref, LONG_FWD_TOL)
+        assert_rms_close("final_state vs fp64", fs, fs_ref, LONG_FWD_TOL)
     return o, fs
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("state_dtype", [None, torch.float32], ids=["no_state", "fp32_state"])
-@pytest.mark.parametrize("variant", PREP_VARIANTS)
-def test_prep_fwd_matches_uncut_and_reference(backend, variant, state_dtype):
-    """One sequence on the prep path: o and final_state within the chain tolerance of the batch-invariant run's and within
-    the fp64 tolerance."""
-    case = prep_case(variant)
-    assert_prep_matches_uncut(backend, case, random_state(case) if state_dtype is not None else None)
+@pytest.mark.parametrize("variant", NEAR_HALF_SM_VARIANTS)
+def test_near_half_sm_fwd_matches_invariant_and_reference(backend, variant, state_dtype):
+    """One sequence on heads just under half the SM count: o and final_state within the long-sequence tolerance of the
+    ``batch_invariant`` run's and within the fp64 tolerance."""
+    case = near_half_sm_case(variant)
+    assert_near_half_sm_matches_invariant(backend, case, random_state(case) if state_dtype is not None else None)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-@pytest.mark.parametrize("variant", PREP_VARIANTS)
-def test_prep_checkpoint_series(backend, variant):
-    """The checkpoint series of a prep-path batch within the chain tolerance of the batch-invariant run's."""
-    case = prep_case(variant)
+@pytest.mark.parametrize("variant", NEAR_HALF_SM_VARIANTS)
+def test_near_half_sm_checkpoint_series(backend, variant):
+    """The checkpoint series within the long-sequence tolerance of the ``batch_invariant`` run's."""
+    case = near_half_sm_case(variant)
     state0 = random_state(case)
     checkpoint = 2 * CHUNK[variant]
     rows = (case.T * case.n - 1) // checkpoint + 1
     o, fs, series = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
     o_u, fs_u, series_u = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint, batch_invariant=True)
-    assert_rms_close("o", o, o_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("final_state", fs, fs_u.float(), CHAIN_VS_UNCUT_TOL)
-    assert_rms_close("state_checkpoints", series[:rows], series_u[:rows].float(), CHAIN_VS_UNCUT_TOL)
+    assert_rms_close("o", o, o_u.float(), INVARIANT_TOL)
+    assert_rms_close("final_state", fs, fs_u.float(), INVARIANT_TOL)
+    assert_rms_close("state_checkpoints", series[:rows], series_u[:rows].float(), INVARIANT_TOL)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-@pytest.mark.parametrize("variant", PREP_VARIANTS)
-def test_prep_state_indices_bitwise(backend, variant, padded):
-    """``state_indices`` on a prep-path batch: output and pool rows bitwise the packed run's (the same path), spare rows
-    untouched, the pool handed back as ``final_state``."""
-    case = prep_case(variant)
+@pytest.mark.parametrize("variant", NEAR_HALF_SM_VARIANTS)
+def test_near_half_sm_state_indices_bitwise(backend, variant, padded):
+    """``state_indices`` on heads just under half the SM count: output and pool rows bitwise the packed run's, spare rows
+    untouched, the pool intermediates back as ``final_state``."""
+    case = near_half_sm_case(variant)
     packed = random_state(case)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True)
-    pool, slots, spare = state_pool(case, packed, padded=padded)
-    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=slots, output_final_state=True)
+    pool, indices, spare = state_pool(case, packed, padded=padded)
+    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
     assert fs is pool
     assert_bitwise("o", o, o_ref)
-    assert_bitwise("final_state", pool[slots.long()], fs_ref)
+    assert_bitwise("final_state", pool[indices.long()], fs_ref)
     assert (pool[spare] == 3.14159).all()
 
 
@@ -6148,10 +6714,2039 @@ def test_prep_state_indices_bitwise(backend, variant, padded):
 @pytest.mark.parametrize("batch", [33, 129])
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 def test_parallel_descriptor_batches(backend, variant, batch, backward):
-    """Every lane publishes its own slots, across warp chunks and empty sequences."""
+    """Batches of 33 and 129 sequences with lengths 0, 1, 15, 17 and 33 tokens, forward and backward."""
     lengths = [[0, 1, 15, 17, 33][i % 5] for i in range(batch)]
     case = make_case(variant, torch.bfloat16, seq_lens=lengths, H=2, K=64, V=64)
     if backward:
         assert_bwd_parity(backend, case)
     else:
         assert_fwd_parity(backend, case)
+
+
+# ---------------------------------------------------------------------------
+# Batches above the SM count in (sequence, head) tiles
+# ---------------------------------------------------------------------------
+
+
+def over_sm_shape():
+    """``(heads, B, b0, h0)`` of a dense batch whose tiles are the SM count plus about a quarter of it, at the first head count of
+    16, 12, 20 or 28 with the SM-count boundary inside a sequence: tile ``S`` (tile order ``b * HO + h``) falls in sequence
+    ``b0`` at head ``h0``."""
+    S = sm_count()
+    heads = next((h for h in (16, 12, 20, 28) if S % h), None)
+    if heads is None:
+        pytest.skip(f"no head count of 16, 12, 20 or 28 puts the SM-count boundary inside a sequence on {S} SMs")
+    B = -(-(S + S // 4) // heads)
+    b0, h0 = divmod(S, heads)
+    return heads, B, b0, h0
+
+
+def over_sm_case(variant):
+    """``(case, b0, h0)`` of a long dense batch above the SM count: ``over_sm_shape`` at 16384 tokens per sequence."""
+    heads, B, b0, h0 = over_sm_shape()
+    return long_case(variant, [16384] * B, H=heads, HK=heads, HV=heads), b0, h0
+
+
+LEADING_BITWISE_ALONE = CHANNEL_VARIANTS  # the leading tiles are bitwise the sequences run alone (``run_fwd_alone``)
+LEADING_BITWISE_VARIANTS = ("mamba2",) + LEADING_BITWISE_ALONE  # Mamba-2: bitwise the ``batch_invariant`` run; GDN, GDP: within tolerance
+
+
+def sm_groups(N, heads):
+    """Consecutive sequence groups ``(s0, s1)``, as few as fit the SM count each (tiles in (S / 2, S]), so every group alone is a
+    batch of at most the SM count in tiles and more than half of it."""
+    S = sm_count()
+    g = 1
+    while -(-N // g) * heads > S:
+        g += 1
+    base, extra = divmod(N, g)
+    sizes = [base + 1] * extra + [base] * (g - extra)
+    assert min(sizes) * heads > S // 2, f"no SM-count grouping of {N} sequences x {heads} heads on {S} SMs"
+    bounds = [0]
+    for size in sizes:
+        bounds.append(bounds[-1] + size)
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def run_fwd_alone(backend, case, *, initial_state=None, **kw):
+    """The outputs of a case from its sequences run alone: the groups of ``sm_groups`` as separate calls, the outputs (tokens,
+    states, checkpoint rows) concatenated in sequence order; a checkpoint series carries only the rows the sequences fill (the
+    whole-batch series has its unwritten capacity rows at the end)."""
+    checkpoint = int(kw.get("checkpoint_every_n_tokens") or 0)
+    outs = []
+    for s0, s1 in sm_groups(case.N, case.HO):
+        alone = sequence_window(case, s0, s1)
+        state = initial_state[s0:s1].contiguous() if initial_state is not None else None
+        out = list(run_fwd(backend, alone, initial_state=state, **kw))
+        if checkpoint:
+            out[2] = out[2][: sum((length * alone.n - 1) // checkpoint + 1 for length in alone.cu.diff().tolist() if length > 0)]
+        outs.append(out)
+    return tuple(torch.cat([out[i] for out in outs]) for i in range(len(outs[0])))
+
+
+def run_fwd_whole(backend, case, **kw):
+    """The whole-sequence reference of a batch above the SM count: the sequences run alone for ``LEADING_BITWISE_ALONE`` families,
+    the ``batch_invariant`` run otherwise."""
+    if case.variant in LEADING_BITWISE_ALONE:
+        return run_fwd_alone(backend, case, **kw)
+    return run_fwd(backend, case, batch_invariant=True, **kw)
+
+
+def assert_matches_whole(case, b0, h0, got, want, tol, *, name, remainder_bitwise=False):
+    """The leading tiles (sequences before ``b0`` and the heads below ``h0`` of ``b0``) bitwise the whole-sequence run for
+    ``LEADING_BITWISE_VARIANTS`` and within ``tol`` otherwise; the remainder tiles within ``tol``, or bitwise with
+    ``remainder_bitwise``.  ``got`` / ``want`` are ``[T, HO, ...]`` outputs or ``[N, HO, ...]`` states."""
+    per_sequence = got.shape[0] == case.N
+    bounds = case.cu.tolist()
+    leading_bitwise = case.variant in LEADING_BITWISE_VARIANTS
+
+    def check(label, a, b, bitwise):
+        if a.numel() == 0:
+            return
+        if bitwise:
+            assert_bitwise(label, a, b)
+        else:
+            assert_rms_close(label, a, b.float(), tol)
+
+    for b in range(case.N):
+        rows = slice(b, b + 1) if per_sequence else slice(bounds[b], bounds[b + 1])
+        if not per_sequence and bounds[b + 1] == bounds[b]:
+            continue
+        if b < b0:
+            check(f"{name} seq {b} (leading)", got[rows], want[rows], leading_bitwise)
+        elif b == b0:
+            check(f"{name} seq {b} heads < {h0} (leading)", got[rows, :h0], want[rows, :h0], leading_bitwise)
+            check(f"{name} seq {b} heads >= {h0} (remainder)", got[rows, h0:], want[rows, h0:], remainder_bitwise)
+        else:
+            check(f"{name} seq {b} (remainder)", got[rows], want[rows], remainder_bitwise)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("state_dtype", [None, torch.float32, torch.bfloat16], ids=["no_state", "fp32_state", "bf16_state"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_fwd_matches_whole_and_reference(backend, variant, state_dtype):
+    """A dense batch of the SM count plus a quarter in tiles: the leading tiles bitwise the whole-sequence run, the remainder within
+    INVARIANT_TOL of it; with an fp32 state, o and final_state within LONG_FWD_TOL of the fp64 reference; a second call bitwise
+    the first."""
+    case, b0, h0 = over_sm_case(variant)
+    state0 = random_state(case, dtype=state_dtype) if state_dtype is not None else None
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o2, fs2 = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    assert_bitwise("second call o", o2, o)
+    assert_bitwise("second call final_state", fs2, fs)
+    o_u, fs_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True)
+    assert fs.dtype == fs_u.dtype == (state_dtype or torch.float32)
+    assert_matches_whole(case, b0, h0, o, o_u, INVARIANT_TOL, name="o")
+    assert_matches_whole(case, b0, h0, fs, fs_u, INVARIANT_TOL, name="final_state")
+    if state_dtype is torch.float32:
+        o_ref, fs_ref = reference(case, initial_state=state0)
+        assert_rms_close("o vs fp64", o, o_ref, LONG_FWD_TOL)
+        assert_rms_close("final_state vs fp64", fs, fs_ref, LONG_FWD_TOL)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_state_indices(backend, variant, padded):
+    """``state_indices`` on a batch above the SM count: the pool rows of every sequence are written in place (leading rows bitwise
+    the packed run's, remainder rows within INVARIANT_TOL), spare rows untouched, the pool handed back as ``final_state``."""
+    case, b0, h0 = over_sm_case(variant)
+    packed = random_state(case)
+    o_ref, fs_ref = run_fwd_whole(backend, case, initial_state=packed.clone(), output_final_state=True)
+    pool, indices, spare = state_pool(case, packed, padded=padded)
+    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
+    assert fs is pool
+    assert_matches_whole(case, b0, h0, o, o_ref, INVARIANT_TOL, name="o")
+    assert_matches_whole(case, b0, h0, pool[indices.long()], fs_ref, INVARIANT_TOL, name="pool rows")
+    assert (pool[spare] == 3.14159).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cadence", [1, 2], ids=["chunk", "two_chunks"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_checkpoint_series(backend, variant, cadence):
+    """The checkpoint series of a batch above the SM count keeps the packed layout: the rows of the leading sequences bitwise the
+    whole-sequence run's, every remainder row at the same token boundary within INVARIANT_TOL, row 0 of every sequence bitwise
+    its incoming state."""
+    checkpoint = cadence * CHUNK[variant]
+    case, b0, h0 = over_sm_case(variant)
+    state0 = random_state(case)
+    _, _, series = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
+    _, _, series_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
+    used = sum((length * case.n - 1) // checkpoint + 1 for length in case.cu.diff().tolist() if length > 0)
+    assert series.shape[1:] == series_u.shape[1:] and series.shape[0] >= series_u.shape[0] >= used
+    row = 0
+    for n, length in enumerate(case.cu.diff().tolist()):
+        rows = (length * case.n - 1) // checkpoint + 1 if length > 0 else 0
+        if rows:
+            assert_bitwise(f"seq {n} row 0", series[row], state0[n].to(series.dtype))
+        for r in range(rows):
+            if n < b0 and case.variant in LEADING_BITWISE_VARIANTS:
+                assert_bitwise(f"seq {n} row {r} (leading)", series[row + r], series_u[row + r])
+            elif n == b0 and case.variant in LEADING_BITWISE_VARIANTS:
+                assert_bitwise(f"seq {n} row {r} heads < {h0} (leading)", series[row + r, :h0], series_u[row + r, :h0])
+                assert_rms_close(f"seq {n} row {r} heads >= {h0} (remainder)", series[row + r, h0:], series_u[row + r, h0:].float(), INVARIANT_TOL)
+            else:
+                assert_rms_close(f"seq {n} row {r}", series[row + r], series_u[row + r].float(), INVARIANT_TOL)
+        row += rows
+    assert row <= series.shape[0]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_ragged_and_empty(backend, variant):
+    """Several lengths beyond the SM-count boundary: the sequence it falls in at the full length, then a short one and an empty one
+    (and a 6144-token one where a fourth lies beyond it); outputs against the whole-sequence run, the empty sequence's state
+    passed through."""
+    heads, B, b0, h0 = over_sm_shape()
+    if B - b0 < 3:
+        pytest.skip("three sequences must lie beyond the SM-count boundary at this SM count")
+    seq_lens = [16384] * b0 + [16384, 300, 0, 6144][: B - b0]
+    case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
+    state0 = random_state(case)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_u, fs_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True)
+    assert_matches_whole(case, b0, h0, o, o_u, INVARIANT_TOL, name="o")
+    assert_matches_whole(case, b0, h0, fs, fs_u, INVARIANT_TOL, name="final_state")
+    empty = seq_lens.index(0)
+    assert_bitwise("empty sequence final_state passthrough", fs[empty], state0[empty])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_alternating_lengths(backend, variant):
+    """A batch above the SM count with lengths alternating T / 2 and T (no sequence long enough for the length-rule chain to
+    cut): o and final_state bitwise the sequences run alone in groups that fit the SM count for ``LEADING_BITWISE_VARIANTS``,
+    within INVARIANT_TOL otherwise."""
+    heads, B, _, _ = over_sm_shape()
+    seq_lens = [8192 if b % 2 else 16384 for b in range(B)]
+    case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
+    state0 = random_state(case)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_u, fs_u = run_fwd_alone(backend, case, initial_state=state0, output_final_state=True)
+    if variant in LEADING_BITWISE_VARIANTS:
+        assert_bitwise("o vs alone", o, o_u)
+        assert_bitwise("final_state vs alone", fs, fs_u)
+    else:
+        assert_rms_close("o vs alone", o, o_u.float(), INVARIANT_TOL)
+        assert_rms_close("final_state vs alone", fs, fs_u.float(), INVARIANT_TOL)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["D_head", "D_channel", "z", "dt_limits"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["mamba2"])
+def test_over_sm_mamba2_fusions(backend, variant, kind):
+    """The Mamba-2 fusions on a batch above the SM count: the D skip per head and per channel, the z gate, and dt limits; outputs
+    against the ``batch_invariant`` run."""
+    case, b0, h0 = over_sm_case(variant)
+    set_seed(SEED + 9)
+    kw = {}
+    if kind == "D_head":
+        kw["D"] = torch.randn(case.HO, device="cuda")
+    elif kind == "D_channel":
+        kw["D"] = torch.randn(case.HO, case.V, device="cuda")
+    elif kind == "z":
+        kw["z"] = torch.randn(case.T * case.B, case.HO, case.V, device="cuda", dtype=case.dtype)
+    else:
+        kw["dt_min"] = 1e-3
+        kw["dt_max"] = 0.9
+    o, fs = run_fwd(backend, case, output_final_state=True, **kw)
+    o_u, fs_u = run_fwd(backend, case, output_final_state=True, batch_invariant=True, **kw)
+    assert_matches_whole(case, b0, h0, o, o_u, INVARIANT_TOL, name="o")
+    assert_matches_whole(case, b0, h0, fs, fs_u, INVARIANT_TOL, name="final_state")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["twice_sm", "large_remainder", "short_sequences"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_controls(backend, variant, shape):
+    """Three more shapes above the SM count: exactly twice the SM count in tiles, a remainder above half the SM count, and a quarter
+    remainder on sequences of 4096 tokens; outputs bitwise the whole-sequence reference for ``LEADING_BITWISE_VARIANTS`` and
+    within INVARIANT_TOL otherwise, the remainder tiles of the 4096-token shape within INVARIANT_TOL."""
+    heads, T = 16, 16384
+    if shape == "twice_sm":
+        heads = 8 if (2 * sm_count()) % 8 == 0 else 1
+        B = 2 * sm_count() // heads
+    elif shape == "large_remainder":
+        B = -(-(sm_count() + 2 * sm_count() // 3) // heads)
+    else:
+        heads, B, b0, h0 = over_sm_shape()
+        T = 4096
+    case = long_case(variant, [T] * B, H=heads, HK=heads, HV=heads)
+    state0 = random_state(case)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_u, fs_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True)
+    if shape == "short_sequences":
+        assert_matches_whole(case, b0, h0, o, o_u, INVARIANT_TOL, name="o")
+        assert_matches_whole(case, b0, h0, fs, fs_u, INVARIANT_TOL, name="final_state")
+    elif variant in LEADING_BITWISE_VARIANTS:
+        assert_bitwise("o", o, o_u)
+        assert_bitwise("final_state", fs, fs_u)
+    else:
+        assert_rms_close("o", o, o_u.float(), INVARIANT_TOL)
+        assert_rms_close("final_state", fs, fs_u.float(), INVARIANT_TOL)
+
+
+def assert_mamba2_summary_over_sm(case, state0):
+    """final_state and transition of the summary op: the second call bitwise the first, every sequence within ``INVARIANT_TOL``
+    (its transition within 1e-5) of its own ``batch_invariant`` run, an empty sequence's final_state bitwise its initial state
+    (zero without one) and its transition 0, final_state within the fp64 reference's tolerance."""
+    h, tr = mamba2_summary(case, initial_state=state0)
+    h2, tr2 = mamba2_summary(case, initial_state=state0)
+    assert_bitwise("second call final_state", h2, h)
+    assert_bitwise("second call transition", tr2, tr)
+    assert tr.shape == (case.N, case.HO)
+    for n in range(case.N):
+        if int(case.cu[n + 1]) == int(case.cu[n]):
+            assert_bitwise(f"final_state of the empty sequence {n}", h[n], state0[n] if state0 is not None else torch.zeros_like(h[n]))
+            assert (tr[n] == 0).all(), f"transition of the empty sequence {n} is not 0"
+            continue
+        alone = window(case, int(case.cu[n]), int(case.cu[n + 1]))
+        h_alone, tr_alone = mamba2_summary(alone, initial_state=state0[n : n + 1].clone() if state0 is not None else None, batch_invariant=True)
+        assert_rms_close(f"final_state seq {n} vs its own run", h[n : n + 1], h_alone, INVARIANT_TOL)
+        assert rms_ratio(tr[n : n + 1], tr_alone) < 1e-5, f"seq {n} transition rms ratio {rms_ratio(tr[n : n + 1], tr_alone):.3g} vs its own run"
+    _, fs_ref = reference(case, initial_state=state0)
+    assert_rms_close("final_state vs fp64", h, fs_ref, LONG_FWD_TOL)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_dense(backend, variant, with_state):
+    """A dense batch of the SM count plus about a quarter in tiles, 2048 tokens per sequence, the SM-count boundary inside a
+    sequence: final_state and transition against every sequence's own ``batch_invariant`` run and, for final_state, the fp64
+    reference."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [2048] * B, H=heads, HK=heads, HV=heads)
+    assert_mamba2_summary_over_sm(case, random_state(case, seed=SEED + 5) if with_state else None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_one_sequence(backend, variant, with_state):
+    """One sequence of 2048 tokens at heads a quarter above the SM count (the context-parallel protocol summarizes one sequence):
+    final_state and transition against its ``batch_invariant`` run and, for final_state, the fp64 reference."""
+    heads = sm_count() + sm_count() // 4
+    case = long_case(variant, [2048], H=heads, HK=heads, HV=heads)
+    assert_mamba2_summary_over_sm(case, random_state(case, seed=SEED + 5) if with_state else None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_ragged(backend, variant):
+    """The dense shape with lengths alternating 2048 and 4096 tokens (the longest twice the shortest): final_state and transition
+    against every sequence's own ``batch_invariant`` run and, for final_state, the fp64 reference."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [4096 if b % 2 else 2048 for b in range(B)], H=heads, HK=heads, HV=heads)
+    assert_mamba2_summary_over_sm(case, random_state(case, seed=SEED + 5))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_empty_sequence(backend, variant, with_state):
+    """The dense shape with the last sequence empty: that sequence's final_state bitwise its initial state (zero without one) and
+    its transition 0, the other sequences against their own ``batch_invariant`` runs and, for final_state, the fp64 reference."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [2304] * (B - 1) + [0], H=heads, HK=heads, HV=heads)
+    assert_mamba2_summary_over_sm(case, random_state(case, seed=SEED + 5) if with_state else None)
+
+
+def assert_mamba2_summary_bwd_over_sm(case, d_o, d_final):
+    """d_initial_state and transition of the backward summary op: the second call bitwise the first, every sequence within
+    ``INVARIANT_TOL`` (its transition within 1e-5) of its own ``batch_invariant`` run and within the fp64 gradient's tolerance,
+    an empty sequence's d_initial_state bitwise its d_final_state (zero without one) and its transition 0."""
+    x, tr = mamba2_summary_bwd(case, d_o, d_final_state=d_final)
+    x2, tr2 = mamba2_summary_bwd(case, d_o, d_final_state=d_final)
+    assert_bitwise("second call d_initial_state", x2, x)
+    assert_bitwise("second call transition", tr2, tr)
+    assert tr.shape == (case.N, case.HO)
+    for n in range(case.N):
+        s, e = int(case.cu[n]), int(case.cu[n + 1])
+        if s == e:
+            assert_bitwise(f"d_initial_state of the empty sequence {n}", x[n], d_final[n] if d_final is not None else torch.zeros_like(x[n]))
+            assert (tr[n] == 0).all(), f"transition of the empty sequence {n} is not 0"
+            continue
+        alone = window(case, s, e)
+        seed = d_final[n : n + 1].clone() if d_final is not None else None
+        x_alone, tr_alone = mamba2_summary_bwd(alone, d_o[s:e].contiguous(), d_final_state=seed, batch_invariant=True)
+        assert_rms_close(f"d_initial_state seq {n} vs its own run", x[n : n + 1], x_alone, INVARIANT_TOL)
+        assert rms_ratio(tr[n : n + 1], tr_alone) < 1e-5, f"seq {n} transition rms ratio {rms_ratio(tr[n : n + 1], tr_alone):.3g} vs its own run"
+        zero = torch.zeros_like(x_alone)
+        want = long_reference_grads(alone, zero, d_o[s:e], seed if seed is not None else zero)["initial_state"]
+        assert_rms_close(f"d_initial_state seq {n} vs fp64", x[n : n + 1], want, LONG_STATE_GRAD_TOL)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_bwd_dense(backend, variant, with_seed):
+    """A dense batch of the SM count plus about a quarter in tiles, 2048 tokens per sequence, the SM-count boundary inside a
+    sequence: d_initial_state and transition against every sequence's own ``batch_invariant`` run and, for d_initial_state,
+    the fp64 gradient."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [2048] * B, H=heads, HK=heads, HV=heads)
+    d_o, _, d0 = summary_bwd_inputs(case)
+    assert_mamba2_summary_bwd_over_sm(case, d_o, d0 if with_seed else None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_bwd_one_sequence(backend, variant, with_seed):
+    """One sequence of 2048 tokens at heads a quarter above the SM count (the context-parallel protocol summarizes one sequence):
+    d_initial_state and transition against its ``batch_invariant`` run and, for d_initial_state, the fp64 gradient."""
+    heads = sm_count() + sm_count() // 4
+    case = long_case(variant, [2048], H=heads, HK=heads, HV=heads)
+    d_o, _, d0 = summary_bwd_inputs(case)
+    assert_mamba2_summary_bwd_over_sm(case, d_o, d0 if with_seed else None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_bwd_ragged(backend, variant):
+    """The dense shape with lengths alternating 2048 and 4096 tokens (the longest twice the shortest): d_initial_state and
+    transition against every sequence's own ``batch_invariant`` run and, for d_initial_state, the fp64 gradient."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [4096 if b % 2 else 2048 for b in range(B)], H=heads, HK=heads, HV=heads)
+    d_o, _, d0 = summary_bwd_inputs(case)
+    assert_mamba2_summary_bwd_over_sm(case, d_o, d0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", NO_BETA_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_mamba2_summary_bwd_empty_sequence(backend, variant, with_seed):
+    """The dense shape with the last sequence empty: that sequence's d_initial_state bitwise its d_final_state (zero without one)
+    and its transition 0, the other sequences against their own ``batch_invariant`` runs and, for d_initial_state, the fp64
+    gradient."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [2304] * (B - 1) + [0], H=heads, HK=heads, HV=heads)
+    d_o, _, d0 = summary_bwd_inputs(case)
+    assert_mamba2_summary_bwd_over_sm(case, d_o, d0 if with_seed else None)
+
+
+def assert_summary_over_sm(case, state0):
+    """final_state and transition of the summary op: the second call bitwise the first, every sequence within ``INVARIANT_TOL``
+    of its own ``batch_invariant`` run (the transition per head), an empty sequence's final_state bitwise its initial state
+    (zero without one) and its transition the identity, final_state within the fp64 reference's tolerance and the transition
+    within the fp64 product oracle's."""
+    h, m = run_summary(case, initial_state=state0)
+    h2, m2 = run_summary(case, initial_state=state0)
+    assert_bitwise("second call final_state", h2, h)
+    assert_bitwise("second call transition", m2, m)
+    eye = torch.eye(case.K, device="cuda", dtype=m.dtype).expand(case.HO, case.K, case.K)
+    for n in range(case.N):
+        if int(case.cu[n + 1]) == int(case.cu[n]):
+            assert_bitwise(f"final_state of the empty sequence {n}", h[n], state0[n] if state0 is not None else torch.zeros_like(h[n]))
+            assert torch.equal(m[n], eye), f"transition of the empty sequence {n} is not the identity"
+            continue
+        alone = sequence_window(case, n, n + 1)
+        h_alone, m_alone = run_summary(alone, initial_state=state0[n : n + 1].clone() if state0 is not None else None, batch_invariant=True)
+        assert_rms_close(f"final_state seq {n} vs its own run", h[n : n + 1], h_alone, INVARIANT_TOL)
+        assert_state_close(f"transition seq {n} vs its own run", m[n : n + 1], m_alone, INVARIANT_TOL)
+    assert_rms_close("final_state vs fp64", h, reference(case, initial_state=state0)[1], LONG_FWD_TOL)
+    assert_state_close("transition vs fp64", m, oracle_m(case), M_TOL[case.dtype])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_dense(backend, variant, with_state):
+    """A dense batch of the SM count plus about a quarter in tiles, 2048 tokens per sequence, the SM-count boundary inside a
+    sequence: final_state and transition against every sequence's own ``batch_invariant`` run and the fp64 oracles."""
+    heads, B, _, _ = over_sm_shape()
+    case = soften(long_case(variant, [2048] * B, H=heads, HK=heads, HV=heads))
+    assert_summary_over_sm(case, random_state(case, seed=SEED + 5) if with_state else None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_one_sequence(backend, variant, with_state):
+    """One sequence of 2048 tokens at heads a quarter above the SM count (the context-parallel protocol summarizes one sequence):
+    final_state and transition against its ``batch_invariant`` run and the fp64 oracles."""
+    heads = sm_count() + sm_count() // 4
+    case = soften(long_case(variant, [2048], H=heads, HK=heads, HV=heads))
+    assert_summary_over_sm(case, random_state(case, seed=SEED + 5) if with_state else None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_ragged(backend, variant):
+    """The dense shape with lengths alternating 2048 and 4096 tokens (the longest twice the shortest): final_state and transition
+    against every sequence's own ``batch_invariant`` run and the fp64 oracles."""
+    heads, B, _, _ = over_sm_shape()
+    case = soften(long_case(variant, [4096 if b % 2 else 2048 for b in range(B)], H=heads, HK=heads, HV=heads))
+    assert_summary_over_sm(case, random_state(case, seed=SEED + 5))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_state", [False, True], ids=["zero_seed", "initial_state"])
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_empty_sequence(backend, variant, with_state):
+    """The dense shape with the last sequence empty: that sequence's final_state bitwise its initial state (zero without one) and
+    its transition the identity, the other sequences against their own ``batch_invariant`` runs and the fp64 oracles."""
+    heads, B, _, _ = over_sm_shape()
+    case = soften(long_case(variant, [2304] * (B - 1) + [0], H=heads, HK=heads, HV=heads))
+    assert_summary_over_sm(case, random_state(case, seed=SEED + 5) if with_state else None)
+
+
+def assert_summary_bwd_over_sm(case, with_seed, *, head_chunk_size=4):
+    """d_initial_state and transition of the backward summary op: the second call bitwise the first, every sequence within
+    ``INVARIANT_TOL`` of its own ``batch_invariant`` run (the transition per head), an empty sequence's d_initial_state bitwise
+    its d_final_state (zero without one) and its transition the identity, the transition within the fp64 product oracle's
+    tolerance and, for the sequence holding the SM-count boundary and the last non-empty one, d_initial_state within the fp64
+    adjoint's."""
+    d_o, _, d0 = summary_bwd_inputs(case)
+    seed = d0 if with_seed else None
+    x, t = run_summary_bwd(case, d_o, d_final_state=seed, output_transition=True)
+    x2, t2 = run_summary_bwd(case, d_o, d_final_state=seed, output_transition=True)
+    assert_bitwise("second call d_initial_state", x2, x)
+    assert_bitwise("second call transition", t2, t)
+    bounds = case.cu.tolist()
+    filled = [n for n in range(case.N) if bounds[n + 1] > bounds[n]]
+    eye = torch.eye(case.K, device="cuda", dtype=t.dtype).expand(case.HO, case.K, case.K)
+    for n in range(case.N):
+        if n not in filled:
+            assert_bitwise(f"d_initial_state of the empty sequence {n}", x[n], d0[n] if with_seed else torch.zeros_like(x[n]))
+            assert torch.equal(t[n], eye), f"transition of the empty sequence {n} is not the identity"
+            continue
+        s, e = bounds[n], bounds[n + 1]
+        alone = sequence_window(case, n, n + 1)
+        d_final = d0[n : n + 1].clone() if with_seed else None
+        x_alone, t_alone = run_summary_bwd(alone, d_o[s:e].contiguous(), d_final_state=d_final, output_transition=True, batch_invariant=True)
+        assert_rms_close(f"d_initial_state seq {n} vs its own run", x[n : n + 1], x_alone, INVARIANT_TOL)
+        assert_state_close(f"transition seq {n} vs its own run", t[n : n + 1], t_alone, INVARIANT_TOL)
+        if n in (min(sm_count() // case.HO, filled[-1]), filled[-1]):
+            zero = torch.zeros_like(d0[n : n + 1])
+            want = long_reference_grads(alone, zero, d_o[s:e], d_final if with_seed else zero, head_chunk_size=head_chunk_size)["initial_state"]
+            assert_state_close(f"d_initial_state seq {n} vs fp64", x[n : n + 1].double(), want, G_TOL)
+    assert_state_close("transition vs fp64", t, oracle_m(case).transpose(-1, -2), M_TOL[case.dtype])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_bwd_dense(backend, variant, with_seed):
+    """A dense batch of the SM count plus about a quarter in tiles, 2048 tokens per sequence, the SM-count boundary inside a
+    sequence: d_initial_state and transition against every sequence's own ``batch_invariant`` run and the fp64 oracles."""
+    heads, B, _, _ = over_sm_shape()
+    case = soften(long_case(variant, [2048] * B, H=heads, HK=heads, HV=heads))
+    assert_summary_bwd_over_sm(case, with_seed)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_bwd_one_sequence(backend, variant, with_seed):
+    """One sequence of 2048 tokens at heads a quarter above the SM count: d_initial_state and transition against its
+    ``batch_invariant`` run and the fp64 oracles (the adjoint 16 heads at a time)."""
+    heads = sm_count() + sm_count() // 4
+    case = soften(long_case(variant, [2048], H=heads, HK=heads, HV=heads))
+    assert_summary_bwd_over_sm(case, with_seed, head_chunk_size=16)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_bwd_ragged(backend, variant):
+    """The dense shape with lengths alternating 2048 and 4096 tokens (the longest twice the shortest): d_initial_state and
+    transition against every sequence's own ``batch_invariant`` run and the fp64 oracles."""
+    heads, B, _, _ = over_sm_shape()
+    case = soften(long_case(variant, [4096 if b % 2 else 2048 for b in range(B)], H=heads, HK=heads, HV=heads))
+    assert_summary_bwd_over_sm(case, True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_seed", [False, True], ids=["zero_seed", "d_final_state"])
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_over_sm_summary_bwd_empty_sequence(backend, variant, with_seed):
+    """The dense shape with the last sequence empty: that sequence's d_initial_state bitwise its d_final_state (zero without one)
+    and its transition the identity, the other sequences against their own ``batch_invariant`` runs and the fp64 oracles."""
+    heads, B, _, _ = over_sm_shape()
+    case = soften(long_case(variant, [2304] * (B - 1) + [0], H=heads, HK=heads, HV=heads))
+    assert_summary_bwd_over_sm(case, with_seed)
+
+
+# ---------------------------------------------------------------------------
+# Batches above the SM count whose remainder is between a third and a half of it (dim_v 128 families)
+# ---------------------------------------------------------------------------
+
+HALF_SM_REMAINDER_VARIANTS = ("gdn", "gdp", "kda", "gdn2")
+
+
+def half_sm_remainder_shape(near=False):
+    """``(heads, B, b0, h0)`` of a dense batch above the SM count whose remainder tiles ``R = heads * B - S`` satisfy ``S // R == 2``:
+    the largest such ``R`` or, with ``near``, the smallest; heads 16, 12, 8, 6, 4, then the SM-count boundary inside a sequence
+    (``0 < h0 < heads``) and the larger head count preferred, a sequence boundary accepted."""
+    S = sm_count()
+    found = []
+    for heads in (16, 12, 8, 6, 4):
+        for B in range(S // heads + 1, (2 * S) // heads + 1):
+            R = heads * B - S
+            if R <= 0 or S // R != 2:
+                continue
+            b0, h0 = divmod(S, heads)
+            found.append((R, 0 < h0 < heads, heads, B, b0, h0))
+    if not found:
+        pytest.skip(f"no {'near-half' if near else 'half'}-SM remainder shape on {S} SMs")
+    found.sort(key=lambda f: (f[0] if near else -f[0], not f[1], -f[2]))
+    _, _, heads, B, b0, h0 = found[0]
+    return heads, B, b0, h0
+
+
+def half_sm_remainder_case(variant, *, near=False, seq_lens=None):
+    """A long dense batch (or a ragged one over the same sequence count) of ``half_sm_remainder_shape`` at 16384 tokens per
+    sequence."""
+    heads, B, b0, h0 = half_sm_remainder_shape(near)
+    if seq_lens is None:
+        seq_lens = [16384] * B
+    assert len(seq_lens) == B
+    case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
+    return case, b0, h0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("state_dtype", [None, torch.float32], ids=["no_state", "fp32_state"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", HALF_SM_REMAINDER_VARIANTS)
+def test_half_sm_remainder_fwd_matches_whole(backend, variant, state_dtype):
+    """A batch whose remainder is between a third and a half of the SM count: the leading tiles as in the tests above, the remainder
+    bitwise the sequences run alone for KDA / GDN-2 and within INVARIANT_TOL for GDN / GDP."""
+    case, b0, h0 = half_sm_remainder_case(variant)
+    state0 = random_state(case, dtype=state_dtype) if state_dtype is not None else None
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_u, fs_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True)
+    bitwise = variant in LEADING_BITWISE_ALONE
+    assert_matches_whole(case, b0, h0, o, o_u, INVARIANT_TOL, name="o", remainder_bitwise=bitwise)
+    assert_matches_whole(case, b0, h0, fs, fs_u, INVARIANT_TOL, name="final_state", remainder_bitwise=bitwise)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", HALF_SM_REMAINDER_VARIANTS)
+def test_half_sm_remainder_state_indices(backend, variant):
+    """``state_indices`` (a padded pool) on a half-SM-remainder batch: every sequence's pool row written in place, spare rows
+    untouched, the pool handed back as ``final_state``."""
+    case, b0, h0 = half_sm_remainder_case(variant)
+    packed = random_state(case)
+    o_ref, fs_ref = run_fwd_whole(backend, case, initial_state=packed.clone(), output_final_state=True)
+    pool, indices, spare = state_pool(case, packed, padded=True)
+    o, fs = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
+    assert fs is pool
+    bitwise = variant in LEADING_BITWISE_ALONE
+    assert_matches_whole(case, b0, h0, o, o_ref, INVARIANT_TOL, name="o", remainder_bitwise=bitwise)
+    assert_matches_whole(case, b0, h0, pool[indices.long()], fs_ref, INVARIANT_TOL, name="pool rows", remainder_bitwise=bitwise)
+    assert (pool[spare] == 3.14159).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_half_sm_remainder_steep_overwrite_initial_state(backend, variant):
+    """A half-SM-remainder batch whose last sequence has a steep per-channel decay, with the final state written over
+    ``initial_state``: o and the state are bitwise the run with a separate ``final_state``."""
+    case, _, _ = half_sm_remainder_case(variant)
+    g = case.gates["g"].clone()
+    g[:, int(case.cu[-2]) :] = steep_gate(sequence_window(case, case.N - 1, case.N), "spike").gates["g"]
+    case = case.clone(gates=dict(case.gates, g=g))
+    state0 = random_state(case)
+    o_ref, fs_ref = run_fwd(backend, case, initial_state=state0.clone(), output_final_state=True)
+    state = state0.clone()
+    o, _ = run_fwd(backend, case, initial_state=state, output_final_state=True, overwrite_initial_state=True)
+    assert torch.isfinite(o).all()
+    assert_bitwise("o", o, o_ref)
+    assert_bitwise("final_state", state, fs_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("checkpoint", [1024, 4096], ids=["1k", "4k"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", HALF_SM_REMAINDER_VARIANTS)
+def test_half_sm_remainder_checkpoint_series(backend, variant, checkpoint):
+    """The checkpoint series of a half-SM-remainder batch keeps the packed layout: every row at its token boundary, row 0 of every
+    sequence bitwise its incoming state, the remainder rows bitwise the sequences run alone for KDA / GDN-2."""
+    case, b0, h0 = half_sm_remainder_case(variant)
+    state0 = random_state(case)
+    _, _, series = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
+    _, _, series_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint)
+    used = sum((length * case.n - 1) // checkpoint + 1 for length in case.cu.diff().tolist() if length > 0)
+    assert series.shape[1:] == series_u.shape[1:] and series.shape[0] >= series_u.shape[0] >= used
+    bitwise = variant in LEADING_BITWISE_ALONE
+    row = 0
+    for n, length in enumerate(case.cu.diff().tolist()):
+        rows = (length * case.n - 1) // checkpoint + 1 if length > 0 else 0
+        if rows:
+            assert_bitwise(f"seq {n} row 0", series[row], state0[n].to(series.dtype))
+        for r in range(rows):
+            got, want = series[row + r], series_u[row + r]
+            if n < b0:
+                if case.variant in LEADING_BITWISE_VARIANTS:
+                    assert_bitwise(f"seq {n} row {r} (leading)", got, want)
+                else:
+                    assert_rms_close(f"seq {n} row {r} (leading)", got, want.float(), INVARIANT_TOL)
+            else:
+                lo = h0 if n == b0 else 0
+                if lo and case.variant in LEADING_BITWISE_VARIANTS:
+                    assert_bitwise(f"seq {n} row {r} heads < {lo} (leading)", got[:lo], want[:lo])
+                elif lo:
+                    assert_rms_close(f"seq {n} row {r} heads < {lo} (leading)", got[:lo], want[:lo].float(), INVARIANT_TOL)
+                if bitwise:
+                    assert_bitwise(f"seq {n} row {r} heads >= {lo} (remainder)", got[lo:], want[lo:])
+                else:
+                    assert_rms_close(f"seq {n} row {r} heads >= {lo} (remainder)", got[lo:], want[lo:].float(), INVARIANT_TOL)
+        row += rows
+    assert row <= series.shape[0]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["quarter_remainder", "half_sm_remainder"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_checkpoints_after_block(backend, variant, shape):
+    """The after-block series of a batch above the SM count, with a remainder of about a quarter of the SM count and of between a
+    third and a half of it: o and final_state within INVARIANT_TOL of the ``batch_invariant`` run's, the row count of that run,
+    every row within LONG_FWD_TOL of its row and the aligned end of every sequence bitwise its final state."""
+    checkpoint = 1024
+    case, _, _ = over_sm_case(variant) if shape == "quarter_remainder" else half_sm_remainder_case(variant)
+    state0 = random_state(case)
+    kw = dict(initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint, checkpoint_after_block=True)
+    o, fs, series = run_fwd(backend, case, **kw)
+    o_u, fs_u, series_u = run_fwd(backend, case, batch_invariant=True, **kw)
+    assert_rms_close("o default-vs-invariant", o, o_u.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_u.float(), INVARIANT_TOL)
+    assert series.shape == series_u.shape
+    row = 0
+    for n, length in enumerate(case.cu.diff().tolist()):
+        rows = length * case.n // checkpoint
+        for r in range(rows):
+            assert_rms_close(f"seq {n} row {r}", series[row + r], series_u[row + r].float(), LONG_FWD_TOL)
+        assert_bitwise(f"seq {n} aligned end", series[row + rows - 1], fs[n].to(series.dtype))
+        row += rows
+    assert row <= series.shape[0]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", HALF_SM_REMAINDER_VARIANTS)
+def test_half_sm_remainder_ragged_and_empty(backend, variant):
+    """Several lengths beyond the SM-count boundary of a half-SM-remainder batch: the first at the full length, then a short one, an
+    empty one and a long one; outputs against the whole-sequence run, the empty sequence's state passed through."""
+    _, B, b0, h0 = half_sm_remainder_shape()
+    if B - b0 < 3:
+        pytest.skip("three sequences must lie beyond the SM-count boundary at this SM count")
+    seq_lens = [16384] * b0 + ([16384, 300, 0, 8192] + [16384] * (B - b0))[: B - b0]
+    case, b0, h0 = half_sm_remainder_case(variant, seq_lens=seq_lens)
+    state0 = random_state(case)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_u, fs_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True)
+    bitwise = variant in LEADING_BITWISE_ALONE
+    assert_matches_whole(case, b0, h0, o, o_u, INVARIANT_TOL, name="o", remainder_bitwise=bitwise)
+    assert_matches_whole(case, b0, h0, fs, fs_u, INVARIANT_TOL, name="final_state", remainder_bitwise=bitwise)
+    empty = seq_lens.index(0)
+    assert_bitwise("empty sequence final_state passthrough", fs[empty], state0[empty])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("checkpoint", [False, True], ids=["no_checkpoints", "checkpoints"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", NEAR_HALF_SM_VARIANTS)
+def test_near_half_sm_remainder(backend, variant, checkpoint):
+    """A remainder just above a third of the SM count: the leading tiles bitwise the sequences run alone, the remainder within
+    INVARIANT_TOL, the checkpoint rows of the remainder at their token boundaries."""
+    case, b0, h0 = half_sm_remainder_case(variant, near=True)
+    state0 = random_state(case)
+    kw = dict(checkpoint_every_n_tokens=2048) if checkpoint else {}
+    out = run_fwd(backend, case, initial_state=state0, output_final_state=True, **kw)
+    out_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True, **kw)
+    assert_matches_whole(case, b0, h0, out[0], out_u[0], INVARIANT_TOL, name="o")
+    assert_matches_whole(case, b0, h0, out[1], out_u[1], INVARIANT_TOL, name="final_state")
+    if checkpoint:
+        series, series_u = out[2], out_u[2]
+        used = sum((length * case.n - 1) // 2048 + 1 for length in case.cu.diff().tolist() if length > 0)
+        assert series.shape[0] >= used and series_u.shape[0] >= used
+        assert_rms_close("checkpoint rows", series[:used], series_u[:used].float(), INVARIANT_TOL)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["mamba2"])
+def test_half_sm_remainder_mamba2(backend, variant):
+    """Mamba-2 (d_v 64) on a half-SM remainder: outputs bitwise the whole run."""
+    S = sm_count()
+    heads = 16
+    B = next(B for B in range(S // heads + 1, (2 * S) // heads + 1) if heads * B - S > 0 and S // (heads * B - S) == 2)
+    case = long_case(variant, [16384] * B, H=heads, HK=heads, HV=heads)
+    state0 = random_state(case)
+    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+    o_u, fs_u = run_fwd_whole(backend, case, initial_state=state0, output_final_state=True)
+    assert_bitwise("o", o, o_u)
+    assert_bitwise("final_state", fs, fs_u)
+
+
+# ---------------------------------------------------------------------------
+# Backward above the SM count, KDA and GDN-2: the leading tiles bitwise the sequences run alone, the remainder within tolerance
+# ---------------------------------------------------------------------------
+
+BWD_SERIES = {"no_series": (0, None), "dense_series": (1, None), "fp32_dense_series": (1, torch.float32), "coarse_series": (3, None)}
+
+
+def grads_alone(backend, case, *, initial_state, d_final_state, dO, **kw):
+    """The whole batch's gradients from its sequences run alone: ``sm_groups`` as separate calls, concatenated in sequence order
+    (token gradients along the tokens, ``d_initial_state`` along the sequences)."""
+    bounds = case.cu.tolist()
+    parts = []
+    for s0, s1 in sm_groups(case.N, case.HO):
+        alone = sequence_window(case, s0, s1)
+        tokens = slice(bounds[s0], bounds[s1])
+        parts.append(long_grads(backend, alone, initial_state=initial_state[s0:s1], d_final_state=d_final_state[s0:s1], dO=dO[tokens], **kw)[2])
+    return {name: torch.cat([part[name] for part in parts]) for name in parts[0]}
+
+
+def bwd_inputs(case):
+    """``(initial_state, d_final_state, dO)`` of a backward case above the SM count."""
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    set_seed(SEED + 7)
+    dO = torch.randn(case.cu[-1].item(), case.HO, case.V, device="cuda", dtype=case.dtype)
+    return state0, d_final, dO
+
+
+def assert_grads_match_alone(case, b0, h0, got, want, *, leading_bitwise=True):
+    """Leading tiles bitwise the sequences run alone and remainder tiles within the long tolerances; with ``leading_bitwise`` off
+    (fp32 rows or a coarse series) every tile is compared within them."""
+    if not leading_bitwise:
+        assert_long_grads_close(got, want, "vs alone")
+        return
+    for name, g in got.items():
+        tol = LONG_GATE_GRAD_TOL if name in ("g", "beta", "w") else INVARIANT_TOL
+        assert_matches_whole(case, b0, h0, g, want[name], tol, name=f"d{name}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("series", list(BWD_SERIES))
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+def test_over_sm_bwd_matches_alone(backend, variant, series):
+    """A batch of the SM count plus a quarter in tiles, backward with an initial state and a final-state gradient: without a forward
+    series, with the dense io series, with fp32 rows and with a coarse io series.  Leading tiles bitwise the sequences run alone
+    and remainder tiles within the long tolerances; with fp32 rows or a coarse series every tile is within them."""
+    cadence, dtype = BWD_SERIES[series]
+    case, b0, h0 = over_sm_case(variant)
+    state0, d_final, dO = bwd_inputs(case)
+    kw = dict(initial_state=state0, d_final_state=d_final, dO=dO, checkpoint=cadence * CHUNK[variant], checkpoint_dtype=dtype)
+    got = long_grads(backend, case, **kw)[2]
+    want = grads_alone(backend, case, **kw)
+    assert_grads_match_alone(case, b0, h0, got, want, leading_bitwise=cadence <= 1 and dtype is None)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+def test_over_sm_bwd_ragged_and_empty_alone(backend, variant):
+    """Several lengths beyond the SM-count boundary in the backward: the sequence it falls in at the full length, a short one and
+    an empty one (and a 6144-token one where a fourth lies beyond it); the empty sequence passes its final-state gradient through
+    to ``d_initial_state``."""
+    heads, B, b0, h0 = over_sm_shape()
+    if B - b0 < 3:
+        pytest.skip("three sequences must lie beyond the SM-count boundary at this SM count")
+    seq_lens = [16384] * b0 + [16384, 300, 0, 6144][: B - b0]
+    case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
+    state0, d_final, dO = bwd_inputs(case)
+    kw = dict(initial_state=state0, d_final_state=d_final, dO=dO)
+    got = long_grads(backend, case, **kw)[2]
+    want = grads_alone(backend, case, **kw)
+    assert_grads_match_alone(case, b0, h0, got, want)
+    empty = seq_lens.index(0)
+    assert_bitwise("empty sequence d_initial_state passthrough", got["initial_state"][empty], d_final[empty])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["twice_sm", "large_remainder"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+def test_over_sm_bwd_controls_alone(backend, variant, shape):
+    """Two more shapes above the SM count in the backward: exactly twice the SM count in tiles and a remainder above half the SM
+    count; every gradient bitwise the sequences run alone."""
+    heads = 16
+    if shape == "twice_sm":
+        heads = 8 if (2 * sm_count()) % 8 == 0 else 1
+        B = 2 * sm_count() // heads
+    else:
+        B = -(-(sm_count() + 2 * sm_count() // 3) // heads)
+    case = long_case(variant, [16384] * B, H=heads, HK=heads, HV=heads)
+    state0, d_final, dO = bwd_inputs(case)
+    kw = dict(initial_state=state0, d_final_state=d_final, dO=dO)
+    got = long_grads(backend, case, **kw)[2]
+    want = grads_alone(backend, case, **kw)
+    for name, g in got.items():
+        assert_bitwise(f"d{name}", g, want[name])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+def test_half_sm_remainder_bwd_matches_alone(backend, variant):
+    """A batch whose remainder is between a third and a half of the SM count, backward with an initial state and a final-state
+    gradient: leading tiles bitwise the sequences run alone and remainder tiles within the long tolerances."""
+    case, b0, h0 = half_sm_remainder_case(variant)
+    state0, d_final, dO = bwd_inputs(case)
+    kw = dict(initial_state=state0, d_final_state=d_final, dO=dO)
+    got = long_grads(backend, case, **kw)[2]
+    want = grads_alone(backend, case, **kw)
+    assert_grads_match_alone(case, b0, h0, got, want)
+
+
+# ---------------------------------------------------------------------------
+# Backward above the SM count, Mamba-2, GDN and GDP: every gradient against the batch_invariant backward
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cadence", [0, 1, 3], ids=["no_series", "dense_series", "coarse_series"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", SCALAR_GATE_VARIANTS)
+def test_over_sm_bwd_matches_invariant(backend, variant, cadence):
+    """The backward of a batch of the SM count plus a quarter in tiles with a nonzero initial_state and d_final_state, in the three
+    checkpoint cases (no series, the dense series, a coarse series): every gradient within the long backward tolerance of the
+    ``batch_invariant`` backward."""
+    case, _, _ = over_sm_case(variant)
+    checkpoint = cadence * CHUNK[variant]
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    _, _, grads, dO, _ = long_grads(backend, case, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, checkpoint=checkpoint, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", SCALAR_GATE_VARIANTS)
+def test_over_sm_bwd_without_states(backend, variant):
+    """The plain training step on a batch above the SM count: no initial_state, no d_final_state, no series."""
+    case, _, _ = over_sm_case(variant)
+    _, _, grads, dO, _ = long_grads(backend, case)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", SCALAR_GATE_VARIANTS)
+def test_over_sm_bwd_ragged_and_empty_invariant(backend, variant):
+    """Several lengths beyond the SM-count boundary in the backward: the sequence it falls in at the full length, a short one and
+    an empty one (and a 6144-token one where a fourth lies beyond it); every gradient against the ``batch_invariant`` backward,
+    the empty sequence's d_initial_state bitwise its d_final_state (the pass-through)."""
+    heads, B, b0, h0 = over_sm_shape()
+    if B - b0 < 3:
+        pytest.skip("three sequences must lie beyond the SM-count boundary at this SM count")
+    seq_lens = [16384] * b0 + [16384, 300, 0, 6144][: B - b0]
+    case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    _, _, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
+    empty = seq_lens.index(0)
+    assert_bitwise("empty sequence d_initial_state passthrough", grads["initial_state"][empty], d_final[empty])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", SCALAR_GATE_VARIANTS)
+def test_over_sm_bwd_close_lengths_and_empty_invariant(backend, variant):
+    """Close lengths beyond the SM-count boundary in the backward: the sequence it falls in at the full length, one a fifth
+    shorter and an empty one; every gradient against the ``batch_invariant`` backward, the empty sequence's d_initial_state
+    bitwise its d_final_state (the pass-through)."""
+    heads, B, b0, h0 = over_sm_shape()
+    if B - b0 < 3:
+        pytest.skip("three sequences must lie beyond the SM-count boundary at this SM count")
+    seq_lens = [16384] * b0 + [16384, 13312, 0, 16384][: B - b0]
+    case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    _, _, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
+    empty = seq_lens.index(0)
+    assert_bitwise("empty sequence d_initial_state passthrough", grads["initial_state"][empty], d_final[empty])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["twice_sm", "large_remainder", "half_sm_remainder", "short_sequences"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", SCALAR_GATE_VARIANTS)
+def test_over_sm_bwd_controls_invariant(backend, variant, shape):
+    """Four more shapes above the SM count in the backward: exactly twice the SM count in tiles, a remainder above half the SM
+    count, a remainder between a third and a half of it, and a quarter remainder on sequences of 4096 tokens; every gradient
+    against the ``batch_invariant`` backward."""
+    heads, T = 16, 16384
+    if shape == "twice_sm":
+        heads = 8 if (2 * sm_count()) % 8 == 0 else 1
+        B = 2 * sm_count() // heads
+    elif shape == "large_remainder":
+        B = -(-(sm_count() + 2 * sm_count() // 3) // heads)
+    elif shape == "half_sm_remainder":
+        B = -(-(sm_count() + 2 * sm_count() // 5) // heads)
+        assert sm_count() // (B * heads - sm_count()) == 2, "the remainder must lie between a third and a half of the SM count"
+    else:
+        heads, B, _, _ = over_sm_shape()
+        T = 4096
+    case = long_case(variant, [T] * B, H=heads, HK=heads, HV=heads)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    _, _, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_long_grads_close(grads, grads_inv)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["remainder", "twice_sm"])
+@pytest.mark.parametrize("cadence", [0, 1, 3], ids=["no_series", "dense_series", "coarse_series"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["mamba2"])
+def test_over_sm_bwd_mamba2_leading_bitwise_alone(backend, variant, cadence, shape):
+    """Mamba-2 with dt limits (under which the backward is batch-independent) above the SM count: every gradient of the leading
+    tiles bitwise the sequences run alone in groups that fit the SM count, the remainder tiles within tolerance; at exactly twice
+    the SM count every tile is bitwise.  With a coarse series every tile is compared within tolerance."""
+    if shape == "remainder":
+        case, b0, h0 = over_sm_case(variant)
+    else:
+        heads = 8 if (2 * sm_count()) % 8 == 0 else 1
+        B = 2 * sm_count() // heads
+        case = long_case(variant, [16384] * B, H=heads, HK=heads, HV=heads)
+        b0, h0 = case.N, 0
+    state0, d_final, dO = bwd_inputs(case)
+    kw = dict(initial_state=state0, d_final_state=d_final, dO=dO, checkpoint=cadence * CHUNK[variant], dt_min=1e-3, dt_max=0.9)
+    got = long_grads(backend, case, **kw)[2]
+    want = grads_alone(backend, case, **kw)
+    assert_grads_match_alone(case, b0, h0, got, want, leading_bitwise=cadence <= 1)
+
+
+# ---------------------------------------------------------------------------
+# Context parallelism: prepare on the boundary sequence, gather, apply with the fold
+# ---------------------------------------------------------------------------
+CP_PREFIX = {"gdn": "gated_delta_net", "kda": "kimi_delta_attention", "gdn2": "gated_delta_net_v2", "gdp": "gated_delta_product", "mamba2": "mamba2"}
+CP_CADENCE = {"gdn": 64, "kda": 16, "gdn2": 16, "gdp": 64, "mamba2": 128}
+CP_LAYOUTS = {"aligned": ([2048, 6144], 4, 0.9), "ragged": ([1400, 3400, 200, 1000, 2192], 4, 0.9), "short_slabs": ([512, 1536], 4, 0.995)}
+CP_TOL = 2e-2
+CP_GATE_TOL = 5e-2
+CP_FOLD_TOL = 1e-5
+CP_CALLER_BWD_TOL = 1e-3  # gradients from a device-folded fp32 row vs the fp64 fold cast to fp32 (test_context_parallel_caller_state)
+
+
+def cp_rank_bounds(bounds, slab_len, rank):
+    """The ``(preceding_rank_start, following_rank_stop)`` of one rank from the global sequence boundaries: the
+    rank holding the first token of the first local sequence, and one past the rank holding the last token of the last."""
+    start, stop = rank * slab_len, (rank + 1) * slab_len
+    first_seq = max(i for i in range(len(bounds) - 1) if bounds[i] <= start)
+    last_seq = max(i for i in range(len(bounds) - 1) if bounds[i] < stop)
+    return bounds[first_seq] // slab_len, (bounds[last_seq + 1] - 1) // slab_len + 1
+
+
+def cp_local_cu(bounds, slab_len, rank):
+    """The slab's local ``cu_seqlens``: the global boundaries inside it, relative to its start."""
+    start, stop = rank * slab_len, (rank + 1) * slab_len
+    return torch.tensor([0, *[b - start for b in bounds if start < b < stop], slab_len], dtype=torch.int32, device="cuda")
+
+
+def cp_main_call(case, leaves, cu):
+    """``(args, kwargs)`` of the family's public op on one slab.  Mamba-2 takes the SSD order ``(x, dt, A, B, C)`` from the
+    suite's ``q = C, k = B, v = x, g = dt`` leaves and ``A`` / ``dt_bias`` by position and keyword; the sub-token family
+    passes ``num_householder``."""
+    plan = dict(plan_name=f"{case.variant}_frost")
+    if case.variant in NO_BETA_VARIANTS:
+        q, k, v, g = leaves
+        return (v, g, case.gates["A"], k, q, cu), dict(dt_bias=case.gates["dt_bias"], **plan)
+    q, k, v, g, beta, *w = leaves
+    n = (case.n,) if case.variant in HOUSEHOLDER_VARIANTS else ()
+    return (q, k, v, g, beta, *w, cu, *n), dict(scale=float(case.K**-0.5), **plan)
+
+
+def cp_forward_prepare(case, leaves, cu):
+    """This rank's forward summary from a zero state: the summary op on the two-entry device view of the LAST local
+    sequence (the one crossing into the next rank), the sequence axis squeezed; fp32 ``(state_update, transition)``."""
+    summary = getattr(la_ops, f"{CP_PREFIX[case.variant]}_summary")
+    plan = dict(plan_name=f"{case.variant}_summary_frost")
+    if case.variant in NO_BETA_VARIANTS:
+        q, k, v, g = leaves
+        h, m = summary(v, g, case.gates["A"], k, cu[-2:], dt_bias=case.gates["dt_bias"], **plan)
+    else:
+        q, k, v, g, beta, *w = leaves
+        n = (case.n,) if case.variant in HOUSEHOLDER_VARIANTS else ()
+        h, m = summary(k, v, g, beta, *w, cu[-2:], *n, **plan)
+    return h[0], m[0]
+
+
+def cp_forward_apply(case, leaves, cu, h_pre, m_pre, checkpoint_every_n_tokens=0):
+    """The local forward with the preceding ranks' summaries (``[P, ...]`` fp32, rank order) folded on the device into the
+    one-row composed state the first local sequence starts from: the public op with ``preceding_state_update`` /
+    ``preceding_transition``.  Returns ``(o, composed_initial_state, state_checkpoints)``; the backward takes the composed
+    state back."""
+    args, kw = cp_main_call(case, leaves, cu)
+    o, _, checkpoints, composed = getattr(la_ops, CP_PREFIX[case.variant])(
+        *args, preceding_state_update=h_pre, preceding_transition=m_pre, checkpoint_every_n_tokens=checkpoint_every_n_tokens, **kw
+    )
+    return o, composed, checkpoints
+
+
+def cp_backward_prepare(case, leaves, cu, dO, output_context=False, checkpoint_every_n_tokens=0, **op_kw):
+    """This rank's backward summary from a zero outgoing-state gradient: the backward summary op on the view of the FIRST
+    local sequence (the one continuing from the previous rank) with ``output_transition``; fp32 ``(local_state_grad,
+    transition)``, the transition already the transpose the fold reads, and with ``output_context`` the summary's
+    context as a third element (the uint8 buffer the raw backward takes as ``context``), None otherwise."""
+    summary_bwd = getattr(la_ops, f"{CP_PREFIX[case.variant]}_summary_bwd")
+    plan = dict(plan_name=f"{case.variant}_summary_frost", output_transition=True, **op_kw)
+    if output_context:
+        plan.update(output_context=True, checkpoint_every_n_tokens=checkpoint_every_n_tokens)
+    if case.variant in NO_BETA_VARIANTS:
+        q, k, v, g = leaves
+        out = summary_bwd(dO, g, case.gates["A"], q, cu[:2], dt_bias=case.gates["dt_bias"], **plan)
+    else:
+        q, k, v, g, beta, *w = leaves
+        n = (case.n,) if case.variant in HOUSEHOLDER_VARIANTS else ()
+        out = summary_bwd(q, k, g, beta, dO, cu[:2], *n, scale=float(case.K**-0.5), **plan)
+    return out[0][0], out[1][0], out[2] if output_context else None
+
+
+def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkpoints=None, checkpoint_every_n_tokens=0, context=None, **op_kw):
+    """The local backward from the forward's composed state with the following ranks' summaries (``[P, ...]`` fp32, rank
+    order) folded on the device into the one-row gradient state the last local sequence starts from: the raw
+    ``torch.ops.cudnn.<op>_bwd`` with ``composed_initial_state`` and ``following_state_grad`` / ``following_transition``;
+    a zero-size composed state (no preceding rank) is ``None``.  ``context`` is the backward summary's context
+    (``output_context``).  Returns the input gradients in the raw op's order with the state gradient dropped."""
+    raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[case.variant]}_bwd")
+    extra = dict(
+        composed_initial_state=composed if composed.numel() else None,
+        state_checkpoints=state_checkpoints,
+        checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+        following_state_grad=g_fol,
+        following_transition=t_fol,
+        plan_name=f"{case.variant}_frost",
+        **({"context": context} if context is not None else {}),
+        **op_kw,
+    )
+    if case.variant in NO_BETA_VARIANTS:
+        q, k, v, g = leaves
+        return raw(dO, v, g, case.gates["A"], k, q, cu, dt_bias=case.gates["dt_bias"], **extra)[:-1]
+    q, k, v, g, beta, *w = leaves
+    n = (int(case.n),) if case.variant in HOUSEHOLDER_VARIANTS else ()
+    out = raw(dO, q, k, v, g, beta, *w, cu, *n, float(case.K**-0.5), **extra)
+    return out[:-3] + out[-2:]
+
+
+def cp_grad_leaves(variant):
+    """The suite's leaf name behind each gradient the backward wrapper returns, in its order (``None`` skips an entry)."""
+    if variant in NO_BETA_VARIANTS:
+        return ["v", "g", "A", "k", "q", None, "dt_bias", None]
+    return ["q", "k", "v", "g", "beta", "w"] if variant == "gdn2" else ["q", "k", "v", "g", "beta"]
+
+
+def cp_forward_whole(case, leaves, **kw):
+    """The unsplit forward through the family op, in the protocol's calling convention (Mamba-2's C unscaled)."""
+    args, extra = cp_main_call(case, leaves, case.cu)
+    return getattr(la_ops, CP_PREFIX[case.variant])(*args, **extra, **kw)[0]
+
+
+def cp_fold(variant, x, h, m):
+    """The host fp64 fold of one rank's summary onto the state ``x``."""
+    if variant in NO_BETA_VARIANTS:
+        return torch.exp2(m)[:, None, None] * x + h
+    return x @ m + h
+
+
+def cp_state_table(N, case, padded):
+    """A caller's fp32 state table ``[N, HO, V, K]``: dense, or a view of a wider buffer with every stride above the
+    innermost padded (the engines read the caller's strides; the folds must too)."""
+    storage = torch.randn(N, case.HO, case.V + 1, case.K + 4, device="cuda", dtype=torch.float32) * 0.1
+    return storage[:, :, : case.V, : case.K] if padded else storage[:, :, : case.V, : case.K].contiguous()
+
+
+def cp_case(variant, seq_lens, lo, H=2):
+    """A packed case whose grouped Mamba-2 heads coincide (B / C at every head) so the slab views stay plain slices."""
+    return make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=H, K=128, V=64 if variant == "mamba2" else 128, lo=lo)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("checkpoint", [False, True], ids=["no_checkpoints", "checkpoints"])
+@pytest.mark.parametrize("layout", [*CP_LAYOUTS, "over_sm"])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_protocol(backend, variant, layout, checkpoint):
+    """The chunkwise context-parallel protocol on one GPU: the packed stream divided into equal slabs, each slab's boundary
+    summaries prepared on the device view of its first / last local sequence, stacked as the gather would, sliced with
+    the rank-bound rule, and applied through the fused ops' fold; ``o`` and every gradient reproduce the unsplit stream.
+    Sequences crossing one, two and three rank boundaries, boundaries on slab edges, short sequences inside a slab, a
+    strong transition product (short slabs, decay near one), slabs above the SM count in (sequence, head) pairs, with and without
+    the forward's state checkpoints."""
+    if layout == "over_sm":
+        heads, local, _, _ = over_sm_shape()
+        seq_lens, slabs, lo = [2048] * (local - 1) + [4096] + [2048] * (local - 1), 2, 0.9
+    else:
+        (seq_lens, slabs, lo), heads = CP_LAYOUTS[layout], 2
+    case = cp_case(variant, seq_lens, lo, H=heads)
+    bounds = case.cu.tolist()
+    slab_len = case.T // slabs
+    cadence = CP_CADENCE[variant] if checkpoint else 0
+    set_seed(SEED + 41)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+
+    leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
+    params = [case.gates[name].detach().clone().requires_grad_(True) for name in PARAM_NAMES.get(variant, ())]
+    with waive_unsupported(backend, variant):
+        o_whole = cp_forward_whole(case.clone(gates={**case.gates, **dict(zip(PARAM_NAMES.get(variant, ()), params))}), leaves)
+    grads_whole = dict(zip(LEAF_NAMES[variant] + PARAM_NAMES.get(variant, ()), torch.autograd.grad([o_whole], leaves + params, [dO])))
+
+    cus = [cp_local_cu(bounds, slab_len, r) for r in range(slabs)]
+    slab_leaves = [thd_tensors(case, window=(r * slab_len, (r + 1) * slab_len)) for r in range(slabs)]
+    slab_dO = [dO[r * slab_len : (r + 1) * slab_len] for r in range(slabs)]
+    summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
+    h_all = torch.stack([s[0] for s in summaries])
+    m_all = torch.stack([s[1] for s in summaries])
+    assert h_all.dtype == m_all.dtype == torch.float32 and h_all.shape == (slabs, case.HO, case.V, case.K)
+    applied = []
+    for r in range(slabs):
+        preceding_rank_start, _ = cp_rank_bounds(bounds, slab_len, r)
+        applied.append(cp_forward_apply(case, slab_leaves[r], cus[r], h_all[preceding_rank_start:r], m_all[preceding_rank_start:r], cadence))
+    assert_rms_close(f"o[{variant}, cp {layout}]", torch.cat([out[0] for out in applied]), o_whole, CP_TOL)
+
+    summaries = [cp_backward_prepare(case, slab_leaves[r], cus[r], slab_dO[r]) for r in range(slabs)]
+    g_all = torch.stack([s[0] for s in summaries])
+    t_all = torch.stack([s[1] for s in summaries])
+    grads = {}
+    for r in range(slabs):
+        _, following_rank_stop = cp_rank_bounds(bounds, slab_len, r)
+        composed, checkpoints = applied[r][1], applied[r][2]
+        out = cp_backward_apply(
+            case,
+            slab_leaves[r],
+            cus[r],
+            slab_dO[r],
+            composed,
+            g_all[r + 1 : following_rank_stop],
+            t_all[r + 1 : following_rank_stop],
+            checkpoints if checkpoints.numel() else None,
+            cadence,
+        )
+        for leaf, grad in zip(cp_grad_leaves(variant), out):
+            if leaf is not None:
+                grads.setdefault(leaf, []).append(grad)
+    for leaf, parts in grads.items():
+        got = torch.stack(parts).sum(0) if leaf in PARAM_NAMES.get(variant, ()) else torch.cat(parts)
+        tol = CP_TOL if leaf in ("q", "k", "v") else CP_GATE_TOL
+        assert_rms_close(f"d{leaf}[{variant}, cp {layout}]", got, grads_whole[leaf].float(), tol)
+
+
+CP_CONTEXT_VARIANTS = ("gdn", "kda", "gdn2", "gdp")
+CP_CONTEXT_FULL = ("gdn", "gdp")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mode", ["no_checkpoints", "checkpoints", "l2norm"])
+@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_context(backend, variant, mode):
+    """The backward summary's context (``output_context``): one sequence per slab, the summary on the first (only) local
+    sequence returns its context beside ``G`` and the transition, and the raw backward given it is BITWISE the raw
+    backward without it, without checkpoints, with the forward's checkpoints at the chunk cadence, and with the q/k l2norm
+    fused in the kernels (GDP at d_v = 64; the forward summary's context then feeds the forward the same way)."""
+    l2norm = mode == "l2norm"
+    full = variant in CP_CONTEXT_FULL
+    cadence = CP_CADENCE[variant] if mode == "checkpoints" else 0
+    V = 64 if (l2norm and variant == "gdp") else 128
+    case = make_case(variant, torch.bfloat16, seq_lens=[8192], H=2, K=128, V=V, lo=0.9)
+    slabs = 4
+    slab_len = case.T // slabs
+    bounds = case.cu.tolist()
+    cus = [cp_local_cu(bounds, slab_len, r) for r in range(slabs)]
+    slab_leaves = [thd_tensors(case, window=(r * slab_len, (r + 1) * slab_len)) for r in range(slabs)]
+    set_seed(SEED + 53)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    op_kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
+    with waive_unsupported(backend, variant):
+        summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
+    h_all = torch.stack([s[0] for s in summaries])
+    m_all = torch.stack([s[1] for s in summaries])
+    applied = []
+    for r in range(slabs):
+        args, kw = cp_main_call(case, slab_leaves[r], cus[r])
+        o, _, checkpoints, composed = getattr(la_ops, CP_PREFIX[variant])(
+            *args, preceding_state_update=h_all[:r], preceding_transition=m_all[:r], checkpoint_every_n_tokens=cadence, **kw, **op_kw
+        )
+        applied.append((composed, checkpoints))
+        if l2norm and full:
+            q, k, v, g, beta, *w = slab_leaves[r]
+            n = (case.n,) if variant in HOUSEHOLDER_VARIANTS else ()
+            _, _, fwd_context = getattr(la_ops, f"{CP_PREFIX[variant]}_summary")(
+                k, v, g, beta, *w, cus[r][-2:], *n, plan_name=f"{variant}_summary_frost", output_context=True, **op_kw
+            )
+            assert fwd_context.dtype == torch.uint8 and fwd_context.numel() > 0
+            o_handed = getattr(la_ops, CP_PREFIX[variant])(
+                *args, preceding_state_update=h_all[:r], preceding_transition=m_all[:r], checkpoint_every_n_tokens=cadence, **kw, **op_kw, context=fwd_context
+            )[0]
+            assert_bitwise(f"o[{variant}, rank {r} context]", o_handed, o)
+    prepared = [cp_backward_prepare(case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len], True, cadence, **op_kw) for r in range(slabs)]
+    g_all = torch.stack([p[0] for p in prepared])
+    t_all = torch.stack([p[1] for p in prepared])
+    for r in range(slabs):
+        context = prepared[r][2]
+        assert context.dtype == torch.uint8 and context.numel() > 0
+        composed, checkpoints = applied[r]
+        common = (case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len], composed, g_all[r + 1 :], t_all[r + 1 :])
+        want = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, **op_kw)
+        got = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, context=context, **op_kw)
+        for name, a, b in zip(cp_grad_leaves(variant), got, want):
+            if name is not None:
+                assert_bitwise(f"d{name}[{variant}, {mode}, rank {r} context]", a, b)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_context_geometry(backend, variant):
+    """A one-sequence summary's context on a backward over two local sequences is bitwise the plain backward, one prepared
+    at another checkpoint cadence is refused, and a zero-size context (a sequence below the span floor) feeds the plain backward bitwise."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[2048, 2048], H=2, K=128, V=128, lo=0.9)
+    leaves = thd_tensors(case)
+    set_seed(SEED + 59)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    with waive_unsupported(backend, variant):
+        g_, t_, context = cp_backward_prepare(case, leaves, case.cu, dO, True)
+    assert context.dtype == torch.uint8 and context.numel() > 0
+    want = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
+    got = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], context=context)
+    for name, a, b in zip(cp_grad_leaves(variant), got, want):
+        if name is not None:
+            assert_bitwise(f"d{name}[{variant}, a one-sequence summary's context on a two-sequence slab]", a, b)
+    one = thd_tensors(case, window=(0, 2048))
+    cu_one = case.cu[:2]
+    g_, t_, context = cp_backward_prepare(case, one, cu_one, dO[:2048], True)
+    _, composed, checkpoints = cp_forward_apply(case, one, cu_one, g_[None][:0], t_[None][:0], 4 * CP_CADENCE[variant])
+    with pytest.raises(ValueError, match="context for these tokens"):
+        cp_backward_apply(case, one, cu_one, dO[:2048], composed, g_[None][:0], t_[None][:0], checkpoints, 4 * CP_CADENCE[variant], context=context)
+    short = make_case(variant, torch.bfloat16, seq_lens=[64], H=2, K=128, V=128, lo=0.9)
+    short_leaves = thd_tensors(short)
+    dO_short = to_thd(torch.randn(short.B, short.T, short.HO, short.V, device="cuda") * 0.1).to(short.v.dtype)
+    g_, t_, context = cp_backward_prepare(short, short_leaves, short.cu, dO_short, True)
+    want = cp_backward_apply(short, short_leaves, short.cu, dO_short, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
+    got = cp_backward_apply(short, short_leaves, short.cu, dO_short, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], context=context)
+    for name, a, b in zip(cp_grad_leaves(variant), got, want):
+        if name is not None:
+            assert_bitwise(f"d{name}[{variant}, a zero-size context on the plain backward]", a, b)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_graph_api_context_matches_op(backend, variant):
+    """The context through cudnn.pygraph: ``output_context`` writes a context the ``input_context`` node reads back to the
+    op's gradients bitwise; a missing or wrong-size buffer is refused."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[2048], H=2, K=128, V=128, lo=0.9)
+    leaves = thd_tensors(case)
+    names = LEAF_NAMES[variant]
+    set_seed(SEED + 61)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    with waive_unsupported(backend, variant):
+        g_, t_, context_op = cp_backward_prepare(case, leaves, case.cu, dO, True)
+    n = {"num_householder": case.n} if variant in HOUSEHOLDER_VARIANTS else {}
+    scale = 1.0 / math.sqrt(case.K)
+    inputs = dict(q=leaves[0], k=leaves[1], g=leaves[3], beta=leaves[4], cu_seqlens=case.cu[:2], dO=dO)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+    x_t, transition_t = getattr(graph, f"{variant}_summary_bwd")(**ports, **n, scale=scale, output_transition=True, output_context=True, name="summary_bwd")
+    x_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    build_and_pin(graph, f"{variant}_summary_frost")
+    assert graph.get_context_size() == context_op.numel() > 0
+    context = torch.empty(graph.get_context_size(), dtype=torch.uint8, device="cuda")
+    d_initial_state = torch.empty(1, *g_.shape, dtype=torch.float32, device="cuda")
+    transition = torch.empty(1, *t_.shape, dtype=torch.float32, device="cuda")
+    pack = {ports[name]: t for name, t in inputs.items()}
+    pack.update({x_t: d_initial_state, transition_t: transition})
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="context"):
+        graph.execute(pack, workspace)
+    graph.execute(pack, workspace, context=context)
+    torch.cuda.synchronize()
+    assert_bitwise(f"d_initial_state[{variant}, graph api]", d_initial_state[0], g_)
+    assert_bitwise(f"transition[{variant}, graph api]", transition[0], t_)
+    want = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], context=context_op)
+    inputs = dict(zip(names, leaves))
+    inputs.update(cu_seqlens=case.cu, dO=dO)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+    outs = getattr(graph, f"{variant}_bwd")(**ports, **n, scale=scale, input_context=True, name="bwd")
+    got = {}
+    for name, port, ref in zip(names, outs, want):
+        port.set_output(True).set_data_type(CUDNN_DTYPE[ref.dtype])
+        got[name] = torch.empty_like(ref)
+    build_and_pin(graph, f"{variant}_frost")
+    assert graph.get_context_size() == context.numel()
+    pack = {ports[name]: t for name, t in inputs.items()}
+    pack.update({port: got[name] for name, port in zip(names, outs)})
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="context"):
+        graph.execute(pack, workspace, context=context[:-1])
+    graph.execute(pack, workspace, context=context)
+    torch.cuda.synchronize()
+    for name, ref in zip(names, want):
+        assert_bitwise(f"d{name}[{variant}, graph api context]", got[name], ref)
+
+
+FORWARD_CONTEXT_VARIANTS = ("gdn", "gdp", "kda", "gdn2")
+FORWARD_CONTEXT_MODES = {"no_checkpoints": (False, False), "checkpoints": (False, True), "l2norm": (True, False), "l2norm_checkpoints": (True, True)}
+
+
+def forward_context_case(variant, layout):
+    """One long sequence, a ragged batch of long sequences, or a batch above the SM count in (sequence, head) pairs with
+    grouped q / k heads; GDP at d_v = 64, where the backward normalizes the forward's rows."""
+    V = 64 if variant == "gdp" else 128
+    if layout == "over_sm":
+        heads, B, _, _ = over_sm_shape()
+        return make_case(variant, torch.bfloat16, seq_lens=[2048] * B, H=heads // 4, HV=heads, K=128, V=V, lo=0.9)
+    seq_lens = [8192] if layout == "one_sequence" else [6144, 8192, 4096]
+    return make_case(variant, torch.bfloat16, seq_lens=seq_lens, H=2, K=128, V=V, lo=0.9)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mode", FORWARD_CONTEXT_MODES)
+@pytest.mark.parametrize("layout", ["one_sequence", "ragged", "over_sm"])
+@pytest.mark.parametrize("variant", FORWARD_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_forward_context(backend, variant, layout, mode):
+    """The forward's context (``output_context``): the op returns it as the last value with ``o`` BITWISE the plain
+    forward's, and the backward given it, through autograd and through the raw op (``context_from_forward``), is BITWISE
+    the backward without it; without checkpoints, with the forward's checkpoints at the chunk cadence, and with the q/k
+    l2norm fused in the kernels.  A plan that keeps nothing returns a zero-size context, which feeds the plain backward."""
+    l2norm, checkpoint = FORWARD_CONTEXT_MODES[mode]
+    cadence = CP_CADENCE[variant] if checkpoint else 0
+    case = forward_context_case(variant, layout)
+    leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
+    set_seed(SEED + 67)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    op_kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
+    args, kw = cp_main_call(case, leaves, case.cu)
+    op = getattr(la_ops, CP_PREFIX[variant])
+    with waive_unsupported(backend, variant):
+        plain = op(*args, checkpoint_every_n_tokens=cadence, **kw, **op_kw)
+    want = torch.autograd.grad([plain[0]], leaves, [dO])
+    handed = op(*args, checkpoint_every_n_tokens=cadence, output_context=True, **kw, **op_kw)
+    context = handed[-1]
+    assert len(handed) == len(plain) + 1 and context.dtype == torch.uint8
+    assert context.numel() > 0 or not l2norm or variant in ("kda", "gdn2")
+    assert_bitwise(f"o[{variant}, {layout}, {mode}, output_context]", handed[0], plain[0])
+    got = torch.autograd.grad([handed[0]], leaves, [dO])
+    for name, a, b in zip(LEAF_NAMES[variant], got, want):
+        assert_bitwise(f"d{name}[{variant}, {layout}, {mode}, autograd with the context]", a, b)
+    raw = cp_backward_apply(
+        case,
+        [t.detach() for t in leaves],
+        case.cu,
+        dO,
+        torch.empty(0, device="cuda"),
+        None,
+        None,
+        plain[2] if cadence else None,
+        cadence,
+        context=context,
+        context_from_forward=True,
+        **op_kw,
+    )
+    for name, a, b in zip(cp_grad_leaves(variant), raw, want):
+        assert_bitwise(f"d{name}[{variant}, {layout}, {mode}, raw backward with the context]", a, b)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", FORWARD_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_graph_api_forward_context_matches_op(backend, variant):
+    """The forward's context through cudnn.pygraph: the forward node with ``output_context`` writes the context the
+    backward node with ``input_context`` and ``context_from_forward`` reads back to the op's gradients bitwise; a missing or
+    wrong-size buffer is refused."""
+    case = forward_context_case(variant, "one_sequence")
+    leaves = thd_tensors(case)
+    names = LEAF_NAMES[variant]
+    set_seed(SEED + 71)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    args, kw = cp_main_call(case, [t.detach().clone().requires_grad_(True) for t in leaves], case.cu)
+    with waive_unsupported(backend, variant):
+        o_op, _, context_op = getattr(la_ops, CP_PREFIX[variant])(*args, use_qk_l2norm_in_kernel=True, output_context=True, **kw)
+    want = torch.autograd.grad([o_op], args[: len(names)], [dO])
+    n = {"num_householder": case.n} if variant in HOUSEHOLDER_VARIANTS else {}
+    scale = 1.0 / math.sqrt(case.K)
+    inputs = dict(zip(names, leaves))
+    inputs.update(cu_seqlens=case.cu)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+    o_t = getattr(graph, variant)(**ports, **n, scale=scale, use_qk_l2norm=True, output_context=True, name="fwd")[0]
+    o_t.set_output(True).set_data_type(CUDNN_DTYPE[o_op.dtype])
+    build_and_pin(graph, f"{variant}_frost")
+    assert graph.get_context_size() == context_op.numel() > 0
+    context = torch.empty(graph.get_context_size(), dtype=torch.uint8, device="cuda")
+    o = torch.empty_like(o_op)
+    pack = {ports[name]: t for name, t in inputs.items()}
+    pack[o_t] = o
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="context"):
+        graph.execute(pack, workspace)
+    graph.execute(pack, workspace, context=context)
+    torch.cuda.synchronize()
+    assert_bitwise(f"o[{variant}, graph api output_context]", o, o_op)
+    inputs.update(dO=dO)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+    outs = getattr(graph, f"{variant}_bwd")(**ports, **n, scale=scale, use_qk_l2norm=True, input_context=True, context_from_forward=True, name="bwd")
+    got = {}
+    for name, port, ref in zip(names, outs, want):
+        port.set_output(True).set_data_type(CUDNN_DTYPE[ref.dtype])
+        got[name] = torch.empty_like(ref)
+    build_and_pin(graph, f"{variant}_frost")
+    assert graph.get_context_size() == context.numel()
+    pack = {ports[name]: t for name, t in inputs.items()}
+    pack.update({port: got[name] for name, port in zip(names, outs)})
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="context"):
+        graph.execute(pack, workspace, context=context[:-1])
+    graph.execute(pack, workspace, context=context)
+    torch.cuda.synchronize()
+    for name, ref in zip(names, want):
+        assert_bitwise(f"d{name}[{variant}, graph api context_from_forward]", got[name], ref)
+
+
+def test_forward_context_arguments(backend):
+    """The forward leaves a context or reads its summary's, never both, and never from the in-place state modes."""
+    case = cp_case("gdn", [512, 512], 0.9)
+    q, k, v, g, beta = thd_tensors(case)
+    with pytest.raises(ValueError, match="one context per call"):
+        la_ops.gated_delta_net(
+            q, k, v, g, beta, case.cu, use_qk_l2norm_in_kernel=True, context=torch.zeros(8, dtype=torch.uint8, device="cuda"), output_context=True
+        )
+    with pytest.raises(ValueError, match="output_context cannot combine with overwrite_initial_state"):
+        la_ops.gated_delta_net(q, k, v, g, beta, case.cu, initial_state=random_state(case), overwrite_initial_state=True, output_context=True)
+    for variant in ("kda", "gdn2"):
+        case = cp_case(variant, [512, 512], 0.9)
+        with pytest.raises(ValueError, match="output_context cannot combine with overwrite_initial_state"):
+            getattr(la_ops, CP_PREFIX[variant])(
+                *thd_tensors(case), case.cu, initial_state=random_state(case), overwrite_initial_state=True, output_context=True
+            )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_composed_state(backend, variant):
+    """The fused forward's ``composed_initial_state`` is ONE fp32 row, the fp64 fold of the preceding ranks' summaries;
+    the forward ran from it (an explicit initial_state table with that row in row 0 and zeros elsewhere reproduces ``o``
+    bitwise); an empty slice (``P = 0``) is the plain forward with a zero-size composed state."""
+    case = cp_case(variant, [1400, 3400, 200, 1000, 2192], 0.9)
+    bounds, slabs = case.cu.tolist(), 4
+    slab_len = case.T // slabs
+    cus = [cp_local_cu(bounds, slab_len, r) for r in range(slabs)]
+    slab_leaves = [thd_tensors(case, window=(r * slab_len, (r + 1) * slab_len)) for r in range(slabs)]
+    with waive_unsupported(backend, variant):
+        summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
+    h_all = torch.stack([s[0] for s in summaries])
+    m_all = torch.stack([s[1] for s in summaries])
+    main_op = getattr(la_ops, CP_PREFIX[variant])
+    for r in range(slabs):
+        preceding_rank_start, _ = cp_rank_bounds(bounds, slab_len, r)
+        o, composed, _ = cp_forward_apply(case, slab_leaves[r], cus[r], h_all[preceding_rank_start:r], m_all[preceding_rank_start:r])
+        args, kw = cp_main_call(case, slab_leaves[r], cus[r])
+        if preceding_rank_start == r:
+            assert composed.numel() == 0
+            assert_bitwise(f"o[{variant}, rank {r} without preceding ranks]", o, main_op(*args, **kw)[0])
+            continue
+        x = torch.zeros(case.HO, case.V, case.K, device="cuda", dtype=torch.float64)
+        for j in range(preceding_rank_start, r):
+            x = cp_fold(variant, x, h_all[j].double(), m_all[j].double())
+        assert composed.dtype == torch.float32 and composed.shape == (1, case.HO, case.V, case.K)
+        assert rms_ratio(composed[0], x) < CP_FOLD_TOL, f"rank {r}: composed row rms ratio {rms_ratio(composed[0], x):.3e}"
+        table = torch.zeros(cus[r].numel() - 1, case.HO, case.V, case.K, device="cuda", dtype=torch.float32)
+        table[0] = composed[0]
+        assert_bitwise(f"o[{variant}, rank {r} from the composed state]", main_op(*args, initial_state=table, **kw)[0], o)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("padded", [False, True], ids=["dense", "padded"])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_caller_state(backend, variant, padded):
+    """A caller-given state table beside the summaries: forward, the composed row is the fold started from the table's
+    row 0 (the state beyond the farthest rank) and the forward equals the plain op on the table with that row swapped
+    in, bitwise; backward, a caller ``d_final_state`` beside the following summaries equals the raw backward on the
+    table with its last row replaced by the fold started from it, bitwise (every other row is read as given).  The
+    table is dense or a padded view; the plain op reads the swapped copy, which is dense either way."""
+    case = cp_case(variant, [1400, 3400, 200, 1000, 2192], 0.9)
+    bounds, slabs = case.cu.tolist(), 4
+    slab_len = case.T // slabs
+    cus = [cp_local_cu(bounds, slab_len, r) for r in range(slabs)]
+    slab_leaves = [thd_tensors(case, window=(r * slab_len, (r + 1) * slab_len)) for r in range(slabs)]
+    set_seed(SEED + 47)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    with waive_unsupported(backend, variant):
+        summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
+    h_all = torch.stack([s[0] for s in summaries])
+    m_all = torch.stack([s[1] for s in summaries])
+    bwd_summaries = [cp_backward_prepare(case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len]) for r in range(slabs)]
+    g_all = torch.stack([s[0] for s in bwd_summaries])
+    t_all = torch.stack([s[1] for s in bwd_summaries])
+    main_op = getattr(la_ops, CP_PREFIX[variant])
+    raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[variant]}_bwd")
+    checked = 0
+    for r in range(slabs):
+        preceding_rank_start, following_rank_stop = cp_rank_bounds(bounds, slab_len, r)
+        N = cus[r].numel() - 1
+        args, kw = cp_main_call(case, slab_leaves[r], cus[r])
+        if preceding_rank_start < r:
+            table = cp_state_table(N, case, padded)
+            o, _, _, composed = main_op(
+                *args, initial_state=table, preceding_state_update=h_all[preceding_rank_start:r], preceding_transition=m_all[preceding_rank_start:r], **kw
+            )
+            x = table[0].double()
+            for j in range(preceding_rank_start, r):
+                x = cp_fold(variant, x, h_all[j].double(), m_all[j].double())
+            assert composed.shape == (1, case.HO, case.V, case.K)
+            assert rms_ratio(composed[0], x) < CP_FOLD_TOL, f"rank {r}: composed row from the caller's row rms ratio {rms_ratio(composed[0], x):.3e}"
+            swapped = table.clone()
+            swapped[0] = composed[0]
+            assert_bitwise(f"o[{variant}, rank {r} caller table + summaries]", main_op(*args, initial_state=swapped, **kw)[0], o)
+            checked += 1
+        if r + 1 < following_rank_stop:
+            dfs = cp_state_table(N, case, padded)
+            do_r = dO[r * slab_len : (r + 1) * slab_len]
+            extra = dict(
+                d_final_state=dfs,
+                following_state_grad=g_all[r + 1 : following_rank_stop],
+                following_transition=t_all[r + 1 : following_rank_stop],
+                plan_name=f"{variant}_frost",
+            )
+            dx = dfs[-1].double()  # the reverse composition walks the following ranks from the farthest one down to rank r + 1
+            for j in range(following_rank_stop - 1, r, -1):
+                dx = cp_fold(variant, dx, g_all[j].double(), t_all[j].double())
+            swapped = dfs.clone()
+            swapped[-1] = dx.float()
+            if variant in NO_BETA_VARIANTS:
+                q, k, v, g = slab_leaves[r]
+                got = raw(do_r, v, g, case.gates["A"], k, q, cus[r], dt_bias=case.gates["dt_bias"], **extra)
+                want = raw(do_r, v, g, case.gates["A"], k, q, cus[r], dt_bias=case.gates["dt_bias"], d_final_state=swapped, plan_name=f"{variant}_frost")
+            else:
+                q, k, v, g, beta, *w = slab_leaves[r]
+                n = (int(case.n),) if variant in HOUSEHOLDER_VARIANTS else ()
+                got = raw(do_r, q, k, v, g, beta, *w, cus[r], *n, float(case.K**-0.5), **extra)
+                want = raw(do_r, q, k, v, g, beta, *w, cus[r], *n, float(case.K**-0.5), d_final_state=swapped, plan_name=f"{variant}_frost")
+            for name, a, b in zip(cp_grad_leaves(variant), got, want):
+                if name is not None:
+                    assert_rms_close(f"d{name}[{variant}, rank {r} caller d_final_state + following summaries]", a, b, CP_CALLER_BWD_TOL)
+            checked += 1
+    assert checked >= 2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_boundary_summaries(backend, variant):
+    """The protocol's boundary summaries come from a two-entry device view of ``cu_seqlens`` with no host read: the
+    forward summary over ``cu[-2:]`` (an offset first entry) and the backward summary over ``cu[:2]`` (trailing tokens
+    ignored) match the full-slab summaries' boundary rows; a lone sequence may be spanned differently, so the state
+    rows agree to fp32 composition rounding and the transitions, bounded by the identity, in absolute terms."""
+    case = cp_case(variant, [1400, 3400, 200, 1000, 2192], 0.9)
+    set_seed(SEED + 43)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    summary = getattr(la_ops, f"{CP_PREFIX[variant]}_summary")
+    summary_bwd = getattr(la_ops, f"{CP_PREFIX[variant]}_summary_bwd")
+    plan = dict(plan_name=f"{variant}_summary_frost")
+    if variant in NO_BETA_VARIANTS:
+        q, k, v, g = thd_tensors(case)
+        params = dict(dt_bias=case.gates["dt_bias"], **plan)
+        forward = lambda cu: summary(v, g, case.gates["A"], k, cu, **params)
+        backward = lambda cu: summary_bwd(dO, g, case.gates["A"], q, cu, output_transition=True, **params)
+    else:
+        q, k, v, g, beta, *w = thd_tensors(case)
+        n = (case.n,) if variant in HOUSEHOLDER_VARIANTS else ()
+        forward = lambda cu: summary(k, v, g, beta, *w, cu, *n, **plan)
+        backward = lambda cu: summary_bwd(q, k, g, beta, dO, cu, *n, scale=float(case.K**-0.5), output_transition=True, **plan)
+    with waive_unsupported(backend, variant):
+        h_full, m_full = forward(case.cu)
+    h_last, m_last = forward(case.cu[-2:])
+    g_full, t_full = backward(case.cu)
+    g_first, t_first = backward(case.cu[:2])
+    assert_rms_close(f"H[{variant}, boundary view]", h_last, h_full[-1:], 1e-2)
+    assert_rms_close(f"G[{variant}, boundary view]", g_first, g_full[:1], 1e-2)
+    for name, got, want in (("M", m_last, m_full[-1:]), ("T", t_first, t_full[:1])):
+        assert torch.isfinite(got).all()
+        assert (got - want).abs().max().item() < 1e-2, f"{name}[{variant}, boundary view] differs from the full-slab row"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_arguments(backend):
+    """The composed summaries come as an fp32 pair of matching rank count shaped like the summary ops' outputs, and
+    never with the in-place state modes."""
+    case = cp_case("gdn", [512, 512], 0.9)
+    q, k, v, g, beta = thd_tensors(case)
+    h = torch.zeros(2, case.HO, case.V, case.K, device="cuda")
+    m = torch.zeros(2, case.HO, case.K, case.K, device="cuda")
+    with pytest.raises(ValueError, match="come together"):
+        la_ops.gated_delta_net(q, k, v, g, beta, case.cu, preceding_state_update=h)
+    with pytest.raises(TypeError, match="float32"):
+        la_ops.gated_delta_net(q, k, v, g, beta, case.cu, preceding_state_update=h.bfloat16(), preceding_transition=m)
+    with pytest.raises(ValueError, match="same rank count"):
+        la_ops.gated_delta_net(q, k, v, g, beta, case.cu, preceding_state_update=h[:1], preceding_transition=m)
+    with pytest.raises(ValueError, match="must be \\[P, "):
+        la_ops.gated_delta_net(q, k, v, g, beta, case.cu, preceding_state_update=h, preceding_transition=m[:, :, :1])
+    with pytest.raises(ValueError, match="overwrite_initial_state"):
+        la_ops.gated_delta_net(
+            q, k, v, g, beta, case.cu, initial_state=random_state(case), overwrite_initial_state=True, preceding_state_update=h, preceding_transition=m
+        )
+    with waive_unsupported(backend, "gdn"):
+        o, fs, checkpoints, composed = la_ops.gated_delta_net(
+            q, k, v, g, beta, case.cu, preceding_state_update=h[:0], preceding_transition=m[:0], plan_name="gdn_frost"
+        )
+    assert composed.numel() == 0 and checkpoints.numel() == 0 and fs.numel() == 0
+    assert_bitwise("o[gdn, empty slice]", o, la_ops.gated_delta_net(q, k, v, g, beta, case.cu, plan_name="gdn_frost")[0])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backend, variant", [("cutile", "gdn"), ("hopper", "kda"), ("hopper_cuda", "kda")], indirect=["backend"])
+def test_context_parallel_declines_non_frost_engines(backend, variant):
+    """Only the FROST engines fold composed summaries into the boundary state row and start the backward from the
+    forward's composed row; a pinned non-FROST plan that serves the graph without them declines the graph with them
+    (the summaries forward, the composed row alone backward: the last rank's call) instead of running it without them."""
+    case = cp_case(variant, [512, 512], 0.9)
+    q, k, v, g, beta = thd_tensors(case)
+    with waive_unsupported(backend, variant):
+        pinned_op(backend, variant)(q, k, v, g, beta, case.cu)
+    h = torch.zeros(2, case.HO, case.V, case.K, device="cuda")
+    m = torch.zeros(2, case.HO, case.K, case.K, device="cuda")
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=backend.plan(variant)):
+        pinned_op(backend, variant)(q, k, v, g, beta, case.cu, preceding_state_update=h, preceding_transition=m)
+    raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[variant]}_bwd")
+    dO = torch.randn_like(v)
+    try:
+        raw(dO, q, k, v, g, beta, case.cu, float(case.K**-0.5), plan_name=backend.plan(variant))
+    except cudnn.cudnnGraphNotSupportedError:
+        return
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=backend.plan(variant)):
+        raw(dO, q, k, v, g, beta, case.cu, float(case.K**-0.5), composed_initial_state=h[:1], plan_name=backend.plan(variant))
+
+
+# ---------------------------------------------------------------------------
+# Length-rule slot capacity and packed ragged batches
+# ---------------------------------------------------------------------------
+
+CAPACITY_LENGTHS = [0, 1, 15, 16, 17, 8191, 8192, 8193, 17001] + [33] * 9
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_batch_invariance_long_ragged_fwd(backend, variant):
+    """Under batch_invariant=True a packed batch of empty, short and long sequences matches each solo B = 1 run bitwise."""
+    case = long_case(variant, CAPACITY_LENGTHS)
+    o, fs = run_fwd(backend, case, output_final_state=True, batch_invariant=True)
+    bounds = case.cu.tolist()
+    for n in range(case.N):
+        s, e = bounds[n], bounds[n + 1]
+        if s == e:
+            continue
+        with waive_unsupported(backend, variant):
+            o_solo, fs_solo = pinned_op(backend, variant)(*op_args(case, window=(s, e)), output_final_state=True, batch_invariant=True)
+        assert torch.equal(bits(o[s:e]), bits(o_solo)), f"seq {n}: packed o differs from solo"
+        assert torch.equal(bits(fs[n]), bits(fs_solo[0])), f"seq {n}: packed final state differs from solo"
+
+
+@pytest.mark.parametrize("checkpoints", [False, True], ids=["no_checkpoints", "checkpoints"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_batch_invariance_long_ragged_bwd(backend, variant, checkpoints):
+    """Under batch_invariant=True the grads of the long sequences of such a batch match their solo B = 1 runs bitwise, with
+    and without the checkpoint series."""
+    case = long_case(variant, CAPACITY_LENGTHS)
+    kw = dict(batch_invariant=True, checkpoint_every_n_tokens=CHUNK[variant] if checkpoints else 0)
+    args = thd_tensors(case)
+    leaves = [args[0].requires_grad_(True), args[1].requires_grad_(True)]
+    bounds = case.cu.tolist()
+    with waive_unsupported(backend, variant):
+        o = pinned_op(backend, variant)(*args, *op_tail(case), **kw)[0]
+        dO = torch.randn_like(o)
+        grads_packed = torch.autograd.grad([o], leaves, [dO])
+        for n in (CAPACITY_LENGTHS.index(8193), CAPACITY_LENGTHS.index(17001)):
+            s, e = bounds[n], bounds[n + 1]
+            solo_args = op_args(case, window=(s, e))
+            solo_leaves = [solo_args[0].requires_grad_(True), solo_args[1].requires_grad_(True)]
+            o_solo = pinned_op(backend, variant)(*solo_args, **kw)[0]
+            grads_solo = torch.autograd.grad([o_solo], solo_leaves, [dO[s:e].clone()])
+            for name, gp, gs in zip(("q", "k"), grads_packed, grads_solo):
+                scale = case.n if name in EXPANDED_LEAVES else 1
+                assert torch.equal(bits(gp[s * scale : e * scale]), bits(gs)), f"seq {n}: packed d{name} slice differs from solo"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_over_sm_one_long_many_short_matches_invariant(backend, variant):
+    """One long sequence packed with short and empty ones beyond the SM count: o, final_state and every gradient against the
+    ``batch_invariant`` run."""
+    heads, B, _, _ = over_sm_shape()
+    case = long_case(variant, [32768] + ([64, 0] * B)[: B - 1], H=heads, HK=heads, HV=heads)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    o, fs, grads, dO, _ = long_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o_inv, fs_inv, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_rms_close("o default-vs-invariant", o, o_inv.float(), INVARIANT_TOL)
+    assert_rms_close("final_state default-vs-invariant", fs, fs_inv.float(), INVARIANT_TOL)
+    assert_long_grads_close(grads, grads_inv)
+
+
+@pytest.mark.parametrize("checkpoints", [False, True], ids=["no_series", "dense_series"])
+@pytest.mark.parametrize("shape", ["leftover_wave", "twice_sm", "below_sm"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_one_long_cut_on_device(backend, variant, shape, checkpoints):
+    """One long sequence among short ones where the plan does not chain by slots: above the SM count with a leftover wave,
+    at twice the SM count in tiles, and at three quarters of it: the device takes the length-rule chain, so o, final_state and
+    every gradient are bitwise the ``batch_invariant`` run."""
+    heads, B, _, _ = over_sm_shape()
+    if shape == "twice_sm":
+        heads = 8 if (2 * sm_count()) % 8 == 0 else 1
+        B = 2 * sm_count() // heads
+    elif shape == "below_sm":
+        B = (3 * sm_count() // 4) // heads
+    case = long_case(variant, [32768] + [64] * (B - 1), H=heads, HK=heads, HV=heads)
+    state0, d_final, dO = bwd_inputs(case)
+    kw = dict(checkpoint=CHUNK[variant] if checkpoints else 0, initial_state=state0, d_final_state=d_final, dO=dO)
+    o, fs, grads, _, _ = long_grads(backend, case, **kw)
+    o_inv, fs_inv, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, **kw)
+    assert_bitwise("o", o, o_inv)
+    assert_bitwise("final_state", fs, fs_inv)
+    for name, g in grads.items():
+        assert_bitwise(f"d{name}", g, grads_inv[name])
+
+
+def prepared_kda_graph(inputs, phase, safe_gate, handle):
+    """``(execute, outputs, storage, size)`` of one pinned batch_invariant KDA graph over ``inputs`` with all storage built before
+    any capture; ``storage`` carries a canary after the exact workspace extent ``size``."""
+    graph = cudnn.pygraph(handle=handle)
+    names = {
+        "fwd": ("q", "k", "v", "g", "beta", "initial_state"),
+        "bwd": ("q", "k", "v", "g", "beta", "initial_state", "dO", "d_final_state"),
+        "summary": ("k", "v", "g", "beta", "initial_state"),
+        "summary_bwd": ("q", "k", "g", "beta", "dO", "d_final_state"),
+    }[phase]
+    names = (*names, "cu_seqlens", *(("a_log", "dt_bias") if safe_gate else ()))
+    ports = {name: graph.tensor(list(inputs[name].shape), data_type=CUDNN_DTYPE[inputs[name].dtype], name=name) for name in names}
+    attrs = dict(batch_invariant=True, safe_gate=safe_gate)
+    if phase == "fwd":
+        outputs = graph.kda(**ports, **attrs, output_final_state=True)
+        dtypes = [inputs["q"].dtype, torch.float32, inputs["q"].dtype, torch.float32]
+    elif phase == "bwd":
+        outputs = graph.kda_bwd(**ports, **attrs)
+        dtypes = [inputs[n].dtype for n in ("q", "k", "v", "g", "beta", "initial_state")] + [torch.float32, torch.float32]
+    else:
+        outputs = getattr(graph, "kda_" + phase)(**ports, **attrs, output_transition=True)
+        dtypes = [torch.float32] * len(outputs)
+    live = [(port, dtype) for port, dtype in zip(outputs, dtypes) if port is not None]
+    for port, dtype in live:
+        port.set_output(True).set_data_type(CUDNN_DTYPE[dtype])
+    build_and_pin(graph, "kda_summary_frost" if phase.startswith("summary") else "kda_frost")
+    result = {str(i): torch.empty(tuple(port.get_dim()), dtype=dtype, device="cuda") for i, (port, dtype) in enumerate(live)}
+    variant_pack = {ports[name]: inputs[name] for name in names}
+    variant_pack.update({port: result[str(i)] for i, (port, _) in enumerate(live)})
+    size = graph.get_workspace_size()
+    storage = torch.full((size + 256,), 0xA5, dtype=torch.uint8, device="cuda")
+    workspace = storage[:size]
+
+    def execute():
+        graph.execute(variant_pack, workspace, handle=handle)
+
+    return execute, result, storage, size
+
+
+def packed_kda_inputs(lengths, dtype, safe_gate, **kw):
+    """Packed KDA graph inputs of ``lengths`` under the graph port names, with a mild constant gate."""
+    from .determinism import pack, sequences
+
+    inputs = pack(sequences("kda", lengths, dtype=dtype, heads=1, **kw))
+    inputs["cu_seqlens"] = inputs.pop("cu")
+    inputs["dO"] = inputs.pop("do")
+    inputs["d_final_state"] = inputs.pop("dfs")
+    inputs["g"].fill_(-4 if safe_gate else -0.001)
+    if safe_gate:
+        inputs["a_log"] = torch.zeros(1, device="cuda")
+        inputs["dt_bias"] = torch.zeros(1, inputs["q"].shape[-1], device="cuda")
+    return inputs
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("phase", ["fwd", "bwd", "summary", "summary_bwd"])
+@pytest.mark.parametrize(
+    "dim,dtype,safe_gate",
+    [(64, torch.bfloat16, False), (64, torch.float16, True), (128, torch.bfloat16, True), (128, torch.float16, False)],
+    ids=["d64-bf16-log", "d64-fp16-safe", "d128-bf16-safe", "d128-fp16-log"],
+)
+def test_kda_shared_stage_reuse(phase, dim, dtype, safe_gate):
+    """Small Racecheck target: wrap shared-memory rings, cross a tail and retain empty identity slots.
+
+    Run under ``compute-sanitizer --tool racecheck --error-exitcode 99``. The original elected generic-memory
+    handoffs report RAW/WAR hazards; every shared-memory reader/writer must publish its own barrier credit."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    inputs = packed_kda_inputs([265, 129, 0, 1], dtype, safe_gate, key_dim=dim, value_dim=dim)
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
+    try:
+        execute, result, storage, size = prepared_kda_graph(inputs, phase, safe_gate, handle)
+        execute()
+        expected = {name: value.clone() for name, value in result.items()}
+        assert all(torch.isfinite(value).all() for value in expected.values())
+        storage[:size].fill_(0xFF)
+        for value in result.values():
+            value.fill_(float("nan"))
+        execute()
+        for name, want in expected.items():
+            assert_bitwise(f"second execution output {name}", result[name], want)
+        assert (storage[size:] == 0xA5).all(), "workspace overrun"
+    finally:
+        torch.cuda.synchronize()
+        cudnn.destroy_handle(handle)
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("phase", ["fwd", "bwd", "summary", "summary_bwd"])
+@pytest.mark.parametrize(
+    "dtype,safe_gate",
+    [(torch.bfloat16, False), (torch.bfloat16, True), (torch.float16, False), (torch.float16, True)],
+    ids=["bf16-log", "bf16-safe", "fp16-log", "fp16-safe"],
+)
+def test_kda_ragged_changed_length_replay(phase, dtype, safe_gate):
+    """A captured batch_invariant graph over empty, short and long sequences replays byte-identical to an eager graph after the
+    lengths change under the same declared shapes, from a poisoned workspace and without writing past it."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    lengths = [0, 1, 15, 16, 17, 8191, 8192, 8193, 17001] + [33] * 257
+    inputs = packed_kda_inputs(lengths, dtype, safe_gate)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle=handle, stream=stream.cuda_stream)
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            eager, expected, eager_storage, eager_size = prepared_kda_graph(inputs, phase, safe_gate, handle)
+            replayed, actual, storage, size = prepared_kda_graph(inputs, phase, safe_gate, handle)
+            eager()
+            replayed()
+            for name, want in expected.items():
+                assert_bitwise(f"second graph output {name}", actual[name], want)
+            with torch.cuda.graph(captured, stream=stream):
+                old_debug = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    replayed()
+                finally:
+                    torch.cuda.set_sync_debug_mode(old_debug)
+            for change, new_lengths in zip((0.125, -0.25), ([sum(lengths)] + [0] * (len(lengths) - 1), list(reversed(lengths)))):
+                inputs["q"].add_(change)
+                inputs["v"].add_(change)
+                inputs["dO"].add_(change)
+                inputs["cu_seqlens"].copy_(torch.tensor([0, *itertools.accumulate(new_lengths)], device="cuda", dtype=torch.int32))
+                eager()
+                storage[:size].fill_(0xFF)
+                for value in actual.values():
+                    value.fill_(float("nan"))
+                captured.replay()
+                for name, want in expected.items():
+                    assert_bitwise(f"changed-length replay output {name}", actual[name], want)
+                assert (storage[size:] == 0xA5).all(), "replayed graph workspace overrun"
+                assert (eager_storage[eager_size:] == 0xA5).all(), "eager graph workspace overrun"
+    finally:
+        stream.synchronize()
+        captured.reset()
+        torch.cuda.current_stream().wait_stream(stream)
+        cudnn.destroy_handle(handle)
+
+
+# ---------------------------------------------------------------------------
+# Host-side piece rules (no kernel is launched)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+def test_ragged_pieces_cap():
+    """The slot cap of the device-chosen chain group: one sequence's heads in one wave, 3 to 16 slots, none when the batch's tokens
+    or one wave hold fewer than 3 slots of a sequence."""
+    from cudnn.linear_attention.frost.common.piece_chain import ragged_pieces
+
+    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=1 << 20) == 9
+    assert ragged_pieces(heads_out=8, num_sm=152, total_tokens=1 << 20) == 16
+    assert ragged_pieces(heads_out=32, num_sm=152, total_tokens=1 << 20) == 4
+    assert ragged_pieces(heads_out=50, num_sm=152, total_tokens=1 << 20) == 3
+    assert ragged_pieces(heads_out=64, num_sm=152, total_tokens=1 << 20) == 0
+    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=3 * 8192) == 3
+    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=2 * 8192) == 0
+
+
+@pytest.mark.L0
+def test_piece_capacity_bounds_empty_and_threshold_lengths():
+    """Include empty identity slots and both sides of the 8192-token rule."""
+    from cudnn.linear_attention.frost.common.piece_chain import piece_capacity
+
+    lengths = (0, 1, 15, 16, 17, 8191, 8192, 8193, 131072, 131073)
+    for batch in itertools.product(lengths, repeat=3):
+        total = sum(batch)
+        pieces = min(max(1, math.ceil(total / 8192)), 16)
+        bound = piece_capacity(num_seqs=len(batch), pieces=pieces, total_tokens=total, batch_invariant=True)
+        needed = sum(max(1, min(pieces, math.ceil(length / 8192))) for length in batch)
+        assert needed <= bound <= len(batch) * pieces
+        assert piece_capacity(num_seqs=len(batch), pieces=pieces, total_tokens=total, batch_invariant=False) == len(batch) * pieces
+    assert piece_capacity(num_seqs=432, pieces=16, total_tokens=131072, batch_invariant=True) == 448
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("states", [False, True], ids=["checkpoint_waves", "state_waves"])
+@pytest.mark.parametrize("waves", [2, 4])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+def test_head_waves_match_one_wave(monkeypatch, backend, variant, waves, states):
+    """A batch-invariant ragged batch in ``waves`` head waves (the forward's state waves; the backward's checkpoint waves alone
+    or with its state waves), each plan built and then replayed: o, final_state and every gradient are bitwise the one-wave run."""
+    from cudnn.linear_attention.frost import kda_engine
+
+    case = long_case(variant, [0, 17, 8193, 513], H=4, HK=4, HV=4)
+    state0, d_final, dO = bwd_inputs(case)
+    monkeypatch.setattr(kda_engine, "_KDA_STATE_WAVE_BYTES", 0 if states else 1 << 62)
+    results, asked = [], []
+    for divisor in (1, waves):
+        monkeypatch.setattr(kda_engine, "_forward_head_divisor", lambda *args, d=divisor: asked.append(("fwd", d)) or d)
+        monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args, d=divisor: asked.append(("bwd", d)) or d)
+        clear_caches()
+        for _ in range(2):
+            results.append(long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO))
+    assert {("fwd", waves), ("bwd", waves)} <= set(asked)
+    o, fs, grads, _, _ = results[0]
+    for o_run, fs_run, grads_run, _, _ in results[1:]:
+        assert_bitwise("o", o_run, o)
+        assert_bitwise("final_state", fs_run, fs)
+        for name, g in grads.items():
+            assert_bitwise(f"d{name}", grads_run[name], g)

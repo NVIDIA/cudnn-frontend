@@ -25,6 +25,10 @@ pytestmark = pytest.mark.skipif(
     reason="RoPE backend op (CUDNN_BACKEND_OPERATION_ROPE_FWD_DESCRIPTOR) requires cuDNN >= 9.24",
 )
 
+_requires_sdpa_sm80 = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8, reason="cuDNN SDPA (FP16 / BF16) requires SM80 or newer"
+)
+
 
 def rope_reference(x, freqs):
     """PyTorch reference for non-interleaved RoPE with raw freqs (BHSD layout).
@@ -52,6 +56,7 @@ def rope_reference(x, freqs):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+@_requires_sdpa_sm80
 def test_rope_sdpa_smoke():
     """Smoke test: build a RoPE+SDPA graph and verify it constructs."""
     B, S, H, D = 1, 128, 8, 128
@@ -142,6 +147,7 @@ def _run_rope_sdpa(B, H_q, H_k, S_q, S_kv, D, output_scale_q, output_scale_k, at
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+@_requires_sdpa_sm80
 def test_rope_output_scale_equivalence():
     """output_scale on Q-RoPE should be equivalent to multiplying attn_scale.
 
@@ -162,6 +168,7 @@ def test_rope_output_scale_equivalence():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+@_requires_sdpa_sm80
 def test_rope_output_scale_mscale_style():
     """YARN-style: scale on both Q-RoPE and K-RoPE should give mscale**2 on logits.
 
@@ -182,6 +189,7 @@ def test_rope_output_scale_mscale_style():
 @pytest.mark.L0
 @pytest.mark.skipif(cudnn.backend_version() < 92400, reason="RoPE backward op requires cuDNN >= 9.24")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+@_requires_sdpa_sm80
 def test_rope_sdpa_fwd_bwd_end_to_end():
     """End-to-end: build fwd graph (rope+sdpa), execute, then build bwd graph
     (sdpa_backward + rope_backward), execute, compare against PyTorch autograd
@@ -326,6 +334,7 @@ def test_rope_sdpa_fwd_bwd_end_to_end():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+@_requires_sdpa_sm80
 def test_rope_output_scale_matches_reference():
     """Standalone correctness: Q-RoPE with output_scale=α produces α * standard_rope(Q)."""
     import math

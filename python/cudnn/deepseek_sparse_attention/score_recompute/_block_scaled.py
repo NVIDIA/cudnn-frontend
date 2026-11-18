@@ -17,9 +17,10 @@ from typing import Optional
 import torch
 
 from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div
-from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100 import IndexerScoreSm100Base
 from .indexer_score_unified_sm100_mxfp4 import IndexerScoreUnifiedSm100Mxfp4
 from .indexer_score_unified_sm100_mxfp8 import IndexerScoreUnifiedSm100Mxfp8
+from .indexer_score_unified_sm100_nvfp4 import IndexerScoreUnifiedSm100Nvfp4
 
 
 @dataclass(frozen=True)
@@ -30,14 +31,18 @@ class BlockScaledFormat:
     their scales, or are ``None`` when the installed torch lacks them
     (``validate_indexer_precision`` reports that). One stored element holds
     ``elems_per_storage`` logical head_dim values (2 for packed FP4, whose last
-    dim is ``head_dim // 2``); each scale covers ``sf_vec_size`` of them.
+    dim is ``head_dim // 2``); each scale covers ``sf_vec_size`` of them, the
+    kernel class's own scale vector size.
     """
 
     data_dtype_name: str
     scale_dtype_name: str
-    sf_vec_size: int
     elems_per_storage: int
-    kernel_cls: type[IndexerScoreUnifiedSm100]
+    kernel_cls: type[IndexerScoreSm100Base]
+
+    @property
+    def sf_vec_size(self) -> int:
+        return self.kernel_cls.sf_vec_size
 
     @property
     def data_dtype(self) -> Optional[torch.dtype]:
@@ -52,21 +57,26 @@ BLOCK_SCALED_FORMATS = {
     "mxfp8": BlockScaledFormat(
         data_dtype_name="float8_e4m3fn",
         scale_dtype_name="float8_e8m0fnu",
-        sf_vec_size=32,
         elems_per_storage=1,
         kernel_cls=IndexerScoreUnifiedSm100Mxfp8,
     ),
     "mxfp4": BlockScaledFormat(
         data_dtype_name="float4_e2m1fn_x2",
         scale_dtype_name="float8_e8m0fnu",
-        sf_vec_size=32,
         elems_per_storage=2,
         kernel_cls=IndexerScoreUnifiedSm100Mxfp4,
     ),
+    # Non-negative E4M3 scales; the caller folds the per-tensor global decode scales into sm_scale.
+    "nvfp4": BlockScaledFormat(
+        data_dtype_name="float4_e2m1fn_x2",
+        scale_dtype_name="float8_e4m3fn",
+        elems_per_storage=2,
+        kernel_cls=IndexerScoreUnifiedSm100Nvfp4,
+    ),
 }
 SM100_INDEXER_PRECISIONS = ("bf16", *BLOCK_SCALED_FORMATS)
-# Block-scaled precision names for error messages: "'mxfp8' or 'mxfp4'".
-BLOCK_SCALED_PRECISION_NAMES = " or ".join(repr(name) for name in BLOCK_SCALED_FORMATS)
+# Block-scaled precision names for error messages: "'mxfp8', 'mxfp4' or 'nvfp4'".
+BLOCK_SCALED_PRECISION_NAMES = ", ".join(repr(name) for name in tuple(BLOCK_SCALED_FORMATS)[:-1]) + f" or {tuple(BLOCK_SCALED_FORMATS)[-1]!r}"
 # The only logical head dim the block-scaled indexer kernels support.
 BLOCK_SCALED_HEAD_DIM = 128
 
@@ -84,11 +94,18 @@ def validate_indexer_precision(precision: str) -> str:
     return precision
 
 
-def validate_sf_vec_size(precision: str, sf_vec_size: int) -> None:
-    """A block-scaled ``precision`` requires its format's scale vector size (``ValueError`` otherwise)."""
+def validate_sf_vec_size(precision: str, sf_vec_size: Optional[int]) -> Optional[int]:
+    """Scale vector size of ``precision``: ``None`` selects the block-scaled format's own (32 for MXFP8 / MXFP4, 16 for
+    NVFP4); any other value must equal it (``ValueError`` otherwise).  BF16 has no scales: it ignores ``sf_vec_size`` and
+    returns ``None``, so the value a caller passes does not split its compile keys."""
     fmt = BLOCK_SCALED_FORMATS.get(precision)
-    if fmt is not None and sf_vec_size != fmt.sf_vec_size:
+    if fmt is None:
+        return None
+    if sf_vec_size is None:
+        return fmt.sf_vec_size
+    if sf_vec_size != fmt.sf_vec_size:
         raise ValueError(f"precision={precision!r} currently requires sf_vec_size={fmt.sf_vec_size}")
+    return sf_vec_size
 
 
 def validate_block_scaled_inputs(

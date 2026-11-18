@@ -4,9 +4,10 @@
 """``cudnn.sdpa.fwd.config_sm100.make_cfg_d192`` -- the SM100 d192x128 forward config's per-tile knobs, host-only.
 
 Pins the fields the half-input single-CTA tile's L2-prefetching loader (``TemplateParams.cga1_l2_prefetch``) sets apart
-from the develop loader and the pair tile -- the K/V L2 prefetch, the TMA-LDG kv-loop unroll factor, the dense-causal
-exp2 tail emulation -- the K sub-stage ring and V ring depths, the validator pins, and the adapter's per-arch claim of the
-flag.  Device-independent: nothing here compiles or launches.
+from the develop loader and the pair tile -- the K/V L2 prefetch, the TMA-LDG kv-loop unroll factor -- the dense-causal
+arm's exp2-split spelling (``EXP2_TAIL_MIX``, from ``TemplateParams.exp2_fma_split`` and the loader), the K sub-stage ring
+and V ring depths, the validator pins, and the adapter's per-arch claim of the loader.  Device-independent: nothing here
+compiles or launches.
 """
 
 from __future__ import annotations
@@ -33,28 +34,36 @@ def _loader(cfg):
 
 
 def test_half_input_cga1_with_the_claim_prefetches_and_unrolls_once():
-    cfg = _cfg(dtype_qkv=2, cta_mma=1, cga1_l2_prefetch=True)
+    cfg = _cfg(dtype_qkv=2, cta_mma=1, cga1_l2_prefetch=True, exp2_fma_split=True)
     assert _loader(cfg) == (1, 1, 4, 1, 0)
     assert (cfg.STAGES_K, cfg.K_SUB, cfg.STAGES_V) == (1, 3, 2)
 
 
 def test_half_input_cga1_without_the_claim_keeps_the_develop_loader():
-    cfg = _cfg(dtype_qkv=2, cta_mma=1)
+    cfg = _cfg(dtype_qkv=2, cta_mma=1, exp2_fma_split=True)
     assert _loader(cfg) == (0, 0, 4, 6, 1)
     assert (cfg.STAGES_K, cfg.K_SUB, cfg.STAGES_V) == (1, 3, 2)
 
 
 @pytest.mark.parametrize("claim", [False, True])
 def test_pair_tile_ignores_the_claim(claim):
-    cfg = _cfg(dtype_qkv=2, cta_mma=2, cga1_l2_prefetch=claim)
+    cfg = _cfg(dtype_qkv=2, cta_mma=2, cga1_l2_prefetch=claim, exp2_fma_split=True)
     assert _loader(cfg) == (0, 0, 4, 6, 1)
     assert (cfg.STAGES_K, cfg.K_SUB, cfg.STAGES_V) == (2, 1, 2)
 
 
 def test_fp8_single_cta_tile_ignores_the_claim():
-    cfg = _cfg(dtype_qkv=_E4M3, cta_mma=1, cga1_l2_prefetch=True)
+    cfg = _cfg(dtype_qkv=_E4M3, cta_mma=1, cga1_l2_prefetch=True, exp2_fma_split=True)
     assert _loader(cfg) == (0, 0, 4, 6, 1)
     assert (cfg.K_SUB, cfg.STAGES_V) == (1, cfg.STAGES_KV)
+
+
+@pytest.mark.parametrize("cta_mma", [1, 2])
+@pytest.mark.parametrize("split", [False, True])
+def test_causal_arm_spelling_follows_the_exp2_split_claim(cta_mma, split):
+    assert _cfg(dtype_qkv=2, cta_mma=cta_mma, exp2_fma_split=split).EXP2_TAIL_MIX == int(split)
+    with_loader = _cfg(dtype_qkv=2, cta_mma=cta_mma, exp2_fma_split=split, cga1_l2_prefetch=True)
+    assert with_loader.EXP2_TAIL_MIX == (int(split) if cta_mma == 2 else 0)
 
 
 @pytest.mark.parametrize(
@@ -64,7 +73,7 @@ def test_fp8_single_cta_tile_ignores_the_claim():
         ("L2_PREFETCH_NEXT_TILE", 0, "next-tile L2 prefetch"),
         ("L2_PREFETCH_MIN_STEPS", 0, "L2_PREFETCH_MIN_STEPS"),
         ("LDG_UNROLL", 6, "unrolled"),
-        ("EXP2_TAIL_MIX", 1, "tail emulation"),
+        ("EXP2_TAIL_MIX", 1, "exp2-split spelling"),
     ],
 )
 def test_validator_pins_the_prefetching_loader_knobs(field, value, match):

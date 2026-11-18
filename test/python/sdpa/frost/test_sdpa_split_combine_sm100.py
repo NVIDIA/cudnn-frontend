@@ -456,3 +456,62 @@ def test_pointer_combine_q_lens_is_a_dense_sink_specialization():
         comb.compile_ptr(dtype_o="bf16", has_lse=True, has_q_lens=True)
     with pytest.raises(ValueError, match="dense"):
         comb.compile_ptr(dtype_o="bf16", has_lse=True, has_sink=True, has_q_lens=True, ragged=True)
+
+
+@pytest.mark.parametrize("partial_tag", ["f16", "bf16", "f32"])
+@pytest.mark.parametrize("splits", [3, 17])
+@pytest.mark.parametrize("sq", [1, 5])
+def test_pointer_combine_infinite_sink_endpoints(partial_tag, splits, sq):
+    """Dominating and disabled sinks retain their semantics in every combine form."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    b, h, d = 2, 3, 128
+    op, lp, _, _ = _partials(b, h, sq, d, splits)
+    op = op.to({"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[partial_tag])
+    op.view(splits, b, sq, h, d)[:, 1].fill_(torch.nan)
+    lp.view(splits, b, h, sq)[:, 1].fill_(-torch.inf)
+    sinks = torch.tensor([-torch.inf, torch.inf, 0.7], device="cuda")
+    ql = torch.tensor([sq, 0], dtype=torch.int32, device="cuda")
+    scores = lp.view(splits, b, h, sq).cpu().double()
+    values = op.view(splits, b, sq, h, d).cpu().double()
+    sink_cpu = sinks.cpu().double().view(1, h, 1).expand(b, h, sq).clone()
+    sink_cpu[1].fill_(-torch.inf)
+    ref_lse = torch.logaddexp(scores.logsumexp(0), sink_cpu)
+    weights = torch.where(torch.isfinite(scores) & torch.isfinite(ref_lse), torch.exp(scores - ref_lse), 0.0)
+    values = values.masked_fill(~torch.isfinite(scores).permute(0, 1, 3, 2).unsqueeze(-1), 0)
+    ref = (weights.permute(0, 1, 3, 2).unsqueeze(-1) * values).sum(0)
+    out = torch.empty(b, sq, h, d, dtype=torch.bfloat16, device="cuda")
+    stats = torch.empty(b, h, sq, device="cuda")
+    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", dtype_partial=partial_tag, has_lse=True, has_sink=True, has_q_lens=True))
+
+    def run():
+        fn(
+            op.data_ptr(),
+            lp.data_ptr(),
+            out.data_ptr(),
+            stats.data_ptr(),
+            (b, h, sq, d),
+            splits,
+            out.stride(),
+            stats.stride(),
+            sinks.data_ptr(),
+            ql.data_ptr(),
+            torch.cuda.current_stream().cuda_stream,
+        )
+
+    run()
+    torch.testing.assert_close(out.cpu().double(), ref, atol=0.004, rtol=0.004)
+    torch.testing.assert_close(stats.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+    before = (out.clone(), stats.clone())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    out.fill_(71)
+    stats.fill_(71)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.uint8), before[0].view(torch.uint8))
+    assert torch.equal(stats.view(torch.uint8), before[1].view(torch.uint8))

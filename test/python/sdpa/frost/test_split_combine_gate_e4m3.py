@@ -28,8 +28,9 @@ cc 10.7 rule selects it for, the f16 underflow boundary of the twin claim (48 ag
 within the ulp), the saturation contract (+-448, never NaN, where the scaled value exceeds the e4m3 range), the strided e4m3 output
 (the element path: canaries kept, bytes bitwise the packed path's), the PDL arm bitwise the plain arm; (3) the ADAPTER's op attribute (``o``
 float8_e4m3fn + ``out_scale`` + the epilogue gate on a split plan) with its declines by name, its combine-form rule on the Blackwell explicit-lean
-parts (the cc 10.7 split-aware rule's shape on cc 10.0, measured on the GB200 class 2026-10-28; cc 10.3 keeps the module's own forms), the lean
-route end to end on ANY SM100-line part (cc 10.0 / 10.3 serve the explicit lean tile; the combine form is the part's own rule) and the tcgen05
+parts (the cc 10.7 split-aware rule's shape on cc 10.0 and cc 10.3, measured on the GB200 class 2026-10-28 and on a GB300 2026-11-05; an
+unmeasured part keeps the module's own forms), the lean route end to end on ANY SM100-line part (cc 10.0 / 10.3 serve the explicit lean
+tile; the combine form is the part's own rule) and the tcgen05
 route's split plan on a Rubin part (the module's own forms inside the bound, the lean group walk on an overflow grid), each against the same
 route with a bf16 ``o`` plus the torch cast.
 
@@ -383,9 +384,10 @@ def _frame_adapter(
 @requires_dsl
 def test_adapter_declares_the_fused_store_by_operand_and_pins_the_combine_form_per_part():
     """``o`` float8_e4m3fn + ``out_scale`` + the epilogue gate on the lean route is the fused entry (an op attribute: the output operand's dtype
-    and a scale operand, never a knob); on cc 10.0 the lean route's combine FORM follows the cc 10.7 split-aware rule's shape (the decode-grid
-    kernel on the small grids from split 8, on the 384-row grid from split 32, the module's own forms otherwise), on cc 10.3 it keeps the module's
-    own forms (unmeasured), on cc 10.7 nothing changes; the declines name the arm (``ValueError`` for a malformed declaration, ``NotImplementedError``
+    and a scale operand, never a knob); on cc 10.0 and cc 10.3 the lean route's combine FORM follows the cc 10.7 split-aware rule's shape (the
+    decode-grid kernel on the small grids from split 8, on the 384-row grid from split 32, the module's own forms otherwise -- measured on the
+    GB200 class 2026-10-28 and on a GB300 2026-11-05), an unmeasured SM100-line part (cc 11.0 here) keeps the module's own forms, on cc 10.7
+    nothing changes; the declines name the arm (``ValueError`` for a malformed declaration, ``NotImplementedError``
     for an unwired form); the tcgen05 core's split plan takes the fused store too (its forms: the module's own inside the bound, the lean group
     walk on an overflow grid on cc 10.7) and is declined on the explicit-lean parts; the record states the explicit part set and appends."""
     from cudnn.sdpa.fwd import sparse_tile_rules as H
@@ -393,9 +395,12 @@ def test_adapter_declares_the_fused_store_by_operand_and_pins_the_combine_form_p
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as sc
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SPARSE_CAPABILITIES, SparseGqaFwdDslSm107, _sparse_combine_decode_grid
 
-    assert H.SPARSE_LEAN_COMBINE_RULE_CCS == ((10, 0),) and H._SPARSE_LEAN_COMBINE_RULE_SOURCE_CC == _DECODE_COMBINE_RULE_CC == (10, 7)
-    assert H.sparse_lean_combine_rule_cc((10, 0), lean=True) == (10, 7) and H.sparse_lean_combine_rule_cc((10, 0), lean=False) == (10, 0)
-    assert H.sparse_lean_combine_rule_cc((10, 3), lean=True) == (10, 3) and H.sparse_lean_combine_rule_cc((10, 7), lean=True) == (10, 7)
+    assert H.SPARSE_LEAN_COMBINE_RULE_CCS == ((10, 0), (10, 3)) and H._SPARSE_LEAN_COMBINE_RULE_SOURCE_CC == _DECODE_COMBINE_RULE_CC == (10, 7)
+    for cc in H.SPARSE_LEAN_COMBINE_RULE_CCS:  # the measured parts: a lean plan reads the cc 10.7 rule, the tcgen05 body its own part
+        assert H.sparse_lean_combine_rule_cc(cc, lean=True) == (10, 7) and H.sparse_lean_combine_rule_cc(cc, lean=False) == cc, cc
+    assert H.sparse_lean_combine_rule_cc((10, 7), lean=True) == (10, 7)
+    for cc in ((11, 0), (11, 5), (12, 0)):  # a part outside the tuple keeps its own reading, lean or not
+        assert H.sparse_lean_combine_rule_cc(cc, lean=True) == H.sparse_lean_combine_rule_cc(cc, lean=False) == cc, cc
     assert SPARSE_CAPABILITIES.gated_e4m3_out is True
     assert list(inspect.signature(SparseGqaFwdDslSm107.__init__).parameters)[-2:] == [
         "out_scale",
@@ -415,19 +420,23 @@ def test_adapter_declares_the_fused_store_by_operand_and_pins_the_combine_form_p
     }.items():
         code = {"auto": sc.DECODE_GRID_AUTO, "off": sc.DECODE_GRID_OFF}[want]
         assert _sparse_combine_decode_grid(b, 24, s_q, split, (10, 0), lean=True) == code, (b, s_q, split, want)
+        assert _sparse_combine_decode_grid(b, 24, s_q, split, (10, 3), lean=True) == code, "cc 10.3 reads the same rule (measured on a GB300 2026-11-05)"
         assert _sparse_combine_decode_grid(b, 24, s_q, split, (10, 7), lean=True) == code, "cc 10.7 reads the same rule"
-        assert _sparse_combine_decode_grid(b, 24, s_q, split, (10, 3), lean=True) == sc.DECODE_GRID_OFF, "cc 10.3: unmeasured, the module's own forms"
-        assert _sparse_combine_decode_grid(b, 24, s_q, split, (10, 0), lean=False) == sc.DECODE_GRID_OFF, "the tcgen05 body keeps the former reading"
-        assert _sparse_combine_decode_grid(b, 24, s_q, split, (10, 0)) == sc.DECODE_GRID_OFF, "a caller of the former 5-argument form reads as before"
-    # the declaration: the explicit lean route on cc 10.0 with the fused store
-    for cc in ((10, 0), (10, 7)):
+        for cc in ((11, 0), (11, 5), (12, 0)):
+            assert _sparse_combine_decode_grid(b, 24, s_q, split, cc, lean=True) == sc.DECODE_GRID_OFF, (cc, "outside the tuple: the module's own forms")
+        for cc in ((10, 0), (10, 3)):
+            assert _sparse_combine_decode_grid(b, 24, s_q, split, cc, lean=False) == sc.DECODE_GRID_OFF, (cc, "the tcgen05 body keeps the former reading")
+            assert _sparse_combine_decode_grid(b, 24, s_q, split, cc) == sc.DECODE_GRID_OFF, (cc, "a caller of the former 5-argument form reads as before")
+    # the declaration: the explicit lean route on the measured parts (cc 10.0 / 10.3) and on cc 10.7 with the fused store -- one form on all three
+    for cc in ((10, 0), (10, 3), (10, 7)):
         a = _frame_adapter(cc=cc, tile_form="lean")
         assert a.check_support() and a.fused_e4m3 and a.tile_form == "lean" and (a.split_kv, a.sub_tiles_per_cta) == (65, 1)
         assert a.combine_form() == sc.DECODE_GRID_AUTO, cc
         a4 = _frame_adapter(cc=cc, tile_form="lean", B=4, SQ=4, sub_tiles_per_cta=4)
         assert a4.check_support() and a4.fused_e4m3 and a4.split_kv == 17 and a4.combine_form() == sc.DECODE_GRID_OFF, cc
-    a3 = _frame_adapter(cc=(10, 3), tile_form="lean")
-    assert a3.check_support() and a3.fused_e4m3 and a3.combine_form() == sc.DECODE_GRID_OFF
+    # a part outside the tuple that the adapter serves (cc 11.0: inside the core's record, the explicit lean tile) keeps the module's own forms
+    a11 = _frame_adapter(cc=(11, 0), tile_form="lean")
+    assert a11.check_support() and a11.fused_e4m3 and a11.split_kv == 65 and a11.combine_form() == sc.DECODE_GRID_OFF
     plain = _frame_adapter(cc=(10, 0), tile_form="lean", out_dtype=torch.bfloat16, out_scale=False)
     assert (
         plain.check_support() and not plain.fused_e4m3 and plain.combine_form() == sc.DECODE_GRID_AUTO
@@ -966,7 +975,8 @@ def _adapter_fused_cell(*, tile_form, split, B, SQ, kv_lens, paged, seed, out_ro
     half, ah = run(torch.bfloat16, 1)
     cc = torch.cuda.get_device_capability(q.device)
     want_split = split or 65
-    # the part's OWN rule: cc 10.7 and (for a lean plan) cc 10.0 the split-aware rule, cc 10.3 the module's own forms, the tcgen05 body as before
+    # the part's OWN rule: cc 10.7 and (for a lean plan) cc 10.0 / 10.3 the split-aware rule, a part outside the tuple the module's own forms,
+    # the tcgen05 body as before
     want_form = _sparse_combine_decode_grid(B, H, SQ, want_split, cc, lean=(tile_form == "lean"))
     assert af.fused_e4m3 and not ah.fused_e4m3 and af.tile_form == ah.tile_form == tile_form and af.split_kv == ah.split_kv == want_split
     assert af.combine_form() == ah.combine_form() == want_form == af._combine_form, (cc, want_form)
@@ -995,12 +1005,13 @@ def _adapter_fused_cell(*, tile_form, split, B, SQ, kv_lens, paged, seed, out_ro
 def test_adapter_lean_route_fused_e4m3_store(B, SQ, kv_lens, paged, rounding):
     """The explicit lean route on the part under test -- cc 10.7 (the measured part) or an admitted Blackwell part (cc 10.0 / 10.3: the accept test
     of the explicit admission, which has no other GPU row) -- with the fused store in both rounding conventions; the combine form is the part's
-    own rule (the decode-grid kernel at split 65 on cc 10.0 and cc 10.7, the module's own forms on cc 10.3)."""
+    own rule (the decode-grid kernel at split 65 on cc 10.0, 10.3 and 10.7 -- the measured parts; an SM100-line part outside the tuple keeps
+    the module's own forms)."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as sc
 
     hist, form = _adapter_fused_cell(tile_form="lean", split=0, B=B, SQ=SQ, kv_lens=kv_lens, paged=paged, seed=B + SQ, out_rounding=rounding)
     cc = torch.cuda.get_device_capability()
-    assert form == (sc.DECODE_GRID_OFF if cc == (10, 3) else sc.DECODE_GRID_AUTO), (cc, form)
+    assert form == (sc.DECODE_GRID_AUTO if cc in ((10, 0), (10, 3), (10, 7)) else sc.DECODE_GRID_OFF), (cc, form)
     print(f"\nadapter lean route fused e4m3 ({rounding}) B={B} S_q={SQ} lens={kv_lens} paged={paged} cc={cc} form={form}: vs the bf16 route's model {hist}")
 
 

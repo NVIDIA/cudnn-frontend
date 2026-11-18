@@ -47,7 +47,7 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
 from ._support import (
     check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
-    resolve_m_block_size as _resolve_m_block_size,
+    validate_bf16_tile as _validate_bf16_tile,
     resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
@@ -130,7 +130,7 @@ def _use_cand_2d(precision: str, pbf: int) -> bool:
     batch base ``batch_idx*pbf`` is computed in 64-bit by CuTe's crd2idx, so
     ``bs*pbf`` may exceed 2^31 with no overflow (verified at ``bs*pbf=2.2e9`` by the
     opt-in ``test_indexer_fwd_dsl_compress_cand_2d_high_offset_64bit``).  bf16 BSHD only:
-    the block-scaled (MXFP8/MXFP4) epilogue and varlen use the 1D store.
+    the block-scaled (MXFP8 / MXFP4 / NVFP4) epilogue and varlen use the 1D store.
     """
     return precision == "bf16" and pbf < (1 << 31)
 
@@ -144,6 +144,7 @@ def compress_topk_cand_buffer_size(
     return_lse: bool = False,
     q_causal_offsets: torch.Tensor | None = None,
     precision: str = "bf16",
+    paged: bool = False,
 ) -> int:
     """Number of float32 elements a caller-provided ``cand_buffer`` must hold for
     ``indexer_fwd_compress_topk`` at this BSHD shape.  It is ``bs * per_batch_floats``; for a
@@ -160,9 +161,14 @@ def compress_topk_cand_buffer_size(
     match the launch contract, ``return_lse=True`` with an explicit
     ``microbatch_rows > 0`` raises here too (microbatch + LSE is unsupported).
 
-    Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``)
+    Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``,
+    ``"nvfp4"``)
     always run a single launch, so this returns the full buffer and an explicit
-    ``microbatch_rows > 0`` raises, as at launch."""
+    ``microbatch_rows > 0`` raises, as at launch.
+
+    Pass ``paged=True`` when the launch reads K through ``block_table`` / ``kv_lens``
+    (``seqlen_k`` is then the launch's ``max_seqlen_k``): paged K also runs a single
+    launch, with the same full-buffer sizing and the same ``microbatch_rows > 0`` error."""
     from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
 
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
@@ -170,6 +176,10 @@ def compress_topk_cand_buffer_size(
     if precision in BLOCK_SCALED_FORMATS:
         if microbatch_rows > 0:
             raise NotImplementedError(f"microbatch_rows is not supported with precision={precision!r} " "(per-window scale repacking is not implemented)")
+        microbatch_rows = 0
+    if paged:
+        if microbatch_rows > 0:
+            raise NotImplementedError("microbatch_rows > 0 is not supported with paged K; pass microbatch_rows=0")
         microbatch_rows = 0
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:
@@ -261,7 +271,7 @@ def indexer_fwd_compress_topk(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     topk_block_threads: int = -1,
     topk_indices_global: bool = False,
     cand_buffer: Optional[torch.Tensor] = None,
@@ -281,9 +291,10 @@ def indexer_fwd_compress_topk(
 ) -> tuple[torch.Tensor, ...]:
     """Compress-logits + top-k (CuTe DSL, BSHD).
 
-    ``precision`` is ``"bf16"`` (default), ``"mxfp8"``, or ``"mxfp4"``.  The
-    block-scaled precisions take blockscaled-packed E8M0 ``q_scale``/``k_scale``
-    (same packing as ``indexer_fwd``).  Microbatching is bf16-only.
+    ``precision`` is ``"bf16"`` (default), ``"mxfp8"``, ``"mxfp4"`` or ``"nvfp4"``.
+    The block-scaled precisions take blockscaled-packed ``q_scale``/``k_scale``
+    (E8M0, or E4M3 for NVFP4; same packing as ``indexer_fwd``).  Microbatching is
+    bf16-only.
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K
     from a page pool ``(num_pages, page_size, 1, head_dim)`` instead of a dense
@@ -298,7 +309,7 @@ def indexer_fwd_compress_topk(
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` [BF16; E4M3 with
             precision="mxfp8"; packed ``float4_e2m1fn_x2`` with last dim
-            ``head_dim // 2`` with precision="mxfp4"]
+            ``head_dim // 2`` with precision="mxfp4" or "nvfp4"]
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` [same dtype rules as q]
         w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16 or FP32 for BF16 Q/K;
             BF16 for block-scaled Q/K.
@@ -374,7 +385,7 @@ def indexer_fwd_compress_topk(
     if is_block_scaled:
         # A dtype/device mismatch would otherwise fail cryptically at compile or run time.
         validate_block_scaled_inputs(precision, q, k, w, q_scale, k_scale)
-    validate_sf_vec_size(precision, sf_vec_size)
+    sf_vec_size = validate_sf_vec_size(precision, sf_vec_size)
 
     bs, seqlen_q, n_heads_q, head_dim = q.shape
     paged = _check_paged_args(block_table, kv_lens)
@@ -418,7 +429,7 @@ def indexer_fwd_compress_topk(
     if n_heads_kv != 1:
         raise ValueError("compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}. The stage-1 GEMM reads only KV head 0.")
     if precision == "bf16":
-        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
+        _validate_bf16_tile(m_block_size, head_dim, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
@@ -612,7 +623,6 @@ def indexer_fwd_compress_topk(
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
-    unified_kv_stage = 4
     # Without LSE the denom slot is compiled out: None at compile and launch (R3).
     lse_buf = (lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)) if want_lse else None
     denom_tmp = lse_buf
@@ -659,9 +669,7 @@ def indexer_fwd_compress_topk(
         m_block_size,
         n_block_size,
         unified_k_block_size,
-        unified_kv_stage,
         sf_vec_size,
-        float(sm_scale),
         seqlen_q,
         None if paged else seqlen_k,  # paged: the key extent is a runtime bound
         page_size,
@@ -692,8 +700,6 @@ def indexer_fwd_compress_topk(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=64,
-                kv_stage=24,
                 ratio=ratio,
                 is_varlen=False,
                 sf_vec_size=sf_vec_size,
@@ -728,7 +734,6 @@ def indexer_fwd_compress_topk(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=unified_k_block_size,
-                kv_stage=unified_kv_stage,
                 ratio=ratio,
                 is_varlen=False,
                 compute_lse=want_lse,
@@ -935,7 +940,7 @@ def _run_compress_gemm_varlen(
     k_scale=None,
     cu_seqlens_q_scale_padded=None,
     cu_seqlens_k_scale_padded=None,
-    sf_vec_size=32,
+    sf_vec_size=None,
     want_lse=False,
     lse_out=None,
     page_size=0,
@@ -951,7 +956,7 @@ def _run_compress_gemm_varlen(
     ``page_size > 0`` reads K from a page pool through ``block_table`` / ``kv_lens``
     (BF16 only); ``cu_seqlens_k`` is then ``None``.
 
-    A block-scaled ``precision`` (``'mxfp8'`` or ``'mxfp4'``) runs the blockscaled
+    A block-scaled ``precision`` (``'mxfp8'``, ``'mxfp4'`` or ``'nvfp4'``) runs the blockscaled
     logits GEMM on the format's Q/K and packed scales (see ``indexer_fwd_compress_topk``).
     THD concatenates per-sequence padded scale regions along ``MN`` and keeps
     only KV heads in ``L``. The user-provided Q/K scale prefixes are consumed
@@ -986,7 +991,6 @@ def _run_compress_gemm_varlen(
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
-    unified_kv_stage = 4
 
     if precision in BLOCK_SCALED_FORMATS:
         # Data uses compact cu_seqlens offsets. Scale regions are independently padded
@@ -1009,7 +1013,6 @@ def _run_compress_gemm_varlen(
             m_block_size,
             n_block_size,
             sf_vec_size,
-            float(sm_scale),
             int(max_seqlen_q),
             int(max_seqlen_k),
             q_causal_offsets is not None,
@@ -1037,8 +1040,6 @@ def _run_compress_gemm_varlen(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=64,
-                kv_stage=24,
                 ratio=ratio,
                 is_varlen=True,
                 sf_vec_size=sf_vec_size,
@@ -1101,8 +1102,6 @@ def _run_compress_gemm_varlen(
         m_block_size,
         n_block_size,
         unified_k_block_size,
-        unified_kv_stage,
-        float(sm_scale),
         int(max_seqlen_q),
         None if page_size else int(max_seqlen_k),  # paged: a runtime bound, not a layout parameter
         q_causal_offsets is not None,
@@ -1128,7 +1127,6 @@ def _run_compress_gemm_varlen(
             m_block_size=m_block_size,
             n_block_size=n_block_size,
             k_block_size=unified_k_block_size,
-            kv_stage=unified_kv_stage,
             ratio=ratio,
             is_varlen=True,
             compute_lse=want_lse,
@@ -1197,7 +1195,7 @@ def _indexer_fwd_compress_topk_thd(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     topk_block_threads: int = -1,
     topk_indices_global: bool = True,
     cand_buffer: Optional[torch.Tensor] = None,
@@ -1213,16 +1211,17 @@ def _indexer_fwd_compress_topk_thd(
     block_table: Optional[torch.Tensor] = None,
     kv_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
-    """THD/varlen compressed-logits top-k, supporting BF16, MXFP8, and MXFP4.
+    """THD/varlen compressed-logits top-k, supporting BF16, MXFP8, MXFP4 and NVFP4.
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K from a
     page pool ``(num_pages, page_size, 1, head_dim)`` (BF16, local ids); ``cu_seqlens_k``
     is then ``None`` and ``max_seqlen_k`` defaults to ``max_pages * page_size``.
 
     A block-scaled ``precision`` runs the blockscaled logits GEMM with
-    blockscaled-packed E8M0 scales: for ``'mxfp8'``, ``q``/``k`` are
-    ``float8_e4m3fn``; for ``'mxfp4'``, they are packed ``float4_e2m1fn_x2``
-    (last dim ``head_dim // 2``).
+    blockscaled-packed scales: for ``'mxfp8'``, ``q``/``k`` are
+    ``float8_e4m3fn`` with E8M0 scales; for ``'mxfp4'`` and ``'nvfp4'``, they are
+    packed ``float4_e2m1fn_x2`` (last dim ``head_dim // 2``) with E8M0 scales per
+    32 values (MXFP4) or E4M3 scales per 16 (NVFP4).
     THD requires both scale-padded prefixes and concatenates per-sequence scale regions
     along ``MN``. The user-provided prefix values are consumed verbatim; spans may
     exceed the logical lengths, but each Q span times ``qhead_per_kv_head`` and
@@ -1275,7 +1274,7 @@ def _indexer_fwd_compress_topk_thd(
         raise ValueError(f"Block scales and scale padded cu_seqlens require precision={BLOCK_SCALED_PRECISION_NAMES}")
     # The THD scale contract (regions concatenated along MN, addressed by the padded
     # prefixes, L = KV head only) is validated below once bs/head metadata is known.
-    validate_sf_vec_size(precision, sf_vec_size)
+    sf_vec_size = validate_sf_vec_size(precision, sf_vec_size)
     paged = _check_paged_args(block_table, kv_lens)
     if q.ndim != 3 or k.ndim != (4 if paged else 3) or w.ndim != 2:
         raise ValueError("THD compressed-logits top-k expects q (T_q,H,D), k (T_k,Hkv,D) or a page pool (num_pages,page,Hkv,D), w (T_q,H)")
@@ -1348,7 +1347,7 @@ def _indexer_fwd_compress_topk_thd(
             device=device,
         )
     if precision == "bf16":
-        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
+        _validate_bf16_tile(m_block_size, head_dim, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     cu_q32 = cu_seqlens_q.to(torch.int32)

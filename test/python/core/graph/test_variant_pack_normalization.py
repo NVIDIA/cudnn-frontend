@@ -160,7 +160,7 @@ def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
     gate = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="g")
     beta = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="beta")
     cu = g.tensor([nseq + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
-    out, _fs, _h = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
+    out, _fs, _h, _composed = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
     out.set_output(True).set_data_type(dt)
     try:
         g.build()
@@ -280,7 +280,6 @@ def test_a_narrower_buffer_covering_the_slot_count_but_not_the_bytes_is_not_re_d
 
 
 @pytest.mark.L0
-@pytest.mark.L0
 def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
     """FlashInfer binds packed fp4 as uint8 and the e4m3 scale blob as uint8:
     the declaration names the dtype, the buffer only has to be as wide. A
@@ -329,6 +328,7 @@ def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
     assert pack.dtype(0) == (17, 4)
 
 
+@pytest.mark.L0
 def test_storage_geometry_packs_fp4_two_per_slot():
     from cudnn.graph_types import storage_geometry as _storage_geometry
 

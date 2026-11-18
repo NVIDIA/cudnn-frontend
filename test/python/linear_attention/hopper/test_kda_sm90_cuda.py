@@ -21,6 +21,8 @@ cannot reach:
   moment anything on the path allocates or synchronises per call.
 """
 
+import importlib.util
+
 import pytest
 import torch
 
@@ -41,6 +43,14 @@ def _hopper() -> bool:
 
 
 requires_hopper = pytest.mark.skipif(not _hopper(), reason="the sm90 CUDA KDA engine needs Hopper")
+
+
+def _has_cutile() -> bool:
+    """Whether the optional cuda.tile runtime (the ``[cutile]`` extra) is installed."""
+    try:
+        return importlib.util.find_spec("cuda.tile") is not None
+    except ModuleNotFoundError:  # no ``cuda`` package at all
+        return False
 
 
 def make_case(T=2048, H=12, N=1, dim=128, lower_bound=-5.0, seed=7):
@@ -81,13 +91,14 @@ def launched_kernels(fn):
 
 @requires_hopper
 def test_is_the_default_on_hopper():
-    """An unpinned call picks the fused CUDA engine, not slot-1 cuTile."""
+    """An unpinned call picks the fused CUDA engine, not cuTile."""
     q, k, v, g, beta, cu, s0 = make_case()
     kernels = launched_kernels(lambda: kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True))
     assert any("kda_fused" in name for name in kernels), f"expected kda_fused, got {kernels[:3]}"
 
 
 @requires_hopper
+@pytest.mark.skipif(not _has_cutile(), reason="pins kda_cutile, which needs the optional cuda.tile runtime ([cutile] extra)")
 def test_plan_name_still_overrides():
     """Ranking is a default, not a lock: naming another engine still runs it.
 
@@ -166,8 +177,15 @@ def test_declined_graph_falls_through():
 
     RED-then-green history: with ranking but no eligibility filter this launched
     the 128-only kernel on 64-dim tensors and raised an illegal memory access.
+
+    Without the optional cuTile engine nothing on Hopper serves this graph, so
+    the call must decline it, with the 128-only engine's own reason.
     """
     q, k, v, g, beta, cu, s0 = make_case(T=512, H=4, dim=64)
+    if not _has_cutile():
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="kda_hopper_cuda: .*head dims must be 128"):
+            kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True)
+        return
     out, final_state = kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True)[:2]
     torch.cuda.synchronize()
     assert torch.isfinite(out).all() and torch.isfinite(final_state).all()
@@ -257,7 +275,7 @@ def test_in_kernel_gate_masks_the_partial_tail(seq_lens):
     sequence, and the rest of the kernel relies on a padded gate being 0. Both
     fusions map 0 to something non-zero -- the gate to lb*sigmoid(ea*dt_bias),
     the sigmoid to 0.5 -- so an unmasked transform corrupts the chunk-cumulative
-    decay of any PARTIAL tail chunk. Equal-split varlen shapes (2048 tokens over
+    decay of any PARTIAL tail chunk. Equal-length varlen shapes (2048 tokens over
     4 sequences) have no partial tail and never saw it; FlashInfer's [0, 65, 0,
     33] case did, as a 0.41 relative error on final_state.
     """

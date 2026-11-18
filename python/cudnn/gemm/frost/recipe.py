@@ -13,7 +13,7 @@ from cudnn.frost.buffers import DeviceView, dtype_name, init_word, is_contiguous
 
 from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
-from .layouts import fold_batch_layout
+from .layouts import checked_layout, fold_batch_layout
 
 # An operand's three axes, named by role rather than by position.
 AX_BATCH, AX_MN, AX_K = 0, 1, 2
@@ -152,6 +152,38 @@ class Aux:
     ref: Any  # TensorRef, for the fake-shape reshape
     mainloop_scale: PerKScaleRule | None = None
     transposed: bool = False
+    access_rule: OperandAuxRule | None = None
+
+
+@dataclass(frozen=True)
+class OperandAuxRule:
+    """Fixed logical shape and domain, allowing arbitrary nonnegative read strides."""
+
+    shape: tuple[int, ...]
+    dtype: str
+    domains: tuple[tuple[bool, tuple[int, int, int]], ...]  # each consumer's canonical domain
+    name: str
+
+    def check(self, buffer, k: int, m: int, n: int) -> None:
+        if tuple(buffer.shape) != self.shape or dtype_name(buffer) != self.dtype:
+            raise ValueError(f"operand aux {self.name!r}: expected {self.dtype} shape {self.shape}")
+        checked_layout(buffer.shape, buffer.stride())
+        for is_b, domain in self.domains:
+            if (int(n if is_b else m), int(k)) != domain[1:]:
+                raise ValueError(f"operand aux {self.name!r}: fixed broadcast domain {domain} requires rebuilding for this matrix shape")
+
+
+def _operand_aux_rule(ref, chain: FusionChain) -> OperandAuxRule | None:
+    if not ref.coordinate_mapped:
+        return None
+    domains = tuple(
+        (is_b, op.operand_access.domain)
+        for is_b, ops in ((False, chain.mainloop_a_ops), (True, chain.mainloop_b_ops))
+        for op in ops
+        if op.aux == ref.name and op.operand_access is not None
+    )
+    dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}[ref.dtype]
+    return OperandAuxRule(ref.dim, dtype, domains, ref.name)
 
 
 @dataclass(frozen=True)
@@ -453,6 +485,9 @@ def check_shapes(recipe: GemmRecipe, operands, mnk, axes) -> None:
     if recipe.block_size:
         reasons.append(_sf_blob_reject(recipe, operands, axes, mnk))
     _raise_first(reasons)
+    for aux in recipe.aux:
+        if aux.access_rule is not None:
+            aux.access_rule.check(operands[aux.index], mnk[2], mnk[0], mnk[1])
 
 
 def check_split_k_shape(k: int, n: int, batch: int, slices: int, cta_k_elems: int, reducer_elems: int = 1) -> None:
@@ -601,6 +636,7 @@ def build(compiled) -> GemmRecipe:
             ref=ref,
             mainloop_scale=_per_k_rule(ref, swap_ab ^ bool(binding.aux_transposed and binding.aux_transposed[i])),
             transposed=bool(binding.aux_transposed and binding.aux_transposed[i]),
+            access_rule=_operand_aux_rule(ref, chain),
         )
         for i, (t, ref) in enumerate(zip(binding.aux, chain.aux_tensors))
     )

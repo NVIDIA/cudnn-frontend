@@ -1,0 +1,37 @@
+{
+  "inputs": {
+    "x": {
+      "dtype": "torch.float32",
+      "sha256": "395a845eb17ac33a92f7b311d9c4aae369346dc3f6e74b41575ba9a3ae19c13c",
+      "shape": [
+        1,
+        257
+      ]
+    }
+  },
+  "outputs": {
+    "sum": {
+      "dtype": "torch.float32",
+      "sha256": "22863b55b779bdf07bc4370cddc5aaa7521506346d6828d651808a267003312e",
+      "shape": [
+        1,
+        1
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13030,
+    "cudnn": 92900,
+    "cutlass": "4.7.1",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.14.0a0+4fdf77b940.nv26.08",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}

@@ -28,14 +28,14 @@ RUBIN_DISPATCH_CASES = [
         id="grouped_gemm_quant",
     ),
     pytest.param(
-        "cudnn.gemm.cutedsl.grouped.glu.api",
+        "cudnn.gemm.cutedsl.grouped.glu._blockscaled_api",
         "cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias",
         "BlockScaledMoEGroupedGemmGluBiasKernel",
         "moe_blockscaled_grouped_gemm_glu_rubin.py",
         id="grouped_gemm_glu",
     ),
     pytest.param(
-        "cudnn.gemm.cutedsl.grouped.dglu.api",
+        "cudnn.gemm.cutedsl.grouped.dglu._blockscaled_api",
         "cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_dbias",
         "BlockScaledMoEGroupedGemmDgluDbiasKernel",
         "moe_blockscaled_grouped_gemm_dglu_rubin.py",
@@ -58,6 +58,7 @@ def _import_api_module(module_path: str):
     return importlib.import_module(module_path)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "api_module_path,default_module_path,default_kernel_name,rubin_filename",
     RUBIN_DISPATCH_CASES,
@@ -73,6 +74,7 @@ def test_rubin_kernel_module_is_present(
     assert rubin_path.is_file(), f"Missing Rubin kernel module: {rubin_path}"
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "api_module_path,default_module_path,default_kernel_name,rubin_filename",
     RUBIN_DISPATCH_CASES,
@@ -110,6 +112,7 @@ def test_is_sm107_device_gating(
         assert api_base.get_device_type() == "rubin"
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "api_module_path,default_module_path,default_kernel_name,rubin_filename",
     RUBIN_DISPATCH_CASES,
@@ -134,6 +137,7 @@ def test_get_rubin_kernel_lazy_import(
         assert rubin_kernel.FIX_PAD_SIZE == 256
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "api_module_path,default_module_path,default_kernel_name,rubin_filename",
     RUBIN_DISPATCH_CASES,

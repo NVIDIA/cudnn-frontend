@@ -13,15 +13,18 @@ schedule. Consumes the forward activations (`Q/K/V/O`), the loss gradient
 Two integration surfaces are provided:
 
 * a standalone wrapper (documented below), `cudnn.sdpa_bwd_wrapper_dsl_sm120`, and
-* a FROST engine (`sdpa_bwd_sm120`, see `cudnn.sdpa.bwd.engines`) that serves
-  single-node `sdpa_backward()` graphs built with `cudnn.pygraph`. It is a
-  default candidate ranked behind the backend, so the default dispatch uses it
-  when the backend declines a graph; select it explicitly from the ranked plan
-  list (`graph.plans` / `graph.select_plan(i)`), or set
-  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` to rank it first.
+* FROST engines (see `cudnn.sdpa.bwd.engines`) that serve single-node
+  `sdpa_backward()` graphs built with `cudnn.pygraph`:
+  `sdpa_bwd_sm120_f16_fused` runs dense graphs with D_QK <= 256 on the fused
+  kernel, and `sdpa_bwd_sm120_f16_two_subgroup` runs packed (THD) graphs and
+  D_QK > 256 on the SM80 two-subgroup kernel compiled for SM120. Both
+  are default candidates ranked behind the backend, so the default dispatch
+  uses them when the backend declines a graph; select one explicitly from the
+  ranked plan list (`graph.plans` / `graph.select_plan(i)`), or set
+  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` to rank them first.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm120/`: the fused five-GEMM
-main kernel and its per-shape `compile()` in `bprop_f16.py`, the SM120-only
+main kernel and its per-shape `compile()` in `f16_fused/kernel.py`, the SM120-only
 rest of the launch chain (the det_2kernel dQ GEMM, the dQ / dBias convert
 kernels) in `bprop_chain_f16.py`, and the shared warp-level primitives in
 `_common.py`. The arch-neutral chain kernels (`dot` preprocess, the GQA
@@ -319,7 +322,8 @@ only the unused relay operand remains in the kernel ABI.
   requested. An fp32 `dBias` output is
   that accumulator itself (no extra workspace, no convert kernel); an
   io-dtype output adds the `dbias_cvt` cast.
-- No dropout / ALiBi / softcap / THD
+- THD (packed / ragged): exact D128 MHA only, on SM120 and SM121; not with deterministic mode, bottom-right causal, a sliding window, or an attention sink / dSink
+- No dropout / ALiBi / softcap
 - Workspace (carved from the caller's buffer): fp32 `delta` scratch, plus
   fp32 `dq_accum` and int32 relay-counter storage (non-deterministic and
   relay-deterministic modes) or the io-dtype `B·H_q·S_q·S_kv_r128` dS buffer

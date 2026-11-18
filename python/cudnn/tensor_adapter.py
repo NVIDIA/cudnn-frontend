@@ -146,6 +146,13 @@ def cuda_is_available() -> bool:
     return err == cudart.cudaError_t.cudaSuccess and count > 0
 
 
+def has_tcgen05(major: int) -> bool:
+    """Whether a device of compute capability ``major``.x can run the SM100-family (tcgen05 / TMEM) CuTe DSL kernels: the
+    ``SM100+`` parts, except cc 12.x (the RTX / workstation Blackwell line), which has no tcgen05 -- ptxas rejects
+    ``tcgen05.mma`` / ``tcgen05.cp`` / ``tcgen05.commit`` for ``sm_120a`` and ``sm_121a``."""
+    return major >= 10 and major != 12
+
+
 def get_compute_capability(device_index: Optional[int] = None) -> Tuple[int, int]:
     """(major, minor) of the selected CUDA device (current if omitted), without requiring torch."""
     torch = sys.modules.get("torch")

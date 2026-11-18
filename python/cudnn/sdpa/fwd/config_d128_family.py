@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 """The arch-NEUTRAL half of the f16/bf16 d128-FILE prefill configuration: the small-tile seams the Rubin and Blackwell
-d128-file kernels share (``sm107/prefill_d128_f16.py``, ``sm100/prefill_d128_f16.py``) -- the additive bias / kv_mask arms,
+d128-file kernels share (``sm107/d128_f16_multi_q/kernel.py``, ``sm107/small_f16_batch_pair/kernel.py``,
+``sm100/d128_f16_multi_q/kernel.py``) -- the additive bias / kv_mask arms,
 the (n, n+1) pair item, the streamed ring, the row-max forms, the padded tail and dead-sub-tile forms, the double-buffered S,
 Q in TMEM, the third softmax warp group -- as ONE field block, ONE TMEM map formula, ONE set of budgets and ONE set of
 validators, each taking the arch's BUDGET (:class:`D128FamilyArch`) as a parameter.
@@ -1093,10 +1094,15 @@ def validate_small_tile_masks(cfg, flavor: str) -> None:
             (
                 not (
                     int(getattr(cfg, "DEAD_SUBTILE_QUIET", 0)) == 1
-                    and (int(getattr(cfg, "N_CHUNK", 0)) or cfg.PACK_GQA or cfg.THD_VARLEN or int(getattr(cfg, "EPILOGUE_GATE", 0)))
+                    and (
+                        int(getattr(cfg, "N_CHUNK", 0))
+                        or cfg.PACK_GQA
+                        or (cfg.THD_VARLEN and (cfg.TILE_K != 64 or getattr(cfg, "PAGED_KV", False) or cfg.SPLIT_KV > 1))
+                        or int(getattr(cfg, "EPILOGUE_GATE", 0))
+                    )
                 ),
-                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without PackGQA, THD or the gated "
-                f"epilogue -- the quiet body replicates its live body's barrier sequence (the plain row mapping's on the Rubin file, the -inf body's "
+                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without PackGQA or the gated "
+                f"epilogue (THD requires non-paged, unsplit D64) -- the quiet body replicates its live body's barrier sequence (the plain row mapping's on the Rubin file, the -inf body's "
                 f"with the ring handshake on the SM100 file; each factory admits the half its file renders) (got N_CHUNK={getattr(cfg, 'N_CHUNK', 0)}, "
                 f"PACK_GQA={cfg.PACK_GQA}, THD_VARLEN={cfg.THD_VARLEN}, EPILOGUE_GATE={getattr(cfg, 'EPILOGUE_GATE', 0)})",
             ),

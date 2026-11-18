@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The STORED dead rows of the SM100 (cc 10.0 / 10.3) f16/bf16 small head-dim tiles under the dead-sub-tile QUIET body
-(``sm100/prefill_d128_f16.py``, ``TemplateParams.dead_subtile_quiet = 1`` on the -inf body): a softmax sub-tile whose first row is at or
+(``sm100/d128_f16_multi_q/kernel.py``, ``TemplateParams.dead_subtile_quiet = 1`` on the -inf body): a softmax sub-tile whose first row is at or
 past its batch entry's Q length runs the quiet body -- the live body's barrier sequence and no math -- so its BMM2 multiplies whatever
 the P region of the S slot holds (the S accumulator's fp32 bits read as bf16 pairs: NaN / Inf in roughly one low half per 256).  Without
 per-batch Q lengths every dead row is at or past S_q and the O descriptor clips it; WITH them (``SEQ_Q_LENS_PRESENT``, the padded-Q trim),
@@ -32,7 +32,7 @@ from frost_test_utils import _SM, requires_dsl, requires_rubin
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_ROW_SM100 = "sdpa_fwd_prefill_sm100"
+_ROW_SM100 = "sdpa_fwd_sm100_d128_multi_q"
 _ROW_SM107 = "sdpa_fwd_prefill_sm107"
 requires_sm100_line = pytest.mark.skipif(_SM not in (100, 103), reason="needs a cc 10.0 / 10.3 device, have " + ("none" if _SM is None else f"sm_{_SM}"))
 
@@ -138,7 +138,7 @@ def test_the_epilogue_selects_the_trimmed_rows_after_the_scale():
     """Static detector (sdpa-invariants s 2): the SM100 d128 file's O store multiplies ``o_chunk * inv_sum`` exactly once, and the
     per-batch-Q-length arm SELECTS ``row_trim | row_dead`` to zero right after it (``vec_select_zero``), before the cast -- never a
     zero folded into the scale alone."""
-    from cudnn.sdpa.fwd.kernels.sm100 import prefill_d128_f16 as kmod
+    from cudnn.sdpa.fwd.kernels.sm100.d128_f16_multi_q import kernel as kmod
     from cudnn.frost.tile_dsl import pointwise
 
     src = inspect.getsource(kmod)
@@ -166,7 +166,10 @@ def _run_twice(
     )
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    ours = [i for i, n in enumerate(names) if n == row or n.startswith(row + "[")]
+    from frost_test_utils import _is_plan_for, half_engine_names
+
+    owners = half_engine_names("sm107") if row == _ROW_SM107 else row
+    ours = [i for i, n in enumerate(names) if _is_plan_for(n, owners)]
     idx = next((i for i in ours if g.plans[i].knobs.split_kv in (None, 1)), None)
     assert idx is not None, f"no unsplit {row} plan in {names}"
     picked = g.plans[idx].knobs
@@ -180,6 +183,16 @@ def _run_twice(
             record[cudnn.knob_type.TILE_CGA_M] = want_cga
         if want_tile_n != picked_tile_n:
             record[cudnn.knob_type.TILE_N] = want_tile_n
+        if row == _ROW_SM107:
+            from cudnn.engines.manifest import family_for
+            from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+            from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+            from cudnn.sdpa.graph_analyzer import analyze
+
+            requested = SdpaFwdKnobs.from_public(record)
+            geometry = select_sm107_half_geometry(analyze(g), requested)
+            engine_id = family_for(g).offered_ids()[geometry.implementation]
+            record = geometry.canonical_knobs(requested).to_public()
         g.create_execution_plan(engine_id, record)
         idx = g.get_execution_plan_count() - 1
     g.select_plan(idx)

@@ -43,3 +43,9 @@ def test_enum_integer_persistence(name):
         # Explicit integer conversion must not turn enums into integer subclasses.
         assert not isinstance(member, int)
         assert {member: member.name}[enum_type(value)] == member.name
+
+
+def test_behavior_note_frontend_band_preserves_existing_values():
+    old = ("RUNTIME_COMPILATION", "REQUIRES_FILTER_INT8x32_REORDER", "REQUIRES_BIAS_INT8x32_REORDER", "SUPPORTS_CUDA_GRAPH_NATIVE_API", "CUBLASLT_DEPENDENCY")
+    assert [int(getattr(cudnn.behavior_note, name)) for name in old] == list(range(1, 6))
+    assert int(cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE) == 1000

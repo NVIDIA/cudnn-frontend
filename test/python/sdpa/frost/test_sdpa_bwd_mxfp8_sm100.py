@@ -174,9 +174,9 @@ def _build_graph(
         out.set_output(True).set_data_type(grad_half).set_dim(list(sh)).set_stride(stride_fn(sh))
     # The op returns the amax ports unconditionally and validate() wants their
     # dims; they stay virtual (not requested) unless declare_amax.
-    for a in (amax_dq, amax_dk, amax_dv):
+    for name, a in zip(("amax_dQ", "amax_dK", "amax_dV"), (amax_dq, amax_dk, amax_dv)):
         a.set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-        if declare_amax:
+        if declare_amax is True or (declare_amax and name in declare_amax):
             a.set_output(True)
     if with_sink:
         t["dsink"].set_output(True)
@@ -186,6 +186,13 @@ def _build_graph(
 
 
 def _plan_index(g, name=_ENGINE):
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
+
+    if name == quantized_contract.MXFP8_ROW:
+        # The row delegates both bodies: the graph is offered under the explicit engine its declaration selects.
+        from cudnn.sdpa import graph_analyzer as ga
+
+        name = quantized_contract.select_mxfp8(ga.analyze(g))
     for i in range(g.get_execution_plan_count()):
         pn = g.get_plan_name_at_index(i)
         if pn == name or pn.startswith(name + "["):
@@ -434,8 +441,8 @@ def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b
     The graph adapter normally selects non-persistent scheduling. Force the
     kernel constructor flag here to cover the CLC zero-trip path as well.
     """
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.dq import BlackwellFmhaBackwardDQ256
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.dkdv import BlackwellFmhaBackwardDKDV256
 
     def with_schedule(init):
         def wrapped(self, *args, **kwargs):
@@ -554,7 +561,7 @@ def test_workspace_accounts_for_repack_buffers():
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
 
     l = b * hq
     # 4 rowwise-A + 5 rowwise/columnwise-B + 2 columnwise-B buffers (see _sf_plan)
@@ -580,7 +587,8 @@ def _decline_reason(**kw):
     b, hq, hkv = kw.pop("b", 1), kw.pop("hq", 2), kw.pop("hkv", 2)
     sq, skv, d = kw.pop("sq", 256), kw.pop("skv", 256), kw.pop("d", _D)
     scale = kw.pop("scale", 1.0 / math.sqrt(d))
-    spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
+
     try:
         g, _t, _outs = _build_graph(b, hq, hkv, sq, skv, d, scale=scale, **kw)
     except (cudnn.cudnnGraphNotSupportedError, RuntimeError) as e:
@@ -588,6 +596,9 @@ def _decline_reason(**kw):
     facts = ga.analyze(g)
     if facts is None:
         return "analyzer did not recognise the graph"
+    # The row delegates both bodies: its verdict for a graph is the selected explicit engine's.
+    name = quantized_contract.select_mxfp8(facts) if _ENGINE == quantized_contract.MXFP8_ROW else _ENGINE
+    spec = next(s for s in ENGINE_SPECS if s.name == name)
     return mismatch(spec.capabilities, facts, knobs)
 
 
@@ -706,8 +717,11 @@ def test_half_row_declines_mxfp8_graph():
     g, _t, _outs = _build_graph(1, 2, 2, 256, 256, scale=1.0 / math.sqrt(_D))
     facts = ga.analyze(g)
     assert facts is not None and facts.is_mxfp8 and facts.is_backward
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
+
+    owner = quantized_contract.select_mxfp8(facts)
     for spec in ENGINE_SPECS:
-        if spec.name != _ENGINE:
+        if spec.name not in (_ENGINE, owner):
             assert mismatch(spec.capabilities, facts) is not None, spec.name
 
 
@@ -737,3 +751,61 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
     assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+
+
+# Architecture CI entry for the shared exact-D512 block-scale contract.
+import d512_mxfp8_bwd_checks as d512_mx_checks
+
+
+@pytest.mark.L0
+class TestD512Mxfp8Backward:
+    @pytest.fixture
+    def d512_mx(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import sys
+
+        mx = sys.modules[__name__]
+        monkeypatch.setattr(mx, "_ENGINE", "sdpa_bwd_d512_mxfp8")
+        original = mx._plan_index
+        monkeypatch.setattr(mx, "_plan_index", lambda graph: original(graph, "sdpa_bwd_d512_mxfp8"))
+        return mx
+
+    test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
+    test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
+    test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("sq,causal", [(257, True), (257, False), (264, True)])
+def test_delta_workspace_padding_does_not_feed_dkdv(d, sq, causal):
+    """The dKdV TMA sees the eight-row scratch extent, including Q-tail padding."""
+    case = _run(d=d, hq=8, hkv=2, sq=sq, skv=256, causal=causal)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    replay = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(replay, stream=stream):
+            case.graph.execute(case.pack, case.workspace)
+        torch.cuda.current_stream().wait_stream(stream)
+        for captured in (False, True):
+            for sentinel in (0, 255, 127):
+                case.workspace.fill_(sentinel)
+                for name in ("dq", "dk", "dv"):
+                    case.pack[case.refs[name]].fill_(float("nan"))
+                if captured:
+                    replay.replay()
+                else:
+                    case.graph.execute(case.pack, case.workspace)
+                torch.cuda.synchronize()
+                for name, expected in zip(("dq", "dk", "dv"), case.expected):
+                    actual = case.pack[case.refs[name]]
+                    assert not actual.isnan().any(), f"{name}: scratch pattern {sentinel}, captured={captured} contaminated the gradient"
+                    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
+    finally:
+        replay.reset()

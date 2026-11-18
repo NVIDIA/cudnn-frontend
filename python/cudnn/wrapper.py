@@ -432,8 +432,11 @@ class Graph:
             self.__node_names.add(node_name)
             # process positional arguments for dlpack tensors
             for i, obj in enumerate(args):
-                if isinstance(obj, tuple):
-                    # use case: dropout in sdpa is a tuple of (float, seed tensor, offset tensor)
+                if isinstance(obj, (list, tuple)):
+                    # Sequence-valued graph arguments include SDPA dropout tuples
+                    # and custom-reduction input lists. A subclass, such as a
+                    # namedtuple, cannot be rebuilt from one list.
+                    container_type = tuple if isinstance(obj, tuple) else list
                     obj = list(obj)  # convert to list to make it mutable
                     for j, elem in enumerate(obj):
                         if hasattr(elem, "__dlpack__"):
@@ -443,7 +446,7 @@ class Graph:
                             obj[j] = self.__tensor_map[obj_id]
                         if isinstance(obj[j], _GRAPH_TENSOR_TYPES):
                             self.__tensor_in[f"{node_name}::{i}::{j}"] = obj[j]
-                    obj = args[i] = tuple(obj)  # convert back to tuple
+                    obj = args[i] = container_type(obj)
                 if hasattr(obj, "__dlpack__"):
                     obj_id = id(obj)
                     if obj_id not in self.__tensor_map:
@@ -453,8 +456,11 @@ class Graph:
                     self.__tensor_in[f"{node_name}::{i}"] = obj
             # process keyword arguments for dlpack tensors
             for key, obj in kwargs.items():
-                if isinstance(obj, tuple):
-                    # use case: dropout in sdpa is a tuple of (float, seed tensor, offset tensor)
+                if isinstance(obj, (list, tuple)):
+                    # Sequence-valued graph arguments include SDPA dropout tuples
+                    # and custom-reduction input lists. A subclass, such as a
+                    # namedtuple, cannot be rebuilt from one list.
+                    container_type = tuple if isinstance(obj, tuple) else list
                     obj = list(obj)  # convert to list to make it mutable
                     for j, elem in enumerate(obj):
                         if hasattr(elem, "__dlpack__"):
@@ -464,7 +470,7 @@ class Graph:
                             obj[j] = self.__tensor_map[obj_id]
                         if isinstance(obj[j], _GRAPH_TENSOR_TYPES):
                             self.__tensor_in[f"{node_name}::{key}::{j}"] = obj[j]
-                    obj = kwargs[key] = tuple(obj)  # convert back to tuple
+                    obj = kwargs[key] = container_type(obj)
                 if hasattr(obj, "__dlpack__"):
                     obj_id = id(obj)
                     if obj_id not in self.__tensor_map:

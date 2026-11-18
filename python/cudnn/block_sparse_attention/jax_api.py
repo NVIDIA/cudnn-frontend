@@ -15,11 +15,9 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 requirement_error = cutedsl_requirement_error("JAX BSA")
 if requirement_error:
     raise ImportError(requirement_error)
-if jax.version.__version_info__ < (0, 9, 1):
-    raise ImportError("JAX BSA requires jax >= 0.9.1")
 
 from cudnn.api_base import TupleDict
-from cudnn.jax import TensorSpec, call, zeros_init
+from cudnn._jax import TensorSpec, call, zeros_init
 from .jax_kernels import Forward, Backward
 
 

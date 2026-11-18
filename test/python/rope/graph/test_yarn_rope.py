@@ -21,6 +21,10 @@ _skip_if_no_rope_backend = pytest.mark.skipif(
     reason="RoPE backend op (CUDNN_BACKEND_OPERATION_ROPE_FWD_DESCRIPTOR) requires cuDNN >= 9.24",
 )
 
+_requires_sdpa_sm80 = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8, reason="cuDNN SDPA (FP16 / BF16) requires SM80 or newer"
+)
+
 
 # Megatron-Core reference (replicated locally; no mcore dependency)
 def _mcore_yarn_inv_freq(head_dim, base, scaling_factor, original_max_position, beta_fast, beta_slow, device):
@@ -204,6 +208,7 @@ def _reference_sdpa_with_yarn(q, k, v, freqs, mscale, attn_scale):
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 @_skip_if_no_rope_backend
+@_requires_sdpa_sm80
 def test_yarn_e2e_dsv3_config():
     """End-to-end YARN + RoPE + SDPA matches a Python reference for the DSv3 config."""
     b, h, s, d = 1, 4, 256, 64
@@ -231,6 +236,7 @@ def test_yarn_e2e_dsv3_config():
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 @_skip_if_no_rope_backend
+@_requires_sdpa_sm80
 def test_yarn_e2e_factor1_no_op():
     """factor=1 should give identical result to plain RoPE+SDPA (no scaling, no mscale)."""
     b, h, s, d = 1, 4, 128, 64
@@ -330,6 +336,7 @@ def _ref_partial_rope_sdpa(q, k, v, freqs, mscale, attn_scale, rope_dim):
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 @_skip_if_no_rope_backend
+@_requires_sdpa_sm80
 def test_partial_rope_dsv3_layout():
     """DSv3-style partial RoPE: head_dim=192 = nope=128 + rope=64, full YARN config."""
     b, h, s = 1, 4, 256
@@ -359,6 +366,7 @@ def test_partial_rope_dsv3_layout():
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 @_skip_if_no_rope_backend
+@_requires_sdpa_sm80
 def test_partial_rope_zero_nope_matches_full_rotation():
     """rope_dim == head_dim must match the full-rotation path (no behavior change)."""
     b, h, s, d = 1, 4, 128, 64
@@ -374,6 +382,7 @@ def test_partial_rope_zero_nope_matches_full_rotation():
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 @_skip_if_no_rope_backend
+@_requires_sdpa_sm80
 def test_yarn_mscale_fold_via_attn_scale():
     """YARN's mscale fold-in equivalence:
     (output_scale=mscale on Q&K, attn_scale=base) == (output_scale=1, attn_scale=base*mscale^2)

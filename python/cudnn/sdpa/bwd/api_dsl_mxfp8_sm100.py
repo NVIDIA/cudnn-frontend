@@ -22,7 +22,7 @@ and seven F8_128x4 scale tensors. The gradients ``dQ/dK/dV`` are half precision
 
 Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
 slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
-see ``kernels/sm100/bprop_sf_repack_mxfp8.py`` for the layouts and why a TMA
+see ``kernels/sm100/d256_mxfp8/sf_repack.py`` for the layouts and why a TMA
 descriptor cannot address the shifted copy. The seven graph SF tensors are
 therefore repacked (eleven small launches, one per kernel operand form) into
 workspace ahead of the two kernels. This is a documented, deliberate exception
@@ -52,6 +52,7 @@ _HEAD_DIM = 256
 _HEAD_PAIRS = ((64, 64), (128, 128), (192, 128), (256, 256))
 _PAIR_ROUTE = _HEAD_PAIRS[:3]
 _SF_BLOCK = 32
+_AMAX = ("amax_dQ", "amax_dK", "amax_dV")
 _ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "q_T", "k_T", "do_T", "do_f16", "sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")
 _ATTRIBUTES = (
     "q",
@@ -83,6 +84,9 @@ def _cdiv(a: int, b: int) -> int:
 
 class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     """d=128 / d=256 block-scale MXFP8 backward on Blackwell (see the module docstring)."""
+
+    _HEAD_PAIRS = _HEAD_PAIRS
+    _PAIR_ROUTE = _PAIR_ROUTE
 
     def __init__(
         self,
@@ -142,7 +146,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         producer's 2-D swizzle with the D tile outside the head plane (see the
         repack module).
         """
-        from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import SF_LAYOUT_SFA, SF_LAYOUT_SFB
 
         b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
         lq, lk = b * hq, b * hk
@@ -209,8 +213,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         the gate. ValueError, never assert.
         """
         self._value_error_if(
-            (self.head_dim_qk, self.head_dim_v) not in _HEAD_PAIRS,
-            f"SM100 MXFP8 bwd: (d_qk, d_v) must be one of {_HEAD_PAIRS}; got ({self.head_dim_qk}, {self.head_dim_v})",
+            (self.head_dim_qk, self.head_dim_v) not in self._HEAD_PAIRS,
+            f"SM100 MXFP8 bwd: (d_qk, d_v) must be one of {self._HEAD_PAIRS}; got ({self.head_dim_qk}, {self.head_dim_v})",
         )
         self._value_error_if(self.h_kv < 1 or self.h_q % self.h_kv != 0, f"SM100 MXFP8 bwd: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
         self._value_error_if(self.dtype != torch.float8_e4m3fn, f"SM100 MXFP8 bwd: the kernels consume E4M3 payloads only; got {self.dtype}")
@@ -257,7 +261,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             self._value_error_if(have != want, f"SM100 MXFP8 bwd: {name} has {have} bytes; the F8_128x4 layout for this shape needs {want}")
         self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 MXFP8 bwd: padding masks (seq lens) are not implemented")
         self._value_error_if(
-            self.window_size_left is not None and not self._pair_route(), f"SM100 MXFP8 bwd: sliding window is served at (d_qk, d_v) in {_PAIR_ROUTE} only"
+            self.window_size_left is not None and not self._pair_route(), f"SM100 MXFP8 bwd: sliding window is served at (d_qk, d_v) in {self._PAIR_ROUTE} only"
         )
         self._value_error_if(self.window_size_left is not None and not self.is_causal, "SM100 MXFP8 bwd: a sliding window requires the causal mask")
         self._value_error_if(
@@ -277,12 +281,12 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     def _kernel_workspace_bytes(self) -> int:
         import cutlass
 
-        from cudnn.sdpa.bwd.kernels.sm100._bprop_mxfp8_common import get_workspace_size
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.common import get_workspace_size
 
         return int(get_workspace_size(self.s_q_max, self.head_dim_qk, self.h_q, self.batch_size, cutlass.Float32))
 
     def _pair_route(self) -> bool:
-        return (self.head_dim_qk, self.head_dim_v) in _PAIR_ROUTE
+        return (self.head_dim_qk, self.head_dim_v) in self._PAIR_ROUTE
 
     def _window(self) -> int:
         return 0 if self.window_size_left is None else int(self.window_size_left) + 1
@@ -292,7 +296,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         kernels size but do not use) plus the eleven repacked scale-factor
         buffers. A pure function of the plan geometry; all of it is carved
         from the caller's buffer at execute. The kernel pair needs the delta rows only."""
-        from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import repack_geometry
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import repack_geometry
 
         if self._pair_route():
             from cudnn.sdpa.bwd.kernels.sm100.prepared_d192_fp8_host import workspace_layout
@@ -319,7 +323,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return q_geom, kv_geom, lse_geom
 
     def _mask_types(self):
-        from cudnn.sdpa.bwd.kernels.sm100 import _bprop_mxfp8_masks as masks
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8 import masks
 
         # Upstream's selection, kept verbatim: the residual mask is needed only
         # for a Q-side tail. A KV-side tail (S_kv not a multiple of 128) is
@@ -369,7 +373,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         from cudnn.frost.device import compute_capability, resolve_device
 
         from .kernels.sm100.prepared_d192_fp8_host import compile_host_mx, sf_geometry, sf_geometry_t, workspace_layout
-        from .prepared import BwdLaunchSpec
+        from .prepared import BwdLaunchSpec, Operand
 
         out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
         b, hq, hk, sq, sk = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max
@@ -385,8 +389,11 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         )
         regions, total = workspace_layout(b, hq, sq)
         major, minor = compute_capability(resolve_device(self.q_desc.device))
+        amax_requested = tuple(name in getattr(self, "amax_requested", ()) for name in _AMAX)
         with torch.cuda.device(resolve_device(self.q_desc.device)):
-            entry = compile_host_mx(self._pair_geoms(), sf_geoms, regions, out_dt, self.is_causal, major * 10 + minor, self._gqa_group, d, dv, self._window())
+            entry = compile_host_mx(
+                self._pair_geoms(), sf_geoms, regions, out_dt, self.is_causal, major * 10 + minor, self._gqa_group, d, dv, self._window(), amax_requested
+            )
         owner = SimpleNamespace(entry=entry, workspace_bytes=total)
         fn = positional_entry(entry)
         if fn is None:
@@ -394,13 +401,13 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         self._prepared = BwdLaunchSpec(
             owner,
             fn,
-            self._operands(),
+            self._operands() + tuple(Operand("float32", (1,), (1,), 1, 4, 4) if requested else None for requested in amax_requested),
             total,
             int(self.q_desc.device.index or 0),
             self.scale_softmax,
             name="sdpa_bwd_sm100_mxfp8",
-            roles=_ROLES,
-            attributes=_ATTRIBUTES,
+            roles=_ROLES + _AMAX,
+            attributes=_ATTRIBUTES + _AMAX,
             scale_log2=False,
             native_binding=False,
         )
@@ -420,9 +427,9 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         from cudnn.frost.compiled_cache import positional_entry
         from cudnn.frost.device import compute_capability, resolve_device
         from .prepared import BwdLaunchSpec, Operand
-        from .kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
-        from .kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
-        from .kernels.sm100.bprop_sf_repack_mxfp8 import Mxfp8SfRepackSm100
+        from .kernels.sm100.d256_mxfp8.dkdv import BlackwellFmhaBackwardDKDV256
+        from .kernels.sm100.d256_mxfp8.dq import BlackwellFmhaBackwardDQ256
+        from .kernels.sm100.d256_mxfp8.sf_repack import Mxfp8SfRepackSm100
         from .kernels.sm100.prepared_mxfp8_host import compile_host
 
         out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
@@ -547,6 +554,9 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         sf_v: Optional[torch.Tensor] = None,
         sf_do: Optional[torch.Tensor] = None,
         sf_do_T: Optional[torch.Tensor] = None,
+        amax_dQ: Optional[torch.Tensor] = None,
+        amax_dK: Optional[torch.Tensor] = None,
+        amax_dV: Optional[torch.Tensor] = None,
     ) -> None:
         from cudnn.sdpa.fwd.prepared import facts_of_tensor
         from .prepared import execute
@@ -574,6 +584,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         if scale_softmax is not None and not math.isclose(float(scale_softmax), float(self.scale_softmax), rel_tol=1e-6):
             raise ValueError(f"SM100 MXFP8 bwd: scale_softmax {scale_softmax} differs from the plan's {self.scale_softmax}")
 
+        amaxes = (amax_dQ, amax_dK, amax_dV)
+        requested = getattr(self, "amax_requested", ())
+        for name, tensor in zip(_AMAX, amaxes):
+            self._value_error_if((tensor is not None) != (name in requested), f"{name} must be bound exactly when requested by the plan")
         self.compile()
         spec = self._prepared
         ws = facts_of_tensor(workspace)
@@ -601,11 +615,13 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             sf_do,
             sf_do_T,
         )
-        facts = dict(zip(_ROLES, map(facts_of_tensor, tensors)))
+        if len(spec.roles) == len(_ROLES) + len(_AMAX):
+            tensors += amaxes
+        facts = dict(zip(spec.roles, map(facts_of_tensor, tensors)))
         stats = facts["stats"]
         if stats is not None and (not stats.contiguous or stats.numel != math.prod(spec.operands[5].shape)):
             raise ValueError("SM100 MXFP8 backward Stats must be contiguous with the plan's element count")
-        geometry = tuple((op.shape, op.strides) if i != 5 and not op.opaque_bytes else None for i, op in enumerate(spec.operands))
+        geometry = tuple((op.shape, op.strides) if op is not None and i != 5 and not op.opaque_bytes else None for i, op in enumerate(spec.operands))
         stream = self._get_default_stream(current_stream)
         execute(spec, facts, ws.ptr, int(stream), geometry=geometry)
 

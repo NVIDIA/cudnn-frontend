@@ -79,6 +79,22 @@ def test_dense_fp8_sink_split_rebind_replay(d, dv, output):
             dense._check(bufs, thd=False, sq=16, skv=512)
 
 
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_dense_fp8_sink_at_decode(d, dv, split, output, dtype):
+    """Dense per-tensor FP8 with an attention sink at S_q == 1, unsplit and split: O, Stats and
+    Amax_O match the reference, sink mass included. test_paged_fp8_sink_split's s_q == 1 row is the
+    paged twin."""
+    sink = torch.linspace(-12, 12, 4, device="cuda").view(1, 4, 1, 1)
+    g, vp, ws, bufs, _ = dense._case(d=d, dv=dv, sq=1, skv=512, split_kv=split, output_dtype=output, sink=sink, dtype=dtype)
+    prepared = g._compiled_plans[g._plan_index]._prepared
+    assert prepared.spec.has_sink and prepared.spec.split == split
+    g.execute(vp, ws)
+    dense._check(bufs, thd=False, sq=1, skv=512)
+
+
 @pytest.mark.parametrize("q_lens", [False, True])
 @pytest.mark.parametrize("output", ["bfloat16", "float8_e4m3fn"])
 def test_quantized_sink_native_frame_and_storage(q_lens, output):

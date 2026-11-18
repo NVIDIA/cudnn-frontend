@@ -257,3 +257,54 @@ def test_public_packed_bias_backward_under_nonreentrant_checkpoint() -> None:
     assert x.grad is not None
     assert weight.grad is not None
     assert bias.grad is not None
+
+
+@pytest.mark.parametrize(
+    "batch,channels,tokens,offsets",
+    [(2, 264, 1, None), (2, 1, 17, None), (1, 264, 1, (0, 1))],
+    ids=("dense_t1", "dense_d1", "packed_one_token"),
+)
+def test_row_major_input_with_a_size_one_dim_takes_the_native_route(batch, channels, tokens, offsets) -> None:
+    """A row-major ``[B, D, T]`` input is contiguous in its ``[B, T, D]`` transpose when ``T == 1`` or ``D == 1``, so the route
+    admits it, but that transpose carries a free stride on the size-1 dim.  It must run, and match the same values passed
+    through the channel-last allocation bitwise (output, final state and every gradient)."""
+
+    _require_native_route()
+    from cudnn.ops.causal_conv1d import (
+        _get_causal_conv1d_last_route,
+        causal_conv1d,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20261101 + channels + tokens)
+    num_sequences = len(offsets) - 1 if offsets is not None else batch
+    cu_seqlens = None if offsets is None else torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    values = torch.randn((batch, tokens, channels), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+    weight0 = torch.randn((channels, 4), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+    bias0 = torch.randn(channels, device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+    initial0 = torch.randn((num_sequences, channels, 3), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+    dy_values = torch.randn((batch, tokens, channels), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+    d_final = torch.randn((num_sequences, channels, 3), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+
+    results = {}
+    for layout in ("channel_last", "row_major"):
+        if layout == "channel_last":
+            x = values.clone().transpose(1, 2)
+            dy = dy_values.clone().transpose(1, 2)
+        else:
+            x = values.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+            dy = dy_values.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+            assert x.stride() != values.clone().transpose(1, 2).stride(), "the layouts must differ in stride"
+        x.requires_grad_()
+        weight = weight0.clone().requires_grad_()
+        bias = bias0.clone().requires_grad_()
+        initial = initial0.clone().requires_grad_()
+        y, final = causal_conv1d(x, weight, bias, "silu", cu_seqlens=cu_seqlens, initial_states=initial, return_final_states=True)
+        assert _get_causal_conv1d_last_route() == "native-autograd"
+        torch.autograd.backward((y, final), (dy, d_final))
+        results[layout] = [t.contiguous() for t in (y.detach(), final.detach(), x.grad, weight.grad, bias.grad, initial.grad)]
+
+    for name, a, b in zip(("y", "final", "dx", "dweight", "dbias", "dinitial"), results["channel_last"], results["row_major"]):
+        if name in ("dweight", "dbias"):  # FP32 atomics outside deterministic mode
+            torch.testing.assert_close(b, a, atol=1e-2, rtol=1e-2)
+        else:
+            assert torch.equal(a, b), name

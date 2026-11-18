@@ -40,17 +40,33 @@ native backend plan there (cuDNN engine 5 on B200 / 9.26).
 A fifth engine, `sdpa_bwd_sm107_d512` (bf16 / fp16, cc 10.7 - 11.9, default behind the
 backend, 2026-10-01), serves **d in (256, 512]** (multiples of 8, envelope-served on
 512-wide tiles) on the same line -- see "The d in (256, 512] row" below.  It is
-the only FROST d > 256 backward on cc 10.7, and the only backward at all for that
-band there: cuDNN 9.26 builds no d > 256 backward plan on cc 10.7, so a pin by
+the half-precision FROST d > 256 backward on cc 10.7. cuDNN 9.26 builds no
+d > 256 backward plan on cc 10.7, so a pin by
 `startswith("sdpa_bwd_sm107_d512")` is still the honest way to measure it.
 
-There is no standalone wrapper for this pass yet; the graph API is the surface, plus the
-adapters' own `execute` for the plan facts no graph declares (per-batch KV lengths, an
-external `delta`, THD on the fp8 and MXFP8 rows — see Sequence lengths and THD below).
+The opt-in `sdpa_bwd_d512_fp8` pair serves exact D512 per-tensor E4M3
+`sdpa_fp8_backward` graphs on SM100, SM103 and SM107. Inputs use compact BSHD
+storage, with FP32 Stats and the standard tensor descales/scales; gradients
+may be E4M3, FP16 or BF16. It supports MHA/GQA/MQA, top-left causal or
+unmasked attention, and a left sliding window. The deterministic flag keeps
+the same fixed ownership and GQA reduction order. Scratch contains only
+FP32 delta rows, padded to 128 queries; no full score or dS matrix is stored.
+THD, padding masks, bottom-right alignment, right-band widening, bias, sinks
+and MXFP8 remain outside this pair's contract. Numerical and bitwise tests
+have run on SM100 and SM107; SM103 execution remains unverified.
+
+There is no separate high-level standalone wrapper for the whole pass; use the graph API
+or an adapter's `execute` method. Standalone THD execution takes per-batch sequence
+lengths, and adapters may be constructed with `external_delta=True`. Graph execution
+supports ragged inputs on all three d = 256 rows when the bindings expose
+`max_total_seq_len_q` and `max_total_seq_len_kv` on the FP8 and MXFP8 nodes; older pybind
+extensions decline those graph plans. Graph plans compute `delta` internally. See
+Sequence lengths and THD below for the packed contract.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm107/`
-(`bprop_d256_f16.py`, `bprop_d256_fp8.py`, `bprop_d256_mxfp8.py`; config
-`bwd/config_sm107.py`), the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
+(`d256_f16_4x1/kernel.py`, `d256_fp8/kernel.py`,
+`d256_mxfp8/kernel.py`). Shared configuration lives in
+`python/cudnn/sdpa/bwd/config_sm107.py`, the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
 and the rest of the launch chain is shared with the other Blackwell-line backward
 engines (`kernels/bprop_matmul_blackwell.py`, `kernels/bprop_chain_common.py`).
 
@@ -101,7 +117,9 @@ fp32 tensors, `dQ/dK/dV` declared E4M3 (or bf16 / fp16), and any of
 
 One backward call is a fixed sequence of launches on the caller's stream, every
 scratch buffer carved from the caller's workspace (`graph.get_workspace_size()`
-is a build-time function of the shape).  Both rows are **prepared launches**
+is a build-time function of the shape). All three d = 256 rows
+(`sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8`, and `sdpa_bwd_sm107_mxfp8`) are
+**prepared launches**
 (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`): the plan compiles
 ONE pointer-host artifact that runs the whole chain from device pointers, and
 every stage below -- the padding copies, the `seq_kv` fill and the (rare) dS zero-fill
@@ -203,7 +221,7 @@ each way). Rubin's 576 TMEM columns and 327 KiB SMEM
 carveout are what let dV stay resident at d = 256 — the SM100 d512 backward is
 a different, three-stage shape.
 
-### The 2x2-datapath body (`kernels/bprop_d256_2x2_f16.py`; the SM100 row, and the Rubin twin)
+### The 2x2-datapath body (`kernels/sm100/d256_f16_2x2/kernel.py`; the SM100 row, and the Rubin twin)
 
 The same chain has a second main kernel on the **2x2 tcgen05 datapath**:
 `tcgen05.mma.cta_group::2` with the collective M = 128, i.e. 64 kv rows per CTA
@@ -244,12 +262,13 @@ and dQ / dK / dV BITWISE the 4x1 body's -- but measured slower than the 4x1 body
 ### The d in (256, 512] row (`sdpa_bwd_sm107_d512`; `bwd/api_dsl_sm107_d512.py`)
 
 Head dims above 256 are a different chain on this line too: the SM100
-large-head-dim backward (`bwd/api_dsl.py::SdpaBwdDslSm100`, see the SM100 ᵇ
-footnote of the support tracker) -- `delta = rowsum(dO·O)` -> a stage-2 kernel
+large-head-dim backward (`bwd/api_dsl.py::SdpaBwdDslSm100`; see the [SM100/SM103
+D512 BPROP entry in the FROST support tracker](https://github.com/NVIDIA/cudnn-frontend/blob/develop/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md#L459-L470))
+-- `delta = rowsum(dO·O)` -> a stage-2 kernel
 that writes `S` and `dS` to `[B, H_chunk, S_q, S_kv]` GMEM workspaces (heads
 chunked to a 4 GiB budget) -> `dV = Sᵀ·dO`, `dK = dSᵀ·Q`, `dQ = dS·K` as the
 `bprop_matmul_blackwell` GEMMs at the (512, 512) cluster tile -> the GQA fold --
-with stage 2 ALWAYS the **2x2-datapath** body `kernels/sm107/bprop_d512_f16_2x2.py`
+with stage 2 ALWAYS the **2x2-datapath** body `kernels/sm107/d512_f16_2x2/kernel.py`
 at the cc 10.7 ring arm: two independent `tcgen05.mma.cta_group::2` pairs per
 (4,1,1) cluster, 64 q rows per CTA, both BMMs (`Q·Kᵀ`, `dO·Vᵀ`) as SMEM SS
 operands with d streamed in 64-column chunks, an **8-stage K/V chunk ring** (the
@@ -504,7 +523,7 @@ E4M3 `q / k / v / dO` plus the transposed-quantization payloads `q_T / k_T / dO_
 fp32 `stats`, and the seven `F8_128x4`-reordered E8M0 scale tensors
 (`descale_q / q_T / k / k_T / v / dO / dO_T`; `descale_v` is the **rowwise** V
 scale, as in the C++ node's own reference math) — with `dQ / dK / dV` declared
-bf16. **One kernel plus scale-factor plumbing** (`sm107/bprop_d256_mxfp8.py`, the
+bf16. **One kernel plus scale-factor plumbing** (`sm107/d256_mxfp8/kernel.py`, the
 fp8 body's pipeline): the scale factors ride their operands' TMA barriers into
 TMEM and dequantize inside every tcgen05 block-scale MMA, so `S` and `dP` are in
 TRUE units; `P` is recomputed from the exact fp32 Stats and quantized to E4M3
@@ -609,3 +628,11 @@ plan creation.
   partials bf16; under THD: the packed scale-factor staging copies at the plan's
   tile capacity and the per-sequence SF tile prefixes). Use
   `graph.get_workspace_size()`.
+
+The separate opt-in `sdpa_bwd_d512_mxfp8` row supplies D512 block-scale
+backward on SM100/SM103/SM107 with CuTeDSL4.8.0. It consumes canonical
+F8_128x4 E8M0 scales and separately quantized Q_T/K_T/dO_T payloads directly,
+produces FP16/BF16 gradients, and keeps only FP32 row-delta scratch. Its
+compact dense MHA/GQA contract includes unmasked/top-left causal attention
+and causal left windows whose query rows retain a key. Deterministic
+execution uses fixed gradient owners. It does not produce Amax outputs.

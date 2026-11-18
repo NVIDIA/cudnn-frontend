@@ -201,7 +201,7 @@ def _frost_plan_index(names) -> Optional[int]:
 # rowwise and V columnwise, writing the compact e4m3 ``q8 / k8 / v8`` + bf16
 # ``gate16`` AND the three F8_128x4 E8M0 scale-factor blobs ``sf_q / sf_k / sf_v``
 # exactly as ``kernels/quantize_mxfp8.py`` lays them down for
-# ``sm107/prefill_d256_mxfp8.py``.  Runner ``run_fused_proj_gemm_mxfp8`` (PR-B
+# ``sm107/d256_mxfp8_single_q/kernel.py``.  Runner ``run_fused_proj_gemm_mxfp8`` (PR-B
 # section 3.1 ABI): it takes the block-scale GEMM's own SF blobs (``sf_a`` /
 # ``sf_w``, PADDED F8_128x4 -- ``sf_padded_dims``) and ``batch`` / ``seq_len`` (the
 # kernel decodes ``(b, s_tile)`` per 128-row tile), and DECLINES (typed

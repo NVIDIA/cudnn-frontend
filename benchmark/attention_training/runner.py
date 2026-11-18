@@ -454,8 +454,7 @@ Examples:
 
     parser.add_argument(
         "--config",
-        required=True,
-        help="Config name (e.g., 'llama'). Must be a Python file in configs/",
+        help="Config name (e.g., 'llama'). Must be a Python file in configs/; required unless --list-configs",
     )
     parser.add_argument(
         "--dry-run",
@@ -509,6 +508,8 @@ Examples:
         for name in configs:
             print(f"  {name}")
         return
+    if args.config is None:
+        parser.error("the following arguments are required: --config")
 
     # Load config
     from .configs import load_config

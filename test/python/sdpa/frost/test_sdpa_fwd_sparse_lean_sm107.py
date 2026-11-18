@@ -1822,10 +1822,13 @@ def test_explicit_lean_is_admitted_on_the_blackwell_parts_for_measurement():
     """cc 10.0 / 10.3 (``SPARSE_LEAN_TILE_EXPLICIT_CCS``: B200 / GB200, B300) serve the EXPLICIT ``tile_form="lean"`` only -- the lean body is
     SM100-legal instruction for instruction and its config pins no Rubin-only size, so the admission is a host rule (2026-10-28, admitted for
     the B200 measurement): the route resolves the lean tile at the lean split (65, k 1), the slab is the 65-partial one and the combine form
-    is the decode-grid kernel on cc 10.0 (``DECODE_GRID_AUTO``: the cc 10.7 split-aware rule's shape, measured there 2026-10-28 --
-    ``SPARSE_LEAN_COMBINE_RULE_CCS``) and the module's own on cc 10.3 (``DECODE_GRID_OFF``, unmeasured); the 24 / 4 geometry (G 6) at S_q 4 builds the
-    lean record with the step rows (N_MT 2).  ``"auto"`` / ``"tcgen05"`` there resolve the tcgen05 core and are declined by name ('EXPLICIT lean
-    tile only', ending with the former statement's spelling), the AUTO pin and the placement rule stay cc 10.7's, the lean body's own declines
+    is the decode-grid kernel on both parts (``DECODE_GRID_AUTO``: the cc 10.7 split-aware rule's shape, measured there 2026-10-28 on cc 10.0
+    and 2026-11-05 on cc 10.3 -- ``SPARSE_LEAN_COMBINE_RULE_CCS``; a part outside that tuple which the adapter serves, cc 11.0 below, keeps the
+    module's own forms, ``DECODE_GRID_OFF``).  The coupling asserted below is INTENDED: the explicit admission requires the combine rule to
+    be measured on the part (``SPARSE_LEAN_TILE_EXPLICIT_CCS`` is a subset of ``SPARSE_LEAN_COMBINE_RULE_CCS``), so a part joins the
+    explicit set together with its combine table.  The 24 / 4 geometry (G 6) at S_q 4 builds the lean record with the step rows (N_MT 2).
+    ``"auto"`` / ``"tcgen05"`` there resolve the tcgen05 core and are declined by name ('EXPLICIT lean tile only', ending with the former
+    statement's spelling), the AUTO pin and the placement rule stay cc 10.7's, the lean body's own declines
     still apply, a part outside both sets keeps the former decline whatever the form, and the gather4 floor still answers first below cc 10.0."""
     from cudnn.sdpa.fwd import sparse_tile_rules as H
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as sc
@@ -1840,10 +1843,11 @@ def test_explicit_lean_is_admitted_on_the_blackwell_parts_for_measurement():
     for cc in H.SPARSE_LEAN_TILE_EXPLICIT_CCS:
         a = _route_adapter(cc=cc, tile_form="lean")
         assert a.check_support() and a.tile_form == "lean" and a.kernel_template == H.SPARSE_TILE_LEAN and (a.split_kv, a.sub_tiles_per_cta) == (65, 1), cc
-        want_form = (
-            sc.DECODE_GRID_AUTO if cc in H.SPARSE_LEAN_COMBINE_RULE_CCS else sc.DECODE_GRID_OFF
-        )  # cc 10.0 measured (the rules module's table), cc 10.3 not
-        assert a.combine_form() == want_form and a.scratch_workspace_bytes() == rubin.scratch_workspace_bytes(), cc
+        assert cc in H.SPARSE_LEAN_COMBINE_RULE_CCS, (
+            cc,
+            "both explicit parts are measured: the rules module's tables (cc 10.0 2026-10-28, cc 10.3 2026-11-05)",
+        )
+        assert a.combine_form() == sc.DECODE_GRID_AUTO and a.scratch_workspace_bytes() == rubin.scratch_workspace_bytes(), cc
         g6 = _route_adapter(cc=cc, tile_form="lean", H=24, KH=4, SQ=4)  # 24 q / 4 kv heads (G 6), the shared list at S_q 4: N_MT = ceil(24 / 16) = 2
         assert g6.check_support() and g6.tile_form == "lean" and g6.template_params().decode_seqlen_q == 4 and g6.template_params().qh_per_kh == 6, cc
         assert not H.sparse_decode_lean_tile_selected(batch=1, h_kv=2, s_q=1, top_k=512, device_cc=cc)
@@ -1853,6 +1857,9 @@ def test_explicit_lean_is_admitted_on_the_blackwell_parts_for_measurement():
                 _route_adapter(cc=cc, tile_form=form).check_support()
         with pytest.raises(NotImplementedError, match="below 8"):  # the lean body's own declines still apply on these parts
             _route_adapter(cc=cc, tile_form="lean", top_k=4).check_support()
+    # a part outside the combine tuple that the adapter serves (cc 11.0: inside the core's record) keeps the module's own forms on the lean route
+    a11 = _route_adapter(cc=(11, 0), tile_form="lean")
+    assert a11.check_support() and a11.tile_form == "lean" and a11.split_kv == 65 and a11.combine_form() == sc.DECODE_GRID_OFF
     with pytest.raises(NotImplementedError, match=r"needs a Rubin-line GPU \(cc 10\.7 \.\. 11\.9\); got cc 12\.0"):
         _route_adapter(cc=(12, 0), tile_form="lean").check_support()  # outside both sets: the former decline, lean or not
     with pytest.raises(NotImplementedError, match="requires a cc 10.0\\+ part"):

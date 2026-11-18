@@ -321,13 +321,13 @@ def test_unsupported_format_combinations(quantization, group_size, scale_format)
 @pytest.mark.L0
 @pytest.mark.parametrize("cc", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0), (12, 1)])
 def test_architecture_gate_fp4_and_fp8(cc, monkeypatch):
-    """fp8 is served on every portable part; fp4 (e2m1x2 converts) on SM100 / SM103 / SM120. SM121 is not served yet.
+    """fp8 is served on every portable part; fp4 (e2m1x2 converts) on SM100 / SM103 / SM120 / SM121.
 
     The served matrix is spelled out here rather than read from ``qdq``, so a change to the
     capability sets has to change this test too."""
     served = {
-        "fp8": {(9, 0), (10, 0), (10, 3), (12, 0)},
-        "fp4": {(10, 0), (10, 3), (12, 0)},
+        "fp8": {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)},
+        "fp4": {(10, 0), (10, 3), (12, 0), (12, 1)},
     }
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)
     for quantization, group_size, scale_format in (("fp4", 32, "ue8m0"), ("fp4", 16, "e4m3"), ("fp8", 32, "ue8m0")):

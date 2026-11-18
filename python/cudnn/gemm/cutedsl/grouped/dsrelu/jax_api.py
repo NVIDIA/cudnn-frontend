@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry points for the grouped GEMM dSReLU backward,
-built on :func:`cudnn.jax.call`.
+built on :func:`cudnn._jax.call`.
 
 ``grouped_gemm_dsrelu_jax_sm100`` serves two modes. With ``b_tensor`` it is the
 canonical block-scaled backward with dense weights: MXFP8 or packed FP4 A
@@ -34,7 +34,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype, get_compute_capability
-from cudnn.jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
+from cudnn._jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
 from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape
 from ..moe_utils import MoEWeightMode
@@ -567,9 +567,11 @@ def dsrelu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sf
             raise ValueError("Unsupported grouped GEMM dSReLU dtype, tile, cluster, alignment, or layout configuration")
         validated_configs.add(validation_key)
     if config not in kernel_cache:
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = get_compute_capability()
-        if major < 10:
-            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100+, found SM{major}{minor}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100+ with tcgen05 (not cc 12.x), found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")

@@ -1,0 +1,107 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "ef005068fa7725ecff0e2862c8958ffe4cdee3da29913ba30880f7b7f8941caa",
+      "shape": [
+        89,
+        2,
+        16,
+        64
+      ]
+    },
+    "kl": {
+      "dtype": "torch.int32",
+      "sha256": "2c16cb7f013a2dd92408437990be5f9af6e851340b4b69e43535e6b4710e2b31",
+      "shape": [
+        5
+      ]
+    },
+    "kt": {
+      "dtype": "torch.int32",
+      "sha256": "c61ec0f06fcaf5c6c65b43fd33ae45fed2d4537cda1a1a3f8288d1ac85d8ac48",
+      "shape": [
+        5,
+        17
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "f582dd1bce34f44b35a7022e1fa61f369f2e28923e14571e2247feab7c16fac6",
+      "shape": [
+        5,
+        8,
+        17,
+        64
+      ]
+    },
+    "ql": {
+      "dtype": "torch.int32",
+      "sha256": "a974b3d9980e87cdea80a0339e1a73ac63607aa603167ae94ad97b028e8def33",
+      "shape": [
+        5
+      ]
+    },
+    "sink": {
+      "dtype": "torch.float32",
+      "sha256": "4b3f7f735a63b0c69d84e4625e084644be609dc28209b5046f7bd99cae3acb45",
+      "shape": [
+        8
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "a0aa348fb71947504fd6419f531f5eeb79e274f9c9ea32be1fe9f556c0239516",
+      "shape": [
+        89,
+        2,
+        16,
+        64
+      ]
+    },
+    "vt": {
+      "dtype": "torch.int32",
+      "sha256": "41c17e66714139a7ba0b224c8fc60e452ac56d172ddddd895b81d6dd8055bf48",
+      "shape": [
+        5,
+        17
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "949c3cff65b824e3b176b89ffd7ff5d13d2fe474c3fb8ec5b3ca431ca76fbbe3",
+      "shape": [
+        3,
+        8,
+        17
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "e5919e1d0b8f1188cdd4f372b1d6e63655dc4a96ed5d2f5a3c7fa1319dfbc257",
+      "shape": [
+        3,
+        8,
+        17,
+        64
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13060,
+    "cudnn": 93000,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      7
+    ],
+    "sm_count": 216,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

@@ -3,12 +3,11 @@
 
 """Per-tensor FP8 d128 decode with two KV streams per CTA (TemplateParams.dual_kv_stream).
 
-sm100/prefill_d128_fp8.py runs its second Q sub-tile as a second KV stream over
+sm100/d128_fp8_dual_kv/kernel.py runs its second Q sub-tile as a second KV stream over
 the first sub-tile's 128 rows: stream 0 takes the even KV tiles, stream 1 the
 odd ones, each with its own running max / sum and O accumulator, merged once in
-the correction epilogue.  The routing is the adapter's (``_fp8_dual_kv_stream``),
-on by default behind ``config_sm100.FP8_DUAL_KV_STREAM_ROUTED``; these tests pin
-it on and check every shape family the merge has to get right: an even and an odd tile
+the correction epilogue.  Graph tests pin the explicit dual-KV engine; standalone adapter tests retain
+the legacy ``_fp8_dual_kv_stream`` routing check. They cover every shape family the merge has to get right: an even and an odd tile
 count (stream 1's phantom step), one and two tiles, a KV split whose chunks are
 odd, bottom-right causal multi-query, an unpacked 64-row Q tile, fp8 and bf16 O,
 and paged K/V with unaligned lengths.
@@ -28,12 +27,13 @@ import cudnn.sdpa  # noqa: F401  -- registers the FROST engines
 from cudnn.sdpa.fwd import config_sm100
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from determinism_utils import assert_bitwise, snapshot
+from frost_test_utils import fp8_engine_names, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
-ENGINE = "sdpa_fwd_prefill_sm100_fp8"
-ENGINE_ID = 20513  # FROST_SDPA_FWD_ID_BASE + manifest slot 13 (sdpa_fwd_prefill_sm100_fp8)
+ENGINE = "sdpa_fwd_sm100_d128_fp8_dual_kv"
+ENGINE_ID = 20528  # Explicit dual-KV implementation, independent of heuristic ranking.
 D = 128
 F8 = torch.float8_e4m3fn
 
@@ -220,21 +220,27 @@ def test_dense_two_kv_streams_match_the_reference(routed, name, b, h, kh, s_q, s
     assert abs(amax - ref.abs().max().item()) <= 0.08 * ref.abs().max().item() + 1e-3, (name, amax, ref.abs().max().item())
 
 
-def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br):
+def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br, split=None, sched_policy=0, pack_gqa=True, hnd=True, replay=False, generator=None):
+    assert len(lens) == b and all(0 <= length <= max_pages * page for length in lens)
     npages = b * max_pages
     k_pool = _rand((npages, kh, page, D), seed=4)
     v_pool = _rand((npages, kh, page, D), seed=5)
-    bt = torch.randperm(npages, device="cuda", dtype=torch.int32).view(b, max_pages)
+    if not hnd:
+        k_pool = k_pool.transpose(1, 2).contiguous().transpose(1, 2)
+        v_pool = v_pool.transpose(1, 2).contiguous().transpose(1, 2)
+    bt = torch.randperm(npages, device="cuda", dtype=torch.int32, generator=generator).view(b, max_pages)
+    bt_v = bt.roll(1, dims=1) if replay else bt
     q = _rand((b, s_q, h, D), seed=6).transpose(1, 2)
     o = torch.empty(b, s_q, h, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
     amax_o = torch.zeros(1, 1, 1, 1, device="cuda", dtype=torch.float32)
     ones = {n: torch.ones(1, 1, 1, 1, device="cuda", dtype=torch.float32) for n in ("dq", "dk", "dv", "ds", "ss", "so")}
     bt4 = bt.view(b, 1, max_pages, 1)
+    btv4 = bt_v.view(b, 1, max_pages, 1)
     slk = torch.tensor(lens, dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
     slq = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
     g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tq, tk, tv = g.tensor_like(q), g.tensor_like(k_pool), g.tensor_like(v_pool)
-    tbk, tbv = g.tensor_like(bt4), g.tensor_like(bt4)
+    tbk, tbv = g.tensor_like(bt4), g.tensor_like(btv4)
     tsq, tsk = g.tensor_like(slq), g.tensor_like(slk)
     sc = {n: g.tensor_like(t) for n, t in ones.items()}
     kw = dict(use_causal_mask_bottom_right=True) if causal_br else {}
@@ -265,19 +271,55 @@ def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.OPENSOURCE])
-    plan = select_engine(g, ENGINE)
+    # This producer is a legal explicit alternative even when heuristics prefer swap-AB.
+    # Preserve the parent's split/packing choice for the unpinned legacy cases.
+    lead = select_engine(g, fp8_engine_names())
+    chosen_split = lead.knobs.split_kv if split is None else split
+    chosen_pack = lead.knobs.pack_gqa if split is None else pack_gqa
+    g.create_execution_plan(ENGINE_ID, SdpaFwdKnobs(sched_policy=sched_policy, tile_m=128, tile_n=128, cga=1, pack_gqa=chosen_pack, split_kv=chosen_split))
+    g.select_plan(len(g.plans) - 1)
+    plan = g.plans[g._plan_index]
     assert plan.knobs.cga in (None, 1), plan.knobs
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    vp = {tq: q, tk: k_pool, tv: v_pool, tbk: bt4, tbv: bt4, tsq: slq, tsk: slk, to: o, ta: amax_o}
+    vp = {tq: q, tk: k_pool, tv: v_pool, tbk: bt4, tbv: btv4, tsq: slq, tsk: slk, to: o, ta: amax_o}
     vp.update({sc[n]: ones[n] for n in ones})
-    g.execute(vp, ws, handle=cudnn.create_handle())
-    torch.cuda.synchronize()
     # gather the pages into dense [B, KH, S, D] for the reference
     k_d = k_pool[bt.long()].permute(0, 2, 1, 3, 4).reshape(b, kh, max_pages * page, D)
-    v_d = v_pool[bt.long()].permute(0, 2, 1, 3, 4).reshape(b, kh, max_pages * page, D)
+    v_d = v_pool[bt_v.long()].permute(0, 2, 1, 3, 4).reshape(b, kh, max_pages * page, D)
     ref = _reference(q, k_d, v_d, lens, s_q, causal_br)
+    handle = cudnn.create_handle()
+    try:
+
+        def execute():
+            cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+            g.execute(vp, ws, handle=handle)
+
+        execute()
+        torch.cuda.synchronize()
+        if replay:
+            first = snapshot({"o": o, "amax_o": amax_o})
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                execute()
+            changed = [max(0, length - 129) for length in lens]
+            for live in (changed, [0] * b, lens):
+                slk.copy_(torch.tensor(live, device="cuda", dtype=torch.int32).view_as(slk))
+                o.fill_(torch.nan)
+                amax_o.zero_()
+                for _ in range(16):
+                    graph.replay()
+                torch.cuda.synchronize()
+                expected = _reference(q, k_d, v_d, live, s_q, causal_br)
+                assert torch.isfinite(o).all() and torch.isfinite(amax_o).all()
+                if any(live):
+                    assert (o.float() - expected).abs().max() <= 0.04 * expected.abs().max()
+                else:
+                    assert torch.count_nonzero(o) == 0
+            assert_bitwise({"o": o, "amax_o": amax_o}, first, "restore lengths after captured replay")
+    finally:
+        cudnn.destroy_handle(handle)
     return o.float(), ref
 
 
@@ -300,8 +342,46 @@ def test_paged_two_kv_streams_match_the_reference(routed, name, b, s_q, page, ma
     assert err < 0.04, (name, err)
 
 
+@pytest.mark.parametrize("hnd", [False, True], ids=["nhd", "hnd"])
+@pytest.mark.parametrize(
+    "b,h,kh,s_q,page,max_pages,lens,split,sched,packed,causal",
+    [
+        # Sixteen live rows keep this on the two-stream producer; <=8 use native decode on SM100.
+        (40, 64, 8, 2, 16, 72, [1152, 777, 0, 40] * 10, 4, 0, True, False),
+        (4, 64, 8, 4, 8, 33, [264, 129, 40, 0], 4, 1, True, True),
+        (2, 8, 8, 64, 128, 9, [1152, 1000], 4, 2, False, False),
+        (4, 64, 8, 4, 8, 33, [264, 129, 40, 0], 1, 0, True, True),
+    ],
+    ids=["persistent-empty-splits", "causal-lpt", "unpacked-lpt-l2", "unsplit"],
+)
+def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh, s_q, page, max_pages, lens, split, sched, packed, causal):
+    """Pin the actual producer, independent V pages and live/empty persistent phases."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    modules = []
+    original_load = api_dsl.load_template
+
+    def load(*args, **kwargs):
+        module = original_load(*args, **kwargs)
+        if hasattr(module, "SPLIT_PAGE_V"):
+            modules.append(module)
+        return module
+
+    monkeypatch.setattr(api_dsl, "load_template", load)
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    o, ref = _run_paged(
+        b, h, kh, s_q, page, max_pages, lens, causal_br=causal, split=split, sched_policy=sched, pack_gqa=packed, hnd=hnd, replay=True, generator=generator
+    )
+    assert modules and all(m.CFG.PAGED_KV and m.DUAL_KV and not m.CFG.THD_VARLEN for m in modules)
+    assert all(m.SPLIT_PAGE_V == (torch.cuda.get_device_capability() == (10, 0)) for m in modules)
+    assert torch.isfinite(o).all() and (o - ref).abs().max() <= 0.04 * ref.abs().max()
+
+
 _PHANTOM_CHILD = textwrap.dedent(r"""
-    import os, sys
+    import faulthandler, os, sys
+    faulthandler.dump_traceback_later(870, exit=False)
+    # pytest adds test/python for shared helpers; a fresh child in tmp_path does not.
+    sys.path.insert(0, os.path.dirname(os.path.dirname("__TEST_DIR__")))
     sys.path.insert(0, "__TEST_DIR__")
     import torch
     import test_sdpa_fwd_fp8_dual_kv_sm100 as t
@@ -309,7 +389,8 @@ _PHANTOM_CHILD = textwrap.dedent(r"""
 
     config_sm100.FP8_DUAL_KV_STREAM_ROUTED = True
     kernels = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels")
-    src = open(os.path.join(kernels, api_dsl._SM100_FP8_KERNEL_FILES[(128, 128)])).read()
+    source_path = os.path.join(kernels, "sm100/d128_fp8_dual_kv/kernel.py")
+    src = open(source_path).read()
     # The MMA warp sleeps before it consumes stream 1's P-ready credits: the adverse ordering in which
     # stream 0 and the ping-pong run ahead while stream 1's previous credits sit unconsumed.
     anchor = "    bars.mb_bmm2_ready[stream * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)\n"
@@ -321,7 +402,12 @@ _PHANTOM_CHILD = textwrap.dedent(r"""
     assert src.count(anchor) == 1, "the stream-indexed ready wait of _mma_dual_pv moved: update this test's anchor"
     path = os.path.join(os.getcwd(), "prefill_d128_fp8_delayed_mma.py")
     open(path, "w").write(src.replace(anchor, delay + anchor))
-    api_dsl._SM100_FP8_KERNEL_FILES[(128, 128)] = path
+    original_load = api_dsl.load_template
+    def delayed_load(filename, *args, **kwargs):
+        if filename == source_path:
+            filename = path
+        return original_load(filename, *args, **kwargs)
+    api_dsl.load_template = delayed_load
     # 4 sequences, 48 packed rows (12 q heads over one KV head x 4 tokens), page 128: 3 / 5 / 7 / 9 KV tiles.
     # Every count is odd, so stream 1 ends on a phantom step with at least one real step before it.
     torch.manual_seed(1234)  # the block table is a random permutation: pin it so the bound below is a number, not a draw
@@ -332,6 +418,7 @@ _PHANTOM_CHILD = textwrap.dedent(r"""
     print("max_rel_err", err, flush=True)
     assert err < 0.04, err
     print("OK", flush=True)
+    faulthandler.cancel_dump_traceback_later()
     """)
 
 _PHANTOM_BUDGET_S = 900.0  # one cold compile of the patched kernel (1-3 min) + one launch; a lap parks the child in its synchronize for ever
@@ -339,8 +426,8 @@ _PHANTOM_BUDGET_S = 900.0  # one cold compile of the patched kernel (1-3 min) + 
 
 def test_phantom_step_cannot_lap_a_delayed_mma(tmp_path):
     """Stream 1's phantom step (odd KV tile count) publishes its P-ready credits only after its own
-    previous PV completed, so a delayed MMA cannot be lapped.  The MMA issues the next pair's BMM1 --
-    which releases the phantom -- before the previous pair's PVs, and ``mb_bmm2_ready`` chunk 1 counts
+    previous PV completed, so a delayed MMA cannot be lapped.  With P in SMEM, the MMA issues stream 1's
+    next BMM1 -- which releases the phantom -- before its previous PV, and ``mb_bmm2_ready`` chunk 1 counts
     softmax lanes only: a phantom that published at once completed a second phase of that barrier while
     the MMA's parity wait for the first was still pending, and the wait never saw a flip.  Child process
     under a wall budget (a regression is a budget miss, never a wedged suite): the kernel is run from a
@@ -351,6 +438,7 @@ def test_phantom_step_cannot_lap_a_delayed_mma(tmp_path):
         proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=_PHANTOM_BUDGET_S, cwd=str(tmp_path))
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        pytest.fail(f"HANG: the delayed-MMA two-stream child did not finish within {_PHANTOM_BUDGET_S:.0f} s (the phantom lapped its consumer).\n{out[-3000:]}")
+        err = (e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        pytest.fail(f"the delayed-MMA two-stream child did not finish within {_PHANTOM_BUDGET_S:.0f} s.\n{out[-3000:]}\n{err[-3000:]}")
     assert proc.returncode == 0, f"child failed rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     assert "OK" in proc.stdout, proc.stdout[-2000:]

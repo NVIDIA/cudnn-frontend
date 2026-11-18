@@ -5,7 +5,7 @@
 
 One frozen dataclass per kernel flavor (the model families the head-dim
 envelopes are named after), all served by the same kernel skeleton
-(``kernels/sm80/prefill_f16.py``; qwen d=256 by ``sm80/prefill_d256_f16.py``).
+(``kernels/sm80/f16_k_prefetch/kernel.py``; qwen d=256 by ``sm80/d256_kv_prefetch/kernel.py``; wide512 / mla576 by ``sm80/wide_cooperative/kernel.py``).
 Knob provenance per flavor:
 
 - **gptoss** (d_qk = d_v = 64): picked from the A100-PCIE-40GB perf sweep. At
@@ -45,6 +45,36 @@ DSV3_CFG = Cfg(D_QK=192, D_V=128, TILE_M=128, TILE_N=64, NUM_WARPS=8)
 QWEN_CFG = Cfg(D_QK=256, D_V=256, TILE_M=128, TILE_N=64, NUM_WARPS=8)
 WIDE512_CFG = Cfg(D_QK=512, D_V=512, TILE_M=32, TILE_N=16, NUM_WARPS=4)
 MLA576_CFG = Cfg(D_QK=576, D_V=512, TILE_M=32, TILE_N=16, NUM_WARPS=4)
+
+FLAVOR_CFGS = {
+    "gptoss": GPTOSS_CFG,
+    "llama": LLAMA_CFG,
+    "dsv3": DSV3_CFG,
+    "qwen": QWEN_CFG,
+    "wide512": WIDE512_CFG,
+    "mla576": MLA576_CFG,
+}
+
+
+def pick_flavor(d_qk: int, d_v: int) -> str:
+    """Smallest native envelope, shared by graph admission and lowering."""
+    for name, cfg in FLAVOR_CFGS.items():
+        if d_qk <= cfg.D_QK and d_v <= cfg.D_V:
+            return name
+    dims = {name: (cfg.D_QK, cfg.D_V) for name, cfg in FLAVOR_CFGS.items()}
+    raise ValueError(f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  Supported envelopes: {dims}.")
+
+
+def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[int]]:
+    """Explicit graph tuning domain; this does not prescribe default tiles.
+
+    The 256-wide double K/V buffers at N128 need 256 KiB, exceeding
+    A100's 164 KiB limit. Wide heads use the fixed column-partition tile.
+    """
+    cfg = FLAVOR_CFGS[pick_flavor(d_qk, d_v)]
+    if cfg.D_QK > 256 or cfg.D_V > 256:
+        return frozenset({32}), frozenset({16})
+    return frozenset({16, 32, 64, 128}), frozenset({16, 32, 64} if cfg == QWEN_CFG else {16, 32, 64, 128})
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +144,10 @@ class TemplateParams:
     score_sign: int = 1
     # Zero retains contiguous K/V; positive values select device page tables.
     paged_page_size: int = 0
+    # Independent KV ranges write split-major partials for the shared reduction.
+    split_kv: int = 1
+    # Q heads sharing one KV head occupy consecutive MMA rows.
+    pack_g: int = 1
 
 
 def score_sign(scale: float) -> int:
@@ -128,12 +162,18 @@ def kernel_scale(scale: float) -> float:
 def validate_params(p: TemplateParams) -> None:
     """Raising validator — a failure here means the capability row or the
     adapter lied about what this template can serve (README Rule 2)."""
+    if p.pack_g < 1 or (p.pack_g > 1 and p.thd_varlen):
+        raise ValueError("sm80: PackGQA requires a positive head group and dense Q")
+    if not 1 <= p.split_kv <= 65535:
+        raise ValueError("sm80: split_kv must be in [1, 65535]")
+    if p.split_kv > 1 and p.thd_varlen:
+        raise ValueError("sm80: split-KV currently requires dense Q")
     wide = p.d_qk > 256 or p.d_v > 256
-    tile_ns = (16,) if wide else (32, *_SM80_SEQ_TILES_N) if (p.d_qk, p.d_v) == (256, 256) else _SM80_SEQ_TILES_N
+    tile_ns = (16,) if wide else (16, 32, *_SM80_SEQ_TILES_N)
     if p.tile_n not in tile_ns:
         raise ValueError(f"sm80: tile_n must be one of {tile_ns}; got {p.tile_n}")
-    if p.num_warps not in (4, 8):
-        raise ValueError(f"sm80: num_warps must be 4 or 8; got {p.num_warps}")
+    if p.num_warps not in (1, 2, 4, 8):
+        raise ValueError(f"sm80: num_warps must be 1, 2, 4 or 8; got {p.num_warps}")
     row_warps = p.num_warps // (2 if wide else 1)
     if p.tile_m % (row_warps * 16) != 0:
         raise ValueError(f"sm80: tile_m ({p.tile_m}) must be a multiple of row_warps*16 ({row_warps * 16})")
@@ -161,7 +201,7 @@ def validate_params(p: TemplateParams) -> None:
 
 def params_for_flavor(flavor: str, **overrides) -> TemplateParams:
     """A TemplateParams seeded from one native flavor's Cfg row."""
-    cfg = {"gptoss": GPTOSS_CFG, "llama": LLAMA_CFG, "dsv3": DSV3_CFG, "qwen": QWEN_CFG, "wide512": WIDE512_CFG, "mla576": MLA576_CFG}[flavor]
+    cfg = FLAVOR_CFGS[flavor]
     base = dict(d_qk=cfg.D_QK, d_v=cfg.D_V, tile_m=cfg.TILE_M, num_warps=cfg.NUM_WARPS, tile_n=cfg.TILE_N)
     base.update(overrides)
     p = TemplateParams(**base)

@@ -1,0 +1,1152 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""BF16/FP16 block sparse attention forward against the torch reference.
+
+Tests without an architecture prefix run on every GPU the forward supports (SM90, SM100/SM103/SM110, SM120), at both
+sparse block sizes where parametrized.  ``test_sm<arch>_blk<size>_*`` tests cover one kernel's scheduling, pipelining
+or tail handling and skip on other GPUs.  Argument checks and dispatch policies are in ``test_BSA_api.py``.
+"""
+
+import importlib
+import math
+
+import pytest
+import torch
+
+from test_utils import torch_fork_set_rng
+from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask
+from block_sparse_attention.cutedsl.bsa_utils import (
+    blk128_case,
+    blk128_reference,
+    check_blk128,
+    cuda_graph,
+    import_bsa,
+    make_fixed_metadata,
+    make_variable_metadata,
+    no_host_sync,
+    require_arch,
+    supported_block_size,
+)
+
+pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+
+with_block_size = pytest.mark.parametrize("block_size", (64, 128), ids=("blk64", "blk128"))
+FORWARD_FAMILIES = (9, 10, 11, 12)
+
+
+def _has_kv_splits(block_size: int) -> bool:
+    """kv_splits is exposed by the SM90 forward and the SM100/SM110 blk64 forward."""
+    major = torch.cuda.get_device_capability()[0]
+    return major == 9 or (major in (10, 11) and block_size == 64)
+
+
+# ---- every architecture
+
+
+@pytest.mark.L0
+@with_block_size
+@torch_fork_set_rng(seed=0)
+def test_fixed_blocks(block_size):
+    """A fixed count over full KV blocks; with kv_splits=2 where the kernel exposes it, in the same output layout."""
+    ops = import_bsa(families=FORWARD_FAMILIES)
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, block_sizes, sparse_block_size=block_size)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+    if not _has_kv_splits(block_size):
+        return
+    split = ops.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, block_sizes, sparse_block_size=block_size, kv_splits=2)
+    torch.testing.assert_close(split["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(split["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+    for name in ("o_tensor", "lse_tensor"):
+        assert split[name].is_contiguous() and split[name].stride() == result[name].stride()
+
+
+@pytest.mark.L0
+@with_block_size
+@torch_fork_set_rng(seed=1)
+def test_variable_blocks_and_layout(block_size):
+    """Variable counts and a partial KV block; BSHD matches BHSD exactly; an empty row gets O = 0 and LSE = -inf."""
+    ops = import_bsa(families=FORWARD_FAMILIES)
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_nums, block_sizes = make_variable_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    kwargs = dict(q2k_block_nums=block_nums, sparse_block_size=block_size)
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, 0, block_sizes, **kwargs)
+    mask = block_sparse_mask(q2k, 0, block_sizes, seqlen_q, seqlen_k, block_size, block_nums)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+    result_bshd = ops.block_sparse_attention_forward(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), q2k, 0, block_sizes, **kwargs, layout="bshd")
+    torch.testing.assert_close(result_bshd["o_tensor"].transpose(1, 2), result["o_tensor"], atol=0, rtol=0)
+    torch.testing.assert_close(result_bshd["lse_tensor"], result["lse_tensor"], atol=0, rtol=0)
+
+    empty_block_nums = block_nums.clone()
+    empty_block_nums[..., 0] = 0
+    empty_result = ops.block_sparse_attention_forward(
+        q, k, v, q2k, 0, block_sizes, q2k_block_nums=empty_block_nums, sparse_block_size=block_size, allow_empty_block_nums=True
+    )
+    empty_mask = block_sparse_mask(q2k, 0, block_sizes, seqlen_q, seqlen_k, block_size, empty_block_nums)
+    empty_o_ref, empty_lse_ref = attention_reference(q, k, v, empty_mask)
+    torch.testing.assert_close(empty_result["o_tensor"].float(), empty_o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(empty_result["lse_tensor"], empty_lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@with_block_size
+@torch_fork_set_rng(seed=19)
+def test_partial_q_and_kv_tiles(block_size):
+    """A one-row final query tile and a one-token final KV block (declared through block_sizes); BSHD matches BHSD."""
+    ops = import_bsa(families=FORWARD_FAMILIES)
+    if block_size == 64 and torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("the SM90 blk64 forward takes whole query blocks")
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 1, block_size + 1, 2 * block_size + 1, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = torch.tensor([0, 2], device="cuda", dtype=torch.int32).view(1, 1, 1, 2).expand(1, 1, 2, 2).contiguous()
+    block_sizes = torch.tensor([block_size, block_size, 1], device="cuda", dtype=torch.int32)
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, 2, block_sizes, sparse_block_size=block_size)
+    mask = block_sparse_mask(q2k, 2, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    assert torch.isfinite(result["o_tensor"]).all() and torch.isfinite(result["lse_tensor"]).all()
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+    result_bshd = ops.block_sparse_attention_forward(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), q2k, 2, block_sizes, sparse_block_size=block_size, layout="bshd"
+    )
+    torch.testing.assert_close(result_bshd["o_tensor"].transpose(1, 2), result["o_tensor"], atol=0, rtol=0)
+    torch.testing.assert_close(result_bshd["lse_tensor"], result["lse_tensor"], atol=0, rtol=0)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=3)
+def test_gqa_without_block_sizes():
+    """GQA with block_sizes=None; on SM100/SM110 blk128 the packed-GQA metadata gives the same result."""
+    ops = import_bsa()
+    block_size = supported_block_size()
+    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 1, 4, 2, 2 * block_size, 4 * block_size, 128
+    q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_sparse_num, full_block_sizes = make_fixed_metadata(batch, q_heads, seqlen_q, seqlen_k, block_size)
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, block_sizes=None, sparse_block_size=block_size, pack_gqa=False)
+    mask = block_sparse_mask(q2k, block_sparse_num, full_block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+    if torch.cuda.get_device_capability()[0] in {10, 11}:
+        gqa_ratio = q_heads // kv_heads
+        packed_q2k, packed_count, _ = make_fixed_metadata(batch, kv_heads, seqlen_q * gqa_ratio, seqlen_k, block_size)
+        packed_result = ops.block_sparse_attention_forward(q, k, v, packed_q2k, packed_count, block_sizes=None, sparse_block_size=block_size)
+        torch.testing.assert_close(packed_result["o_tensor"], result["o_tensor"], atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(packed_result["lse_tensor"], result["lse_tensor"], atol=2e-3, rtol=2e-3)
+
+
+# Large-logit regressions: the kernels must center P on the running maximum through their 16-bit conversion.  An
+# exponent offset by the rounding residual of max * softmax_scale (* log2(e)) overflows or underflows there (O = NaN
+# or 0).  Each row names the kernel family it pins.
+SM90 = dict(families=(9,), reason="the SM90 blk64 forward is under test")
+SM100 = dict(families=(10, 11), reason="the SM100/SM110 forward is under test")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("gate", "sparse_block_size", "dtype", "q_value", "k_value"),
+    [
+        pytest.param(SM90, 64, torch.float16, 10000.0, 10008.0, id="sm90-blk64-fp16-p-underflow"),
+        pytest.param(SM90, 64, torch.float16, 30000.0, 30128.0, id="sm90-blk64-fp16-exp-overflow"),
+        pytest.param(SM100, 128, torch.float16, 10000.0, 10008.0, id="sm100-blk128-fp16-p-underflow"),
+        pytest.param(SM100, 128, torch.float16, 30000.0, 30128.0, id="sm100-blk128-fp16-exp-overflow"),
+        pytest.param(SM100, 64, torch.bfloat16, 16384.0, 16896.0, id="sm100-blk64-bf16-exp-overflow"),
+        pytest.param(SM100, 64, torch.bfloat16, 16384.0, 16640.0, id="sm100-blk64-bf16-exp-underflow"),
+    ],
+)
+def test_large_equal_logits(gate, sparse_block_size, dtype, q_value, k_value):
+    """Equal ~1e9 logits with V = 1 weight every key equally, so O is exactly 1 and LSE is known in closed form."""
+    ops = import_bsa(**gate)
+    seqlen_q, seqlen_k, dim = 128, 256, 128
+    q = torch.full((1, 1, seqlen_q, dim), q_value, device="cuda", dtype=dtype)
+    k = torch.full((1, 1, seqlen_k, dim), k_value, device="cuda", dtype=dtype)
+    v = torch.ones_like(k)
+    num_kv_blocks = seqlen_k // sparse_block_size
+    q2k = torch.arange(num_kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, seqlen_q // sparse_block_size, -1).contiguous()
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, num_kv_blocks, sparse_block_size=sparse_block_size)
+    torch.testing.assert_close(result["o_tensor"], torch.ones_like(q), atol=0, rtol=0)
+    q_value, k_value = q[0, 0, 0, 0].item(), k[0, 0, 0, 0].item()  # as rounded to dtype
+    lse_ref = torch.full_like(result["lse_tensor"], q_value * k_value * math.sqrt(dim) + math.log(seqlen_k), dtype=torch.float64)
+    torch.testing.assert_close(result["lse_tensor"].double(), lse_ref, atol=0, rtol=2e-6)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("max_order", ("rises", "falls"))
+@pytest.mark.parametrize(
+    ("gate", "sparse_block_size", "dtype", "q_value", "k_low", "k_high"),
+    [
+        pytest.param(SM90, 64, torch.float16, 10000.0, 10000.0, 10048.0, id="sm90-blk64-fp16"),
+        pytest.param(SM90, 64, torch.bfloat16, 30000.0, 30000.0, 30208.0, id="sm90-blk64-bf16"),
+        pytest.param(SM100, 128, torch.float16, 30000.0, 30000.0, 30128.0, id="sm100-blk128-fp16"),
+        pytest.param(SM100, 64, torch.bfloat16, 16384.0, 16640.0, 16896.0, id="sm100-blk64-bf16"),
+    ],
+)
+def test_large_logits_max_rises_and_falls(gate, sparse_block_size, dtype, q_value, k_low, k_high, max_order):
+    """Half of the KV blocks score far below the other half; V is 1 there and 2 on the high blocks, so O is exactly 2.
+
+    Lists are walked from the end (SM90 walks the whole list; SM100 blk128 alternates slots between its softmax
+    warpgroups, blk64 hands out groups of four), so "rises" lists the high blocks first and "falls" lists them last.
+    """
+    ops = import_bsa(**gate)
+    seqlen_q, dim = 128, 128
+    num_kv_blocks = 4 if sparse_block_size == 128 else 16
+    seqlen_k = num_kv_blocks * sparse_block_size
+    num_low_keys = num_kv_blocks // 2 * sparse_block_size
+    q = torch.full((1, 1, seqlen_q, dim), q_value, device="cuda", dtype=dtype)
+    k = torch.full((1, 1, seqlen_k, dim), k_high, device="cuda", dtype=dtype)
+    k[:, :, :num_low_keys] = k_low
+    v = torch.full_like(k, 2.0)
+    v[:, :, :num_low_keys] = 1.0
+    low = torch.arange(num_kv_blocks // 2, device="cuda", dtype=torch.int32)
+    high = low + num_kv_blocks // 2
+    order = torch.cat((high, low) if max_order == "rises" else (low, high))
+    q2k = order.expand(1, 1, seqlen_q // sparse_block_size, -1).contiguous()
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, num_kv_blocks, sparse_block_size=sparse_block_size)
+    torch.testing.assert_close(result["o_tensor"], torch.full_like(q, 2.0), atol=0, rtol=0)
+    num_high_keys = seqlen_k - num_low_keys
+    q_value, k_high = q[0, 0, 0, 0].item(), k[0, 0, -1, 0].item()  # as rounded to dtype
+    lse_ref = torch.full_like(result["lse_tensor"], q_value * k_high * math.sqrt(dim) + math.log(num_high_keys), dtype=torch.float64)
+    torch.testing.assert_close(result["lse_tensor"].double(), lse_ref, atol=0, rtol=2e-6)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("gate", "sparse_block_size", "dtype", "q_value", "k_value"),
+    [
+        pytest.param(SM90, 64, torch.float16, 10000.0, 10008.0, id="sm90-blk64-fp16"),
+        pytest.param(SM90, 64, torch.bfloat16, 10000.0, 10008.0, id="sm90-blk64-bf16"),
+        pytest.param(SM100, 128, torch.float16, 20000.0, 20016.0, id="sm100-blk128-fp16"),
+        pytest.param(SM100, 64, torch.bfloat16, 32768.0, 16896.0, id="sm100-blk64-bf16"),
+    ],
+)
+@torch_fork_set_rng(seed=5)
+def test_large_logits_mixed_warp(gate, sparse_block_size, dtype, q_value, k_value):
+    """Even query rows see equal ~1e9 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
+    holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
+    ops = import_bsa(**gate)
+    seqlen_q, seqlen_k, dim = 128, 256, 128
+    q = torch.zeros((1, 1, seqlen_q, dim), device="cuda", dtype=dtype)
+    q[..., 0::2, : dim // 2] = q_value
+    q[..., 1::2, dim // 2 :] = torch.randn((1, 1, seqlen_q // 2, dim // 2), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, seqlen_k, dim), device="cuda", dtype=dtype)
+    k[..., : dim // 2] = k_value
+    v = torch.randn_like(k)
+    num_kv_blocks = seqlen_k // sparse_block_size
+    q2k = torch.arange(num_kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, seqlen_q // sparse_block_size, -1).contiguous()
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, num_kv_blocks, sparse_block_size=sparse_block_size)
+    mask = torch.zeros((seqlen_q, seqlen_k), device="cuda", dtype=torch.float32)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    # Even rows: LSE ~1e9, where the FP32 reference itself is off by a few hundred; bound it relatively.
+    torch.testing.assert_close(result["lse_tensor"][..., 0::2].double(), lse_ref[..., 0::2].double(), atol=0, rtol=2e-6)
+    torch.testing.assert_close(result["lse_tensor"][..., 1::2], lse_ref[..., 1::2], atol=2e-3, rtol=2e-3)
+
+
+# ---- SM90 blk64
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kv_splits", (1, 2))
+@pytest.mark.parametrize("with_block_sizes", (True, False), ids=("block_sizes", "short_last_tile"))
+@torch_fork_set_rng(seed=6)
+def test_sm90_blk64_partial_kv_blocks(with_block_sizes, kv_splits):
+    """Partial KV blocks are masked, full ones skip the mask. They come from block_sizes or, without it, from a short
+    last KV tile. Each list is walked from its last slot, so row 0 masks in the prologue and row 1 in the loop."""
+    ops = import_bsa(families=(9,), reason="the blk64 forward kernel under test is specific to SM90")
+    seqlen_q, seqlen_k = 2 * 64, 4 * 64 - (0 if with_block_sizes else 17)
+    q = torch.randn((1, 2, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = torch.tensor([[0, 1, 3], [3, 2, 0]], device="cuda", dtype=torch.int32).expand(1, 2, 2, 3).contiguous()
+    block_sizes = torch.tensor([64, 40, 64, 23], device="cuda", dtype=torch.int32) if with_block_sizes else None
+
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, 3, block_sizes, sparse_block_size=64, kv_splits=kv_splits)
+    reference_sizes = block_sizes if with_block_sizes else torch.full((4,), 64, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, 3, reference_sizes, seqlen_q, seqlen_k, 64)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("size_range", ((1, 64), (1, 15)), ids=("rows_1_64", "rows_1_15"))
+@torch_fork_set_rng(seed=41)
+def test_sm90_blk64_row_aware_boxes_match_full_boxes(monkeypatch, size_range):
+    """The row-count-aware K/V TMA boxes load 16 * ceil(rows / 16) rows of a partial KV block and leave the rest of the
+    K tile and V slot to what an earlier full load of the same CTA put there (the prologue's K[0]/V[0] and step 1's
+    V[1] always load all 64 rows); the masked columns then make O and LSE bitwise equal to the full-box kernel. Random
+    block sizes, lists whose first block is partial and lists of 0..4 blocks (N = 1 has no steady state, N = 2 fills
+    V slot 1 in step 1, N >= 3 prefetches two steps ahead) keep that invariant under test."""
+    ops = import_bsa(families=(9,), reason="the blk64 forward kernel under test is specific to SM90")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    fwd = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90")
+    heads, q_blocks, kv_blocks, width = 2, 16, 16, 4
+    seqlen = kv_blocks * 64
+    q, k, v = [torch.randn((1, heads, seqlen, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    counts = torch.randint(0, width + 1, (1, heads, q_blocks), device="cuda", dtype=torch.int32)
+    # Distinct block ids per row (the prefix of a random permutation); the slots past the count hold a poison index.
+    indices = torch.argsort(torch.rand((1, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    indices.masked_fill_(torch.arange(width, device="cuda") >= counts[..., None], 2147483647)
+    sizes = torch.randint(size_range[0], size_range[1] + 1, (kv_blocks,), device="cuda", dtype=torch.int32)
+    assert (sizes[indices[..., 0][counts > 0]] < 64).any(), "some list must start with a partial block"
+
+    def forward(**flags):
+        builds = []
+
+        class Kernel(fwd.BlockSparseAttnForwardSm90Blk64):
+            def __init__(self, *args, **kwargs):
+                builds.append(flags)
+                super().__init__(*args, **kwargs, **flags)
+
+        monkeypatch.setattr(interface, "BlockSparseAttnForwardSm90Blk64", Kernel)
+        monkeypatch.setattr(interface.bsa_attn_fwd, "compile_cache", {})
+        result = ops.block_sparse_attention_forward(
+            q, k, v, indices, width, sizes, q2k_block_nums=counts, sparse_block_size=64, kv_splits=1, allow_empty_block_nums=True
+        )
+        assert builds, "the forward did not build the SM90 blk64 kernel"
+        return result["o_tensor"].clone(), result["lse_tensor"].clone()
+
+    o_full, lse_full = forward(row_aware_boxes=False, window_prefetch=False)
+    o_boxes, lse_boxes = forward()
+    assert torch.isfinite(o_boxes).all()
+    assert torch.equal(o_boxes, o_full) and torch.equal(lse_boxes, lse_full)
+    mask = block_sparse_mask(indices, width, sizes, seqlen, seqlen, 64, counts)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(o_boxes.float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse_boxes, lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_dim", (64, 96, 128))
+@pytest.mark.parametrize("value_dim", (96, 128))
+@pytest.mark.parametrize("with_block_sizes", (False, True))
+@torch_fork_set_rng(seed=28)
+def test_sm90_blk64_ring_head_dims(dtype, head_dim, value_dim, with_block_sizes):
+    """Exercise real K-ring dispatch, short lists, wraparound, empty rows, and both partial-block paths.
+
+    Repeat five query tiles to cross the large-grid gate without constructing a large dense reference.
+    Counts 0/1/2/3/8 cover first fill, first reuse, multiple barrier phases, and drain.
+    """
+    ops = import_bsa(families=(9,), reason="the blk64 forward kernel under test is specific to SM90")
+    copies, seqlen_q, seqlen_k = 256, 5 * 64, 16 * 64 - 17
+    q = torch.randn((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, seqlen_k, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn((1, 1, seqlen_k, value_dim), device="cuda", dtype=dtype)
+    counts = torch.tensor([[[0, 1, 2, 3, 8]]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([15, 1, 4, 6, 8, 10, 12, 14], device="cuda", dtype=torch.int32).repeat(1, 1, 5, 1)
+    indices[:, :, 4] = indices[:, :, 4].flip(-1)  # The tail occurs in both prologue and steady state.
+    indices.masked_fill_(torch.arange(8, device="cuda") >= counts[..., None], 2147483647)
+    sizes = torch.full((16,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        sizes[1::2] = 23
+    mask = block_sparse_mask(indices, 8, sizes, seqlen_q, seqlen_k, 64, counts)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+
+    result = ops.block_sparse_attention_forward(
+        q.repeat(1, 1, copies, 1),
+        k,
+        v,
+        indices.repeat(1, 1, copies, 1),
+        8,
+        sizes if with_block_sizes else None,
+        q2k_block_nums=counts.repeat(1, 1, copies),
+        sparse_block_size=64,
+        kv_splits=1,
+        allow_empty_block_nums=True,
+    )
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref.repeat(1, 1, copies, 1), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref.repeat(1, 1, copies), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("value_dim", (64, 96, 128))
+@pytest.mark.parametrize("with_block_sizes", (False, True))
+@torch_fork_set_rng(seed=29)
+def test_sm90_blk64_rescale_row_slots(dtype, value_dim, with_block_sizes):
+    """Cover unchanged/increasing maxima, different row slots, and mixed rows within a warp vote.
+
+    The rescale acts on the O accumulator, so value_dim varies; head_dim only sizes the QK reduction (its dispatch is
+    covered by test_sm90_blk64_ring_head_dims).
+    """
+    ops = import_bsa(families=(9,), reason="the blk64 forward kernel under test is specific to SM90")
+    head_dim = 128
+    seqlen_q, seqlen_k = 5 * 64, 16 * 64 - 17
+    q = torch.zeros((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
+    row = torch.arange(64, device="cuda")
+    q[0, 0, 64:128, 0] = 8
+    q[0, 0, 128:192, 0] = torch.where(row % 16 < 8, -8, 8)
+    q[0, 0, 192:256, 0] = torch.where(row % 16 < 8, 8, -8)
+    q[0, 0, 256:320, 0] = torch.where(row % 2 == 0, 8, -8)
+    k = torch.zeros((1, 1, seqlen_k, head_dim), device="cuda", dtype=dtype)
+    k[0, 0, :, 0] = (torch.arange(seqlen_k, device="cuda") // 64).to(dtype) * 0.5
+    v = torch.randn((1, 1, seqlen_k, value_dim), device="cuda", dtype=dtype)
+    # Reverse traversal visits blocks in increasing logit order for positive Q rows.
+    indices = torch.tensor([15, 6, 5, 4, 3, 2, 1, 0], device="cuda", dtype=torch.int32).repeat(1, 1, 5, 1)
+    sizes = torch.full((16,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        sizes[:2] = 0  # Two fully masked blocks before the first finite maximum.
+        sizes[15] = 23
+    result = ops.block_sparse_attention_forward(q, k, v, indices, 8, sizes if with_block_sizes else None, sparse_block_size=64, kv_splits=1)
+    mask = block_sparse_mask(indices, 8, sizes, seqlen_q, seqlen_k, 64)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_sm90_blk64_auto_kv_splits_matches_unsplit(monkeypatch):
+    """kv_splits="auto" resolves to a split count before the output is allocated and matches the unsplit result."""
+    BSA = import_bsa(families=(9,), reason="SM90 blk64 split policy")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    q = torch.randn((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, 1024, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    ids = torch.arange(0, 16, device="cuda", dtype=torch.int32).expand(1, 2, 4, 16).contiguous()
+    expected = BSA.block_sparse_attention_forward(q, k, v, ids, 16, sparse_block_size=64, kv_splits=1)
+    seen = []
+
+    def choose(q_arg, k_arg, v_arg, count):
+        seen.append(count)
+        return 2
+
+    monkeypatch.setattr(interface, "_sm90_blk64_auto_kv_splits", choose)
+    result = BSA.block_sparse_attention_forward(q, k, v, ids, 16, sparse_block_size=64, kv_splits="auto")
+    assert seen == [16]
+    torch.testing.assert_close(result["o_tensor"], expected["o_tensor"], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(result["lse_tensor"], expected["lse_tensor"], atol=1e-3, rtol=1e-3)
+
+
+# ---- SM90 blk128
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d,dv", [(d, dv) for d in (64, 96, 128) for dv in (64, 96, 128)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sm90_blk128_dimensions(d, dv, dtype):
+    require_arch(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    check_blk128(d=d, dv=dv, dtype=dtype, backward=False, ratio=4, layout="bshd")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+@pytest.mark.parametrize("splits", [1, 2, 7, "auto"])
+def test_sm90_blk128_split_partial_gqa(rank, splits):
+    require_arch(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    check_blk128(sq=129, sk=513, variable=True, sizes_rank=rank, splits=splits, ratio=2, backward=False)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d,dv,dtype", [(64, 96, torch.float16), (96, 128, torch.float16), (128, 64, torch.bfloat16), (96, 96, torch.bfloat16)])
+def test_sm90_blk128_split_mixed_dimensions(d, dv, dtype):
+    require_arch(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    check_blk128(sq=129, sk=257, d=d, dv=dv, dtype=dtype, layout="bshd", ratio=4, variable=True, sizes_rank=3, splits=7, backward=False)
+
+
+@pytest.mark.L1
+def test_sm90_blk128_maximum_splits():
+    require_arch(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    check_blk128(sq=1, sk=1, d=64, dv=96, dtype=torch.float16, layout="bshd", ratio=4, splits=256, backward=False)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("active_count", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("variable", [False, True])
+def test_sm90_blk128_pipeline_lengths(active_count, variable):
+    """Prologue/drain, both ring phases, and empty rows alongside active rows; variable counts use two stages even
+    when the maximum count is one."""
+    require_arch(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    check_blk128(sq=129, sk=1153, active_count=active_count, variable=variable, sizes_rank=2, backward=False)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
+@pytest.mark.parametrize("variable", [False, True])
+def test_sm90_blk128_partial_prologue(scale, variable):
+    """Begin with the one-token physical KV tail, then visit full blocks; variable counts include empty rows and
+    exercise the scheduler's short-list paths."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    q, k, v, ids, counts, sizes, count = blk128_case(sq=129, sk=1153, dv=96, ratio=2, dtype=torch.float16, active_count=8, sizes_rank=2, variable=variable)
+    order = torch.cat((torch.tensor([9], device=ids.device, dtype=ids.dtype), torch.arange(count - 1, device=ids.device, dtype=ids.dtype)))
+    ids.copy_(order)
+    sizes.fill_(128)
+    sizes[:, -1] = 1
+    result = ops.block_sparse_attention_forward(
+        q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=variable, block_sizes=sizes, sparse_block_size=128, softmax_scale=scale
+    )
+    ro, rl, _ = blk128_reference(q, k, v, ids, counts, sizes, count, scale, "bhsd")
+    torch.testing.assert_close(result["o_tensor"].double(), ro, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(result["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
+
+
+def _sm90_blk128_forward_with_flags(monkeypatch, call, *variants, built=None):
+    """Run ``call()`` once per dict of kernel-constructor flags in ``variants``, each on a freshly built SM90 blk128
+    forward kernel (empty compile cache), and return the cloned ``(O, LSE)`` of every run.  ``built`` (a list) receives
+    the keyword arguments each kernel was constructed with, the overriding flags included."""
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    fwd = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm90_blk128.bsa_fwd_sm90")
+    # The module's own kernel class, also when an earlier call of this helper left a subclass in its place.
+    base = next(cls for cls in fwd.BlockSparseAttnForwardSm90Blk128.__mro__ if cls.__module__ == fwd.__name__)
+    results = []
+    for flags in variants:
+        builds = []
+
+        class Kernel(base):
+            def __init__(self, *args, **kwargs):
+                builds.append({**kwargs, **flags})
+                super().__init__(*args, **{**kwargs, **flags})
+
+        monkeypatch.setattr(fwd, "BlockSparseAttnForwardSm90Blk128", Kernel)
+        monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+        result = call()
+        assert builds, "the forward did not build the SM90 blk128 kernel"
+        if built is not None:
+            built.extend(builds)
+        results.append((result["o_tensor"].clone(), result["lse_tensor"].clone()))
+    return results
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "variable, count, splits, sizes_rank, kv_tail, scale",
+    [
+        pytest.param(True, 5, 1, 2, True, 0.137, id="variable-sizes_rank2-tail"),
+        pytest.param(True, 5, 1, 1, False, -0.125, id="variable-sizes_rank1-negative_scale"),
+        pytest.param(True, 5, 1, 0, True, 0.0, id="variable-tail_only-zero_scale"),
+        pytest.param(True, 5, 1, 0, False, 0.137, id="variable-full_blocks"),
+        pytest.param(True, 5, 3, 3, True, 0.137, id="variable-split3-sizes_rank3-tail"),
+        pytest.param(False, 5, 1, 2, True, 0.137, id="fixed-sizes_rank2-tail"),
+        pytest.param(False, 1, 1, 1, False, 0.137, id="fixed-single_block-one_stage"),
+        pytest.param(False, 4, 2, 0, False, -0.125, id="fixed-split2-full_blocks-negative_scale"),
+    ],
+)
+@torch_fork_set_rng(seed=128)
+def test_sm90_blk128_lean_consumer_loop_matches_plain_loop(monkeypatch, variable, count, splits, sizes_rank, kv_tail, scale):
+    """The lean consumer loop (full KV blocks skip the mask, partial ones compare one limit per thread; the O rescale
+    runs one step later, behind a warp vote) returns the O and LSE bits of the plain loop.  GQA problems with a
+    one-row last Q tile; variable counts walk lists of 0..5 blocks in every head; block sizes mix full, 127-, 96-,
+    64-, 3- and 1-token blocks, per batch and per head where the rank allows, and the physical KV tail."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    batch, heads, kv_heads, q_blocks, kv_blocks = 2, 4, 2, 6, 8
+    seqlen_q = (q_blocks - 1) * 128 + 1
+    tail = 37 if kv_tail else 128
+    seqlen_k = (kv_blocks - 1) * 128 + tail
+    q = torch.randn((batch, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, seqlen_k, 96), device="cuda", dtype=torch.bfloat16)
+    # Distinct block ids per row (the prefix of a random permutation); the slots past a variable count hold a poison index.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :count].to(torch.int32).contiguous()
+    counts = None
+    if variable:
+        lengths = torch.arange(q_blocks, device="cuda", dtype=torch.int32)
+        counts = torch.stack([lengths.roll(i) for i in range(batch * heads)]).view(batch, heads, q_blocks).contiguous()
+        assert counts.min() == 0 and counts.max() == count
+        indices.masked_fill_(torch.arange(count, device="cuda") >= counts[..., None], 999999)
+    sizes = None
+    if sizes_rank:
+        pattern = torch.tensor([128, 1, 127, 128, 3, 96, 64, tail], device="cuda", dtype=torch.int32)
+        shape = {1: (kv_blocks,), 2: (batch, kv_blocks), 3: (batch, heads, kv_blocks)}[sizes_rank]
+        rows = pattern.expand(shape).reshape(-1, kv_blocks)
+        # Every row of the rank keeps the tail size last and rotates the other blocks.
+        sizes = torch.stack([torch.cat((row[:-1].roll(i), row[-1:])) for i, row in enumerate(rows)]).view(shape).contiguous()
+
+    def call():
+        return ops.block_sparse_attention_forward(
+            q,
+            k,
+            v,
+            indices,
+            count,
+            sizes,
+            q2k_block_nums=counts,
+            allow_empty_block_nums=variable,
+            sparse_block_size=128,
+            softmax_scale=scale,
+            kv_splits=splits,
+        )
+
+    (o_plain, lse_plain), (o_lean, lse_lean) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(lean_consumer_loop=False), {})
+    assert torch.isfinite(o_lean).all()
+    assert torch.equal(o_lean, o_plain) and torch.equal(lse_lean, lse_plain)
+    o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, counts, sizes, count, scale, "bhsd")
+    torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
+@torch_fork_set_rng(seed=129)
+def test_sm90_blk128_lean_consumer_loop_rescale_vote(monkeypatch, with_block_sizes):
+    """Both outcomes of the warp vote that guards the deferred O rescale, bitwise against the plain loop.  Every key of
+    KV block j has the logit 4 * j for a query row with q = 8 and -4 * j for one with q = -8, and the lists are
+    ascending, so a positive row raises its running max at every step (ratio < 1) and a zero or negative row never
+    does (ratio exactly 1.0).  Tile 0 never rescales, tile 1 rescales in every warp, tile 2 alternates warps of the two
+    kinds and tile 3 mixes both kinds of row inside every warp."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    q_blocks, kv_blocks = 4, 8
+    seqlen_q, seqlen_k = q_blocks * 128, kv_blocks * 128
+    row = torch.arange(128, device="cuda")
+    q = torch.zeros((1, 1, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    q[0, 0, 128:256, 0] = 8
+    q[0, 0, 256:384, 0] = torch.where(row % 32 < 16, -8, 8).to(q.dtype)
+    q[0, 0, 384:512, 0] = torch.where(row % 2 == 0, 8, -8).to(q.dtype)
+    k = torch.zeros((1, 1, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    k[0, 0, :, 0] = (torch.arange(seqlen_k, device="cuda") // 128).to(k.dtype) * 0.5
+    v = torch.randn((1, 1, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, q_blocks, kv_blocks).contiguous()
+    sizes = torch.tensor([128, 1, 128, 77, 128, 3, 128, 111], device="cuda", dtype=torch.int32) if with_block_sizes else None
+
+    # The rows of one compute warp are 16 consecutive query rows. A warp must rescale at a step when the block's logit
+    # exceeds the running max of one of its rows, and must skip the rescale when it does so for none of them.
+    block_logit = q[0, 0, :, 0].double()[:, None] * k[0, 0, ::128, 0].double()[None, :]
+    raised = (block_logit[:, 1:] > block_logit.cummax(dim=1).values[:, :-1]).view(q_blocks * 8, 16, kv_blocks - 1)
+    assert raised.any(1).any() and (~raised.any(1)).any(), "the problem must hold a rescaling warp-step and a skipping one"
+    assert (raised.any(1) & ~raised.all(1)).any(), "some warp must mix rescaled and unchanged rows"
+
+    def call():
+        return ops.block_sparse_attention_forward(q, k, v, indices, kv_blocks, sizes, sparse_block_size=128)
+
+    (o_plain, lse_plain), (o_lean, lse_lean) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(lean_consumer_loop=False), {})
+    assert torch.equal(o_lean, o_plain) and torch.equal(lse_lean, lse_plain)
+    o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, None, sizes, kv_blocks, None, "bhsd")
+    torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_blocks, layout", [pytest.param(11, "bhsd", id="small_sort"), pytest.param(4100, "bshd", id="large_sort")])
+@torch_fork_set_rng(seed=130)
+def test_sm90_blk128_tile_order_matches_identity_order(monkeypatch, q_blocks, layout):
+    """Longest-list-first CTA order (variable counts, kv_splits == 1): CTA x of a head runs the Q tile at rank x of the
+    head's stable descending list-length order, which the wrapper sorts on the device.  Which CTA computes a tile does
+    not change the tile's arithmetic, so O and LSE are the bits of the identity-order kernel.  The counts tie and
+    include empty lists, the last Q tile has one row and the heads are grouped.  A CUDA graph is then replayed after
+    the counts and the lists changed at the same addresses: the replay sorts the new counts, without a host
+    synchronization or a new compile.  4100 Q tiles take torch's sort for more than 4096 elements (no FP64 reference
+    at that size; the identity-order kernel is the reference)."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    small = q_blocks <= 4096
+    batch, heads, kv_heads, dim, value_dim = (2, 4, 2, 128, 96) if small else (1, 2, 1, 64, 64)
+    kv_blocks, width = 8, 5
+    seqlen_q, seqlen_k = (q_blocks - 1) * 128 + 1, (kv_blocks - 1) * 128 + 37
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, seqlen_k, value_dim), device="cuda", dtype=torch.bfloat16)
+    inputs = [q, k, v] if layout == "bhsd" else [t.transpose(1, 2).contiguous() for t in (q, k, v)]
+    # Every slot of a list holds a valid block id, so that any count up to the width is legal after the lists change.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    counts = torch.randint(0, width + 1, (batch, heads, q_blocks), device="cuda", dtype=torch.int32)
+    sizes = torch.tensor([128, 1, 127, 128, 3, 96, 64, 37], device="cuda", dtype=torch.int32)
+    tiles = torch.arange(q_blocks, device="cuda")
+    assert (counts == 0).any() and (torch.argsort(counts, dim=-1, descending=True, stable=True) != tiles).any()
+
+    def call():
+        return ops.block_sparse_attention_forward(
+            *inputs, indices, width, sizes, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128, layout=layout
+        )
+
+    built = []
+    (o_identity, lse_identity), (o_order, lse_order) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(has_tile_order=False), {}, built=built)
+    assert [flags["has_tile_order"] for flags in built] == [False, True], "the wrapper must ask for the tile order with variable counts"
+    assert torch.isfinite(o_order).all()
+    assert torch.equal(o_order, o_identity) and torch.equal(lse_order, lse_identity)
+
+    cache = interface._bsa_attn_fwd_sm90_blk128.compile_cache
+    compiled = dict(cache)
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            captured = call()
+        counts.copy_(counts.flip(-1))
+        indices.copy_(indices.flip(-2))
+        assert (torch.argsort(counts, dim=-1, descending=True, stable=True) != tiles).any()
+        captured["o_tensor"].fill_(float("nan"))
+        captured["lse_tensor"].fill_(float("nan"))
+        with no_host_sync():
+            graph.replay()
+            eager = call()
+        o_graph, lse_graph = captured["o_tensor"].clone(), captured["lse_tensor"].clone()
+    assert cache == compiled, "new counts must not compile another kernel"
+    assert torch.equal(o_graph, eager["o_tensor"]) and torch.equal(lse_graph, eager["lse_tensor"])
+    ((o_identity, lse_identity),) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(has_tile_order=False))
+    assert torch.equal(o_graph, o_identity) and torch.equal(lse_graph, lse_identity)
+    if small:
+        o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, counts, sizes, width, None, "bhsd")
+        torch.testing.assert_close(o_graph.double(), o_ref, atol=8e-3, rtol=8e-3)
+        torch.testing.assert_close(lse_graph.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+def _longest_list_first(counts):
+    """Per (batch, head), the Q tiles by descending list length with equal lengths in their natural order, computed
+    on the host.  Every tile has its own sort key, so the reference does not rest on the stability of a sort."""
+    lengths = counts.long().cpu()
+    tiles = torch.arange(lengths.shape[-1])
+    return torch.argsort((lengths.max() - lengths) * lengths.shape[-1] + tiles, dim=-1)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_blocks", [pytest.param(11, id="small_sort"), pytest.param(4100, id="large_sort")])
+@torch_fork_set_rng(seed=131)
+def test_sm90_blk128_tile_order_is_longest_list_first(monkeypatch, q_blocks):
+    """The tile order that the wrapper hands to the kernel is, per (batch, head), the permutation of the Q tiles by
+    descending list length with equal lengths in their natural order.  O and LSE cannot show it (every permutation
+    of the CTAs gives the same bits), so the launch arguments are recorded.  Checked on an eager call, on a second
+    one after the counts changed at the same address, and on a CUDA graph replayed after another change: the order
+    tensor of the captured launch then holds the order of the counts the replay ran on.  11 and 4100 Q tiles take
+    torch's two sort paths (up to and beyond 4096 elements)."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    batch, heads, kv_heads, dim = (2, 4, 2, 128) if q_blocks <= 4096 else (1, 2, 1, 64)
+    kv_blocks, width = 8, 5
+    q = torch.randn((batch, heads, (q_blocks - 1) * 128 + 1, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, kv_blocks * 128, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, kv_blocks * 128, 64), device="cuda", dtype=torch.bfloat16)
+    # Every slot of a list holds a valid block id, so that any count up to the width is legal after the counts change.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    counts = torch.randint(0, width + 1, (batch, heads, q_blocks), device="cuda", dtype=torch.int32)
+
+    def call():
+        return ops.block_sparse_attention_forward(q, k, v, indices, width, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
+
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    call()
+    cache = interface._bsa_attn_fwd_sm90_blk128.compile_cache
+    ((key, compiled),) = cache.items()
+    launches = []
+
+    def recorder(*args):
+        launches.append(args)
+        return compiled(*args)
+
+    cache[key] = recorder
+
+    def launched_order():
+        # Launch arguments: q, k, v, o, lse, lists, counts, sizes, order, then the scalars and the stream.
+        order = launches[-1][8]
+        assert tuple(order.shape) == (q_blocks, heads, batch) and not order.dtype.is_floating_point, (order.shape, order.dtype)
+        return order.permute(2, 1, 0).long().cpu()
+
+    call()
+    first = _longest_list_first(counts)
+    assert (first != torch.arange(q_blocks)).any(), "the natural order must not already be the longest-list-first order"
+    assert torch.equal(launched_order(), first)
+
+    counts.copy_(counts.flip(-1))
+    call()
+    second = _longest_list_first(counts)
+    assert not torch.equal(second, first)
+    assert torch.equal(launched_order(), second), "an eager call must order the counts it is given"
+
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            call()
+        counts.copy_(counts.roll(1, -1))
+        third = _longest_list_first(counts)
+        assert not torch.equal(third, second)
+        with no_host_sync():
+            graph.replay()
+        assert torch.equal(launched_order(), third), "a replay must order the counts it runs on"
+    assert len(launches) == 3 and list(cache) == [key], "three launches of the one compiled kernel"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("surplus", [pytest.param(2, id="more_lengths_than_q_tiles"), pytest.param(-1, id="fewer_lengths_than_q_tiles")])
+@torch_fork_set_rng(seed=132)
+def test_sm90_blk128_tile_order_rejects_lengths_off_the_q_grid(monkeypatch, surplus):
+    """The host entry ranks every list length it is given and the grid has one CTA per Q tile of q.  Lengths for more
+    Q tiles than q has would hand CTAs to tiles that do not exist and leave real tiles unwritten; lengths for fewer
+    would leave CTAs without a tile.  The public API rejects such metadata by its shape (test_BSA_api.py); the
+    private entry behind it raises before a kernel is built or launched."""
+    import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    q_blocks, kv_blocks, width = 4, 8, 5
+    q = torch.randn((1, 2, q_blocks * 128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, kv_blocks * 128, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indices = torch.arange(width, device="cuda", dtype=torch.int32).expand(1, 2, q_blocks + surplus, width).contiguous()
+    counts = torch.full((1, 2, q_blocks + surplus), width, device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    with pytest.raises(ValueError, match=f"one list length per Q tile: expected {q_blocks}, got {q_blocks + surplus}"):
+        interface.bsa_attn_fwd(q, k, v, indices, width, q2k_block_nums=counts, sparse_block_size=128)
+    assert not interface._bsa_attn_fwd_sm90_blk128.compile_cache, "the rejection must come before a kernel is built"
+
+
+# ---- SM100/SM110 blk64
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "use_clc, variable_counts, with_block_sizes, layout",
+    # The layout only changes the strides of q/k/v, independently of the scheduler and the metadata: it alternates
+    # over the full scheduler x metadata grid, so that every value of each sees both layouts.
+    [
+        pytest.param(
+            clc,
+            variable,
+            sizes,
+            "bshd" if (clc + variable + sizes) % 2 else "bhsd",
+            id=f"clc{int(clc)}-{'variable_with_empty' if variable else 'fixed'}-{'partial' if sizes else 'full'}_blocks",
+        )
+        for clc in (False, True)
+        for variable in (False, True)
+        for sizes in (False, True)
+    ],
+)
+@torch_fork_set_rng(seed=4593)
+def test_sm100_blk64_persistent_query_replay(use_clc, variable_counts, with_block_sizes, layout):
+    """Multiple persistent waves exercise KV-ring rotation, empty queries and changed-input replay.
+
+    Repeat distinct query tiles to bound the independent dense reference while
+    forcing each SM to process several tiles. Counts cross the 8-block padding
+    boundary and different ring phases. Q always has a partial final tile;
+    partial KV blocks use explicit block_sizes, as required by the API.
+    """
+    ops = import_bsa(families=(10, 11), reason="persistent blk64 forward requires SM100/SM110")
+    batch, heads, pattern_tiles, capacity = 2, 4, 9, 32
+    copies = max(2, math.ceil(4 * torch.cuda.get_device_properties(0).multi_processor_count / (batch * heads * pattern_tiles)))
+    length_q = pattern_tiles * 64 * copies - 17
+    length_k = capacity * 64 - (17 if with_block_sizes else 0)
+    q_base = torch.randn((batch, heads, pattern_tiles * 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, length_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    # The final KV block occurs in every active list, with no duplicates.
+    other_indices = torch.rand((batch, heads, pattern_tiles, capacity - 1), device="cuda").argsort(-1).to(torch.int32)
+    indices_base = torch.cat((torch.full_like(other_indices[..., :1], capacity - 1), other_indices), -1)
+    counts_base = torch.tensor([0, 1, 3, 7, 8, 9, 16, 17, 32], device="cuda", dtype=torch.int32).expand(batch, heads, -1).clone()
+    if not variable_counts:
+        counts_base.fill_(8)
+    indices = indices_base.repeat(1, 1, copies, 1)
+    counts = counts_base.repeat(1, 1, copies)
+    q = q_base.repeat(1, 1, copies, 1)[..., :length_q, :].contiguous()
+    reference_sizes = torch.full((capacity,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        reference_sizes[1::2] = 23
+        reference_sizes[2] = 0
+        reference_sizes[-1] = 47
+    inputs = [q, k, v] if layout == "bhsd" else [t.transpose(1, 2).contiguous() for t in (q, k, v)]
+
+    def invoke():
+        return ops.block_sparse_attention_forward(
+            *inputs,
+            indices,
+            block_sparse_num=capacity if variable_counts else 8,
+            block_sizes=reference_sizes if with_block_sizes else None,
+            q2k_block_nums=counts if variable_counts else None,
+            sparse_block_size=64,
+            layout=layout,
+            use_clc=use_clc,
+            kv_splits=1,
+            allow_empty_block_nums=variable_counts,
+        )
+
+    invoke()
+    torch.cuda.synchronize()
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            result = invoke()
+        for replay in range(2):
+            if replay:
+                q_base.mul_(0.75)
+                inputs[0].mul_(0.75)
+                inputs[2].neg_()
+                counts_base = counts_base.flip(-1)
+            counts.copy_(counts_base.repeat(1, 1, copies))
+            indices.copy_(indices_base.repeat(1, 1, copies, 1))
+            indices.masked_fill_(torch.arange(capacity, device="cuda") >= counts[..., None], torch.iinfo(torch.int32).max)
+            result["o_tensor"].fill_(float("nan"))
+            result["lse_tensor"].fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            mask = block_sparse_mask(indices_base, capacity, reference_sizes, pattern_tiles * 64, length_k, 64, counts_base)
+            k_ref, v_ref = inputs[1:] if layout == "bhsd" else [t.transpose(1, 2) for t in inputs[1:]]
+            o_ref, lse_ref = attention_reference(q_base, k_ref, v_ref, mask)
+            expected_o = o_ref.repeat(1, 1, copies, 1)[..., :length_q, :]
+            actual_o = result["o_tensor"] if layout == "bhsd" else result["o_tensor"].transpose(1, 2)
+            torch.testing.assert_close(actual_o.float(), expected_o, atol=3e-2, rtol=3e-2)
+            torch.testing.assert_close(result["lse_tensor"], lse_ref.repeat(1, 1, copies)[..., :length_q], atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=2029)
+def test_sm100_blk64_split_kv_clc_persistent_tiles():
+    """Split-KV with CLC scheduling over more tiles than two waves matches the static schedule, and repeats exactly."""
+    ops = import_bsa(families=(10, 11), reason="blk64 split-KV CLC scheduling is specific to SM100/SM110")
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    batch, heads, num_kv_blocks, head_dim = 2, 3, 8, 128
+    kv_splits = 3
+    num_q_blocks = max(32, 2 * sm_count // (batch * heads * kv_splits) + 1)
+    block_size = 64
+    seqlen_q, seqlen_k = num_q_blocks * block_size, num_kv_blocks * block_size
+    assert batch * heads * num_q_blocks * kv_splits > 2 * sm_count
+
+    q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = (
+        torch.arange(num_kv_blocks, device="cuda", dtype=torch.int32)
+        .view(1, 1, 1, num_kv_blocks)
+        .expand(batch, heads, num_q_blocks, num_kv_blocks)
+        .contiguous()
+    )
+    block_sizes = torch.full((num_kv_blocks,), block_size, device="cuda", dtype=torch.int32)
+
+    def run(use_clc):
+        result = ops.block_sparse_attention_forward(
+            q, k, v, q2k, num_kv_blocks, block_sizes, sparse_block_size=block_size, use_clc=use_clc, kv_splits=kv_splits
+        )
+        torch.cuda.synchronize()
+        return result
+
+    reference, actual, repeated = run(False), run(True), run(True)
+    torch.testing.assert_close(actual["o_tensor"], reference["o_tensor"], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual["lse_tensor"], reference["lse_tensor"], rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(repeated["o_tensor"], actual["o_tensor"], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(repeated["lse_tensor"], actual["lse_tensor"], rtol=0.0, atol=0.0)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=6)
+@pytest.mark.parametrize("seqlen_q", [1, 63, 65])
+def test_sm100_blk64_combine_partial_tail_rows(seqlen_q):
+    """Exercise a partial Q tile through both the producer and split combine.
+
+    A non-multiple-of-64 sequence makes the blk64 producer's final tile partial
+    and leaves invalid rows in the split-combine tile. The former must keep every
+    correction warp converged through its exchange barriers; the latter must
+    initialize invalid shared-LSE rows to ``-inf``.
+    """
+    ops = import_bsa(families=(10, 11), reason="blk64 split combine is specific to SM100/SM110")
+    block_size = 64
+    batch, heads, seqlen_k, dim = 1, 1, 256, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+
+    for kv_splits in (1, 2):
+        actual = ops.block_sparse_attention_forward(
+            q, k, v, q2k, block_sparse_num, block_sizes, sparse_block_size=block_size, use_clc=False, kv_splits=kv_splits
+        )
+        torch.testing.assert_close(actual["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(actual["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
+@pytest.mark.parametrize("seqlen", [193, 1089])
+def test_sm100_blk64_empty_rows_and_partial_tiles(clc, splits, seqlen):
+    """Variable counts with empty rows, a partial final Q tile and a partial final KV block, per scheduler and split."""
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
+    torch.manual_seed(19000 + seqlen)
+    q, k, v = [torch.randn((1, 2, seqlen, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    blocks = (seqlen + 63) // 64
+    indices = torch.arange(blocks - 1, -1, -1, device="cuda", dtype=torch.int32).view(1, 1, 1, -1).expand(1, 2, blocks, blocks).contiguous()
+    counts = (torch.arange(2 * blocks, device="cuda", dtype=torch.int32) % (blocks + 1)).view(1, 2, blocks)
+    sizes = torch.full((blocks,), 64, device="cuda", dtype=torch.int32)
+    sizes[-1] = seqlen - (blocks - 1) * 64
+    mask = block_sparse_mask(indices, 0, sizes, seqlen, seqlen, 64, counts)
+    expected, expected_lse = attention_reference(q, k, v, mask)
+    output, lse = bsa.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        indices,
+        block_sizes=sizes,
+        q2k_block_nums=counts,
+        sparse_block_size=64,
+        use_clc=clc,
+        kv_splits=splits,
+        allow_empty_block_nums=True,
+    )
+    torch.testing.assert_close(output.float(), expected, atol=0.03, rtol=0.03)
+    torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "misalignment, tensor_index, splits",
+    # Whether a view can feed TMA is decided per tensor on the host, before and independently of kv_splits: splits
+    # alternates so that every misalignment and every tensor sees both.
+    [
+        pytest.param(misalignment, index, 1 + (m + index) % 2, id=f"{misalignment}-{name}-splits{1 + (m + index) % 2}")
+        for m, misalignment in enumerate(("stride", "address", "aligned_stride"))
+        for index, name in enumerate("qkv")
+    ],
+)
+def test_sm100_blk64_bshd_sliced_inputs(misalignment, tensor_index, splits):
+    """BSHD q/k/v views with a padded row stride or a misaligned start address."""
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
+    torch.manual_seed(20260911)
+    inputs = [torch.randn((2, 64, 3, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    padding = 1 if misalignment == "stride" else 8
+    start = 1 if misalignment == "address" else 0
+    storage = torch.empty((2, 64, 3, 128 + padding), device="cuda", dtype=torch.bfloat16)
+    sliced = storage[..., start : start + 128]
+    sliced.copy_(inputs[tensor_index])
+    inputs[tensor_index] = sliced
+    indices = torch.zeros((2, 3, 1, 1), device="cuda", dtype=torch.int32)
+    sizes = torch.full((1,), 64, device="cuda", dtype=torch.int32)
+    output, lse = bsa.block_sparse_attention_forward(*inputs, indices, 1, sizes, sparse_block_size=64, layout="bshd", kv_splits=splits)
+    canonical = [t.transpose(1, 2) for t in inputs]
+    mask = block_sparse_mask(indices, 1, sizes, 64, 64, 64)
+    ref_output, ref_lse = attention_reference(*canonical, mask)
+    assert output.is_contiguous()
+    torch.testing.assert_close(output.transpose(1, 2).float(), ref_output, atol=0.03, rtol=0.03)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
+
+
+# ---- SM120 blk128
+
+
+def _require_fa4():
+    """Skip unless the CuTe DSL meets the FA4-style blk128 floor."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("FA4-style blk128 requires a supported CuTe DSL version")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "dtype, block_sparse_num",
+    # The 16-bit type is independent of the list length: it alternates over the counts.
+    [(torch.float16 if count % 2 else torch.bfloat16, count) for count in (1, 2, 3, 4, 5)],
+)
+@torch_fork_set_rng(seed=20)
+def test_sm120_blk128_fixed_topk(dtype, block_sparse_num):
+    """Cover fixed top-k 1-5, GQA, partial Q, and query-dependent KV selections."""
+    ops = import_bsa(families=(12,), reason="FA4-style blk128 forward is specific to SM120")
+    _require_fa4()
+    block_size = 128
+    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 6 * block_size, 128
+    q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=dtype)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+
+    q_block = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 1, 2, 1)
+    batch_head = torch.arange(batch * q_heads, device="cuda", dtype=torch.int32).view(batch, q_heads, 1, 1)
+    slots = torch.tensor([0, 2, 3, 5, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 5)
+    q2k = ((q_block + batch_head + slots) % 6).contiguous()
+
+    result = ops.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num=block_sparse_num,
+        sparse_block_size=block_size,
+    )
+    block_sizes = torch.full((6,), block_size, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "dtype, wave_kind, block_sparse_num",
+    # The 16-bit type is independent of the wave split: it alternates over the wave kinds.
+    [
+        (torch.float16, "tail_only", 3),
+        (torch.bfloat16, "unsplit", 1),
+        (torch.float16, "full", 5),
+        (torch.bfloat16, "mixed", 3),
+    ],
+)
+@torch_fork_set_rng(seed=20)
+def test_sm120_blk128_wave_boundaries(dtype, wave_kind, block_sparse_num):
+    """Validate all query rows across full, split-tail, mixed, and unsplit waves."""
+    require_arch(archs=(120,), reason="native blk128 wave scheduling requires SM120")
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    full_wave_q_blocks = sm_count // 2 if sm_count % 2 == 0 else sm_count
+    q_blocks = {
+        "tail_only": 2,
+        "unsplit": sm_count // 4 + 1,
+        "full": full_wave_q_blocks,
+        "mixed": full_wave_q_blocks + 2,
+    }[wave_kind]
+    sequence = (q_blocks - 1) * 128 + 1
+    ops = import_bsa()
+    _require_fa4()
+    q = torch.randn((1, 2, sequence, 128), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, 768, 128), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    q_block = torch.arange(q_blocks, device="cuda", dtype=torch.int32).view(1, 1, -1, 1)
+    head = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 2, 1, 1)
+    slots = torch.tensor([0, 2, 3, 5, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 5)
+    q2k = ((3 * q_block + 7 * head + slots) % 6).contiguous()
+    result = ops.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num=block_sparse_num, sparse_block_size=128)
+
+    # Exercise every output row, including the Q64 boundary inside blk128 and
+    # the final partial Q tile. Per-query metadata prevents accidental reuse
+    # of the first sparse row from passing this check.
+    block_sizes = torch.full((6,), 128, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, sequence, 768, 128)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+def test_sm120_blk128_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
+    """Ensure cached launches reuse the SM-count decision made during tracing."""
+    ops = import_bsa(archs=(120,), reason="native blk128 wave scheduling requires SM120")
+    _require_fa4()
+    from cudnn.block_sparse_attention import _interface
+    from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128 import bsa_fwd_sm120_fa4
+
+    query_count = 0
+    original_query = bsa_fwd_sm120_fa4._device_sm_count
+
+    def counted_query():
+        """Count device-metadata queries while preserving the actual SM count."""
+        nonlocal query_count
+        query_count += 1
+        return original_query()
+
+    monkeypatch.setattr(bsa_fwd_sm120_fa4, "_device_sm_count", counted_query)
+    monkeypatch.setattr(_interface.bsa_attn_fwd, "compile_cache", {})
+    q = torch.zeros((1, 1, 129, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.ones_like(k)
+    indices = torch.zeros((1, 1, 2, 1), device="cuda", dtype=torch.int32)
+    first = ops.block_sparse_attention_forward(q, k, v, indices, block_sparse_num=1, sparse_block_size=128)
+    assert query_count > 0
+    trace_query_count = query_count
+    second = ops.block_sparse_attention_forward(q, k, v, indices, block_sparse_num=1, sparse_block_size=128)
+    assert query_count == trace_query_count
+    torch.testing.assert_close(first["o_tensor"], torch.ones_like(q), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(second["o_tensor"], first["o_tensor"], atol=0.0, rtol=0.0)

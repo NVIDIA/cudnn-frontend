@@ -38,10 +38,21 @@ from mxfp8_test_reference import _cdiv, _quantize, _quantize_seq, _ref
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import (
+    _SM,
+    assert_no_new_spills,
+    make_dense_stats,
+    requires_blackwell,
+    requires_dsl,
+    requires_pre_rubin_blackwell,
+    requires_rubin,
+    run_sass_probe,
+    sass_probe_source,
+)
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
+from frost_test_utils import mxfp8_engine_names
 
 # Rubin (cc10.7) now has MXFP8 lowerings of its own, so this suite is no longer
 # pre-Rubin only.  ONE engine per arch line: pin the row that serves the device
@@ -56,7 +67,7 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # the test cannot run.  Flip the condition to False when the gap closes.
 #
 # INVERTED 2026-09-09: the d192xd128 MXFP8 gap CLOSED
-# (sm107/prefill_d192_d128_mxfp8.py), so every DENSE d192 case below now runs on
+# (sm107/d192_mxfp8_multi_q/kernel.py), so every DENSE d192 case below now runs on
 # Rubin.  It runs at cga2 there and only cga2 -- at cga1 that flavor's four
 # scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window
 # -- which the row expresses by leaving (192, 128) on its default cgas={2}, so
@@ -311,7 +322,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -403,6 +414,8 @@ def _ref_from_sdpa(sdpa_kwargs):
     lb = sdpa_kwargs.get("diagonal_band_left_bound")
     if lb is not None:
         out["swa_window"] = lb - 1  # cuDNN length - 1
+    if sdpa_kwargs.get("causal_exclude_own_block"):
+        out["exclude_own_block"] = sdpa_kwargs["causal_exclude_own_block"]
     return out
 
 
@@ -1474,7 +1487,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     g.execute(
@@ -1601,6 +1614,7 @@ def _run_thd(
     o_fill=0.0,
     stats_layout="token",
     with_lse_ref=False,
+    reference_fn=None,
 ):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF.
@@ -1793,8 +1807,8 @@ def _run_thd(
         else:
             if stats_layout == "head":
                 # Ragged Stats, packed HEAD-major: [h, head_stride] storage, the head stride a token capacity that
-                # covers the packed total (rounded up to 64 like the backward suite declares it); the kernel adds
-                # cu_q[b] itself, the ragged offsets keep the declaration a packed one (SDPA Rule S1).
+                # covers the packed total (rounded up to 64 like the backward suite declares it).
+                # Each sequence's physical element origin advances by one per token in this layout.
                 head_stride = max(64, _cdiv(T_q, 64) * 64)
                 stats_stor = torch.zeros(H_q * head_stride, dtype=torch.float32, device=dev)
                 stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((H_q * head_stride, head_stride, 1, 1))
@@ -1803,7 +1817,8 @@ def _run_thd(
                 # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
                 stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
                 stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-            stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
+            stats_token_stride = 1 if stats_layout == "head" else H_q
+            stats_ro_t = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * stats_token_stride).view(B + 1, 1, 1, 1)
             stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
             stats_t.set_ragged_offset(stats_ro)
             vp[stats_ro] = stats_ro_t
@@ -1812,7 +1827,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amax_o: amax})
@@ -1841,7 +1856,7 @@ def _run_thd(
         )
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
-        ob = _ref(qd, kd, vd, scale=scale, return_stats=with_lse_ref, **ref_kw)
+        ob = (reference_fn or _ref)(qd, kd, vd, scale=scale, return_stats=with_lse_ref, **ref_kw)
         if with_lse_ref:
             ob, lse_b = ob
             lse_ref[cu_q[b] : cu_q[b + 1]] = lse_b.squeeze(0).T
@@ -1917,7 +1932,51 @@ def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
     monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
     scale = 1.0 / math.sqrt(d_qk)
     lens = [1024, 768, 512, 256]
-    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, in_key, torch.float16, scale=scale, causal=True, d_qk=d_qk, d_v=d_v)
+
+    def rounded_probability_reference(q, k, v, *, scale, return_stats, is_causal, bottom_right, swa_window):
+        from sdpa.fp8_ref import compute_ref
+
+        assert is_causal and not bottom_right and swa_window is None and not return_stats
+        # The SM100 D512 body rounds its unnormalized P to the input FP8 type
+        # before PV. The full-precision P reference can exceed the unchanged
+        # output tolerance even for a causal row with only three live keys.
+        # The shared oracle uses 128-key blocks and a four-bit rescale threshold;
+        # reciprocal scale factors leave its effective P scale at one.
+        import cudnn
+
+        output, _, _ = compute_ref(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            scale,
+            1.0,
+            1.0,
+            1.0,
+            16.0,
+            1.0 / 16,
+            _FP8[in_key],
+            torch.float16,
+            right_bound=0,
+            diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+            rescale_threshold=4.0,
+            dtype=torch.float64,
+            quantize_o=False,
+        )
+        return output.transpose(1, 2)
+
+    o_out, o_ref, amax, _ = _run_thd(
+        lens,
+        lens,
+        8,
+        8,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=True,
+        d_qk=d_qk,
+        d_v=d_v,
+        reference_fn=rounded_probability_reference if d_qk == d_v == 512 and _ARCH == "sm100" else None,
+    )
     _check(o_out, o_ref, torch.float16, in_key)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
@@ -2602,7 +2661,7 @@ def test_mxfp8_block_scaled_output_declines_wide_flavor():
 
 # ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the SASS per arch
 # Both are invisible to every numerics test (O to the bf16 rounding, LSE within 6e-6, Amax_O exact before and after) and
-# worth +10.9 % at S=16K on B200 (`sm100/prefill_d128_mxfp8.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
+# worth +10.9 % at S=16K on B200 (`sm100/d128_mxfp8_multi_q/kernel.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
 # these pins compile the kernel here for the target arch (`CUTE_DSL_ARCH` needs no matching device -- the module-level
 # `requires_blackwell` is what confines them to the Blackwell-line lanes) and count the instructions.  Two arms, one per
 # cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True: the split is ON) and
@@ -2717,7 +2776,7 @@ _CREDIT_ARRIVE_SITES = {
     (128, 128): 6,
     (192, 128): 7,
 }  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the softmax (d128: one site at the loop top for every mask arm; d192x128: one per mask arm)
-_SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
+_SM100_MXFP8_OPTED_OUT = ("d128_mxfp8_multi_q/kernel.py", "d192_mxfp8_multi_q/kernel.py")  # the ONLY sm100 kernels that pass predicated=
 # Representative graph masks for exercising the module constant and bindings.
 _CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": {}, "causal": {"window_right": 0}, "padded": {"seq_kv_lens_present": True}}
 # d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
@@ -2800,7 +2859,7 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
     ``kernels/sm100/``.  Widening the opt-out to a third kernel is a MEASURED, per-specialization decision that adds its file to
     ``_SM100_MXFP8_OPTED_OUT`` (and a row to ``_CREDIT_ARRIVE_SITES``), never a copy-paste."""
     kdir = _sm100_kernel_dir()
-    files = sorted(p.name for p in kdir.glob("*.py") if p.name != "__init__.py")
+    files = sorted(p.relative_to(kdir).as_posix() for p in kdir.rglob("*.py") if p.name != "__init__.py")
     assert set(_SM100_MXFP8_OPTED_OUT) <= set(files), f"opted-out kernels missing from {kdir}: {files}"
     leaked = {}
     for name in files:
@@ -3029,7 +3088,16 @@ def test_mxfp8_thd_batched_setup(batch, cu_lens):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize(
+    "d_qk,d_v",
+    [
+        pytest.param(64, 64, marks=pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 line has no D64 body")),
+        (128, 128),
+        (192, 128),
+        (256, 256),
+        (512, 512),
+    ],
+)
 @pytest.mark.parametrize("mask", ["none", "causal"])
 def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
     """A negative attn_scale negates S in the block-scaled BMM1 (a_negate) and runs at |scale| (#1435). Block
@@ -3043,3 +3111,26 @@ def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
     assert not o_neg.isnan().any()
     assert torch.equal(o_neg, o_pos)
     assert torch.equal(a_neg, a_pos)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestPhysicalOrigins:
+    """Collect native D128/D512 origin contracts in the architecture CI entry."""
+
+    from sdpa.frost import sdpa_fwd_thd_origins_mxfp8_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestMidwidthPhysicalOrigins:
+    """Exercise independent origins on the D192/V128 and D256 native bodies."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _checks("mxfp8")

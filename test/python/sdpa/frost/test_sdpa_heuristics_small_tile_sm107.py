@@ -33,8 +33,7 @@ from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 pytestmark = [pytest.mark.L0]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-_ENGINE_ID = 20599
-_OFFERED = {_ROW: _ENGINE_ID}
+_OFFERED = {"sdpa_fwd_sm107_d128_multi_q": 20559, "sdpa_fwd_sm107_small_batch_pair": 20560, "sdpa_fwd_sm107_shared_single_q": 20569}
 _SMS = 212  # the measured node class; the chunk rule reads the SM count
 _H = 4
 
@@ -68,8 +67,11 @@ def _facts(d, s, b, form, *, padded=False):
     return SdpaGraphFacts(**kw)
 
 
-def _spec():
-    return next(sp for sp in engines.ENGINE_SPECS if sp.name == _ROW)
+def _spec(engine_id=None):
+    if engine_id is None:
+        return heur.sm100_legacy_policy_spec(_ROW)
+    name = next(name for name, candidate_id in _OFFERED.items() if candidate_id == engine_id)
+    return next(sp for sp in engines.ENGINE_SPECS if sp.name == name)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -229,7 +231,7 @@ def test_table_cell_is_the_heuristics_primary_plan(cell, want, best, margin, met
     knobs, plans = _primary(facts)
     assert (knobs.tile_n, knobs.cga) == (tile_n, cga), (cell, knobs, best, margin, metric)
     assert (knobs.split_kv or 1) == 1 and not knobs.pack_gqa and knobs.tile_m == 128, knobs
-    assert engines.mismatch(_spec().capabilities, facts, knobs) is None, (cell, knobs)
+    assert all(engines.mismatch(_spec(p.engine_id).capabilities, facts, p.knobs) is None for p in plans), (cell, plans)
     # every proposed set is admissible and names a different knob assignment
     assert len({(p.knobs.tile_n, p.knobs.cga, p.knobs.sched_policy, p.knobs.split_kv, p.knobs.pack_gqa) for p in plans}) == len(plans)
     # the private axes: the config picks the engine row, the adapter and the factory read (rule 8b')
@@ -266,8 +268,8 @@ def test_table_record_round_trips_through_the_public_knob_vocabulary(cell, want,
     ``knobs_to_public`` / ``knobs_from_public`` and the dataclass pair; a persisted record (integer keys) replays to the same knobs --
     once per distinct record shape (the round trip re-derives the private axes from the shape behind the public record)."""
     d, s, b, form, padded = cell
-    knobs, _ = _primary(_facts(d, s, b, form, padded=padded))
-    engine = FrostSdpaFwdEngine(_spec(), _ENGINE_ID)
+    knobs, plans = _primary(_facts(d, s, b, form, padded=padded))
+    engine = FrostSdpaFwdEngine(_spec(plans[0].engine_id), plans[0].engine_id)
     public = engine.knobs_to_public(knobs)
     assert public and all(isinstance(k, cudnn.knob_type) and isinstance(v, int) and not isinstance(v, bool) for k, v in public.items()), public
     assert public[cudnn.knob_type.TILE_N] == want[0] and public[cudnn.knob_type.TILE_CGA_M] == want[1], public
@@ -318,7 +320,6 @@ def test_width_pick_is_one_arithmetic_for_the_heuristics_and_the_row():
 def test_fp32_vector_with_a_bias_keeps_its_only_served_width():
     """The fp32 ADDITIVE kv_mask vector WITH a bias ran TILE_N 64 before the table (the 128-wide rendering spills): the table agrees
     (a bias with any mask takes the narrow tile), so the row's typed decline of an explicit 128 and the pick stay consistent."""
-    spec = _spec()
     f32 = cudnn.data_type.FLOAT
     facts = SdpaGraphFacts(
         b=384,
@@ -343,8 +344,9 @@ def test_fp32_vector_with_a_bias_keeps_its_only_served_width():
         kv_mask_stride=(384, 384, 384, 1),
         kv_mask_dtype=f32,
     )
-    knobs, _ = _primary(facts)
+    knobs, plans = _primary(facts)
     assert knobs.tile_n == c.SM107_FP32_VECTOR_WITH_BIAS_TILE_N == 64
+    spec = _spec(plans[0].engine_id)
     assert engines.mismatch(spec.capabilities, facts, SdpaFwdKnobs(tile_n=128)) is not None, "an explicit 128 stays a typed decline"
 
 

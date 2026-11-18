@@ -67,6 +67,19 @@ y, sm, sr = norm_fprop(NormVariant.BATCH_NORM, x, gamma, beta, training=True,
                        momentum=0.1, running_mean=rm, running_var=rv)
 ```
 
+## JAX
+
+`cudnn.ops.layer_norm_forward_jax` and `cudnn.ops.rms_norm_forward_jax`
+reuse the SM100/SM103 forward and backward kernels through XLA custom calls. They
+return `(y,)`, containing the normalized array, and support `jax.jit` and first-order
+`jax.grad`/`jax.vjp`, including gradients for optional affine parameters.
+Inputs and affine parameters share a bf16, fp16 or fp32 dtype; parameter
+gradients accumulate in fp32 and are cast to the parameter dtype at the VJP
+boundary. PyTorch is not required.
+
+See [LayerNorm and RMSNorm in JAX](../../../docs/operations/normalizations/norm_jax.md)
+for signatures, trailing-dimension semantics and the support matrix.
+
 ## How the kernels use CUTLASS primitives
 
 Norms are memory-bound (no tensor cores), so the primitives that matter are
@@ -216,7 +229,8 @@ pytest test/python/norm/graph/test_frost_norm_affine.py
 
 Requires Blackwell (SM100 or SM103; Hopper SM90 through the opt-in `norm_*_sm90` rows), a CUDA 13-capable driver, and a CUTLASS DSL build
 >= 4.7.0 that exports `cutlass.experimental.primitives` (every public wheel does). The norm entry points
-reject builds without this module. Check the active environment before running:
+reject builds without this module, and `norm_fprop` / `norm_bprop` raise `NotImplementedError` on a GPU older than SM90
+(use the graph API there; the cuDNN backend serves it). Check the active environment before running:
 
 ```bash
 python -c "import cutlass.experimental.primitives"

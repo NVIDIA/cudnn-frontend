@@ -207,7 +207,14 @@ def test_causal_conv1d_nwh_autograd(dtype, kernel_size, activation):
     x = x_data.detach().requires_grad_(True)
     weight = weight_data.detach().requires_grad_(True)
     bias = bias_data.detach().requires_grad_(True)
-    actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    try:
+        actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    except RuntimeError as error:
+        # CUDNN_STATUS_NOT_SUPPORTED_SHARED_MEMORY_INSUFFICIENT: the FP64 NWH kernel needs more shared memory per block than
+        # a ~99 KB device (SM86 / SM89 / SM120) offers; the backend declines it there.
+        if "status 3010" in str(error):
+            pytest.skip(f"cuDNN reports insufficient shared memory for this NWH case on this device: {error}")
+        raise
     actual.backward(grad_out)
 
     x_ref = x_data.double().detach().requires_grad_(True)
@@ -275,6 +282,69 @@ def test_b2b_causal_conv1d_autograd(dtype):
     _assert_close(weights_proj.grad, weights_proj_ref.grad, dtype)
     _assert_close(weights_mixer.grad, weights_mixer_ref.grad, dtype)
     _assert_close(skip_bias.grad, skip_bias_ref.grad, dtype)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", ["plain", "nwh", "b2b"])
+def test_causal_conv1d_runs_on_a_thread_with_no_cuda_context(variant):
+    """The forward kernels are launched through the driver API (cuLaunchKernel), which needs a context bound to the
+    calling thread; a fresh thread (an autograd worker, a DataParallel replica) has none, and the forwards failed there
+    with status 5000 (CUDA_ERROR_INVALID_CONTEXT). Each primitive binds the work's context first: a fresh thread making
+    no CUDA call of its own reproduces the main thread's forward and backward bitwise."""
+    import importlib
+    from concurrent.futures import ThreadPoolExecutor
+
+    # cudnn.ops exports are lazy: register the primitives here so the test also runs on its own (-k), not only after
+    # earlier tests in the file called the public wrappers.
+    importlib.import_module("cudnn.ops.causal_conv1d")
+    ops = torch.ops.cudnn
+    dtype = torch.float32
+    torch.manual_seed(7)
+    batch, dim, seq_len = 2, 8, 128
+    if variant == "b2b":
+        _require_variant(("b2b_causal_conv1d_forward", "b2b_causal_conv1d_backward"), dtype, 92400)
+        x = _make_tensor((batch, 3 * dim, seq_len), dtype, scale=0.1)
+        weights_proj = _make_tensor((3 * dim, 4), dtype, scale=0.5)
+        weights_mixer = _make_tensor((dim, 7), dtype, scale=0.4)
+        skip_bias = _make_tensor((dim,), dtype, scale=0.1)
+        grad_y = _make_tensor((batch, dim, seq_len), dtype, scale=0.1)
+
+        def run():
+            outputs = list(ops.b2b_causal_conv1d_fwd_primitive(x, weights_proj, weights_mixer, skip_bias))
+            return outputs + list(ops.b2b_causal_conv1d_bwd_primitive(grad_y, x, weights_proj, weights_mixer, skip_bias, outputs[0]))
+
+    else:
+        nwh = variant == "nwh"
+        _require_variant(
+            ("causal_conv1d_nwh_forward", "causal_conv1d_nwh_backward") if nwh else ("causal_conv1d_forward", "causal_conv1d_backward"),
+            dtype,
+            92400 if nwh else 92200,
+        )
+        shape = (batch, seq_len, dim) if nwh else (batch, dim, seq_len)
+        x = _make_tensor(shape, dtype, scale=0.1)
+        weight = _make_tensor((4, dim) if nwh else (dim, 4), dtype, scale=0.5)
+        bias = _make_tensor((dim,), dtype, scale=0.1)
+        grad_out = _make_tensor(shape, dtype, scale=0.1)
+        fwd = ops.causal_conv1d_nwh_fwd_primitive if nwh else ops.causal_conv1d_fwd_primitive
+        bwd = ops.causal_conv1d_nwh_bwd_primitive if nwh else ops.causal_conv1d_bwd_primitive
+
+        def run():
+            return [fwd(x, weight, bias, "silu"), *bwd(grad_out, x, weight, bias, "silu")]
+
+    expected = run()
+    torch.cuda.synchronize()
+
+    def on_fresh_thread():
+        result = run()
+        torch.cuda.synchronize()
+        return result
+
+    # A new executor gives this call a fresh thread. result() propagates worker
+    # exceptions to pytest instead of relying on a shared error list.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(on_fresh_thread).result()
+    for got, want in zip(result, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
 
 
 @pytest.mark.L0

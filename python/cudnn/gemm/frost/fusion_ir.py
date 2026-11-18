@@ -8,6 +8,8 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from operator import index
+from math import prod
 from typing import Literal
 
 Dtype = Literal[
@@ -53,6 +55,236 @@ class Axis(Enum):
     K = auto()
     BATCH = auto()
     GROUP = auto()
+
+
+@dataclass(frozen=True)
+class IndexExpr:
+    """Nonnegative Int64 coordinate expression, independent of codegen names.
+
+    Constants, scoped axis references, add/multiply and positive-constant
+    division/remainder describe fixed-shape view composition;
+    this does not introduce symbolic reshape dimensions or runtime shape guesses.
+    Integer references are scoped by IndexMap; Axis references are bound by the
+    lowered fragment. Neither domain contains backend source variable names.
+    """
+
+    op: Literal["constant", "axis", "floor_div", "mod", "add", "mul"]
+    value: int | Axis
+    operand: IndexExpr | None = None
+    rhs: IndexExpr | None = None
+
+    def __post_init__(self):
+        if self.op != "add" and self.op != "mul" and self.rhs is not None:
+            raise ValueError("index rhs is only valid for addition or multiplication")
+        if self.op in ("add", "mul"):
+            if self.value != 0 or not isinstance(self.operand, IndexExpr) or not isinstance(self.rhs, IndexExpr):
+                raise ValueError("index arithmetic requires two expression operands")
+        elif self.op == "axis":
+            if (not isinstance(self.value, Axis) and (type(self.value) is not int or self.value < 0)) or self.operand is not None:
+                raise ValueError("index axis requires an Axis and no operand")
+        elif self.op in ("constant", "floor_div", "mod"):
+            value = index(self.value)
+            object.__setattr__(self, "value", value)
+            if not 0 <= value <= (1 << 63) - 1:
+                raise ValueError("index expression constant exceeds nonnegative Int64")
+            if self.op == "constant":
+                if self.operand is not None:
+                    raise ValueError("index constant takes no operand")
+            elif value == 0 or not isinstance(self.operand, IndexExpr):
+                raise ValueError("index division requires a positive divisor and an expression operand")
+        else:
+            raise ValueError(f"unsupported index expression {self.op!r}")
+
+    @classmethod
+    def coordinate(cls, axis):
+        return cls("axis", axis)
+
+    @classmethod
+    def constant(cls, value):
+        return cls("constant", value)
+
+    def floor_div(self, divisor):
+        divisor = index(divisor)
+        if not 0 < divisor <= (1 << 63) - 1:
+            raise ValueError("index division requires a positive Int64 divisor")
+        if divisor == 1:
+            return self
+        if self.op == "constant":
+            return self.constant(self.value // divisor)
+        return IndexExpr("floor_div", divisor, self)
+
+    def modulo(self, divisor):
+        divisor = index(divisor)
+        if not 0 < divisor <= (1 << 63) - 1:
+            raise ValueError("index remainder requires a positive Int64 divisor")
+        if divisor == 1:
+            return self.constant(0)
+        if self.op == "constant":
+            return self.constant(self.value % divisor)
+        return IndexExpr("mod", divisor, self)
+
+    def add(self, other):
+        """Compose integer addition, folding constants and neutral elements."""
+        if not isinstance(other, IndexExpr):
+            other = self.constant(other)
+        if other == self.constant(0):
+            return self
+        if self == self.constant(0):
+            return other
+        if self.op == other.op == "constant":
+            return self.constant(self.value + other.value)
+        return IndexExpr("add", 0, self, other)
+
+    def multiply(self, other):
+        """Compose integer multiplication, folding constants and neutral elements."""
+        if not isinstance(other, IndexExpr):
+            other = self.constant(other)
+        if other == self.constant(0) or self == self.constant(0):
+            return self.constant(0)
+        if other == self.constant(1):
+            return self
+        if self == self.constant(1):
+            return other
+        if self.op == other.op == "constant":
+            return self.constant(self.value * other.value)
+        return IndexExpr("mul", 0, self, other)
+
+    @property
+    def axes(self):
+        if self.op == "axis":
+            return frozenset((self.value,))
+        return (self.operand.axes if self.operand is not None else frozenset()) | (self.rhs.axes if self.rhs is not None else frozenset())
+
+    def substitute(self, coordinates):
+        """Compose coordinate maps structurally, never by editing source strings."""
+        if self.op == "axis":
+            replacement = coordinates.get(self.value, self)
+            if not isinstance(replacement, IndexExpr):
+                raise ValueError("index substitution requires expression values")
+            return replacement
+        if self.operand is None:
+            return self
+        operand = self.operand.substitute(coordinates)
+        if self.rhs is not None:
+            rhs = self.rhs.substitute(coordinates)
+            return operand.add(rhs) if self.op == "add" else operand.multiply(rhs)
+        return operand.floor_div(self.value) if self.op == "floor_div" else operand.modulo(self.value)
+
+    def evaluate(self, coordinates):
+        """Independent host evaluator for index-map/reference checks."""
+        if self.op == "axis":
+            value = index(coordinates[self.value])
+        elif self.op == "constant":
+            value = self.value
+        else:
+            operand = self.operand.evaluate(coordinates)
+            if self.rhs is not None:
+                rhs = self.rhs.evaluate(coordinates)
+                value = operand + rhs if self.op == "add" else operand * rhs
+            else:
+                value = operand // self.value if self.op == "floor_div" else operand % self.value
+        if not 0 <= value <= (1 << 63) - 1:
+            raise ValueError("index coordinate exceeds nonnegative Int64")
+        return value
+
+
+@dataclass(frozen=True)
+class IndexMap:
+    """Fixed-shape consumer -> producer logical coordinates, not storage strides.
+
+    Integer axis references are scoped to consumer_shape. Every constructor
+    defines a map over its entire positive rectangular consumer domain; reshape
+    preserves lexicographic order, permutation preserves elements, and broadcast
+    need not be invertible. Shape products and intermediate arithmetic fit Int64.
+    """
+
+    consumer_shape: tuple[int, ...]
+    producer_shape: tuple[int, ...]
+    coordinates: tuple[IndexExpr, ...]
+
+    def __post_init__(self):
+        for name in ("consumer_shape", "producer_shape"):
+            shape = tuple(map(index, getattr(self, name)))
+            if not shape or any(d <= 0 for d in shape) or prod(shape) > (1 << 63) - 1:
+                raise ValueError("index map requires positive, fixed Int64 shape geometry")
+            object.__setattr__(self, name, shape)
+        object.__setattr__(self, "coordinates", tuple(self.coordinates))
+        if len(self.coordinates) != len(self.producer_shape):
+            raise ValueError("index map requires one expression per producer axis")
+        for expr, extent in zip(self.coordinates, self.producer_shape):
+            if not isinstance(expr, IndexExpr) or not expr.axes <= set(range(len(self.consumer_shape))):
+                raise ValueError("index map references an axis outside its consumer domain")
+            if self._upper_bound(expr) >= extent:
+                raise ValueError("index map expression exceeds its producer extent")
+
+    def _upper_bound(self, expr):
+        if expr.op == "axis":
+            return self.consumer_shape[expr.value] - 1
+        if expr.op == "constant":
+            return expr.value
+        bound = self._upper_bound(expr.operand)
+        if expr.rhs is not None:
+            rhs = self._upper_bound(expr.rhs)
+            bound = bound + rhs if expr.op == "add" else bound * rhs
+        elif expr.op == "floor_div":
+            bound //= expr.value
+        else:
+            bound = min(bound, expr.value - 1)
+        if bound > (1 << 63) - 1:
+            raise ValueError("index map intermediate arithmetic exceeds Int64")
+        return bound
+
+    @classmethod
+    def identity(cls, shape):
+        return cls(tuple(shape), tuple(shape), tuple(IndexExpr.coordinate(i) for i in range(len(shape))))
+
+    @classmethod
+    def permutation(cls, producer_shape, permutation):
+        permutation = tuple(map(index, permutation))
+        if sorted(permutation) != list(range(len(producer_shape))):
+            raise ValueError("index map permutation must contain every producer axis once")
+        return cls(
+            tuple(producer_shape[i] for i in permutation),
+            tuple(producer_shape),
+            tuple(IndexExpr.coordinate(permutation.index(i)) for i in range(len(permutation))),
+        )
+
+    @classmethod
+    def reshape(cls, producer_shape, consumer_shape):
+        producer_shape, consumer_shape = tuple(producer_shape), tuple(consumer_shape)
+        if prod(producer_shape) != prod(consumer_shape):
+            raise ValueError("index map reshape must preserve element count")
+        # Validate geometry before constructing any flattening intermediates.
+        cls.identity(producer_shape)
+        cls.identity(consumer_shape)
+        linear = IndexExpr.constant(0)
+        for i, extent in enumerate(consumer_shape):
+            linear = linear.multiply(extent).add(IndexExpr.coordinate(i))
+        coordinates = tuple(linear.floor_div(prod(producer_shape[i + 1 :])).modulo(extent) for i, extent in enumerate(producer_shape))
+        return cls(consumer_shape, producer_shape, coordinates)
+
+    @classmethod
+    def broadcast(cls, producer_shape, consumer_shape):
+        producer_shape, consumer_shape = tuple(producer_shape), tuple(consumer_shape)
+        offset = len(consumer_shape) - len(producer_shape)
+        if offset < 0 or any(p != 1 and p != c for p, c in zip(producer_shape, consumer_shape[offset:])):
+            raise ValueError("index map shapes do not broadcast")
+        return cls(
+            consumer_shape, producer_shape, tuple(IndexExpr.constant(0) if d == 1 else IndexExpr.coordinate(i + offset) for i, d in enumerate(producer_shape))
+        )
+
+    def compose(self, consumer_map):
+        """Apply consumer_map first, then this map, preserving map direction."""
+        if consumer_map.producer_shape != self.consumer_shape:
+            raise ValueError("index map composition requires matching intermediate shapes")
+        replacements = dict(enumerate(consumer_map.coordinates))
+        return IndexMap(consumer_map.consumer_shape, self.producer_shape, tuple(expr.substitute(replacements) for expr in self.coordinates))
+
+    def apply(self, coordinates):
+        """Bind graph-axis expressions to another coordinate domain."""
+        if len(coordinates) != len(self.consumer_shape):
+            raise ValueError("index map binding requires every consumer coordinate")
+        return tuple(expr.substitute(dict(enumerate(coordinates))) for expr in self.coordinates)
 
 
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
@@ -279,6 +511,7 @@ class TensorRef:
     bcast_mode: BroadcastMode
     grouped_by_moe: bool = False
     reduction_axis: int | None = None
+    coordinate_mapped: bool = False  # original aux shape/strides, not a matrix view
 
     def __post_init__(self) -> None:
         if self.dtype not in SUPPORTED_DTYPES:
@@ -315,6 +548,8 @@ class TensorRef:
         Kernel ABI rank promotion belongs to lowering, not this record.
         Per-K orientation comes from the operand, even when K equals one.
         """
+        if self.coordinate_mapped:
+            return self.dim
         if self.bcast_mode == "per_k":
             shape = [1, 1, 1]
             shape[self.k_axis] = Axis.K
@@ -329,6 +564,29 @@ class TensorRef:
             batch = Axis.GROUP if self.grouped_by_moe else (1 if self.dim[0] == 1 else Axis.BATCH)
             return (batch, *axes)
         return axes[2 - len(self.dim) :]
+
+
+@dataclass(frozen=True)
+class OperandAccess:
+    """Lowered consumer-to-aux coordinates with a fixed operand domain.
+
+    Coordinates select source elements, not addresses. Runtime strides remain
+    owned by the auxiliary buffer. The domain is canonical (batch, MN, K),
+    independent of graph rank, storage major, or swap-AB.
+    """
+
+    domain: tuple[int, int, int]
+    coordinates: tuple[IndexExpr, ...]
+
+    def __post_init__(self):
+        if len(self.domain) != 3 or any(d <= 0 for d in self.domain) or prod(self.domain) > (1 << 63) - 1:
+            raise ValueError("operand access requires a positive fixed Int64 matrix domain")
+        if not self.coordinates or any(not isinstance(expr, IndexExpr) for expr in self.coordinates):
+            raise ValueError("operand access requires one integer expression per auxiliary axis")
+
+    @property
+    def axes(self):
+        return frozenset().union(*(expr.axes for expr in self.coordinates))
 
 
 def gemm_source(g: int) -> int:
@@ -359,14 +617,23 @@ class FusionOp:
     attrs: tuple[tuple[str, float], ...] = ()  # scalar attrs (negative_slope/clips/swish_beta/axis)
     compute_dtype: Dtype = "fp32"
     out_dtype: Dtype = "fp32"
+    index_expr: IndexExpr | None = None
+    operand_access: OperandAccess | None = None
 
     def __post_init__(self) -> None:
+        if self.operand_access is not None and (self.aux is None or not isinstance(self.operand_access, OperandAccess)):
+            raise ValueError("operand access requires an auxiliary tensor")
         if self.op not in ALL_OPS:
             raise ValueError(f"unknown op {self.op!r}; expected one of {ALL_OPS}")
         if self.compute_dtype not in COMPUTE_DTYPES:
             raise ValueError(f"op {self.op!r}: compute_data_type {self.compute_dtype!r} is not " f"supported — expected one of {COMPUTE_DTYPES}.")
         if self.out_dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"op {self.op!r}: unsupported out_dtype {self.out_dtype!r}; " f"expected one of {SUPPORTED_DTYPES}")
+        if self.index_expr is not None:
+            if self.op != "gen_index" or not isinstance(self.index_expr, IndexExpr):
+                raise ValueError("only gen_index can carry a coordinate expression")
+            if not self.index_expr.axes <= {Axis.BATCH, Axis.M, Axis.N, Axis.K}:
+                raise ValueError("index expression may reference only batch, M, N and K")
         if self.op == "aux_load":
             if self.aux is None:
                 raise ValueError("aux_load requires an aux tensor name")
@@ -611,6 +878,8 @@ class FusionChain:
         if len(names) != len(self.aux_tensors):
             raise ValueError("aux_tensors contain duplicate names")
         for op in self.ops:
+            if op.operand_access is not None:
+                raise ValueError("operand coordinate access cannot be used in the epilogue")
             if op.aux is not None and op.aux not in names:
                 raise ValueError(f"op {op.op!r} references unknown aux {op.aux!r}")
             if op.aux is not None and self.aux_by_name(op.aux).bcast_mode == "per_k":
@@ -653,20 +922,34 @@ class FusionChain:
             quant_refs.append(spec.quant_idx)
         if sorted(quant_refs) != list(range(len(self.quants))):
             raise ValueError(f"each quant needs exactly one dense data output; quants={len(self.quants)}, " f"referenced={sorted(quant_refs)}")
+        for op in self.ops:
+            if op.aux is not None and self.aux_by_name(op.aux).coordinate_mapped:
+                raise ValueError("coordinate-mapped operand auxiliary cannot also use the epilogue matrix ABI")
+            if op.index_expr is not None and Axis.K in op.index_expr.axes:
+                raise ValueError("epilogue index expression cannot reference K")
         for label, oplist in (
             ("mainloop_a_ops", self.mainloop_a_ops),
             ("mainloop_b_ops", self.mainloop_b_ops),
         ):
-            for op in oplist:
-                if op.parent_idx_b is not None:
-                    raise ValueError(f"{label} op {op.op!r} cannot have parent_idx_b (no fan-in)")
-                if op.op in BINARY_OPS and op.aux is None:
-                    raise ValueError(f"{label} binary op {op.op!r} needs an aux tensor")
+            for i, op in enumerate(oplist):
+                for parent in (op.resolved_parent_idx(i), op.parent_idx_b):
+                    if parent is not None and not -1 <= parent < i:
+                        raise ValueError(f"{label} op {op.op!r} has an invalid parent reference")
+                allowed = {Axis.BATCH, Axis.K, Axis.M if label == "mainloop_a_ops" else Axis.N}
+                if op.index_expr is not None and not op.index_expr.axes <= allowed:
+                    raise ValueError(f"{label} index expression references the other operand axis")
                 if op.aux is not None:
                     if op.aux not in names:
                         raise ValueError(f"{label} op {op.op!r} references unknown aux {op.aux!r}")
                     ref = self.aux_by_name(op.aux)
-                    if ref.bcast_mode == "per_k":
+                    if op.operand_access is not None:
+                        if not ref.coordinate_mapped or len(op.operand_access.coordinates) != len(ref.dim):
+                            raise ValueError("operand access requires the original auxiliary rank")
+                        if not op.operand_access.axes <= allowed:
+                            raise ValueError("operand access references the other operand axis")
+                    elif ref.coordinate_mapped:
+                        raise ValueError("coordinate-mapped auxiliary requires an operand access")
+                    elif ref.bcast_mode == "per_k":
                         expected = (1, 1, self.matmul.K) if label == "mainloop_a_ops" else (1, self.matmul.K, 1)
                         axis = 2 if label == "mainloop_a_ops" else 1
                         if ref.dim != expected or ref.k_axis != axis:
@@ -847,6 +1130,15 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         return {"per_row": "per_col", "per_col": "per_row"}.get(mode, mode)
 
     def _op(op):
+        access = op.operand_access
+        if access is not None:
+            access = dataclasses.replace(
+                access,
+                coordinates=tuple(expr.substitute({Axis.M: IndexExpr.coordinate(Axis.N), Axis.N: IndexExpr.coordinate(Axis.M)}) for expr in access.coordinates),
+            )
+            op = dataclasses.replace(op, operand_access=access)
+        if op.index_expr is not None:
+            return dataclasses.replace(op, index_expr=op.index_expr.substitute({Axis.M: IndexExpr.coordinate(Axis.N), Axis.N: IndexExpr.coordinate(Axis.M)}))
         attrs = tuple((key, 3 - value if key == "axis" and value in (1, 2) else value) for key, value in op.attrs)
         return dataclasses.replace(op, attrs=attrs) if attrs != op.attrs else op
 
@@ -864,6 +1156,9 @@ def swap_ab(chain: FusionChain) -> FusionChain:
     )
     swapped_aux = []
     for t in chain.aux_tensors:
+        if t.coordinate_mapped:
+            swapped_aux.append(t)
+            continue
         dim, stride = t.dim, t.stride
         if len(dim) == 1:
             dim, stride = (1, dim[0]), (stride[0], stride[0])
@@ -930,8 +1225,8 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         num_a_operands=chain.num_b_operands,
         num_b_operands=chain.num_a_operands,
         gemm_operands=[(b, a) for a, b in chain.gemm_operands],
-        mainloop_a_ops=list(chain.mainloop_b_ops),
-        mainloop_b_ops=list(chain.mainloop_a_ops),
+        mainloop_a_ops=[_op(op) for op in chain.mainloop_b_ops],
+        mainloop_b_ops=[_op(op) for op in chain.mainloop_a_ops],
         mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
         mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
         block_scale=block_scale,

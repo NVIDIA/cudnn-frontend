@@ -44,6 +44,19 @@ class _PlanWithWorkspace:
         return self.compiled(variant_pack, stream=stream, workspace=self.workspace)
 
 
+def frost_gemm_unsupported_reason() -> str | None:
+    """Why the FROST GEMM engines cannot serve the current GPU, or ``None``.
+
+    They serve the SM100 family (SM 10.x / 11.x) and SM 12.x. On an older GPU every
+    strategy declines with ``NotImplementedError``, which the sweeps below would
+    otherwise report as "no strategy produced a correct result".
+    """
+    major, minor = torch.cuda.get_device_capability()
+    if major < 10:
+        return f"FROST GEMM needs an SM100-family or SM 12.x GPU; found SM{major}{minor}, skipping."
+    return None
+
+
 def with_workspace(compiled):
     """Prepare a fixed-shape benchmark plan for warmup and repeated launches.
 

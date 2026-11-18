@@ -29,6 +29,8 @@ import cudnn  # noqa: F401
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
+if torch.cuda.get_device_capability()[0] < 8:
+    pytest.skip("cuDNN SDPA (FP16 / BF16) requires SM80 or newer", allow_module_level=True)
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -39,6 +41,12 @@ except ImportError:
 import torch.nn.functional as F  # noqa: E402
 
 import cudnn.torch as provider  # noqa: E402
+from cudnn.torch import sdpa_provider  # noqa: E402
+from sdpa.torch._provider_test_utils import assert_public_rejection, cudnn_rejection_reasons, provider_varlen  # noqa: E402
+
+# Public calls follow the installed Torch selector. The separate operator
+# parameter keeps FE numerical coverage on architectures/GQA/windows that
+# Torch's public selector cannot yet send to cuDNN.
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +185,8 @@ VARLEN_CASES = [
 
 @pytest.mark.L0
 @pytest.mark.parametrize("Hq,Hkv,D,lens,window,enable_gqa,kv_packed", VARLEN_CASES)
-def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
+@pytest.mark.parametrize("entrypoint", ["public", "provider"])
+def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed, entrypoint):
     torch.manual_seed(0)
     lens_t = torch.tensor(lens, device="cuda")
     cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
@@ -191,7 +200,19 @@ def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
         v = torch.randn(T, Hkv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
     fwd0, bwd0 = provider.calls["fwd"], provider.calls["bwd"]
-    out, lse = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=window, enable_gqa=enable_gqa, return_aux=AuxRequest(lse=True))
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        if entrypoint == "provider":
+            out, lse = provider_varlen(q, k, v, cu, cu, mx, mx, window, enable_gqa)
+        else:
+            reasons = cudnn_rejection_reasons(q, k, v, cu, cu, mx, list(window), enable_gqa)
+
+            def public_call():
+                return varlen_attn(q, k, v, cu, cu, mx, mx, window_size=window, enable_gqa=enable_gqa, return_aux=AuxRequest(lse=True))
+
+            if reasons:
+                assert_public_rejection(reasons, public_call)
+                return
+            out, lse = public_call()
     grad = torch.randn_like(out)
     out.backward(grad)
     assert provider.calls["fwd"] == fwd0 + 1 and provider.calls["bwd"] == bwd0 + 1, "provider did not intercept"
@@ -238,7 +259,8 @@ def test_varlen_backward_does_not_sync():
     q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True) for _ in range(3))
 
     bwd0 = provider.calls["bwd"]
-    out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        out, _ = provider_varlen(q, k, v, cu, cu, mx, mx)
     grad = torch.randn_like(out)
 
     # Any blocking D2H inside the backward raises here.
@@ -271,7 +293,7 @@ def test_varlen_backward_uses_prepared_stats(case, monkeypatch):
     if case == "no_sync":
         test_varlen_backward_does_not_sync()
     else:
-        test_varlen_attn(*next(param.values for param in VARLEN_CASES if param.id == case))
+        test_varlen_attn(*next(param.values for param in VARLEN_CASES if param.id == case), entrypoint="provider")
     assert calls, "provider backward did not launch the prepared Stats conversion"
 
 
