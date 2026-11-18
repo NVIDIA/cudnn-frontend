@@ -365,6 +365,10 @@ aggregate count or dropping a body from coverage. Detectors include
 `test_sdpa_fwd_pointer_abi.py`, `test_sdpa_fwd_o_empty_backedge.py`, and the
 MXFP8 credit-arrive inventory in `test_sdpa_fwd_mxfp8_sm100.py`.
 
+PTX probes that assert parameter positions must keep earlier arguments live
+in every specialization. The compiler can prune unused arguments and renumber
+later ones. The consume/arrive probe retains `steps` in its output for this reason.
+
 PTX hash records also depend on imported helpers and the trace probe's fake
 tensor geometry. A scheduler or shared decoder change can invalidate a record
 even when the kernel file itself is unchanged. Before refreshing a record,
