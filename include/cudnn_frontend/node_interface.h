@@ -217,6 +217,7 @@ class INode {
         ADALAYERNORM,
         DADALAYERNORM,
         SDPA,
+        SDPA_BWD,
         ROPE,
         ROPE_BWD,
         MOE_GROUPED_MATMUL,
@@ -487,6 +488,14 @@ class INode {
     virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         return {-1, {}};
+    }
+
+    // Whether the config override_heuristics_query() returns is the only one that serves this node as requested. An
+    // exclusive config is not followed by the heuristics' configs, and a backend that declines it leaves the graph
+    // unsupported instead of falling back to the heuristics query.
+    virtual bool
+    is_heuristics_override_exclusive() const {
+        return false;
     }
 
     std::shared_ptr<Tensor_attributes> matmul(std::shared_ptr<Tensor_attributes>,

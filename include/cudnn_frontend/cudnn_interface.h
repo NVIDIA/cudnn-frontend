@@ -149,11 +149,13 @@ create_cudnn_tensor(
 namespace graph {
 class UnifiedSDPANode;
 class CustomReductionNode;
+class UnifiedSDPABackwardNode;
 }  // namespace graph
 
 class ICudnn {
     friend class graph::UnifiedSDPANode;
     friend class graph::CustomReductionNode;
+    friend class graph::UnifiedSDPABackwardNode;
 
    protected:
     using uid_t = int64_t;
