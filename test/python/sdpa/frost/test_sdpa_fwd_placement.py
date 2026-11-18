@@ -1470,6 +1470,56 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
 
 
 @pytest.mark.L0
+def test_sm100_fp8_decode_gap_classes_follow_the_study():
+    """Study sm100_fp8_decode_gaps_20261118 (module docstring): paged d64 (any window, S_q 1-16), windowed paged d256, dense d192 x 128
+    and its windowed sink twin lead where the row packs the whole GQA group (powers of two); unpacked groups lead only inside their fitted
+    bounds, windowed paged d128 only unpacked and on cc 10.0. Outside the measured box the hand rules answer as before."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100_fp8")
+    paged = dict(has_paged_kv=True, padded=True, page_size=16)
+    base = dict(b=128, h_q=128, h_kv=16, s_q=4, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True, device_cc=(10, 0), **paged)
+
+    def place(**over):
+        return placement.place(spec, _facts(**{**base, **_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, **over}))
+
+    # d64 paged, packed (muse_spark 128/16 and 16/2): every S_q, with or without a window, both parts
+    for s_q in (1, 4, 8):
+        for cc in ((10, 0), (10, 3)):
+            assert place(s_q=s_q, device_cc=cc) == placement.LEAD
+            assert place(s_q=s_q, device_cc=cc, h_q=16, h_kv=2, b=1, window_left=2047) == placement.LEAD
+    unpacked = dict(h_q=36, h_kv=3)  # group 12 runs unpacked
+    assert place(**unpacked) == placement.TRAIL
+    assert place(**unpacked, window_left=2047, s_kv=16384) == placement.LEAD
+    assert place(**unpacked, window_left=2047, s_kv=placement.SM100_FP8_D64_WIN_UNPACKED_MAX_KV + 1) == placement.TRAIL
+    assert place(**unpacked, window_left=2047, s_q=1, causal=True, s_kv=16384) == placement.TRAIL
+    # windowed paged d128: packed failed its nightly gate; unpacked leads on cc 10.0 up to S_q 12
+    d128 = dict(d_qk=128, d_v=128, window_left=511)
+    assert place(**d128, h_q=64, h_kv=8) == placement.TRAIL
+    assert place(**d128, h_q=80, h_kv=8, s_q=8) == placement.LEAD
+    assert place(**d128, h_q=80, h_kv=8, s_q=16) == placement.TRAIL
+    assert place(**d128, h_q=80, h_kv=8, s_q=8, device_cc=(10, 3)) == placement.TRAIL
+    # dense d192 x 128 (mimo): packed leads; its windowed sink twin leads from enough KV tokens in flight
+    d192 = dict(d_qk=192, d_v=128, has_paged_kv=False, padded=False, page_size=0, s_q=8)
+    assert place(**d192, h_q=64, h_kv=4) == placement.LEAD
+    assert place(**d192, h_q=36, h_kv=3) == placement.TRAIL  # unpacked failed its holdout
+    sink = dict(d192, window_left=127, has_sink=True, h_q=64, h_kv=8)
+    assert place(**sink) == placement.LEAD
+    assert place(**sink, b=1) == placement.TRAIL  # 8 units x 136 keys = 1088 tokens, below the packed floor
+    sink_unpacked = {**sink, "b": 1, "h_q": 36, "h_kv": 3, "window_left": 511}  # 3 units x 520 keys = 1560 tokens
+    assert place(**sink_unpacked) == placement.LEAD
+    assert place(**sink_unpacked, device_cc=(10, 3)) == placement.TRAIL  # failed the B300 holdout
+    # windowed paged d256 (gemma4): packed every group it serves
+    assert place(d_qk=256, d_v=256, h_q=16, h_kv=8, window_left=1023) == placement.LEAD
+    # outside the measured box
+    assert place(page_size=64) == placement.TRAIL
+    assert place(dtype_o=cudnn.data_type.BFLOAT16) == placement.TRAIL
+    assert place(s_kv=512) == placement.TRAIL
+    assert place(h_q=256, h_kv=8) == placement.TRAIL  # group 32 not measured
+    assert place(padded=False) == placement.TRAIL  # paged without per-request lengths
+
+
+@pytest.mark.L0
 def test_sm100_fp8_d512_mtp_leads_outside_its_small_work_floor():
     """SM100 per-tensor FP8 d512 MTP rows (2 <= s_q <= 16 under the bottom-right diagonal, dense unpadded E4M3 KV, MLA-absorbed or GQA)
     lead except one request of <= 32 query heads over a short cache (module docstring). Before the rule every one trailed."""

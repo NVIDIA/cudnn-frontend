@@ -175,6 +175,14 @@ set around the floor were never behind the default; every B300 loss (1.07-1.76) 
 cases + a 48-cell hold-out with uneven lengths): the same floor holds (its only losses 1.50, b1 16/1 KV 1k q 8 / 16;
 elsewhere 0.003-0.82), and the one mask-free row has no backend plan -> LEAD. Padded dense, mask-free MTP, windowed
 and MHA d512 MTP were not measured -> TRAIL.
+Decode classes the rules above trailed (``_sm100_fp8_decode_gap``; study sm100_fp8_decode_gaps_20261118, B200 + B300, cuDNN
+9.24.0.43 and 9.30.0.8, 2896 train + 252 holdout cells, page 16, GQA 2-16, KV 1k-128k): the kernels pack the GQA group only when
+it is a power of two, and the regimes split there (packed 0.11-0.46 of the backend, unpacked near parity up to 1.26-1.89).
+Paged d64 without a sink (S_q 1-16, full cache or windowed), windowed paged d256 and dense d192 x 128 lead when packed; its
+windowed sink twin leads from 1616 KV tokens in flight. Unpacked, windowed d64 MTP / verify leads up to 72k keys; on cc 10.0 only
+(B300 or GB300 failed), windowed d128 up to S_q 12 and the d192 sink twin from 1059 tokens. Windowed d128 packed lost 1.26-1.35
+on the GB200 / GB300 nightlies' b 1 x 2-unit rows -> TRAIL, as do the other unpacked classes (holdout up to 1.15-1.90).
+cuDNN 9.24 builds no FP8 plan for dense d192 x 128 or paged d256, so there FROST is the only plan either way.
 Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
 submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
 host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 query heads wins both at
@@ -527,6 +535,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from typing import Optional
 
 import cudnn
 
@@ -666,6 +675,13 @@ SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-
 SM100_FP8_D512_MTP_FLOOR_HEADS = 45  # b * h_q
 SM100_FP8_D512_MTP_FLOOR_KV = 1448
 SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
+# _sm100_fp8_decode_gap (study sm100_fp8_decode_gaps_20261118): each bound sits halfway between measured train values
+SM100_FP8_GAP_MAX_GROUP = 16  # measured GQA groups 2-16
+SM100_FP8_GAP_PAGE = 16  # measured page size
+SM100_FP8_D64_WIN_UNPACKED_MAX_KV = 73728  # unpacked windowed d64 MTP / verify: 16k caches lead, 128k ones do not
+SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q = 12  # unpacked windowed d128: S_q 2-8 lead, 16 does not
+SM100_FP8_D192_SINK_PACKED_MIN_TOKENS = 1616  # windowed d192 x 128 + sink: b * h_kv * keys per row
+SM100_FP8_D192_SINK_UNPACKED_MIN_TOKENS = 1059
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
 SM100_PAGED_D128_PREFIX_MAX_B = 64  # SM100 paged bf16 d128 GQA prefix lead: measured bounds (module docstring)
@@ -1147,9 +1163,52 @@ def _sm100_fp8_decode_leads(facts) -> bool:
     return facts.s_q >= 2 and shape in ((128, 128), (256, 256))
 
 
+def _sm100_fp8_decode_gap(caps: Capabilities, facts) -> Optional[str]:
+    """Study sm100_fp8_decode_gaps_20261118 (module docstring, "SM100 per-tensor FP8 row"): LEAD for the decode classes it shipped,
+    None for every other graph (the hand rules below decide those, as before). The kernels pack the GQA group only when it is a power
+    of two; the row's own packing decides the regime, as ``placement_table._decode_pack_group`` does without its S_q <= 4 depth."""
+    if facts.device_cc not in ((10, 0), (10, 3)) or facts.thd or facts.o_block_scale or facts.has_epilogue_gate or not facts.h_kv:
+        return None
+    if facts.dtype != cudnn.data_type.FP8_E4M3 or facts.dtype_o != cudnn.data_type.FP8_E4M3:
+        return None
+    group = facts.h_q // facts.h_kv
+    if not 1 < group <= SM100_FP8_GAP_MAX_GROUP or facts.s_q > DECODE_SHAPED_MAX_S_Q or facts.s_kv < SM100_FP8_DECODE_MIN_KV:
+        return None
+    if facts.right_band_widening or facts.padded != facts.has_paged_kv or (facts.has_paged_kv and facts.page_size != SM100_FP8_GAP_PAGE):
+        return None
+    if (facts.s_q > 1 and not (facts.causal and facts.bottom_right)) or (facts.causal and not facts.bottom_right):
+        return None  # measured under the bottom-right diagonal (the window's anchor at s_q == 1)
+    from .heuristics import _pack_gqa_eligible, _pack_gqa_group
+
+    packed = _pack_gqa_group(caps, facts, 128, _pack_gqa_eligible(caps, facts, 128)) == group
+    window = facts.window_left is not None
+    keys = min(facts.s_kv, facts.window_left + 1 + facts.s_q) if window else facts.s_kv
+    shape = (facts.d_qk, facts.d_v)
+    if shape == (64, 64) and facts.has_paged_kv and not facts.has_sink:
+        lead = packed or (window and facts.s_q > 1 and facts.s_kv <= SM100_FP8_D64_WIN_UNPACKED_MAX_KV)
+    elif facts.s_q == 1:
+        return None
+    elif shape == (128, 128) and facts.has_paged_kv and window and not facts.has_sink:
+        # packed: the GB200 / GB300 nightly's b 1 x 2-unit rows lost 1.26-1.35, so the class failed its gate; unpacked failed GB300's
+        lead = not packed and facts.device_cc == (10, 0) and facts.s_q <= SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q
+    elif shape == (192, 128) and not facts.has_paged_kv and not window and not facts.has_sink:
+        lead = packed
+    elif shape == (192, 128) and not facts.has_paged_kv and window and facts.has_sink:
+        tokens = facts.b * facts.h_kv * keys
+        lead = tokens >= SM100_FP8_D192_SINK_PACKED_MIN_TOKENS if packed else facts.device_cc == (10, 0) and tokens >= SM100_FP8_D192_SINK_UNPACKED_MIN_TOKENS
+    elif shape == (256, 256) and facts.has_paged_kv and window and not facts.has_sink:
+        lead = packed
+    else:
+        return None
+    return LEAD if lead else None
+
+
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:
     # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / block-scaled O, a window only inside _d512_swa;
     # decode-shaped GQA (s_q <= 16) also paged and with a d64 sink.
+    gap = _sm100_fp8_decode_gap(caps, facts)
+    if gap is not None:
+        return gap
     if facts.s_q <= DECODE_SHAPED_MAX_S_Q and _sm100_fp8_decode_leads(facts):
         return LEAD
     if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or facts.o_block_scale:
