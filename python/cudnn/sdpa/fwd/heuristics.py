@@ -284,6 +284,13 @@ _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
 # holdout cells, no changed cell past 1.04 / 1.01 of today's choice. The 64-row tile keeps the shared model.
 _SM80_SPLIT_KV_CTA_COST = 3.0
 _SM80_SPLIT_KV_COMBINE_COST = 0.02
+# SM80 half d256 PAGED decode on the short-d256 tile (64-row Q tile, 32-key KV tiles): the wave model mis-splits it in both
+# directions, so it takes a direct rule (_sm80_paged_d256_split_choice): the largest power-of-two split that keeps >= 8 KV tiles
+# per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced split 1.388 -> 1.038 on
+# 60 train cells, 1.338 -> 1.033 on 30 holdout cells, no cell slower than today's choice. Dense d256 keeps the shared model.
+_SM80_PAGED_D256_SPLIT_MIN_KV_TILES = 8
+_SM80_PAGED_D256_SPLIT_MAX_WAVES = 16
+_SM80_SPLIT_PARTIAL_O_MAX_ELEMS = 1 << 31  # SM80 split-KV faults once the partial-O buffer reaches 2^31 elements
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
 # S_q of _SERIAL_COMBINE_MIN_SQ and up there. That kernel walks the split axis
@@ -2638,6 +2645,34 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     return longest
 
 
+def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.d_qk == facts.d_v == 256
+        and not facts.thd
+        and facts.has_paged_kv
+        and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 64
+    )
+
+
+def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
+    """The largest power-of-two split <= 64 with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES
+    waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
+    kv_tiles = _ceil_div(facts.s_kv, tile_n or 32)
+    ctas = facts.b * (facts.h_q // pack_g) * _ceil_div(facts.s_q * pack_g, tile_m or 64)
+    split = 1
+    while (
+        split < 64
+        and kv_tiles // (2 * split) >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES
+        and ctas * 2 * split <= _SM80_PAGED_D256_SPLIT_MAX_WAVES * sm_count
+        and 2 * split * facts.b * facts.s_q * facts.h_q * facts.d_v < _SM80_SPLIT_PARTIAL_O_MAX_ELEMS
+    ):
+        split *= 2
+    return split
+
+
 def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
     """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
     return (
@@ -2883,7 +2918,7 @@ def _split_points(
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )
 
-    split = _choose(physical=True)
+    split = _sm80_paged_d256_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_paged_d256_split(caps, facts, tile_m) else _choose(physical=True)
     if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
         # The physical CTA count is a one-sided correction: every measured win of
         # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,

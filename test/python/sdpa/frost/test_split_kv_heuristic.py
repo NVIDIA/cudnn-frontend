@@ -1479,3 +1479,45 @@ def test_sm80_d128_chunks_split_on_the_adapter_grid(b, h_q, h_kv, s_q, s_kv, spl
         device_cc=(8, 0),
     )
     assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+@pytest.mark.parametrize(
+    "layout,b,h_q,h_kv,s_q,s_kv,split",
+    [
+        # Paged short-d256 tile: >= 8 KV tiles per split, <= 16 waves. A100 80GB PCIe ms by split
+        # (study sm80_d256_decode_split_cal_20261118; the shared model chose the first split listed):
+        ("paged", 8, 36, 4, 1, 131073, 32),  # 16: 3.14, 32: 2.71, 64: 2.76
+        ("paged", 4, 6, 1, 16, 32769, 64),  # 16: 0.285, 32: 0.305, 64: 0.272
+        ("paged", 64, 16, 1, 2, 16385, 16),  # 1: 1.55, 8: 0.825, 16: 0.740, 32: 0.781
+        ("paged", 64, 40, 4, 8, 1025, 2),  # 1: 0.411, 2: 0.410, 4: 0.444
+        # Dense d256 keeps the shared model's choice.
+        ("dense", 8, 40, 4, 1, 32768, 2),
+    ],
+)
+def test_sm80_paged_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, split):
+    """SM80 paged d256 decode on the short tile takes a direct split rule; the wave model mis-split it both ways."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm80")
+    paged = layout == "paged"
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_paged_kv=paged,
+        page_size=16 if paged else 0,
+        padded=paged,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
