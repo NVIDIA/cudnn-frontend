@@ -1477,6 +1477,32 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
 
 
 @pytest.mark.L0
+def test_sm107_fp8_d192_decode_gap_follows_the_study():
+    """Study sm107_fp8_d192_decode_20261118 (module docstring): on cc 10.7, dense FP8 d192 x 128 verify / MTP leads where the row packs
+    the whole GQA group, with the full cache always and with a window + sink from 3208 KV tokens in flight. Unpacked groups, S_q 1 and
+    graphs past the verify depth keep the existing rule (TRAIL for d192)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    base = dict(b=1, h_q=64, h_kv=4, s_q=8, s_kv=131072, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(10, 7))
+
+    def place(**over):
+        return placement.place(spec, _facts(**{**base, **_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, **over}))
+
+    for h_q, h_kv in ((64, 4), (16, 1), (128, 8)):  # mimo full cache: group 16
+        assert place(h_q=h_q, h_kv=h_kv) == placement.LEAD
+        assert place(h_q=h_q, h_kv=h_kv, b=128, s_q=2) == placement.LEAD
+    assert place(h_q=36, h_kv=3) == placement.TRAIL  # group 12 runs unpacked
+    assert place(s_q=1, causal=False, bottom_right=False) == placement.TRAIL  # not measured (the backend has no S_q 1 plan here)
+    assert place(s_q=32) == placement.TRAIL  # past the verify depth
+    sink = dict(window_left=127, has_sink=True, h_q=64, h_kv=8)  # 136 keys per row at S_q 8
+    assert place(**sink, b=128) == placement.LEAD
+    assert place(**sink, b=3) == placement.LEAD  # 3 x 8 x 136 = 3264 tokens
+    assert place(**sink, b=2) == placement.TRAIL  # 2176 tokens: the b 1-2 rows (~11 us) the backend wins
+    assert place(**{**sink, "b": 128, "h_q": 36, "h_kv": 3}) == placement.TRAIL  # unpacked: no rule shipped
+
+
+@pytest.mark.L0
 def test_sm100_fp8_decode_gap_classes_follow_the_study():
     """Study sm100_fp8_decode_gaps_20261118 (module docstring): paged d64 (any window, S_q 1-16), windowed paged d256, dense d192 x 128
     and its windowed sink twin lead where the row packs the whole GQA group (powers of two); unpacked groups lead only inside their fitted
