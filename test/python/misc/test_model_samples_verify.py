@@ -1243,7 +1243,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         "tensors, so the first verify step reads what the prompt left and nothing is copied." in section
     )
     # the capacity of such a session, as the refusals test runs it: a prompt of 5, 9 new tokens and 5 drafted need 18 positions
-    assert "so a run of a prompt and `n` new tokens is built with a capacity of `prompt + n + k - 1`" in section and 5 + 9 + 5 - 1 == 18
+    assert "so a run of a prompt and `n` new tokens is built with a capacity of `prompt + n + k - 1`" in section
     assert "(`tie_out.forced_drafts`): every step kept the count it was scheduled to keep, and every count was kept." in section
     assert "`recorded`: the ids and logits of every step the session recorded of its own run are the replay's bytes" in section
     assert "The comparison is made once per run, on the session as its run left it, and leaves it reset with its records." in section
@@ -2462,7 +2462,7 @@ def test_what_a_session_with_draft_tokens_refuses():
     session.read(session.prefill(prompts))
     for kept in (5, 0):
         session.verify(window, kept)
-    assert session.state.position == 5 + 9 - 2 == 12 and session.capacity == 5 + 9 + 5 - 1
+    assert session.state.position == 12 and session.capacity == 18
     session.verify(window, 0)
     with pytest.raises(ValueError, match="was built for 18 positions per sequence; build it with a larger capacity"):
         session.verify(window, 0)
@@ -2619,8 +2619,7 @@ def test_the_decode_adapter_builds_the_layout_the_prompt_launches(monkeypatch):
     option says the state's tokens -- so the form is built with the plan and launched once at the load; the adapter of a
     plain session builds the plain pool's, as it did."""
     import cudnn
-    import model_samples
-    from model_samples import blocks
+    from model_samples import Session, TextIO, blocks
     from model_samples.providers import fe
     from model_samples.qwen_dense import QwenDense, configs
 
@@ -2657,12 +2656,12 @@ def test_the_decode_adapter_builds_the_layout_the_prompt_launches(monkeypatch):
     assert len(entry.calls) == 2 and tuple(entry.calls[1][2].stride()) == (8 * qkv, 1, qkv), "the prompt's form, on scratch operands of its layout"
     # through sessions on stated facts: the decode plan of a session with draft tokens carries the state's tokens, no other plan does
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 2**36)))
-    text = model_samples.TextIO.synthetic(g.vocab)
-    session = model_samples.Session(model, text, stack="native", device="cuda:0", draft_tokens=5)
+    text = TextIO.synthetic(g.vocab)
+    session = Session(model, text, stack="native", device="cuda:0", draft_tokens=5)
     session.resolve()
     assert type(session.prefill_plan["linear_attention.step"]) is fe.GdnDecodeFusedBlock and session.prefill_plan["linear_attention.step"]._state_tokens() == 6
     assert type(session.plan["linear_attention.step"]) is fe.GdnVerifyFusedBlock and "state_tokens" not in session.plan["linear_attention.step"].options
-    other = model_samples.Session(model, text, stack="native", device="cuda:0")
+    other = Session(model, text, stack="native", device="cuda:0")
     assert other.resolve()["linear_attention.step"]._state_tokens() == 1 and "state_tokens" not in other.plan["linear_attention.step"].options
     # ... and the state hands a decode step exactly that layout
     from model_samples.state import DecodeState

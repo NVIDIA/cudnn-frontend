@@ -1055,17 +1055,16 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     capability 10.0, 148 SMs, stack ``native``, the published geometry): its load keeps the forms both plans read -- as a
     run of a decode session and a verify session does -- and the memory sentence counts one state of ``draft_tokens + 1``
     tokens per sequence, where two sessions count two."""
-    import model_samples
-    from model_samples import blocks, loop
+    from model_samples import Session, TextIO, blocks, loop
     from model_samples.qwen_dense import QwenDense
 
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * GIB)))
     model = QwenDense()
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     common = dict(sequences=1, stack="native", device="cuda:0", capacity=2051)
 
     def new(**more):
-        return model_samples.Session(model, text, **common, **more)
+        return Session(model, text, **common, **more)
 
     session = new(draft_tokens=5)
     table = session.plan_table()
@@ -1100,7 +1099,7 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     assert both - need == model.state_bytes(1, 2051) and f"needs about {both / GIB:.1f} GiB on this GPU for 1 and 1 sequences, one count after the other" in two
     # a run of a plain session and such a session names the kinds of step; a run without one keeps its words
     plain = new()
-    behind = model_samples.Session(model, text, share=plain, draft_tokens=5, **common)
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
     run = plain.plan_table([behind])
     assert plain.stored_weights() == decode.stored_weights() and plain.uncopied_weights() == decode.uncopied_weights()
     assert (
@@ -1108,7 +1107,7 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
         in run
     )
     assert loop.PROMPT_ROWS not in run, "the first session's table; a later session prints its own"
-    four = model_samples.Session(model, text, share=plain, **{**common, "sequences": 4})
+    four = Session(model, text, share=plain, **{**common, "sequences": 4})
     counts = new().plan_table([four])
     assert "for 1 and 4 sequences, one count after the other" in counts
     # an override selects its row in both plans; a key whose rows do not serve one of the two kinds of step declines there
@@ -1124,7 +1123,7 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
         new(draft_tokens=8).plan_table()
     assert str(declined.value) == "cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per sequence"
     with pytest.raises(NotImplementedError) as declined:
-        model_samples.Session(model, text, draft_tokens=5, **{**common, "sequences": 5}).plan_table()
+        Session(model, text, draft_tokens=5, **{**common, "sequences": 5}).plan_table()
     assert str(declined.value) == "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
     # what the first launch of the fused step reserves outside the pool is reserved once in a process, so the sentence carries it
     # once -- not once more for the second plan of such a session.  On a class that has such a reserve (compute capability
@@ -1148,6 +1147,6 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     assert asked(alone_table) == f"{(need + reserve) / GIB:.1f}" != f"{(need + 2 * reserve) / GIB:.1f}", alone_table.splitlines()[-1]
     decode, verify, plain = new(), new(tokens=6), new()
     verify._share = decode
-    behind = model_samples.Session(model, text, share=plain, draft_tokens=5, **common)
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
     with_prompt, two_sessions = plain.plan_table([behind]), decode.plan_table([verify])
     assert asked(with_prompt) == asked(two_sessions), "one reserve and one more state in both runs"
