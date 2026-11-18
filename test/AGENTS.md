@@ -1526,8 +1526,10 @@ both packings classify the same element, but the token-major binder requires
 exact strides, so the wrapper must retain the head-major ABI for unused pitches.
 
 For Torch/JAX DLPack transfers, select the tensor's CUDA device during conversion
-and restore the caller's device afterward. Cover values, metadata, gradients and
-reverse transfers. The simplified sparse attention JAX suite checks the context
+and restore the caller's device afterward. Initialize the JAX GPU backend inside
+an outer device guard before entering the conversion guards: initialization can
+leave another device current. Keep JIT execution inside the outer guard too.
+Cover values, metadata, gradients and reverse transfers. The simplified sparse attention JAX suite checks the context
 guard and runs with another GPU current when two devices are available.
 
 For JAX device-target admission, test zero-argument JIT closures that capture every
