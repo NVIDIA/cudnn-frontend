@@ -195,6 +195,19 @@ non-FP8 results against it, so FlashAttention 4 must be installed and must
 support the GPU (the Docker image above provides it). FlashAttention 4 does
 not run on SM8x; add `--skip_ref` there.
 
+For dense BF16/FP16, a backward-only run checks the forward output used to
+prepare backward and the three input gradients. The CSV's `max_diff` is the
+largest absolute difference across the checked tensors and iterations.
+A skipped reference or a failed check produces `NaN` (an empty field in the runner CSV).
+Timing can still succeed when reference validation fails.
+
+FlashAttention counts window radii inclusively, so a width of W uses a
+left radius of W−1 on its native causal diagonal. For a rectangular
+top-left mask, the timed FlashAttention leg uses shifted radii when both
+bounds are representable and reports an unsupported case otherwise.
+The untimed FA4 reference can also reverse the sequence axes to check
+these masks at their original lengths.
+
 ```bash
 # cuDNN Frontend (BF16)
 python benchmark_single_sdpa.py \
