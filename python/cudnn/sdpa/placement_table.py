@@ -158,12 +158,15 @@ def _unpacked_decode(row: str, facts) -> bool:
 
 
 def _sm100_unpacked_window_prefill(row: str, facts) -> bool:
-    """SM100 / SM103 windowed paged d128 prefill whose GQA group the row does not pack whole (the packed group must divide its tile):
-    groups 5 / 6 / 9 / 10 / 12 ran unpacked at parity with the backend (up to 1.23) where group 8 ran 0.75-0.80, and the windowed
-    classes' `always` entries led both (sm100_prefill_d192_gaps_20261118, d128 diagnostic family). Scoped to the measured class."""
-    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)) or (facts.d_qk, facts.d_v) != (128, 128):
+    """SM100 / SM103 windowed prefill whose GQA group the row does not pack whole (the packed group must divide its tile), in the
+    measured classes: paged d128, where groups 5 / 6 / 9 / 10 / 12 ran unpacked at parity with the backend (up to 1.23) and group 8
+    ran 0.75-0.80 (sm100_prefill_d192_gaps_20261118, d128 diagnostic family); dense d192 x 128 with a window, where group 6 ran
+    at parity and groups 4 / 8 / 16 ran 0.66-0.72 (sm100_d192x128_swa_sink_pack_20261118)."""
+    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)):
         return False
-    if facts.window_left is None or not facts.has_paged_kv or facts.s_q <= 4 or facts.h_q == facts.h_kv:
+    if ((facts.d_qk, facts.d_v), bool(facts.has_paged_kv)) not in (((128, 128), True), ((192, 128), False)):
+        return False
+    if facts.window_left is None or facts.s_q <= 4 or facts.h_q == facts.h_kv:
         return False
     pack = _row_pack_group(row, facts)
     return pack is not None and pack < facts.h_q // facts.h_kv
@@ -1684,6 +1687,34 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "paged", "window", False, "gqa_unpacked", True): Entry(
         "always", None, "sm100_d128_window_prefill_unpacked_20261118"
+    ),
+    # study sm100_d192x128_swa_sink_pack_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, B200 + B300 holdout at fresh head
+    # pairs scored once; run-559 gates GB200 11 rows at 0.690, GB300 11 at 0.591): mimo swa dense d192 x 128 with a window and a sink,
+    # keyed by whether the row packs the GQA group whole (`_sm100_unpacked_window_prefill`). On the tile both lead past a tiles floor
+    # (the b 1 2048-square 16-head rows stay below it); off the tile both lead
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
+        "ge", 9.5, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
+        "always", None, "sm100_d192x128_swa_sink_pack_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_unpacked", False): Entry(
+        "ge", 12.953, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_unpacked", True): Entry(
+        "always", None, "sm100_d192x128_swa_sink_pack_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
+        "ge", 9.5, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
+        "always", None, "sm100_d192x128_swa_sink_pack_20261118"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_unpacked", False): Entry(
+        "ge", 12.953, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_unpacked", True): Entry(
+        "always", None, "sm100_d192x128_swa_sink_pack_20261118"
     ),
     # study sm103_d256_bwd_v2_20261031, THD half (B300 SXM6 1100 W, cuDNN 9.28.0.38; 129 train cases: S 128-32k, b 1-128, GQA 16/2 /
     # 32/4 / 32/1 / 64/2 and MHA 16/16; 24 off-lattice holdout cases). The dense classes have no entry: they lost on small-work

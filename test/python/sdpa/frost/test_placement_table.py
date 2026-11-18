@@ -1328,6 +1328,38 @@ def test_sm100_windowed_d128_prefill_keys_unpacked_groups_apart(device_cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_sm100_dense_d192x128_window_sink_prefill_entries_follow_the_study(device_cc):
+    """Study sm100_d192x128_swa_sink_pack_20261118: mimo swa dense d192 x 128 context (128-key window, sink) keys `gqa` when the row
+    packs the group whole and `gqa_unpacked` otherwise; on the tile each leads past its tiles floor (the b 1 2048-square 16-head rows,
+    1.27-1.31 on GB200, stay with the backend), off the tile both lead. Paged caches keep their key."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def dense(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=2048, s_kv=2048, d_qk=192, d_v=128, causal=True, bottom_right=True, window_left=127, has_sink=True)
+        base.update(device_cc=device_cc, has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    for over, key, lead in (
+        (dict(), "gqa", True),
+        (dict(h_q=128), "gqa", True),
+        (dict(h_q=16, h_kv=1), "gqa", False),
+        (dict(h_q=16, h_kv=2), "gqa", False),
+        (dict(h_q=16, h_kv=1, s_q=8192, s_kv=8192), "gqa", True),
+        (dict(h_q=16, h_kv=1, s_kv=2049), "gqa", True),
+        (dict(h_q=48), "gqa_unpacked", False),
+        (dict(h_q=96, s_q=16384, s_kv=16384, b=2), "gqa_unpacked", True),
+        (dict(h_q=48, s_kv=2049), "gqa_unpacked", True),
+    ):
+        facts = dense(**over)
+        assert pt.class_key(row, facts)[8] == key, over
+        assert pt.lookup(row, facts) is lead, over
+        assert pt.matched_entry(row, facts).study == "sm100_d192x128_swa_sink_pack_20261118"
+    assert pt.class_key(row, dense(has_paged_kv=True, page_size=16, padded=True, thd=True, h_q=48))[8] == "gqa"
+
+
+@pytest.mark.L0
 def test_sm107_paged_window_entries_follow_the_study():
     """Study sm107_window_gaps_20261118 (Rubin, the inference benchmark's windowed paged generation graph): windowed paged d192 x 192 and
     d256 lead at S_q 1 through prefill, d64 up to S_q 45, d128 MTP (whole-pack groups) on caches up to 32k. Windowed d128 verify
