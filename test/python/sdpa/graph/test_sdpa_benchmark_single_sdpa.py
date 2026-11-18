@@ -31,6 +31,35 @@ def _reference_causal_nonmasked_elems(q_seqlen: int, kv_seqlen: int, attn_mask: 
     return total
 
 
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_benchmark_native_backward_uses_bound_output_gradient(monkeypatch, dtype):
+    import runpy
+
+    import torch
+
+    script = _REPO_ROOT / "benchmark/attention_training/benchmark_single_sdpa.py"
+    monkeypatch.syspath_prepend(str(script.parent))
+    args = (
+        "--sdpa_backend cudnn --batch_size 2 --q_seqlen 64 --kv_seqlen 128 "
+        "--num_q_heads 4 --num_kv_heads 2 --head_dim 64 --profile_pass bwd --num_iterations 2 --skip_ref"
+    ).split()
+    monkeypatch.setattr(sys, "argv", [str(script), *args, "--data_type", dtype])
+    state = runpy.run_path(str(script), run_name="__main__")
+    pack = state["variant_pack_bwd"]
+
+    def bound(name):
+        return pack[state[name + "_bwd"]].detach().double()
+
+    q, k, v = (bound(name).requires_grad_() for name in ("q", "k", "v"))
+    scores = q @ k.repeat_interleave(2, dim=1).transpose(-1, -2) / q.shape[-1] ** 0.5
+    out = scores.softmax(dim=-1) @ v.repeat_interleave(2, dim=1)
+    expected = torch.autograd.grad(out, (q, k, v), bound("dO"))
+    for name, grad in zip(("dQ", "dK", "dV"), expected):
+        torch.testing.assert_close(bound(name), grad, rtol=2e-2, atol=2e-2)
+    d_o = state["dO_bwd"]
+    assert tuple(d_o.get_stride()) == pack[d_o].stride()
+
+
 def test_count_causal_nonmasked_elems_square_top_left():
     assert count_causal_nonmasked_elems(4, 4, "top_left") == 10
 

@@ -905,10 +905,14 @@ else:
             dQuery = torch.empty_like(query)
             dKey = torch.empty_like(key)
             dValue = torch.empty_like(value)
+
         # dO in O's memory format (BSHD-physical): torch.randn(output.shape) would
         # allocate BHSD-contiguous and hand every backward a gradient laid out
         # differently from the activations.
-        dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+        def new_cudnn_doutput():
+            return torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+
+        dOutput = new_cudnn_doutput()
         stats = _new_stats()
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -1851,9 +1855,8 @@ else:
             amax_dP_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
-        dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
-
         if is_cudnn_fe:
+            dOutput = new_cudnn_doutput()
             if args.data_type == "mxfp8":
                 if o_block_scale == 16:
                     # FP4 O: the packed byte container (two E2M1 per byte).
@@ -2040,6 +2043,8 @@ else:
                 if run_bwd:
                     variant_pack_bwd[seed_bwd] = dropout_seed
                     variant_pack_bwd[offset_bwd] = dropout_offset
+        else:
+            dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
 
         l2_flush_buffer.zero_()
 
