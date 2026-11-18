@@ -9,6 +9,7 @@ from packaging.version import InvalidVersion, Version
 
 SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8, 16, 32, 64)
 SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 16
+SM90_PHYSICAL_RELAY_CLUSTER_SIZES = (4, 8, 16)
 SM90_SIGNED_INT32_ELEMENT_LIMIT = 1 << 31
 
 
@@ -72,3 +73,22 @@ def normalize_sm90_relay_cluster_size(value) -> int:
     if cluster_size not in SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES:
         raise ValueError("SM90 deterministic_relay_cluster_size must be 4, 8, 16, 32, or 64 " f"(32, 16, 8, 4, or 2 FP32 planes), got {cluster_size}")
     return cluster_size
+
+
+def sm90_physical_relay_cluster_size(relay_cluster_size, device=None) -> int:
+    """Choose the widest launchable physical cluster for a logical relay.
+
+    Hopper parts do not all admit the non-portable C16 cluster.  Query the
+    driver's cluster occupancy table once per device and split a logical relay
+    into same-stream phases when its preferred physical width cannot launch.
+    """
+    relay_cluster_size = normalize_sm90_relay_cluster_size(relay_cluster_size)
+    from cudnn.frost.occupancy import occupancy_map
+
+    active_clusters = occupancy_map(device)
+    for physical_cluster_size in reversed(SM90_PHYSICAL_RELAY_CLUSTER_SIZES):
+        if physical_cluster_size <= relay_cluster_size and active_clusters[physical_cluster_size - 1] > 0:
+            return physical_cluster_size
+    raise NotImplementedError(
+        "deterministic SM90 DSA backward requires a launchable C4, C8, or C16 " f"physical cluster for logical relay C{relay_cluster_size}"
+    )

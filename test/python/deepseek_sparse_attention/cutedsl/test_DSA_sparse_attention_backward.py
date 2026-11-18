@@ -6076,7 +6076,7 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
 
     # qhpkv controls the query-head tiling and must remain part of the main
     # compile key, independently of the runtime tensor shape.
-    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-5] is False]
+    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-6] is False]
     assert matching_keys
     assert all(key[-1] == 0 for key in matching_keys), "non-deterministic kernels must not specialize on rounded head extents"
 
@@ -7060,6 +7060,43 @@ def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
     assert _sm90_relay.sm90_deterministic_relay_indexing_error(limit + 1) == (
         "deterministic SM90 DSA backward dKV accumulator has 2147483649 elements, " "which exceeds the signed Int32 element offset range"
     )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "relay_cluster_size,active_sizes,expected",
+    [
+        (4, (4, 8), 4),
+        (8, (4, 8), 8),
+        (16, (4, 8), 8),
+        (32, (4, 8, 16), 16),
+        (64, (4,), 4),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_physical_relay_uses_largest_launchable(monkeypatch, relay_cluster_size, active_sizes, expected):
+    """Logical relays split at the device's actual physical-cluster limit."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.frost import occupancy
+
+    active_clusters = [0] * occupancy.MAX_CLUSTER_SIZE
+    for size in active_sizes:
+        active_clusters[size - 1] = 1
+    monkeypatch.setattr(occupancy, "occupancy_map", lambda device=None: active_clusters)
+
+    assert _sm90_relay.sm90_physical_relay_cluster_size(relay_cluster_size, "cuda:7") == expected
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_physical_relay_rejects_unlaunchable_device(monkeypatch):
+    """A plan declines before compilation when even a physical C4 cannot launch."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.frost import occupancy
+
+    monkeypatch.setattr(occupancy, "occupancy_map", lambda device=None: [0] * occupancy.MAX_CLUSTER_SIZE)
+    with pytest.raises(NotImplementedError, match=r"requires a launchable C4, C8, or C16 physical cluster"):
+        _sm90_relay.sm90_physical_relay_cluster_size(16, "cuda:0")
 
 
 @pytest.mark.L0

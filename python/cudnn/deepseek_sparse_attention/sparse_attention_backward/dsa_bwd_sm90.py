@@ -620,6 +620,7 @@ class FlashAttentionDSABackwardSm90:
         q_wave_ctas: int = 1,
         padded_head_dim: int = 0,
         emit_cli_target: bool = False,
+        physical_relay_cluster_size: Optional[int] = None,
     ):
         """Specialize the Hopper backward kernel and optional deterministic relay."""
         self.dtype = dtype
@@ -650,7 +651,9 @@ class FlashAttentionDSABackwardSm90:
         self.deterministic = deterministic
         self.num_dkv_shards = num_dkv_shards
         self.relay_cluster_size = relay_cluster_size
-        self.physical_relay_cluster_size = min(relay_cluster_size, 16)
+        self.physical_relay_cluster_size = min(relay_cluster_size, 16) if physical_relay_cluster_size is None else physical_relay_cluster_size
+        assert self.physical_relay_cluster_size in (1, 4, 8, 16)
+        assert relay_cluster_size % self.physical_relay_cluster_size == 0
         self.relay_phases = relay_cluster_size // self.physical_relay_cluster_size
         self.q_wave_ctas = q_wave_ctas
         self.padded_head_dim = padded_head_dim
@@ -995,8 +998,9 @@ class FlashAttentionDSABackwardSm90:
 
         # One CTA per query/head tile; TMA predicates the final partial head tile.
         # Deterministic execution bounds the logical grid to one query wave and
-        # serializes head tiles. Logical C32/C64 groups are split into two/four
-        # ordered physical C16 launches that reuse the same FP32 plane.
+        # serializes head tiles. A logical relay wider than the device's widest
+        # launchable C16/C8/C4 cluster is split into ordered physical launches
+        # that reuse the same FP32 plane.
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
         total_q = cute.size(mQ.shape[3])

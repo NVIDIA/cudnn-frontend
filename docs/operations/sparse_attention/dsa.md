@@ -321,10 +321,11 @@ the split count is fixed when the plan is compiled.
 On SM90, `deterministic=True` uses a row-aware relay with logical cluster size
 `C in {4, 8, 16, 32, 64}` for H16/H32/H64/H96/H128. The public
 `deterministic_relay_cluster_size` argument selects `C` and defaults to 16.
-Each 128-query wave gives one FP32 dKV plane to every logical relay group. C4,
-C8, and C16 launch one physical cluster per group; C32 and C64 run each group
-as two or four same-stream physical C16 phases. Kernel completion orders phase
-reuse without making a CTA wait for a nonresident cluster. A setup kernel builds
+Each 128-query wave gives one FP32 dKV plane to every logical relay group. The
+plan queries CUDA cluster occupancy and uses the widest launchable physical
+C16, C8, or C4 cluster no larger than the logical relay. A wider logical relay
+runs as ordered same-stream phases. Kernel completion orders phase reuse
+without making a CTA wait for a nonresident cluster. A setup kernel builds
 packed `C`-bit rank masks for every referenced
 `(query wave, M64 head tile, KV row)`. A relay CTA waits only for lower logical
 ranks that actually update the same row; a 128-thread WG1
