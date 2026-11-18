@@ -789,7 +789,7 @@ def build_schedule(
 
 def _build_schedule(workspace, config, top_experts, num_local_experts, out=None):
     """The schedule build of ``build_schedule`` and of ``schedule_execute``, which passes ``out`` -- the caller's
-    peer_rank, peer_token_idx and counts buffers and the plan's scratch -- so that nothing is allocated."""
+    peer_rank, peer_token_idx and counts buffers and scratch -- so that nothing is allocated."""
     if not isinstance(workspace, CuteMoKWorkspace):
         raise TypeError("workspace must be a CuteMoKWorkspace")
     _validate_config_type(config)
@@ -1219,8 +1219,9 @@ def _forward(
     ``forward`` leaves ``buffers`` None: the megakernel's outputs and counters and the epilogue's output are
     allocated per call, and a kernel variant is compiled when it is first used.  ``forward_execute`` passes
     ``buffers = (context_out, out, counters, scratch, gate_out)`` -- the caller's megakernel outputs (nine BF16, or
-    the MXFP8 forward's thirteen / eleven) and final output, the plan's counter buffer, for MXFP8 the plan's four
-    scratch buffers and, gated, the caller's BF16 [num_local_tokens, 1] buffer of G -- so nothing is allocated.
+    the MXFP8 forward's thirteen / eleven) and final output, the caller's int32 counter buffer, for MXFP8 the
+    caller's four scratch buffers and, gated, the caller's BF16 [num_local_tokens, 1] buffer of G -- so nothing is
+    allocated.
     """
     _validate_config_type(config)
     validate_inputs(config, workspace, schedule, x, router_weights)
@@ -1374,6 +1375,10 @@ def _forward(
             hidden_routed=hidden_routed,
         )
 
+    # y_routed (MXFP8: a view of the call's scratch storage) is read by nothing after the megakernel: released here,
+    # before the epilogue allocates, so the call's peak is the megakernel's (stream-ordered reuse).
+    del y_routed
+    mxfp8_outputs = None
     if situ_beta is not None:
         forward_context = _replace_fields(forward_context, situ_beta=situ_beta)
     shared_output_gate = None
@@ -1863,6 +1868,7 @@ def _backward(
     shared_output_gate_main_grad=None,
     zero_unrouted_router_grads=True,
     buffers=None,
+    storage=None,
 ):
     """The backward of ``backward`` and of ``backward_execute``: the same checks, staging copy, barriers and
     kernels.
@@ -1870,11 +1876,13 @@ def _backward(
     ``backward`` leaves ``buffers`` None: the scratch, the weight gradients (without ``main_grads``), d_x and
     d_router_weights are allocated per call, the workspace keeps one counter / metadata set per configuration,
     and a kernel variant is compiled when it is first used.  ``backward_execute`` passes ``buffers = (scratch,
-    d_weights, storage, out, d_router_weights_out, route_mask, gate_buffers)`` -- the plan's scratch, storage and
-    route mask and the caller's output buffers -- so nothing is allocated (BF16: seven scratch tensors and the
+    d_weights, storage, out, d_router_weights_out, route_mask, gate_buffers)`` -- the caller's scratch, the plan's
+    storage, the caller's route mask and output buffers -- so nothing is allocated (BF16: seven scratch tensors and the
     (int32, float32) storage; MXFP8: the flat scratch buffers by name and the int32 counter buffer).  Gated,
-    ``gate_buffers`` is (G * dY, dZ, the gate weight gradient's FP32 scratch) of the plan and the caller's
-    ``d_w_output_gate_out``; otherwise None.
+    ``gate_buffers`` is (G * dY, dZ, the gate weight gradient's FP32 scratch) and the caller's
+    ``d_w_output_gate_out``; otherwise None.  ``storage`` without ``buffers`` (``cutemok_backward``): a plan's
+    ``backward_storage``, which the BF16 backward then uses instead of a buffer set of the workspace's own; everything
+    else is allocated per call.
     """
     _validate_config_type(config)
     if buffers is not None and not isinstance(forward_context, CuteMoKForwardContext):
@@ -1986,6 +1994,8 @@ def _backward(
     # Capability errors come before the call touches the workspace (the symmetric buffer copies
     # and the barrier below), like the validation errors above.
     caller_buffers = gate_buffers = None
+    if buffers is None and storage is not None and not isinstance(routed_gate_weights, tuple):
+        caller_buffers = (None, None, storage)  # the plan's counters / metadata / router-weight storage, nothing else
     if buffers is not None:
         scratch, d_weights, storage, out, d_router_weights_out, route_mask, gate_buffers = buffers
         if (
@@ -2122,26 +2132,9 @@ def _backward(
             caller_buffers=caller_buffers,
             **replay_arguments,
         )
-        (
-            d_x_shared,
-            d_x_routed,
-            d_gate_shared,
-            d_gate_fp8_routed,
-            d_gate_sc_routed,
-            d_up_shared,
-            d_up_fp8_routed,
-            d_up_sc_routed,
-            d_hidden_shared,
-            d_hidden_routed,
-            d_y_fp8_routed,
-            d_y_sc_routed,
-            d_w_shared_gate,
-            d_w_routed_gate,
-            d_w_shared_up,
-            d_w_routed_up,
-            d_w_shared_down,
-            d_w_routed_down,
-        ) = outputs
+        # Only d_x_shared (the epilogue's input) and the weight gradients are read after the megakernel.
+        d_x_shared = outputs[0]
+        d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down = outputs[12:]
     else:
         from .cutedsl.persistent_bf16_bwd import (
             backward_bf16 as cutedsl_backward_bf16,
@@ -2177,6 +2170,9 @@ def _backward(
         d_w_shared_gate, d_w_routed_gate = raw[7], raw[8]
         d_w_shared_up, d_w_routed_up = raw[9], raw[10]
         d_w_shared_down, d_w_routed_down = raw[11], raw[12]
+    # The megakernel's other scratch is read by nothing after it: released here, before the epilogue and the
+    # router-gradient copy allocate (stream-ordered reuse), so the call's peak is the megakernel's.
+    raw = outputs = None
     ops.barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs, workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     if split_hidden:
         # The shared and routed input gradients live in different hiddens: reduce the routed top-k
@@ -2221,43 +2217,39 @@ def _backward(
 # ---------------------------------------------------------------------------------------------
 # Plan / execute entries (transitional names, all in this section)
 #
-# make_plan compiles every kernel a layer configuration launches and allocates what a call would
-# otherwise allocate, its workspace included; schedule_execute / forward_execute / backward_execute then
-# run build_schedule / forward / backward into the caller's buffers: they compile nothing and allocate no
-# device memory.  They are the same code as the layer functions (_build_schedule, _forward, _backward); only
-# the owner of the buffers differs.  BF16 or MXFP8 routed weights (one per plan).
+# make_plan compiles every kernel a layer configuration launches and allocates what persists across calls:
+# the workspace and the backward's counter storage; schedule_execute / forward_execute / backward_execute then
+# run build_schedule / forward / backward into the caller's buffers and scratch: they compile nothing and allocate
+# no device memory.  They are the same code as the layer functions (_build_schedule, _forward,
+# _backward); only the owner of the buffers differs.  BF16 or MXFP8 routed weights (one per plan).
 # ---------------------------------------------------------------------------------------------
 @dataclass(slots=True)
 class CuteMoKPlan:
     """What ``make_plan`` prepared for one layer configuration.
 
-    The plan owns the megakernels' counters, the backward's scratch, the scheduler's scratch and the workspace
-    of ``max_tokens_per_rank`` (the symmetric buffers, from ``create_workspace``: not in ``get_workspace``'s
-    cache, so the plan holds the only reference and dropping it frees them).  The compiled kernels stay in the
-    process caches of their modules.  Calls on one plan must not overlap: they share its buffers, in stream
-    order.  Drop a plan only after every call and graph replay on it has finished on every rank of its group
-    (other ranks write into its symmetric buffers), outside graph capture.
+    The plan owns the workspace of ``max_tokens_per_rank`` (the symmetric buffers, from ``create_workspace``: not
+    in ``get_workspace``'s cache, so the plan holds the only reference and dropping it frees them) and the
+    backward's counter storage (BF16: with its launch storage).  The scratch a call reads only during that call (the
+    scheduler's intermediate counts, the forward's counters, the MXFP8 forward's e4m3 operands, the backward's
+    gradient scratch, the router-gradient mask, the shared output gate's buffers) is not the plan's:
+    ``cutemok_forward`` / ``cutemok_backward`` allocate it per call, the execute steps take it from the caller
+    (``_schedule_scratch_shapes`` / ``_forward_scratch_shapes`` / ``_backward_scratch_shapes``).  The compiled
+    kernels stay in the process caches of their modules.  Calls on one plan must not overlap: they share its
+    buffers, in stream order.  Drop a plan only after every call and graph replay on it has finished on every rank
+    of its group (other ranks write into its symmetric buffers), outside graph capture.
     """
 
     workspace: CuteMoKWorkspace  # the buffers, sized for max_tokens_per_rank
     num_local_experts: int
     intermediate_size: int
     has_shared: bool
-    macrobatch_size: int  # the largest macrobatch of a backward (MXFP8: of a forward too)
+    macrobatch_size: int  # the largest macrobatch of a BF16 backward (its launch storage's bound)
     routed_precision: str  # "bf16" or "mxfp8": the routed weights of every call on the plan
-    forward_counters: torch.Tensor  # int32: the forward megakernel's readiness counters at their largest
-    forward_scratch: tuple | None  # MXFP8: the forward's e4m3 x / Hidden and their scales, flat, at the
-    # largest macrobatch (FORWARD_SCRATCH order); BF16: None
-    schedule_scratch: torch.Tensor  # int32: the scheduler's intermediate counts
-    backward_scratch: tuple | dict | None  # BF16: the backward's seven scratch tensors at their largest; MXFP8:
-    # its flat scratch buffers by name (backward_mxfp8_plan_sizes)
     backward_storage: tuple | torch.Tensor | None  # BF16 (int32, float32): its counters, decoder metadata,
-    # router weights / partials; MXFP8: its int32 counters
-    route_mask: torch.Tensor | None  # bool [max_tokens_per_rank, topk]: the unrouted slots of d_router_weights
+    # router weights / partials, bound into the backward's launch
+    # plan and kept across calls; MXFP8: its int32 counters; None
+    # without the backward
     shared_output_gate: bool  # calls pass shared_output_gate_weight (make_plan's shared_output_gate)
-    gate_scratch: tuple | None  # gated with the backward: BF16 G * dY [max_tokens_per_rank, H] and dZ
-    # [max_tokens_per_rank, 1], and the FP32 [1, H] gate weight gradient
-    # added into a shared_output_gate_main_grad
     _views: dict  # num_local_tokens -> that token count's view of the workspace
     _shapes: dict  # (step, ...) -> _schedule_shapes / _forward_shapes, computed once
 
@@ -2281,7 +2273,7 @@ class CuteMoKPlan:
             view = self._views[num_local_tokens] = _replace_fields(
                 workspace,
                 num_local_tokens=num_local_tokens,
-                schedule_capacity=workspace.schedule_capacity // workspace.num_local_tokens * num_local_tokens,
+                schedule_capacity=self._schedule_capacity(num_local_tokens),
                 x_buffer=workspace.x_buffer[:num_local_tokens],
                 combine_buffer=workspace.combine_buffer[:rows],
                 d_y_buffer=workspace.d_y_buffer[:num_local_tokens],
@@ -2297,6 +2289,11 @@ class CuteMoKPlan:
             )
         return view
 
+    def _schedule_capacity(self, num_local_tokens: int) -> int:
+        """The schedule capacity of calls with ``num_local_tokens`` tokens per rank (that of ``workspace_for``)."""
+        workspace = self.workspace
+        return workspace.schedule_capacity // workspace.num_local_tokens * num_local_tokens
+
     def _schedule_shapes(self, num_local_tokens: int) -> tuple[tuple[int], ...]:
         """The shapes of ``schedule_execute``'s three int32 ``out`` buffers: peer_rank, peer_token_idx, counts."""
         from .cutedsl.scheduler import schedule_buffer_lengths
@@ -2309,6 +2306,14 @@ class CuteMoKPlan:
                 (length,) for length in schedule_buffer_lengths(self.num_local_experts, workspace.ep_size, workspace.schedule_capacity)[:3]
             )
         return shapes
+
+    def _schedule_scratch_shapes(self) -> tuple[tuple[int], torch.dtype]:
+        """``schedule_execute``'s ``scratch``: the scheduler's int32 intermediate counts, ``((elements,), int32)``,
+        the length a schedule build that allocates its own takes (it depends on the expert count and the EP size
+        only).  Read only inside the call."""
+        from .cutedsl.scheduler import scratch_sections
+
+        return (scratch_sections(self.num_local_experts, self.workspace.ep_size)[-1],), torch.int32
 
     def _forward_shapes(self, config: CuteMoKConfig, num_local_tokens: int) -> tuple[tuple, tuple[int, int]]:
         """The shapes of ``forward_execute``'s buffers: ``(context_out shapes, out shape)``; ``out`` is BF16.
@@ -2381,15 +2386,100 @@ class CuteMoKPlan:
         shared = ((i, h), (i, h), (h, i)) if self.has_shared else (None, None, None)
         return out, (num_local_tokens, workspace.topk), (shared[0], (e, i, r), shared[1], (e, i, r), shared[2], (e, r, i))
 
+    def _forward_scratch_shapes(self, config: CuteMoKConfig, num_local_tokens: int) -> tuple:
+        """``forward_execute``'s ``scratch``, as ``((elements,), dtype)`` pairs: with MXFP8 routed weights the
+        forward's four flat buffers, the e4m3 x and Hidden of a macrobatch and their scales (``FORWARD_SCRATCH``
+        order, for ``config.macrobatch_size``), then the megakernel's int32 readiness counters (for
+        ``num_local_tokens`` and the config's forward minibatch); BF16: the counters alone.  Read only inside the
+        call; the call zeroes the counters."""
+        minibatch = _fwd_minibatch_size(config)
+        key = ("forward scratch", config.macrobatch_size, minibatch, config.gate_up_context, num_local_tokens)
+        result = self._shapes.get(key)
+        if result is not None:
+            return result
+        workspace = self.workspace
+        sizes = dict(
+            hidden_size=workspace.hidden_size, routed_hidden_size=workspace.routed_hidden_size, intermediate_size=self.intermediate_size, topk=workspace.topk
+        )
+        capacity = self._schedule_capacity(num_local_tokens)
+        if self.routed_precision == "mxfp8":
+            from .cutedsl.persistent_mxfp8_fwd import forward_mxfp8_buffer_specs, forward_mxfp8_counter_words
+
+            _, specs = forward_mxfp8_buffer_specs(
+                num_local_tokens, **sizes, macrobatch_size=config.macrobatch_size, gate_up_context=config.gate_up_context, has_shared=self.has_shared
+            )
+            buffers = tuple(((math.prod(shape),), dtype) for shape, dtype in specs)
+            counters = forward_mxfp8_counter_words(num_local_tokens, capacity, **sizes, minibatch_size=minibatch)
+        else:
+            from .cutedsl.persistent_bf16_fwd import forward_bf16_counter_words
+
+            buffers = ()
+            counters = forward_bf16_counter_words(num_local_tokens, capacity, **sizes, minibatch_size=minibatch, has_shared=self.has_shared)
+        result = self._shapes[key] = (*buffers, ((counters,), torch.int32))
+        return result
+
+    def _backward_scratch_shapes(self, config: CuteMoKConfig, num_local_tokens: int) -> tuple:
+        """``backward_execute``'s ``scratch``: ``(gradients, route_mask, gate)``, everything the backward reads only
+        inside the call.  ``gradients``: BF16 the megakernel's seven scratch shapes (raw13 0-6: d_x_shared,
+        d_x_routed, d_gate_shared, d_gate_routed, d_up_shared, d_up_routed, d_y_routed; None where unused), MXFP8
+        its flat buffers by name as ``((elements,), dtype)`` pairs (``backward_mxfp8_plan_sizes``); routed rows for
+        ``config.macrobatch_size``, shared rows for ``num_local_tokens``.  ``route_mask``: ``((T, topk), bool)``,
+        the unused route slots.  ``gate``: with the shared output gate, G * dY (BF16 [T, H]), dZ (BF16 [T, 1])
+        and the gate weight gradient's FP32 [1, H]; otherwise None.  A buffer of more rows than these serves too
+        (its leading rows are used)."""
+        key = ("backward scratch", config.macrobatch_size, config.gate_up_context, num_local_tokens)
+        result = self._shapes.get(key)
+        if result is not None:
+            return result
+        workspace = self.workspace
+        tokens, macro = num_local_tokens, config.macrobatch_size
+        h, r, i = workspace.hidden_size, workspace.routed_hidden_size, self.intermediate_size
+        merged = self.has_shared and h == r
+        if self.routed_precision == "mxfp8":
+            from .cutedsl.persistent_mxfp8_bwd import backward_mxfp8_plan_sizes
+
+            specs, _ = backward_mxfp8_plan_sizes(
+                num_local_tokens=tokens,
+                hidden_size=h,
+                routed_hidden_size=r,
+                intermediate_size=i,
+                num_local_experts=self.num_local_experts,
+                schedule_capacity=workspace.schedule_capacity,
+                macrobatch_size=macro,
+                gate_up_context=config.gate_up_context,
+                has_shared=self.has_shared,
+            )
+            gradients = {name: ((numel,), dtype) for name, numel, dtype in specs}
+        else:
+            shared = self.has_shared
+            gradients = (
+                (tokens, h) if merged else None,
+                (macro, r),
+                (tokens, i) if shared else None,
+                (macro, i),
+                (tokens, i) if shared else None,
+                (macro, i),
+                (macro, r),
+            )
+        gate = None
+        if self.shared_output_gate:
+            gate = (((tokens, h), torch.bfloat16), ((tokens, 1), torch.bfloat16), ((1, h), torch.float32))
+        result = self._shapes[key] = (gradients, ((tokens, workspace.topk), torch.bool), gate)
+        return result
+
 
 def _empty_buffers(shapes, dtype: torch.dtype, device: torch.device):
     """``torch.empty`` buffers of a plan's ``_*_shapes``: a shape, a (shape, dtype) pair (the MXFP8 context, of
-    that dtype), None, or a tuple of them (the same structure, of tensors)."""
+    that dtype), None, or a tuple or dict of them (the same structure, of tensors)."""
     if shapes is None:
         return None
+    if isinstance(shapes, dict):
+        return {name: _empty_buffers(item, dtype, device) for name, item in shapes.items()}
+    if not shapes:
+        return ()
     if isinstance(shapes[0], int):
         return torch.empty(shapes, dtype=dtype, device=device)
-    if isinstance(shapes[1], torch.dtype):
+    if len(shapes) == 2 and isinstance(shapes[1], torch.dtype):
         return torch.empty(shapes[0], dtype=shapes[1], device=device)
     return tuple(_empty_buffers(item, dtype, device) for item in shapes)
 
@@ -2420,8 +2510,8 @@ def make_plan(
     native_columnwise: bool = False,
 ) -> CuteMoKPlan:
     """The plan step, once per layer configuration, called by every rank of the group: compiles every kernel
-    the execute steps launch for this configuration and allocates what they would otherwise allocate per call,
-    except their outputs, which the caller passes.
+    the execute steps launch for this configuration and allocates what persists across their calls; the
+    outputs and the per-call scratch are the caller's.
 
     Compiled (over stand-in tensors of the kernels' ranks and dtypes; no caller data): the route all-gather and
     the scheduler; ``barrier_all``; the forward megakernel variant selected by the arguments below and
@@ -2432,10 +2522,13 @@ def make_plan(
 
     Allocated: the plan's own workspace (``create_workspace``, not cached: symmetric buffers for
     ``max_tokens_per_rank`` and the schedule capacity ``config.schedule_capacity_multiplier`` gives, peer address
-    tables), the forward's counters (MXFP8: and its scratch, for ``config.macrobatch_size``), the scheduler's
-    scratch and, with ``backward``, its scratch (token- and macrobatch-sized, for ``config.macrobatch_size``), its
-    counter / metadata / router-weight storage, the route mask and, gated, the shared output gate's scratch (whose
-    fused Triton kernels are compiled here too).
+    tables) and, with ``backward``, its counter storage (BF16: with the decoder metadata and the router-weight
+    storage of macrobatches up to ``config.macrobatch_size``, which its launch plan binds).  Not allocated: the
+    scratch a call reads only during that call (the scheduler's intermediate counts, the forward's counters, the
+    MXFP8 forward's e4m3 operands, the backward's gradient scratch, the router-gradient mask and, gated, the shared
+    output gate's buffers, whose fused Triton kernels are compiled here); the execute steps take it from the caller
+    (``_schedule_scratch_shapes`` / ``_forward_scratch_shapes`` / ``_backward_scratch_shapes``) and
+    ``cutemok_forward`` / ``cutemok_backward`` allocate it per call.
 
     Token counts, routed rows, macrobatch / minibatch sizes and the communication SMs are not part of the plan:
     they are runtime values of every execute call (a backward's macrobatch, and an MXFP8 forward's, at most the
@@ -2465,8 +2558,8 @@ def make_plan(
     from .cutedsl.barrier_all import compile_barrier_all
     from .cutedsl.copy_routed_rows import compile_copy_routed_rows
     from .cutedsl.fwd_epilogue import compile_fwd_epilogue
-    from .cutedsl.persistent_bf16_fwd import compile_forward_bf16, forward_bf16_counter_words
-    from .cutedsl.scheduler import compile_scheduler, schedule_buffer_lengths
+    from .cutedsl.persistent_bf16_fwd import compile_forward_bf16
+    from .cutedsl.scheduler import compile_scheduler
 
     # The plan's own workspace: not in get_workspace's cache, so dropping the plan frees it.
     workspace = create_workspace(
@@ -2493,33 +2586,11 @@ def make_plan(
     def words(length):
         return torch.zeros(length, dtype=torch.int32, device=device)
 
-    forward_scratch = None
-    if mxfp8:
-        from .cutedsl.persistent_mxfp8_fwd import forward_mxfp8_buffer_specs, forward_mxfp8_counter_words
-
-        sizes = dict(hidden_size=hidden_size, routed_hidden_size=workspace.routed_hidden_size, intermediate_size=intermediate_size, topk=topk)
-        forward_counters = words(forward_mxfp8_counter_words(max_tokens_per_rank, workspace.schedule_capacity, **sizes))
-        _, scratch_specs = forward_mxfp8_buffer_specs(
-            max_tokens_per_rank, **sizes, macrobatch_size=config.macrobatch_size, gate_up_context=config.gate_up_context, has_shared=has_shared
-        )
-        forward_scratch = tuple(torch.empty(math.prod(shape), dtype=dtype, device=device) for shape, dtype in scratch_specs)
-    else:
-        forward_counters = words(
-            forward_bf16_counter_words(
-                max_tokens_per_rank,
-                workspace.schedule_capacity,
-                hidden_size=hidden_size,
-                routed_hidden_size=routed_hidden_size,
-                intermediate_size=intermediate_size,
-                topk=topk,
-            )
-        )
-    schedule_scratch = words(schedule_buffer_lengths(num_local_experts, workspace.ep_size, workspace.schedule_capacity)[3])
     # Stand-ins of the callers' tensors: one rank's slice of the gathered routes for top_experts, a workspace
-    # buffer of routed rows for a [T, H] activation.
+    # buffer of routed rows for a [T, H] activation, a 16-byte int32 vector for the scheduler's buffers.
     routes = workspace.all_gather_top_experts_buffer[0]
     compile_all_gather_top_experts(routes, workspace.all_gather_top_experts_buffer_multicast_ptr)
-    compile_scheduler(workspace.all_gather_top_experts_buffer, schedule_scratch)
+    compile_scheduler(workspace.all_gather_top_experts_buffer, words(4))
     compile_barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs, workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     if mxfp8:
         from .cutedsl.persistent_mxfp8_fwd import compile_forward_mxfp8
@@ -2552,12 +2623,11 @@ def make_plan(
     # With differing hiddens the epilogues reduce the routed rows alone, as for a routed-only layer.
     merged = has_shared and not split_hidden
     compile_fwd_epilogue(workspace.x_buffer if merged else None, workspace.combine_buffer, workspace.router_weight_buffer, routes, gated=shared_output_gate)
-    backward_scratch = backward_storage = route_mask = None
+    backward_storage = None
     if backward:
         from .cutedsl.bwd_epilogue import compile_bwd_epilogue
 
         compile_bwd_epilogue(workspace.d_y_buffer if merged else None, workspace.d_x_routed_buffer, routes)
-        route_mask = torch.zeros(max_tokens_per_rank, topk, dtype=torch.bool, device=device)
     if backward and mxfp8:
         from .cutedsl.persistent_mxfp8_bwd import backward_mxfp8_plan_sizes, compile_backward_mxfp8
 
@@ -2573,7 +2643,7 @@ def make_plan(
             native_columnwise=native_columnwise,
             gate_up_context=config.gate_up_context,
         )
-        scratch_specs, counter_words = backward_mxfp8_plan_sizes(
+        _, counter_words = backward_mxfp8_plan_sizes(
             num_local_tokens=max_tokens_per_rank,
             hidden_size=hidden_size,
             routed_hidden_size=workspace.routed_hidden_size,
@@ -2584,7 +2654,6 @@ def make_plan(
             gate_up_context=config.gate_up_context,
             has_shared=has_shared,
         )
-        backward_scratch = {name: torch.empty(numel, dtype=dtype, device=device) for name, numel, dtype in scratch_specs}
         backward_storage = words(counter_words)
     elif backward:
         from .cutedsl.persistent_bf16_bwd import backward_bf16_storage_lengths, compile_backward_bf16
@@ -2602,42 +2671,24 @@ def make_plan(
         )
         if not split_hidden:
             compile_copy_routed_rows(routes, workspace.x_buffer, workspace.router_weight_buffer, num_pairs=2)
-        tokens, macro = max_tokens_per_rank, config.macrobatch_size
-        h, r, i = hidden_size, workspace.routed_hidden_size, intermediate_size
-        # raw13 0-6: d_x_shared, d_x_routed, d_gate_shared, d_gate_routed, d_up_shared, d_up_routed, d_y_routed.
-        # d_x_shared is the caller's output when the hiddens differ; a routed-only layer has no shared ones.
-        backward_scratch = tuple(
-            None if shape is None else torch.empty(shape, dtype=torch.bfloat16, device=device)
-            for shape in (
-                (tokens, h) if merged else None,
-                (macro, r),
-                (tokens, i) if has_shared else None,
-                (macro, i),
-                (tokens, i) if has_shared else None,
-                (macro, i),
-                (macro, r),
-            )
-        )
+        # The counters, decoder metadata, router weights and partials: the launch plan binds them, so they stay.
         int_words, float_words = backward_bf16_storage_lengths(
             workspace,
             num_local_experts=num_local_experts,
             intermediate_size=intermediate_size,
-            macrobatch_size=macro,
+            macrobatch_size=config.macrobatch_size,
             minibatch_size=_bwd_minibatch_size(config),
         )
         backward_storage = (words(int_words), torch.zeros(float_words, dtype=torch.float32, device=device))
-    gate_scratch = None
     if shared_output_gate and backward:
-        gate_scratch = (
-            torch.empty(max_tokens_per_rank, hidden_size, dtype=torch.bfloat16, device=device),
-            torch.empty(max_tokens_per_rank, 1, dtype=torch.bfloat16, device=device),
-            torch.empty(1, hidden_size, dtype=torch.float32, device=device),
-        )
-        # The gated backward's fused kernels, compiled over rows of the scratch (the row count is their grid).
-        d_shared, d_z, _ = gate_scratch
+        # The gated backward's fused kernels, compiled over two-row stand-ins (the row count is their grid),
+        # dropped afterwards: the calls take their own buffers.
+        d_shared = torch.empty(2, hidden_size, dtype=torch.bfloat16, device=device)
+        d_z = torch.empty(2, 1, dtype=torch.bfloat16, device=device)
         fused = _gate_fused_module()
         fused._launch_gate_bwd_pre(d_shared[:1], d_shared[:1], d_z[:1], out=(d_shared[1:2], d_z[1:2]))
         fused._launch_gate_bwd_post_(d_shared[1:2], d_z[:1], d_shared[:1])
+        del d_shared, d_z
     return CuteMoKPlan(
         workspace=workspace,
         num_local_experts=num_local_experts,
@@ -2645,14 +2696,8 @@ def make_plan(
         has_shared=has_shared,
         macrobatch_size=config.macrobatch_size,
         routed_precision=routed_precision,
-        forward_counters=forward_counters,
-        forward_scratch=forward_scratch,
-        schedule_scratch=schedule_scratch,
-        backward_scratch=backward_scratch,
         backward_storage=backward_storage,
-        route_mask=route_mask,
         shared_output_gate=shared_output_gate,
-        gate_scratch=gate_scratch,
         _views={},
         _shapes={},
     )
@@ -2691,7 +2736,7 @@ def _check_buffer(name: str, tensor, dtype: torch.dtype, shape: tuple, device: t
 
 
 def schedule_execute(
-    plan: CuteMoKPlan, config: CuteMoKConfig, top_experts: torch.Tensor, *, out: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    plan: CuteMoKPlan, config: CuteMoKConfig, top_experts: torch.Tensor, *, out: tuple[torch.Tensor, torch.Tensor, torch.Tensor], scratch: torch.Tensor
 ) -> CuteMoKSchedule:
     """The execute step of ``build_schedule``: into the caller's buffers, compiling and allocating nothing.
 
@@ -2703,12 +2748,15 @@ def schedule_execute(
         out:         three int32 buffers of ``plan._schedule_shapes(num_local_tokens)``, 16-byte aligned:
                      peer_rank, peer_token_idx and the counts (num_tokens and the per-expert rows are views
                      of it).  They are the returned schedule and must stay untouched until the layer's backward.
+        scratch:     the int32 buffer of ``plan._schedule_scratch_shapes()`` (or longer), 16-byte aligned, read
+                     only inside this call.  Under CUDA graph capture the caller keeps ``scratch`` alive as long as
+                     the graph, like ``out``: the replays use its addresses.
     """
     from .cutedsl._host_common import compiled_only
 
     workspace = _plan_workspace(plan, top_experts, "top_experts")
     with compiled_only():
-        return _build_schedule(workspace, config, top_experts, plan.num_local_experts, out=(*out, plan.schedule_scratch))
+        return _build_schedule(workspace, config, top_experts, plan.num_local_experts, out=(*out, scratch))
 
 
 def forward_execute(
@@ -2730,6 +2778,7 @@ def forward_execute(
     out: torch.Tensor,
     shared_output_gate_weight: torch.Tensor | None = None,
     situ_beta: tuple[float, float] | None = None,
+    scratch: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], CuteMoKForwardContext]:
     """The execute step of ``forward``: into the caller's buffers, compiling nothing (a kernel variant the plan
     did not compile raises) and allocating no device memory.
@@ -2741,7 +2790,7 @@ def forward_execute(
 
     Per call it launches, in order: the staging copy of the routed rows of ``x`` and of the router weights into
     the symmetric buffers (BF16: one kernel when ``x`` is 256-byte aligned and the hiddens coincide; otherwise,
-    and with MXFP8 weights, two ``copy_``), ``barrier_all``, the zeroing of the plan's counters, the forward
+    and with MXFP8 weights, two ``copy_``), ``barrier_all``, the zeroing of the caller's counters, the forward
     megakernel, ``barrier_all``, gated the GEMM and sigmoid of G, and the forward epilogue.
 
     The inputs are ``forward``'s, with ``x`` of any token count up to the plan's maximum (the same on every
@@ -2755,6 +2804,11 @@ def forward_execute(
         out:                the output's buffer, BF16 [num_local_tokens, routed_hidden_size]: the layer
                             output, or y_routed when the routed hidden differs (y_shared is context_out[7])
         shared_output_gate_weight: ``forward``'s; given exactly when the plan has the shared output gate
+        scratch:            the flat buffers of ``plan._forward_scratch_shapes`` (or larger: their leading
+                            elements are used), read only inside this call: with MXFP8 weights four, then the
+                            int32 counters; BF16: the counters alone.  Under CUDA graph capture the caller
+                            keeps ``scratch`` alive as long as the graph, like ``out``: the replays use its
+                            addresses.
 
     Outputs: as ``forward``, over the caller's buffers.
     """
@@ -2764,6 +2818,9 @@ def forward_execute(
     if not isinstance(out, torch.Tensor) or context_out is None:
         raise ValueError("forward_execute needs the caller's context_out and out buffers")
     _require_plan_gate(plan, shared_output_gate_weight)
+    if len(scratch) != (5 if plan.routed_precision == "mxfp8" else 1):
+        raise ValueError("forward_execute takes the scratch buffers of plan._forward_scratch_shapes (the counters last)")
+    *scratch, counters = scratch
     gate_out = None
     if plan.shared_output_gate:
         *context_out, gate_out = context_out
@@ -2785,7 +2842,7 @@ def forward_execute(
             routed_input,
             situ_beta=situ_beta,
             shared_output_gate_weight=shared_output_gate_weight,
-            buffers=(tuple(context_out), out, plan.forward_counters, plan.forward_scratch, gate_out),
+            buffers=(tuple(context_out), out, counters, tuple(scratch), gate_out),
         )
 
 
@@ -2816,6 +2873,7 @@ def backward_execute(
     shared_output_gate_weight: torch.Tensor | None = None,
     shared_output_gate_main_grad: torch.Tensor | None = None,
     d_w_output_gate_out: torch.Tensor | None = None,
+    scratch: tuple,
 ) -> tuple:
     """The execute step of ``backward``: into the caller's buffers, compiling nothing and allocating no device
     memory.
@@ -2832,7 +2890,7 @@ def backward_execute(
     epilogue, the copy of the router-weight gradients and, with ``zero_unrouted_router_grads``, a compare and a
     masked fill of their unrouted slots.  Gated, the fused Triton kernel of G * dY and dZ comes before the staging
     copy, and the gate weight's gradient GEMM (with a main_grad: and its addition) and the fused merge of
-    dZ @ w into d_x follow the epilogue; G * dY and dZ are the plan's scratch.  (Under a tensor subclass, dispatch
+    dZ @ w into d_x follow the epilogue; G * dY and dZ are the caller's scratch.  (Under a tensor subclass, dispatch
     mode or torch.func transform the fused kernels' reference torch operations run instead, and allocate.)
 
     The inputs are ``backward``'s -- a forward context with its routed activations, a macrobatch at most the
@@ -2849,6 +2907,10 @@ def backward_execute(
                               into them.  With ``main_grads`` the gradients are accumulated there instead.
         d_w_output_gate_out:  gated without ``shared_output_gate_main_grad``: FP32 [1, hidden_size], the gate
                               weight's gradient; None otherwise
+        scratch:              the buffers of ``plan._backward_scratch_shapes`` (gradients, route_mask, gate), or
+                              larger (their leading rows / elements are used); read only inside this call.
+                              Under CUDA graph capture the caller keeps ``scratch`` alive as long as the graph,
+                              like ``out``: the replays use its addresses.
 
     Outputs: as ``backward``, over the caller's buffers (the last entry, the gate weight's gradient, is
     ``d_w_output_gate_out``, the ``shared_output_gate_main_grad`` it was added into, or None ungated).
@@ -2856,8 +2918,22 @@ def backward_execute(
     from .cutedsl._host_common import compiled_only
 
     workspace = _plan_workspace(plan, x, "x", routed_gate_weights)
-    if plan.backward_scratch is None:
+    if plan.backward_storage is None:
         raise ValueError("the plan was made without the backward (make_plan(backward=False))")
+    if not isinstance(scratch, tuple) or len(scratch) != 3:
+        raise ValueError("backward_execute takes scratch = (gradients, route_mask, gate) of plan._backward_scratch_shapes")
+    gradient_scratch, route_mask, gate_scratch = scratch
+    tokens = workspace.num_local_tokens
+    if (
+        type(route_mask) is not torch.Tensor
+        or route_mask.dtype != torch.bool
+        or route_mask.device != workspace.device
+        or route_mask.ndim != 2
+        or route_mask.shape[0] < tokens
+        or route_mask.shape[1] != workspace.topk
+        or not route_mask.is_contiguous()
+    ):
+        raise ValueError(f"the scratch route mask must be a contiguous bool [>= {tokens}, {workspace.topk}] tensor on the plan's device")
     if (main_grads is None) == (d_weights_out is None):
         raise ValueError("backward_execute takes main_grads or d_weights_out, not both")
     _require_backward_gate(plan, forward_context, shared_output_gate_weight)
@@ -2867,8 +2943,21 @@ def backward_execute(
             raise ValueError("a gated backward_execute takes shared_output_gate_main_grad or d_w_output_gate_out, not both")
         if d_w_output_gate_out is not None:
             _check_buffer("d_w_output_gate_out", d_w_output_gate_out, torch.float32, (1, workspace.hidden_size), workspace.device)
-        tokens = workspace.num_local_tokens
-        d_shared, d_z, contribution = plan.gate_scratch
+        if gate_scratch is None:
+            raise ValueError("a gated backward_execute takes the shared output gate's scratch (G * dY, dZ, FP32 [1, H])")
+        d_shared, d_z, contribution = gate_scratch
+        for name, buffer, dtype, columns in (("G * dY", d_shared, torch.bfloat16, workspace.hidden_size), ("dZ", d_z, torch.bfloat16, 1)):
+            if (
+                type(buffer) is not torch.Tensor
+                or buffer.dtype != dtype
+                or buffer.device != workspace.device
+                or buffer.ndim != 2
+                or buffer.shape[0] < tokens
+                or buffer.shape[1] != columns
+                or not buffer.is_contiguous()
+            ):
+                raise ValueError(f"the scratch {name} must be a contiguous {dtype} [>= {tokens}, {columns}] tensor on the plan's device")
+        _check_buffer("the scratch gate weight gradient", contribution, torch.float32, (1, workspace.hidden_size), workspace.device)
         gate_buffers = (d_shared[:tokens], d_z[:tokens], contribution, d_w_output_gate_out)
     elif d_w_output_gate_out is not None:
         raise ValueError("d_w_output_gate_out is the gradient of shared_output_gate_weight, which is None")
@@ -2895,5 +2984,5 @@ def backward_execute(
             shared_output_gate_weight=shared_output_gate_weight,
             shared_output_gate_main_grad=shared_output_gate_main_grad,
             zero_unrouted_router_grads=zero_unrouted_router_grads,
-            buffers=(plan.backward_scratch, d_weights_out, plan.backward_storage, out, d_router_weights_out, plan.route_mask, gate_buffers),
+            buffers=(gradient_scratch, d_weights_out, plan.backward_storage, out, d_router_weights_out, route_mask, gate_buffers),
         )

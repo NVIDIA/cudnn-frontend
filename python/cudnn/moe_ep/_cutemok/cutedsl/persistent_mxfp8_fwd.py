@@ -339,7 +339,7 @@ def _packed_offsets(lengths: tuple[int, ...]) -> tuple[list[int], int]:
 def packed_int32_views(lengths: tuple[int, ...], device, storage=None) -> tuple[object, tuple[object, ...]]:
     """One zero-filled int32 allocation split into 16-byte-aligned views, one per length.
 
-    Zeroing the storage once replaces one memset launch per readiness array.  ``storage``: a plan's int32
+    Zeroing the storage once replaces one memset launch per readiness array.  ``storage``: the caller's int32
     counter buffer (the execute step of a plan), at least as long as these arrays; its leading words are zeroed
     on the current stream instead of allocating.
     """
@@ -591,9 +591,15 @@ def _dtype(kind: str):
 
 
 def _sizes_plan(
-    *, hidden_size: int, routed_hidden_size: int | None, intermediate_size: int, topk: int, macrobatch_size: int = ROW_ALIGNMENT
+    *,
+    hidden_size: int,
+    routed_hidden_size: int | None,
+    intermediate_size: int,
+    topk: int,
+    macrobatch_size: int = ROW_ALIGNMENT,
+    minibatch_size: int = ROW_ALIGNMENT,
 ) -> PersistentMxfp8Plan:
-    """A plan of one layer's sizes with a 256-row minibatch, for the buffer and counter sizes of a plan step."""
+    """A plan of one layer's sizes, for the buffer and counter sizes of a plan step."""
     return PersistentMxfp8Plan(
         num_local_experts=1,
         hidden_size=hidden_size,
@@ -601,7 +607,7 @@ def _sizes_plan(
         intermediate_size=intermediate_size,
         topk=topk,
         macrobatch_size=macrobatch_size,
-        minibatch_size=ROW_ALIGNMENT,
+        minibatch_size=minibatch_size,
         num_comm_sms=2,
         intermediate_alignment=128,
         hidden_alignment=128,
@@ -621,7 +627,7 @@ def forward_mxfp8_buffer_specs(
 ) -> tuple[tuple, tuple]:
     """``(outputs, scratch)``: the ``(shape, dtype)`` of each buffer a forward returns, in return order (None where
     a routed-only layer has no shared output), and of its four scratch buffers (``FORWARD_SCRATCH`` order) --
-    the execute step of a plan takes the first from the caller and the second from the plan."""
+    the execute step of a plan takes both from the caller."""
     specs = persistent_mxfp8_buffer_specs(
         num_local_tokens,
         gate_up_context=gate_up_context,
@@ -635,15 +641,30 @@ def forward_mxfp8_buffer_specs(
 
 
 def forward_mxfp8_counter_words(
-    num_local_tokens: int, schedule_capacity: int, *, hidden_size: int, routed_hidden_size: int | None, intermediate_size: int, topk: int
+    num_local_tokens: int,
+    schedule_capacity: int,
+    *,
+    hidden_size: int,
+    routed_hidden_size: int | None,
+    intermediate_size: int,
+    topk: int,
+    minibatch_size: int = ROW_ALIGNMENT,
 ) -> int:
-    """How many int32 words the five counters of any forward over these sizes take: the length of a plan's
-    counter buffer.  They grow as the minibatch (a runtime value) shrinks, so this is the length at the
-    smallest one, 256 rows; the macrobatch and the communication SMs do not change it."""
+    """How many int32 words the five counters of a forward over these sizes take: the length of an execute
+    call's counter buffer, as a call that allocates its own counters does.  They grow as the minibatch shrinks;
+    the default, the smallest one (256 rows), gives a length that serves every minibatch.  The macrobatch and
+    the communication SMs do not change it."""
     lengths = persistent_mxfp8_counter_lengths(
         num_local_tokens,
         schedule_capacity,
-        plan=_sizes_plan(hidden_size=hidden_size, routed_hidden_size=routed_hidden_size, intermediate_size=intermediate_size, topk=topk),
+        plan=_sizes_plan(
+            hidden_size=hidden_size,
+            routed_hidden_size=routed_hidden_size,
+            intermediate_size=intermediate_size,
+            topk=topk,
+            macrobatch_size=minibatch_size,
+            minibatch_size=minibatch_size,
+        ),
     )
     return _packed_offsets(
         (lengths.gate_up_tile_ready, lengths.hidden_row_block_ready, lengths.x_routed_ready + STREAM_HEAD_WORDS, lengths.y_routed_ready, lengths.y_routed_done)
@@ -675,7 +696,7 @@ def prepare_persistent_mxfp8_state(
 
 def _allocate_state(layout, device, has_shared: bool, gate_up_context: str = "mxfp8", caller_buffers=None):
     """The state cut as ``layout`` (_state_layout) says: one allocation per group, one zeroed counter block;
-    or, with ``caller_buffers``, the caller's and the plan's buffers (``_caller_state``)."""
+    or, with ``caller_buffers``, the caller's buffers (``_caller_state``)."""
     import torch
 
     if caller_buffers is not None:
@@ -696,9 +717,9 @@ def _caller_state(layout, device, has_shared: bool, gate_up_context: str, caller
     """The state of a call in the execute step of a plan, which allocates nothing.  ``caller_buffers`` =
     ``(outputs, scratch, counters)``: the caller's buffers of the returned tensors in return order (None where a
     routed-only layer has no shared output; ``forward_mxfp8_buffer_specs`` gives their shapes and dtypes), checked
-    against the layout; the plan's four flat scratch buffers (``FORWARD_SCRATCH`` order), of which the leading
-    elements are used; and the plan's int32 counter buffer, whose leading words are zeroed on the current
-    stream."""
+    against the layout; the caller's four flat scratch buffers (``FORWARD_SCRATCH`` order), of which the leading
+    elements are used; and the caller's int32 counter buffer (``forward_mxfp8_counter_words``), whose leading
+    words are zeroed on the current stream."""
     groups, counter_lengths, buffer_count = layout
     state_class = PersistentMxfp8StateE4m3Context if gate_up_context == "mxfp8" else PersistentMxfp8State
     names = _STATE_FIELD_NAMES[state_class][:buffer_count]
@@ -1078,7 +1099,7 @@ def forward_mxfp8(
     function on the current stream.  ``functional.forward`` calls this after the entry barrier.
 
     ``caller_buffers`` (the execute step of a plan): ``(outputs, scratch, counters)`` -- the caller's buffers of
-    the returned tensors (``forward_mxfp8_buffer_specs``), the plan's four flat scratch buffers and its int32
+    the returned tensors (``forward_mxfp8_buffer_specs``), the caller's four flat scratch buffers and int32
     counter buffer (``_caller_state``).  The call then allocates nothing and returns the caller's buffers.  By
     default it allocates its state.
     """

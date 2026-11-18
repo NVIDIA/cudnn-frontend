@@ -8,13 +8,15 @@
 over the input types ``CuteMoKConfig``, ``CuteMoKPlan`` and ``CuteMoKSplitWeight`` (the names cuDNN frontend exports
 as ``cudnn.ops.*``).
 
-The operator functions are thin wrappers over the plan / execute entries of ``functional``: ``prepare`` is
-``make_plan``, ``forward`` is ``schedule_execute`` followed by ``forward_execute``, ``backward`` is
-``backward_execute``.  The wrappers add two things: the decline of an input layout or dtype the execute steps do not
-serve, raised as ``NotImplementedError`` naming the tensor before anything is launched, and the allocation of the
-results.  ``prepare`` compiles the kernels and allocates the symmetric workspace, counters and scratch, which the
-plan owns; ``forward`` and ``backward`` compile nothing and allocate their results on every call (``torch.empty``
-on the plan's device, the current stream's caching allocator: a CUDA graph capture's private pool inside one).
+The operator functions are thin wrappers over ``functional``: ``prepare`` is ``make_plan``; ``forward`` and
+``backward`` run the layer functions' calls (``build_schedule`` + ``forward``, ``backward``) on the plan's workspace,
+with every kernel compiled by ``prepare``.  The wrappers add the decline of an input layout or dtype the kernels do
+not serve, raised as ``NotImplementedError`` naming the tensor before anything is launched.  ``prepare`` compiles
+the kernels and allocates what persists across calls: the symmetric workspace and the backward's counter storage.
+``forward`` and ``backward`` compile nothing and allocate their results and their scratch (the scheduler's
+intermediate counts and the forward's counters among it) on every call (the current stream's
+caching allocator on the plan's device: a CUDA graph capture's private pool inside one); the scratch is released
+as soon as the megakernel is enqueued, before the epilogue allocates the output.
 ``cutemok_quantize_weights`` turns BF16 routed weights into the MXFP8 forms the forward and backward take.
 """
 
@@ -29,14 +31,13 @@ from cudnn.moe_ep._cutemok.functional import (
     CuteMoKPlan,
     CuteMoKSchedule,
     CuteMoKSplitWeight,
-    _combined_fc1,
-    _empty_buffers,
+    _backward,
+    _build_schedule,
+    _forward,
+    _plan_workspace,
     _require_backward_gate,
     _require_plan_gate,
-    backward_execute,
-    forward_execute,
     make_plan,
-    schedule_execute,
 )
 
 #: The keys of the backward's result, in order.  The ninth is the shared output gate weight's gradient (None without
@@ -63,7 +64,7 @@ __all__ = [
     "cutemok_quantize_weights",
 ]
 # CuteMoKConfig: the runtime configuration of every call (communication SMs, macrobatch / minibatch sizes, schedule
-# capacity).  CuteMoKPlan: what ``cutemok_prepare`` returns; it owns the workspace.
+# capacity).  CuteMoKPlan: what ``cutemok_prepare`` returns; it owns the workspace and the backward's counters.
 # CuteMoKSplitWeight: a routed weight held in per-expert allocations (``CuteMoKSplitWeight.from_experts``).
 
 
@@ -121,8 +122,9 @@ def cutemok_prepare(
     routed_precision: str = "bf16",
     native_columnwise: bool = False,
 ) -> CuteMoKPlan:
-    """Prepare one layer configuration: compile every kernel the forward and backward launch and allocate the
-    symmetric workspace, counters and scratch they use.  Collective over ``group``; outside CUDA graph capture.
+    """Prepare one layer configuration: compile every kernel the forward and backward launch and allocate what
+    persists across their calls, the symmetric workspace and the backward's counters.  Collective over ``group``;
+    outside CUDA graph capture.
 
     The arguments are ``cudnn.moe_ep._cutemok.functional.make_plan``'s, which this calls.  The token count, macrobatch /
     minibatch sizes and communication SMs are not part of the plan: they are runtime values of every call (token
@@ -131,11 +133,14 @@ def cutemok_prepare(
     The workspace is the plan's own (not cached or shared with another plan): the symmetric buffers, dominated by
     the two BF16 [max_tokens_per_rank * topk, routed_hidden_size] buffers of the routed rows' results (combine) and
     input gradients, next to two [max_tokens_per_rank, routed_hidden_size] BF16 buffers (staged x and dY), the
-    router weights and their gradients and the gathered routes.  One plan serves every layer of the same
-    configuration: pass it to all of them.  Calls on a plan run in stream order and must not overlap.  Keep the
-    plan until every call and graph replay that uses it has finished on every rank of the group; then drop it on
-    every rank, outside graph capture, which frees the workspace.  Synchronize first (for example
-    ``torch.cuda.synchronize()`` and a barrier over the group): the other ranks write into this rank's buffers.
+    router weights and their gradients and the gathered routes.  The backward's counters are small (with the BF16
+    backward's router-weight storage, ``config.macrobatch_size * (1 + intermediate_size / 128)`` FP32 values, the
+    largest); the forward's counters and the macrobatch-sized scratch are allocated per call, not here.  One plan
+    serves every layer of the same configuration: pass it to all of them.  Calls on a plan run in stream order and
+    must not overlap.  Keep the plan until every call and graph replay that uses it has finished on every rank of
+    the group; then drop it on every rank, outside graph capture, which frees the workspace.  Synchronize first (for
+    example ``torch.cuda.synchronize()`` and a barrier over the group): the other ranks write into this rank's
+    buffers.
 
     Returns:
         CuteMoKPlan.
@@ -183,11 +188,12 @@ def cutemok_forward(
     """Dispatch the tokens to their top-k experts, run the expert MLPs and combine the results.  Collective over
     the plan's group; every rank passes the same token count.
 
-    Allocates its results (the output, the schedule and the saved activations, ``torch.empty``) and launches
-    ``schedule_execute``'s kernels (route all-gather, barrier, three scheduler kernels) and then
-    ``forward_execute``'s (staging copy, barrier, counter reset, forward megakernel, barrier, gated the GEMM and
-    sigmoid of G, epilogue).  Every element of the results is written by the kernels (unused schedule capacity is
-    never read), so nothing is zeroed.
+    Allocates its results (the output, the schedule and the saved activations) and its scratch (``torch.empty``)
+    and launches the route all-gather, a barrier and the three scheduler kernels, then the staging copy, a barrier,
+    the counter reset, the forward megakernel, a barrier, gated the GEMM and sigmoid of G, and the epilogue.  The
+    scratch (MXFP8: the e4m3 x / Hidden of a macrobatch; the routed Y rows) is released once the megakernel is
+    enqueued.  Every element of the results is written by the kernels (unused schedule capacity is never read), so
+    nothing is zeroed.
 
     Inputs:
         x:                 bfloat16 [T, hidden_size], T a multiple of 256 in [512, max_tokens_per_rank]
@@ -217,29 +223,28 @@ def cutemok_forward(
         _decline_layout(name, tensor, dtype)
     _decline_routed_weights(plan, (routed_gate_weights, routed_up_weights, routed_down_weights))
     _require_plan_gate(plan, shared_output_gate_weight)
-    device = plan.workspace.device
-    schedule_out = _empty_buffers(plan._schedule_shapes(int(top_experts.shape[0])), torch.int32, device)
-    schedule = schedule_execute(plan, config, top_experts, out=schedule_out)
-    context_shapes, out_shape = plan._forward_shapes(config, int(x.shape[0]))
-    output, forward_context = forward_execute(
-        plan,
-        config,
-        schedule,
-        x,
-        router_weights,
-        shared_gate_weights,
-        shared_up_weights,
-        shared_down_weights,
-        routed_gate_weights,
-        routed_up_weights,
-        routed_down_weights,
-        swiglu_limit,
-        routed_input,
-        context_out=_empty_buffers(context_shapes, torch.bfloat16, device),
-        out=_empty_buffers(out_shape, torch.bfloat16, device),
-        shared_output_gate_weight=shared_output_gate_weight,
-        situ_beta=situ_beta,
-    )
+    from cudnn.moe_ep._cutemok.cutedsl._host_common import compiled_only
+
+    workspace = _plan_workspace(plan, x, "x")
+    with compiled_only():
+        schedule = _build_schedule(workspace, config, top_experts, plan.num_local_experts)
+        output, forward_context = _forward(
+            config,
+            workspace,
+            schedule,
+            x,
+            router_weights,
+            shared_gate_weights,
+            shared_up_weights,
+            shared_down_weights,
+            routed_gate_weights,
+            routed_up_weights,
+            routed_down_weights,
+            swiglu_limit,
+            routed_input,
+            shared_output_gate_weight=shared_output_gate_weight,
+            situ_beta=situ_beta,
+        )
     return TupleDict(output=output, schedule=schedule, forward_context=forward_context)
 
 
@@ -268,11 +273,14 @@ def cutemok_backward(
     shared_output_gate_main_grad: torch.Tensor | None = None,
 ) -> TupleDict:
     """The gradients of ``cutemok_forward`` with respect to x, the router weights, the six weights and the shared
-    output gate's weight.  Collective over the plan's group.  Allocates its results (``torch.empty``; every element
-    is written by the kernels, so nothing is zeroed) and launches ``backward_execute``'s kernels (gated: the fused
-    G * dY / dZ kernel; staging copy, barrier, counter reset, metadata builder or tensormap prologue, backward
-    megakernel, barrier, epilogue, router-weight gradient copy and, with ``zero_unrouted_router_grads``, the
-    masking of unrouted slots; gated: the gate weight's gradient GEMM and the fused merge into d_x).
+    output gate's weight.  Collective over the plan's group.  Allocates its results and its scratch
+    (``torch.empty``; every element is written by the kernels, so nothing is zeroed) and launches (gated: the fused
+    G * dY / dZ kernel;) the staging copy, a barrier, the counter reset, the metadata builder or tensormap prologue,
+    the backward megakernel, a barrier, the epilogue, the router-weight gradient copy and, with
+    ``zero_unrouted_router_grads``, the masking of unrouted slots (gated: the gate weight's gradient GEMM and the
+    fused merge into d_x).  The megakernel's scratch is released once it is enqueued, before the epilogue and the
+    router-gradient copy allocate.  The forward context must hold the routed activations (as ``cutemok_forward``
+    returns it).
 
     Inputs: the forward's, with the weights' backward forms (MXFP8: (e4m3, scale, e4m3_t, scale_t) for gate / up,
     (e4m3_t, scale_t) for down, the backward forms of ``cutemok_quantize_weights``), and:
@@ -311,49 +319,38 @@ def cutemok_backward(
         _decline_layout(name, tensor, dtype)
     _decline_routed_weights(plan, (routed_gate_weights, routed_up_weights, routed_down_weights))
     _require_backward_gate(plan, forward_context, shared_output_gate_weight)
-    device = plan.workspace.device
-    out_shape, d_router_shape, d_weight_shapes = plan._backward_shapes(int(x.shape[0]))
-    d_weights_out = None
-    if main_grads is None:
-        shapes = list(d_weight_shapes)
-        combined = bool(_combined_fc1(routed_gate_weights, routed_up_weights)[2])
-        if combined:  # a combined FC1: one [E_local, 2I, H] gradient under both gate and up
-            experts, rows, columns = shapes[1]
-            shapes[1], shapes[3] = (experts, 2 * rows, columns), None
-        d_weights_out = list(_empty_buffers(tuple(shapes), torch.bfloat16, device))
-        if combined:
-            d_weights_out[3] = d_weights_out[1]
-        d_weights_out = tuple(d_weights_out)
-    d_w_output_gate_out = None
-    if shared_output_gate_weight is not None and shared_output_gate_main_grad is None:
-        d_w_output_gate_out = torch.empty(1, plan.workspace.hidden_size, dtype=torch.float32, device=device)
-    gradients = backward_execute(
-        plan,
-        config,
-        schedule,
-        forward_context,
-        grad_output,
-        x,
-        router_weights,
-        shared_gate_weights,
-        shared_up_weights,
-        shared_down_weights,
-        routed_gate_weights,
-        routed_up_weights,
-        routed_down_weights,
-        swiglu_limit,
-        main_grads,
-        main_grad_storage_tables,
-        routed_grad_output,
-        routed_input,
-        out=_empty_buffers(out_shape, torch.bfloat16, device),
-        d_router_weights_out=_empty_buffers(d_router_shape, torch.float32, device),
-        d_weights_out=d_weights_out,
-        zero_unrouted_router_grads=zero_unrouted_router_grads,
-        shared_output_gate_weight=shared_output_gate_weight,
-        shared_output_gate_main_grad=shared_output_gate_main_grad,
-        d_w_output_gate_out=d_w_output_gate_out,
-    )
+    workspace = _plan_workspace(plan, x, "x")
+    if plan.backward_storage is None:
+        raise ValueError("the plan was prepared without the backward (cutemok_prepare(backward=False))")
+    if not isinstance(forward_context, CuteMoKForwardContext) or forward_context.x_routed is None:
+        raise NotImplementedError("cutemok_backward takes the forward context cutemok_forward returned, with its routed activations")
+    from cudnn.moe_ep._cutemok.cutedsl._host_common import compiled_only
+
+    with compiled_only():
+        gradients = _backward(
+            config,
+            workspace,
+            schedule,
+            forward_context,
+            grad_output,
+            x,
+            router_weights,
+            shared_gate_weights,
+            shared_up_weights,
+            shared_down_weights,
+            routed_gate_weights,
+            routed_up_weights,
+            routed_down_weights,
+            swiglu_limit,
+            main_grads,
+            main_grad_storage_tables,
+            routed_grad_output,
+            routed_input,
+            shared_output_gate_weight=shared_output_gate_weight,
+            shared_output_gate_main_grad=shared_output_gate_main_grad,
+            zero_unrouted_router_grads=zero_unrouted_router_grads,
+            storage=plan.backward_storage,
+        )
     return TupleDict(zip(_BACKWARD_RESULT_NAMES, gradients, strict=True))
 
 

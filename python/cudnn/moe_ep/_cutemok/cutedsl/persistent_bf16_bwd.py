@@ -788,7 +788,7 @@ def _build_launch_plan(
 
     def raw13_of(config):
         shapes = tuple(item.shape for item in raw13_descriptors(config))
-        if caller_buffers is None:
+        if caller_buffers is None or caller_buffers[0] is None:
             return _allocate_raw13(shapes, torch.empty(0, dtype=torch.bfloat16, device=workspace.device), main_grads, bool(up_row_offset), has_shared)
         return _caller_raw13(shapes, caller_buffers[0], caller_buffers[1], main_grads, bool(up_row_offset), has_shared, workspace.device)
 
@@ -1188,7 +1188,7 @@ def _caller_raw13(shapes, scratch, d_weights, main_grads, combined_fc1: bool, ha
     """The raw13 of a call in the execute step of a plan, which allocates nothing.
 
     ``scratch``: the seven scratch tensors (raw13 0-6), each at least as many rows as this call's and its
-    columns exactly -- the plan's are sized for its largest token count and macrobatch -- of which the leading
+    columns exactly -- a caller may size them for its largest token count and macrobatch -- of which the leading
     rows are used.  The weight gradients are ``main_grads`` (fused accumulation), or ``d_weights``: the caller's
     six output buffers in raw13's order (shared / routed per matrix: gate, up, down), shaped like the weights,
     None where a routed-only layer has no shared weight; a combined FC1 passes its one ``[E, 2I, H]`` buffer
@@ -1273,7 +1273,8 @@ def backward_bf16(
     ``caller_buffers`` (the execute step of a plan): ``(scratch, d_weights, storage)`` -- the seven scratch
     tensors and the six weight-gradient buffers of ``_caller_raw13`` (``d_weights`` None with ``main_grads``)
     and the plan's ``(int32, float32)`` storage of ``prepare_persistent_bwd_state``.  The call then allocates
-    nothing.  By default it allocates its raw13, and the workspace keeps one buffer set per configuration.
+    nothing.  ``(None, None, storage)`` (the operator API): the plan's storage, the raw13 allocated per call.  By
+    default it allocates its raw13, and the workspace keeps one buffer set per configuration.
 
     ``recompute_forward_context``: ``forward_context`` holds the shared activations only (its routed ones are None); the
     kernel replays the first macrobatch's routed X / Gate / Up like every later one's.
@@ -1458,7 +1459,7 @@ def backward_bf16(
         # The call's scratch and dW (a plan hit): allocated after the counter memset and the metadata
         # builder are enqueued, so the host-side allocation overlaps their GPU time instead of
         # delaying the mega launch.  The allocation is stream-ordered on the same stream.
-        if caller_buffers is None:
+        if caller_buffers is None or caller_buffers[0] is None:
             raw13 = _allocate_raw13(launch_plan.raw13_shapes, launch_plan.raw13_proto, main_grads, bool(up_row_offset), has_shared)
         else:
             raw13 = _caller_raw13(launch_plan.raw13_shapes, caller_buffers[0], caller_buffers[1], main_grads, bool(up_row_offset), has_shared, workspace.device)

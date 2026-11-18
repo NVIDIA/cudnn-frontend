@@ -465,7 +465,7 @@ def _allocate_state(layout, device):
 def _caller_state(layout, device, outputs, counters):
     """The state of a call in the execute step of a plan, which allocates nothing: ``outputs`` are the caller's
     nine buffers (None where a routed-only layer has no shared output), checked against the layout;
-    ``counters`` is the plan's int32 buffer, at least as long as this call's counters, whose leading words are
+    ``counters`` is the caller's int32 buffer, at least as long as this call's counters, whose leading words are
     zeroed here on the current stream and split into the five arrays."""
 
     import torch
@@ -1189,8 +1189,8 @@ def forward_bf16(
 
     ``outputs`` / ``counters`` (the execute step of a plan, both or neither): the caller's nine output buffers
     in that order, shaped as ``persistent_bf16_output_shapes`` gives (None where a routed-only layer has no
-    shared output), and the plan's int32 counter buffer; the call then allocates nothing and returns the
-    caller's buffers.  By default the call allocates its outputs and counters.
+    shared output), and the caller's int32 counter buffer (``forward_bf16_counter_words``); the call then
+    allocates nothing and returns the caller's buffers.  By default the call allocates its outputs and counters.
 
     ``macrobatch_size`` / ``minibatch_size`` (rows) and ``num_comm_sms`` are runtime launch values;
     ``swiglu_limit`` is the clamp value, or None for the unclamped variant.
@@ -1340,21 +1340,30 @@ def forward_bf16(
 
 
 def forward_bf16_counter_words(
-    num_local_tokens: int, schedule_capacity: int, *, hidden_size: int, routed_hidden_size: int | None, intermediate_size: int, topk: int
+    num_local_tokens: int,
+    schedule_capacity: int,
+    *,
+    hidden_size: int,
+    routed_hidden_size: int | None,
+    intermediate_size: int,
+    topk: int,
+    minibatch_size: int = ROW_ALIGNMENT,
+    has_shared: bool = True,
 ) -> int:
-    """How many int32 words the five counters of any forward over these sizes take: the length of a plan's
-    counter buffer.  The minibatch size is a runtime value of every call and the counters grow as it shrinks,
-    so this is the length at the smallest one (256 rows); the macrobatch size and the communication SMs do not
-    change it."""
+    """How many int32 words the five counters of a forward over these sizes take: the length of an execute
+    call's counter buffer, as a call that allocates its own counters does.  They grow as the minibatch shrinks;
+    the default, the smallest one (256 rows), gives a length that serves every minibatch.  The macrobatch size
+    and the communication SMs do not change it."""
     plan = PersistentBf16Plan(
         num_local_experts=1,
         hidden_size=hidden_size,
         routed_hidden_size=routed_hidden_size,
         intermediate_size=intermediate_size,
         topk=topk,
-        macrobatch_size=ROW_ALIGNMENT,
-        minibatch_size=ROW_ALIGNMENT,
+        macrobatch_size=minibatch_size,
+        minibatch_size=minibatch_size,
         num_comm_sms=CLUSTER_SIZE,
+        has_shared=has_shared,
     )
     return _state_layout(num_local_tokens, schedule_capacity, plan)[2]
 

@@ -420,9 +420,9 @@ def prepare_persistent_mxfp8_bwd_state(
     stands in for each (in the weight gradients' dtype for the three shared dW), never touched.
 
     ``caller_buffers`` (the execute step of a plan, which allocates nothing): ``(scratch, d_weights, counters,
-    d_x_shared)`` -- the plan's flat buffers by name (``backward_mxfp8_plan_sizes``), of which the leading elements
-    are used; the caller's six weight-gradient buffers in ``main_grads`` order (shaped like the weights, a combined
-    FC1's one ``[E, 2I, H]`` buffer under both Gate and Up), or None with ``main_grads``; the plan's int32
+    d_x_shared)`` -- the caller's flat scratch buffers by name (``backward_mxfp8_plan_sizes``), of which the leading
+    elements are used; the caller's six weight-gradient buffers in ``main_grads`` order (shaped like the weights, a
+    combined FC1's one ``[E, 2I, H]`` buffer under both Gate and Up), or None with ``main_grads``; the plan's int32
     counter buffer, whose leading words are zeroed on the current stream; and the caller's ``d_x_shared`` when
     the two hiddens differ (None: from the scratch)."""
 
@@ -931,7 +931,7 @@ def backward_mxfp8(
     hidden; the kernel reads both hiddens from the tensors, one executor serves both).  Only the executor is
     cached; state, stream, pointers and runtime arguments are fresh for every call.
 
-    ``caller_buffers`` (the execute step of a plan): the plan's scratch and counters and the caller's weight
+    ``caller_buffers`` (the execute step of a plan): the caller's scratch, the plan's counters and the caller's weight
     gradient and ``d_x_shared`` buffers, as ``prepare_persistent_mxfp8_bwd_state`` takes them; the call then
     allocates nothing.  Not with ``recompute_forward_context``, whose routed context this call allocates.
     """

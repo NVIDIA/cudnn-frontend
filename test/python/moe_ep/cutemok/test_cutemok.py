@@ -175,6 +175,16 @@ def _check(name, reference, actual, tolerance):
     )
 
 
+def _assert_all_ranks(ok, message, device):
+    """``assert ok, message`` on every rank together: the failures are counted over the ranks first (an all-reduce),
+    so a check that fails on some ranks fails it on all of them instead of leaving the others in the next collective
+    (the next call's kernels, or the next test's prepare)."""
+    failed = torch.tensor(0 if ok else 1, dtype=torch.int32, device=device)
+    dist.all_reduce(failed)
+    failed = int(failed.item())
+    assert failed == 0, f"{message if not ok else 'passed on this rank'} (failed on {failed} of {dist.get_world_size()} ranks)"
+
+
 def _config():
     return CuteMoKConfig(fwd_num_comm_sms=8, bwd_num_comm_sms=8, minibatch_size=1024, macrobatch_size=4096, schedule_capacity_multiplier=1.5)
 
@@ -430,6 +440,177 @@ def test_plan_owns_workspace(group):
     del plan
     gc.collect()
     assert len(buffers) == 8 and all(ref() is None for ref in buffers), "a workspace buffer outlived its plan"
+    dist.barrier()
+
+
+def _routed_forms(layer, precision):
+    """(forward, backward) routed weights of a layer: the BF16 ones, or their MXFP8 forms."""
+    routed = layer[4]
+    return cutemok_quantize_weights(*routed) if precision == "mxfp8" else (routed, routed)
+
+
+def _step(plan, config, layer, forms):
+    """One layer's forward and backward on ``plan`` with the routed weights ``forms`` (``_routed_forms``): the output
+    and the eight gradients."""
+    x, top_experts, router_weights, shared, _, d_output = layer
+    forward_routed, backward_routed = forms
+    output, schedule, saved = cutemok_forward(x, top_experts, router_weights, *shared, *forward_routed, plan=plan, config=config)
+    grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config)
+    return [output, *list(grads)[:8]]
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_plan_memory(group, precision):
+    """prepare keeps what later calls read -- the workspace and the backward's counters, none of it scaling with the
+    macrobatch but the BF16 backward's router-weight storage; the scheduler's scratch and the forward's counters are
+    per call, as in the layer functions -- and a forward + backward returns all of its scratch: after the first call
+    (which builds the BF16 backward's launch storage) a call leaves the allocated bytes unchanged."""
+    rank, world_size, device = group
+    layer = _inputs(rank, world_size, device, 85)
+    forms = _routed_forms(layer, precision)
+    resident, peak = {}, {}
+    for macrobatch in (4096, 8192):
+        config = dataclasses.replace(_config(), macrobatch_size=macrobatch)
+        torch.cuda.synchronize(device)
+        gc.collect()
+        before = torch.cuda.memory_allocated(device)
+        plan = _prepare(config, device, routed_precision=precision)
+        torch.cuda.synchronize(device)
+        resident[macrobatch] = torch.cuda.memory_allocated(device) - before
+        # Device buffers besides the workspace: a tensor or a tuple of them.
+        held = {field.name for field in dataclasses.fields(plan) if field.name != "workspace" and isinstance(getattr(plan, field.name), (torch.Tensor, tuple))}
+        _assert_all_ranks(held == {"backward_storage"}, f"{precision}: the plan holds {held}", device)
+        _step(plan, config, layer, forms)
+        torch.cuda.synchronize(device)
+        settled = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        _step(plan, config, layer, forms)
+        torch.cuda.synchronize(device)
+        returned = torch.cuda.memory_allocated(device) == settled
+        peak[macrobatch] = torch.cuda.max_memory_allocated(device) - settled
+        _assert_all_ranks(returned, f"{precision}: a call kept device memory", device)
+        dist.barrier()
+        del plan
+        gc.collect()
+        dist.barrier()
+    # The BF16 backward's router weights and partials: macrobatch * (1 + I / 128) FP32 values, and int32 counters
+    # that do not grow with the macrobatch.
+    bound = 4 * (8192 - 4096) * (1 + INTERMEDIATE // 128) if precision == "bf16" else 0
+    _assert_all_ranks(resident[8192] - resident[4096] <= bound + 64 * 1024, f"{precision}: resident bytes {resident}", device)
+    # The per-call scratch grows with the macrobatch instead: it is in the call's peak, not in the plan.
+    _assert_all_ranks(peak[8192] > peak[4096], f"{precision}: call peaks {peak}", device)
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_call_scratch_not_read_across_calls(group, precision):
+    """Nothing a forward leaves outside its results is read by the backward: with a NaN-filled allocation (which
+    reuses the freed scratch) and another plan's forward between them, the results equal a forward and backward
+    back to back, bit for bit."""
+    rank, world_size, device = group
+    config = _config()
+    plan, other = (_prepare(config, device, routed_precision=precision) for _ in range(2))
+    layer, other_layer = (_inputs(rank, world_size, device, seed) for seed in (90, 91))
+    forms = _routed_forms(layer, precision)
+    expected = [t.clone() for t in _step(plan, config, layer, forms)]
+
+    x, top_experts, router_weights, shared, _, d_output = layer
+    forward_routed, backward_routed = forms
+    output, schedule, saved = cutemok_forward(x, top_experts, router_weights, *shared, *forward_routed, plan=plan, config=config)
+    junk = torch.full((128 << 20,), float("nan"), dtype=torch.bfloat16, device=device)
+    del junk
+    ox, otop, orouter, oshared, _, _ = other_layer
+    other_forward = cutemok_forward(ox, otop, orouter, *oshared, *_routed_forms(other_layer, precision)[0], plan=other, config=config)
+    grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config)
+    differ = [name for name, a, b in zip(("output", *GRADIENT_NAMES), expected, [output, *list(grads)[:8]], strict=True) if not torch.equal(a, b)]
+    _assert_all_ranks(not differ, f"{precision}: {differ} differ with other work between forward and backward", device)
+    del other_forward
+    torch.cuda.synchronize(device)
+    dist.barrier()
+
+
+def _launch_plans(precision):
+    """The megakernels' kept launch plans (their LaunchPlanCache values): a call that misses its cache adds one."""
+    if precision == "mxfp8":
+        from cudnn.moe_ep._cutemok.cutedsl import persistent_mxfp8_bwd, persistent_mxfp8_fwd
+
+        caches = (persistent_mxfp8_fwd._FAST_PLANS, persistent_mxfp8_bwd._FAST_PLANS)
+    else:
+        from cudnn.moe_ep._cutemok.cutedsl import persistent_bf16_bwd, persistent_bf16_fwd
+
+        caches = (persistent_bf16_fwd._LAUNCH_PLANS, *persistent_bf16_bwd._PLAN_CACHES)
+    return [entry[2] for cache in caches for entry in cache._entries.values()]
+
+
+def _free_blocks(device):
+    """The caching allocator's free blocks that an allocation on the current stream can return: (state, size) of the
+    blocks of the default pool's segments of that stream not in use (freed, or freed with pending stream uses).
+    Without a large-pool block of 1 MiB or less: expandable segments (test/python/conftest.py enables them) split off
+    such remainders, and a large-pool request exceeds 1 MiB, so one is reused only as part of a larger block."""
+    stream = torch.cuda.current_stream(device).cuda_stream
+    return [
+        (block["state"], block["size"], segment["segment_type"])
+        for segment in torch.cuda.memory_snapshot()
+        if segment["device"] == device.index and segment["stream"] == stream and tuple(segment.get("segment_pool_id", (0, 0))) == (0, 0)
+        for block in segment["blocks"]
+        if block["state"] != "active_allocated" and (segment["segment_type"] == "small" or block["size"] > 1 << 20)
+    ]
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_cache_hit_scratch_at_new_addresses(group, precision):
+    """A call that hits the launch plans an earlier call built passes its own scratch, not the addresses the plans
+    were built with: with every block the first forward + backward freed (its scratch among them) held by a
+    sentinel during the second, the second call's results equal the first's bit for bit and the sentinel is
+    untouched.  The plan has the shared output gate, so the gate's scratch (G * dY) reaches the backward
+    megakernel too."""
+    rank, world_size, device = group
+    config = _config()
+    gc.collect()
+    torch.cuda.empty_cache()  # the earlier tests' cached blocks: the sentinel then holds only this test's
+    plan = _prepare(config, device, routed_precision=precision, shared_output_gate=True)
+    layer = _inputs(rank, world_size, device, 95)
+    x, top_experts, router_weights, shared, _, d_output = layer
+    forward_routed, backward_routed = _routed_forms(layer, precision)
+    gate = dict(shared_output_gate_weight=_gate_weight(rank, device, 96))
+
+    def step():
+        output, schedule, saved = cutemok_forward(x, top_experts, router_weights, *shared, *forward_routed, plan=plan, config=config, **gate)
+        grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config, **gate)
+        return [output, *grads]
+
+    earlier = _launch_plans(precision)
+    expected = [t.clone() for t in step()]
+    built = [p for p in _launch_plans(precision) if not any(p is q for q in earlier)]
+    _assert_all_ranks(len(built) == 2, f"{precision}: the first call built {len(built)} megakernel launch plans, not 2", device)
+
+    # Every block the first call freed is held: the allocator is best fit, so allocating the free blocks' sizes
+    # largest first takes each block whole (a small-pool block in pieces of at most 1 MiB, the small pool's largest
+    # request).  A few rounds also fill what the sentinel's own allocations leave free.  The second call's scratch
+    # then comes from new segments, at addresses the first call never used.
+    torch.cuda.synchronize(device)
+    torch.empty(1, device=device)  # an allocation processes the frees whose stream uses have completed
+    pattern, small = 0x5A, 1 << 20
+    sentinel = []
+    for _ in range(8):
+        free = sorted(((size, kind) for state, size, kind in _free_blocks(device) if state == "inactive"), reverse=True)
+        if not free:
+            break
+        for size, kind in free:
+            piece = min(size, small) if kind == "small" else size
+            sentinel += [torch.empty(piece, dtype=torch.uint8, device=device).fill_(pattern) for _ in range(size // piece)]
+    left = _free_blocks(device)
+    _assert_all_ranks(bool(sentinel) and not left, f"{precision}: free blocks left beside the sentinel: {left}", device)
+
+    actual = step()
+    kept = _launch_plans(precision)
+    hit = all(any(p is q for q in kept) for p in built) and all(any(p is q for q in earlier + built) for p in kept)
+    _assert_all_ranks(hit, f"{precision}: the second call did not run on the first call's launch plans", device)
+    differ = [name for name, a, b in zip(("output", *GRADIENT_NAMES, "d_w_output_gate"), expected, actual, strict=True) if not torch.equal(a, b)]
+    _assert_all_ranks(not differ, f"{precision}: {differ} differ on the cache hit", device)
+    extrema = torch.stack([torch.stack((t.min(), t.max())) for t in sentinel])
+    _assert_all_ranks(bool((extrema == pattern).all()), f"{precision}: the second call wrote into the first call's freed blocks", device)
+    del sentinel
+    torch.cuda.synchronize(device)
     dist.barrier()
 
 

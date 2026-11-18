@@ -60,13 +60,18 @@ PyTorch symmetric memory sized for `max_tokens_per_rank` (T_max). Two BF16
 (`4 * T_max * K * H` bytes together), dominate it; the rest are two BF16
 `[T_max, H]` staging buffers, the FP32 `[T_max, K]` router weights and their
 gradients, the int32 `[ranks, T_max, K]` gathered routes and a barrier word. The
-plan also holds the megakernels' counters and scratch (sized by the config's
-macrobatch).
+plan also holds, with the backward, the backward's int32 counters (BF16: with
+its router-weight storage, `macrobatch * (1 + I / 128)` FP32 values); no
+macrobatch-sized scratch, no scheduler scratch and no forward counters.
 
-Forward and backward are allocating eager calls: they allocate their results with
-`torch.empty` on the current stream's device on every call, nothing cached across
-calls, and return them; they compile nothing and never read device memory to the
-host. The first call over new `CuteMoKSplitWeight` address tables also allocates
+Forward and backward are allocating eager calls: they allocate their results and
+their scratch with `torch.empty` on the current stream's device on every call
+(inside a CUDA graph capture, from the graph's pool), nothing cached across calls,
+and return the results; the scratch (the forward's counters; MXFP8: the e4m3 x and
+Hidden of a macrobatch; the routed Y rows; the backward's gradient scratch) is released as soon
+as the megakernel is enqueued, before the epilogue allocates the output, so a
+call's peak is at its megakernel. They compile nothing and never read device
+memory to the host. The first call over new `CuteMoKSplitWeight` address tables also allocates
 and builds their TMA descriptors, once per set of tables. The schedule and the
 forward context hold the backward's inputs: keep them until the backward.
 
