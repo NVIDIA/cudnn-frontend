@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Test-local stream NEIGHBOURS of the add + RMSNorm + quantize decode step, for its dependent-launch cells: three byte-copy launches.
+"""Test-local stream NEIGHBOURS of a direct-call decode step, for the dependent-launch cells of the step suites (the add + RMSNorm +
+quantize step, the attention preparation step): three byte-copy launches.  "The step" below is the entry under test.
 
 * ``DependentCopy(device)`` -- a DEPENDENT of the step.  Launched with the programmatic-stream-serialization attribute, it issues
   ``griddepcontrol.wait`` as its first statement and then copies ``n`` bytes from ``src`` to ``dst``: the minimal consumer that honours
@@ -16,7 +17,8 @@
   at once, while the destination holds ``src``'s bytes only when the grid has completed -- which takes far longer than a launch
   needs to start, on purpose.  A dependent that reads this grid's destination in front of its own wait reads other bytes.
 
-Not a test module (no ``test_`` prefix) and not part of the package: imported by name from the suite beside it, after the DSL gate."""
+Not a test module (no ``test_`` prefix) and not part of the package: imported by name from the step suites (``test/python`` is on
+their path, as for ``launch_records``), after the DSL gate."""
 
 import cuda.bindings.driver as cuda
 import cutlass
