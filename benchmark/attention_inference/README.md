@@ -100,10 +100,13 @@ are visible. Architectures are reported in isolation, never merged.
 
 ## Measurement notes
 
-- Timing is CUDA events around the steady-state call, median of
-  `num_iterations`, after warmup. All host-side planning (graph build,
-  workspace, page tables) happens **outside** the timed region: this measures
-  per-step device cost.
+- The default timing is the median of `num_iterations` profiler samples,
+  each summing the matched CUDA kernel durations after an L2 flush. Setup and
+  warmup happen outside the timed region.
+- On the single-case script, `--graph_replay N` captures `N` cuDNN executions
+  in one CUDA graph and uses CUDA events to report median time per execution
+  during warm replay. Results are tagged `[graph-replay xN]`. Compare runs
+  using the same timing mode.
 - Peak-bandwidth table for % SOL lives in `benchmark_single_attention.py`
   (`PEAK_BW_GBPS`); override with `CUDNN_BENCH_PEAK_BW_GBPS=<GB/s>`.
 - fp8 KV on the cudnn paths runs the fp8 attention graph (q/k/v e4m3, unit
