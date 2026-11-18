@@ -3829,7 +3829,24 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     — honored-or-never-listed — and NO mode. Standalone callers (wrappers,
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
+
+    If bias removes every A candidate, reuse validated FALLBACK candidates.
+    This restores discovery without changing any existing nonempty list.
     """
+    return _recommend_with_bias_fallback(kind, facts, offered)[0]
+
+
+def _recommend_with_bias_fallback(kind, facts, offered):
+    """Return candidates and whether A needed bias fallback recovery."""
+    plans = _recommend(kind, facts, offered)
+    if kind == "A" and not plans and facts.has_bias:
+        plans = _recommend("FALLBACK", facts, offered)
+        return plans, bool(plans)
+    return plans, False
+
+
+def _recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
+    """Generate and validate the requested mode before bias recovery."""
     from .kernels.sm107 import d512_half_contract as sm107_wide_half
 
     from .kernels.sm107 import shared_half_contract as sm107_half
@@ -3969,8 +3986,9 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     FROST is timed ahead of the backend, the backend's block first where it is
     not. ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set means the caller asked for
     FROST (the ``cudnn_oss`` benchmark lane, the FROST suites): ours lead
-    everywhere. An empty proposal list stays empty — nothing to place."""
-    ours = recommend(kind, facts, offered)
+    everywhere. Recovered bias candidates trail every backend mode by default.
+    An empty proposal list stays empty — nothing to place."""
+    ours, recovered_bias = _recommend_with_bias_fallback(kind, facts, offered)
     if not ours:
         return ours
     from cudnn.engines.heuristics import BACKEND, LAST_RESORT
@@ -3980,6 +3998,10 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if opt_in_engines_enabled():
         return ours + [BACKEND]
+    if recovered_bias:
+        # These plans previously were absent from A. Existing placement studies
+        # do not qualify them: preserve the backend default across all modes.
+        return [BACKEND, LAST_RESORT] + ours
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
     # A trail-only row still leads where a generated placement_table entry says so.
     last = [p for p in ours if p.engine_id in spec_of and spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and place(spec_of[p.engine_id], facts) != LEAD]

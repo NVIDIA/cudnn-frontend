@@ -55,7 +55,7 @@ def recommendations(monkeypatch):
     # Opaque knobs deliberately carry no real performance-policy assumptions.
     plans = [PlanConfig(_OFFERED[_SM100], object()), PlanConfig(_OFFERED[_SM100], object())]
     recommend = Mock(return_value=plans)
-    monkeypatch.setattr(heuristics, "recommend", recommend)
+    monkeypatch.setattr(heuristics, "_recommend", recommend)
     return plans, recommend
 
 
@@ -123,7 +123,7 @@ def test_a_trail_only_row_leads_where_a_generated_entry_says_so(monkeypatch, ent
     table = {} if entry is None else {placement_table.class_key(name, facts): placement_table.Entry(entry, None, "synthetic")}
     monkeypatch.setattr(placement_table, "TABLE", table)
     ours = [PlanConfig(_OFFERED[name], object())]
-    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=ours))
+    monkeypatch.setattr(heuristics, "_recommend", Mock(return_value=ours))
     plans = heuristics.propose("A", facts, {name: _OFFERED[name]})
     assert plans == (ours + [BACKEND] if entry == "always" else [BACKEND, LAST_RESORT] + ours)
     assert placement.place(spec, facts) == (placement.LEAD if entry == "always" else placement.TRAIL)
@@ -157,7 +157,7 @@ def test_propose_opt_in_overrides_placement(monkeypatch, recommendations, kind):
 @pytest.mark.L0
 @pytest.mark.parametrize("opt_in", ["0", "1"])
 def test_propose_keeps_an_empty_recommendation_empty(monkeypatch, opt_in):
-    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=[]))
+    monkeypatch.setattr(heuristics, "_recommend", Mock(return_value=[]))
     monkeypatch.setattr(placement, "place", Mock(return_value=placement.LEAD))
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", opt_in)
     assert heuristics.propose("A", _facts(), {_SM100: _OFFERED[_SM100]}) == []
@@ -547,7 +547,7 @@ def test_propose_ranks_the_rubin_mxfp8_row_first_without_the_flag(monkeypatch, k
     cc 10.7 and behind it elsewhere, with the flag deleted."""
     name = "sdpa_fwd_prefill_sm107_mxfp8"
     plans = [PlanConfig(_OFFERED[name], object())]
-    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=plans))
+    monkeypatch.setattr(heuristics, "_recommend", Mock(return_value=plans))
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, s_q=4096)
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **quant), {name: _OFFERED[name]}) == plans + [BACKEND]
     assert heuristics.propose(kind, _facts(device_cc=(10, 0), **quant), {name: _OFFERED[name]}) == [BACKEND] + plans
@@ -668,7 +668,7 @@ def test_propose_ranks_the_rubin_fp8_row_first_without_the_flag(monkeypatch, kin
     block on cc 10.7 at d256 and behind it at d128."""
     name = "sdpa_fwd_prefill_sm107_fp8"
     plans = [PlanConfig(_OFFERED[name], object())]
-    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=plans))
+    monkeypatch.setattr(heuristics, "_recommend", Mock(return_value=plans))
     values = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT}
     offered = {name: _OFFERED[name]}
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **values), offered) == plans + [BACKEND]
@@ -793,7 +793,7 @@ def test_propose_ranks_the_sm120_fp8_row_per_its_band_without_the_flag(monkeypat
     """The arm is wired into place(): with recommend mocked and the flag deleted, propose puts the row ahead of the backend
     block on a long d128 cache and behind it on a short one."""
     plans = [PlanConfig(_OFFERED[_SM120_FP8], object())]
-    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=plans))
+    monkeypatch.setattr(heuristics, "_recommend", Mock(return_value=plans))
     offered = {_SM120_FP8: _OFFERED[_SM120_FP8]}
     values = {**_SM120_FP8_DENSE, **_SM120_FP8_QUANT}
     assert heuristics.propose(kind, _facts(**values), offered) == plans + [BACKEND]

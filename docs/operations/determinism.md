@@ -636,14 +636,15 @@ this forward result does not establish a backward or cross-runtime guarantee.
 ## SM120 D128 additive-bias forward
 
 FP16/BF16 dense D128 forward with FP32 or matching-input bias is repeatable
-and batch invariant for the tested fixed M64 dense and M128 causal plans.
+and batch invariant for the tested fixed M64/N128 dense, M128/N128 causal,
+and M64/N64 dense and causal plans.
 O and FP32 Stats preserve their bytes across fresh allocations, concurrent
 work, isolated/reordered/duplicated batches, changed neighbors and CUDA Graph
 replay on SM120 (cc 12.0). The M128 path also passes sustained K/V stage-refill
 stress with its result-dependent stores before stage reuse.
 
 This covers unpaged, unpacked, unsplit forward with no physical origins;
-bias backward is unsupported. SM121 execution and cross-GPU, cross-plan or
+backward bias is outside this qualification. SM121 execution and cross-GPU, cross-plan or
 cross-runtime bitwise identity remain unverified. The coverage report records
 both tested DSL compiler flavors and the original stress failure.
 
