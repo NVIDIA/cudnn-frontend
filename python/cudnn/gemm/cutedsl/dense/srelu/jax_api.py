@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry points for the GEMM + sReLU forward and
-backward (dsReLU) kernels, built on :func:`cudnn.jax.call`.
+backward (dsReLU) kernels, built on :func:`cudnn._jax.call`.
 
 The kernels' optional sfd/amax/norm_const parameters are compile-time ``None``
 constants inside the ``@cute.jit`` adapters for the JAX-reachable (non-fp8-D)
@@ -20,7 +20,7 @@ import cutlass.utils
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import TensorSpec, call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec, zeros_init
+from cudnn._jax import TensorSpec, call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec, zeros_init
 from .api import GemmSreluSm100
 from ..dsrelu.api import GemmDsreluSm100
 

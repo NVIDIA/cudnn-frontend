@@ -58,15 +58,14 @@ from typing import Dict, Optional
 # (the CI job log).  Record a version only after the whole matrix is clean on it, and leave the graphs the row serves
 # on the row: this constant lifts the GUARD, not the placement verdict (``placement._place_sm107_mxfp8``).
 #
-# Recorded: the 9.30.0.5 nightly runs the whole matrix clean through planning and building on cc 10.0, cc 10.3
-# (B300) and cc 10.7 (Rubin), 2026-11-12. Its earlier 9.30.0 nightlies (.2-.4) still crash and report the same 93000; only
-# those pre-release builds are uncovered.
-SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = 93000
+# Recorded: the backend fix is in cuDNN 9.29.0, which runs the whole matrix clean through planning and building on
+# cc 10.0 and cc 10.7.
+SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = 92900
 
 # The devices the crash is measured on.  cc 10.0 and 10.3 build the plan through the SM100 decode emitter and segfault in
 # it (emit_code_native_sdpa_decode_sm100, which has no MXFP8 scale-factor path) for a dense d128 graph on every build
 # tried: 9.23.1.3, 9.26.0.51, 9.27.0.42, 9.28.0.38 and the 9.30.0.2 nightly (148-SM cc 10.0, cc 10.3 B300, 2026-11-10).
-# The backend fix routes single-query MXFP8 graphs to the prefill kernel (in review), so one FIXED_IN covers all three.
+# The backend fix routes single-query MXFP8 graphs to the prefill kernel, so one FIXED_IN covers all three.
 SQ1_MXFP8_CRASH_DEVICES = frozenset({(10, 0), (10, 3), (10, 7)})
 
 
@@ -83,7 +82,7 @@ def backend_guard(graph, facts) -> Optional[str]:
     return (
         f"cuDNN {cudnn.backend_version_string()} backend crashes the process while planning or building single-query MXFP8 SDPA graphs "
         f"on cc 10.0 / 10.3 / 10.7 without a sink token (cc 10.7: heuristics on 9.26.0.51 and 9.27.0.28, plan build on 9.28.0; "
-        f"cc 10.0 / 10.3: plan build on 9.23.1 through 9.30; dense and THD, Stats on or off); "
+        f"cc 10.0 / 10.3: plan build on 9.23.1 through 9.28; dense and THD, Stats on or off); "
         f"the backend is not consulted for this graph"
     )
 
@@ -99,12 +98,79 @@ WIDE_V_WRONG_O_SINCE = 92301
 # First backend version shown to return the right O on these engines, or None while every build since 9.23.1 is wrong.
 # A measurement, re-taken by test_sdpa_backend_guard.py::test_wide_v_engine_guard_is_current on a cc 10.x device (the
 # engines run with the guard lifted); record a version only from that detector, never a guessed release.
-WIDE_V_WRONG_O_FIXED_IN: Optional[int] = None
+# Recorded: the backend fix is in cuDNN 9.29.0, which returns the right O for the detector's graph on engine 10
+# (cc 10.0) and on engines 10 and 18 (cc 10.7).
+WIDE_V_WRONG_O_FIXED_IN: Optional[int] = 92900
 WIDE_V_WRONG_O_ENGINES = (10, 18)
+
+# Actual cuDNN 9.24.0.43 on Hopper leaves O / Stats unwritten for live query
+# rows whose per-batch KV length is zero (NaN when the output was poisoned).
+# Dense, ragged and paged graphs reproduce this with engine 9; engine 8 is
+# correct. The same defect is present in 9.23.2.1: 9.24 is the serving-stack
+# qualification target, not an introduction boundary. Without an established
+# unaffected earlier release, retain this exclusion below the verified fix.
+# 9.25.0.15 and 9.25.1.1 pass the
+# saved FP16/BF16 repros with and without Stats. This is a data-dependent
+# defect: a positive-length launch does not qualify the same graph for a
+# later empty-KV launch. Device lengths cannot be inspected while planning.
+# Keep the backend's other engines and FROST candidates, and do not add an
+# execute-time synchronization or output-repair kernel.
+SM90_ZERO_KV_WRONG_O_FIXED_IN = 92500
 
 
 def backend_engine_guard(graph, facts) -> Dict[int, str]:
     """Backend engines (global ids) that must not run ``graph`` (its SDPA facts), each with the reason."""
+    excluded = _wide_v_engine_guard(graph, facts)
+    for engine, reason in _zero_kv_engine_guard(graph, facts).items():
+        excluded.setdefault(engine, reason)
+    for engine, reason in _sm120_empty_q_engine_guard(graph, facts).items():
+        excluded.setdefault(engine, reason)
+    return excluded
+
+
+def _zero_kv_engine_guard(graph, facts) -> Dict[int, str]:
+    import cudnn
+
+    if facts is None or facts.invalid is not None or facts.is_backward:
+        return {}
+    if facts.device_cc != (9, 0) or not facts.padded or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        return {}
+    if cudnn.backend_version() >= SM90_ZERO_KV_WRONG_O_FIXED_IN:
+        return {}
+    return {
+        9: f"cuDNN {cudnn.backend_version_string()} engine 9 leaves O and Stats unwritten for zero-length KV in padded Hopper SDPA forward "
+        f"(dense, ragged or paged; reproduced in 9.23.2.1 and 9.24.0.43, fixed in 9.25.0.15); the backend's other engines serve this graph"
+    }
+
+
+# Real 9.23.2.1 / 9.24.0.43 / 9.25.0.15 / 9.25.1.1 execute engine 11
+# with an illegal instruction on a cold compact THD request containing an
+# empty query sequence and 0xff-initialized caller workspace. Reserved-span
+# and warmed controls may pass; retain the original cold request in the
+# detector. The observed failure is
+# independent of the attention mask, sink, head precision and stride gaps.
+# The same engine/knobs pass on 9.26.0.51 and 9.27.0.42. Query lengths can
+# change in retained device buffers, so the declaration must be safe before
+# launch; do not read lengths back or add an execute-time repair kernel.
+SM120_EMPTY_Q_CRASH_FIXED_IN = 92600
+
+
+def _sm120_empty_q_engine_guard(graph, facts) -> Dict[int, str]:
+    import cudnn
+
+    if facts is None or facts.invalid is not None or facts.is_backward:
+        return {}
+    if facts.device_cc != (12, 0) or not facts.thd or not facts.padded or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        return {}
+    if cudnn.backend_version() >= SM120_EMPTY_Q_CRASH_FIXED_IN:
+        return {}
+    return {
+        11: f"cuDNN {cudnn.backend_version_string()} engine 11 crashes with zero-length Q in SM120 THD SDPA forward "
+        f"(reproduced through 9.25.1.1, fixed in 9.26.0.51); other backend and FROST engines remain available"
+    }
+
+
+def _wide_v_engine_guard(graph, facts) -> Dict[int, str]:
     import cudnn
 
     if facts is None or facts.invalid is not None or facts.is_backward:

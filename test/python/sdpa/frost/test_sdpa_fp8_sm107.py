@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestRaggedBackwardMetadata:
+    """Keep the shared backward metadata regression in the SM107 CI selection."""
+
+    from sdpa.graph.test_ragged_offset_multiplier import test_fp8_ragged_sm107_existing_route as _ragged
+
+    test_offset_units_and_declared_totals = staticmethod(_ragged)
+
+
 class TestServiceRegisterRelease:
     from service_register_release_checks import test_sm107_service_register_release as _release
 
@@ -38,6 +46,67 @@ class TestNativeHalfRegisterRelease:
     from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
 
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestBiasForwardRegressions:
+    """Keep explicit-loader and native-layout regressions in the CI selection."""
+
+    from sdpa.frost import test_sdpa_bias_max_form_sm107 as _max_form
+    from sdpa.frost import test_sdpa_bias_tile_n_additive_sm107 as _tile_n
+
+    test_default_loader = staticmethod(_max_form.test_the_default_pick_runs_the_hardware_form_on_the_kv_mask_only_plan_and_the_software_tree_with_a_bias)
+    test_tile_n_reference = staticmethod(_tile_n.test_tile_n_64_cells_match_the_fp64_oracle_and_the_128_wide_rendering)
+    test_bhsd_strides = staticmethod(_tile_n.test_bhsd_contiguous_activations_use_the_declared_strides)
+    test_strided_outer_axes = staticmethod(_tile_n.test_strided_outer_axes_are_addressed_through_the_declared_strides)
+    test_alignment_declines = staticmethod(_tile_n.test_non_16_byte_outer_strides_are_typed_declines_on_real_graphs)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestHalfForwardOwnerRegressions:
+    """Pin native half bodies without relying on standalone selection switches."""
+
+    from sdpa.frost import test_sdpa_fwd_dsl_sm107 as _half
+    from sdpa.frost import native_d128_dense_paged_sm107_checks as _small_paged
+    from sdpa.frost import native_d512_paged_sm107_checks as _wide_paged
+    from sdpa.frost import test_sdpa_fwd_d512_2x2_sm107 as _two_by_two
+    from sdpa.frost import test_sdpa_single_sequence_setup_sm107 as _single
+
+    _d512_role_split = staticmethod(_half._d512_role_split)
+    test_role_split_reference = staticmethod(_half.test_d512_half_prefolded_scale_matches_the_oracle)
+    test_role_split_dead_rows = staticmethod(_half.test_d512_half_prefolded_scale_keyless_and_dead_rows)
+    test_role_split_masked_leading_tile = staticmethod(_half.test_d512_half_masked_leading_tile_keeps_rows_with_later_keys_finite)
+    test_role_split_thd = staticmethod(_half.test_d512_half_prefolded_scale_thd)
+    test_role_split_sink_stats = staticmethod(_half.test_d512_half_prefolded_scale_sink_and_stats)
+    test_explicit_role_split = staticmethod(_two_by_two.test_two_by_two_role_split_untouched_when_twin_off)
+    test_small_paged_boundaries = staticmethod(_small_paged.test_page_boundaries)
+    test_wide_paged_boundaries = staticmethod(_wide_paged.test_boundaries)
+    test_single_sequence_batch_bytes = staticmethod(_single.test_single_sequence_batch_bytes)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestSparseDecodeForwardRegressions:
+    """Exercise the reference ABI and explicit decode body through the CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_sparse_sm107 as _sparse
+    from sdpa.frost import test_sdpa_fwd_decode_d256_sm107 as _decode
+
+    test_sparse_dense_reference = staticmethod(_sparse.test_identity_vs_the_dense_kernel_below_the_bound)
+    test_decode_qwen_token_tile = staticmethod(_decode.test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units)
+    test_decode_independent_pool_layouts = staticmethod(_decode.test_paged_decode_independent_pool_layouts)
+
+
+@requires_rubin
+class TestD256HalfSplitOrigins:
+    """Keep the shared half D256 origin regression in the selected SM107 CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_d256_split_origins_determinism as _origins
+
+    test_matching_extension = staticmethod(_origins.test_split_origins_require_matching_extension)
+    test_reference_replay_batch_and_golden = staticmethod(_origins.test_origins_reference_replay_batch_and_golden)
 
 
 @requires_rubin

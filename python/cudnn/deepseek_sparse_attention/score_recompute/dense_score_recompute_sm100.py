@@ -11,7 +11,7 @@ Dense variant: iterates over the full KV sequence via TMA (no topk_indices).
     out[b,q,t] = S[b,q,t]   (written per n_block)
     denom[b,q] = sum_t S[b,q,t]
 
-The indexer scores (BF16 / MXFP8 / MXFP4) and the MXFP8 attention score run the newer kernels built on
+The indexer scores (BF16 / MXFP8 / MXFP4 / NVFP4) and the MXFP8 attention score run the newer kernels built on
 ``score_kernel_sm100.ScoreKernelSm100``.
 
 K is loaded via TMA (dense sequential, not sparse gather).

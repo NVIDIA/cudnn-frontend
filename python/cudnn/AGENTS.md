@@ -457,7 +457,7 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
-  `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
+  `cudnn._jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
   the JAX dependency group and runtime guard enforce this higher floor.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
@@ -804,6 +804,10 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+  The common graph execution boundary must restore the caller's original
+  context on success and failure, including an empty worker context. The
+  backend and FROST cases in `core/graph/test_execute_device_context.py`
+  check mapping/ordered/indexed execution, default streams and captured replay.
 - **A guard that keeps the backend's planner away from a graph covers EVERY
   path that creates a backend plan, not only the heuristics query.** The cc 10.7
   single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
@@ -823,6 +827,18 @@ treatment at the caller boundary.**
   (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
   the first guard. A version-bounded guard also needs the detector that
   re-measures its bound (test/AGENTS.md).
+  The first version where a defect was measured is not its introduction
+  boundary. A lower bound needs evidence of an unaffected earlier release;
+  otherwise exclude the known-bad engine until the verified fixed version.
+  Exercise earlier supported versions in both default-planning and explicit
+  replay tests, and do not version-skip their numerical detector. The SM90
+  ragged-backward cases in `test_sdpa_bwd_backend_guard.py` cover this boundary.
+- **Provider support is not graph invalidity.** A layout a FROST engine cannot
+  run may still be valid for the backend. Preserve its graph facts and let the
+  provider's matcher decline it; returning an empty `invalid` fact record can
+  bypass backend correctness guards. Detector: the mixed dense/ragged Q/K/V
+  checks and native old/fixed-backend gradient controls in
+  `test_sdpa_bwd_backend_guard.py`.
 - **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
   `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
   `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
@@ -1011,6 +1027,16 @@ Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
 
+Array slices need wide coordinates for wide global strides. In CuTe DSL 4.8,
+`cutlass.Array` slicing (for example `a[batch, row, head, :]`) multiplies each
+coordinate by a stride cast to that coordinate's integer width. An Int64
+tensor layout alone does not prevent overflow: widen each dynamic sliced
+coordinate before forming its stride product. Full scalar indexing is a
+different path; do not infer a slicing guarantee from it. Detector:
+`TestNativeHalfStrides::test_physical_wide_stride` in the SM100/SM107 forward
+suites physically allocates a wide batch stride and checks output and replay,
+including D256 SwapAB decode at one query row.
+
 Widen operands before triangular workspace products, in both producer and
 consumer. Widening an already-overflowed offset cannot recover it. Derive tile
 decoder bounds from the input extent. `test_triangular_offsets.py` compiles the
@@ -1144,6 +1170,32 @@ it reads the outputs. Detector: `test_dependent_that_waits_reads_the_eager_bytes
 (SwiGLU FP4 decode suite: a waiting dependent behind the entry copies the
 outputs, eager and captured); the rendering pin counts one
 `launch_dependents`.
+
+**The pairing order of a block reduction is part of a kernel's bytes.** A sum
+over a thread block is a tree of fp32 additions. Pairing the lanes of a warp
+with the shuffle offsets 1, 2, 4, 8, 16 or with 16, 8, 4, 2, 1 gives totals
+that differ in the last bit on some rows, and at EITHER level alone: a body
+that is right inside the warp and wrong over the warp sums passes every row
+whose mass sits in one warp. Spell a row reduction through
+`tile_dsl.rowwise.block_reduce`, whose `order` has no default, and name the
+order in the entry's text. Detector: `test_block_sum_is_the_documented_tree`
+in `test/python/sdpa/frost/test_tile_dsl_rowwise.py` compares every lane with
+a host replay of the tree on three row classes (all mass in one warp, one
+non-zero lane per warp, a full row), each shown to tell a wrong level apart;
+the rendering pin of the same module reads the shuffle offsets in program
+order.
+
+**`redux.sync.max.f32` assembles for compute capability 10.x targets only.**
+The single-instruction fp32 warp maximum is rejected by the assembler for
+`sm_90a`, `sm_110a`, `sm_120a` and `sm_121a` (`Instruction 'redux.f32' not
+supported`); the integer forms assemble there. A kernel that may be admitted
+on such a target takes its warp maximum from a helper that carries the
+shuffle arm. `tile_dsl.rowwise.block_reduce` (`kind="max"`, `"max_index"`)
+chooses by a positive list, so a target nobody named gets the arm that
+assembles everywhere. Detector: `test_rendering_of_every_primitive[sm_120a]`
+(ten shuffles with ten `max.f32`, no `redux.sync.max.f32`) and
+`test_shuffle_arm_is_the_redux_arm` (the two arms bitwise equal on a
+compute-capability-10.x device).
 
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel

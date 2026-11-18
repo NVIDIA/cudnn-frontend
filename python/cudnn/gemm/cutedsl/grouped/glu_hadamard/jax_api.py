@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for grouped GEMM GLU + Hadamard, built on
-:func:`cudnn.jax.call`.
+:func:`cudnn._jax.call`.
 
 ``grouped_gemm_glu_hadamard_jax_forward`` is the canonical forward with dense weights
 for packed FP4 inputs: A ``(m, k / 2)`` and B ``(experts, n, k / 2)`` as uint8, and
@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.jax import zeros_init
+from cudnn._jax import zeros_init
 from cudnn.tensor_adapter import get_compute_capability
 from ..canonical import kernel_facing_fp4
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, grouped_call, output_type, sf_array

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry points for the grouped GEMM dSReLU backward,
-built on :func:`cudnn.jax.call`.
+built on :func:`cudnn._jax.call`.
 
 ``grouped_gemm_dsrelu_jax_sm100`` serves two modes. With ``b_tensor`` it is the
 canonical block-scaled backward with dense weights: MXFP8 or packed FP4 A
@@ -34,7 +34,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype, get_compute_capability
-from cudnn.jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
+from cudnn._jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
 from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape
 from ..moe_utils import MoEWeightMode

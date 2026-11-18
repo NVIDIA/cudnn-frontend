@@ -132,11 +132,14 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, mixed-form sequence lengths require cuDNN 9.25.0 or higher.")
         pytest.skip("mixed-form sequence lengths (cumulative on one side only) require cuDNN 9.25.0 or higher")
 
-    # Same gate as test_sdpa_edge_cases.py: the random sweeps draw zero-length
-    # sequences (~10% per batch), which older engines answer with NaN rows.
-    if cudnn_version < "9.25.0" and (0 in cfg.seq_len_q or 0 in cfg.seq_len_kv):
-        print("@@@@ Overall result: WAIVED, zero sequence length SDPA requires cuDNN 9.25.0 or higher.")
-        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+    # Forward empty-sequence handling is qualified on 9.24 with FE's backend
+    # guards. Keep the training qualification floor separate; a forward guard
+    # does not establish backward support. These are test floors, not the
+    # versions where the underlying backend defects were introduced.
+    zero_seqlen_floor = "9.25.0" if cfg.is_train else "9.24.0"
+    if cudnn_version < zero_seqlen_floor and (0 in cfg.seq_len_q or 0 in cfg.seq_len_kv):
+        print(f"@@@@ Overall result: WAIVED, zero sequence length SDPA requires cuDNN {zero_seqlen_floor} or higher.")
+        pytest.skip(f"zero sequence length SDPA requires cuDNN {zero_seqlen_floor} or higher")
 
 
 def kv_packed(cfg) -> bool:
@@ -756,6 +759,11 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
         dO.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            for tensor in (q, k, dQ, dK):
+                tensor.set_ragged_offset_multiplier(cfg.d_qk)
+            for tensor in (v, o, dV, dO):
+                tensor.set_ragged_offset_multiplier(cfg.d_v)
 
     try:
         graph.validate()

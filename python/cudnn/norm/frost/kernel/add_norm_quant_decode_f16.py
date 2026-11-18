@@ -40,9 +40,11 @@ PIPELINE, in order, for every thread:
     +-6), two codes per byte (the even element in the low nibble), one 32-bit global store of the thread's four code bytes; the even
     thread of the pair stores the scale byte at its position in the 128 x 4 scale layout over (rows, blocks).
 
-THE SUM TREE AND THE ROUNDING CHAIN ARE THE CONTRACT.  The reduction is spelled inline on purpose: the fused chain in element order,
-the butterfly offsets ASCENDING (1, 2, 4, 8, 16) at both levels, an IEEE division by the width (never a multiplication by
-``1 / hidden``) and the default ``rsqrt``.  ``tile_dsl.pointwise.lane_group_sum`` pairs lanes in the opposite order (16, 8, 4, 2, 1)
+THE SUM TREE AND THE ROUNDING CHAIN ARE THE CONTRACT.  The fused chain in element order is spelled here; steps 7 and 8 are ONE call,
+``tile_dsl.rowwise.block_reduce(..., kind="sum", order="ascending")`` -- the butterfly offsets ASCENDING (1, 2, 4, 8, 16) at both
+levels, the order named at the call because it is part of the bytes -- on this kernel's own ``lane`` / ``warp`` and its one slot
+array; then an IEEE division by the width (never a multiplication by ``1 / hidden``) and the default ``rsqrt``.
+``tile_dsl.pointwise.lane_group_sum`` pairs lanes in the opposite order (16, 8, 4, 2, 1)
 and ``rmsnorm_rstd`` multiplies by a reciprocal width: the same quantity with other last bits, hence another bf16 value on some
 elements.  The fused multiply-add is explicit (``cute.math.fma``), never left to the optimizer's contraction of ``s + v * v``; the
 NVFP4 factor 1/6 is the bit pattern ``0x3E2AAAAB`` inside ``nvfp4_block_scale_global``, never an approximate reciprocal of a constant
@@ -60,7 +62,8 @@ BARRIER TABLE.  No mbarrier, no cluster, no ``cp.async`` group, no loop with a r
     the thread-block barrier (8)    named barrier 0      cfg.THREADS       WARPS x 32, once each    none (const_expr-only control flow)
 
 ``SUM(issuing lanes) = 32 x WARPS == THREADS``: every thread the barrier counts reaches it exactly once on every path (the only
-run-time branch in front of it, lane 0's slot store, rejoins before it).  The config pins ``THREADS == hidden / 8`` in full warps.
+run-time branch in front of it, lane 0's slot store, rejoins before it).  The barrier and the slot accesses of the table below are
+emitted by ``block_reduce``; the kernel reaches that call with every thread, outside any run-time branch.  The config pins ``THREADS == hidden / 8`` in full warps.
 
 SHARED-MEMORY TABLE.  ONE buffer; no tensor memory, no descriptor:
 
@@ -88,6 +91,7 @@ import cutlass.memory
 
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_times_inv_to_e4m3, fp32_to_e2m1x2, fp32_to_fp16, nvfp4_block_scale_global, rcp_div_rn
+from cudnn.frost.tile_dsl.rowwise import block_reduce
 from cudnn.frost.tile_dsl.sf_layout import sf_atom_offset
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v4
 
@@ -95,7 +99,6 @@ from .add_norm_quant_decode_config import SF_ATOM_BYTES, SF_TILE_ROWS, VEC, WARP
 
 FP32, INT32, BF16, UINT8 = cutlass.Float32, cutlass.Int32, cutlass.BFloat16, cutlass.Uint8
 PAIRS = VEC // 2  # element pairs of a thread: one 32-bit word of a 128-bit bf16 load or store, one byte of NVFP4 codes
-BUTTERFLY_STEPS = 5  # offsets 1, 2, 4, 8, 16: the 32 lanes of a warp
 
 
 def _bf16_words(vals):
@@ -155,17 +158,9 @@ def frost_add_rms_norm_quant(
     # ADD updates the residual in place; STORE_RESIDUAL (no add) initializes it to x
     if cutlass.const_expr(cfg.ADD or cfg.STORE_RESIDUAL):
         st_global_v4((res.iterator + idx).toint(), _bf16_words(vals), INT32)
-    # byte contract: the butterfly offsets ASCEND (1, 2, 4, 8, 16); tile_dsl's lane_group_sum pairs lanes in the opposite order
-    for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
-        sumsq = sumsq + cute.arch.shuffle_sync_bfly(sumsq, offset=1 << step)
-    if lane == 0:
-        smem[warp] = sumsq
-    cute.arch.barrier()  # the ONE thread-block barrier: all cfg.THREADS threads, under const_expr-only control flow
-    total = FP32(0)
-    if lane < cfg.WARPS:
-        total = smem[lane]
-    for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
-        total = total + cute.arch.shuffle_sync_bfly(total, offset=1 << step)
+    # byte contract: the row total in the ASCENDING order (butterfly offsets 1, 2, 4, 8, 16 inside each warp, then over the warp sums).
+    # The call holds the ONE thread-block barrier: all cfg.THREADS threads reach it here, under const_expr-only control flow.
+    total = block_reduce(sumsq, lane, warp, smem, cfg.WARPS, kind="sum", order="ascending")
     # byte contract: an IEEE division by the width (never a multiplication by 1 / width), then the default rsqrt (rsqrt.approx.f32)
     inv_rms = cute.math.rsqrt(total / FP32(cfg.HIDDEN) + FP32(cfg.EPS))
 

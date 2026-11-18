@@ -117,6 +117,7 @@ def _leads(spec: EngineSpec, facts) -> bool:
 TRAIL_ONLY_ROWS = frozenset(
     {
         "sdpa_bwd_sm80",
+        "sdpa_bwd_sm89",
         "sdpa_bwd_sm120",
         "sdpa_bwd_sm107",
         "sdpa_bwd_sm107_d512",

@@ -36,6 +36,17 @@ from sdpa.blocked import fetch_blocked_tests
 from sdpa.helpers import print_section_begin, print_section_end
 from sdpa.softmax_knobs import served_softmax_knob_sets, knob_set_for_case, knob_set_label, is_default_knob_set
 import frost_routing
+from sdpa.graph import test_sdpa_sm90_zero_kv_compat as _sm90_zero_kv_compat
+
+
+@pytest.mark.L0
+class TestSM90ZeroKVCompatibility:
+    """Keep the versioned compatibility checks in the maintained graph CI entry."""
+
+    test_default_zero_kv_and_changed_length_capture = staticmethod(_sm90_zero_kv_compat.test_default_zero_kv_and_changed_length_capture)
+    test_zero_kv_layouts_use_safe_default = staticmethod(_sm90_zero_kv_compat.test_zero_kv_layouts_use_safe_default)
+    test_zero_kv_backend_fix_boundary_is_current = staticmethod(_sm90_zero_kv_compat.test_zero_kv_backend_fix_boundary_is_current)
+
 
 # fmt: off
 
@@ -1714,14 +1725,14 @@ def test_sdpa_fwd_paged_d192x128_prefill_frost_L0(env_info, request, cudnn_handl
 
 def _require_paged_d512_env():
     """Environment gates for the d512 paged configs below, checked BEFORE the
-    strict wrapper so a missing prerequisite stays a skip: cuDNN >= 9.25.0 (the
-    configs carry zero-length KV entries, which validate_config waives below
-    it), then _require_frost_sm100() -- the SM100 class (cc 10.0-10.6) and a
+    strict wrapper so a missing prerequisite stays a skip: cuDNN >= 9.24.0 (the
+    qualified forward floor for zero-length KV entries), then
+    _require_frost_sm100() -- the SM100 class (cc 10.0-10.6) and a
     usable CuTe DSL (a missing or too-old DSL is a skip, not a failure: the
     native backend serving the graph then is a legitimate fallback, not a
     FROST regression)."""
-    if cudnn.backend_version() < 92500:
-        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+    if cudnn.backend_version() < 92400:
+        pytest.skip("zero sequence length forward SDPA is qualified on cuDNN 9.24.0 or higher")
     _require_frost_sm100()
 
 
@@ -3786,10 +3797,10 @@ _P2_TEMPLATE = {128: "prefill_d128_f16", 256: "prefill_d256_f16"}
 
 
 def _require_p2_env():
-    """Environment gates BEFORE the strict block: zero-length entries need cuDNN >= 9.25; the row must be offered
+    """Environment gates BEFORE the strict block: forward zero-length entries are qualified on cuDNN >= 9.24; the row must be offered
     on a cc 10.7 device with a DSL that targets sm_107a (_require_frost_sm107)."""
-    if cudnn.backend_version() < 92500:
-        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+    if cudnn.backend_version() < 92400:
+        pytest.skip("zero sequence length forward SDPA is qualified on cuDNN 9.24.0 or higher")
     _require_frost_sm107(_cc107_engine("half"))
 
 
@@ -4181,14 +4192,14 @@ def _p2_fp8_pools_graph(form):
 @pytest.mark.parametrize("form", ["thd", "dense"])
 def test_sdpa_paged_sink_fp8_pools_decline_cc107_L0(env_info, form, request, cudnn_handle):
     """The lift is the HALF row's: per-tensor FP8 pools with a sink (graph.sdpa_fp8 over paged K/V, packed THD or dense
-    queries, _p2_fp8_pools_graph) keep a typed decline on cc 10.7 at the GRAPH level -- the cc 10.7 FP8 row has no paged
-    capability (its `paged_kv = not rubin_row`) -- pinned by engine id through create_execution_plan so the row, not the
+    queries, _p2_fp8_pools_graph) keep a typed decline on cc 10.7 at the GRAPH level -- the D128 FP8 multi-Q implementation
+    has no paged capability -- pinned by engine id through create_execution_plan so the implementation, not the
     walk, answers (test_sdpa_fwd_dsl_sm107.py::test_sm107_fp8_paged_sink_declines is the host-only facts twin).  The
     explicit FLOAT softmax keeps the backend out of planning (as the quantized cc 10.7 sweeps do), so the walk proposes
     nothing and the pinned plan's check_support is the only answer."""
     _require_p2_env()
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")   # the cc 10.7 FP8 row is opt-in: offered so the pin can name it
+        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")   # include the explicit FP8 owner regardless of default placement
         graph = _p2_fp8_pools_graph(form)
         graph.validate()
         graph.build_operation_graph()
@@ -4197,7 +4208,8 @@ def test_sdpa_paged_sink_fp8_pools_decline_cc107_L0(env_info, form, request, cud
         except cudnn.cudnnGraphNotSupportedError as e:
             print(f"@@@@ no engine proposed a plan ({e}); the cell pins its own")
         from cudnn.engines.manifest import MANIFEST
-        engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("fp8")]
+        from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_multi_q.contract import NAME
+        engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[NAME]
         graph.create_execution_plan(engine_id, {})
         graph.select_plan(graph.get_execution_plan_count() - 1)
         with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="paged") as decline:
@@ -5857,3 +5869,12 @@ def test_sdpa_reference_matmul(contraction, dtype):
                 grads = torch.autograd.grad(actual, (a, b), weights)
                 for grad, expected_grad in zip(grads, expected_grads):
                     torch.testing.assert_close(grad.cpu().double(), expected_grad, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+class TestSM120EmptyQueryCompatibility:
+    from sdpa.graph import test_sdpa_sm120_empty_q_compat as _compat
+    test_backend_boundary = staticmethod(_compat.test_sm120_empty_query_backend_fix_boundary)
+    test_cold_packed_empty = staticmethod(_compat.test_sm120_cold_packed_empty_query)
+    test_default_and_capture = staticmethod(_compat.test_sm120_empty_query_default_and_changed_capture)
+    test_length_transports = staticmethod(_compat.test_sm120_empty_query_length_transports)

@@ -20,6 +20,10 @@ def mismatch(facts, knobs):
         return "ordinary D32 requires one CTA; paged D192 requires two CTAs"
     if cga not in (1, 2):
         return "ordinary multi-Q requires one or two CTAs"
+    if facts.d_qk == 128 and facts.thd and cga == 1 and (knobs.split_kv or 1) > 1:
+        # Packed THD split uses the shared single-Q entry for both uniform
+        # half storage and mixed half-Q/FP8-KV. This body has no such entry.
+        return "D128 THD split uses the shared SM100 single-Q body"
     if facts.uniform_dtype and facts.d_qk in (64, 128) and cga == 1:
         if (knobs.split_kv or 1) > 1 and (facts.thd or not facts.has_paged_kv) and (facts.d_qk == 128 or knobs.tile_n in (None, 128)):
             return "this split geometry uses the shared SM100 single-Q body"
