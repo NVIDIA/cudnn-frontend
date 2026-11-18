@@ -1324,6 +1324,9 @@ def test_sm100_windowed_d128_prefill_keys_unpacked_groups_apart(device_cc):
     assert pt.class_key(row, packed)[8] == "gqa"
     assert pt.lookup(row, packed) is True
     assert pt.matched_entry(row, packed).study.endswith("_swa_prefill_20261031")
+    for verify in (paged(h_q=80, h_kv=8, s_q=8, thd=False), paged(h_q=72, h_kv=8, s_q=255)):  # below the measured S_q: as before
+        assert pt.class_key(row, verify)[8] == "gqa"
+        assert pt.matched_entry(row, verify).study.endswith("_swa_prefill_20261031")
     assert pt.class_key(row, paged(has_paged_kv=False, padded=False, page_size=0))[8] == "gqa"
 
 
@@ -1357,6 +1360,9 @@ def test_sm100_dense_d192x128_window_sink_prefill_entries_follow_the_study(devic
         assert pt.lookup(row, facts) is lead, over
         assert pt.matched_entry(row, facts).study == "sm100_d192x128_swa_sink_pack_20261118"
     assert pt.class_key(row, dense(has_paged_kv=True, page_size=16, padded=True, thd=True, h_q=48))[8] == "gqa"
+    for over in (dict(h_q=16, h_kv=1, s_q=8, s_kv=131072, b=128), dict(h_q=48, s_q=255)):  # below the measured S_q: the hand rules
+        assert pt.class_key(row, dense(**over))[8] == "gqa_short", over
+        assert pt.lookup(row, dense(**over)) is None, over
 
 
 @pytest.mark.L0

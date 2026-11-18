@@ -46,6 +46,7 @@ def _dtype_name(dtype) -> Optional[str]:
 DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80"})
 SM80_DET_NARROW_WINDOW_MAX_LEFT = 383  # window_left at or below keys `window_narrow` on sdpa_bwd_sm80 prefill_det (256 measured, 512 not)
 SM120_PAGED_BODY_MAX_S_Q = 16  # sdpa_fwd_prefill_sm120 paged d128 up to this s_q, off the decode tile, keys `gqa_body`
+SM100_WINDOW_PREFILL_MIN_S_Q = 256  # the smallest S_q the SM100 windowed packing studies timed (sm100_d192x128_swa_sink_pack_20261118)
 """Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
 (SM120: the two-kernel dS / dQ split), so those graphs neither share the default classes' entries nor count as unmeasured."""
 
@@ -157,19 +158,35 @@ def _unpacked_decode(row: str, facts) -> bool:
     return _decode_pack_group(row, facts) == 1
 
 
+def _sm100_window_prefill_measured(row: str, facts) -> Optional[bool]:
+    """Whether an SM100 / SM103 windowed GQA graph of the two packing studies' classes (paged d128; dense d192 x 128) lies in their
+    measured S_q range; None outside those classes. Both studies timed S_q >= 256 only. A spec-decode verify graph (S_q 5-16) keys
+    `prefill` here too, and on the GB300 / GB200 nightlies the row's existing order led those 2-4.7x (ripple / laguna d128, mimo
+    d192 x 128 at S_q 8): below the floor the packed / unpacked split does not apply."""
+    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)):
+        return None
+    if ((facts.d_qk, facts.d_v), bool(facts.has_paged_kv)) not in (((128, 128), True), ((192, 128), False)):
+        return None
+    if facts.window_left is None or facts.s_q <= 4 or facts.h_q == facts.h_kv:
+        return None
+    return facts.s_q >= SM100_WINDOW_PREFILL_MIN_S_Q
+
+
 def _sm100_unpacked_window_prefill(row: str, facts) -> bool:
     """SM100 / SM103 windowed prefill whose GQA group the row does not pack whole (the packed group must divide its tile), in the
     measured classes: paged d128, where groups 5 / 6 / 9 / 10 / 12 ran unpacked at parity with the backend (up to 1.23) and group 8
     ran 0.75-0.80 (sm100_prefill_d192_gaps_20261118, d128 diagnostic family); dense d192 x 128 with a window, where group 6 ran
     at parity and groups 4 / 8 / 16 ran 0.66-0.72 (sm100_d192x128_swa_sink_pack_20261118)."""
-    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)):
-        return False
-    if ((facts.d_qk, facts.d_v), bool(facts.has_paged_kv)) not in (((128, 128), True), ((192, 128), False)):
-        return False
-    if facts.window_left is None or facts.s_q <= 4 or facts.h_q == facts.h_kv:
+    if not _sm100_window_prefill_measured(row, facts):
         return False
     pack = _row_pack_group(row, facts)
     return pack is not None and pack < facts.h_q // facts.h_kv
+
+
+def _sm100_short_window_d192(row: str, facts) -> bool:
+    """Dense d192 x 128 windowed graphs below the packing study's S_q floor: their own class with no entry, so the row's hand rules
+    keep deciding them as before the study."""
+    return _sm100_window_prefill_measured(row, facts) is False and (facts.d_qk, facts.d_v) == (192, 128)
 
 
 def _sm90_partial_pack(row: str, facts) -> bool:
@@ -283,6 +300,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "gqa_split" if _packed_split(row, facts) else "gqa"
     if group == "gqa" and _sm120_paged_body(row, facts):
         group = "gqa_body"
+    if group == "gqa" and _sm100_short_window_d192(row, facts):
+        group = "gqa_short"
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
     # an on-tile study never answers.
     kv_off_tile = facts.s_kv % 128 != 0
