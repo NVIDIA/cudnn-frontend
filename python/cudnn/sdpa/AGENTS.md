@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Check contradictory mask attributes before normalizing legacy spellings. A
+causal flag can overwrite the explicit diagonal alignment and silently change
+non-square attention. Keep Python validation, shared analyzer facts and all six
+compiled SDPA builders consistent. `test_sdpa_causal_alignment.py` covers both
+directions, half/FP8/MXFP8, every architecture's candidate declarations and legal
+mask controls; architecture skips must not hide a host-side semantic regression.
+In synthetic device fixtures, replace both `_device_cc` and `_device_sm_count`;
+leaving either live still probes CUDA, even if Torch device helpers are mocked.
+
 An isolated implementation's thin host entry must not import the engine
 registry that imports it. Inject common lowering and knob construction from
 the registry. Keep historical-domain metadata with engine definitions so

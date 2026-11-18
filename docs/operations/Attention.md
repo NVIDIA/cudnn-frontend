@@ -441,6 +441,15 @@ graph.sdpa(
   - Sliding window: Set `left_bound` to window size
   - Band attention: Set both `left_bound` and `right_bound`
 
+The legacy `use_causal_mask=True` flag selects top-left causal masking. Combining
+it with `diagonal_alignment=BOTTOM_RIGHT` raises an error in every SDPA forward
+and backward API, including FP8 and MXFP8. For bottom-right causal masking, use
+`use_causal_mask_bottom_right=True`, or set the right band bound to zero with
+`diagonal_alignment=BOTTOM_RIGHT`. The bound is named `diagonal_band_right_bound`
+on `sdpa`, `sdpa_backward`, and `sdpa_mxfp8`, and `right_bound` on `sdpa_fp8`,
+`sdpa_fp8_backward`, and `sdpa_mxfp8_backward`. An alignment alone, without a band
+or causal flag, does not enable masking.
+
 - **Paged attention**: Enables non-contiguous K/V caches to reduce memory fragmentation. See the [PagedAttention paper](https://arxiv.org/abs/2309.06180).
   - **Requirements**:
     - Pass the `paged_attention_k_table` tensor with block offsets into the K container (optional if K is not paged)
