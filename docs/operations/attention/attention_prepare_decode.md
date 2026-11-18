@@ -151,9 +151,10 @@ The sum tree and the rounding chain are the contract, not a tolerance. Per head 
 6. The gate rows and the value rows are bit copies.
 
 What changes bytes: the geometry (the tree and the divisor), `eps`, the position form with its section (which
-position row an index reads; under underflow also item 5), and the operand values. What never changes a byte: the token count, a token's place in the call, the other tokens, the page
-size and the integer dtypes (they select addresses and load widths), `pdl`, `pdl_release`, and who owns an output. A
-token alone writes the bytes it writes inside a call of up to 1024 tokens.
+position row an index reads; under underflow also item 5), and the operand values. What never changes a byte: the
+token count, a token's place in the call, the other tokens, the page size and the integer dtypes (they select
+addresses and load widths), `pdl`, `pdl_release`, and who owns an output. A token alone writes the bytes it writes
+inside a call of up to 1024 tokens.
 
 Against a PyTorch chain with the same rounding points whose mean and root are evaluated in fp64 (the suite's twin),
 every pass-through element is within one bf16 unit, the unit taken at the larger of the two magnitudes, and every
