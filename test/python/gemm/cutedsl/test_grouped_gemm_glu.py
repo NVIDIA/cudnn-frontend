@@ -859,10 +859,7 @@ def _assert_adjacent_e4m3(actual, reference, *, max_mismatch_ratio=1e-5):
     max_ulp = int(ulp_diff.max().item())
     mismatch_ratio = float((ulp_diff != 0).float().mean().item())
     assert max_ulp <= 1, f"PowLU MXFP8 payload differs by {max_ulp} E4M3 ULPs"
-    assert mismatch_ratio <= max_mismatch_ratio, (
-        f"PowLU MXFP8 mismatch ratio {mismatch_ratio:.3e} exceeds "
-        f"{max_mismatch_ratio:.3e}"
-    )
+    assert mismatch_ratio <= max_mismatch_ratio, f"PowLU MXFP8 mismatch ratio {mismatch_ratio:.3e} exceeds " f"{max_mismatch_ratio:.3e}"
 
 
 def _check_powlu_mxfp8_reference(inputs, outputs, cfg):
@@ -907,9 +904,7 @@ def _check_powlu_mxfp8_reference(inputs, outputs, cfg):
         rtol=0,
         atol=0,
     )
-    _assert_adjacent_e4m3(
-        outputs["d_col_tensor"].cpu(), reference["d_col_ref"].cpu()
-    )
+    _assert_adjacent_e4m3(outputs["d_col_tensor"].cpu(), reference["d_col_ref"].cpu())
 
 
 @pytest.mark.L0
