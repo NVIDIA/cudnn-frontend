@@ -5,10 +5,11 @@
 tables, the forms and three launch arms, every typed decline of the entry (CPU tensors) with the three construction facts (page
 size, position dtype, slot dtype), the overlap rule on views that interleave in one allocation, the DSL gates (version, target,
 compiler), the plan-time-only compile key, the launch facts, the lazy export, and the kernel's RENDERING for the claimed targets
-(the instructions that define the sum tree and the rounding chain; the position of the dependent-launch wait and release; the form
-inside the first 100 characters of the symbol); on a cc 10.x device the bytes against the reference of ``attention_prepare_utils``
-(a PyTorch twin with the kernel's rounding points and its band; the gate rows, the value rows and every untouched pool row
-bitwise), edge rows, the slot predicate (negative slots, a short and an empty slot vector, a slot at the pool's end and one past
+(the instructions that define the sum tree and the rounding chain, the operand selects that decide which product of a rotation
+is the fused one; the position of the dependent-launch wait and release; the form inside the first 100 characters of the
+symbol); on a cc 10.x device the bytes against the reference of ``attention_prepare_utils`` (a PyTorch twin with the kernel's
+rounding points and its band; the gate rows, the value rows and every untouched pool row bitwise), the fused product of each
+rotary half BITWISE on rows whose products underflow, edge rows, the slot predicate (negative slots, a short and an empty slot vector, a slot at the pool's end and one past
 it), output ownership per output, the bit-neutral arms, the wait behind a predecessor that released early, the release beside a
 dependent launch, CUDA-graph replay, the warm path's allocation / synchronization discipline and the profiler's record of a launch.
 
@@ -59,6 +60,10 @@ from attention_prepare_utils import (  # noqa: E402  (the form tables, the opera
     fresh_outputs,
     make_entry,
     make_operands,
+    pool_rows,
+    twin_rows,
+    underflow_operands,
+    underflow_rotary_bits,
 )
 
 from cudnn.attention_prepare.frost import prepare_decode as entry  # noqa: E402
@@ -176,7 +181,7 @@ def test_construction_declines_name_the_argument():
     for geometry in (G(32, 8, 256, 64), G(24, 4, 128, 64), G(24, 4, 256, 32), G(24, 4, 512, 64)):
         with pytest.raises(NotImplementedError, match=r"serves the geometries \(HEADS, KV_HEADS, HEAD_DIM, ROTARY_DIM\) \(24, 4, 256, 64\)"):
             _make(geometry=geometry)
-    for eps in (0.0, -1e-6, float("nan"), float("inf"), 1e-60, "1e-6", None, True):
+    for eps in (0.0, -1e-6, float("nan"), float("inf"), 1e-60, 1e39, 10**400, -(10**400), "1e-6", None, True):
         with pytest.raises(ValueError, match="eps must be a finite positive float"):
             _make(eps=eps)
     for positions in ("2d", "3D", None, 3, ""):
@@ -231,6 +236,8 @@ def test_construction_declines_name_the_argument():
         kcfg.validate_cfg(dict())
     with pytest.raises(TypeError, match="pdl must be a bool"):
         kcfg.validate_cfg(replace(_make(), PDL=1))
+    with pytest.raises(TypeError, match=r"SECTION must be a tuple of three ints or None, got \[11, 11, 10\]"):
+        kcfg.validate_cfg(replace(_make(), SECTION=[11, 11, 10]))  # a Cfg built by hand: the constructor's path stores the tuple
     for rows in (0, -3):
         with pytest.raises(ValueError, match="rows must be at least 1"):
             kcfg.validate_rows(rows)
@@ -239,6 +246,23 @@ def test_construction_declines_name_the_argument():
             kcfg.validate_rows(rows)
     with pytest.raises(NotImplementedError, match="at most 1024 rows"):
         kcfg.validate_rows(1025)
+
+
+def test_config_declines_a_geometry_the_body_cannot_hold(monkeypatch):
+    """The structural couplings of the kernel body are pinned in the config's validator, behind the served set: with a geometry
+    ADMITTED to the served set whose rotary part is not exactly one warp (or whose block is not a power-of-two count of full warps
+    of at most 32), the config is still declined by type -- the body would address a partner lane that does not hold it."""
+    G = kcfg.AttentionPrepareGeometry
+    for geometry, text in ((G(24, 4, 256, 128), "ROTARY_DIM 128"), (G(24, 4, 256, 32), "ROTARY_DIM 32"), (G(24, 4, 4096, 64), "HEAD_DIM 4096")):
+        as_tuple = (geometry.HEADS, geometry.KV_HEADS, geometry.HEAD_DIM, geometry.ROTARY_DIM)
+        with pytest.raises(NotImplementedError, match="serves the geometries"):
+            _make(geometry=geometry)
+        monkeypatch.setattr(kcfg, "SERVED_GEOMETRIES", (*kcfg.SERVED_GEOMETRIES, as_tuple))
+        with pytest.raises(
+            NotImplementedError, match=rf"the kernel body needs HEAD_DIM / 2 threads .* a rotary part of exactly one warp \(ROTARY_DIM 64\); got .*{text}"
+        ):
+            _make(geometry=geometry, mrope_section=None, positions="1d")
+    assert _make().GEOMETRY == GEOMETRY, "the served geometry still passes with the widened set"
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -466,6 +490,58 @@ def _mutations():
     )
     m["slot_mapping of rank 2"] = (f64, swap("slot_mapping", lambda o: o["slot_mapping"].reshape(1, T)), ValueError, "slot_mapping must be 1-D")
     m["slot_mapping strided"] = (f64, swap("slot_mapping", lambda o: torch.arange(2 * T)[::2]), ValueError, "slot_mapping must be contiguous")
+    m["slot_mapping misaligned"] = (
+        f64,
+        swap("slot_mapping", lambda o: _misaligned_int64((T,))),
+        ValueError,
+        "slot_mapping must be aligned to its 8-byte element",
+    )
+    # a pool whose OWN rows share bytes: two thread blocks of one launch would write one address (the slot contract cannot exclude it)
+    m["k_pool with one head expanded to four"] = (
+        f64,
+        swap("k_pool", lambda o: torch.zeros(2, 1, 64, D, dtype=BF16).expand(-1, KV_HEADS, -1, -1)),
+        ValueError,
+        r"k_pool must not overlap itself: stride\[1\] = 0 elements is shorter than the 256 elements the axes inside it span",
+    )
+    m["v_pool with one page expanded to two"] = (
+        f64,
+        swap("v_pool", lambda o: torch.zeros(1, KV_HEADS, 64, D, dtype=BF16).expand(2, -1, -1, -1)),
+        ValueError,
+        r"v_pool must not overlap itself: stride\[0\] = 0 elements is shorter than the 256 elements",
+    )
+    m["k_pool with rows that overlap by half"] = (
+        f64,
+        swap(
+            "k_pool", lambda o: torch.zeros(2 * KV_HEADS * 64 * 128 + D, dtype=BF16).as_strided((2, KV_HEADS, 64, D), (KV_HEADS * 64 * 128, 64 * 128, 128, 1))
+        ),
+        ValueError,
+        r"k_pool must not overlap itself: stride\[2\] = 128 elements is shorter than the 256 elements .*two of its rows share bytes",
+    )
+    m["v_pool with one row expanded over a page"] = (
+        f32,
+        swap("v_pool", lambda o: torch.zeros(2, KV_HEADS, 1, D, dtype=BF16).expand(-1, -1, 16, -1)),
+        ValueError,
+        r"v_pool must not overlap itself: stride\[2\] = 0 elements",
+    )
+    # a call above the token ceiling, and an operand off the device, on the HOST (metadata only)
+    m["more tokens than the ceiling"] = (
+        f64,
+        lambda o: make_operands(kcfg.MAX_ROWS + 1, f64),
+        NotImplementedError,
+        r"serves at most 1024 rows \(tokens\) per call; got 1025",
+    )
+    m["operands off the entry's device"] = (
+        f64,
+        lambda o: dict(o, _out=dict(device=torch.device("cuda", 0))),
+        ValueError,
+        r"every operand must live on one device, the entry's \(cuda:0\); q is on cpu",
+    )
+    m["gate on another device than q"] = (
+        f64,
+        swap("gate", lambda o: torch.empty(T, HEADS, D, dtype=BF16, device="meta")),
+        ValueError,
+        r"every operand must live on one device, q's \(cpu\); gate is on meta",
+    )
     # overlap of a written operand with another operand
     m["q_out is the query rows' storage"] = (
         f64,
@@ -511,19 +587,22 @@ def test_typed_declines_name_the_operand(name):
 
 def test_declines_run_in_front_of_the_paged_contract_without_the_dsl(monkeypatch):
     """A host without the CuTe DSL: the checks in front of the pools run and decline by their own type; a call that reaches the
-    pools gets the typed decline that names the missing DSL (the paged-pool contract's package imports it), never an import error."""
+    pools gets the typed decline that names the missing DSL (the paged-pool contract's package imports it), never an import error.
+    The contract module's import is BLOCKED here (``None`` in ``sys.modules``: the import statement raises ``ImportError``, as the
+    package's own import does on a host without the DSL), so the entry's real wrapper runs.  An import that fails although a DSL is
+    installed is the same typed decline, naming the module."""
     from cudnn.frost import buffers
 
     ops = make_operands(3, DEFAULT_FORM)
-
-    def absent():
-        raise NotImplementedError("the attention preparation decode step requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed")
-
-    monkeypatch.setattr(entry, "_paged_contract", absent)
+    monkeypatch.setitem(sys.modules, "cudnn.gated_attention_block.cache_write_contract", None)
     monkeypatch.setattr(buffers, "_DSL_STATE", (False, None))
     with pytest.raises(TypeError, match="q must be torch.bfloat16"):
         _check(DEFAULT_FORM, dict(ops, q=ops["q"].float()))
-    with pytest.raises(NotImplementedError, match="requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed"):
+    with pytest.raises(NotImplementedError, match="requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed") as declined:
+        _check(DEFAULT_FORM, ops)
+    assert isinstance(declined.value.__cause__, ImportError), "the decline carries the import error it stands for"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    with pytest.raises(NotImplementedError, match=r"the paged-pool contract \(cudnn.gated_attention_block.cache_write_contract\) could not be imported"):
         _check(DEFAULT_FORM, ops)
 
 
@@ -555,6 +634,27 @@ def test_overlap_rule_separates_views_that_interleave_in_one_allocation():
     pairs = slab[:, : HEADS * 2 * D].view(3, HEADS, 2 * D)
     q, gate = pairs[..., :D], pairs[..., D:]
     assert foot(q)[2:] == (2 * D, 4 * D) and not share(foot(q), foot(gate)), "the query rows and the gate rows of one slab share no byte"
+
+
+def test_a_pools_own_rows_share_no_byte():
+    """The walk that proves a pool's rows disjoint (``_own_rows_overlap``): the two halves of a packed cache, a compact pool and a
+    pool whose head axis is the inner one (rows of one page side by side) pass at either page size and with ONE page; an expanded
+    page, head or row axis, rows that overlap by a part, and heads laid closer than a page of rows are named with the axis, its
+    stride (in elements) and the span it must clear."""
+    walk = entry._own_rows_overlap
+    for page in (64, 16):
+        for pages in (1, 3):
+            cache = canary_cache(pages, page)
+            assert walk(cache[..., :D]) is None and walk(cache[..., D:]) is None and walk(cache) is None
+            compact = torch.zeros(pages, KV_HEADS, page, D, dtype=BF16)
+            assert walk(compact) is None and walk(compact.transpose(1, 2).contiguous().transpose(1, 2)) is None
+        one = torch.zeros(1, KV_HEADS, page, D, dtype=BF16)
+        assert walk(one.expand(4, -1, -1, -1)) == (0, 0, D)  # an expanded axis is the walk's first step: nothing clears a zero stride
+        assert walk(one[:, :1].expand(-1, KV_HEADS, -1, -1)) == (1, 0, D)
+        assert walk(one[:, :, :1].expand(-1, -1, page, -1)) == (2, 0, D)
+        flat = torch.zeros(4 * KV_HEADS * page * D, dtype=BF16)
+        assert walk(flat.as_strided((2, KV_HEADS, page, D), (KV_HEADS * page * D, page * D, D // 2, 1))) == (2, D // 2, D)
+        assert walk(flat.as_strided((2, KV_HEADS, page, D), (KV_HEADS * page * D, page * D - D, D, 1))) == (1, page * D - D, page * D)
 
 
 def _intercepted_entry(monkeypatch, form=DEFAULT_FORM, tokens=3):
@@ -1029,7 +1129,11 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     multiply and add) and seven ``mul.f32``; NINE ``shfl.sync.bfly`` whose offsets read, in program order, 16, 8, 4, 2, 1 (inside a
     warp), 2, 1 (over the four warp sums: the SEVEN shuffles of the reduction) and 16, 16 (the two rotary partners); ONE ``bar.sync``
     with one ``st.shared`` in front of it and one ``ld.shared`` behind it that is NOT under a predicate (every lane loads); two
-    ``cvt.rn.bf16x2.f32`` (the rounding of record and the rotated pair); two 32-bit global stores; ``.reqntid 128``; no ``mbarrier`` /
+    ``cvt.rn.bf16x2.f32`` (the rounding of record and the rotated pair); WHICH PRODUCT OF THE SECOND ROTARY HALF IS THE FUSED ONE:
+    under ``"3d"`` NO ``selp.f32`` (both halves are ``fma(own, cos, partner x sin)``), under ``"1d"`` EIGHT, all under the one
+    predicate of the rotary half (the multiply's two operands and the fused multiply-add's two multiplicands, per element of the
+    pair: the second half is ``fma(partner, sin, own x cos)``) -- the two orders write other bytes where a product underflows, and
+    a device cell of this module compares those bytes; two 32-bit global stores; ``.reqntid 128``; no ``mbarrier`` /
     ``cp.async`` / ``tcgen05``; NO integer ``div`` / ``rem`` (the page size is a compile-time power of two: a shift and a mask); the
     symbol = the kernel's name + the form text inside the first 100 characters; thirty kernel parameters whatever the form.  THE
     LOAD WIDTHS follow the form's integer dtypes: an int64 ``positions`` / ``slot_mapping`` value is ONE ``ld.global.v2.b32`` (three
@@ -1039,14 +1143,18 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     (the weights) sits in front of the wait and every other global load and both stores behind it; within a form the three arms hold
     the same instructions.  With an nvdisasm that decodes the cubin, also the SASS: one ``BAR.SYNC``, one shared store and load, no
     spill, ONE ``MUFU.RSQ`` directly behind the ``FFMA`` that folds the division by 256 and the eps (a register multiplier and the
-    eps as its immediate addend), ``ACQBULK`` / ``PREEXIT`` as the arm says and in that order around the global accesses.  A compile
-    failure FAILS; a DSL that does not serve the target (version, target list, compiler) SKIPS with the gate's text."""
+    eps as its immediate addend), ``ACQBULK`` / ``PREEXIT`` as the arm says and in that order around the global accesses; whether
+    that half ran is one line of the run's "measured" section (COMPARED with its count, or NOT COMPARED: no disassembler decoded
+    the cubins).  A compile failure FAILS; a DSL that does not serve the target (version, target list, compiler) SKIPS with the
+    gate's text."""
+    import frost_routing
+
     msg = entry._dsl_error(cc)
     if msg is not None:
         pytest.skip(msg)
     cells = [(form, arm, arm_id) for form in FORMS for arm, arm_id in zip(LAUNCH_ARMS, LAUNCH_ARM_IDS)]
     major, kept = _render(tmp_path, arch, [_spec(form, arm) for form, arm, _ in cells])
-    neutral, symbols = {}, set()
+    neutral, symbols, disassembled = {}, set(), 0
     for form, arm, arm_id in cells:
         files = kept.get(_spec(form, arm), [])
         ptx_files = [f for f in files if f.endswith(".ptx")]
@@ -1071,6 +1179,7 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
             "st.shared": 1,
             "ld.shared": 1,
             "cvt.rn.bf16x2.f32": 2,
+            "selp.f32": 8 if positions == "1d" else 0,
             "st.global.b32": 2,
             "st.global": 2,
             "ld.global.v2.b32": wide,
@@ -1094,6 +1203,8 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
         assert f".target {arch}" in ptx and ".reqntid 128, 1, 1" in ptx, what
         offsets = [int(re.search(r"shfl\.sync\.bfly\.b32\s+%r\d+, %r\d+, (\d+),", ln).group(1)) for ln in lines if "shfl.sync.bfly" in ln]
         assert offsets == [16, 8, 4, 2, 1, 2, 1, 16, 16], f"{what}: the shuffle offsets in program order are {offsets}"
+        selects = {re.search(r"(%p\d+);", ln).group(1) for ln in lines if "selp.f32" in ln}
+        assert len(selects) == int(positions == "1d"), f"{what}: the operand selects of the rotation are under the predicates {sorted(selects)}"
         at = {needle: next(i for i, ln in enumerate(lines) if needle in ln) for needle in ("st.shared", "bar.sync", "ld.shared")}
         shuffles = [i for i, ln in enumerate(lines) if "shfl.sync.bfly" in ln]
         assert shuffles[4] < at["st.shared"] < at["bar.sync"] < at["ld.shared"] < shuffles[5], f"{what}: the two levels do not bracket the barrier"
@@ -1119,6 +1230,7 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
         cubins = [f for f in files if f.endswith(".cubin")]
         sass = _sass(cubins[0]) if cubins else None
         if sass is not None:
+            disassembled += 1
             ops = [m.group(1) for m in (re.match(r"\s*/\*[0-9a-f]+\*/\s+(?:@!?U?P\d+\s+)?([A-Z0-9_.]+)", ln) for ln in sass) if m]
             n = lambda needle: sum(1 for op in ops if op.startswith(needle))  # noqa: E731
             assert n("BAR.SYNC") == 1 and n("STS") == 1 and n("LDS") == 1, f"{what}: the barrier and the warp-sum slot in the SASS"
@@ -1139,6 +1251,10 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
             if release:
                 assert not any(op.startswith(("LDG", "STG")) for op in ops[: ops.index("PREEXIT")]), f"{what}: a global access in front of the release"
     assert len(symbols) == len(cells), "two forms or arms share a kernel symbol"
+    frost_routing.measured(
+        f"the SASS half of the rendering pins, {arch} (compiler CUDA {major})",
+        f"COMPARED: {disassembled} of {len(cells)} renderings" if disassembled else f"NOT COMPARED: no nvdisasm decoded the {len(cells)} cubins",
+    )
     for form in FORMS:
         for arm_id in ("wait", "release-wait"):
             assert neutral[(form, arm_id)] == neutral[(form, "plain")], f"{arch} {form}: the {arm_id} arm holds other instructions than the plain launch"
@@ -1216,6 +1332,42 @@ def test_edge_rows():
         outs, ops = _run(k, ops)
         assert_twin(ops, outs, k.cfg, label=f"{form} edge")
         assert bool((outs["q_out"][0].float() == 0).all()) and bool((outs["q_out"][1].float() == 0).all()), "a zero row normalizes to zeros"
+
+
+@pytest.mark.parametrize("form", sorted(FORMS))
+def test_fused_product_of_a_rotation_is_the_forms_on_underflowing_rows(form):
+    """WHICH product of a rotation is the fused one, BITWISE.  The twin's band cannot see it: the two orders of the second rotary
+    half agree wherever both products are exact in fp32.  On rows of bf16 subnormals rotated by table rows of bf16 subnormals every
+    product underflows, each rotated value is a zero, and its SIGN is the sign of its fused product -- so the expected bits follow
+    from sign bits alone (``underflow_rotary_bits``: no product and no root on the host).  The rotary part of ``q_out`` and of every
+    written K pool row equals them bitwise; the bits of the OTHER order differ from them in hundreds of elements of the same call
+    (the cell is not vacuous); the twin, which follows the form's order, agrees with the sign arithmetic bit for bit; the rest of
+    the call holds the twin's band, the gate and value rows bitwise."""
+    dev = _device_or_skip()
+    k = _entry(dev, form)
+    cfg = k.cfg
+    other = "1d" if cfg.POSITIONS == "3d" else "3d"
+    for tokens, seed in ((1, 41), (9, 42), (160, 43)):
+        ops = underflow_operands(tokens, form, dev, seed=seed)
+        outs, ops = _run(k, ops)
+        label = f"{form} underflowing rows, tokens {tokens}"
+        assert_twin(ops, outs, cfg, label=label)
+        slots = ops["slot_mapping"].detach().cpu().tolist()
+        k_rows, _ = pool_rows(ops["cache"], slots, cfg.PAGE_SIZE)
+        for name, x, weight, got in (("q_out", ops["q"], ops["q_weight"], outs["q_out"]), ("the K pool rows", ops["k"], ops["k_weight"], k_rows)):
+            want = underflow_rotary_bits(x, weight, ops["positions"], ops["cos_sin"], cfg)
+            wrong = underflow_rotary_bits(x, weight, ops["positions"], ops["cos_sin"], cfg, positions_form=other)
+            seen = bits(got)[..., :ROTARY]
+            assert int((want != wrong).sum()) > want.numel() // 8, f"{label}: the two product orders agree on these operands: the cell compares nothing"
+            assert torch.equal(want[..., :HALF], wrong[..., :HALF]), "the first rotary half has ONE order"
+            differing = int((seen != want).sum())
+            as_other = int((seen == wrong).sum()) - int((want == wrong).sum())
+            assert differing == 0, (
+                f"{label}: {name}: {differing} of {want.numel()} rotated elements are not the zero of the form's fused product "
+                f"({as_other} of them are the zero of the other order: fma(n[r], sin, n[r + HALF] x cos) against fma(n[r + HALF], cos, n[r] x sin))"
+            )
+            ref = twin_rows(x, weight, ops["positions"], ops["cos_sin"], cfg)[0]
+            assert torch.equal(bits(ref)[..., :ROTARY], want), f"{label}: the twin's rotated zeros are not the sign arithmetic's"
 
 
 def test_slot_predicate_decides_which_pool_rows_are_written():

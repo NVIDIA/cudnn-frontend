@@ -160,6 +160,44 @@ def bind(ops, form):
     return ops
 
 
+#: the table rows :func:`underflow_operands` fills with bf16 subnormals; every position of its call names one of them
+UNDERFLOW_TABLE_ROWS = (4, 5, 6, 7)
+
+
+def _subnormals(shape, gen):
+    """bf16 SUBNORMALS of ``shape``: a zero exponent field, a random sign and a random non-zero mantissa."""
+    raw = torch.randint(0, 1 << 16, shape, generator=gen, dtype=torch.int32)
+    pattern = (raw & 0x807F) | 0x0001
+    return ((pattern ^ 0x8000) - 0x8000).to(I16).view(BF16)
+
+
+def underflow_operands(tokens, form=DEFAULT_FORM, device="cpu", seed=0):
+    """Operands whose rotary PRODUCTS UNDERFLOW, for the cell that pins which product of a rotation is the fused one.  Every head row
+    is bf16 subnormals (random signs) and every position of the call names a table row of bf16 subnormals (under three position
+    rows each row names its own).  The weights keep ``|1 + weight|`` between 1 / 8 and 2, with a stretch of ``-2.5`` (a negative
+    gain) in each rotary half.  Then: a row's sum of squares underflows to zero, so its root is the root of eps alone; every
+    normalized element is a normal fp32 value whose SIGN is ``sign(x) ^ sign(1 + weight)``; every rotary product lies far below the
+    smallest fp32 subnormal; and each rotated value is a ZERO with the sign of its FUSED product -- the rounded product is a zero
+    and cannot change the sign of a non-zero exact sum (:func:`underflow_rotary_bits`)."""
+    ops = make_operands(tokens, form, device="cpu", seed=seed)
+    gen = torch.Generator(device="cpu").manual_seed(seed + 7919)
+    ops["slab"][:] = _subnormals((tokens, SLAB), gen)
+    for name in ("q_weight", "k_weight"):
+        ops[name][:] = ops[name].float().clamp(-0.875, 0.875).bfloat16()
+        ops[name][4:8] = -2.5
+        ops[name][HALF + 8 : HALF + 12] = -2.5
+    first, count = UNDERFLOW_TABLE_ROWS[0], len(UNDERFLOW_TABLE_ROWS)
+    ops["cos_sin"][first : first + count] = _subnormals((count, ROTARY), gen)
+    token = torch.arange(tokens)
+    if FORMS[form][0] == "3d":
+        for row in range(3):
+            ops["positions"][row] = (first + (token + row) % count).to(ops["positions"].dtype)
+    else:
+        ops["positions"][:] = (first + token % count).to(ops["positions"].dtype)
+    names = ("slab", "q_weight", "k_weight", "cos_sin", "positions", "cache", "slot_mapping")
+    return bind({name: ops[name].to(device) for name in names}, form)
+
+
 CALL_ORDER = ("q", "gate", "k", "v", "q_weight", "k_weight", "cos_sin", "positions", "k_pool", "v_pool", "slot_mapping")
 
 
@@ -233,6 +271,29 @@ def twin(ops, cfg):
     q_ref, q_band = twin_rows(ops["q"], ops["q_weight"], ops["positions"], ops["cos_sin"], cfg)
     k_ref, k_band = twin_rows(ops["k"], ops["k_weight"], ops["positions"], ops["cos_sin"], cfg)
     return dict(q_out=q_ref, q_band=q_band, k_rows=k_ref, k_band=k_band, gate_out=ops["gate"].detach().cpu().clone(), v_rows=ops["v"].detach().cpu().clone())
+
+
+def underflow_rotary_bits(x, weight, positions, table, cfg, positions_form=None):
+    """Host int32 ``[tokens, heads, ROTARY_DIM]``: the bit patterns (``0x0000`` or ``0x8000``) of the rotated values of head rows
+    ``x`` of :func:`underflow_operands`, by SIGN arithmetic alone -- no product and no root is evaluated.  ``sign(n) = sign(x) ^
+    sign(1 + weight)``.  First half: ``fma(n[r], cos, -(n[r + HALF] sin))`` -> the sign of ``n[r] cos``.  Second half: the sign of
+    its FUSED product -- ``n[r + HALF] cos`` under ``"3d"``, ``n[r] sin`` under ``"1d"``.  ``positions_form`` overrides the config's
+    position form in that last step only: the bits the OTHER order would write."""
+    order = cfg.POSITIONS if positions_form is None else positions_form
+    negative = lambda t: (bits(t) >> 15).bool()  # noqa: E731
+    gain = weight.detach().cpu().float() + 1.0  # exact: a bf16 weight of magnitude below 4
+    assert bool((gain.abs() >= 0.125).all()), "the cell's weights keep the gain away from zero"
+    sign_n = negative(x) ^ (gain < 0).reshape(1, 1, -1)  # [tokens, heads, D]
+    pos = positions.detach().cpu().long().reshape(-1, x.shape[0])  # [1 or 3, tokens]
+    selected = pos[position_rows(cfg)].t()  # [tokens, HALF]: the position of rotary index r for each token
+    sign_table = negative(table)
+    column = torch.arange(cfg.HALF).reshape(1, -1)
+    sign_cos = sign_table[selected, column].reshape(x.shape[0], 1, cfg.HALF)
+    sign_sin = sign_table[selected, column + cfg.HALF].reshape(x.shape[0], 1, cfg.HALF)
+    n1, n2 = sign_n[..., : cfg.HALF], sign_n[..., cfg.HALF : cfg.ROTARY_DIM]
+    first = n1 ^ sign_cos
+    second = (n2 ^ sign_cos) if order == "3d" else (n1 ^ sign_sin)
+    return torch.cat([first, second], dim=-1).to(torch.int32) << 15
 
 
 def assert_band(got, ref, band, label):

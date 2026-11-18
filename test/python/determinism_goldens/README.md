@@ -3410,22 +3410,27 @@ changes any of them (2026-11-18 UTC, the runtime above; the four golden files ar
 `test_replay_on_a_fresh_entry_and_fresh_operands` 2, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 2,
 `test_reordered_and_duplicated_tokens_and_neighbour_isolation` 2, `test_slots_decide_pool_rows_and_nothing_else` 2,
 `test_inputs_are_unmodified` 1, `test_crosses_scheduling_waves` 2, `test_row_ceiling_and_the_empty_call_are_typed_declines` 1,
-`test_golden` 4.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 142 passed, 1 skipped: the module 137
+`test_golden` 4.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 157 passed, 1 skipped: the module 152
 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices are
 required" -- one device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the
 symbol-prefix test 5 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 12
-of 12 cells (one kernel per call; grid `(tokens, 28, 1)`, block `(128, 1, 1)`, 16 B of shared memory).  The module's case behind a
+of 12 cells (one kernel per call; grid `(tokens, 28, 1)`, block `(128, 1, 1)`, 16 B of shared memory).  The module's case on rows
+whose rotary products underflow (`test_fused_product_of_a_rotation_is_the_forms_on_underflowing_rows`: head rows and table rows of
+bf16 subnormals, where the two product orders of the second rotary half differ in the sign of a zero) compared the rotated
+elements of `q_out` and of the written K pool rows bitwise with the zero of each form's fused product at 1, 9 and 160 tokens in 5 of
+5 forms; the bits of the other order differ from them in about a quarter of those elements.  The module's case behind a
 predecessor that released early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 8 of 8 launches of
 the step equal to the plain step, behind its positive control: a dependent without a wait read other bytes than the written ones in
 4 of 4 eager launches and 4 of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a
-pass.  The same command with `<suite>` added, on an x86 host with a cc 8.0 device (every device case skips): 106 passed, 76 skipped.
+pass.  The same command with `<suite>` added, on an x86 host with a cc 8.0 device (every device case skips): 116 passed, 81 skipped.
 
 CUDA 12.9 compiler flavour on the same part and runtime (2026-11-18 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
 libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13), from the same clean tree.
 The strict command -> 39 passed, 0 skipped against the same four golden files: the two flavours write the same bytes.  The module
-command -> 141 passed, 2 skipped: the module 136 passed and 2 skipped (the two-device case; the `sm_107a` rendering case, which
+command -> 156 passed, 2 skipped: the module 151 passed and 2 skipped (the two-device case; the `sm_107a` rendering case, which
 skips with the entry's decline -- that flavour does not assemble the target), the symbol-prefix test 5 passed.  The case behind a
-predecessor that released early: 8 of 8 launches equal, its control 4 of 4 and 4 of 4.
+predecessor that released early: 8 of 8 launches equal, its control 4 of 4 and 4 of 4.  The case on rows whose rotary products
+underflow: 5 of 5 forms.
 
 Renderings (host, no device; one fresh process per target and flavour, CuTe DSL 4.8.0): all 48 forms of the served set (two position
 forms x two page sizes x two position dtypes x two slot dtypes x three launch arms) trace-compile for `sm_100a`, `sm_103a` and
