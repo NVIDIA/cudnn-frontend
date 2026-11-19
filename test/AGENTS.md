@@ -795,6 +795,13 @@ teardown if the collector freed one. Whether a graph lands in a cycle can
 depend on test order, so a test that passes alone can still trip it in a
 suite.
 
+Tests that own external green-context streams must release associated CUDA
+Graph objects, tensors, and cached allocations before destroying those
+streams. PyTorch's expandable allocator can retain an otherwise unused
+stream and synchronize it later during `empty_cache()`. The SE green-context
+regression reproduced a driver crash when fixture teardown destroyed the
+stream first; synchronize and empty the allocator cache while it is live.
+
 ### Architecture test re-exports
 
 When an architecture test module re-exports shared checks, those checks must

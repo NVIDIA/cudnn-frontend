@@ -8636,3 +8636,83 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
 python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
   -n 0 -m L0 -q -rs -x -k warm_stress
 ```
+
+
+## SM107 SE and green-context qualification
+
+The public packed SE route now admits SM107. Dense BF16 width-four SiLU,
+packed persistent backward, paired tiled arithmetic, and tap-parallel
+parameter reduction also admit SM107. CuTe DSL 4.8.0 must use a CUDA compiler
+version of at least 13.4. An actual CUDA 12.9 compiler rejects the public
+SM107 call before JIT; a mocked missing target is rejected separately.
+
+Qualification on 2026-11-19 used native SM107 with 216 SMs, driver 630.10,
+Torch 2.14.1+cu130, cuDNN 9.29.0.2, and CuTe DSL 4.8.0 compiling CUDA 13.4.
+The current Python source was overlaid on an existing FE 1.32.0 binding
+build. The current `_device` helper was reloaded from this checkout after
+the binding package import; the binding build itself was not rebuilt.
+
+| Selection | Passed | Skipped | Runtime |
+| --- | ---: | ---: | ---: |
+| Broad packed/public/dense/API/reduction/schedule sweep, excluding goldens and stress | 435 | 0 | 688.04 s |
+| Final runtime, green-context, schedule, persistent, golden and staging checks | 112 | 0 | 31.10 s |
+| Public sharding, state and gradient checks with ordinary/localized inputs | 36 | 0 | Artifact runner |
+
+The broad sweep uses Torch's bundled CUDA runtime. The final 112-case run
+and green-context checks preload CUDA 13.6's runtime; the effective
+`cudaRuntimeGetVersion` result is 13060. Both runtime libraries remain mapped,
+so this is a CUDA 13.6 runtime preload over a Torch CUDA 13.0 build.
+The bundled runtime produced context diagnostics in Compute Sanitizer for
+both SE capture and a Torch-only control. Both controls report zero errors
+with the preload. The older runtime combination is not qualified for green
+contexts by these results.
+
+Nineteen new environment-specific goldens cover 15 packed combinations and
+four persistent/tuned cases. No existing golden is replaced. Each record
+follows independent numerical checks, then passes strict comparison in a
+fresh process with recording disabled. Packed reference tests compare all
+outputs and gradients with FP64. Large persistent checks sample eight fixed
+channels across every token, check all values for finiteness, and compare
+complete dX bytes against the tiled parent.
+
+The two green-context domains each expose 108 SMs. Modern stream-resource
+queries and the legacy converted-context query both report 108; the ordinary
+stream reports 216. Persistent C=768 backward uses 72 splits in each domain.
+Tests recreate contexts, exercise cold autograd workers, capture execution
+without host synchronization, and replay after input and offset changes.
+The changed-offset replay matches every output and gradient byte against a
+direct call on the same partition.
+
+Sharding keeps whole sequences and their state together. The 36 combinations
+cover FP16/BF16/FP32, with/without history, empty/short/ragged/long packs, and
+ordinary/localized inputs. Output, dX, final history and initial-history
+gradient bytes match the unsharded call. Shard parameter gradients are summed
+in FP32 before casting; the changed grouping is checked numerically.
+All 36 combinations also pass Compute Sanitizer memcheck with zero errors
+in the CUDA 13.6 runtime environment.
+Independent FP64 checks use absolute/relative tolerances of 0.003/0.002 for
+FP16, 0.03/0.02 for BF16, and 2e-5/2e-5 for FP32. The sharding artifact checks
+eight fixed channels and full-output finiteness; it does not establish a
+worst-case cancellation bound.
+
+Five staging cases each pass 3,000 warm and 3,000 poisoned launches, for
+30,000 launches with zero byte mismatches in the final runtime. The unsafe
+control fails 200/200. Packed persistent launches 432 CTAs, two per SM;
+tiled cases have fewer than two CTAs per SM, which limits that stress result.
+Control-flow inspection of five persistent PTX/SASS variants verifies the
+async-proxy fence and warp barrier on each loop path before stage reuse.
+
+Final pytest selection, from `test/python`, with the intended CUDA runtime:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_green_context.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_runtime_unit.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_schedule_unit.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_packed_goldens.py -n 0 -m L0 -q -rs -x
+```
+
+Green-context creation requires the tested locality-domain driver interfaces.
+Other admitted GPU families and multiple physical devices retain their earlier
+coverage status. These local results do not establish repository CI coverage.

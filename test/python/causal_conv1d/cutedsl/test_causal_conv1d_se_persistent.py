@@ -16,14 +16,14 @@ def persistent_arch():
     from cudnn.causal_conv1d_se.packed import _require_dsl
 
     _require_dsl()
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("persistent SE backward requires SM100 or SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("persistent SE backward requires SM100, SM103, or SM107")
 
 
 @pytest.fixture
 def dense_arch():
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("the public dense SE adapter is qualified on SM103")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("the public dense SE adapter is qualified on SM103/SM107")
 
 
 def _inputs(lengths, channels, bias=True):

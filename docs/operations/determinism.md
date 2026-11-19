@@ -1226,7 +1226,7 @@ This does not establish determinism for frontend kernel plans.
 
 ## SE causal convolution
 
-The explicit `cudnn.ops.causal_conv1d(..., backend="se")` route has SM100/SM103
+The explicit `cudnn.ops.causal_conv1d(..., backend="se")` route has SM100/SM103/SM107
 repeatability coverage for packed FP16/BF16/FP32 forward, final history, and
 all gradients. Sequence batch-invariance checks cover width-eight SiLU with
 history in all three dtypes, plus the width-four BF16 persistent route's
@@ -1235,10 +1235,18 @@ empty and repeated sequences. Parameter gradients have a fixed reduction
 order for a fixed pack, but their bytes can change when packing or split
 count changes. They are replay-only.
 
-Dense SM103 BF16 K4 SiLU persistent calls have forward/backward replay
+Dense SM103/SM107 BF16 K4 SiLU persistent calls have forward/backward replay
 coverage under strict deterministic mode. Dense tiled parameter reductions
 use atomics and reject strict mode (or warn under `warn_only=True`). Dense
 initial/final history is unsupported by this route. Packed SM80/86/89/90/120
-execution remains unverified for this integration; SM107 is not admitted.
+execution remains unverified for this integration. SM107 requires the DSL
+CUDA compiler version 13.4 or newer.
 See the operation guide for dispatch restrictions and the golden coverage
 report for commands, runtime versions, and measured stress coverage.
+
+On SM107, two green-context locality partitions retain packed output, dX,
+and history bytes against ordinary execution in the covered cases. The
+partition-specific split count can change parameter-gradient reduction
+grouping; those gradients are checked against independent numerical references.
+Their bytes can differ across partitions. Fixed-partition graph replay with
+changed offsets retains output and all gradient bytes against a direct call.

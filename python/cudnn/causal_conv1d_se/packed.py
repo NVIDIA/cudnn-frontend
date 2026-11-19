@@ -21,7 +21,7 @@ from torch import Tensor
 def _source_digest():
     here = Path(__file__).resolve().parent
     return sha256(
-        b"".join((here / name).read_bytes() for name in ("packed.py", "packed_kernel.py", "persistent_backward.py", "schedule.py", "kernel.py"))
+        b"".join((here / name).read_bytes() for name in ("packed.py", "packed_kernel.py", "persistent_backward.py", "schedule.py", "kernel.py", "runtime.py"))
     ).hexdigest()
 
 
@@ -78,16 +78,21 @@ def _validate(x, weight, cu, bias, initial, silu, return_final):
         if tensor is not None and (tensor.dtype != x.dtype or tensor.device != x.device):
             raise ValueError(f"{name} must match the input dtype and device")
     _require_dsl()
-    if torch.cuda.get_device_capability(x.device) not in {(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)}:
-        raise NotImplementedError("packed causal_conv1d requires SM80/86/89/90/100/103/120")
+    from .runtime import require_arch
+
+    capability = torch.cuda.get_device_capability(x.device)
+    require_arch(capability)
+    if capability not in {(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7), (12, 0)}:
+        raise NotImplementedError("packed causal_conv1d requires SM80/86/89/90/100/103/107/120")
 
 
 def _backward_schedule(x, weight, bias, initial, dy, dfinal, silu):
     from .schedule import backward_schedule
+    from .runtime import stream_multiprocessors
 
     with torch.cuda.device(x.device):
         capability = torch.cuda.get_device_capability(x.device)
-        multiprocessors = torch.cuda.get_device_properties(x.device).multi_processor_count
+        multiprocessors = stream_multiprocessors(x.device)
     native = (
         all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (x, dy))
         and (bias is None or (bias.is_contiguous() and bias.data_ptr() % 16 == 0))
@@ -192,10 +197,13 @@ def _compiled(direction, tensors, width, silu):
 def _launch(direction, tensors, width, silu):
     from cuda.bindings import driver as cuda
 
+    from cudnn._device import execution_context
+
     with torch.cuda.device(tensors[0].device):
-        compiled = _compiled(direction, tensors, width, silu)
         stream = cuda.CUstream(torch.cuda.current_stream(tensors[0].device).cuda_stream)
-        compiled(*tensors, stream)
+        with execution_context(int(stream), torch.cuda.current_device()):
+            compiled = _compiled(direction, tensors, width, silu)
+            compiled(*tensors, stream)
 
 
 @torch.library.custom_op(

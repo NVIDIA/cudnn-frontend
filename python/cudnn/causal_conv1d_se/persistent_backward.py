@@ -300,7 +300,7 @@ def launch_supported_backward(
     from cutlass.cutlass_dsl import CuTeDSL
 
     arch = CuTeDSL._get_dsl().get_arch_enum()
-    assert arch.major == 10 and arch.minor in (0, 3), "persistent SE backward requires SM100 or SM103"
+    assert arch.major == 10 and arch.minor in (0, 3, 7), "persistent SE backward requires SM100, SM103, or SM107"
     assert fast and index32 and x.element_type.width == 16
     assert width == 4 and silu and initial is None and dfinal is None and dinitial is None
     # TMA requires a nonzero row pitch even when a static unit axis has stride zero.

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Native channel-last SE autograd adapter for SM103 BF16 width-four SiLU."""
+"""Native channel-last SE autograd adapter for SM103/SM107 BF16 width-four SiLU."""
 
 from functools import cache
 from hashlib import sha256
@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from .packed import _require_dsl
+from .runtime import require_arch, stream_multiprocessors
 
 
 @cache
@@ -21,6 +22,7 @@ def _source_digest():
             (here / name).read_bytes()
             for name in (
                 "dense.py",
+                "runtime.py",
                 "kernel.py",
                 "backward_kernel.py",
                 "persistent_backward.py",
@@ -32,7 +34,7 @@ def _source_digest():
 
 def _persistent_shape(shape, capability):
     batch, tokens, channels = shape
-    return capability == (10, 3) and channels == 2048 and batch * tokens * channels >= 100_000_000 and 1 < tokens and batch * tokens <= 2**31 - 257
+    return capability in ((10, 3), (10, 7)) and channels == 2048 and batch * tokens * channels >= 100_000_000 and 1 < tokens and batch * tokens <= 2**31 - 257
 
 
 def _compiled(kind, tensors):
@@ -71,16 +73,22 @@ def _compiled(kind, tensors):
 def _launch(kind, tensors):
     from cuda.bindings import driver as cuda
 
+    from cudnn._device import execution_context
+
     with torch.cuda.device(tensors[0].device):
-        fn = _compiled(kind, tensors)
-        fn(*tensors, cuda.CUstream(torch.cuda.current_stream(tensors[0].device).cuda_stream))
+        stream = cuda.CUstream(torch.cuda.current_stream(tensors[0].device).cuda_stream)
+        with execution_context(int(stream), torch.cuda.current_device()):
+            fn = _compiled(kind, tensors)
+            fn(*tensors, stream)
 
 
 @torch.library.custom_op("cudnn::causal_conv1d_dense_se_fwd", mutates_args=(), device_types="cuda")
 def _forward(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
     _require_dsl()
-    if torch.cuda.get_device_capability(x.device) != (10, 3):
-        raise NotImplementedError("dense SE causal_conv1d is qualified on SM103")
+    capability = torch.cuda.get_device_capability(x.device)
+    require_arch(capability)
+    if capability not in ((10, 3), (10, 7)):
+        raise NotImplementedError("dense SE causal_conv1d is qualified on SM103/SM107")
     if any(t.data_ptr() % 16 for t in (x, weight, bias)):
         raise ValueError("dense SE tensors require 16-byte aligned storage")
     y = torch.empty_like(x)
@@ -97,10 +105,10 @@ def _forward_fake(x, weight, bias):
 def _backward(x: Tensor, weight: Tensor, bias: Tensor, dy: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     with torch.cuda.device(x.device):
         capability = torch.cuda.get_device_capability(x.device)
-        multiprocessors = torch.cuda.get_device_properties(x.device).multi_processor_count
+        multiprocessors = stream_multiprocessors(x.device)
     persistent = _persistent_shape(x.shape, capability)
     if not persistent and torch.are_deterministic_algorithms_enabled():
-        message = "dense SE tiled backward uses atomic parameter reductions; deterministic mode requires the large SM103 persistent route or packed SE"
+        message = "dense SE tiled backward uses atomic parameter reductions; deterministic mode requires the large SM103/SM107 persistent route or packed SE"
         if not torch.is_deterministic_algorithms_warn_only_enabled():
             raise RuntimeError(message)
         warnings.warn(message, UserWarning, stacklevel=2)

@@ -36,7 +36,7 @@ def _schedule(*args):
         (2**31, 2048, ("tiled", 64)),
     ],
 )
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_measured_dispatch_boundaries(tokens, channels, expected, capability):
     assert _schedule(tokens, channels, 4, "torch.bfloat16", True, True, capability, 148) == expected
 
@@ -49,7 +49,6 @@ def test_measured_dispatch_boundaries(tokens, channels, expected, capability):
         (4, "torch.float16", True, True, (10, 3)),
         (4, "torch.bfloat16", False, True, (10, 3)),
         (4, "torch.bfloat16", True, False, (10, 3)),
-        (4, "torch.bfloat16", True, True, (10, 7)),
         (4, "torch.bfloat16", True, True, (9, 0)),
     ],
 )

@@ -1,0 +1,90 @@
+{
+  "inputs": {
+    "b": {
+      "dtype": "torch.bfloat16",
+      "sha256": "174980c5078b58c7ab64d2a380a27afa74f24630587553b0d0af93169893a3a7",
+      "shape": [
+        1032
+      ]
+    },
+    "cu": {
+      "dtype": "torch.int32",
+      "sha256": "9643ded580317f1a604cf5d586c1df382f4351f7f95050422997f85e3485493c",
+      "shape": [
+        3
+      ]
+    },
+    "dy": {
+      "dtype": "torch.bfloat16",
+      "sha256": "84eb520befe876661c9edfc7a6dd7c1761c3e809143abe28c8269863b388283b",
+      "shape": [
+        2062,
+        1032
+      ]
+    },
+    "w": {
+      "dtype": "torch.bfloat16",
+      "sha256": "fcecae32874ed740c6ef2bad00cddec5ec4e511d5c91e8f3dad7cddc68fd53b2",
+      "shape": [
+        1032,
+        4
+      ]
+    },
+    "x": {
+      "dtype": "torch.bfloat16",
+      "sha256": "c3755b6e0c18c682fc0b1945627151ee0721ada52fdd04c360449fbb75d4d7f7",
+      "shape": [
+        2062,
+        1032
+      ]
+    }
+  },
+  "outputs": {
+    "db": {
+      "dtype": "torch.bfloat16",
+      "sha256": "7b6a1b79a0d6768c033507fb5df867c04af5271a407a3694f3e8e30d27064c6c",
+      "shape": [
+        1032
+      ]
+    },
+    "dw": {
+      "dtype": "torch.bfloat16",
+      "sha256": "7dab14fdc68c85a3df0c4cb97f7e65d29309612c2dda9e78e27c42f10c6bdc67",
+      "shape": [
+        1032,
+        4
+      ]
+    },
+    "dx": {
+      "dtype": "torch.bfloat16",
+      "sha256": "17887f396d2e39c7cef08151d6b4dc9aa73485471ec18a21632dcef843cd0106",
+      "shape": [
+        2062,
+        1032
+      ]
+    },
+    "y": {
+      "dtype": "torch.bfloat16",
+      "sha256": "a8e58868c5bd4e738fd055e3904ee91873b628ab327c908454bc6a1212a56042",
+      "shape": [
+        2062,
+        1032
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13060,
+    "cudnn": 92900,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      7
+    ],
+    "sm_count": 216,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.15.post2"
+  },
+  "schema": 1
+}

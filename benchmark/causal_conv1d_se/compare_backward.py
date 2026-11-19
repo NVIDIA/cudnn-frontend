@@ -21,6 +21,7 @@ from cutlass.base_dsl.version_info import CUDA_VERSION
 
 from cudnn.causal_conv1d_cake.api import CausalConv1dPlan
 from cudnn.causal_conv1d_se import packed, dense
+from cudnn.causal_conv1d_se.runtime import require_arch, stream_multiprocessors
 from timing import measure
 from reference_checks import reference_check, replay_check
 
@@ -55,8 +56,9 @@ def main():
     args = parser.parse_args()
     case = next(c for c in json.loads(Path(__file__).with_name("backward_workloads.json").read_text()) if c["id"] == args.case)
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)) or (args.mode == "dense" and capability != (10, 3)):
-        raise RuntimeError("the comparison requires SM100/103 for packed mode or SM103 for dense mode")
+    require_arch(capability)
+    if capability not in ((10, 0), (10, 3), (10, 7)) or (args.mode == "dense" and capability not in ((10, 3), (10, 7))):
+        raise RuntimeError("the comparison requires SM100/103/107 for packed mode or SM103/107 for dense mode")
     before = _hashes()
     _idle()
     lengths, channels = case["lengths"], case["channels"]
@@ -90,9 +92,9 @@ def main():
             raise ValueError("dense mode requires equal sequence lengths")
         shape = (len(lengths), lengths[0], channels)
         wk = w.T.contiguous()
-        if dense._persistent_shape(shape, (10, 3)):
+        if dense._persistent_shape(shape, capability):
             route = "persistent-dense"
-            splits = max(1, 2 * torch.cuda.get_device_properties(0).multi_processor_count // ((channels + 255) // 256))
+            splits = max(1, 2 * stream_multiprocessors(x.device) // ((channels + 255) // 256))
             partials = torch.empty((splits, 5, channels), device=x.device, dtype=torch.float32)
             tensors = (x, wk.T, b, cu, None, dy, None, dz, out["dx"], out["dw"], out["db"], None, partials)
             fn = dense._compiled("persistent", tensors)

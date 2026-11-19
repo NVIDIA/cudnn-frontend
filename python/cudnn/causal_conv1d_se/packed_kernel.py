@@ -372,7 +372,7 @@ def launch_packed_parameter_reduce(partials, dw, db, width: cutlass.Constexpr, s
     arch = CuTeDSL._get_dsl().get_arch_enum()
     parallel = cutlass.const_expr(
         dw.element_type == cutlass.Float32
-        or (fast and width == 4 and silu and dw.element_type == cutlass.BFloat16 and arch.major == 10 and arch.minor in (0, 3))
+        or (fast and width == 4 and silu and dw.element_type == cutlass.BFloat16 and arch.major == 10 and arch.minor in (0, 3, 7))
     )
     if cutlass.const_expr(parallel):
         taps = width + (1 if cutlass.const_expr(db is not None) else 0)
@@ -1237,7 +1237,15 @@ def _packed_backward_rows(
     from cutlass.cutlass_dsl import CuTeDSL
 
     paired = cutlass.const_expr(
-        all((x.element_type.width == 16, width == 4, silu, CuTeDSL._get_dsl().get_arch_enum().major == 10, CuTeDSL._get_dsl().get_arch_enum().minor in (0, 3)))
+        all(
+            (
+                x.element_type.width == 16,
+                width == 4,
+                silu,
+                CuTeDSL._get_dsl().get_arch_enum().major == 10,
+                CuTeDSL._get_dsl().get_arch_enum().minor in (0, 3, 7),
+            )
+        )
     )
     vector = 128 // x.element_type.width
     window = cute.make_rmem_tensor(cute.make_layout((width, vector), stride=(vector, 1)), cutlass.Float32)

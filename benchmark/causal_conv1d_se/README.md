@@ -129,7 +129,7 @@ The current FP32 NWH rounding profiles target the verified cuDNN 9.29 backend wi
 `compare_backward.py` compares the integrated private SE launch with Cake on
 the same BF16 width-four SiLU backward workload. `backward_workloads.json`
 defines the eight packed cases; five have equal sequence lengths and also
-support dense mode. Use an idle SM100/SM103 GPU for packed mode or SM103 for
+support dense mode. Use an idle SM100/SM103/SM107 GPU for packed mode or SM103/SM107 for
 dense mode, with Cake's CUDA 13.4 dependencies.
 For each case, run three fresh processes:
 

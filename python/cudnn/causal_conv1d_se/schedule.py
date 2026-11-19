@@ -6,7 +6,7 @@
 def backward_schedule(tokens, channels, width, dtype, silu, native, capability, multiprocessors):
     partial_bytes = 8 if dtype == "torch.float32" else 4
     splits = max(1, min(64, (16 * 1024 * 1024) // (channels * (width + 1) * partial_bytes)))
-    if capability not in ((10, 0), (10, 3)) or width != 4 or not silu or not native or dtype != "torch.bfloat16":
+    if capability not in ((10, 0), (10, 3), (10, 7)) or width != 4 or not silu or not native or dtype != "torch.bfloat16":
         return "tiled", splits
     # These channel widths cover the measured shared training workloads.
     # Retain the tiled path for short streams and partial channel tiles.

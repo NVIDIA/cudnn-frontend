@@ -14,12 +14,18 @@ def _dsl():
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
         pytest.skip(f"requires CuTe DSL >= {CUTEDSL_MIN_VERSION}")
-    if torch.cuda.get_device_capability() not in {(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)}:
+    if torch.cuda.get_device_capability() not in {(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7), (12, 0)}:
         pytest.skip("requires a target in the packed-convolution qualification matrix")
     from cutlass import cute
     from cutlass.cute.runtime import from_dlpack
     from cuda.bindings import driver as cuda
 
+    from cudnn.causal_conv1d_se.runtime import require_arch
+
+    try:
+        require_arch(torch.cuda.get_device_capability())
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
     return cute, from_dlpack, cuda
 
 

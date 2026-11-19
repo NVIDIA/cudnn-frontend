@@ -132,10 +132,12 @@ No Miles or FlashInfer installation is required.
 
 `causal_conv1d(..., backend="se")` selects the CuTe DSL SE implementation.
 It supports autograd and `torch.compile`; `backend="auto"` keeps its existing
-routing. CuTe DSL 4.8.0 or newer is required.
+routing. CuTe DSL 4.8.0 or newer is required. SM107 additionally requires
+the DSL CUDA compiler version 13.4 or newer; the CUDA 12 compiler flavor
+declines before JIT compilation, regardless of the Torch runtime version.
 
 ```python
-# Dense: BF16 channel-last physical storage, SM103, width four, SiLU.
+# Dense: BF16 channel-last physical storage, SM103/SM107, width four, SiLU.
 y = causal_conv1d(x_btd.transpose(1, 2), weight, bias, "silu", backend="se")
 
 # Packed: x_tc concatenates the sequences without padding.
@@ -149,7 +151,7 @@ y, final = causal_conv1d(
 Packed calls support matching FP16, BF16, or FP32 activations and parameters,
 filter widths 2 through 8, and identity or SiLU activation. Channels must be
 positive and divisible by eight. The existing packed schedules admit
-SM80/86/89/90/100/103/120. Initial and final history contain exactly `W - 1`
+SM80/86/89/90/100/103/107/120. Initial and final history contain exactly `W - 1`
 samples. Input, weight, bias, and initial-history gradients are supported;
 double backward is unsupported. Strided packed inputs use the existing scalar
 or tiled schedules. The wrapper preserves dense input memory formats when
@@ -161,21 +163,21 @@ empty sequences. An all-empty pack is supported. Offset values are checked
 on the device without a host read; invalid values cause a device trap and
 invalidate the CUDA context. Every replay reads the current offsets.
 
-Dense SE currently admits SM103 BF16 width-four SiLU with matching parameters,
+Dense SE currently admits SM103/SM107 BF16 width-four SiLU with matching parameters,
 positive batch and token counts, and channel-last physical storage. It
 prepares a contiguous `[4, channels]` filter for forward and saves that tensor
 for backward. Broadcast output gradients are materialized at the allocating
 autograd boundary. Dense initial/final history is not supported by this route;
 use an equivalent packed call when history is needed.
 
-For contiguous BF16, width-four SiLU packed backward on SM100/SM103, the persistent
+For contiguous BF16, width-four SiLU packed backward on SM100/SM103/SM107, the persistent
 schedule is selected at 8192 or more tokens and 768 or 2048 channels, with no
 state gradients. Other cases retain the tiled schedules. Dense backward uses
 the persistent schedule at 2048 channels and at least 100 million activation
 elements, with more than one token per sequence. The kernel retains its input
 and pending-gradient windows in registers across eight-token TMA stages.
 
-The BF16 K4 SiLU parameter reduction on SM100/SM103 assigns each filter tap
+The BF16 K4 SiLU parameter reduction on SM100/SM103/SM107 assigns each filter tap
 and bias gradient to separate thread blocks. Each output retains its fixed
 split-sum order. Small tiled calls cap the split count at the number of
 64-token tiles; packs with 256 channels and 4096–8191 tokens use one split
@@ -199,3 +201,21 @@ Dense calls also require legal CUDA launch geometry: batch and the selected
 forward token-tile count must each fit 65535, and channels must leave room for
 signed int32 tile arithmetic. Unsupported geometry raises before compilation;
 packed offsets avoid the dense batch-grid limit.
+
+The backward schedule sizes persistent work from the current CUDA stream's
+SM resource count. A green-context stream therefore uses its partition's
+SM count. Calls on cold autograd threads bind that stream's execution
+context before driver queries and kernel launches.
+
+Callers own green-context creation, memory placement, and sharding. SE does
+not allocate localized memory or split a packed call automatically. Split
+at sequence boundaries and keep each sequence's history with that sequence.
+Parameter gradients require a reduction across shards; changing this
+reduction grouping can change their bits. Destroy captured graphs and free
+allocations and allocator caches associated with an external stream before
+destroying the stream or green context.
+
+Green-context qualification used a CUDA 13.6 runtime with Torch 2.14.1.
+Torch's bundled CUDA 13.0 runtime produced stream-context diagnostics under
+Compute Sanitizer, including in a Torch-only control; that runtime
+combination is not qualified for this green-context path.

@@ -14,8 +14,8 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 @pytest.mark.parametrize("strided", [False, True])
 def test_parallel_bf16_reduction_preserves_all_output_bytes(channels, splits, bias, strided):
     cute, dlpack, cuda = _dsl()
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("the BF16 parallel reducer is selected on SM100 and SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the BF16 parallel reducer is selected on SM100, SM103, and SM107")
     from cudnn.causal_conv1d_se.packed_kernel import packed_parameter_reduce, packed_parameter_reduce_parallel
 
     gen = torch.Generator().manual_seed(47219)
