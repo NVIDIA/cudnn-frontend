@@ -474,6 +474,16 @@ class Session:
         return f"a session of {sequences} x {self.tokens} tokens" if self.tokens > 1 else f"a plain session of {sequences}"
 
     # ------------------------------------------------------------------ load
+    def _weights_owner(self) -> "Session":
+        """The session that loaded the weights this session runs on: itself, or the end of its chain of ``share=`` -- a
+        session may share one that shares in turn.  What describes those weights is there: the checkpoint they were
+        read or drawn from, which a session that shares never holds, and for seeded weights the seed of that checkpoint
+        (``Checkpoint.seed``; a session's own ``seed=`` is only what it makes its checkpoint with when it is handed none)."""
+        owner = self
+        while owner._share is not None:
+            owner = owner._share
+        return owner
+
     def load(self) -> None:
         plan = self.resolve()
         # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
@@ -495,12 +505,11 @@ class Session:
             self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule, **forms)
         self._check_forms()
         if self.drafter is not None:  # with the table the model loaded: the drafter holds no second copy of it
-            source = self if self._share is None else self._share
-            checkpoint = source.checkpoint
-            if getattr(checkpoint, "synthetic_weights", False):  # a seeded model: the drafter's tensors are drawn by name from the same seed
+            checkpoint = self._weights_owner().checkpoint  # the one the weights were loaded from: a session that shares holds none
+            if getattr(checkpoint, "synthetic_weights", False):  # a seeded model: the drafter's tensors are drawn by name from the seed of ITS checkpoint
                 from .weights import Checkpoint
 
-                checkpoint = Checkpoint.synthetic(self.drafter, source.seed)
+                checkpoint = Checkpoint.synthetic(self.drafter, checkpoint.seed)
             self.draft_weights = self.drafter.load(checkpoint, self.device, self.stages, embedding=self.weights.embedding)
         for each, tokens in self._kinds():  # every kind of step this session runs: each block's compile is a stage named with its rows
             for name, block in each.items():

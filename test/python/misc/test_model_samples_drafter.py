@@ -1753,6 +1753,45 @@ def test_the_readmes_speculative_loop_runs_on_the_checkpoint_the_loaders_call_de
     checkpoint.close()
 
 
+@pytest.mark.parametrize("links", [0, 1, 2])
+def test_a_session_loads_the_drafter_of_the_checkpoint_its_weights_were_read_from(tmp_path, links):
+    """A checkpoint on disk, generated here, with its drafter.  A session with the drafter that is handed the checkpoint
+    and loads it itself (no link), that runs on the weights of the session that was handed it (one link, ``share=``),
+    or on those of a session that shares that one's (two links): its drafter's tensors are the file's -- what the
+    loader's call loads -- beside the table the model was loaded with.  A session in between holds no checkpoint."""
+    pytest.importorskip("safetensors")
+    from model_samples import Checkpoint, Session, TextIO
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+    from model_samples.qwen_dense.drafter import MULTIPLIES, NORMS
+
+    tiny = _tiny_model()
+    directory = _write_checkpoint(tmp_path / "tiny-checkpoint", _disk_tensors(tiny, QwenDenseDrafter.seeded(tiny, seed=5), 5), _config(tiny.geometry))
+    (tmp_path / "ids.json").write_text(json.dumps(list(range(0, 272, 3))))
+    checkpoint = Checkpoint.describe(str(directory))
+    model = QwenDense.describe(checkpoint)
+    drafter = QwenDenseDrafter.describe(checkpoint, model, draft_vocab=str(tmp_path / "ids.json"))
+    text, common = TextIO.synthetic(272), dict(stack="reference", device="cpu", capacity=16)
+    chain = [Session(model, text, checkpoint=checkpoint, **common)]
+    for _ in range(links - 1):
+        chain.append(Session(model, text, share=chain[-1], **common))
+    how = dict(share=chain[-1]) if links else dict(checkpoint=checkpoint)
+    chain.append(Session(model, text, draft_tokens=3, drafter=drafter, **common, **how))
+    for each in chain:
+        each.load()
+    session, table = chain[-1], checkpoint.load("embed_tokens.weight", "cpu")
+    own = drafter.load(checkpoint, "cpu", embedding=table)  # the drafter as the loader's call loads it
+    assert [each.checkpoint for each in chain[1:-1]] == [None] * max(links - 1, 0) and all(each.weights is chain[0].weights for each in chain[:-1])
+    assert torch.equal(session.weights.embedding, table) and session.draft_weights.embedding is session.weights.embedding
+    for name, _ in MULTIPLIES:
+        loaded = getattr(session.draft_weights, name)
+        assert torch.equal(loaded.codes, getattr(own, name).codes) and torch.equal(loaded.scale, getattr(own, name).scale), name
+    assert all(torch.equal(getattr(session.draft_weights, name), getattr(own, name)) for name, _ in NORMS)
+    head = session.draft_weights.head
+    assert torch.equal(head.codes, own.head.codes) and torch.equal(head.block_scales, own.head.block_scales) and head.scale == own.head.scale
+    assert session.draft_weights.head_ids.tolist() == list(range(0, 272, 3))
+    checkpoint.close()
+
+
 def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     """The sentences of the family README's section on the drafter that state a count, a figure or a behaviour of the
     draft pass, each against the code: the calls of a pass, its call sites, the rule of the row quantiser, what a load
