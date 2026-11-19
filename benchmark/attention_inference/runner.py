@@ -385,6 +385,12 @@ def main():
     parser.add_argument("--resume", action="store_true", help="reuse successful cases from an existing --checkpoint")
     parser.add_argument("--output-dir", type=Path, help="override config.output_dir (CSV + charts land here)")
     parser.add_argument("--no-chart", action="store_true")
+    parser.add_argument(
+        "--replot",
+        type=Path,
+        metavar="CSV",
+        help="redraw the config's charts from an existing results CSV (no benchmarking; charts land in --output-dir or config.output_dir)",
+    )
     parser.add_argument("--list-configs", action="store_true")
     args = parser.parse_args()
 
@@ -413,6 +419,15 @@ def main():
         # config's models, shapes and page sizes; a listed one is filtered as before
         logger.info(f"backend '{args.filter_backend}' is not in config '{config.name}' ({config.backends}); running it alone over the config's axes")
         config.backends = [args.filter_backend]
+    if args.replot:
+        import pandas as pd
+
+        from .charts import generate_charts
+
+        for path in generate_charts(pd.read_csv(args.replot), config):
+            logger.info(f"Chart: {path}")
+        return
+
     runner = InferenceBenchmarkRunner()
 
     if args.dry_run:
