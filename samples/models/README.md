@@ -30,12 +30,12 @@ out-projections on the 8-bit one -- and `native` calls the library for them on c
 launches 451 of the 484 (178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results). Of
 those, 387 (114 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results) are held to the
 kernel and the launch shape the census records; the other 64 are the out-projections, whose kernel the library chooses
-among its own: they are held by membership, and in every run so far the library launched its own CUTLASS multiply there,
-not the cuBLASLt kernel the census records as the target's pick -- the same call, another kernel. FlashInfer is an
-optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it. The two attention
-blocks are still on their fallback rows, printed as `not yet`; their kernels and a captured decode step (a step recorded
-once and replayed without Python between its launches) follow in that stack. Speculative decoding has its first pieces:
-the loader of the checkpoint's drafter
+among its own: they are held by membership, and in every run so far the library, untuned, launched its own CUTLASS
+multiply there, not the cuBLASLt kernel the census records as the target's pick -- the same call, another kernel.
+FlashInfer is an optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it.
+The two attention blocks are still on their fallback rows, printed as `not yet`; their kernels and a captured decode
+step (a step recorded once and replayed without Python between its launches) follow in that stack. Speculative decoding
+has its first pieces: the loader of the checkpoint's drafter
 (its tensors, its rows of the output head, its 8-bit weights); the drafter's draft pass on reference blocks, reached
 from the library (`QwenDenseDrafter.body`, `propose`, `draft`: every block of it a reference chain in every stack, its
 embedding lookup PyTorch's gather); and the verify step -- the step that feeds every sequence

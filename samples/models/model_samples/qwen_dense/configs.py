@@ -147,7 +147,12 @@ BMM_FP8_FORM = (("BACKEND", "auto"),)
 
 
 def _library_row(block: str, form) -> ProviderRow:
-    """The row of ``native`` that serves ``block`` with a library call on the stored weight (:data:`LIBRARY_ROWS`)."""
+    """The row of ``native`` that serves ``block`` with a library call on the stored weight (:data:`LIBRARY_ROWS`).  Its launch
+    order: the library launches its own kernels as dependents of the launch before them (the adapters pass nothing that changes
+    it), so behind a launch that releases early -- the fused step or the gate in front of the out-projection, the gate / up
+    kernel in front of the down multiply -- the kernel starts early and must wait before it reads that launch's codes.  The
+    kernels of the validated version wait in front of their first load.  A launch behind one that carries the attribute must
+    wait before it reads the product (the norm: its row).  In front of the head stand PyTorch's launches: no early release."""
     key, serves, widths = LIBRARY_ROWS[block]
     # no test of this repository's own lanes runs a row that needs the library's package: printed as unverified in CI
     return ProviderRow(("cc10.x",), (1, None), (1, None), key, "native", serves=serves, band="bf16_rounding", ci=False, form=form, widths=widths)
@@ -363,7 +368,7 @@ PROVIDERS = {
                 # scalars; only weight tiles are read ahead of the wait.  The launch before it must not write the weight or
                 # its block scales: both are constants of the layer.  It signals the launch after it before its last output
                 # tile is written: a launch behind it that carries the attribute must wait before it reads the codes; the
-                # multiply over a copy behind it in this stack carries none and starts when this kernel has completed
+                # multiply behind it carries it where it is the library's (``native``: its row), a multiply over a copy none
                 form=(("TOKEN_TILE", tile), ("PREWAIT_STAGES", 2), ("L2_EVICT_FIRST", True), ("MAX_CLUSTERS", 148), ("PDL", True)),
                 rows=(first, last),
                 # the widths the entry serves (its page: hidden 5120, intermediate 17408, the published model's).  A checkpoint of
@@ -403,7 +408,7 @@ PROVIDERS = {
             band="gate_fp8",
             batch_invariant=("cc10.0",),
             # the target's form: 256 threads per thread block, an ordinary launch that releases its successor at entry.  The
-            # launch after it in this stack carries no dependent-launch attribute, so the release changes nothing here
+            # launch after it carries the attribute where it is the library's out-projection (``native``: its row), else none
             form=(("THREADS", 256), ("PDL_RELEASE", True)),
             rows=(1, 160),
         ),

@@ -470,7 +470,8 @@ release, issues two stages of its weight and waits for the norm before it reads 
 and the two scalars. The kernel signals the launch after it before its last output tile is written (it has no knob
 for that). In `fe-entries` the down multiply behind it is a fallback row, launched without the attribute, and starts
 when the kernel has completed; in `native` it is the library's kernel, which the library launches with programmatic
-dependent launch at its own default and which waits for the launch before it at its start. Each
+dependent launch at its own default and which waits for the launch before it at its start. The library launches its
+8-bit multiply the same way: in `native` it starts on the release of the fused step or of the gate, and waits. Each
 row of `configs.py` says what the launch before it must not write and what the launch after it must wait for. With `--provider
 linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
@@ -2048,8 +2049,8 @@ sentence is short, on every stack: what a run holds per row beyond the state the
 sentence counts is not in its flat allowance. At 64 sequences the default stack asked for about 3.9 GiB, reserved
 6.6 GiB and grew the device by 6.8 GiB; the cuDNN Frontend rows (`fe-entries` today) asked for about 3.8 GiB,
 reserved 6.0 GiB and grew it by 6.2 GiB, and with `--sequences 64,65` for about 4.4 GiB, reserved 8.0 GiB and grew it
-by 8.2 GiB; `--stack native --sequences 64,65` with its library rows asked for about 4.2 GiB, reserved 7.5 GiB and
-grew it by 7.6 GiB. A
+by 8.2 GiB; `--stack native --sequences 64,65` with its library rows asked for about 4.2 GiB, reserved 7.1 GiB and
+grew it by 7.3 GiB. A
 verify plan of 48 to 80 rows is short by 0.3 to 2.6 GiB (the section "The verify step" has the runs). At
 such a count a GPU needs several GiB more than the sentence says.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
