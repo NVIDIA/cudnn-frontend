@@ -337,7 +337,7 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         raise AssertionError(f"the report file holds {constant}")
 
     data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
-    assert data["schema"] == "model-sample-performance/1" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["schema"] == "model-sample-performance/2" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
     assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
     requests = data["raw"]["requests"]
     assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]

@@ -66,7 +66,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import census, tie_out
 from .timing import now, step_facts
 
-SCHEMA = "model-sample-performance/1"
+SCHEMA = "model-sample-performance/2"
 WIDTH = 110  # of the screen: no line is wider
 ORIENTATION, CONTROLLED = "orientation", "controlled"
 PASS, FAIL, NOT_OBSERVED = census.PASS, census.FAIL, census.NOT_OBSERVED
@@ -559,7 +559,12 @@ def _checks_lines(checks: dict) -> List[str]:
 def screen(data: dict, unwritten: str = "") -> List[str]:
     """The screen of a run, rendered from the data the report file holds and from nothing else: at most ``WIDTH`` characters
     a line.  Every time of a reduced model carries ``reduced model:``, and such a run prints no rate.  ``unwritten``: why
-    the run could not write that file (``write_report``); the last line then says so in the place of the file's name."""
+    the run could not write that file (``write_report``); the last line then says so in the place of the file's name.
+    ``ValueError`` for the data of a file of another schema than ``SCHEMA``, in one sentence that names both: such a
+    file has other sections and statistics, and nothing of it is rendered."""
+    found = data.get("schema") if isinstance(data, dict) else None
+    if found != SCHEMA:
+        raise ValueError(f"a report file of schema {found!r} is not read by this version of the performance mode, which reads and writes {SCHEMA!r}")
     model, gpu, kernels, protocol, traced = data["model"], data["environment"]["gpu"], data["kernels"], data["protocol"], data["traced"]
     stats, memory, record = data["statistics"], data["memory"], data["record"]
     prefix = "reduced model: " if model["reduced"] else ""

@@ -17,7 +17,7 @@
   before the last timed request, nothing but the step inside a timed request, the three statements of the ``checks``
   lines, and what a statement that does not hold does to the rate line and to the last line;
 * the screen (no line wider than 110 characters, in every form) and the report file (strict JSON, a definition beside
-  every statistic, no local path);
+  every statistic, no local path; its schema, and a file of another schema refused in one sentence that names both);
 * the sample's flags, each refusal before the load, ``main()`` with ``--perf`` to its last line, and an ordinary run
   that prints what it printed and does not import the mode's module;
 * the session of a run, built for its longest request: a warm-up request longer than the timed one runs to its report,
@@ -816,7 +816,8 @@ def _data(**changes):
 
 def _checkpoint_form(**changes):
     """The data of a run on a checkpoint -- not a reduced model, a rate, 51 traced steps behind a prompt of 58 tokens --
-    with sections replaced as in :func:`_data`."""
+    with sections replaced as in :func:`_data`.  The rate and the step are made up for the form -- 2.5 tokens per second
+    and a step of 400 ms -- and are no run's."""
     base = {
         "model": {"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False},
         "record": {"reasons": ["fallback rows present", "kernel identity not claimed on this GPU class", "launched from Python"]},
@@ -825,16 +826,16 @@ def _checkpoint_form(**changes):
     for section, values in changes.items():
         base[section] = {**base[section], **values} if isinstance(values, dict) and section in base else values
     data = _data(**base)
-    data["statistics"]["decode_rate"].update(value=9.9, reason=None, total=9.9)
-    data["statistics"]["step"]["value"] = 100.0
+    data["statistics"]["decode_rate"].update(value=2.5, reason=None, total=2.5)
+    data["statistics"]["step"]["value"] = 400.0
     data["protocol"]["prompt"]["tokens"] = 58
     return _gpu_side(data)
 
 
-def _gpu_side(data, busy=20.0, overhead=70.0, host=10.0, stretch=5.0, why=""):
+def _gpu_side(data, busy=80.0, overhead=280.0, host=40.0, stretch=5.0, why=""):
     """The GPU side of a report's data, set: GPU busy in ms (``None``: not measured, and ``why``), launch overhead where it
     is a term of the step (``None``: not resolved), the loop's host time, tracing's stretch in percent.  The defaults
-    are made up for the form -- round parts of a step of 100 ms, the time per block call that of 700 calls -- and are
+    are made up for the form -- round parts of a step of 400 ms, the time per block call that of 700 calls -- and are
     no run's."""
     stats = data["statistics"]
     stats["gpu_busy"].update(value=busy, reason=None if busy is not None else f"GPU busy not measured ({why})")
@@ -859,7 +860,7 @@ def test_orientation_stands_in_the_rate_line():
     assert lines[2] == "                      kernel identity not claimed on this GPU class; launched from Python", "a line ends where a reason ends"
     assert lines[3] == "scope       a decode-loop rate, not a served rate: one process, no request queue, no scheduler, no network"
     rate = _line(lines, "decode rate")
-    assert rate.startswith("decode rate (orientation)   9.9  tokens/s per sequence   (") and " ms per token; 2 requests within " in rate
+    assert rate.startswith("decode rate (orientation)   2.5  tokens/s per sequence   (") and " ms per token; 2 requests within " in rate
     assert not any(line.startswith("decode rate   ") for line in lines) and not any("reduced model:" in line for line in lines)
     assert "with draft tokens     not run by this script (plain decode)" in lines
     reduced = perf.screen(_data())
@@ -878,18 +879,18 @@ def test_orientation_stands_in_the_rate_line():
     _says("area", "The line `with draft tokens` says `not run by this script`: this script decodes without a drafter.")
     controlled = perf.screen(_checkpoint_form(record={"class": "controlled", "reasons": []}))
     assert controlled[1] == "record class          controlled run in one process; a number of record is the median of 3 such runs"
-    assert _line(controlled, "decode rate").startswith("decode rate           9.9  tokens/s per sequence   (")
+    assert _line(controlled, "decode rate").startswith("decode rate           2.5  tokens/s per sequence   (")
     several = perf.screen(_checkpoint_form(model={"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False, "sequences": 4}))
-    at = several.index("decode rate (orientation)   9.9  tokens/s per sequence (9.9 in all)")  # the total beside the rate: the bracket moves down
+    at = several.index("decode rate (orientation)   2.5  tokens/s per sequence (2.5 in all)")  # the total beside the rate: the bracket moves down
     assert several[at + 1].startswith(" " * 28 + "(") and several[at + 1].endswith(" %)") and "| 4 sequences | greedy" in _line(several, "model       ")
     # every number of the timing lines is the field of the file's data its label names: the run's value, never the mean
     stats = (labelled := _checkpoint_form(model={"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False, "sequences": 4}))["statistics"]
-    stats["decode_rate"].update(value=9.9, total=39.6)
+    stats["decode_rate"].update(value=2.5, total=10.0)
     stats["time_per_output_token"].update(value=111.111, median=111.111, mean=222.222, minimum=1.0, maximum=999.0, spread_percent=3.3)
     stats["token_to_token_interval"].update(value=33.333, median=33.333, mean=44.444, p90=55.555, p99=66.666)
     stats["time_to_first_token"].update(value=7777.7, median=7777.7, mean=8888.8)
     said = " ".join(line.strip() for line in perf.screen(labelled))
-    assert "decode rate (orientation)   9.9  tokens/s per sequence (39.6 in all) (111.111 ms per token; 2 requests within 3.3 %)" in said
+    assert "decode rate (orientation)   2.5  tokens/s per sequence (10.0 in all) (111.111 ms per token; 2 requests within 3.3 %)" in said
     assert "token-to-token interval: median 33.333, p90 55.555, p99 66.666 ms time to first token   7777.7  ms for a 58-token prompt" in said
 
 
@@ -902,15 +903,15 @@ def test_the_step_line_says_what_was_not_measured():
     lines = perf.screen(_gpu_side(_checkpoint_form(), busy=None, overhead=None, why=cut))
     at = lines.index(_line(lines, "step  "))
     said = lines[at] + " " + lines[at + 1].strip()
-    assert said == f"step                  100.000  ms at the 51 traced positions, 58 to 108; GPU busy not measured ({cut})"
+    assert said == f"step                  400.000  ms at the 51 traced positions, 58 to 108; GPU busy not measured ({cut})"
     assert _line(lines, "time to first token   ").endswith(" ms for a 58-token prompt (58 decode steps: this sample has no prefill kernel)")
     assert not any("launch overhead" in line or line.startswith(("note ", "per kernel, per step (")) for line in lines)
     _says("area", "Where the traced steps could not be observed the line says `GPU busy not measured`, with the reason, and no table is printed")
     one = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 1, "last_position": 58}), busy=None, overhead=None, why=cut))
-    assert _line(one, "step  ").startswith("step                  100.000  ms at the traced position, 58; GPU busy not measured (the launch records ")
+    assert _line(one, "step  ").startswith("step                  400.000  ms at the traced position, 58; GPU busy not measured (the launch records ")
     why = "the profiler's trace could not be exported (No space left on device)"
     unmeasured = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, overhead=None, why=why))
-    at = unmeasured.index("step                  100.000  ms over every timed step; GPU busy not measured (the profiler's trace could not")
+    at = unmeasured.index("step                  400.000  ms over every timed step; GPU busy not measured (the profiler's trace could not")
     assert unmeasured[at + 1] == "                      be exported (No space left on device))"
     table = unmeasured.index("per kernel, per step  not printed: the kernels of the traced steps were not observed (the profiler's trace")
     assert unmeasured[table + 1] == "                      could not be exported (No space left on device))" and unmeasured[table - 1] == ""
@@ -1007,7 +1008,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
     sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
     sections += " startup text_path"
-    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/1" and data["kind"] == "run"
+    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/2" and data["kind"] == "run"
     assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
@@ -1067,6 +1068,67 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     _says("guide", "One definition per statistic, written in the report file, with a host test of its arithmetic on constructed time stamps.")
     _says("area", "**The statistics**, each with one definition, which the report file carries beside the number:")
     _says("area", "in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB")
+
+
+def _schema_1(data):
+    """The report file of the same run as the mode wrote it before it took the GPU side of a step from the traced
+    request, schema ``model-sample-performance/1``: 17 sections and 10 statistics -- no ``per_kernel`` section, none of
+    the six statistics of the GPU side, a ``traced`` section of seven entries that says GPU busy was not taken, and the
+    definition of the step with the sentence that said so."""
+    import copy
+
+    older = copy.deepcopy(data)
+    older["schema"] = "model-sample-performance/1"
+    del older["per_kernel"]
+    for key in ("gpu_busy", "launch_overhead", "tracing_stretch", "kernel_launches", "kernel_time_per_launch", "kernel_time_per_step"):
+        del older["statistics"][key]
+    older["statistics"]["step"]["definition"] += " This version does not take GPU busy from the traced request, so the step is not taken apart."
+    for key in ("per_step", "tracing_stretch_percent", "time_resolution_us"):
+        del older["traced"][key]
+    older["traced"].update(gpu_busy_ms=None, gpu_busy_reason="this version")
+    return older
+
+
+def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_path):
+    """The report file names its schema in its first field, and the screen is rendered from the data of a file of that
+    schema alone.  Handed a file of another schema -- the file of the same run as the mode wrote it before it took the
+    GPU side of a step, read back from disk; a file of this version's own shape under the next name and under a name of
+    something else; a file that names no schema; something that is no report file -- ``perf.screen`` renders nothing and
+    says so in one sentence that names both schemas: a ``ValueError``, never the ``KeyError`` of an entry the other
+    schema does not have."""
+    from model_samples import perf
+
+    outcome, lines, events, _ = _mode(monkeypatch, tmp_path)
+    data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/2"
+    _says("area", f"The file's first field names its schema, `{perf.SCHEMA}`.")
+    assert perf.screen(data) == perf.screen(outcome.data) and perf.screen(data)[0] in lines, "a file of this schema is rendered: the screen of its run"
+    _says("area", "The screen is rendered from the data of a file of this schema (`screen` in `model_samples/perf.py`);")
+    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/2'"
+
+    def refused(file):
+        with pytest.raises(ValueError) as said:  # a KeyError is not one: it would pass through and fail the test
+            perf.screen(file)
+        return str(said.value)
+
+    # the file of the version before: written and read back as a file, 17 sections and 10 statistics where this version has 18 and 16
+    older = _schema_1(data)
+    assert (len(older), len(older["statistics"]), len(data), len(data["statistics"])) == (17, 10, 18, 16)
+    assert list(older["traced"])[-2:] == ["gpu_busy_ms", "gpu_busy_reason"] and len(older["traced"]) == 7
+    assert perf.write_report(str(tmp_path / "older.json"), older) == ""
+    read = json.loads((tmp_path / "older.json").read_text(encoding="utf-8"))
+    assert read == older and "per_kernel" not in read and "gpu_busy" not in read["statistics"], "what the screen of this version would look for"
+    assert refused(read) == refusal.format("'model-sample-performance/1'")
+    assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
+    # a name this version does not know, on a file of this version's own shape: the name decides, and nothing is rendered
+    later = f"model-sample-performance/{int(perf.SCHEMA.rsplit('/', 1)[1]) + 1}"
+    for name in (later, "kernel-census/2", "model-sample-performance", 2):
+        assert refused({**data, "schema": name}) == refusal.format(repr(name)), name
+    assert refused({key: value for key, value in data.items() if key != "schema"}) == refusal.format("None"), "a file that names no schema"
+    assert refused([]) == refused({}) == refusal.format("None"), "and what is no report file at all"
+    _says("area", "handed a file of another schema, written by another version of the mode, it renders nothing and says so")
+    _says("area", "it renders nothing and says so in one sentence that names both schemas.")
+    _says("area", "never written over, its schema, and a file of another schema refused in one sentence that names both);")
 
 
 def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
@@ -1432,22 +1494,22 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     _says("area", "A line under it says how many steps were traced, at which positions, and by how much tracing lengthened a step.")
     # form A: the equation, its second line and the note
     lines = perf.screen(_checkpoint_form())
-    at = lines.index("step                  100.000  ms = GPU busy 20.000 + launch overhead 70.000 + host 10.000")
+    at = lines.index("step                  400.000  ms = GPU busy 80.000 + launch overhead 280.000 + host 40.000")
     assert lines[at + 1] == "                      (GPU busy from 51 traced steps, positions 58 to 108; tracing lengthens a step by 5.0 %)"
-    note = lines.index("note                  launch overhead 70 % of a step = 100 us per block call: time in this sample's call path")
+    note = lines.index("note                  launch overhead 70 % of a step = 400 us per block call: time in this sample's call path")
     assert lines[note + 1] == "                      from Python, not kernel time" and lines.index(_line(lines, "memory  ")) < note and lines[note + 2] == ""
     _says("area", "and what it is -- time in this sample's call path from Python, not kernel time |")
     one = perf.screen(_checkpoint_form(traced={"steps": 1, "last_position": 58}))
     assert "                      (GPU busy from the traced step, position 58; tracing lengthens a step by 5.0 %)" in one
     # form B: GPU busy is not the smaller part -- the step, GPU busy as the upper bound it is, and no term for the rest; no note
-    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=60.0, overhead=None))
-    at = bound.index("step                  100.000  ms (not traced)")
+    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, overhead=None))
+    at = bound.index("step                  400.000  ms (not traced)")
     assert bound[at + 1 : at + 4] == [
-        "                      GPU busy 60.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
+        "                      GPU busy 240.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
         "                      launch overhead and host together: not resolved by this method",
         "                      (GPU busy from 51 traced steps, positions 58 to 108; tracing lengthens a step by 5.0 %)",
     ]
-    assert not any(line.startswith("note ") or "launch overhead 30" in line for line in bound), "the remainder is in the file, not on the screen"
+    assert not any(line.startswith("note ") or "launch overhead 120" in line for line in bound), "the remainder is in the file, not on the screen"
     unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
     at = unformed.index("                      (GPU busy from 51 traced steps, positions 58 to 108;")  # wider than a line: it breaks at the separator
     assert unformed[at + 1] == "                      the stretch of tracing was not formed)"
@@ -2139,9 +2201,12 @@ def test_the_session_is_built_for_the_longest_request(monkeypatch, capsys, tmp_p
         assert "protocol    warm-up 300 steps | timed 6 steps x 1, end token ignored | launched from Python, not captured" in runs[300][1]
         # ... and nothing a request computes or launches moves with it: the ids of the checked, the timed and the traced request, the
         # kernels of a step, the traced steps and the checks are those of the small session, whatever the warm-up made of the session
+        # (of the traced section every entry but tracing's stretch, which stays in the section: a ratio of two host times of the run)
         for warmup, (data, _, _) in runs.items():
             assert [data["raw"]["requests"][index]["ids_sha256"] for index in (0, 2, 3)] == [small["raw"]["requests"][0]["ids_sha256"]] * 3, warmup
-            assert data["kernels"] == small["kernels"] and data["traced"] == small["traced"] and data["checks"] == small["checks"], warmup
+            traced, of_small = ({key: value for key, value in one["traced"].items() if key != "tracing_stretch_percent"} for one in (data, small))
+            assert data["kernels"] == small["kernels"] and traced == of_small and data["checks"] == small["checks"], warmup
+            assert list(data["traced"]) == list(small["traced"]) and isinstance(data["traced"]["tracing_stretch_percent"], float), warmup
         # what does follow the session is its allocation: the attention cache has that many positions (here 2 tensors x 8 x 2 bytes each),
         # and the digest of an end state reads every byte of it -- equal sessions give equal digests, a larger one another
         assert (far["memory"]["state_gib"] - small["memory"]["state_gib"]) * GIB == pytest.approx(32 * (327 - 33))
