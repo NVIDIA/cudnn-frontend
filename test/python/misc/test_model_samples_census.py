@@ -158,9 +158,10 @@ AREA_POLICY = (
     "no requirement file of this repository's tests names the package `native` needs (FlashInfer), which is why `fe-entries` exists. The GPU test "
     "has an L0 cell for `native` that runs where the package is installed at a validated version and is skipped elsewhere: skipped is uncovered, "
     "not passing",
-    "Dependency alerts on `samples/models/requirements.txt`, `requirements-flashinfer.txt` and `constraints-native.txt` are raised by the `pip` "
-    "entry for `/samples/models` in `.github/dependabot.yml` and are handled by the maintainers of this repository, as for its other requirement "
-    "files.",
+    "Dependency alerts on `samples/models/requirements.txt` and `requirements-flashinfer.txt` are raised by the `pip` entry for `/samples/models` "
+    "in `.github/dependabot.yml` and are handled by the maintainers of this repository, as for its other requirement files. The exact pins of "
+    "`constraints-native.txt` are on the ignore list of that entry: they are the versions a family's kernel census was recorded with, and a pin "
+    "changes only together with a recorded run.",
 )
 #: what a run of the stack ``native`` at 65,535 rows needs: the library rows hold their weights on the stored codes at every row count
 MOST_NATIVE = "263.3 GiB on this GPU, 0.17 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
@@ -8486,6 +8487,7 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     assert (
         "the same rows in a step of speculative decoding, behind the drafter's passes: the kernel class and the launch shape of the 4-bit multiply and "
         "the recorded pick of the 8-bit one held and printed at the model's call sites;" in area
+        and "the ignore list of the Dependabot entry against the packages the constraints pin;" in area
         and "a launch in another shape than the recorded one at the model's site, a kernel class and a recorded pick at the model's site);" in area
     )
     modules = [line.split("|")[1].strip() for line in (MODELS / "README.md").read_text().splitlines() if line.startswith("| `providers/")]
@@ -8505,3 +8507,56 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     assert "--dry-plan" not in family + area + script, "the script has no such flag: a plan on stated device facts is made through the helper layer"
     assert "the call log reads `TUNED True`, and the kernel check fails with the form it found beside the form the row names" in family
     assert "prints the kernel that was chosen beside the pick the census records, says whether it is that pick, and never fails on it" in family
+
+
+def _ignored_by_dependabot(text: str, ecosystem: str, directory: str) -> list:
+    """The ``dependency-name`` values of the ``ignore`` list of the one ``updates`` entry of a Dependabot file for ``ecosystem``
+    and ``directory``, in file order; read as lines, as the file is written (block style, one key a line)."""
+
+    def value(line):
+        return line.split(":", 1)[1].split(" #", 1)[0].strip().strip("\"'")
+
+    entries = re.split(r"(?m)^  - (?=package-ecosystem:)", text)[1:]
+    found = [
+        entry for entry in entries if value(entry.splitlines()[0]) == ecosystem and re.search(rf'(?m)^    directory: "?{re.escape(directory)}"?\s*$', entry)
+    ]
+    assert len(found) == 1, f"one updates entry for {ecosystem} in {directory}; found {len(found)}"
+    names, inside = [], False
+    for line in found[0].splitlines()[1:]:
+        if re.match(r"^    [a-z-]+:", line):  # a key of the entry: the list ends at the next one
+            inside = line.startswith("    ignore:")
+            assert not inside or line.rstrip() == "    ignore:", "the ignore list is written one item a line"
+        elif inside and line.strip() and not line.strip().startswith("#"):
+            assert line.startswith("      - dependency-name:"), f"an item of the ignore list names one package and nothing else: {line!r}"
+            names.append(value(line))
+    return names
+
+
+def test_the_dependabot_entry_ignores_exactly_the_packages_the_native_constraints_pin():
+    """The exact pins of ``constraints-native.txt`` are the versions the kernel census was recorded with, so an update of
+    one fails this module by design, and the ``pip`` entry for ``/samples/models`` of ``.github/dependabot.yml`` must not
+    propose one: its ignore list names the packages the file pins -- each by its own name, none by a pattern, none
+    twice, no package more and none less.  A pin that is added without its ignore line fails here, and so does an ignore
+    line whose pin is gone.  (Which versions the file pins is held by the test of the requirement files, against the
+    census.)"""
+    from model_samples.providers import flashinfer_calls
+
+    root = MODELS.parents[1]
+    constraints = [line for line in (root / flashinfer_calls.CONSTRAINTS).read_text().splitlines() if line and not line.startswith("#")]
+    assert constraints and all(line.count("==") == 1 for line in constraints), "every line of the constraints is one exact pin"
+    pinned = [line.split("==")[0].strip() for line in constraints]
+    dependabot = (root / ".github" / "dependabot.yml").read_text()
+    ignored = _ignored_by_dependabot(dependabot, "pip", "/samples/models")
+    assert sorted(ignored) == sorted(pinned), f"the ignore list names {sorted(ignored)}; the constraints pin {sorted(pinned)}"
+    assert len(set(ignored)) == len(ignored) and not any(set(name) & set("*?[]") for name in ignored), "one line a package, by its name"
+    # the reader, on what it must tell apart: another directory's entry, a list that ends at the next key, an item that is no name
+    other = "updates:\n  - package-ecosystem: pip\n    directory: /\n    ignore:\n      - dependency-name: torch\n"
+    mine = '  - package-ecosystem: "pip"\n    directory: "/samples/models"\n    ignore:\n      - dependency-name: "a"  # why\n      - dependency-name: b\n    labels:\n      - c\n'
+    assert _ignored_by_dependabot(other + mine, "pip", "/samples/models") == ["a", "b"] and _ignored_by_dependabot(other + mine, "pip", "/") == ["torch"]
+    assert _ignored_by_dependabot(other + mine.replace("    ignore:\n", ""), "pip", "/samples/models") == []
+    with pytest.raises(AssertionError, match="one updates entry for pip in /samples/models; found 0"):
+        _ignored_by_dependabot(other, "pip", "/samples/models")
+    with pytest.raises(AssertionError, match="names one package and nothing else"):
+        _ignored_by_dependabot(
+            mine.replace("      - dependency-name: b\n", '      - dependency-name: b\n        versions: ["2.x"]\n'), "pip", "/samples/models"
+        )
