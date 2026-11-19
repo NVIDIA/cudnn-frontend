@@ -147,7 +147,7 @@ def _fe_backend_search():
             return f"{os.path.realpath(hits[0])} (via site-packages {sub})"
     for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
         for base in sys.path:
-            hits = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]")) if base else []
+            hits = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]")) if base and isinstance(base, str) else []
             if hits:
                 return f"{os.path.realpath(hits[0])} (via sys.path entry {base}, {sub})"
     return "dynamic-linker soname fallback (ldconfig / RPATH)"

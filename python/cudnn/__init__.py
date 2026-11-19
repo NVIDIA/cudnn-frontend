@@ -252,7 +252,8 @@ def _cudnn_wheel_lib_on_sys_path():
     ``--system-site-packages`` venv."""
     for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
         for base in sys.path:
-            if not base:
+            # The import system only looks at str entries, so skip the rest too.
+            if not base or not isinstance(base, str):
                 continue
             lib_path = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]"))
             if lib_path:

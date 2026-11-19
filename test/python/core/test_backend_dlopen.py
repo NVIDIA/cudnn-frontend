@@ -4,12 +4,14 @@
 """Which libcudnn ``cudnn._dlopen_cudnn`` picks for a pip-installed backend."""
 
 import ctypes
+import os
 import sys
 import sysconfig
 
 import pytest
 
 import cudnn
+from cudnn import collect_env
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="Linux dlopen path; Windows uses load_cudnn")
 
@@ -49,6 +51,20 @@ def test_dlopen_finds_wheel_on_sys_path_outside_purelib(opened, monkeypatch, tmp
     monkeypatch.setattr(sys, "path", ["", str(tmp_path / "other"), str(site)])
     cudnn._dlopen_cudnn()
     assert opened == [str(lib)]
+
+
+@pytest.mark.L0
+def test_dlopen_skips_non_str_sys_path_entries(opened, monkeypatch, tmp_path):
+    # The import system ignores sys.path entries that are not str, so the
+    # wheel search must skip them instead of failing in os.path.join.
+    site = tmp_path / "site"
+    lib = site / "nvidia/cudnn/lib" / "libcudnn.so.9"
+    lib.parent.mkdir(parents=True)
+    lib.touch()
+    monkeypatch.setattr(sys, "path", [str(tmp_path / "other").encode(), str(site)])
+    cudnn._dlopen_cudnn()
+    assert opened == [str(lib)]
+    assert collect_env._fe_backend_search().startswith(os.path.realpath(lib))
 
 
 @pytest.mark.L0
