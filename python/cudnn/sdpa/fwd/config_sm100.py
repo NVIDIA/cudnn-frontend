@@ -255,7 +255,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
     """Scalar-tail masking composes with the native half split flavors."""
-    if device_cc not in ((10, 0), (10, 3), (10, 7)):
+    if device_cc not in ((10, 0), (10, 3), (10, 7), (11, 0)):
         return False
     if fp8:
         return d_shape == (128, 128) and pertensor

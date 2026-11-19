@@ -677,7 +677,7 @@ def host_thd_2cta(
             dv,
             meta,
             origins,
-            cutlass.Int32(batch),
+            batch,
             max_skv,
             _origin_row(origin_specs, 6),
             _origin_row(origin_specs, 7),

@@ -130,6 +130,11 @@ class EngineFamily:
     # typed decline; the backend's other engines stay. None: no engine is excluded. Same contract as
     # backend_guard: a documented backend defect on a measured domain, never placement policy.
     backend_engine_guard: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_plan_guard(graph, facts, engine_id, knobs) -> Optional[str]``:
+    # a correctness decline for one backend configuration. Knobs are the public vocabulary, including backend-
+    # resolved defaults on explicit replay. The opaque BACKEND_HEURISTIC_ENGINE_ID sentinel may also be declined
+    # when its unfiltered fallback cannot be made safe. This is a measured defect, never ranking policy.
+    backend_plan_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -369,6 +374,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         validator=("cudnn._sdpa_validate", "validate_graph"),
         backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
         backend_engine_guard=("cudnn.sdpa.fwd.backend_guard", "backend_engine_guard"),
+        backend_plan_guard=("cudnn.sdpa.fwd.backend_guard", "backend_plan_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -537,6 +543,12 @@ def resolve_backend_engine_guard(family: EngineFamily):
     """The family's backend-engine guard, or None (see EngineFamily.backend_engine_guard)."""
 
     return _resolve(family, family.backend_engine_guard, "backend_engine_guard")
+
+
+def resolve_backend_plan_guard(family: EngineFamily):
+    """The family's backend-plan correctness guard, or None."""
+
+    return _resolve(family, family.backend_plan_guard, "backend_plan_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

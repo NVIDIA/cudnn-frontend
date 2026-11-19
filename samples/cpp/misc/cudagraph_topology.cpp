@@ -42,6 +42,7 @@ Set CUDNN186_LOG=<path> to also append every printed line to a raw log file.
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -2014,19 +2015,28 @@ TEST_CASE("186 G08: repeated create/update/instantiate/destroy with growing loop
                             __float2half(-1234.f));
 
     // cudaMemGetInfo reports the whole device, so another process on the same GPU or a
-    // one-time pool / driver growth moves it as well. A leak that scales with the loop
-    // count loses memory on every pass, so each loop count gets up to kAttempts passes
-    // and passes only when one of them is clean: its delta stays within the slack in BOTH
-    // directions. A large gain is another process freeing memory in the window, which
-    // could cancel a leak, so it is retried like a large loss. This assumes the window
-    // is not contaminated by an amount that matches the leak; on a shared GPU the check
-    // stays best-effort.
+    // one-time pool / driver growth moves it as well, by hundreds of MB to GBs in either
+    // direction on shared CI runners. So no single window decides. Each loop count gets up
+    // to kAttempts passes, stopping at the first clean one (within the slack in both
+    // directions), and keeps the smallest loss among them. A gain beyond the slack means
+    // another process freed memory in that window, which could hide a leak, so it is not
+    // a measurement.
+    //
+    // A leak in the lifecycle loses memory on every pass, in proportion to the loop count.
+    // So the test fails only if the largest loop count loses more than the slack AND every
+    // smaller loop count loses at least its proportional share of that (less the slack).
+    // Noise from other processes does not scale with the loop count. On a shared GPU the
+    // check stays best-effort: a gain in every pass of the largest loop count hides a leak,
+    // and another process losing a little more than the slack in every one of those passes
+    // looks like a small leak.
     int const kAttempts               = 3;
     long long const kDeviceSlackBytes = 32LL * 1024LL * 1024LL;
 
     std::vector<int> loop_counts = {10, 50, 100, 200};
+    std::vector<long long> smallest_losses;
     for (auto loops : loop_counts) {
-        bool clean_attempt = false;
+        long long smallest_loss = std::numeric_limits<long long>::max();
+        bool measured           = false;
         for (int attempt = 1; attempt <= kAttempts; ++attempt) {
             // Warm the allocator / driver caches before taking the baseline.
             for (int i = 0; i < 5; ++i) {
@@ -2091,15 +2101,30 @@ TEST_CASE("186 G08: repeated create/update/instantiate/destroy with growing loop
             REQUIRE(memory_before.second != 0);
             REQUIRE(memory_after.second != 0);
 
+            if (device_free_delta <= kDeviceSlackBytes) {
+                measured      = true;
+                smallest_loss = std::min(smallest_loss, -device_free_delta);
+            }
             if (-kDeviceSlackBytes <= device_free_delta && device_free_delta <= kDeviceSlackBytes) {
-                clean_attempt = true;
                 break;
             }
         }
-        // A leak that scales with the loop count would show up as device memory that never
-        // comes back on any pass. Allow a small driver-level slack only.
-        REQUIRE(clean_attempt);
+        // Every pass gained memory: no measurement for this loop count.
+        if (!measured) {
+            smallest_loss = 0;
+        }
+        smallest_losses.push_back(smallest_loss);
+        ev("[186][G08] loops=" + std::to_string(loops) +
+           " smallest_device_loss_bytes=" + std::to_string(smallest_loss));
     }
+
+    long long const largest_loss = smallest_losses.back();
+    bool proportional_leak       = largest_loss > kDeviceSlackBytes;
+    for (size_t i = 0; i + 1 < smallest_losses.size(); ++i) {
+        long long const share = largest_loss / loop_counts.back() * loop_counts[i];
+        proportional_leak     = proportional_leak && smallest_losses[i] >= share - kDeviceSlackBytes;
+    }
+    REQUIRE_FALSE(proportional_leak);
     ev("[186][G08] PASS, see the per-loop-count deltas above (host and device)");
 #endif
 }

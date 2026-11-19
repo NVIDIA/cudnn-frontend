@@ -1211,7 +1211,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert (
         "**One session for a prompt and its verify steps.** A session built with `draft_tokens=k` does both: it feeds its prompt through decode steps "
         "and then runs verify steps of `k + 1` tokens on the same state. Its plan table shows both plans, and one memory sentence counts one state. "
-        "The caller supplies the drafted tokens and says after the host read how many were kept; nothing drafts yet. Two sessions on one load still "
+        "The caller supplies the drafted tokens and says after the host read how many were kept; no session drafts yet. Two sessions on one load still "
         "share weights, never a state." in section
     )
     assert "One state for both kinds of step is not built" not in section and "no run here prefills a prompt" not in section

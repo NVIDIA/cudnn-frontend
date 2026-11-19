@@ -4,6 +4,7 @@ The API reference groups graph operations and experimental Python kernels by
 operation. Use the sidebar to find an operation and its related APIs.
 
 - [Attention](/operations/Attention)
+- [JAX SDPA Python frontend (experimental)](sdpa_jax.md)
 - [Sparse Attention](/operations/sparse_attention)
 - [Linear Attention](/operations/LinearAttention)
 - [Matmul and GEMM Fusions](/operations/Matmul)
@@ -35,6 +36,7 @@ The experimental API catalog includes:
 - [FP8 Projection for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/fp8_projection_decode) — an FP8 E4M3 weight times FP8 E4M3 activations to bf16 at decode-time row counts (1 .. 32) as one FROST launch with split-K clusters (or one K slice per weight tile, without a cluster) and the weight stream ahead of the dependent-launch wait; the split is a numerics attribute fixed per entry, bitwise repeatable and batch-invariant
 - [Add + RMSNorm + Quantize Decode Step (SM100-class)](/operations/Normalizations/add_norm_quant_decode) — the residual add, the RMSNorm and the quantization of the next projection's input at decode-time row counts (1 .. 1024) as one FROST launch (bf16 in; bf16, FP8 E4M3 or NVFP4 out), bitwise repeatable and batch-invariant
 - [SwiGLU FP4 Gate / Up Product for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/swiglu_fp4_decode) — the gate / up product of a block-scaled FP4 (NVFP4) MLP with SiLU(gate) x up and the FP4 re-quantization of the result at decode-time row counts (1 .. 64) as one FROST launch, with the weight stream ahead of the dependent-launch wait; no numerics knob, bitwise repeatable and batch-invariant
+- [Attention Preparation Decode Step (SM100-class)](/operations/Attention/attention_prepare_decode) — per token of a decode step the RMSNorm of every query and key head row, the rotation of its rotary part by the token's position (one or three position rows), the gate rows copied beside the queries and the keys and values written into paged pools at the token's slot, at decode-time token counts (1 .. 1024), as one FROST launch (bf16 in and out), bitwise repeatable and batch-invariant
 - [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
@@ -64,6 +66,7 @@ The experimental API catalog includes:
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
+- [Pooled DSA](/operations/sparse_attention/pooled_dsa): full indexer, selection from logits, cache update, and index expansion
 - [Fused DSA indexer and exact top-k (Cake)](/operations/dsa_indexer_topk)
 - [Cake sparse-attention training](/operations/dsa_sparse_training)
 - [Cake deterministic DSA and Lightning indexer](/operations/dsa_deterministic)

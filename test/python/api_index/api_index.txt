@@ -2,6 +2,7 @@ cudnn
 cudnn.AddNormQuantDecode
 cudnn.AlignedHCABackward
 cudnn.AttentionGateQuantDecode
+cudnn.AttentionPrepareDecode
 cudnn.BSA
 cudnn.BlockScaledTensor
 cudnn.BsaBackwardMetadata
@@ -469,6 +470,7 @@ cudnn.engines.EngineFamily
 cudnn.engines.EngineFamily.analyzer
 cudnn.engines.EngineFamily.backend_engine_guard
 cudnn.engines.EngineFamily.backend_guard
+cudnn.engines.EngineFamily.backend_plan_guard
 cudnn.engines.EngineFamily.heuristics
 cudnn.engines.EngineFamily.id_end
 cudnn.engines.EngineFamily.offered_ids
@@ -1559,6 +1561,11 @@ cudnn.ops.dsa.indexer_forward
 cudnn.ops.dsa.indexer_forward_jax
 cudnn.ops.dsa.indexer_top_k_forward
 cudnn.ops.dsa.indexer_top_k_workspace_size
+cudnn.ops.dsa.pooled_cache_update_forward
+cudnn.ops.dsa.pooled_expand_forward
+cudnn.ops.dsa.pooled_indexer_forward
+cudnn.ops.dsa.pooled_select_forward
+cudnn.ops.dsa.pooled_select_workspace_size
 cudnn.ops.dsa.sparse_attention_backward
 cudnn.ops.dsa.sparse_attention_backward_jax
 cudnn.ops.dsa.sparse_attention_forward
@@ -1632,6 +1639,8 @@ cudnn.ops.quantize_mok_weights
 cudnn.ops.ragged_grouped_gemm_backward
 cudnn.ops.ragged_grouped_gemm_forward
 cudnn.ops.rms_norm_forward_jax
+cudnn.ops.sdpa_backward_jax
+cudnn.ops.sdpa_forward_jax
 cudnn.ops.simplified_sparse_attention_forward
 cudnn.ops.simplified_sparse_attention_forward_jax
 cudnn.ops.simplified_sparse_attention_reserve

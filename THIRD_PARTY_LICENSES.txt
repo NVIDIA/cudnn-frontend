@@ -406,7 +406,32 @@ FlashInfer's NOTICE:
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 
 -------------------------------------------------------------------------------
-13. Mixture-of-Kittens (cursor/mixture-of-kittens)
+13. vLLM (vllm-project/vllm)
+    https://github.com/vllm-project/vllm
+
+The attention preparation kernel for decode rows in
+python/cudnn/attention_prepare/frost/kernel/prepare_decode_f16.py follows the
+thread shape and the arithmetic of vLLM's fused QK-RMSNorm + partial RoPE +
+gate copy kernel (_fused_qk_rmsnorm_rope_gate_kernel in
+vllm/model_executor/layers/fused_qk_norm_rope.py), pinned to commit
+2a777ce26e8315fa503ac5e88b595235d1c2b928. vLLM distributes the source file
+under Apache License 2.0 (Copyright contributors to the vLLM project); the
+derived file names the source and its licence in its header. The port is
+written on the CuTe DSL (the source is a Triton kernel), makes the geometry,
+the epsilon, the position form, the page size and the integer dtypes
+compile-time constants, serves bf16 only (the source takes its input dtype as
+a constant), fixes the gain at 1 + weight (the source adds a constant
+norm_beta), takes the query rows and the gate rows as two operands with their
+own strides (the source reads one [q | gate] row per head), loads a thread's
+elements once, reads the rotary partner from another thread of the warp,
+writes the keys into a paged pool at a slot and copies the value rows into a
+second pool beside them (the source writes the keys to a dense output and has
+no value operand) with the store predicated by the pool's capacity, and adds
+the host entry with its typed declines and launch arms.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+14. Mixture-of-Kittens (cursor/mixture-of-kittens)
     https://github.com/cursor/mixture-of-kittens
 
 The MoE dispatch, expert MLP and combine operator under

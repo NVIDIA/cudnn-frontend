@@ -13,6 +13,7 @@ from sdpa.random_config import ExecConfig
 
 @pytest.mark.L0
 @pytest.mark.parametrize("sequence", [2816, 2818], ids=["aligned", "tail"])
+@pytest.mark.skipif(cudnn.backend_version() < 92900, reason="Known MXFP8 backward amax issue in cuDNN < 9.29")
 def test_mxfp8_bwd_amax_live_rows(sequence, request, cudnn_handle):
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("MXFP8 SDPA requires Blackwell (SM100+)")

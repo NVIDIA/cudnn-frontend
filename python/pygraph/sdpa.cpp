@@ -19,6 +19,17 @@ namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 
+namespace {
+void
+validate_causal_alignment(bool use_causal_mask, cudnn_frontend::DiagonalAlignment_t diagonal_alignment) {
+    if (use_causal_mask && diagonal_alignment == cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT) {
+        throw std::runtime_error(
+            "use_causal_mask=True requires diagonal_alignment=TOP_LEFT; "
+            "use use_causal_mask_bottom_right=True for bottom-right causal masking");
+    }
+}
+}  // namespace
+
 // Internal SDPA implementation - delegates to sdpa() or sdpa_fp8() based on mma_core_mode
 cudnn_frontend::graph::SDPA_attributes::SDPA_outputs
 PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
@@ -278,6 +289,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
               bool const stats_use_log2) {
+    validate_causal_alignment(use_causal_mask, diagonal_alignment);
+
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -410,6 +423,8 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::optional<PyCallback> fn_bprop,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
+    validate_causal_alignment(use_causal_mask, diagonal_alignment);
+
     auto attributes =
         cudnn_frontend::graph::SDPA_backward_attributes()
             .set_bias(bias)
@@ -577,6 +592,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
                   bool const stats_use_log2) {
+    validate_causal_alignment(use_causal_mask, diagonal_alignment);
+
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
 
@@ -703,6 +720,8 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
                     py::object const& paged_attention_max_seq_len_kv) {
+    validate_causal_alignment(use_causal_mask, diagonal_alignment);
+
     auto attributes =
         cudnn_frontend::graph::SDPA_fp8_attributes().set_name(name).set_compute_data_type(compute_data_type);
 
@@ -868,6 +887,8 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
                            py::object const& max_total_seq_len_q,
                            py::object const& max_total_seq_len_kv) {
+    validate_causal_alignment(use_causal_mask, diagonal_alignment);
+
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
     py::object actual_right_bound                                 = right_bound;
 
@@ -1041,6 +1062,8 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
                              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
                              py::object const& max_total_seq_len_q,
                              py::object const& max_total_seq_len_kv) {
+    validate_causal_alignment(use_causal_mask, diagonal_alignment);
+
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
     py::object actual_right_bound                                 = right_bound;
 

@@ -73,6 +73,9 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    # Keep all device facts synthetic: an unmocked SM-count probe initializes
+    # the CUDA driver on CPU hosts, once for every candidate and graph.
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))

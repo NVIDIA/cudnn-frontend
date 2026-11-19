@@ -1,0 +1,93 @@
+{
+  "inputs": {
+    "cos_sin": {
+      "dtype": "torch.bfloat16",
+      "sha256": "eb63630b0b117490ecd45b9950fae2c479e356c196eb8a582dc768aa8aea6777",
+      "shape": [
+        4096,
+        64
+      ]
+    },
+    "k_weight": {
+      "dtype": "torch.bfloat16",
+      "sha256": "4b32c87eeadc60e0416ea3b47e2d6b88d93a91989bd4e84bade2bfeab1ee0ba5",
+      "shape": [
+        256
+      ]
+    },
+    "positions": {
+      "dtype": "torch.int64",
+      "sha256": "0fac7ed83ba56d865214684b267a5b25ecbe3d8ca50c4563686ffb0930a24288",
+      "shape": [
+        9
+      ]
+    },
+    "q_weight": {
+      "dtype": "torch.bfloat16",
+      "sha256": "c5d1c24c53aabdd5095cbe7e41b4b9012b73f41252b10ea236c52ae0aa8ad1c9",
+      "shape": [
+        256
+      ]
+    },
+    "slab": {
+      "dtype": "torch.bfloat16",
+      "sha256": "bc91b88b60861aa9f7139d7b3f4b9ac7d8f9dce3f1754ee34276ddf156bbe1cb",
+      "shape": [
+        9,
+        14336
+      ]
+    },
+    "slot_mapping": {
+      "dtype": "torch.int32",
+      "sha256": "df7ed22e4b75ce1389d10f13b72682c324038db027d3fa8dd10af24f83f44dec",
+      "shape": [
+        4
+      ]
+    }
+  },
+  "outputs": {
+    "cache": {
+      "dtype": "torch.int16",
+      "sha256": "e0a1de6ab964e3ab5c7cd0b9926be5a72bdc0c5f4f208bd84aa77a419077acbc",
+      "shape": [
+        3,
+        4,
+        16,
+        512
+      ]
+    },
+    "gate_out": {
+      "dtype": "torch.int16",
+      "sha256": "f1c1aafbb67e85234cd30eb6e594bf28c6e05345e40dc7d7e37991c15a3b05a9",
+      "shape": [
+        9,
+        24,
+        256
+      ]
+    },
+    "q_out": {
+      "dtype": "torch.int16",
+      "sha256": "2e549cea5618411dab6c11fd1ecee90ad832981584fb3cad4081d0199a05147d",
+      "shape": [
+        9,
+        24,
+        256
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13010,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.13.0+cu130",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}
