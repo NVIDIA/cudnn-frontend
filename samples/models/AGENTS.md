@@ -245,8 +245,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
     files are read behind the traced request, and its loops end with the pipe the run holds: at the stop, or when the
     run is gone.
     A list of processes counts as empty only beside the run's own entry and a device memory in use that the run's own
-    explains. A `not observed` carries a reason from a closed list, never the tool's path or its own words; no process
-    name and no id of another process is kept. A lock is the operator's declaration: it is printed as declared, held
+    explains. A count of other processes is stated only of a list that shows the run's own entry too. A `not observed`
+    carries a reason from a closed list, never the tool's path or its own words; no process name is asked for, and
+    the report keeps no id of another process. A lock is the operator's declaration: it is printed as declared, held
     against the observed clock in both directions, and never set.
 
 ## What the first GPU run of this area taught

@@ -14,16 +14,18 @@ An ``Observer`` makes
   tool -- the SM clock, the power and the clock event reasons; the list of compute processes -- each writing a line every
   ``PERIOD_MS`` into a file of its own, and then waits for its standard input to close.  The process that times holds the
   other end of that pipe and does nothing else with the child between the start and the stop: no read, no poll, no
-  thread.  The loops end when the pipe closes, at the stop or when the run is gone for any reason; the files are read
-  behind the stop.
+  thread.  The loops end when the pipe closes, at the stop or when the run is gone for any reason: the keeper ends
+  them, kills one that does not end, and on Linux none outlives its keeper.  The files are read behind the stop.
 
 **The cut.**  The tool stamps every line on the host's wall clock.  A sample belongs to a request when its stamp lies
 between the request being handed to the text path and its last token's ids on the host (``summary``); the bounds of a
-request are brought to the wall clock by one pair of clock readings taken when the sampler starts.
+request are brought to the wall clock by one pair of clock readings taken when the sampler starts, and a second pair
+at its stop shows a wall clock that was set meanwhile -- by more than ``DRIFT_LIMIT_MS``, and the samples are not used.
 
 **What is stated** (``others``, ``clocks``).  ``none seen`` only when no other process id was in a reading or in a sample,
 this process's own id was in every reading and in a sample of every timed request, and the device's memory in use agreed
-with this process's own in every reading: a list that hides processes ends in ``not observed``.  The clocks are ``yes``
+with this process's own in every reading: a list that hides processes ends in ``not observed``, and so does a list
+that shows other ids and not this process's own -- no count is stated of it.  The clocks are ``yes``
 with the median and the minimum over the samples of the timed requests, ``thin`` where a timed request has fewer than
 ``LEAST_SAMPLES``, or ``no``.  A lock is a declaration of the caller: it is held against the observed clock and never
 set.  Whatever cannot be read is ``not observed`` with one of ``REASONS``, a closed list of phrases: never the tool's
@@ -32,6 +34,7 @@ path, its own words or an exception's text.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import statistics
@@ -50,6 +53,8 @@ LEAST_SAMPLES = 10  # clock samples every timed request must have
 FLOOR, CEILING = 0.97, 1.03  # the minimum against a declared lock, or against the median where none is declared; the maximum against a declared lock
 MEMORY_SLACK_MIB = 64  # device memory in use above this process's own that still agrees with it
 ASK_LIMIT_S = 10.0  # of one call of the tool, and of the wait for the keeper at the stop
+LOOP_LIMIT_S = 3.0  # of the keeper's wait for a loop it has ended: a loop that is still there is killed
+DRIFT_LIMIT_MS = 1.0  # the wall clock against the clock of the stamps, between the sampler's start and its stop: the resolution of the tool's stamp
 FORMAT = "--format=csv,noheader,nounits"
 READING_FIELDS = "driver_version,clocks.sm,memory.used,utilization.gpu"
 CLOCK_FIELDS = "timestamp,clocks.sm,power.draw,clocks_event_reasons.active"
@@ -75,11 +80,13 @@ TOOL_ERROR = "nvidia-smi ended with an error"
 UNREAD = "nvidia-smi's answer could not be read"
 NO_SAMPLER = "the sampler could not be started"
 NOT_LISTED = "this process is not in the driver's list"
+NO_MEMORY = "the driver reports no memory figure"
 MEMORY_BEYOND = "device memory in use exceeds this process's own"
 NO_PROCESS_SAMPLE = "no process sample inside a timed request"
 NO_CLOCK_SAMPLE = "no clock sample inside a timed request"
 NO_CLOCK = "the driver reports no SM clock"
 CLOCK_MOVED = "the host's clock moved during the timed requests"
+NO_READING = "no reading was made"
 #: every reason a ``not observed`` can carry
 REASONS = (
     NOT_FOUND,
@@ -90,29 +97,43 @@ REASONS = (
     UNREAD,
     NO_SAMPLER,
     NOT_LISTED,
+    NO_MEMORY,
     MEMORY_BEYOND,
     NO_PROCESS_SAMPLE,
     NO_CLOCK_SAMPLE,
     NO_CLOCK,
     CLOCK_MOVED,
+    NO_READING,
 )
-#: the child that keeps the two loops: it ends them when its standard input closes or holds a byte, or when it is ended
+#: the child that keeps the two loops: it ends them when its standard input closes or holds a byte, or when it is ended,
+#: and kills a loop that has not ended within its limit; on Linux a loop is bound to its keeper (the parent-death signal,
+#: prctl option 1), so that none outlives a keeper that was killed
 KEEPER = f"""
 import signal, subprocess, sys
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
-tool, target, period, *files = sys.argv[1:]
+tool, target, period, limit, *files = sys.argv[1:]
+try:
+    import ctypes
+    prctl = ctypes.CDLL(None).prctl
+except (ImportError, OSError, AttributeError):
+    prctl = None
+bound = (lambda: prctl(1, int(signal.SIGKILL))) if prctl else None
 loops = []
 try:
     for query, path in zip(("--query-gpu={CLOCK_FIELDS}", "--query-compute-apps={PROCESS_FIELDS}"), files):
         with open(path, "wb") as out:
             command = [tool, "--id=" + target, query, "{FORMAT}", "--loop-ms=" + period]
-            loops.append(subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL))
+            loops.append(subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL, preexec_fn=bound))
     sys.stdin.buffer.read(1)
 finally:
     for loop in loops:
         loop.terminate()
     for loop in loops:
-        loop.wait()
+        try:
+            loop.wait(float(limit))
+        except subprocess.TimeoutExpired:
+            loop.kill()
+            loop.wait()
 """
 
 #: statistic -> (unit, definition, serving counterpart): the one definition of what this module observes, as the report
@@ -152,10 +173,13 @@ class Seen(NamedTuple):
 
 
 def _number(text: str) -> Optional[float]:
+    """A field of the tool that is a size -- MHz, W, MiB, percent -- or ``None``: a field the driver does not give ("[N/A]",
+    "[Not Supported]"), and one that is no size (not finite, or below zero)."""
     try:
-        return float(text)
-    except ValueError:  # "[N/A]", "[Not Supported]": a field the driver does not give
+        value = float(text)
+    except ValueError:
         return None
+    return value if math.isfinite(value) and value >= 0.0 else None
 
 
 def _stamp(text: str) -> Optional[float]:
@@ -177,7 +201,7 @@ def clock_sample(line: str) -> Optional[Clock]:
         events = int(fields[3], 16)
     except ValueError:
         events = None
-    return Clock(at, _number(fields[1]), _number(fields[2]), events)
+    return Clock(at, _number(fields[1]) or None, _number(fields[2]), events)  # a clock of zero is no clock
 
 
 def process_sample(line: str) -> Optional[Seen]:
@@ -279,12 +303,24 @@ def reading(tool: str, target: str, pid: int, when: str) -> Reading:
     if not made.reason and (len(device) != 1 or len(device[0]) != 4 or any(len(row) != 2 or not row[0].isdigit() for row in listed)):
         made.reason = UNREAD
     if not made.reason:
-        made.driver, made.clock, made.used, made.utilization = device[0][0], _number(device[0][1]), _number(device[0][2]), _number(device[0][3])
+        made.driver = None if device[0][0].startswith("[") else device[0][0] or None  # "[N/A]": a version the driver does not give
+        made.clock, made.used, made.utilization = _number(device[0][1]) or None, _number(device[0][2]), _number(device[0][3])
         made.others = {int(row[0]): _number(row[1]) for row in listed}
         made.listed = pid in made.others
         made.own = made.others.pop(pid, None)
     made.seconds = now() - start
     return made
+
+
+def _pair() -> Tuple[float, float]:
+    """One moment on both clocks, ``(wall clock, the clock of the stamps)``: the wall clock read between two readings of
+    the other, and of three such readings the one whose two lie closest -- a read that was put off between its clocks
+    is not the one taken."""
+    tries = []
+    for _ in range(3):
+        before, wall, after = now(), time.time(), now()
+        tries.append((after - before, wall, (before + after) / 2))
+    return min(tries)[1:]
 
 
 class Sampler:
@@ -302,22 +338,25 @@ class Sampler:
     def start(self) -> str:
         if not sys.executable:
             return NO_SAMPLER
-        self.folder = tempfile.TemporaryDirectory(prefix="perf-observe-")
+        try:
+            self.folder = tempfile.TemporaryDirectory(prefix="perf-observe-")
+        except OSError:  # no folder for temporary files on this host
+            return NO_SAMPLER
         files = [os.path.join(self.folder.name, name) for name in ("clocks.csv", "processes.csv")]
-        command = [sys.executable, "-I", "-S", "-c", KEEPER, self.tool, self.target, str(self.period), *files]
+        command = [sys.executable, "-I", "-S", "-c", KEEPER, self.tool, self.target, str(self.period), str(LOOP_LIMIT_S), *files]
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             self.folder.cleanup()
             return NO_SAMPLER
-        self.started = (time.time(), now())
+        self.started = _pair()
         return ""
 
     def stop(self) -> None:
         if self.child is None:
             return
         child, self.child = self.child, None
-        self.stopped = (time.time(), now())
+        self.stopped = _pair()
         try:
             child.stdin.write(b"\n")
             child.stdin.close()
@@ -370,17 +409,23 @@ def request_facts(kind: str, lines: Sequence[Clock], seen: Sequence[Seen], pid: 
 
 def others(readings: Sequence[Reading], requests: Sequence[dict], strangers: int, failed: str = "") -> dict:
     """Condition C5, the other compute processes: ``seen`` with their count where another process id was in a reading or
-    in a sample; else ``not observed`` with the reason where the driver could not be read (``failed``: why there are no
-    samples), a timed request has no process sample, this process is missing from a reading or from the samples of a
-    timed request, or the device's memory in use is not this process's own; else ``none seen``."""
+    in a sample -- and this process itself was in every reading that was made and in the samples of every timed request
+    that has any: of a list that shows other ids and not this process's own no count is stated, one of them may be this
+    process under another id; else ``not observed`` with the reason where the driver could not be read (``failed``: why
+    there are no samples), a timed request has no process sample, this process is missing from a reading or from the
+    samples of a timed request, the driver gives no memory figure, or the device's memory in use is not this process's
+    own; else ``none seen``."""
     timed = [made for made in requests if made["kind"] == "timed"]
-    if strangers:
+    hidden = any(not made.reason and not made.listed for made in readings) or any(made["process_samples"] and not made["this_process_listed"] for made in timed)
+    if strangers and not hidden:
         return {"verdict": "seen", "seen": strangers, "reason": None}
-    reason = next((made.reason for made in readings if made.reason), failed)
+    reason = NOT_LISTED if strangers else next((made.reason for made in readings if made.reason), failed)
     if not reason and not (timed and all(made["process_samples"] for made in timed)):
         reason = NO_PROCESS_SAMPLE
     if not reason and not (readings and all(made.listed for made in readings) and all(made["this_process_listed"] for made in timed)):
         reason = NOT_LISTED
+    if not reason and any(made.used is None or made.own is None for made in readings):
+        reason = NO_MEMORY
     if not reason and not all(made.agrees() for made in readings):
         reason = MEMORY_BEYOND
     return {"verdict": "not observed" if reason else "none seen", "seen": None if reason else 0, "reason": reason or None}
@@ -532,7 +577,7 @@ class Observer:
     def driver(self) -> dict:
         """The driver's version for the file's ``environment``, or why it is not there."""
         version = next((made.driver for made in self.readings if made.driver), None)
-        missing = self.reason or next((made.reason for made in self.readings if made.reason), "") or "no reading was made"
+        missing = self.reason or next((made.reason for made in self.readings if made.reason), "") or (UNREAD if self.readings else NO_READING)
         return {"value": version, "reason": None if version else f"not observed ({missing})"}
 
     def section(self, requests: Sequence[Tuple[str, float, float]]) -> dict:
@@ -543,10 +588,11 @@ class Observer:
             return {**made, "source": "none", "reason": self.reason, "sampler_period_ms": None, "unread_lines": None, "clock_offset_drift_ms": None}
         sampler, failed = self.sampler, self.failed
         offset = sampler.started[0] - sampler.started[1] if sampler is not None else 0.0  # the stamps' clock to the wall clock
-        if sampler is not None and not failed and abs(sampler.stopped[0] - sampler.stopped[1] - offset) * 1e3 > PERIOD_MS:
+        drift = (sampler.stopped[0] - sampler.stopped[1] - offset) * 1e3 if sampler is not None else None
+        if drift is not None and not failed and abs(drift) > DRIFT_LIMIT_MS:
             failed = CLOCK_MOVED
         bounds = [(kind, start + offset, stop + offset) for kind, start, stop in requests]
         clock_samples, process_samples = ([], []) if sampler is None or failed else (sampler.clocks, sampler.processes)
         made = summary(self.readings, clock_samples, process_samples, bounds, self.pid, self.lock, failed)
-        drift = (sampler.stopped[0] - sampler.stopped[1] - offset) * 1e3 if sampler is not None else None
-        return {**made, "unread_lines": sampler.unread if sampler is not None else None, "clock_offset_drift_ms": drift}
+        period = sampler.period if sampler is not None else None  # of the loops as they were started
+        return {**made, "sampler_period_ms": period, "unread_lines": sampler.unread if sampler is not None else None, "clock_offset_drift_ms": drift}
