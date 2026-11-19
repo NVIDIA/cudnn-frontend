@@ -560,10 +560,11 @@ def test_verify_mode_checks_every_call(monkeypatch):
     assert cpp_launcher.VERIFIED["matched"] == matched + 2
 
 
-def test_verify_mode_compares_a_float_argument_by_its_bits(monkeypatch):
+def test_verify_mode_takes_a_nan_argument_as_unchanged(monkeypatch):
     """A NaN is not equal to itself, and it is the same argument in the call and in its replay."""
     import math
 
+    import numpy
     import tvm_ffi
 
     from cudnn import cpp_launcher
@@ -575,13 +576,14 @@ def test_verify_mode_compares_a_float_argument_by_its_bits(monkeypatch):
 
     @cpp_launched
     def api(x, scale):
-        launch(sink, scale)
+        launch(sink, float(scale))
         return x
 
     matched = cpp_launcher.VERIFIED["matched"]
     x = torch.zeros(8, device="cuda")
-    assert api(x, math.nan) is x
-    assert cpp_launcher.VERIFIED["matched"] == matched + 1
+    for nan in (math.nan, float("nan"), numpy.float32("nan"), numpy.float64("nan")):
+        assert api(x, nan) is x
+    assert cpp_launcher.VERIFIED["matched"] == matched + 4
 
 
 def test_a_call_keys_the_same_however_its_arguments_are_passed():

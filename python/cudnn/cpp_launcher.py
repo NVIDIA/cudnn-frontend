@@ -944,7 +944,7 @@ def _difference(a, b, where):
         return next((d for d in (_difference(a[k], b[k], f"{where}[{k!r}]") for k in a.keys()) if d is not None), None)
     if isinstance(a, float):  # by the bits: a NaN is the same argument in the call and in its replay, and 0.0 is not -0.0
         return None if float_bits(a) == float_bits(b) else where
-    return None if a == b or _stream_like(a) else where
+    return None if a is b or a == b or _stream_like(a) else where
 
 
 @atexit.register
