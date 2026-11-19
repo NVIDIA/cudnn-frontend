@@ -36,6 +36,62 @@ the same operand bytes, so the split follows the host CPU's `randn` path, not
 the PyTorch version. Outputs from these four files are only comparable with
 records drawn on an aarch64 host.
 
+### SM100 D256 swap-AB in-launch reduction on a 152-SM part (2026-11-19)
+
+The suite of the [record below](#sm100-d256-swap-ab-in-launch-reduction-2026-11-18)
+ran on one GB200 (compute capability 10.0, 152 SMs; aarch64 host; CuTe DSL
+4.8.0, cuDNN 9.27 debug libraries, PyTorch 2.14.0+cu130), exclusive to the
+run, after `heuristics.FUSED_CLUSTER_BOUND` gained the rows of that part (76
+clusters of 2 chunks, 36 of 4, 15 of 8).
+
+The graph-plan group has nine cells from here on. Each builds the default
+plan of a two-token step with no knob record, reads from the compiled plan's
+record which form ran -- the in-launch form where the plan's clusters are
+within the part's row for its split, the two-launch form past the row or on a
+part without one -- and rebuilds both forms from public records with the bytes
+of the default plan. On this part the default plan ran in the launch at 4 and
+8 clusters of 8 chunks, 4 and 36 clusters of 4, 40 clusters of 2, and 15
+clusters of 8 with 8/1 heads; it ran two launches at 16 clusters of 8 (24/4
+and 8/1 heads) and at 37 clusters of 4.
+
+| Selection | Result |
+| --- | --- |
+| `TestClusterReduce` with `CUDNN_DETERMINISM_GOLDENS` set (68 cells) | **65 passed, 3 failed** |
+| `test_sdpa_fwd_decode_d256_sm100.py` without the class | **74 passed** |
+| `test_sdpa_fwd_decode_cluster_reduce.py` (no device needed) | **116 passed** |
+
+The three failures are the same three cells that failed on this device before
+the rows were added:
+
+- Both golden cells: this runtime has no recorded golden for
+  `sdpa-decode-d256-swap-ab-bf16-packed-split8` and
+  `sdpa-decode-d256-swap-ab-f16-unpacked-split4`. Everything in front of the
+  golden comparison passed in both cells (eight replays per form, the two
+  forms byte for byte, the retained CUDA graph, changed inputs). Without the
+  checking mode the comparison is skipped: a coverage gap for this runtime.
+- `test_two_chunks_commute`: with the inputs this host draws, the separate
+  pass reducing two chunks in the reverse order differs from the forward order
+  in a few BF16 elements, by one to three units of the last place. The same
+  difference appears on the
+  two-launch plan's own slab, so it is a property of that pass's two-chunk
+  arithmetic and of the draw, not of the in-launch form; the two forms are
+  byte-equal for that configuration. The cell's premise does not hold for
+  every input and is open.
+
+The element-budget, stale-partial, refilled-workspace and batch-invariance
+cells passed, as did the replay and retained-graph steps in front of the two
+golden comparisons, so the statements of the status page hold on this part.
+The warm stress passed behind its control (the unsafe ring failed 200 of 200
+launches at cluster size two); the stressed launch had 72 thread blocks on
+152 SMs, below the control's density, as on the 148-SM part.
+
+```text
+suite=sdpa/frost/test_sdpa_fwd_decode_d256_sm100.py
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest "$suite" -q -rs -k TestClusterReduce
+python -m pytest "$suite" -q -rs -k "not TestClusterReduce"
+python -m pytest sdpa/frost/test_sdpa_fwd_decode_cluster_reduce.py -q -rs
+```
+
 ### SM100 D256 swap-AB in-launch reduction (2026-11-18)
 
 `sdpa/frost/sdpa_decode_cluster_reduce_sm100.py` (collected through

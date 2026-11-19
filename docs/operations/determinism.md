@@ -190,9 +190,16 @@ cache length and the batch: a caller that needs a sequence's bytes to stay
 equal across batch sizes fixes `SPLIT_KV`. At a fixed split count the tested
 sequences keep their bytes alone, among 8 and among 64, reordered, duplicated
 and with changed neighbours, in both forms. Bytes are not equal across split
-counts, to the unsplit plan, or to another engine. SM103 execution is
-unverified. See the
-[coverage record](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18).
+counts, to the unsplit plan, or to another engine. The configurations were
+run on a 148-SM and on a 152-SM compute capability 10.0 device (x86-64 and
+aarch64 hosts). On the 152-SM device the heuristics' default plan was also run
+in each form -- inside the cluster counts recorded for that part and, at 4 and
+8 chunks, one cluster past them -- and rebuilt from public records with equal
+bytes. SM103 execution is unverified.
+See the coverage records of the
+[suite](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18)
+and of its
+[152-SM run](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-on-a-152-sm-part-2026-11-19).
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
