@@ -204,6 +204,7 @@ class QwenDense:
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
     target_stacks = configs.TARGET_STACKS  # the stacks a run of which is held against the census of the target kernel set
+    attention_page = configs.ATTENTION_PAGE  # positions per page of the target's attention cache: where a timed run is judged
     _target = None  # that census, read once per process
 
     @classmethod
