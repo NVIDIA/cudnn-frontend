@@ -51,15 +51,15 @@ def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=Fal
         sdpa_kwargs=kwargs,
     )
     selected = g.plans[g._plan_index]
-    g.create_execution_plan(
-        selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=split, sched_policy=sched, cga=4 if (d, dv) == (512, 512) else 2)
-    )
+    # Narrow logical widths still use the D512 body and its four-CTA cluster.
+    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=split, sched_policy=sched, cga=4))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
     assert seen and set(seen) == {"sm107/d512_fp8_role_split/kernel.py"}, seen
     assert g.plans[g._plan_index].knobs.pack_gqa == pack
+    assert g.plans[g._plan_index].knobs.cga == 4
     for name in ("q", "k", "v"):
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))

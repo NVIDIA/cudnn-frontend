@@ -122,13 +122,13 @@ def test_outputs_and_capture(torch_cuda, backward, rowwise, colwise):
     plan.execute(x, outputs, dy)
     for value, expected in zip(outputs, captured):
         assert torch.equal(value.view(torch.uint8), expected)
-    from cudnn.ops import gated_act_mxfp8_backward, gated_act_mxfp8_forward
+    from cudnn.ops import swiglu_quantize_backward, swiglu_quantize_forward
 
     side.wait_stream(torch.cuda.current_stream())
     wrapped = (
-        gated_act_mxfp8_backward(x, dy, rowwise=rowwise, colwise=colwise, stream=side)
+        swiglu_quantize_backward(x, dy, rowwise=rowwise, colwise=colwise, stream=side)
         if backward
-        else gated_act_mxfp8_forward(x, rowwise=rowwise, colwise=colwise, stream=side)
+        else swiglu_quantize_forward(x, rowwise=rowwise, colwise=colwise, stream=side)
     )
     torch.cuda.current_stream().wait_stream(side)
     for value, expected in zip(wrapped, captured):

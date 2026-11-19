@@ -73,6 +73,9 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    # Keep all device facts synthetic: an unmocked SM-count probe initializes
+    # the CUDA driver on CPU hosts, once for every candidate and graph.
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
@@ -183,7 +186,7 @@ def test_zero_attn_scale_declined_where_the_kernel_cannot_run_it(attn_scale):
 
 def test_zero_attn_scale_claims():
     """The rows claiming zero_scale are those qualified at zero scale on GPU, masked and unmasked: SM80 / SM90 forward
-    (score_sign / SCALE_ZERO) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
+    (score_sign / SCALE_ZERO) and the SM80 / SM89 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
     assert fwd == {
@@ -197,6 +200,8 @@ def test_zero_attn_scale_claims():
     }
     assert bwd == {
         "sdpa_bwd_sm80",
+        "sdpa_bwd_sm89",
+        "sdpa_bwd_sm89_f16_d64",
         "sdpa_bwd_sm80_f16_d64",
         "sdpa_bwd_sm80_f16_two_subgroup",
         "sdpa_bwd_sm100",

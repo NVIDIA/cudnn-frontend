@@ -2835,8 +2835,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # The per-arch-line split lives in the kernel FILES and the engine rows;
         # this adapter serves both lines, so the gate is simply "a cc10.x line
         # we have kernels for".
-        _allowed_cc = ((10, 0), (10, 3), (10, 7))
-        _allowed_msg = "cc=10.0/10.3 (Blackwell) or 10.7 (Rubin)"
+        _allowed_cc = ((10, 0), (10, 3), (10, 7), (11, 0))
+        _allowed_msg = "cc=10.0/10.3/11.0 (Blackwell) or 10.7 (Rubin)"
         self._value_error_if(
             self._device_cc not in _allowed_cc,
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
@@ -6347,6 +6347,10 @@ def sdpa_fwd_wrapper_dsl_sm90(
         window_size_left=window_size_left,
         scale_softmax=scale_softmax,
     )
+    # A D128 causal claim-counter plan (and any split or THD plan) needs caller workspace; the binder zeroes it per launch.
+    required = sdpa_fwd.scratch_workspace_bytes()
+    workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
+
     sdpa_fwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -6357,6 +6361,7 @@ def sdpa_fwd_wrapper_dsl_sm90(
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
+        workspace=workspace,
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -7808,10 +7813,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
         self._device_cc = (major, minor)
-        self._value_error_if(
-            (major, minor) != (8, 0),
-            f"SdpaFwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}",
-        )
+        from cudnn.sdpa.native_sm80 import part_mismatch, smem_budget_bytes
+
+        part_reason = part_mismatch(self._device_cc, "SdpaFwdDslSm80")
+        self._value_error_if(part_reason is not None, f"{part_reason} on {device}")
 
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
@@ -7835,6 +7840,21 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self.flavor in ("wide512", "mla576") and (self.kernel_tile_m, self.kernel_tile_n, self.kernel_num_warps) != (32, 16, 4),
             "SM80 wide heads require TILE_M=32 and TILE_N=16 with four warps",
         )
+        smem_budget = smem_budget_bytes(self._device_cc)
+        if smem_budget is not None:
+            from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains, prefill_smem_bytes
+
+            def _smem(tile_n):
+                return prefill_smem_bytes(self.flavor_d_qk, self.flavor_d_v, self.kernel_tile_m, tile_n)
+
+            if self.tile_n is None and _smem(self.kernel_tile_n) > smem_budget:
+                narrower = sorted((n for n in graph_tile_domains(d_qk, d_v)[1] if n < self.kernel_tile_n and _smem(n) <= smem_budget), reverse=True)
+                self.kernel_tile_n = narrower[0] if narrower else self.kernel_tile_n
+            self._not_implemented_error_if(
+                _smem(self.kernel_tile_n) > smem_budget,
+                f"SM80 prefill at D_QK={self.flavor_d_qk}/D_V={self.flavor_d_v} needs {_smem(self.kernel_tile_n)} bytes of shared memory per CTA "
+                f"at TILE_M={self.kernel_tile_m}, TILE_N={self.kernel_tile_n}; cc {major}.{minor} provides {smem_budget}",
+            )
         self._value_error_if(
             self.cga not in (None, 1),
             f"SM80 SDPA has no CGA clustering; cga must be 1 (or unset), got {self.cga}",

@@ -28,7 +28,7 @@ docker run -it --gpus all --rm cudnn_linear_attention_benchmark
 # cuDNN Frontend (BF16, GDN, forward + backward)
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend cudnn --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
@@ -72,14 +72,14 @@ python benchmark_single_linear_attention.py \
 # FLA (flash-linear-attention) comparison point
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend fla --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
 # FlashQLA (TileLang) comparison point (gdn variant only)
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend flash_qla --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
@@ -100,7 +100,7 @@ python benchmark_single_linear_attention.py \
 # Input initial state and dump state for every chunk
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend cudnn --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd --initial_state --store_on
 ```
@@ -111,14 +111,17 @@ Every variant, except Mamba-2, applies the q/k L2 normalization; pass `--no_qk_l
 
 The decay gates are all ones (alpha = 1, log gate 0) for every variant and backend, so the measured schedule does not depend on the input draw; kda and gdn2 feed the raw safe-gate logit of that gate, whose in-kernel `lower_bound * sigmoid` transform reproduces alpha = 1 exactly in fp32. The write strengths (beta, and w for GDN-2) stay random.  Mamba-2 feeds a raw dt of -30 (A = -1, zero dt_bias): softplus makes dt vanish, so its decay exp(A dt) is 1 in fp32 as well.
 
-### SM100 packed-ragged KDA schedule
+### Packed-ragged KDA schedule
 
 `benchmark_kda_e2e.py --ragged-suite` exercises packed batches whose declared
-`B * H` tile count can hide a long-sequence tail. On compute capability 10.0,
-the automatic KDA selector may reuse the existing device-side length-rule
-piece table when the ordinary selector would otherwise leave the batch uncut.
-Sequences of at most 8192 tokens remain one piece; longer sequences use at
-most four pieces. Other architectures preserve the previous selector.
+`B * H` tile count can hide a long-sequence tail. A KDA plan the ordinary
+selector leaves uncut carries the device-side length-rule piece table as a
+second launch group, and the gate of its first kernel takes that group when
+the sequences it would cut fill at most half the SMs with their tiles and the
+cut halves the longest item (`forward_schedule` / `backward_schedule` read
+`device`). Sequences of at most 16384 tokens remain one piece; longer
+sequences use three or more pieces, up to the count that keeps one sequence's
+heads in one wave (no group above a third of the SMs in heads).
 
 The schedule changes plan selection only. It does not change the public KDA
 API, arithmetic, checkpoint format, or the `batch_invariant=True` contract.
@@ -151,7 +154,7 @@ python benchmark_kda_e2e.py \
 
 The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-SM103 and SM107, the cuTile engines elsewhere. `gdn2`, `gdp` and `mamba2` are FROST-only.
 
-Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, and the `mamba2` x heads; Mamba-2's B / C default to 8 groups, `--num_q_heads` being the group count).  For Mamba-2 only, `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`). 
+Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, and the `mamba2` x heads; Mamba-2's B / C default to 8 groups, `--num_q_heads` being the group count; GDN's q / k heads default to 16, one per 4 value heads).  For Mamba-2 only, `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`). 
 
 ## Results
 

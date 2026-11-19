@@ -9,7 +9,7 @@ import torch
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from cudnn.ops import simplified_sparse_attention_jax
+from cudnn.ops import simplified_sparse_attention_forward_jax
 from cudnn.simplified_sparse_attention import jax_api
 from ssa_reference import pack, sample
 from test_simplified_sparse_attention import supported_gpu
@@ -61,7 +61,7 @@ def test_filtered_training_and_changed_inputs(topk, monkeypatch):
         selected.clear()
 
         def operation(*values):
-            return simplified_sparse_attention_jax(*values, *arrays[5:9], topk=topk)
+            return simplified_sparse_attention_forward_jax(*values, *arrays[5:9], topk=topk)
 
         (output, loss), pullback = jax.vjp(operation, *arrays[:5])
         gradients = pullback((arrays[9], jnp.ones_like(loss)))

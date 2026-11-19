@@ -318,30 +318,49 @@ with a helper kernel. With the default `deterministic=False`, short query
 batches split each query's top-k range across otherwise idle two-SM clusters;
 the split count is fixed when the plan is compiled.
 
-On SM90, `deterministic=True` uses a row-aware relay with logical cluster size
-`C in {4, 8, 16, 32, 64}` for H16/H32/H64/H96/H128. The public
-`deterministic_relay_cluster_size` argument selects `C` and defaults to 16.
-Each 128-query wave gives one FP32 dKV plane to every logical relay group. C4,
-C8, and C16 launch one physical cluster per group; C32 and C64 run each group
-as two or four same-stream physical C16 phases. Kernel completion orders phase
-reuse without making a CTA wait for a nonresident cluster. A setup kernel builds
-packed `C`-bit rank masks for every referenced
-`(query wave, M64 head tile, KV row)`. A relay CTA waits only for lower logical
-ranks that actually update the same row; a 128-thread WG1
-barrier carries the acquired visibility to every reducer lane, and the matching
-barrier publishes all relaxed FP32 reductions before one lane release-clears
-that rank's ownership bit at GPU scope when a successor exists. Head tiles and
-later query waves are stream-ordered, while disjoint sparse rows within a
-cluster can progress independently. The postprocess kernel combines the
-`128 / C` planes in fixed order, and one warp per head computes `d_sink` with a
-fixed strided-lane/tree reduction order. Duplicate valid top-k indices within
-one query row remain outside this deterministic contract.
+On SM90, `deterministic=True` and the default
+`deterministic_dkv_mode='records'` use conflict-rank dKV storage for
+H16/H32/H64/H96/H128. A setup kernel builds an immutable 128-bit
+query-selection bitmap and four zero-initialized ticket words for every
+referenced `(query wave, M64 head tile, KV row)`. Each query computes its stable
+conflict rank by popcounting lower query ordinals. Ranks zero through three
+accumulate into four separate dense FP32 planes. Higher ranks reuse plane zero
+after all lower plane-zero writers for that row publish monotonically increasing
+release tickets. On a resident 128-CTA wave, D512 uses four independent column groups
+and D576 uses two, so adjacent overflow ranks can pipeline disjoint columns
+instead of serializing the complete row update. A multi-launch schedule keeps
+one ticket per row because its phases are already stream ordered. Ranks one
+through three require no ticket because their planes are disjoint. A prepared
+plan reads the device SM count once and divides each wave into cooperative
+power-of-two phases with at most one CTA per SM. Cooperative launch guarantees
+that every writer a CTA can wait for is resident; same-stream phase order
+carries completed tickets across launches. The selected phase count is compiled
+into the plan and is not queried during execution or CUDA Graph replay.
+Head tiles and later waves remain stream ordered, and
+the postprocess kernel combines the four planes in fixed order. One warp per
+head computes `d_sink` with a fixed strided-lane/tree reduction order.
+Duplicate valid top-k indices within one query row remain outside this
+deterministic contract.
 
-The SM90 deterministic dKV allocation is
-`(128 / C) * (K64 + mask_rows) * D32 * sizeof(float)`, where
+The conflict-rank dKV allocation is
+`4 * (K64 + mask_rows) * D32 * sizeof(float)`, where
 `K64 = round_up(total_S_kv, 64)`, `D32 = round_up(D, 32)`, and
+`mask_rows = ceil(2 * ceil(total_S_q / 128) * ceil(H / 64) * K64 / D32)`.
+The factor two stores the immutable bitmap and four 32-bit column-phase ticket
+words; both groups are striped across the four planes.
+
+An explicit `deterministic_relay_cluster_size=C`, for
+`C in {4, 8, 16, 32, 64}`, selects the previous `'shards'` cluster relay even
+when the requested dKV mode is `'records'`. Each 128-query wave then gives one
+FP32 dKV plane to every logical relay group. The plan queries CUDA cluster
+occupancy and uses the widest launchable physical C16, C8, or C4 cluster no
+larger than the logical relay; wider relays use ordered same-stream phases.
+The setup kernel builds packed
+`C`-bit ownership masks, relay CTAs wait only for lower ranks that update the
+same row, and the postprocess combines `128 / C` planes. Its allocation is
+`(128 / C) * (K64 + mask_rows) * D32 * sizeof(float)`, with
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
-(K64 / (mask_bits / C)) * (mask_bits / 32) / D32)`, where `mask_bits` is
+(K64 / (mask_bits / C)) * (mask_bits / 32) / D32)` and `mask_bits` equal to
 64 for C64 and 32 otherwise.
 The caller-owned workspace is cleared and the masks are rebuilt on every
 execution, so changing `topk_idxs` or `topk_length` between launches is safe.
@@ -349,14 +368,22 @@ After one eager execution populates the SM90 concrete-tensor compile caches,
 the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
 the declared tensor shapes and addresses fixed while allowing tensor contents,
 including `topk_idxs` and `topk_length`, to change.
-On the target H200 sweep (BF16 H64 D576/Dv512, KV=65536, top-k 2048), C16
-measured 1.47--1.54x the non-deterministic latency with 1.13--1.26 GiB of
-workspace and remains the conservative default. C32 measured 1.34--1.37x
-with 0.57--0.70 GiB, the best time/memory point in that workload. C64 reduced
-workspace further to 0.29--0.41 GiB, but four sequential physical phases
-raised latency to 2.30--2.37x non-deterministic. C32 and C64 are therefore
-explicit workload-specific choices rather than the automatic default; the
-full table and environment are recorded in `benchmark/dsa/README.md`.
+On H20-3e with BF16 H64/D512, Q=16384, KV=262144, and top-k 2048, conflict-rank
+records measured 119.223 ms and 3.008 GiB versus 484.915 ms and 4.508 GiB for
+the C16 logical relay baseline split into physical C8 launches: 4.07x faster
+with 33.3% less workspace. Historical explicit-relay H200 measurements and the
+full environments are recorded in `benchmark/dsa/README.md`.
+
+On the AIStudio H200 allocation (runtime name `NVIDIA L20X`) with BF16 H64,
+Q=16384, KV=262144, and top-k 2048, the single-wave records schedule measured
+69.147--69.217 ms for D512 and 83.164--83.285 ms for D576. The existing C16
+relay measured 84.643 and 100.126 ms respectively; the H200-tuned C32 relay
+measured 75.936--75.970 and 94.546 ms. Each result uses five warmups and 20
+allocation-free calls. Records are 1.224x faster than C16 and 1.098x faster
+than C32 for D512, and 1.204x faster than C16 and 1.137x faster than C32 for
+D576. When every query shares the same 2048 KV rows, column-phase tickets
+reduce D512 from 151.586 to 87.678 ms (1.73x) and D576 from 195.635 to
+139.779 ms (1.40x) relative to the previous single-ticket records path.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
@@ -788,7 +815,7 @@ compressed column 0.
     changing the Q/K dtype; FP32 W requires unit stride in its last dimension.
     Unsupported strides are rejected instead of copied. The SM90 FP8 path also
     accepts FP32 when weights have already been pre-scaled by
-    `q_scale * sm_scale`; SM100 MXFP8 and MXFP4 require BF16 weights.
+    `q_scale * sm_scale`; SM100 MXFP8, MXFP4 and NVFP4 require BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
   - `block_table` + `kv_lens` (optional, SM100 BF16): read `k` straight from
@@ -831,7 +858,8 @@ compressed column 0.
     descales with one value per token/head. Set `return_lse=True` (or provide
     `lse_out`) to compute LSE in the same kernel invocation.
   - SM100 `precision="mxfp8"`: Q/K use E4M3 with block-scaled, packed E8M0
-    scale tensors; `sf_vec_size` is currently fixed at 32 and
+    scale tensors; `sf_vec_size` (default `None`, the format's size) must be
+    32, and
     `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (the tile is always 128 packed
     rows -- the scale atom -- so a 4-head group packs 32 query tokens per
     tile; all-ones scale blobs make it a plain E4M3 x E4M3 scorer).
@@ -855,15 +883,42 @@ compressed column 0.
     `pack_q_scale_bshd`/`pack_k_scale_bshd` for BSHD, and
     `pack_q_scale_thd`/`pack_k_scale_thd` into a caller-provided `out` with
     prefixes from `make_scale_cu_seqlens_padded` for THD.
-    `sf_vec_size` is fixed at 32, and THD inputs take the same
+    `sf_vec_size` must be 32 (its default), and THD inputs take the same
     `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded` scale-prefix
     contract. Its kernel differs from the MXFP8 one only in the MMA:
     tcgen05 `kind::mxf4`, K = 64 per MMA. Requires a PyTorch build with
     `torch.float4_e2m1fn_x2`; otherwise `precision="mxfp4"` raises
     `NotImplementedError`.
+  - SM100 `precision="nvfp4"`: Q/K are packed E2M1 as for MXFP4
+    (`torch.float4_e2m1fn_x2`, last dim `D // 2`). `q_scale`/`k_scale` are
+    non-negative `torch.float8_e4m3fn` scales, one per 16 head_dim values, so
+    `D // 16` (8) per row, packed by the same packers (they move any one-byte
+    scale) and with the same THD scale-prefix contract. `sf_vec_size` must be
+    16, its default. The per-tensor FP32 global scales of NVFP4 are not
+    inputs: fold the product of the Q and K global decode scales into
+    `sm_scale`, since a score is
+    `sm_scale * sum_h relu(q_h . k) * w_h` and the ReLU commutes with a
+    positive scale. A decode scale multiplies an E2M1 value times its E4M3
+    block scale back to the real value: for a global scale stored as the
+    encoding factor `g = 448 * 6 / amax`, fold `1 / g`. `sm_scale` is a launch
+    argument, so a new global scale per step compiles nothing. Its kernel
+    differs from the MXFP4 one only in the scales: tcgen05 `kind::mxf4nvf4`
+    with 16-value blocks (`scale_vec::4X`),
+    K = 64 per MMA, reading four E4M3 scales per row per MMA. Requires a
+    PyTorch build with `torch.float4_e2m1fn_x2`; otherwise
+    `precision="nvfp4"` raises `NotImplementedError`.
+
+    ```python
+    result = DSA.indexer_forward_top_k_wrapper(
+        q_fp4, k_fp4, w, top_k=2048, ratio=4, precision="nvfp4",
+        q_scale=pack_q_scale_bshd(q_scale_e4m3, qhead_per_kv_head=64),
+        k_scale=pack_k_scale_bshd(k_scale_e4m3),
+        sm_scale=sm_scale * q_decode_scale * k_decode_scale,
+    )
+    ```
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
-  SM100 BF16, MXFP8 and MXFP4 dense and combined Top-K paths support
+  SM100 BF16, MXFP8, MXFP4 and NVFP4 dense and combined Top-K paths support
   `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` at a fixed 128-row MMA tile
   (4 heads x 32 tokens, ..., 64 heads x 2 tokens), so `m_block_size` must be
   128. All currently
@@ -897,15 +952,16 @@ The combined compressed path supports different validated rows on SM90 and
 SM100. SM90 initially supports packed THD only with `ratio=4`,
 `head_dim=128`, `H_kv=1`, `qhead_per_kv_head=64`, and contiguous inputs. Q/K
 may be BF16 with BF16 or FP32 weights, or E4M3 FP8 with FP32 per-token/head
-descales and BF16 weights. SM90 does not support BSHD, MXFP8/MXFP4, paged K,
+descales and BF16 weights. SM90 does not support BSHD, MXFP8/MXFP4/NVFP4, paged K,
 or explicit query microbatching in this path. SM100 retains both BSHD and THD
-with BF16 Q/K and BF16 or FP32 weights, plus MXFP8 or MXFP4 Q/K with BF16
-weights.
+with BF16 Q/K and BF16 or FP32 weights, plus MXFP8, MXFP4 or NVFP4 Q/K with
+BF16 weights.
 `topk_indices_global=True` is the default. Optional caller-owned
 candidate/output/softmax/LSE buffers avoid per-call allocations; size the
 candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
 `compress_topk_cand_buffer_size_thd` for THD. SM90 LSE is supported for BF16
-and FP8; SM100 LSE is supported for BSHD and THD with BF16, MXFP8, and MXFP4.
+and FP8; SM100 LSE is supported for BSHD and THD with BF16, MXFP8, MXFP4, and
+NVFP4.
 Explicit microbatching is BF16 BSHD-only and cannot
 be combined with LSE or explicit `q_causal_offsets`. BSHD with explicit
 `q_causal_offsets` currently computes its per-batch candidate offsets eagerly
@@ -916,7 +972,7 @@ preallocation rule applies to SM90 capture; SM90 capture additionally requires
 outside the prepared two-kernel path. Compile both kernels with an eager
 warmup before capture. Compact
 addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
-prefix are clamped to `seqlen_k_b`. THD MXFP8 and MXFP4 use the same
+prefix are clamped to `seqlen_k_b`. THD MXFP8, MXFP4 and NVFP4 use the same
 caller-guaranteed device-side scale-prefix contract described in §3; the
 interface does not validate prefix values with a device-to-host copy.
 
@@ -1010,8 +1066,8 @@ Leave `microbatch_rows=-1` to use the BSHD long-sequence memory policy; it
 enables windowing only for compatible BF16 shapes. Pass `0` to force one
 launch, or a positive value only when deliberately controlling the scratch
 footprint. Size the buffer with the launch's `microbatch_rows` and
-`precision`: `compress_topk_cand_buffer_size` sizes MXFP8 and MXFP4 launches,
-which never microbatch, for one full launch.
+`precision`: `compress_topk_cand_buffer_size` sizes MXFP8, MXFP4 and NVFP4
+launches, which never microbatch, for one full launch.
 
 Paged K (`block_table` + `kv_lens`, the §3 contract) serves BSHD and THD
 queries with BF16 Q/K in one launch and returns local key ids
@@ -1238,10 +1294,10 @@ shares the indexer kernels' warp-specialized scaffolding and block-scale
 plumbing.
 
 - **Precision** — on SM100, `dense_indexer_score_recompute_wrapper` takes
-  `precision="bf16"`, `"mxfp8"`, or `"mxfp4"` with the Q/K and scale
-  contract of Indexer Forward (§3); its block-scaled precisions require
+  `precision="bf16"`, `"mxfp8"`, `"mxfp4"`, or `"nvfp4"` with the Q/K and
+  scale contract of Indexer Forward (§3); its block-scaled precisions require
   `qhead_per_kv_head ∈ {32, 64}`. `dense_attn_score_recompute_wrapper` takes
-  `"bf16"` or `"mxfp8"` and rejects `"mxfp4"`. The
+  `"bf16"` or `"mxfp8"` and rejects `"mxfp4"` and `"nvfp4"`. The
   `DenseIndexerScoreRecompute` and `DenseAttnScoreRecompute` classes, and
   SM90, are BF16-only.
 - **Layouts** — BSHD on SM90 and SM100+. THD packed (`cu_seqlens_q`/`cu_seqlens_k`
@@ -1361,7 +1417,7 @@ forward used `topk_indices_global=False`. The public sparse
 `indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
-indices. FP8, MXFP8, and MXFP4 indexer backward are not currently supported
+indices. FP8, MXFP8, MXFP4, and NVFP4 indexer backward are not currently supported
 because the backward wrapper requires BF16 Q/K/W inputs.
 
 On SM100, `topk_indices_global` describes the input
@@ -1489,16 +1545,16 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
   inline-assembly bridge with the compiler-owned descriptor; the issued data
   movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
-  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16, MXFP8, and
-  MXFP4 support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
-  combined Top-K paths require `H_kv = 1`. MXFP4 runs on the SM100-family
-  capabilities 10.0, 10.3, and 10.7 (no SM90 path).
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16, MXFP8,
+  MXFP4, and NVFP4 support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the
+  dense and combined Top-K paths require `H_kv = 1`. MXFP4 and NVFP4 run on
+  the SM100-family capabilities 10.0, 10.3, and 10.7 (no SM90 path).
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
   (`H_kv = 1`); every precision keeps its 128-row tile for every head
-  group; explicit microbatching cannot be combined with MXFP8, MXFP4, LSE, or
+  group; explicit microbatching cannot be combined with MXFP8, MXFP4, NVFP4, LSE, or
   explicit per-batch causal offsets.
 
 

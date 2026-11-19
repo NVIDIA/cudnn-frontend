@@ -5,12 +5,13 @@
 directory sweep collects each suite once)."""
 
 import math
+from dataclasses import replace
 
 import torch
 
 import cudnn
 
-from frost_test_utils import _is_plan_for, make_dense_stats, select_engine
+from frost_test_utils import make_dense_stats, select_engine
 from mxfp8_test_reference import _quantize
 
 OWN = 32
@@ -28,9 +29,9 @@ _PIN = "sdpa_fwd_sm100_d128_mxfp8_multi_q"
 class _Plan:
     """One built, pinned plan for a dense BSHD (B, H_q / H_kv, S, 128) sdpa_mxfp8 graph with BF16 O and Stats.
 
-    ``pack_gqa`` pins the packed (True) or unpacked (False) leg; ``split`` pins the smallest KV split above 1
-    the heuristics offer for the shape.  Both default to the heuristics' best guess; ``self.knobs`` records
-    the pinned plan's knobs."""
+    ``pack_gqa`` pins the packed (True) or unpacked (False) leg; ``split=True`` explicitly requests two KV
+    splits, independent of the device's SM count or ranked split candidates. Other settings retain the
+    heuristics' choice; ``self.knobs`` records the pinned plan's knobs."""
 
     def __init__(self, b, h_q, h_kv, s, in_key, *, own_block=OWN, bottom_right=False, pack_gqa=None, split=False):
         self.shape = (b, h_q, h_kv, s)
@@ -70,17 +71,14 @@ class _Plan:
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        split_kv = None
+        selected = select_engine(g, _PIN, pack_gqa=pack_gqa)
         if split:
-            offered = {
-                g.plans[i].knobs.split_kv
-                for i in range(len(g.plans))
-                if _is_plan_for(g.get_plan_name_at_index(i), _PIN) and (pack_gqa is None or g.plans[i].knobs.pack_gqa == pack_gqa)
-            }
-            splits = sorted(n for n in offered if (n or 1) > 1)
-            assert splits, f"the heuristics offer no split-KV plan for {self.shape}"
-            split_kv = splits[0]
-        self.knobs = select_engine(g, _PIN, pack_gqa=pack_gqa, split_kv=split_kv).knobs
+            # Numerical coverage of the split leg must not depend on whether
+            # splitting this grid is profitable on the current GPU.
+            g.create_execution_plan(selected.engine_id, replace(selected.knobs, split_kv=2).to_public())
+            g.select_plan(len(g.plans) - 1)
+            selected = g.plans[-1]
+        self.knobs = selected.knobs
         g.check_support()
         g.build_plans()
         self.graph = g

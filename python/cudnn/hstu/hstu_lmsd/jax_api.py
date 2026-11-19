@@ -19,7 +19,7 @@ if requirement_error:
 import cutlass
 import cutlass.cute as cute
 
-from cudnn.jax import call
+from cudnn._jax import call
 from ._kernels._common import MAX_FLAT_ELEMENTS, is_supported_hidden_size
 from ._kernels._config import HSTULMSDBwdConfig, HSTULMSDFwdConfig
 from ._kernels.hstu_lmsd_bwd import HSTULMSDBackward, HSTULMSDGradReduce

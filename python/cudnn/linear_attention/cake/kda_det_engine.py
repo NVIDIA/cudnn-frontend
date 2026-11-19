@@ -85,7 +85,10 @@ class KdaCakeDetEngine(BaseEngine):
         arch = loader.device_arch()
         if arch != "sm_100a":
             raise NotImplementedError(f"{self.name}: requires SM100, got {arch}")
-        loader.check_toolkit(arch, self.name)
+        try:
+            loader.check_toolkit(arch, self.name)
+        except RuntimeError as exc:
+            raise NotImplementedError(f"{self.name}: {exc}") from exc
 
     def build_plan(self, graph, plan, ctx=None):
         from ..frost.engine import FrostLaPlan

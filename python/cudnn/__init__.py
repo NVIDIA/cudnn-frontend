@@ -170,7 +170,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.33.0"
+__version__ = "1.34.0"
 # Keep in sync with the JAX dependency minimum in pyproject.toml.
 CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
 CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
@@ -401,6 +401,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -433,6 +434,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     # in and out, 1 .. 64 rows, SM100-class parts): a direct-call entry like the steps above (also `cudnn.gemm.SwigluFp4Decode`, with
     # its `SwigluGeometry`)
     "SwigluFp4Decode": (".gemm.frost.swiglu_decode.swiglu_fp4_decode", "SwigluFp4Decode"),
+    # the attention preparation decode step (per token the RMSNorm and the rotation of the query and key head rows, the gate rows copied
+    # and the keys and values written into paged pools, in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.attention_prepare.frost.AttentionPrepareDecode`, with its `AttentionPrepareGeometry`)
+    "AttentionPrepareDecode": (".attention_prepare.frost.prepare_decode", "AttentionPrepareDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -503,7 +508,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
-    "block_sparse_attention_prepare_backward": (".block_sparse_attention", "block_sparse_attention_prepare_backward"),
+    "block_sparse_attention_backward_metadata": (".block_sparse_attention", "block_sparse_attention_backward_metadata"),
     "kpage_prepare_layout": (".block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": (".block_sparse_attention", "KPageLayout"),
     "BsaBackwardMetadata": (".block_sparse_attention", "BsaBackwardMetadata"),
@@ -824,17 +829,9 @@ def __getattr__(name: str) -> Any:
         globals()[name] = module
         return module
 
-    if name == "jax":
-        # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
-        # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
-        _jax = importlib.import_module(".jax", __name__)
-        globals()["jax"] = _jax
-        return _jax
-
     if name == "torch":
-        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
-        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`.
+        # Deferred so `import cudnn` never
         # eagerly imports torch; the submodule raises its own descriptive error
         # when torch (or the 2.13+ flash-impl registry) is unavailable — which
         # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would

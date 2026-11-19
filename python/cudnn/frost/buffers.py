@@ -604,13 +604,25 @@ def cutedsl_too_old(version, floor=CUTEDSL_MIN_VERSION):
     return tuple(parts) < tuple(floor)
 
 
-@lru_cache(maxsize=1)
-def _cutedsl_has_sm107():
-    # Only the SM107 support check imports the DSL. A public version alone
+# The parts whose kernels compile for a family-specific target a DSL build may lack.
+_ARCH_TARGETS = {(10, 7): "sm_107a", (11, 0): "sm_110a"}
+
+
+@lru_cache(maxsize=None)
+def _cutedsl_has_target(name):
+    # Only these support checks import the DSL. A public version alone
     # cannot identify target support in the differently numbered internal builds.
     from cutlass.base_dsl import Arch
 
-    return hasattr(Arch, "sm_107a")
+    return hasattr(Arch, name)
+
+
+def _cutedsl_has_sm107():
+    return _cutedsl_has_target("sm_107a")
+
+
+def _cutedsl_has_sm110():
+    return _cutedsl_has_target("sm_110a")
 
 
 def cutedsl_arch_requirement_error(device_cc):
@@ -624,11 +636,13 @@ def cutedsl_arch_requirement_error(device_cc):
     if device_cc is not None and tuple(device_cc) < (8, 0):
         major, minor = device_cc
         return f"the CuTe DSL has no target below SM80 (its Arch starts at sm_80); found cc {major}.{minor}"
-    if device_cc != (10, 7) or _cutedsl_has_sm107():
+    target = None if device_cc is None else _ARCH_TARGETS.get(tuple(device_cc))
+    if target is None or (_cutedsl_has_sm107() if target == "sm_107a" else _cutedsl_has_sm110()):
         return None
     _, version = cutedsl_state()
     found = "unknown version" if version is None else " ".join(version)
-    return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
+    major, minor = device_cc
+    return f"SM{major}{minor} requires a CuTe DSL build supporting {target}; found {found} without that target"
 
 
 def cutedsl_primitives_error(what):

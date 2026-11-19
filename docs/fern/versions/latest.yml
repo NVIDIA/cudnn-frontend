@@ -30,6 +30,9 @@ navigation:
         path: ../../operations/Attention.md
         slug: operations/Attention
         contents:
+          - page: JAX SDPA Python frontend (experimental)
+            path: ../../operations/sdpa_jax.md
+            slug: jax_sdpa
           - page: Ahead-of-time Attention (SM120 C/C++)
             path: ../../operations/attention/aot_sm120_attention.md
             slug: aot_sm120_attention
@@ -39,6 +42,9 @@ navigation:
           - page: Attention Gate + Quantize Decode Step (SM100-class)
             path: ../../operations/attention/gate_quant_decode.md
             slug: gate_quant_decode
+          - page: Attention Preparation Decode Step (SM100-class)
+            path: ../../operations/attention/attention_prepare_decode.md
+            slug: attention_prepare_decode
           - page: Compact GQA backward (SM107)
             path: ../../operations/attention/compact_gqa_backward.md
             slug: compact_gqa_backward
@@ -320,6 +326,9 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
+          - page: 'C++ launcher: repeated calls launched from C++'
+            path: ../../utilities/cpp_launcher.md
+            slug: cpp_launcher
   - section: Developer Guide
     slug: developer
     contents:

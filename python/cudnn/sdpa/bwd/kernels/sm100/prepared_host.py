@@ -11,7 +11,7 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
-from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host, dot_do_o_kernel
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host, dot_do_o_thd_origins_host
 from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
@@ -276,9 +276,7 @@ def _chain(
     padded_dim = (dim + 63) // 64 * 64
     if cutlass.const_expr(physical):
         # O / dO at their own origins into the compact packed delta; one block column per sequence, clipped to its length.
-        dot_do_o_kernel(
-            o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, None, None, meta, origins, (rows[3], rows[4]), cutlass.Int32(batch)
-        ).launch(grid=((q_max + 127) // 128, o.shape[2], batch), block=(256, 1, 1), stream=stream)
+        dot_do_o_thd_origins_host(o, do, delta, meta, origins, batch, q_max, (rows[3], rows[4]), padded_dim, stream)
     else:
         dot_do_o_host(o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, stream)
     group = heads // kv_heads

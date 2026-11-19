@@ -105,6 +105,13 @@ def _check_dim_stride(node, port: str, t: Any) -> None:
         raise _not_supported("The stride for the last dimension corresponding to the embedding size per head should be 1 for " + port)
 
 
+def _causal_alignment_error(params: dict) -> Optional[str]:
+    """Reject contradictory legacy and band mask spellings before normalization."""
+    if params.get("use_causal_mask") and getattr(params.get("diagonal_alignment"), "name", None) == "BOTTOM_RIGHT":
+        return "use_causal_mask=True requires diagonal_alignment=TOP_LEFT; " "use use_causal_mask_bottom_right=True for bottom-right causal masking"
+    return None
+
+
 def _diagonal(params: dict) -> tuple:
     """(alignment_name, left_bound, right_bound) with the pybind's spelling
     precedence: the use_causal_mask* flags override diagonal_alignment and pin
@@ -203,6 +210,9 @@ def _validate_gate_tail(tail: GateTail) -> None:
 
 def validate_node(node) -> None:
     """Validate one SDPA-family node, raising with classic error semantics."""
+    error = _causal_alignment_error(node.params)
+    if error is not None:
+        raise RuntimeError(error)
     if node.node_type in _FWD_TYPES:
         _validate_forward(node)
     elif node.node_type in _BWD_TYPES:

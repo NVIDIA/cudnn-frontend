@@ -158,7 +158,7 @@ def _plan(device, total_q, total_k, segments, top_k, ratio):
     return _IndexerPlan(device, total_q, total_k, segments, top_k, ratio)
 
 
-def dsa_indexer_topk_workspace_size(total_q, total_k, num_segments, top_k=2048, *, ratio=1, device=None):
+def indexer_top_k_workspace_size(total_q, total_k, num_segments, top_k=2048, *, ratio=1, device=None):
     """Scratch bytes, including the launch ticket and unread ABI operands."""
     from cudnn._cake import loader
 
@@ -170,7 +170,7 @@ def dsa_indexer_topk_workspace_size(total_q, total_k, num_segments, top_k=2048, 
     return (int(choice.workspace_bytes) + 255) // 256 * 256 + 256
 
 
-def dsa_indexer_topk_forward(
+def indexer_top_k_forward(
     q,
     k,
     weights,
@@ -206,4 +206,4 @@ def dsa_indexer_topk_forward(
     return TupleDict(indices=indices, scores=scores)
 
 
-__all__ = ["dsa_indexer_topk_forward", "dsa_indexer_topk_workspace_size"]
+__all__ = ["indexer_top_k_forward", "indexer_top_k_workspace_size"]

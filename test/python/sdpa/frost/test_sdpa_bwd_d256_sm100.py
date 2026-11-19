@@ -119,9 +119,9 @@ def test_engine_is_registered_and_offered_by_default():
 def test_capabilities_match_what_is_implemented():
     """The row claims exactly what the accept tests run; every deferral is pinned False with its reject test."""
     c = _spec().capabilities
-    assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "SM100 / SM103 (cc 10.0-10.6); the native Rubin row owns 107+"
-    assert c.d == frozenset({128, 192, 256}) and not c.d_envelope and c.dqk_ge_dv
-    assert c.declaration_check is not None, "only the exact D256 and D192x128 head pairs are qualified"
+    assert (c.sm_lo, c.sm_hi) == _SM_RANGE and c.sm_extra == frozenset({110}), "SM100 / SM103 (cc 10.0-10.6) plus Thor; the native Rubin row owns 107-109"
+    assert c.d == frozenset({128, *range(192, 257, 8)}) and not c.d_envelope and c.dqk_ge_dv
+    assert c.declaration_check is not None, "only D256, D192x128 and the dense D_V in {192, 256} envelope pairs are qualified"
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
     assert c.causal and c.bottom_right and c.swa and c.gqa
@@ -295,7 +295,7 @@ def test_deterministic_follows_the_claim(monkeypatch):
     assert (_decline_reason(monkeypatch, use_deterministic_algorithm=True) is None) == claimed
 
 
-@pytest.mark.parametrize("cc", [(10, 7), (11, 0), (12, 0), (8, 0), (9, 0)], ids=["sm107", "sm110", "sm120", "sm80", "sm90"])
+@pytest.mark.parametrize("cc", [(10, 7), (11, 5), (12, 0), (8, 0), (9, 0)], ids=["sm107", "sm115", "sm120", "sm80", "sm90"])
 def test_reject_other_arch_lines(monkeypatch, cc):
     reason = _decline_reason(monkeypatch, cc=cc)
     assert reason is not None and "SM100-106" in reason, reason
@@ -968,7 +968,7 @@ def test_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_bu
         (dict(window_size_left=0), "window_left > 0"),
         (dict(seq_kv_lens_present=True), "padding masks"),
         (dict(thd=True), "THD"),
-        (dict(d=512), "d_qk = d_v = 256"),
+        (dict(d=512), "head dims must be"),
     ],
     ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "padded", "thd", "d512"],
 )

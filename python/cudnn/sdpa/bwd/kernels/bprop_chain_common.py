@@ -37,7 +37,9 @@ by the SM100 and SM107 adapters; a module at THIS level names the shared
 ownership, per the ``kernels/__init__.py`` layout rule.  The ``dot`` /
 ``reduce`` / ``dsink`` bodies are byte-identical to their pre-move form apart
 from the two trailing ``None``-specialized descale operands of the ``dot``
-kernel (``None`` on every half-precision caller: the branch folds out).
+kernel (``None`` on every half-precision caller: the branch folds out), the
+large-grid block decoder and widened delta addressing. Ordinary launch grids
+and each row's reduction order remain unchanged.
 """
 
 from typing import Optional, Type
@@ -63,6 +65,16 @@ DOT_Q_TILE = 128
 DOT_CHUNK_ELEMS = 64
 
 
+def _dot_launch_grid(q_blocks: int, heads: int, batch: int):
+    """Keep existing grids; flatten only when CUDA's y/z limits require it."""
+    if heads <= 65535 and batch <= 65535:
+        return (q_blocks, heads, batch), 0
+    work = q_blocks * heads * batch
+    if work > 2**31 - 1:
+        raise ValueError("backward delta launch exceeds the flat grid.x limit")
+    return (work, 1, 1), q_blocks
+
+
 @cute.kernel
 def dot_do_o_kernel(
     o: cute.Tensor,  # [B, S_Q, H, D_V]
@@ -82,6 +94,7 @@ def dot_do_o_kernel(
     thd_origins=None,
     thd_origin_rows: cutlass.Constexpr = (-1, -1),
     thd_n_batch: cutlass.Int32 = 0,
+    flat_q_blocks: cutlass.Constexpr[int] = 0,
 ):
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_launch_dependents()
@@ -94,6 +107,11 @@ def dot_do_o_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     S_Q = o.shape[1]
     H = o.shape[2]
+    if cutlass.const_expr(flat_q_blocks > 0):
+        owner = q_block // flat_q_blocks
+        q_block = q_block % flat_q_blocks
+        head = owner % H
+        batch = owner // H
     S_Q_R = ceil_div(S_Q, ROW_ROUND) * ROW_ROUND
     Q_TILE = q_tile
 
@@ -124,7 +142,7 @@ def dot_do_o_kernel(
         # address at 2^32 elements (B1 S64K H128, B32 S2K H128).  Promote the block indices BEFORE the multiply when
         # the declared span needs Int64 (`wide_index` is the identity below it: smaller shapes render unchanged).
         base = ((wide_index(batch, o) * S_Q + wide_index(q_block, o) * Q_TILE) * H + wide_index(head, o)) * D_V
-    delta_base = (batch * H + head) * S_Q_R + q_block * Q_TILE
+    delta_base = (wide_index(batch, delta) * H + wide_index(head, delta)) * S_Q_R + wide_index(q_block, delta) * Q_TILE
     q_left = S_Q - q_block * Q_TILE
     if cutlass.const_expr(thd_meta is not None):
         meta = cutlass.make_array_view(thd_meta)
@@ -266,8 +284,9 @@ def dot_do_o_host(
     stream: cuda_driver.CUstream,
 ):
     q_blocks = ceil_div(o.shape[1], q_tile)
-    dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, D_QK, D_V, chunk_elems, use_pdl, deterministic, None, None).launch(
-        grid=(q_blocks, o.shape[2], o.shape[0]),
+    grid, flat_q_blocks = _dot_launch_grid(q_blocks, o.shape[2], o.shape[0])
+    dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, D_QK, D_V, chunk_elems, use_pdl, deterministic, None, None, flat_q_blocks=flat_q_blocks).launch(
+        grid=grid,
         block=(256, 1, 1),
         stream=stream,
         use_pdl=use_pdl,
@@ -291,16 +310,20 @@ def dot_do_o_scaled_host(
     descales).  The dQ accumulator / relay slots of the SM120 chain do not exist
     here, so they are not in the signature."""
     q_blocks = ceil_div(o.shape[1], q_tile)
-    dot_do_o_kernel(o, do, delta, None, None, q_tile, D_V, D_V, chunk_elems, False, False, descale_o, descale_do).launch(
-        grid=(q_blocks, o.shape[2], o.shape[0]),
+    grid, flat_q_blocks = _dot_launch_grid(q_blocks, o.shape[2], o.shape[0])
+    dot_do_o_kernel(o, do, delta, None, None, q_tile, D_V, D_V, chunk_elems, False, False, descale_o, descale_do, flat_q_blocks=flat_q_blocks).launch(
+        grid=grid,
         block=(256, 1, 1),
         stream=stream,
     )
 
 
 @cute.jit
-def dot_do_o_thd_origins_host(o, do, delta, meta, origins, n_batch, max_sq, origin_rows: cutlass.Constexpr, D: cutlass.Constexpr, stream):
+def dot_do_o_thd_origins_host(
+    o, do, delta, meta, origins, n_batch: cutlass.Constexpr[int], max_sq: cutlass.Constexpr[int], origin_rows: cutlass.Constexpr, D: cutlass.Constexpr, stream
+):
     """Stream caller O/dO at independent origins into compact delta scratch."""
+    grid, flat_q_blocks = _dot_launch_grid(ceil_div(max_sq, DOT_Q_TILE), o.shape[2], n_batch)
     dot_do_o_kernel(
         o,
         do,
@@ -319,7 +342,8 @@ def dot_do_o_thd_origins_host(o, do, delta, meta, origins, n_batch, max_sq, orig
         origins,
         origin_rows,
         cutlass.Int32(n_batch),
-    ).launch(grid=(ceil_div(max_sq, DOT_Q_TILE), o.shape[2], n_batch), block=(256, 1, 1), stream=stream)
+        flat_q_blocks,
+    ).launch(grid=grid, block=(256, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------

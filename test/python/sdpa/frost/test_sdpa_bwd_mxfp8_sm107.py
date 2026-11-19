@@ -119,7 +119,7 @@ _SLOT = 6  # engines/manifest.py: EngineSlot(6, opt_in=True) -> FROST_SDPA_BWD_I
 _ENGINE_ID = 20_606
 _D = 256
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)
+_SM_RANGE = (107, 109)
 # dV: the fp8 suite's tolerance recipe (test_sdpa_bwd_fp8_sm107.py::_FP8_GRAD_TOL): within atol 0.08 / rtol 0.2 of the oracle under
 # assert_close_fp8_grad's midpoint-flip budget.  dK / dQ: the bf16 row's recipe (test_sdpa_bwd_dsl_sm107.py::_TOL[bf16]), no flip
 # budget -- P-c's dK / dQ see no fp8 rounding.  ONE place each; never widened (report the magnitude instead).
