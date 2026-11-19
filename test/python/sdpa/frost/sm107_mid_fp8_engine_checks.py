@@ -391,13 +391,14 @@ def test_d256_pair_release_dependence(tmp_path):
     assert sorted(site.loaded_registers for site in sites if site.dependent) == [1, 1, 1, 2]
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-def test_d256_pair_batch_invariance(causal):
+def test_d256_pair_batch_invariance(dtype, causal):
     """A sequence's O/Stats bytes do not depend on its batch neighbors: alone, reordered, and next to changed neighbors."""
     from determinism_utils import assert_bitwise, snapshot
 
     b, hq, hkv, sq, skv = 3, 4, 2, 1024 if causal else 200, 1024
-    q8, k8, v8 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv)
+    q8, k8, v8 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dtype=dtype)
     out = torch.empty(b, hq, sq, 256, device="cuda", dtype=torch.bfloat16)
     lse = torch.empty(b, hq, sq, device="cuda", dtype=torch.float32)
     api, _ = _d256_pair_adapter(q8, k8, v8, out, lse, is_causal=causal)
@@ -422,7 +423,7 @@ def test_d256_pair_batch_invariance(causal):
     reordered = run(api, q8[order].contiguous(), k8[order].contiguous(), v8[order].contiguous())
     assert_bitwise(reordered, {name: value[order] for name, value in full.items()}, "reordered")
     # changed neighbors: sequence 1 keeps its bytes while 0 and 2 change
-    q2, k2, v2 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, seed=7)
+    q2, k2, v2 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dtype=dtype, seed=7)
     q2[1], k2[1], v2[1] = q8[1], k8[1], v8[1]
     changed = run(api, q2, k2, v2)
     assert_bitwise({name: value[1:2] for name, value in changed.items()}, {name: value[1:2] for name, value in full.items()}, "changed neighbors")
