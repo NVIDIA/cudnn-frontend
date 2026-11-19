@@ -56,6 +56,8 @@ quantize decode step, also under `cudnn.attention_gate.frost`) and
 under `cudnn.gemm`) is a direct-call step entry of the same kind.
 `AttentionPrepareDecode` (the attention preparation decode step, also under
 `cudnn.attention_prepare.frost`) is a direct-call step entry of the same kind.
+`RowQuantizeFp4Decode` (the FP4 row quantization decode step, also under
+`cudnn.row_quantize.frost`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
@@ -81,6 +83,7 @@ arbitrary user callbacks.
 | `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `AttentionPrepareDecode` (attention preparation decode step) | fprop (inference step) | BF16 in and out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
+| `RowQuantizeFp4Decode` (4-bit block-scaled quantization of decode rows) | fprop (inference step) | BF16 in; FP4 E2M1 codes with E4M3 block scales out | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -500,6 +503,30 @@ a row alone and inside a batch under the entry's own picks.
   approximate reciprocal square root: the status holds on a fixed runtime,
   equal bytes across GPU architectures are not claimed, and a golden recorded
   on one runtime does not qualify another. No backward entry point exists.
+- FP4 row quantization decode step (`RowQuantizeFp4Decode`): no
+  determinism switch and no numerics knob. A block's bytes -- its eight code
+  bytes and its one scale byte -- are a function of its sixteen values and of
+  the global scale: one thread owns the whole block, and the kernel has no
+  reduction across threads, no barrier and no shared memory. A row alone
+  writes the bytes it writes inside a call of up to 1024 rows, at any position
+  and among any neighbours: its codes and its block scales (a block scale's
+  position in the 128 x 4 scale layout follows the row index; its value does
+  not). The launch knobs (`pdl`, `pdl_release`) and the owner of an output
+  write the same bytes. SM100 is verified on cc 10.0 (148 SMs) with the
+  committed goldens of that one runtime, recorded under CuTe DSL 4.8.0 and
+  checked under both of its compiler flavours; the suites also ran under both
+  compiler flavours of CuTe DSL 4.8.1 with the same bytes. cc 10.3 and cc 10.7
+  have not been run, so SM103 and SM107 are unverified: the entry admits
+  compute capability 10.x, the kernel's rendering is pinned for the
+  `sm_100a`, `sm_103a` and `sm_107a` targets, and cc 10.7 needs the DSL's CUDA
+  13 compiler flavour. SM90 and SM120 are declined by type. The 1024-row call
+  crosses a scheduling wave on a part of at most 170 SMs and no served call
+  does on a 212-SM part; the kernel holds no state between thread blocks. The
+  codes follow the part's approximate reciprocal: the status holds on a fixed
+  runtime, equal bytes across GPU architectures are not claimed (a code at an
+  exact rounding tie under a block scale that is not a power of two follows
+  the approximate reciprocal), and a golden recorded on one runtime does not
+  qualify another. No backward entry point exists.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in

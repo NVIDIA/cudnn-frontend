@@ -159,6 +159,7 @@ cudnn.Nvfp4AttentionQatBackward
 cudnn.RmsNormRhtAmaxSm100
 cudnn.RmsNormSiluPadSm100
 cudnn.RopeQDQInplace
+cudnn.RowQuantizeFp4Decode
 cudnn.SharedExpertDecode
 cudnn.SwigluFp4Decode
 cudnn.TailRoPEForward
