@@ -3797,6 +3797,46 @@ def test_a_checkpoints_drafter_on_seeded_weights_or_a_drafter_of_other_widths_is
         Session(model, text, sequences=2, drafter=described, **common)
 
 
+@pytest.mark.parametrize("handed", [False, True])
+def test_a_chain_of_sessions_with_a_drafter_loads_every_drafter_from_the_owner_of_the_weights(handed):
+    """Every session of a chain of ``share=`` may have a drafter: the first loads the weights, the second shares the
+    first, the third the second -- a session with a drafter as the loader and one in the middle of the chain, each with
+    another behind it.  All three load, and the drafter of each is drawn from the seed of the OWNER's checkpoint (11),
+    not from what a session that shares was built with (``seed=7``; ``handed``: seed 7's checkpoint as well, which no
+    load reads).  The loop on each emits the tokens of a plain session on seed 11's checkpoint, and the pairs and the
+    drafter's proposals of every step are equal across the chain.  A walk to the owner that stopped in front of a
+    session with a drafter would leave the second nothing to load from, or load seed 7's drafter there: every token
+    still right, other proposals."""
+    from model_samples import Checkpoint, Session, TextIO
+
+    model = _tiny_model()
+    text, drafted, new = TextIO.synthetic(model.geometry.vocab), 3, 12
+    common = dict(stack="reference", device="cpu", capacity=5 + new + drafted)
+    drafting = dict(draft_tokens=drafted, drafter=_seeded_drafter(model), **common)
+    behind = dict(seed=7, checkpoint=Checkpoint.synthetic(model, 7)) if handed else dict(seed=7)
+    plain = Session(model, text, checkpoint=Checkpoint.synthetic(model, 11), **common)
+    chain = [Session(model, text, checkpoint=Checkpoint.synthetic(model, 11), **drafting)]
+    for _ in range(2):
+        chain.append(Session(model, text, share=chain[-1], **behind, **drafting))
+    for each in [plain] + chain:
+        each.load()
+    assert [_not_drawn_from(each, 11) for each in chain] == [[]] * 3, "the owner's draw: in the loader, and one and two sessions with a drafter behind it"
+    assert [len(_not_drawn_from(each, 7)) for each in chain[1:]] == [19, 19], "not what a session that shares was built with or handed"
+    assert [each._weights_owner() for each in chain] == chain[:1] * 3 and all(each.weights is chain[0].weights for each in chain)
+    prompts = [torch.randint(0, model.geometry.vocab, (5,), generator=torch.Generator().manual_seed(1))]
+    ids = plain.prefill(prompts)
+    stream = plain.read(ids)
+    for _ in range(new + drafted - 1):
+        ids = plain.step(ids)
+        stream += plain.read(ids)
+    made = []
+    for each in chain:
+        out, _, pairs = _engine_loop(each, prompts, None, new, scheduled=False)
+        assert out == stream[: len(out)] and each.record.count >= 2, "the plain session's tokens"
+        made.append((torch.stack(pairs), each.record.proposals[: each.record.count].clone()))
+    assert all(torch.equal(pairs, made[0][0]) and torch.equal(proposals, made[0][1]) for pairs, proposals in made[1:]), "the same steps on each"
+
+
 def test_a_snapshot_behind_a_step_that_kept_drafted_tokens_gives_the_steps_behind_it():
     """``snapshot`` / ``restore`` on a loop that KEEPS drafted tokens: the scheduled loop (``force=``) keeps 0, 1, 2, .. of
     them in turn, so the state a snapshot is taken behind stands on a kept drafted token -- its kept count is 2, where the
