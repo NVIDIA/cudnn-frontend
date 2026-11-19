@@ -8571,13 +8571,15 @@ on an explicit `cga=2` with `softmax_precision=HALF`; the public record keeps
 `cga=1`. `TestMidFp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py`
 gained the admission test (route assertion, declines, default width), the
 fp64 reference + replay cases (odd and even step counts, a zero-Q/K run that
-never rescales O, causal, and bottom-right causal with keyless Q tiles handed
-over under the cluster launch control), batch-isolation cases (a sequence
-alone, reordered within the batch, next to changed neighbors; dense and
-causal), a PTX pin of the four shared-memory slot credits that depend on their
-loaded words through the release-zero argument, and a warm-stress case over
-the refilled alpha / running-max / final-stat slots (2048 CTAs, eight KV steps
-per tile).
+never rescales O, causal, bottom-right causal with keyless Q tiles handed
+over under the cluster launch control, and window, per-batch length and sink
+masks), batch-isolation cases (a sequence alone, reordered within the batch,
+next to changed neighbors; dense, causal, and bottom-right with a window,
+per-batch lengths and a sink), a PTX pin of the four shared-memory slot
+credits that depend on their loaded words through the release-zero argument
+(eight rendering families covering every input type, mask form, output type
+and Stats / Amax_O setting), and a warm-stress case over the refilled alpha /
+running-max / final-stat slots (2048 CTAs, eight KV steps per tile).
 
 Run on native cc 10.7 (208 SMs) with Torch 2.12.1+cu130, cuDNN 9.30.0 and
 CuTe DSL 4.8.0a0 (CUDA 13.4 compiler): all cases pass; the warm-stress control
