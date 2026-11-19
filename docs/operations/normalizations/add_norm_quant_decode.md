@@ -145,6 +145,26 @@ passed one, so the overlap rule covers it: a call whose `x`, `residual`, `weight
 entry-owned output that the call does not pass (a tensor an earlier call of that row count returned, fed back in) is
 declined with `ValueError` before the launch. To feed a returned output back in, pass a caller-owned output.
 
+**A launch is ordered behind the initialization of an entry-owned set.** The set is allocated on torch's current stream
+of the entry's device at that moment, and its initialization is work of that stream: the zero-fill of `scales`, a fill
+torch adds to `out` / `codes` under deterministic algorithms, a write the stream still owes a recycled block. Every
+launch that writes bytes of the set waits for it on whatever stream it runs and however the tensor reached the call:
+the entry's own output, a tensor taken with `outputs(rows)` and passed back as an output or as `residual`, whole or as
+a view, at this row count or another, by this entry or by another entry that orders its launches the same way
+(today `AddNormQuantDecode`); the test is one of addresses.
+On the allocating stream that is stream order; on another stream the launch stream waits for an event recorded behind
+the initialization, without a host wait and without synchronizing a stream or the device, so `compile(rows)` may run
+on any stream. A capturing stream cannot wait for an event recorded outside its capture: a captured call that finds
+the initialization still pending waits for that one event on the host before its launch. That is set-up, never part
+of a replay, and a set allocated before the capture on the capturing thread's stream needs no wait. Once a call has
+seen an initialization complete nothing is kept of it and a warm call does nothing extra; while one is pending on the
+device, every call of such an entry on that device reads the device's records (address arithmetic and at most
+one event query per allocating stream). What stays the caller's: the operands a launch only reads (`x`, `weight`,
+`scale`), also when one is laid over an entry-owned tensor, and the caller's own reads and writes of a returned tensor
+outside a call. While the set's initialization may be pending those run on the stream that was current when the set
+was allocated, or the caller orders its own stream behind that one. `outputs(rows)` returns a copy of the entry's
+table (the same tensors) without waiting.
+
 **The kernel writes the live rows' scale bytes only.** A caller-owned `scales` buffer serves one row count, or its
 owner clears it when the row count shrinks: after a call with more rows, a call with fewer leaves the earlier call's
 bytes in the rows between the new `rows` and `ceil(rows / 128) * 128`.

@@ -52,7 +52,22 @@ caller's current device is restored behind it (Rule 5).
 Output ownership is PER OUTPUT.  An output the caller passes is the caller's and is returned as given (never re-sliced: rows past
 ``rows`` are untouched).  An output the caller does not pass is the entry's: one set per row count holding only the form's outputs,
 ``scales`` zero-filled, allocated by ``compile(rows)`` / ``outputs(rows)`` or at the first call of that row count -- call
-``compile(rows)`` for every row count before a stream capture.  Entry-owned outputs are valid until the entry's next call at that row
+``compile(rows)`` for every row count before a stream capture.  THE INITIALIZATION OF AN ENTRY-OWNED SET IS STREAM WORK of torch's
+current stream of the entry's device at the moment the set is allocated -- the allocation, the zero-fill of ``scales``, a fill torch
+adds to ``out`` / ``codes`` under deterministic algorithms, and whatever that stream still owes a block the allocator recycles -- and
+EVERY launch that writes bytes of the set is ordered behind it on WHATEVER stream it runs, HOWEVER the tensor reached the call: the
+entry's own output of the row count, a tensor taken with ``outputs`` and passed back as an explicit output or as ``residual``, whole
+or as a view, at this row count or another, by this entry or by another entry that orders its launches the same way
+(``cudnn.frost.init_order``; the test is one of addresses: the bytes a launch writes against the set's allocations).  The same stream: by stream order.  Another stream: by a
+stream-side wait for the event recorded behind the initialization -- no host wait, never a synchronization of a stream or of the
+device -- so ``compile(rows)`` may run on any stream.  A captured launch cannot carry that dependency: a call that finds the
+initialization still pending under a capture waits for that ONE event on the host before its captured launch (set-up, never part of
+a replay; a set allocated before the capture on the capturing thread's stream needs no wait).  Once a call has seen an initialization
+complete nothing is kept of it, and a warm call does nothing for it; while one is pending on the device, every call reads the
+device's records.  WHAT STAYS THE CALLER'S: the operands a launch only READS (``x``, ``weight``, ``scale``), also when one is laid
+over an entry-owned tensor, and the caller's own reads and writes of a returned tensor outside a call of an entry -- while the set's
+initialization may be pending those run on the stream that was current when the set was allocated, or the caller orders its own
+stream behind that one.  Entry-owned outputs are valid until the entry's next call at that row
 count from ANY host thread (stream order does not serialize host calls): two host threads that share one entry pass their own
 outputs or build one entry each; a caller that sweeps many row counts passes its own outputs (the per-row-count sets are never
 freed).  A returned entry-owned output cannot come back as an operand of a call that would write it: a call at that row count
@@ -60,12 +75,14 @@ whose ``x``, ``residual``, ``weight``, ``scale`` or passed output overlaps an en
 (``ValueError``) before the launch -- pass a caller-owned output to feed a result back in.  THE KERNEL WRITES THE LIVE ROWS' SCALE
 BYTES ONLY: a caller-owned ``scales`` buffer serves one row count, or its owner clears it when the row count shrinks (after a call
 with more rows, a call with fewer leaves the earlier bytes in the rows between ``rows`` and ``scale_rows(rows)``).  Workspace: none.
-The warm path allocates nothing and reads no device memory to the host.
+The warm path allocates nothing and reads no device memory to the host; the one host wait of the entry is the one above, of a
+captured launch into a set whose initialization is still pending.
 """
 
 from typing import Any, Dict, Optional, Tuple
 
 from cudnn._torch_stream import device_context  # imports no framework at module level
+from cudnn.frost import init_order  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
@@ -371,6 +388,8 @@ class AddNormQuantDecode:
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[int, Dict[str, Any]] = {}
         self._buffer_views: Dict[int, Dict[str, Any]] = {}
+        #: the device's records of entry-owned allocations whose initialization may be pending (shared by every entry of the device)
+        self._pending = init_order.pending_of(self.device)
 
     # ---- the form and the compile key ----
     def cfg_for(self, rows: int) -> Cfg:
@@ -418,7 +437,13 @@ class AddNormQuantDecode:
     def outputs(self, rows: int) -> Dict[str, Any]:
         """The entry-owned output buffers of ``rows``: the form's subset of ``out`` (bf16 ``[rows, hidden]``), ``codes`` (E4M3
         ``[rows, hidden]`` or uint8 ``[rows, hidden / 2]``) and ``scales`` (E4M3 ``[scale_rows(rows), hidden / 16]``, zero-filled).
-        Allocated once per row count; see the module docstring for their lifetime."""
+        Allocated once per row count; see the module docstring for their lifetime and for what is ordered behind their
+        initialization.  Returns a copy of the entry's table (the same tensors), without waiting."""
+        return dict(self._owned(rows))
+
+    def _owned(self, rows: int) -> Dict[str, Any]:
+        """The entry's own table of the set of ``rows``, allocated on first use.  The initialization is recorded
+        (:mod:`cudnn.frost.init_order`) behind the last fill and BEFORE the set is in the table."""
         rows = validate_rows(rows)
         if rows not in self.buffers:
             import torch
@@ -431,8 +456,15 @@ class AddNormQuantDecode:
             if cfg.QUANT == "nvfp4":
                 bufs["codes"] = torch.empty(rows, cfg.HIDDEN // 2, dtype=torch.uint8, device=dev)
                 bufs["scales"] = torch.zeros(scale_rows(rows), cfg.HIDDEN // SF_BLOCK, dtype=torch.float8_e4m3fn, device=dev)
+            init_order.record(self._pending, bufs.values())
             self.buffers[rows] = bufs
         return self.buffers[rows]
+
+    def _launch_writes(self, rows: int, results: Dict[str, Any], residual) -> Tuple[Tuple[int, int], ...]:
+        """The byte ranges a launch of ``rows`` rows WRITES: its resolved outputs and, under ``add`` / ``store_residual``, the
+        ``residual`` it updates in place -- what the launch is ordered by (:func:`cudnn.frost.init_order.order_behind`)."""
+        written = dict(results, residual=residual) if (self.cfg.ADD or self.cfg.STORE_RESIDUAL) else results
+        return tuple(_touched_ranges(self.cfg, rows, written).values())
 
     def _output_view(self, name: str, t):
         """The DSL view of an output: bf16 as it is, the code and scale bytes through their ``uint8`` view (one byte per element)."""
@@ -443,7 +475,7 @@ class AddNormQuantDecode:
     def _owned_views(self, rows: int) -> Dict[str, Any]:
         """The DSL views of the entry-owned outputs of ``rows``: the buffers never move, so each view is built once."""
         if rows not in self._buffer_views:
-            self._buffer_views[rows] = {name: self._output_view(name, t) for name, t in self.outputs(rows).items()}
+            self._buffer_views[rows] = {name: self._output_view(name, t) for name, t in self._owned(rows).items()}
         return self._buffer_views[rows]
 
     def _args(self, x, residual, weight, scale, views: Dict[str, Any]):
@@ -486,7 +518,8 @@ class AddNormQuantDecode:
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan time: the typed declines of the device, the part and the DSL, then ONE trace-compile of the entry's form (a no-op
         once compiled).  With ``rows`` it also allocates the entry-owned outputs of that row count -- call it for every row count
-        before a stream capture.  Needs no operand."""
+        before a stream capture, on any stream: a later launch that writes them is ordered behind the allocation's stream work.
+        Needs no operand: the compile binds the entry-owned outputs of ``rows``, and of ONE row when no row count is given."""
         if rows is not None:
             validate_rows(rows)
         if self.key() not in self.compiled:
@@ -517,7 +550,7 @@ class AddNormQuantDecode:
                 args = self._args(x, residual, weight, scale, self._owned_views(bind_rows))
                 self.compiled[self.key()] = cute.compile(mod.launch, cfg, *args, cutlass.Int32(bind_rows), make_fake_stream())
         if rows is not None:
-            self.outputs(rows)
+            self._owned(rows)
 
     # ---- launch ----
     def __call__(self, x, residual, weight, scale, out=None, codes=None, scales=None):
@@ -526,7 +559,8 @@ class AddNormQuantDecode:
         first use.  Every launch re-runs the binding checks before the compiled kernel is looked up, the overlap check on the
         RESOLVED operands: an entry-owned output the launch would write must not overlap ``x``, ``residual``, ``weight``,
         ``scale`` or a passed output (``ValueError``; a returned output fed back in needs a caller-owned output).  The launch is
-        scoped to the entry's device and the caller's current device is restored behind it."""
+        ordered behind the pending initialization of every entry-owned allocation of the device it writes (the module
+        docstring), scoped to the entry's device, and the caller's current device is restored behind it."""
         import torch
 
         cfg = self.cfg
@@ -548,11 +582,14 @@ class AddNormQuantDecode:
                     views[name] = self._output_view(name, given[name])
                 else:
                     if owned is None:
-                        owned, owned_views = self.outputs(rows), self._owned_views(rows)
+                        owned, owned_views = self._owned(rows), self._owned_views(rows)
                     results[name] = owned[name]
                     views[name] = owned_views[name]
             args = self._args(x, residual, weight, scale, views)
-            self.compiled[key](*args, cutlass.Int32(rows), cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
+            stream = torch.cuda.current_stream(self.device)
+            if self._pending:  # empty in the steady state: a warm call does nothing here
+                init_order.order_behind(self._pending, stream, self._launch_writes(rows, results, residual))
+            self.compiled[key](*args, cutlass.Int32(rows), cuda.CUstream(stream.cuda_stream))
         return results.get("out"), results.get("codes"), results.get("scales")
 
 

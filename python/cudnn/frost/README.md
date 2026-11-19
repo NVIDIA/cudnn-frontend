@@ -1301,4 +1301,10 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     by allocating before the capture. An accessor returns a copy of the
     entry's table. The test is a WARM launch on another stream than the
     allocation's, with that stream held behind pending work
-    (`test/python/init_order_schedules.py`).
+    (`test/python/init_order_schedules.py`). On the helper today:
+    `AddNormQuantDecode`. Not yet, to follow: `AttentionPrepareDecode`,
+    `AttentionGateQuantDecode`, `GdnDecodeFused`, `GdnVerifyFused`,
+    `SharedExpertDecode` (they allocate: record and order),
+    `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order). Until
+    then a launch of one of those into a buffer another entry allocated is
+    ordered by the caller.
