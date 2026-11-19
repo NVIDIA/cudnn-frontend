@@ -3690,6 +3690,25 @@ live scale bytes zero, 0 code bytes differing), and on a recycled block a pendin
 codes.  The other three compilers of the record above were not run again (the kernel is unchanged).  The host command above:
 257 passed, 239 skipped.
 
+Third re-run on the same part (2026-11-19 UTC), CuTe DSL 4.8.0 with CUDA 13.4, from a clean tree with the files of this change as
+they stand before this text.  Since the record above the ordering follows the allocation: a launch is ordered behind the pending
+initialization of every entry-owned pair whose bytes it writes, however the tensor reached the call.  The record above ordered only
+a call that took an output by default; a pair taken with `outputs(rows)` and passed back as explicit outputs was launched unordered.
+The module gained nine cases: two that need no device (which pending pairs a launch is ordered behind, by address; the place of the
+record behind the allocation and the fill) and seven on a device (the pair taken with `outputs(rows)` on a side stream behind a
+delay kernel and passed back whole, as its scales beside caller-owned codes and as a view of its scales; slices of another row
+count's pair; entry-owned codes on a recycled block, passed back; two streams with disjoint entry-owned outputs; the documented
+capture flow with entry-owned outputs).  The kernel and its config did not change: the 36 renderings are byte-identical, cubin and
+PTX text, to those of the records above.  The strict determinism command -> 20 passed, 0 skipped; the functional command -> 148
+passed, 1 skipped (the two-device case): the module 143 passed, the symbol-prefix test 5 passed, and none of the eighteen cases of
+the ordering skipped; the three `sm_100a` cubins the run compiled are the host's renderings.  Against the entry of the record above
+the five device cases that pass a tensor of a pair back fail: with the pair of seven rows taken on another stream and passed back,
+the kernel's block scales were written first and the pending zero-fill erased them (2,240 of 2,240 live scale bytes zero, 0 code
+bytes differing), and on a recycled block a pending write of the block's previous owner replaced the passed-back codes.  CuTe DSL
+4.8.1 with CUDA 12.9 ran the functional command again -> 146 passed, 3 skipped (the two `sm_107a` cases, each with the entry's own
+decline; the two-device case); the other two compilers of the records above were not run again (the kernel is unchanged).  The host
+command above: 259 passed, 246 skipped.
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
