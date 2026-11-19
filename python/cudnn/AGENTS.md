@@ -369,8 +369,9 @@ the kernel that reads it).
   first and the allocating stream's zero-fill (or a write it still owes a
   recycled block) lands on top of them. The one implementation of the order is
   `cudnn.frost.init_order` (`pending_of`, `record`, `order_behind`); every
-  direct-call entry calls it, none writes its own event bookkeeping
-  (`python/cudnn/frost/README.md` rule 16). Detector: a warm launch on another
+  direct-call entry is to call it and no entry adds event bookkeeping of its
+  own (`python/cudnn/frost/README.md` rule 16 lists the entries that call it
+  today and those that do not yet). Detector: a warm launch on another
   stream than the allocation's while that stream is parked behind a delay
   kernel (`test/python/init_order_schedules.py`).
 
@@ -631,11 +632,12 @@ spellings the torch vocabulary does not name.
   under capture (`linear_attention/cake/compiler.py::check_not_capturing`).
   That is the only legal shape of an exception: declared in the engine, loud,
   never on a captured stream. One documented host wait exists outside the
-  engines: a direct-call entry whose captured launch writes a buffer the
-  entry allocated on another stream, with that initialization still pending,
-  waits for that one event before the launch (`cudnn.frost.init_order`; a
-  capturing stream cannot wait for an event recorded outside the capture). It
-  is set-up, never part of a replay; allocate before the capture to avoid it.
+  engines: a direct-call entry whose captured launch writes an entry-owned
+  buffer of the device whose initialization is still pending (allocated on
+  any stream, by any entry) waits for that one event before the launch
+  (`cudnn.frost.init_order`; a capturing stream cannot wait for an event
+  recorded outside the capture). It is set-up, never part of a replay;
+  allocate before the capture, and let that work finish, to avoid it.
 - **Detectors.** `test_execute_allocates_nothing_and_never_synchronizes`
   (`torch.cuda.set_sync_debug_mode("error")` plus allocator accounting around
   a prepared execute) — run the same assertion around the BUILD;

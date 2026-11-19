@@ -11,9 +11,12 @@ paths that have such a lazy step ask here first and refuse TYPED, naming the rou
 and the remedy, instead of letting the driver report an "operation not permitted when stream is capturing" from the
 middle of a launch sequence.
 
-:func:`capture_state` is the status query (``cuStreamGetCaptureInfo``), legal under every capture mode from any thread;
+:func:`capture_state` is the status query (``cuStreamGetCaptureInfo``), legal under every capture mode;
 :func:`is_capturing` its boolean; :func:`check_not_capturing` the refusal.  ``stream`` is a raw ``CUstream`` handle
-(``torch.cuda.Stream.cuda_stream`` / ``torch.cuda.current_stream().cuda_stream``; ``0`` = the legacy default stream).
+(``torch.cuda.Stream.cuda_stream`` / ``torch.cuda.current_stream().cuda_stream``; ``0`` = the legacy default stream).  The
+driver answers for a stream of its own handle from any host thread; for the legacy default stream it needs a context
+current on the calling thread and raises ``CUDA_ERROR_INVALID_CONTEXT`` on a thread that has made no CUDA call yet -- that
+stream cannot capture, so a caller that may run on such a thread does not ask for it (``cudnn.frost.init_order`` does not).
 
 The callers today: the gated attention block's projection GEMM driver (``gated_attention_block/kernels/proj_gemm.py``:
 ``compile()`` refused under capture; the GRAPH route's cuDNN handle creation refused under capture) and the grouped GEMM's

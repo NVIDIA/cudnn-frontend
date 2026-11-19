@@ -35,24 +35,31 @@ another stream -- THAT stream waits for the event (``cudaStreamWaitEvent``; the 
 the next stream; a capturing stream -- it cannot wait for an event recorded outside the capture, so the HOST waits for that
 ONE event (``cudaEventSynchronize``) before the captured launch.  That is the one host wait of the ordering: it is set-up,
 bounded by what the allocating stream had queued, never part of a replay, and a caller avoids it by allocating before the
-capture on the capturing thread's stream (``torch.cuda.graph`` synchronizes the device when it is entered).  Never a
-synchronization of a stream or of the device.  A record whose event is complete is dropped by ANY call that walks the
-device's records, hit or not, so every flow reaches "no record" and a warm call then pays one truth test.  Operands a launch
-only READS are not ordered here, and neither are the caller's own reads and writes of a returned tensor outside a call.
+capture and letting that stream's work finish (``torch.cuda.graph`` synchronizes the device when it is entered; a raw
+capture does not).  Never a synchronization of a stream or of the device.  A record whose event is complete is dropped by
+ANY call that walks the device's records, hit or not, so every flow reaches "no record" and a warm call then pays one truth
+test.  Operands a launch only READS are not ordered here, and neither are the caller's own reads and writes of a returned
+tensor outside a call.
 
 WHAT A CALL COSTS WHILE A RECORD IS PENDING: every call of every entry of the device walks the device's records -- address
 arithmetic per record, one capture-mode exchange, and event queries: one per record it drops and one per allocating stream
 that still holds a pending record (the events of one stream complete in the order they were recorded, so behind a stream's
 first pending record its later ones are taken as pending without a query).  Allocations that no launch follows are swept
-of complete records by a later allocation (:data:`SWEEP_AT`).
+of complete records by a later allocation that finds more records than the mark (:data:`SWEEP_AT`, or twice what the last
+sweep left); until then the complete ones stay, one event each.
 
 THE RECORDS are kept per device for the life of the process, ONE object for every entry of that device
-(:func:`pending_of`); a copy or a pickle of an entry refers to the same object.  A record holds no tensor: an event, the raw
-handle of the allocating stream and integers.  It stays true when its tensors are freed -- until the event completes that
-stream may still write those bytes -- so a launch into a block that a later allocation reused is ordered behind it too, and
-it is gone at the first call behind its completion.  Host threads: every change is one dictionary operation and a walk reads
-a copy; no lock.  A record another host thread dropped is skipped, and a drop never raises.  The streams are compared by raw
-handle (``torch.cuda.current_stream`` returns a new object per call); the per-thread stream handle is never the same stream.
+(:func:`pending_of`); a copy or a pickle of an entry refers to the same object (the copy's tensors are another matter: a
+deep copy made after an allocation clones the buffers with torch, on the copying thread's stream, and nothing records the
+clones -- copy an entry before it allocates).  A record holds no tensor: an event, the raw handle of the allocating stream
+and integers.  It stays true when its tensors are freed -- until the event completes that stream may still write those
+bytes -- so a launch into a block that a later allocation reused is ordered behind it too, and it is gone at the first call
+behind its completion.  Host threads: every change is one dictionary operation and a walk reads a copy; no lock.  A record
+another host thread dropped is skipped, and a drop never raises.  The streams are compared by raw handle
+(``torch.cuda.current_stream`` returns a new object per call); the per-thread stream handle is never the same stream.  A
+STREAM IS KNOWN BY ITS RAW HANDLE, so it must outlive the work it has queued: a caller-made stream destroyed with an
+initialization still pending, whose handle the driver then gives to a new stream, is taken for the allocating stream and a
+launch on the new one is not ordered (torch's own streams are never destroyed).
 
 Not recorded: an allocation on a device without streams (a host entry), and one made INSIDE a stream capture -- its fill is
 a node of the captured graph, ordered in front of the captured launches by the graph itself, and an event recorded there
@@ -65,7 +72,7 @@ from __future__ import annotations
 import itertools
 from typing import Dict, Iterable, Tuple
 
-from cudnn._torch_stream import device_context  # imports no framework at module level
+from cudnn._torch_stream import DEFAULT_STREAM_HANDLES, device_context  # imports no framework at module level
 
 from . import capture
 
@@ -180,7 +187,9 @@ def order_behind(pending: Records, stream, written: Iterable[Tuple[int, int]]) -
                 if hit:
                     if capturing is None:
                         handle = stream.cuda_stream
-                        capturing = capture.is_capturing(handle)
+                        # the legacy default stream cannot capture, and the driver reads its status only for a host thread
+                        # with a current context: a thread whose first CUDA call is this launch has none yet
+                        capturing = handle not in DEFAULT_STREAM_HANDLES and capture.is_capturing(handle)
                     if capturing:
                         done.synchronize()  # this ONE event, on the host: a captured launch cannot carry the dependency
                         pending.pop(serial, None)
@@ -193,7 +202,7 @@ def order_behind(pending: Records, stream, written: Iterable[Tuple[int, int]]) -
                 if hit and (handle != init_handle or handle == 2):  # 2: the per-thread stream, another one in each thread
                     stream.wait_event(done)  # the launch stream waits, the host does not; the record stays for the next stream
         finally:
-            walk = done = None  # a dropped event is released here, while the capture check is still relaxed
+            walk = done = None  # a precaution: a dropped event is released here, while the capture check is still relaxed
 
 
-__all__ = ["Records", "SWEEP_AT", "order_behind", "pending_of", "record", "span"]
+__all__ = ["order_behind", "pending_of", "record", "span"]

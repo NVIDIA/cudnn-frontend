@@ -48,9 +48,11 @@ def test_one_record_is_decided_by_its_state(monkeypatch):
     capture (no host wait for bytes the launch does not write).  Pending and hit: the allocating stream itself -- nothing
     enqueued; another stream -- THAT stream waits for the event; both kept for the next stream.  Hit under a capture: the
     host waits for this ONE event without querying it, and the record is dropped.  The allocating stream is the same stream
-    also as another object, and the per-thread handle never is.  No branch synchronizes a stream or the device (the
-    stand-ins raise).  A failed read restores the capture check; a failed exchange reads and drops nothing, and stops only
-    a launch that writes a recorded allocation."""
+    also as another object, and the per-thread handle never is.  The capture status of the legacy default stream is never
+    read (it cannot capture, and the driver answers for it only on a host thread with a current context: a thread whose
+    first CUDA call is this launch has none); its launch gets the stream wait like any other.  No branch synchronizes a
+    stream or the device (the stand-ins raise).  A failed read restores the capture check; a failed exchange reads and drops
+    nothing, and stops only a launch that writes a recorded allocation."""
     s = stand_ins(monkeypatch)
     pending = init_order.pending_of(DEV)
     inside, outside = ((1500, 1600),), ((5000, 5100),)
@@ -74,6 +76,8 @@ def test_one_record_is_decided_by_its_state(monkeypatch):
     assert decide(False, inside, OTHER, captured=True) == ([status(OTHER), "synchronize"], False)
     assert decide(False, inside, INIT, captured=True) == ([status(INIT), "synchronize"], False)
     assert decide(False, inside, 2, init=2) == ([status(2), "query", ("wait_event", 2)], True), "the per-thread stream"
+    for legacy in (0, 1):
+        assert decide(False, inside, legacy) == (["query", ("wait_event", legacy)], True), "the legacy default stream: no status read"
 
     pending.clear()
     s.calls.clear()
@@ -149,8 +153,9 @@ def test_which_records_a_launch_is_ordered_behind(monkeypatch):
 def test_record_holds_the_event_the_allocating_stream_and_every_range(monkeypatch):
     """``record``: under the device, the capture status of ITS current stream, then an event recorded on that stream; the
     record holds the stream's raw handle and the byte range of every tensor (an empty one is skipped).  Nothing is recorded
-    for a device without streams, for an allocation without a byte, or inside a capture.  Allocations that no launch
-    follows are swept of complete records once the device holds more than the mark."""
+    for a device without streams, for an allocation without a byte, or inside a capture.  A record keeps a key of its own:
+    one made behind a drop does not take the place of a pending one.  Allocations that no launch follows are swept of
+    complete records once the device holds more than the mark."""
     s = stand_ins(monkeypatch)
     pending = init_order.pending_of(DEV)
     a, b, empty = torch.empty(3, 5, dtype=torch.int16), torch.zeros(7, dtype=torch.uint8), torch.empty(0, 4)
@@ -168,6 +173,16 @@ def test_record_holds_the_event_the_allocating_stream_and_every_range(monkeypatc
     assert s.calls == [("enter", DEV), ("leave", DEV)] and len(pending) == 1, "inside a capture nothing is recorded"
 
     s.capturing = set()
+    pending.clear()
+    init_order.record(pending, (a,))
+    init_order.record(pending, (b,))
+    first, second = pending
+    pending[first][0].complete = True
+    init_order.order_behind(pending, None, ())  # a walk that writes nothing: the complete record is dropped
+    init_order.record(pending, (a,))
+    assert second in pending and len(pending) == 2 and len({first, *pending}) == 3, "a new record took the place of a pending one"
+
+    s.calls.clear()
     pending.clear()
     monkeypatch.setattr(s.Event, "__init__", lambda self, complete=True, fails=False: self.__dict__.update(complete=complete, fails=fails))
     for _ in range(init_order.SWEEP_AT):
@@ -197,8 +212,9 @@ class _Holder:
 def test_the_records_of_a_device_are_one_object(monkeypatch):
     """Every entry of a device holds THE records of that device: the same object for the same device however often it is
     asked for, another for another device; a copy, a deep copy or a pickle of an object that holds it refers to the same
-    object -- with a record pending too (an event is neither copied nor pickled) -- so a copied entry keeps ordering.  A
-    CUDA device without an index is refused.  The truth test an entry makes in front of a launch is no Python-level call.
+    object -- with a record pending too (an event is neither copied nor pickled) -- so a copied entry reads the device's
+    records (the tensors a deep copy clones are not recorded: that is the copier's).  A CUDA device without an index is
+    refused.  The truth test an entry makes in front of a launch is no Python-level call.
     The module needs neither torch nor the CuTe DSL."""
     s = stand_ins(monkeypatch)
     pending = init_order.pending_of(DEV)
@@ -284,17 +300,17 @@ def test_host_threads_share_the_records_without_a_lock(monkeypatch):
 
     previous = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
+    threads = [threading.Thread(target=walker, daemon=True) for _ in range(2)]
     try:
-        threads = [threading.Thread(target=walker) for _ in range(2)]
         for t in threads:
             t.start()
         for _ in range(3000):
             init_order.record(pending, (a,))
+    finally:  # also when ``record`` raises: the walkers end with the case, they do not keep the session alive
         stop.set()
-        for t in threads:
-            t.join(60)
-    finally:
         sys.setswitchinterval(previous)
+    for t in threads:
+        t.join(60)
     assert not failures and not pending and not any(t.is_alive() for t in threads)
 
 
