@@ -3774,6 +3774,12 @@ def test_a_checkpoints_drafter_on_seeded_weights_or_a_drafter_of_other_widths_is
     assert middle.checkpoint is None and Session(model, text, drafter=described, share=middle, **common).drafter is described
     with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
         Session(model, text, drafter=described, share=handed, **common)
+    # ... and three share= away as well: behind a loader that was handed the checkpoint the drafter is taken; behind a seeded
+    # loader it is refused, also where a session on the way holds a checkpoint
+    far = Session(model, text, stack="reference", device="cpu", share=middle)
+    assert far._share._share is loads and Session(model, text, drafter=described, share=far, **common).drafter is described
+    with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+        Session(model, text, drafter=described, share=Session(model, text, stack="reference", device="cpu", share=handed), **common)
     # a session WITH a drafter as the loader and in the middle of a chain, another one behind it: the walk goes through both
     first = Session(model, text, drafter=described, checkpoint=on_disk, **common)
     last = Session(model, text, drafter=described, share=Session(model, text, drafter=described, share=first, **common), **common)
@@ -3789,6 +3795,10 @@ def test_a_checkpoints_drafter_on_seeded_weights_or_a_drafter_of_other_widths_is
             ValueError, match=f"^{re.escape('the drafter was described for a model of other widths than this session' + chr(39) + 's: ' + said)}$"
         ):
             Session(model, text, drafter=_seeded_drafter(other), **common)
+    # two widths that differ: the one named is the first of the geometry's fields (vocab stands in front of mlp there), not the last
+    two = QwenDense(replace(model.geometry, mlp=128, vocab=300), reductions=("tiny geometry",))
+    with pytest.raises(ValueError, match=r"than this session's: its vocab is 300, the model's 272$"):
+        Session(model, text, drafter=_seeded_drafter(two), **common)
     deeper = QwenDense(replace(model.geometry, layer_kinds=("linear_attention",) * 3 + ("full_attention",)), reductions=("tiny geometry",))
     assert Session(deeper, text, drafter=seeded, **common).drafter is seeded, "the depth of a model is no width of its drafter: its one layer is its own"
     assert isinstance(model.geometry, Geometry) and "layer_kinds" in vars(model.geometry)
