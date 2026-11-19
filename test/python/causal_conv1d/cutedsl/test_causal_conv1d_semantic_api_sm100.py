@@ -308,3 +308,101 @@ def test_row_major_input_with_a_size_one_dim_takes_the_native_route(batch, chann
             torch.testing.assert_close(b, a, atol=1e-2, rtol=1e-2)
         else:
             assert torch.equal(a, b), name
+
+
+@pytest.mark.parametrize("deterministic", [False, True], ids=("atomic", "deterministic"))
+def test_packed_sequence_count_reuses_one_plan(monkeypatch, deterministic: bool) -> None:
+    """Packed N varies per microbatch at fixed total_T; one fwd and one bwd plan serve every N.
+
+    Each shared-plan result must also equal a plan compiled for that exact N.
+    """
+
+    _require_native_route()
+    import importlib
+
+    from cudnn.causal_conv1d_bulk_sm100 import api as forward_api
+
+    # ``cudnn.ops`` re-exports the function under the module's name.
+    semantic = importlib.import_module("cudnn.ops.causal_conv1d")
+
+    compiles = {"forward": 0, "training": 0}
+    compile_training = semantic._compile_causal_conv1d_training_backend
+    compile_forward = forward_api.CausalConv1dBulkFwdSm100.compile
+
+    def count_training(*args, **kwargs):
+        compiles["training"] += 1
+        return compile_training(*args, **kwargs)
+
+    def count_forward(self):
+        if self._compiled_kernel is None:
+            compiles["forward"] += 1
+        return compile_forward(self)
+
+    monkeypatch.setattr(semantic, "_compile_causal_conv1d_training_backend", count_training)
+    monkeypatch.setattr(forward_api.CausalConv1dBulkFwdSm100, "compile", count_forward)
+    monkeypatch.setattr(semantic, "_CAUSAL_CONV1D_TRAINING_CACHE", type(semantic._CAUSAL_CONV1D_TRAINING_CACHE)())
+    monkeypatch.setattr(forward_api, "_API_CACHE", type(forward_api._API_CACHE)())
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: deterministic)
+
+    generator = torch.Generator(device="cuda").manual_seed(20261119 + int(deterministic))
+    tokens, channels = 517, 264
+    offsets_by_count = {
+        1: (0, tokens),
+        3: (0, 5, 300, tokens),
+        7: (0, 1, 2, 3, 130, 131, 400, tokens),
+        40: tuple(range(0, 40 * 3, 3)) + (tokens,),
+    }
+    weight0 = torch.randn((channels, 4), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+    bias0 = None if deterministic else torch.randn(channels, device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+
+    def run(offsets, x0, dy0, initial0, d_final):
+        cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+        x = x0.clone().transpose(1, 2).requires_grad_()
+        weight = weight0.clone().requires_grad_()
+        bias = None if bias0 is None else bias0.clone().requires_grad_()
+        initial = initial0.clone().requires_grad_()
+        y, final = semantic.causal_conv1d(x, weight, bias, "silu", cu_seqlens=cu_seqlens, initial_states=initial, return_final_states=True)
+        torch.autograd.backward((y, final), (dy0.transpose(1, 2), d_final))
+        return [t.contiguous() for t in (y.detach(), final.detach(), x.grad, weight.grad, initial.grad)]
+
+    cases = {}
+    for count, offsets in offsets_by_count.items():
+        x0 = torch.randn((1, tokens, channels), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+        dy0 = torch.randn((1, tokens, channels), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+        initial0 = torch.randn((count, channels, 3), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+        d_final = torch.randn((count, channels, 3), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
+        cases[count] = (offsets, x0, dy0, initial0, d_final)
+
+    shared = {count: run(*case) for count, case in cases.items()}
+    assert compiles == {"forward": 1, "training": 1}
+
+    for count, case in cases.items():
+        semantic._CAUSAL_CONV1D_TRAINING_CACHE.clear()
+        forward_api._API_CACHE.clear()
+        exact = run(*case)
+        for name, a, b in zip(("y", "final", "dx", "dweight", "dinitial"), shared[count], exact):
+            if name == "dweight" and not deterministic:  # FP32 atomics
+                torch.testing.assert_close(a, b, atol=1e-2, rtol=1e-2)
+            else:
+                assert torch.equal(a, b), (count, name)
+
+        offsets, x0, dy0, initial0, d_final = case
+        cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+        reference_x = x0.float().requires_grad_()
+        reference_initial = initial0.float().requires_grad_()
+        expected, expected_full_final = causal_conv1d_bulk_reference(
+            reference_x,
+            weight0.float(),
+            bias=None if bias0 is None else bias0.float(),
+            cu_seqlens=cu_seqlens,
+            initial_state=torch.cat((torch.zeros_like(reference_initial[..., :1]), reference_initial), dim=-1),
+        )
+        torch.autograd.backward(
+            (expected, expected_full_final),
+            (dy0.float(), torch.cat((torch.zeros_like(d_final[..., :1]), d_final), dim=-1).float()),
+        )
+        y, final, dx, _, dinitial = shared[count]
+        torch.testing.assert_close(y.transpose(1, 2).float(), expected, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(final.float(), expected_full_final[..., 1:], atol=0, rtol=0)
+        torch.testing.assert_close(dx.transpose(1, 2).float(), reference_x.grad, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dinitial.float(), reference_initial.grad, atol=5e-2, rtol=5e-2)

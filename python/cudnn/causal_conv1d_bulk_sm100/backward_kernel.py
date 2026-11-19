@@ -409,8 +409,6 @@ class CausalConv1dBulkBackwardKernel:
         *,
         batch_size: int,
         sequence_length: int,
-        num_sequences: int,
-        packed_tile_capacity: int,
         threads: int = 256,
         tokens_per_cta: int = 64,
         use_dweight_partials: bool = False,
@@ -418,8 +416,6 @@ class CausalConv1dBulkBackwardKernel:
     ):
         self.batch_size = batch_size
         self.sequence_length = sequence_length
-        self.num_sequences = num_sequences
-        self.packed_tile_capacity = packed_tile_capacity
         self.threads = threads
         self.tokens_per_cta = tokens_per_cta
         self.use_dweight_partials = use_dweight_partials
@@ -444,21 +440,25 @@ class CausalConv1dBulkBackwardKernel:
         stream: cuda.CUstream,
     ) -> None:
         tiles_per_sequence = (self.sequence_length - 1) // self.tokens_per_cta + 1
-        n_partials = self.batch_size * tiles_per_sequence
+        num_sequences = cutlass.Int32(self.batch_size)
+        n_partials = cutlass.Int32(self.batch_size * tiles_per_sequence)
         if cutlass.const_expr(cu_seqlens is not None):
+            # Packed N is runtime: one compiled plan serves every sequence count.
+            total_tokens = self.batch_size * self.sequence_length
+            num_sequences = cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(1)
+            n_partials = num_sequences + (cutlass.Int32(total_tokens) - num_sequences) // cutlass.Int32(self.tokens_per_cta)
             _build_packed_tile_map_kernel(
                 cu_seqlens,
                 packed_tile_map,
-                cutlass.Int32(self.num_sequences),
-                cutlass.Int64(self.batch_size * self.sequence_length),
+                num_sequences,
+                cutlass.Int64(total_tokens),
                 cutlass.Int32(self.tokens_per_cta),
-                cutlass.Int32(self.packed_tile_capacity),
+                n_partials,
             ).launch(
                 grid=(1, 1, 1),
                 block=(1, 1, 1),
                 stream=stream,
             )
-            n_partials = self.packed_tile_capacity
         if cutlass.const_expr(self.use_dweight_partials):
             _causal_conv1d_bulk_bwd_kernel(
                 x,
@@ -483,7 +483,7 @@ class CausalConv1dBulkBackwardKernel:
             _reduce_dweight_partials_kernel(
                 dw_partials,
                 dw_accum,
-                cutlass.Int32(n_partials),
+                n_partials,
                 cutlass.Int32(x.shape[1]),
             ).launch(
                 grid=(cute.ceil_div(x.shape[1], self.reduction_threads), 1, 1),
@@ -522,10 +522,10 @@ class CausalConv1dBulkBackwardKernel:
                 d_initial_state,
                 cu_seqlens,
                 cutlass.Int32(self.sequence_length),
-                cutlass.Int32(self.num_sequences),
+                num_sequences,
                 cutlass.Int32(x.shape[1]),
             ).launch(
-                grid=(self.num_sequences, cute.ceil_div(x.shape[1], self.threads), 1),
+                grid=(num_sequences, cute.ceil_div(x.shape[1], self.threads), 1),
                 block=(self.threads, 1, 1),
                 stream=stream,
             )
