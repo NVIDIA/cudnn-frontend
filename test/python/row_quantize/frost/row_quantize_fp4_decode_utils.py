@@ -21,7 +21,9 @@ package is imported -- and it is statements about BYTES:
    approximate reciprocal (its documented bound), doubled, plus one fp32 unit for the two multiplications.  A code outside the
    bracket is a finding with its magnitude, never a reason to widen.
 4. *The codes of an exact block* (:func:`exact_codes`): BITWISE.  Where the global scale and the block's scale value are powers of
-   two, both reciprocals and the multiply are exact, so the code is ``e2m1(x x gs / F)``.
+   two, both reciprocals and the multiply are exact, so the code is ``e2m1(x x gs / F)`` -- ONE code, an exact rounding tie
+   included (it goes to the even code).  :func:`assert_codes` holds every such block of every operand to that one code
+   (:func:`exact_blocks` says which blocks they are); the bracket of statement 3 is the statement about every other block.
 
 THE GLOBAL SCALES.  ``SCALE_BITS`` holds eleven fp32 patterns.  Under each of the first eight (``PLAIN_SCALE_BITS``: a
 non-power-of-two value near 48.65, 1, 0.25, 37, 2^10, 2^-3, 2^-20, 2^20) the association of statement 1 and three other ways to form
@@ -264,19 +266,38 @@ def exact_codes(x, block_bytes, scale):
     return e2m1_codes(_scaled(x, block_bytes, scale))
 
 
+def exact_blocks(block_bytes, scale):
+    """The blocks of statement 4 (host bool ``[rows, width / 16]``): the global scale is a power of two and the block's stored
+    scale value is a non-zero power of two (E4M3's subnormal powers of two included).  All False under any other global scale."""
+    gs = scale.detach().cpu().float().reshape(())
+    f = block_bytes.view(E4M3).float()
+    if float(torch.frexp(gs)[0]) != 0.5:
+        return torch.zeros_like(f, dtype=torch.bool)
+    return (f != 0) & (torch.frexp(f)[0] == 0.5)
+
+
 def assert_codes(codes, x, block_bytes, scale, label="", blocks=None):
-    """Statement 3 on the kernel's packed codes (uint8 ``[rows, width / 2]``); returns the count of elements whose bracket holds two
-    codes (the elements within the reciprocal bound of an E2M1 midpoint).  ``blocks`` (a host bool ``[rows, width / 16]``) restricts
-    the statement to those blocks."""
+    """Statements 3 and 4 on the kernel's packed codes (uint8 ``[rows, width / 2]``): every code inside the two-code bracket, and
+    in an exact block (:func:`exact_blocks`) the ONE code ``e2m1(x x gs / F)`` -- there the bracket's second code is a wrong code
+    (another tie rule, a multiplier one unit off).  Returns the count of elements whose bracket holds two codes (the elements within
+    the reciprocal bound of an E2M1 midpoint).  ``blocks`` (a host bool ``[rows, width / 16]``) restricts both statements to those
+    blocks."""
     got = unpack_e2m1(codes.detach().cpu())
     lo, hi = code_bracket(x, block_bytes, scale)
     outside = (got != lo) & (got != hi)
+    inexact = exact_blocks(block_bytes, scale).repeat_interleave(BLOCK, dim=1) & (got != exact_codes(x, block_bytes, scale))
     if blocks is not None:
         outside &= blocks.repeat_interleave(BLOCK, dim=1)
+        inexact &= blocks.repeat_interleave(BLOCK, dim=1)
     n_out = int(outside.sum())
     assert n_out == 0, (
         f"{label}: {n_out} of {got.numel()} codes outside the bracket of the approximate reciprocals "
         f"(first at flat element {int(outside.reshape(-1).nonzero()[0])})"
+    )
+    n_inexact = int(inexact.sum())
+    assert n_inexact == 0, (
+        f"{label}: {n_inexact} codes of exact blocks (a power-of-two global scale and block scale) differ from e2m1(x x gs / F) "
+        f"(first at flat element {int(inexact.reshape(-1).nonzero()[0])})"
     )
     return int((lo != hi).sum())
 
@@ -342,6 +363,119 @@ def exact_operands(scale_bits, width=WIDTH):
     sub = bf16_from_patterns(torch.arange(width, dtype=torch.int64) % 0x7F + 1 + ((torch.arange(width, dtype=torch.int64) % 2) << 15))
     out[4] = sub
     return out.contiguous()
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# the kernel's global accesses, read from its PTX: WHERE every byte is read and written
+# ---------------------------------------------------------------------------------------------------------------------------
+def ptx_global_accesses(ptx, rows, threads):
+    """Every global load and store of a rendered kernel with its ADDRESS, from the PTX text (always kept: no disassembler).  The
+    integer address arithmetic is EVALUATED -- not matched as text -- for every thread ``0 .. threads - 1`` of every thread block
+    ``0 .. rows - 1``, with 32-bit wrap-around and the sign extensions the instructions state, so the result is the byte each
+    thread addresses whatever instructions the compiler chose for it.  Returns one dict per access, in program order:
+    ``op`` (the PTX opcode), ``param`` (the kernel parameter the address is based on, by its name in the text -- an identity, never
+    a number), ``offset`` (host int64, broadcastable to ``[rows, threads]``: the byte offset from that parameter) and ``value`` (a
+    store's source operand as text).  ``param`` and ``offset`` are ``None`` for an address this reader cannot follow (an operand of
+    an instruction it does not evaluate): the caller treats that as a failure, never as a pass."""
+    import re
+
+    row = torch.arange(rows, dtype=torch.int64).reshape(-1, 1)
+    tid = torch.arange(threads, dtype=torch.int64).reshape(1, -1)
+    env, accesses = {}, []
+
+    def u32(v):
+        return v & 0xFFFFFFFF
+
+    def s32(v):
+        return (u32(v) ^ 0x80000000) - 0x80000000
+
+    def split(rest):
+        out, depth, token = [], 0, ""
+        for ch in rest:
+            depth += (ch in "{[") - (ch in "}]")
+            if ch == "," and depth == 0:
+                out.append(token.strip())
+                token = ""
+            else:
+                token += ch
+        return out + [token.strip()] if token.strip() else out
+
+    def value(token):
+        if token.startswith("%"):
+            return {"%tid.x": tid, "%ctaid.x": row}.get(token, env.get(token))
+        return torch.tensor(int(token, 0), dtype=torch.int64) if re.fullmatch(r"-?(0[xX][0-9a-fA-F]+|\d+)", token) else None
+
+    def address(token):
+        m = re.fullmatch(r"\[\s*(%\w+)\s*(?:\+\s*(\d+))?\s*\]", token)
+        base = env.get(m.group(1)) if m else None
+        if not isinstance(base, tuple):
+            return None, None
+        return base[0], base[1] + int(m.group(2) or 0)
+
+    def integers(operands):
+        values = [value(t) for t in operands]
+        return values if all(isinstance(v, torch.Tensor) for v in values) else None
+
+    binary = {
+        "shl.b32": lambda a, b: u32(a << b),
+        "shr.u32": lambda a, b: u32(a) >> b,
+        "shr.s32": lambda a, b: u32(s32(a) >> b),
+        "and.b32": lambda a, b: u32(a & b),
+        "or.b32": lambda a, b: u32(a | b),
+        "xor.b32": lambda a, b: u32(a ^ b),
+        "add.s32": lambda a, b: u32(a + b),
+        "add.u32": lambda a, b: u32(a + b),
+        "sub.s32": lambda a, b: u32(a - b),
+        "sub.u32": lambda a, b: u32(a - b),
+        "mul.lo.s32": lambda a, b: u32(a * b),
+        "mul.lo.u32": lambda a, b: u32(a * b),
+        "mul.wide.s32": lambda a, b: s32(a) * s32(b),
+        "mul.wide.u32": lambda a, b: u32(a) * u32(b),
+        "shl.b64": lambda a, b: a << b,
+        "sub.s64": lambda a, b: a - b,
+        "mul.lo.s64": lambda a, b: a * b,
+        "mul.lo.u64": lambda a, b: a * b,
+    }
+    unary = {"cvt.s64.s32": s32, "cvt.u64.u32": u32, "mov.u32": u32, "mov.b32": u32, "mov.u64": lambda a: a, "mov.b64": lambda a: a}
+    text = "\n".join(line.split("//")[0] for line in ptx[ptx.index(".entry") :].splitlines())
+    for raw in text.split(";"):
+        stmt = re.sub(r"^(\$\w+:\s*)+", "", raw.strip().lstrip("{}").strip())  # block braces, then labels
+        stmt = re.sub(r"^@!?%\w+\s+", "", stmt)  # a predicate
+        if not stmt or stmt.startswith(".") or len(stmt.split(None, 1)) < 2:
+            continue
+        op, rest = stmt.split(None, 1)
+        operands = split(rest)
+        if op.startswith(("ld.global", "st.global")):
+            where = operands[1] if op.startswith("ld.") else operands[0]
+            param, offset = address(where)
+            accesses.append(dict(op=op, param=param, offset=offset, value=operands[1] if op.startswith("st.") else None))
+            for token in re.findall(r"%\w+", operands[0]) if op.startswith("ld.") else ():
+                env[token] = None  # loaded data: never an address input of this kernel
+            continue
+        if not operands or not operands[0].startswith("%"):
+            continue
+        dst, result = operands[0], None
+        if op == "ld.param.b64":
+            result = (operands[1].strip("[] "), torch.zeros((), dtype=torch.int64))
+        elif op in ("add.s64", "add.u64") and len(operands) == 3:
+            a, b = value(operands[1]), value(operands[2])
+            pointers = [v for v in (a, b) if isinstance(v, tuple)]
+            others = [v for v in (a, b) if isinstance(v, torch.Tensor)]
+            if len(pointers) == 1 and len(others) == 1:
+                result = (pointers[0][0], pointers[0][1] + others[0])
+            elif len(others) == 2:
+                result = others[0] + others[1]
+        elif op in ("mad.lo.s32", "mad.lo.u32") and len(operands) == 4:
+            v = integers(operands[1:])
+            result = None if v is None else u32(v[0] * v[1] + v[2])
+        elif op in binary and len(operands) == 3:
+            v = integers(operands[1:])
+            result = None if v is None else binary[op](*v)
+        elif op in unary and len(operands) == 2:
+            v = integers(operands[1:])
+            result = None if v is None else unary[op](v[0])
+        env[dst] = result
+    return accesses
 
 
 # ---------------------------------------------------------------------------------------------------------------------------

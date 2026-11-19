@@ -5,7 +5,9 @@
 tables, the three launch arms, every typed decline of the entry (CPU tensors), the DSL gates (version, target, compiler), the
 plan-time-only compile key, the launch facts, the lazy export, why the reference's global scales are what they are, and the kernel's
 RENDERING for the claimed targets (the instructions that define the rounding chain, the position of the dependent-launch wait, the
-operand wiring of the compiled kernel, the form inside the first 100 characters of the symbol); on a cc 10.x device the bytes
+byte every global load and store addresses, one text for every claimed target, the operand wiring of the compiled kernel, the
+form inside the first 100 characters of the symbol) and the scale positions against the layout a block-scaled FP4 multiply
+reads; on a cc 10.x device the bytes
 against the independent references of ``row_quantize_fp4_decode_utils`` (the block scales bitwise, the two-code bracket), the scale
 byte of EVERY finite bf16 block maximum under eleven global scales, the exact cells (codes bitwise), the equality with the NVFP4 form
 of the add + RMSNorm + quantize step, blocks with a NaN or an infinity, output ownership per output, the bit-neutral arms, the wait
@@ -58,6 +60,7 @@ from row_quantize_fp4_decode_utils import (  # noqa: E402  (the launch arms, the
     make_entry,
     make_operands,
     maxima_scale_bytes,
+    ptx_global_accesses,
     sass_wiring_facts,
     scale_byte_index,
     scale_bytes,
@@ -293,6 +296,8 @@ def test_binding_check_requires_every_operand_on_the_given_device():
     ops = _host_operands()
     with pytest.raises(ValueError, match=r"every operand must live on one device, the entry's \(cuda:0\); x is on cpu"):
         entry.check_binding(_cfg(), ops["x"], ops["scale"], device=torch.device("cuda", 0))
+    with pytest.raises(ValueError, match=r"every operand must live on one device, x's \(cpu\); scale is on meta"):
+        entry.check_binding(_cfg(), ops["x"], torch.ones(1, device="meta"))  # no device given: the operands share x's
     assert entry.check_binding(_cfg(), ops["x"], ops["scale"], ops["codes"], ops["scales"], device="cpu") == 3
 
 
@@ -568,7 +573,8 @@ def test_kernel_takes_its_instructions_from_the_tile_library():
     block-scale chain from ``cudnn.frost.tile_dsl.pointwise``, the row load and the 4-bit store from ``tile_dsl.rowwise``, the
     layout rule from ``tile_dsl.sf_layout`` and the dependent-launch pair from ``tile_dsl.barrier``; it spells no instruction inline,
     allocates no shared memory, holds no barrier and no shuffle, and names no address space (a kernel module takes that name from
-    ``cudnn._cutlass_compat``, never off ``cute``)."""
+    ``cudnn._cutlass_compat``, never off ``cute``).  Its ONE subscript store is the scale byte, indexed by the layout rule of
+    ``(row, block)`` with the config's atoms per band (the rendering cells evaluate the compiled address)."""
     source = (REPO / "python" / "cudnn" / "row_quantize" / "frost" / "kernel" / "row_quantize_fp4_decode_f16.py").read_text()
     tree = ast.parse(source)
 
@@ -584,6 +590,8 @@ def test_kernel_takes_its_instructions_from_the_tile_library():
     names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     for absent in ("inline_ptx", "SmemAllocator", "barrier", "shuffle_sync_bfly", "AddressSpace", "block_reduce"):
         assert absent not in names, f"the kernel module names {absent}"
+    stores = [ast.unparse(t) for node in ast.walk(tree) if isinstance(node, ast.Assign) for t in node.targets if isinstance(t, ast.Subscript)]
+    assert stores == ["sf[sf_band_offset(row, tid, cfg.SF_ATOMS)]"], f"the kernel's subscript stores: {stores}"
     code = "\n".join(ln for ln in source.splitlines() if not ln.lstrip().startswith("#"))
     assert "cute.AddressSpace" not in code.split('"""')[-1], "the kernel's code reads AddressSpace off cute"
 
@@ -824,6 +832,52 @@ PTX_PINS = {
 PTX_ABSENT = ("div.", "fma.", "shfl.", "bar.", "mbarrier", "cp.async", "tcgen05", "ld.shared", "st.shared", "redux.", "atom.", "rsqrt.", "sqrt.")
 
 
+#: arch -> {arm id: the rendering from its entry on}: this session's renderings (a cache of what a cell rendered, never an input)
+_RENDERED_BODIES = {}
+
+
+def _assert_addresses(ptx, what):
+    """WHERE the kernel reads and writes, from the PTX of a rendering (``ptx_global_accesses``: the integer address arithmetic
+    evaluated for every thread of every thread block of a ``MAX_ROWS`` call).  Five global accesses on four distinct kernel
+    parameters: the scale's 32-bit load at byte 0 of its own; the two 128-bit loads at the bf16 elements ``row x width + 16 t``
+    and eight elements on; the 64-bit store at byte ``row x width / 2 + 8 t`` of the codes; the byte store at the position of
+    block scale ``(row, t)`` in the 128 x 4 layout WRITTEN OUT in the test helpers (``scale_byte_index``) -- and what that store
+    writes is the E4M3 convert's code.  A row-major scale index, a dropped band term or another quarter of the atom FAILS here."""
+    rows = kcfg.MAX_ROWS
+    accesses = ptx_global_accesses(ptx, rows, THREADS)
+    assert sorted(a["op"] for a in accesses) == ["ld.global.b32", "ld.global.v4.b32", "ld.global.v4.b32", "st.global.b8", "st.global.v2.b32"], what
+    lost = [a["op"] for a in accesses if a["param"] is None]
+    assert not lost, f"{what}: the address of {lost} is not followed by the reader (an instruction it does not evaluate feeds it)"
+    by_op = {a["op"]: a for a in accesses}
+    row = torch.arange(rows, dtype=torch.int64).reshape(-1, 1)
+    block = torch.arange(THREADS, dtype=torch.int64).reshape(1, -1)
+    element = row * WIDTH + block * BLOCK
+
+    def at(access, want, name):
+        got = access["offset"].expand(rows, THREADS)
+        differing = got != want.expand(rows, THREADS)
+        first = tuple(int(v) for v in differing.nonzero()[0]) if bool(differing.any()) else None
+        assert first is None, (
+            f"{what}: {name} addresses another byte for {int(differing.sum())} of {rows * THREADS} (row, block) pairs "
+            f"(first at {first}: byte {int(got[first])}, want {int(want.expand(rows, THREADS)[first])})"
+        )
+
+    row_loads = [a for a in accesses if a["op"] == "ld.global.v4.b32"]
+    at(by_op["ld.global.b32"], torch.zeros((), dtype=torch.int64), "the scale's load")
+    at(row_loads[0], 2 * element, "the first row load")
+    at(row_loads[1], 2 * (element + BLOCK // 2), "the second row load")
+    at(by_op["st.global.v2.b32"], row * (WIDTH // 2) + block * (BLOCK // 2), "the code store")
+    at(by_op["st.global.b8"], scale_byte_index(rows), "the scale byte's store")
+    operands = [by_op["ld.global.b32"]["param"], row_loads[0]["param"], by_op["st.global.v2.b32"]["param"], by_op["st.global.b8"]["param"]]
+    assert row_loads[1]["param"] == row_loads[0]["param"] and len(set(operands)) == 4, f"{what}: the accesses are not on four distinct operands: {operands}"
+    convert = re.search(r"cvt\.rn\.satfinite\.e4m3x2\.f32\s+(\w+)\s*,[^;]*;\s*cvt\.u32\.u16\s+(%\w+)\s*,\s*\1\s*;", ptx)
+    assert convert is not None, f"{what}: the E4M3 convert's code register"
+    code = convert.group(2)
+    assert (
+        by_op["st.global.b8"]["value"] == code and len(re.findall(r"[\w.]+\s+" + re.escape(code) + r"\s*,", ptx)) == 1
+    ), f"{what}: the scale byte's store writes {by_op['st.global.b8']['value']}, not the E4M3 convert's code {code} (written once)"
+
+
 def _assert_arm_sites(ops, lines, wait, release, what):
     """The dependent-launch sites, read from the PTX by INSTRUCTION FORM (never by a kernel parameter's number): the one 32-bit
     global load is the scale's; the wait sits in the entry block behind it and in front of both 128-bit loads and both stores; the
@@ -857,6 +911,8 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     (``PTX_ABSENT``), no ``.shared`` declaration; ``.reqntid 320``; the symbol = the kernel's name + the form text inside the first
     100 characters; four kernel parameters.  THE DEPENDENT-LAUNCH SITES (``_assert_arm_sites``): the wait sits in the entry block,
     behind the scale's load and in front of the first read of the row and of every store; the release is the very next instruction.
+    THE ADDRESSES (``_assert_addresses``): the byte every global load and store addresses, evaluated from the PTX for every
+    (row, block) of a 1024-row call -- the scale byte at its position in the 128 x 4 layout written out in the test helpers.
     The three arms differ ONLY in the ``griddepcontrol`` blocks.
 
     With an nvdisasm that decodes the cubin, also the compiled kernel: two ``MUFU.RCP`` and one multiply between them, all three
@@ -914,6 +970,7 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
         head = SYMBOL + str(_cfg(arm))
         assert symbol.startswith(head + "_") and len(head) <= 100, f"{what}: the symbol {symbol[:120]} does not carry the form in its first 100 characters"
         _assert_arm_sites(ops, lines, wait, release, what)
+        _assert_addresses(ptx, what)
         bodies[arm_id] = _body(ptx)
         cubins = [f for f in files if f.endswith(".cubin")]
         sass = _sass(cubins[0]) if cubins else None
@@ -945,8 +1002,109 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
         assert _without_pdl_blocks(bodies[arm_id]) == _without_pdl_blocks(
             bodies["plain"]
         ), f"{arch}: the {arm_id} arm changes more than its griddepcontrol blocks"
+    _RENDERED_BODIES[arch] = bodies
     if not decoded:
         pytest.skip(f"compiled + PTX pinned for {arch}; SASS half skipped: no nvdisasm candidate decodes the target")
+
+
+def _arm_bodies(tmp_path, arch):
+    """The three launch arms' renderings of ``arch`` from their entry on (the symbol normalized): rendered once per session."""
+    if arch not in _RENDERED_BODIES:
+        cells = list(zip(LAUNCH_ARMS, LAUNCH_ARM_IDS))
+        where = tmp_path / arch
+        where.mkdir()
+        compiler, kept, rejected = _render(where, arch, [_spec(arm) for arm, _ in cells])
+        assert not rejected, f"{arch} (compiler CUDA {compiler[0]}.{compiler[1]}): the trace-compile was rejected: {rejected}"
+        _RENDERED_BODIES[arch] = {arm_id: _body(Path(next(f for f in kept[_spec(arm)] if f.endswith(".ptx"))).read_text()) for arm, arm_id in cells}
+    return _RENDERED_BODIES[arch]
+
+
+@pytest.mark.parametrize("arch, cc", (("sm_103a", (10, 3)), ("sm_107a", (10, 7))))
+def test_rendering_of_a_claimed_target_is_the_sm_100a_text(arch, cc, tmp_path):
+    """The kernel is arch-portable PTX: from its entry on (the ``.target`` line sits in the header in front of it) the rendering
+    for ``sm_103a`` and for ``sm_107a`` is, line for line, the ``sm_100a`` rendering of the same launch arm.  So the text whose
+    bytes the device cells check on a cc 10.0 part is the text the entry admits the other compute capability 10.x parts on; what
+    a part of another class adds is its own assembler and its own approximate reciprocal -- the device run that class is owed,
+    not another kernel.  A DSL that does not serve one of the two targets SKIPS with the gate's text."""
+    for target_cc in ((10, 0), cc):
+        msg = entry._dsl_error(target_cc)
+        if msg is not None:
+            pytest.skip(msg)
+    reference, other = _arm_bodies(tmp_path, "sm_100a"), _arm_bodies(tmp_path, arch)
+    for arm_id in LAUNCH_ARM_IDS:
+        want, got = reference[arm_id].splitlines(), other[arm_id].splitlines()
+        differing = [i for i, (a, b) in enumerate(zip(want, got)) if a != b]
+        assert (
+            len(want) == len(got) and not differing
+        ), f"{arch} {arm_id}: the rendering is not the sm_100a text ({len(got)} lines against {len(want)}; {len(differing)} differing" + (
+            f", first at line {differing[0]}: {got[differing[0]]!r} against {want[differing[0]]!r})" if differing else ")"
+        )
+
+
+_LAYOUT_PROBE = textwrap.dedent("""
+    import json, os, sys
+    os.environ["CUTE_DSL_ARCH"] = "sm_100a"  # unconditional: a host function is traced, nothing is assembled or launched
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.utils.blockscaled_layout as blockscaled_layout
+
+    width, block = int(sys.argv[1]), int(sys.argv[2])
+    row_counts = tuple(int(v) for v in sys.argv[3:])
+    out = dict(reads={}, one_block=[])
+
+    def evaluate():  # plain Python, run while the host function below is traced: the layout algebra needs a trace
+        for rows in row_counts:
+            layout = blockscaled_layout.tile_atom_to_shape_SF((rows, width, 1), block)
+            out["reads"][str(rows)] = [[int(cute.crd2idx((r, c * block, 0), layout)) for c in range(width // block)] for r in range(rows)]
+        layout = blockscaled_layout.tile_atom_to_shape_SF((2, width, 1), block)
+        out["one_block"] = [int(cute.crd2idx((1, 7 * block + j, 0), layout)) for j in range(block)]
+
+    @cute.jit
+    def trace(rows: cutlass.Constexpr):
+        evaluate()
+
+    cute.compile(trace, row_counts)
+    print("LAYOUT", json.dumps(out))
+    """)
+
+
+def test_scale_positions_are_those_a_block_scaled_fp4_multiply_reads(tmp_path):
+    """THE LAYOUT, position by position, on the host (the DSL's layout algebra at trace time of a host function, in a fresh
+    process: nothing is assembled or launched and no device is needed).  A block-scaled FP4 multiply of this library builds the
+    scale layout of an operand of shape ``(rows, width, 1)`` with ``cutlass.utils.blockscaled_layout.tile_atom_to_shape_SF(shape,
+    16)`` (``cudnn.SwigluFp4Decode`` binds the scales of both of its operands so).  For EVERY (row, block) of 1, 2 and 129 rows --
+    one band and two -- the byte that layout addresses for the block's elements is the byte the entry writes the block's scale to
+    (the config's ``scale_byte_offset``: the kernel's index) and the byte the suite's reference reads (``scale_byte_index``: the
+    layout written out); the sixteen elements of a block address ONE byte; and of the 640 (row, block) pairs of two rows a
+    row-major index names the layout's byte for the first four blocks of row 0 only.  Needs the CuTe DSL; SKIPS with the version
+    gate's text without it."""
+    msg = entry._dsl_version_error()
+    if msg is not None:
+        pytest.skip(msg)
+    row_counts = (1, 2, 129)
+    probe = tmp_path / "layout_probe.py"  # a FILE: the DSL preprocessor re-reads a traced function's source through inspect
+    probe.write_text(_LAYOUT_PROBE)
+    proc = subprocess.run([sys.executable, str(probe), str(WIDTH), str(BLOCK), *(str(r) for r in row_counts)], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"the layout probe failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}"
+    out = json.loads(next(ln for ln in proc.stdout.splitlines() if ln.startswith("LAYOUT ")).split(" ", 1)[1])
+    cfg = _cfg()
+    for rows in row_counts:
+        reads = torch.tensor(out["reads"][str(rows)])
+        assert tuple(reads.shape) == (rows, BLOCKS)
+        writes = torch.tensor([[kcfg.scale_byte_offset(cfg, row, block) for block in range(BLOCKS)] for row in range(rows)])
+        differing = reads != writes
+        assert not bool(differing.any()), (
+            f"{rows} rows: the multiply's layout reads another byte than the entry writes for {int(differing.sum())} of {rows * BLOCKS} "
+            f"(row, block) pairs (first at {tuple(int(v) for v in differing.nonzero()[0]) if bool(differing.any()) else None})"
+        )
+        assert torch.equal(writes, scale_byte_index(rows)), f"{rows} rows: the entry's index is not the layout written out in the test helpers"
+        assert int(writes.max()) < scale_rows(rows) * BLOCKS and writes.unique().numel() == writes.numel(), f"{rows} rows: distinct bytes inside the buffer"
+    two_rows = torch.tensor(out["reads"]["2"])
+    assert set(out["one_block"]) == {int(two_rows[1, 7])}, "the sixteen elements of a block address one scale byte"
+    row_major = torch.arange(2 * BLOCKS).reshape(2, BLOCKS)
+    same = (two_rows == row_major).nonzero().tolist()
+    assert same == [[0, 0], [0, 1], [0, 2], [0, 3]], f"a row-major index names the layout's byte at {same}"
 
 
 def test_wiring_reader_refuses_a_miswired_kernel():
@@ -1622,10 +1780,12 @@ def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, arm, arm_id):
     assert k.form_for(rows) == asdict(k.cfg)
 
 
-def test_code_domain_is_inside_the_bracket_and_exact_where_the_scale_is_a_power_of_two():
+def test_code_domain_is_inside_the_bracket():
     """The enumerated code domain of the non-power-of-two plain scale (854 rows, one call): every positive and every negative bf16
     element under every scale byte.  Scales bitwise; every code inside the two-code bracket; the count of two-code elements is one
-    line of the run's "measured" section (they are the elements that can see the last bit of the part's approximate reciprocals)."""
+    line of the run's "measured" section (they are the elements that can see the last bit of the part's approximate reciprocals).
+    No block is exact under this scale: the one-code statement of the exact blocks is ``test_matches_the_reference`` under the six
+    power-of-two scales and ``test_exact_cells``."""
     dev = _device_or_skip()
     import frost_routing
 
