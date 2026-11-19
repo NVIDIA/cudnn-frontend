@@ -125,6 +125,7 @@ arbitrary user callbacks.
 | FROST native D64 dense/THD paged forward (standalone qualification; fixed split count and packing) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations, including matching-half THD splits) |
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | FROST D128 paged forward with at most eight live query rows per packed unit (fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported for this lowering | Supported (tested configurations) | Unsupported for this lowering |
+| FROST SM100 D256 swap-AB paged decode with 2 to 8 KV chunks, reduced by the separate pass or inside the launch (`CLUSTER_K_REDUCE=1`; fixed packing and split count) | fprop | matching FP16/BF16 Q/K/V/O; FP32 Stats | Unsupported for this engine | Supported (SM100, tested configurations); SM103 unverified, and `CLUSTER_K_REDUCE=1` is declined there | Unsupported for this engine |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D128 paged decode with at most eight live query rows per packed unit (fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | SM100: Supported (tested configurations); SM103: Supported (tested D128 paged configurations, existing lowering) | Unsupported for this lowering |
 | `pygraph.sdpa_fp8`, FROST D64/D128 paged KV with dense Q (fixed CTA width, packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or matching FP8 O | Unsupported | Supported (tested configurations) | Unverified by this suite |
@@ -167,6 +168,22 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+
+The SM100 D256 swap-AB split decode tile reduces its per-chunk partial results
+in the separate reduction pass or, with `CLUSTER_K_REDUCE=1`, inside its own
+launch. Both forms add the partials in split order with the same operations.
+In the tested configurations (2, 4 and 8 chunks; FP16/BF16; packed one- and
+two-token units and unpacked three- to eight-token units; pages of 16, 32 and
+64; bottom-right causal masks and per-batch lengths) they store identical O
+and Stats bytes, so the knob does not change a plan's result at a fixed split
+count. The result still follows the split count, which the heuristics choose
+from the declared cache length and the batch: a caller that needs a sequence's
+bytes to stay equal across batch sizes fixes `SPLIT_KV`. At a fixed split
+count the tested sequences keep their bytes alone, among 8 and among 64,
+reordered, duplicated and with changed neighbours, in both forms. Bytes are
+not equal across split counts, to the unsplit plan, or to another engine.
+SM103 execution is unverified. See the
+[coverage record](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18).
 | `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in), including bottom-right causal when `S_q <= S_kv` | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and

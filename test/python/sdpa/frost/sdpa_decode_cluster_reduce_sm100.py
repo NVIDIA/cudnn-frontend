@@ -369,7 +369,7 @@ def test_batch_invariance(reduce, pack, s_q, split):
 )
 def test_replay_capture_and_golden(name, kwargs):
     """Fresh-buffer replay, a retained CUDA graph against eager execution, changed inputs under the retained graph, and one
-    golden per path that BOTH forms must reproduce."""
+    golden per path that BOTH forms must reproduce (compared last: a runtime without a recorded golden skips there)."""
     _device()
     runner = Runner(lens=(2048, 1027, 0), seed=11, **kwargs)
     order = [0, 1, 2]
@@ -377,8 +377,7 @@ def test_replay_capture_and_golden(name, kwargs):
     for reduce in (False, True):
         results[reduce] = assert_replays(lambda: runner.check(runner.run(order, reduce)[0]), repeats=8)
     assert_bitwise(results[True], results[False], "in-launch reduction against the two-launch form")
-    # One golden per path: the two forms are byte-equal above, so both reproduce it.
-    assert_golden(f"sdpa-decode-d256-swap-ab-{name}", dict(q=runner.q, k=runner.k, v=runner.v), results[True])
+    inputs = dict(q=runner.q.clone(), k=runner.k, v=runner.v)
     # a retained graph of the in-launch form: replay equals eager, and follows changed lengths and data
     t = runner.batch(order)
     api = runner.plan(t, True)
@@ -405,17 +404,19 @@ def test_replay_capture_and_golden(name, kwargs):
     finally:
         torch.cuda.synchronize()
         graph.reset()
+    # One golden per path: the two forms are byte-equal above, so both reproduce it.
+    assert_golden(f"sdpa-decode-d256-swap-ab-{name}", inputs, results[True])
 
 
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group("gpu_exclusive")
 def test_warm_refill_stress():
-    """The tile's ring, P slots and max slots are refilled inside one launch (five key tiles per chunk); the in-launch form is
+    """The tile's ring, P slots and max slots are refilled inside one launch (ten key tiles per chunk); the in-launch form is
     a new rendering of that mainloop, so it is stressed warm behind the control of its cluster size."""
     from warm_stress import StressCase, assert_warm_stress, stress_validation
 
     _device()
-    split, users = 4, 9
+    split, users = 2, 9
     runner = Runner(s_q=2, split=split, causal=True, declared=2560, lens=[2560] * users, seed=17, margin=0)
     order = list(range(users))
     t, api, ws = runner.run(order, True)
@@ -432,7 +433,7 @@ def test_warm_refill_stress():
             launch,
             {"o": t["o_store"], "lse": t["lse_store"]},
             thread_blocks=users * KH * split,
-            refills_per_launch=4,
+            refills_per_launch=9,
             reference=reference,
         ),
         validation=stress_validation(cluster=split),

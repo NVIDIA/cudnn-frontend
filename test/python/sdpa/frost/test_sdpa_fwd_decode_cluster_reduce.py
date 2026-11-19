@@ -298,6 +298,50 @@ def test_adapter_passes_the_keywords_only_for_a_requested_plan(stats, requested)
             SdpaFwdDslSm100._explicit_compile_kwargs(api)
 
 
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        (None, None),
+        ("old_extension", "rebuild the extension"),
+        ("no_cluster", "cannot run a thread-block cluster of 8 blocks"),
+        ("prefill", "does not lower onto it"),
+        ("rubin", "does not lower onto it"),
+        ("pdl", "programmatic-dependent-launch"),
+        ("sink", "does not carry a sink"),
+        ("split16", "2 to 8 KV chunks"),
+    ],
+)
+def test_standalone_adapter_declines_like_the_row_and_adds_the_installation_checks(monkeypatch, change, reason):
+    """The adapter's twin of the row decline, on a stand-in plan: the same contract predicate, then the two answers only an
+    installation can give -- an extension that binds the reduced launch over pages and lengths, and a device that can launch
+    a cluster of that size (a device query at support, never on the planning path)."""
+    from cudnn.frost import occupancy
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    binder = SimpleNamespace() if change == "old_extension" else SimpleNamespace(supports_fused_split_paged=True)
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", binder)
+    table = [148, 74, 45, 33, 26, 22, 15, 0 if change == "no_cluster" else 15] + [0] * 8
+    monkeypatch.setattr(occupancy, "occupancy_map", lambda device=None: table)
+    half = SimpleNamespace(dtype="bfloat16", device=SimpleNamespace(index=0))
+    api = SimpleNamespace(
+        _fp8=False,
+        _mixed_fp8_kv=False,
+        _device_cc=(10, 7) if change == "rubin" else (10, 0),
+        _decode_q_tile=lambda: 0 if change == "prefill" else 16,
+        flavor=(256, 256),
+        split_kv=16 if change == "split16" else 8,
+        thd=False,
+        has_sink=change == "sink",
+        stats_log2=False,
+        gate_desc=None,
+        o_desc=half,
+        q_desc=half,
+        use_pdl=change == "pdl",
+    )
+    got = SdpaFwdDslSm100._cluster_reduce_decline(api)
+    assert got is None if reason is None else reason in got
+
+
 def _paged_fused_fixture(stats):
     """A split-8 paged D256 spec with per-batch KV and Q lengths whose host order is this tile's own, bound fused."""
     from test_sdpa_native_split_binding import _split_fixture
