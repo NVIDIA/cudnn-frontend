@@ -915,7 +915,7 @@ class TestClusterReduce:
 
     test_reduction_matches_reference_and_two_launch_bytes = staticmethod(_checks.test_reduction_matches_reference_and_two_launch_bytes)
     test_byte_identity_element_budget = staticmethod(_checks.test_byte_identity_element_budget)
-    test_two_chunks_commute = staticmethod(_checks.test_two_chunks_commute)
+    test_two_chunks_follow_the_split_order = staticmethod(_checks.test_two_chunks_follow_the_split_order)
     test_stale_partials_are_never_read = staticmethod(_checks.test_stale_partials_are_never_read)
     test_batch_invariance = staticmethod(_checks.test_batch_invariance)
     test_replay_capture_and_golden = staticmethod(_checks.test_replay_capture_and_golden)

@@ -362,16 +362,27 @@ def test_byte_identity_element_budget(dtype, users, splits, needed, unpacked_tok
     assert compared >= needed
 
 
-def test_two_chunks_commute():
-    """With two chunks every order gives the same sum: the reverse-order control must reproduce the bytes there, which is why
-    the two-chunk cells count for nothing in the element budget."""
+def test_two_chunks_follow_the_split_order():
+    """Two chunks are reduced in split order like every other count, and their byte comparison takes that order too. The
+    separate pass accumulates ``acc + w * v`` from zero as a fused multiply-add: the first chunk's product is rounded before
+    the second is added, the second is not. Exchanging two chunks therefore keeps the Stats (their denominator is one FP32
+    addition of the two weights) and moves a stored O element now and then: about two in a hundred thousand BF16 elements
+    with random scores, mostly by one unit of the last place. Whether a small batch holds such an element follows the low
+    bits of the host's normal draw, which differ between hosts, so "the reverse order reproduces O" is no assertion. The
+    cell compares both forms and the separate pass in split order, over a full-cache batch large enough to hold moved
+    elements on about every draw (an exchanged order in either form would then move a stored byte), asserts the Stats of
+    the reverse order, and prints how many O elements that order moves. The element budget counts 4 and 8 chunks only."""
     _device()
-    runner = Runner(s_q=2, split=2, causal=True, lens=[2048] * 4, seed=7)
-    t, api, ws = runner.run([0, 1, 2, 3], reduce=True)
-    two = runner.plan(t, False)
-    slab_o, slab_lse = runner.slabs(api, ws, 4)
-    o_rev, _ = runner.separate_combine(two, slab_o.flip(0).contiguous(), slab_lse.flip(0).contiguous(), 4)
-    assert _same_bytes(o_rev, t["o_store"][:, :2])
+    users = 32
+    runner = Runner(s_q=2, split=2, causal=True, lens=[2048] * users, seed=7)
+    order = list(range(users))
+    compared = _compare_forms(runner, order)
+    t, api, ws = runner.run(order, reduce=True)
+    slab_o, slab_lse = runner.slabs(api, ws, users)
+    o_rev, lse_rev = runner.separate_combine(runner.plan(t, False), slab_o.flip(0).contiguous(), slab_lse.flip(0).contiguous(), users)
+    assert _same_bytes(lse_rev, t["lse_store"][:, :, : runner.s_q]), "two weights add to one denominator in either order: the Stats of the reverse order moved"
+    moved = int((o_rev.view(torch.int16) != t["o_store"][:, : runner.s_q].contiguous().view(torch.int16)).sum())
+    print(f"two chunks: {compared} bfloat16 O elements compared and equal in split order; the reverse order moves {moved} of them")
 
 
 @pytest.mark.parametrize("reduce", [False, True], ids=["two-launch", "in-launch"])

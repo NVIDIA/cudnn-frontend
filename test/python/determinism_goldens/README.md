@@ -76,7 +76,7 @@ the rows were added:
   two-launch plan's own slab, so it is a property of that pass's two-chunk
   arithmetic and of the draw, not of the in-launch form; the two forms are
   byte-equal for that configuration. The cell's premise does not hold for
-  every input and is open.
+  every input; the cell is replaced, see below.
 
 The element-budget, stale-partial, refilled-workspace and batch-invariance
 cells passed, as did the replay and retained-graph steps in front of the two
@@ -91,6 +91,51 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest "$suite" -
 python -m pytest "$suite" -q -rs -k "not TestClusterReduce"
 python -m pytest sdpa/frost/test_sdpa_fwd_decode_cluster_reduce.py -q -rs
 ```
+
+The policy file had 116 cells at this run. It has 131 now: five more
+rule-table cells at and past the row of 2 chunks, and ten cells that pin, for
+the nine default-plan steps of the device cell, the form the rules give on a
+148-SM and on a 152-SM part. They need no device; the added cells have not run
+on the 152-SM part.
+
+#### The two-chunk cell after this run
+
+`test_two_chunks_commute` required the separate pass, run over the in-launch
+slab in the reverse split order, to reproduce the in-launch O bytes. That pass
+accumulates `acc + w * v` from zero as a fused multiply-add: the first chunk's
+product is rounded before the second is added, the second is not. Two chunks
+in the other order therefore give the same Stats (their denominator is one
+FP32 addition of the two weights) and, now and then, another stored O element.
+
+The comparison was repeated on the 148-SM part (x86-64 host) for 385 seeds of
+the cell's runner (4 sequences, 49,152 BF16 O elements per seed) under both
+paths of the host's `torch.randn`: the default vectorised one and the scalar
+one (`ATEN_CPU_CAPABILITY=default`). The scalar path draws the bytes of the
+aarch64 host (Q and K of the twelve seeds compared are equal), and under it
+the 148-SM part reproduced the differing elements of the 152-SM run for those
+twelve seeds: the same count per seed, and the same position and bits in the
+13 of 14 elements compared, seed 7 included.
+
+| `randn` path | Seeds with a differing O element | Differing elements | Largest difference |
+| --- | --- | --- | --- |
+| vectorised (x86-64 default) | 244 of 385 | 369 of 18,923,520 | 15 units of the last place |
+| scalar (the aarch64 host's bytes) | 224 of 385 | 321 of 18,923,520 | 15 units of the last place |
+
+Seed 7, the cell's seed, has no such element on the vectorised path and one
+on the scalar path, which is why the cell passed on the x86-64 host and failed
+on the aarch64 one. In all 770 runs the two forms stored equal O and Stats
+bytes, their partial slabs were equal, the separate pass in split order
+reproduced the in-launch O and Stats, and the reverse order reproduced the
+Stats.
+
+The cell is now `test_two_chunks_follow_the_split_order`. It compares both
+forms and the separate pass in split order over 32 full-cache sequences
+(393,216 BF16 O elements), requires the Stats of the reverse order byte for
+byte, and prints how many O elements the reverse order moves; it makes no
+assertion on those. On the 148-SM part it passed under both `randn` paths, and
+the reverse order moved 6 elements under each. It has not run on a 152-SM
+part. The row "Two chunks commute" of the table in the record below describes
+the cell it replaces.
 
 ### SM100 D256 swap-AB in-launch reduction (2026-11-18)
 
