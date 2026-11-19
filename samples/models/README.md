@@ -24,17 +24,18 @@ RMSNorm + quantise in its five forms, the 8-bit in-projection on the stored weig
 the target launches that kernel), the fused 4-bit gate / up step of the MLP on the stored weights (on compute
 capability 10.x), the attention gate + quantise: on compute capability 10.0, 321 of the 484 launches of a step of the
 64-layer model, 48 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results (322 = 49 +
-273 with PyTorch's gather; the 1 declared stand-in has no block yet). Three more blocks are multiplies the target runs on
-a library, FlashInfer, on the stored weights -- the MLP's down multiply and the output head on the 4-bit format, the
+273 with PyTorch's gather; the 1 declared stand-in has no block yet). Three more blocks are multiplies the target runs
+on a library, FlashInfer, on the stored weights -- the MLP's down multiply and the output head on the 4-bit format, the
 out-projections on the 8-bit one -- and `native` calls the library for them on compute capability 10.x: with them it
-launches 451 of the 484 (178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results).
-Of those, 387 (114 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results) are held to
-the kernel and the launch shape the census records; the other 64 are the out-projections, whose kernel the library
-chooses among its own: they are held by membership, and in every run so far the library launched its own CUTLASS
-multiply there, not the cuBLASLt kernel the census records as the target's pick -- the same call, another kernel.
-FlashInfer is an optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it.
-The two attention blocks are still on their fallback rows, printed as `not yet`; their kernels and a captured decode
-step (a step recorded once and replayed without Python between its launches) follow in that stack. Speculative decoding has its first pieces: the loader of the checkpoint's drafter
+launches 451 of the 484 (178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results). Of
+those, 387 (114 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results) are held to the
+kernel and the launch shape the census records; the other 64 are the out-projections, whose kernel the library chooses
+among its own: they are held by membership, and in every run so far the library launched its own CUTLASS multiply there,
+not the cuBLASLt kernel the census records as the target's pick -- the same call, another kernel. FlashInfer is an
+optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it. The two attention
+blocks are still on their fallback rows, printed as `not yet`; their kernels and a captured decode step (a step recorded
+once and replayed without Python between its launches) follow in that stack. Speculative decoding has its first pieces:
+the loader of the checkpoint's drafter
 (its tensors, its rows of the output head, its 8-bit weights); the drafter's draft pass on reference blocks, reached
 from the library (`QwenDenseDrafter.body`, `propose`, `draft`: every block of it a reference chain in every stack, its
 embedding lookup PyTorch's gather); and the verify step -- the step that feeds every sequence
@@ -94,8 +95,8 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 
 # The stack native calls FlashInfer for three multiplies: an optional package of that stack alone. The constraints pin
 # PyTorch 2.14.0, CuTe DSL 4.8.0, FlashInfer 0.7.2.post1 and apache-tvm-ffi 0.1.11, the versions its kernel census was
-# recorded with: in an environment with another PyTorch the line replaces it and its cuDNN, so give native an environment
-# of its own (run `pip install -e .` again if pip lists nvidia-cudnn-frontend among what it installed).
+# recorded with: in an environment with another PyTorch the line replaces it and its cuDNN, so give native an
+# environment of its own (run `pip install -e .` again if pip lists nvidia-cudnn-frontend among what it installed).
 pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt
 python samples/models/qwen_dense/00_decode.py --stack native           # without the package, on compute capability 10.x: SKIP before anything is loaded
 ```
@@ -342,6 +343,6 @@ No tokenizer, template or weight file of a real checkpoint is committed. A defau
 uncovered there, not passing. The family README lists, per GPU class, whether the default run has been verified.
 
 Dependency alerts on `samples/models/requirements.txt` and `requirements-flashinfer.txt` are raised by the `pip` entry
-for `/samples/models` in `.github/dependabot.yml` and are handled by the maintainers of this repository, as for its other
-requirement files. The exact pins of `constraints-native.txt` are on the ignore list of that entry: they are the versions
-a family's kernel census was recorded with, and a pin changes only together with a recorded run.
+for `/samples/models` in `.github/dependabot.yml` and are handled by the maintainers of this repository, as for its
+other requirement files. The exact pins of `constraints-native.txt` are on the ignore list of that entry: they are the
+versions a family's kernel census was recorded with, and a pin changes only together with a recorded run.

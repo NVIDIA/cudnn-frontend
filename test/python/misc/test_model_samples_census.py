@@ -8507,6 +8507,14 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     assert "--dry-plan" not in family + area + script, "the script has no such flag: a plan on stated device facts is made through the helper layer"
     assert "the call log reads `TUNED True`, and the kernel check fails with the form it found beside the form the row names" in family
     assert "prints the kernel that was chosen beside the pick the census records, says whether it is that pick, and never fails on it" in family
+    for sentence in (  # what the library rows are, where they serve and where they have run (a comment mark of a command block left out)
+        "Three more blocks are multiplies the target runs on a library, FlashInfer, on the stored weights",
+        "so give native an environment of its own",
+        "the out-projection FlashInfer's (a multiply over a copy in `fe-entries`)",
+        "On compute capability 12.x no row of the library serves, so the three multiplies are over copies again",
+        "have run on 10.0 alone: on 10.3 and 10.7 the rows are unrun, the census has no section",
+    ):
+        assert sentence in (area + family).replace(" # ", " "), sentence
 
 
 def _ignored_by_dependabot(text: str, ecosystem: str, directory: str) -> list:

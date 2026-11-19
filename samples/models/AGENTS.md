@@ -110,11 +110,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
     change as the code that needs it (for `jinja2`, whose sandbox a checkpoint's template runs in, with a sandbox fix). The
     family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
     package versions and the GPU class of the last run with a checkpoint. Dependency alerts come through the `pip` entry for
-    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose kernels
-    a stack calls has a requirement file of its own, a lower bound with its "Validated with" line
-    (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the versions
-    the launch records of the family's census were recorded with. The maintainers of this area own that list; a version
-    joins it with a recorded run, never with an update of the pin alone.
+    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose
+    kernels a stack calls has a requirement file of its own, a lower bound with its "Validated with" line
+    (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the
+    versions the launch records of the family's census were recorded with. The maintainers of this area own that list; a
+    version joins it with a recorded run, never with an update of the pin alone.
 13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events.** An event is stamped
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one

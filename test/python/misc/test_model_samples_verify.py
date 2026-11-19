@@ -3830,6 +3830,8 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "What building the speculative script taught",
         "What the rows a library serves taught",
     ], "the section, and the script's behind it; the last three sections of the guide, in the order they were built"
+    speculative = guide_text.split("\n## What the speculative step taught\n", 1)[1].split("\n## ", 1)[0]
+    assert "(`Session._weights_owner`)" in speculative, "the lesson of the drafter's load stands in the speculative step's section, where it was appended"
     lessons = (
         "- The cut of a step follows the one host read.",
         "a cache kept beside the state would have carried the first prompt set into the second,",
