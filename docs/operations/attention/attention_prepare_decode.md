@@ -119,14 +119,14 @@ Every launch that writes bytes of the pair waits for that work on whatever strea
 reached the call: the entry's own output, a tensor taken with `outputs(tokens)` and passed back as `q_out` /
 `gate_out` or as a pool, whole or as a view, at this token count or another, by this entry or by another entry that
 orders its launches the same way (today `AddNormQuantDecode`, `AttentionPrepareDecode` and `AttentionGateQuantDecode`);
-the test is one of addresses. On the allocating stream that is stream order; on another stream the launch
-stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a stream or
-the device, so `compile(tokens)` may run on any stream. A captured call that finds the work still pending waits for
+the test is one of addresses. The launch stream waits for an event recorded behind the allocation, without a host
+wait and without synchronizing a stream or the device, so `compile(tokens)` may run on any stream; on the allocating
+stream itself the event is already behind the launch and the wait is free, and a stream that was given the raw handle
+of a destroyed allocating stream waits like any other. A captured call that finds the work still pending waits for
 that one event on the host before its launch (a capturing stream cannot wait for an event recorded outside its
 capture): set-up, never part of a replay, and not needed for a pair allocated before the capture once its stream's
 earlier work is done (`torch.cuda.graph` synchronizes when it is entered; a raw capture does not). Not ordered: a pair
-allocated inside a stream capture (nothing is recorded: allocate before the capture), and a launch on a new stream
-that got the raw handle of a destroyed allocating stream (a stream outlives the work it has queued). An allocation on
+allocated inside a stream capture (nothing is recorded: allocate before the capture). An allocation on
 the legacy default stream while a blocking stream of another host thread captures raises torch's error: allocate
 before that capture or on a stream of your own. Once a call has seen the work complete nothing is kept of it; while
 it is pending on the device, every call of such an entry on that device reads the device's records. What stays the

@@ -69,16 +69,17 @@ ones that stream still owes a write.  EVERY launch that writes bytes of the pair
 runs, HOWEVER the tensor reached the call -- the entry's own output of the token count, a tensor taken with ``outputs`` and passed
 back as ``q_out`` / ``gate_out`` or as a pool, whole or as a view, at this token count or another, by this entry or by another
 entry that orders its launches the same way (``cudnn.frost.init_order``; the test is one of addresses: the bytes a launch writes
-against the pair's allocations).  The same stream: by stream order.  Another stream: by a stream-side wait for the event recorded
-behind the allocation -- no host wait, never a synchronization of a stream or of the device -- so ``compile(rows)`` may run on any
-stream.  A captured launch cannot carry that dependency: a call that finds the work still pending under a capture waits for that
-ONE event on the host before its captured launch (set-up, never part of a replay; a pair allocated before the capture needs no wait
-once its stream's earlier work is done: ``torch.cuda.graph`` synchronizes when it is entered, a raw capture does not).  NOT ordered:
-a pair allocated INSIDE a stream capture (nothing is recorded: a fill of it is a node of that graph -- allocate before the capture),
-and a launch on a new stream that got the raw handle of a destroyed allocating stream (a stream outlives the work it has queued).
-Once a call has seen it complete nothing is kept of it, and a warm call does nothing for it; while one is pending on the device,
-every call reads the device's records.  WHAT STAYS THE CALLER'S: the operands a launch only READS (``q``, ``gate``,
-``k``, ``v``, the weights, ``cos_sin``, ``positions``, ``slot_mapping``), also when one is laid over an entry-owned tensor, and the
+against the pair's allocations).  The launch stream waits for the event recorded behind the allocation -- a stream-side wait: no
+host wait, never a synchronization of a stream or of the device; on the allocating stream itself the event is already behind the
+launch and the wait is free, and a stream that was given the raw handle of a destroyed allocating stream waits like any other --
+so ``compile(rows)`` may run on any stream.  A captured launch cannot carry that dependency: a call that finds the work still
+pending under a capture waits for that ONE event on the host before its captured launch (set-up, never part of a replay; a pair
+allocated before the capture needs no wait once its stream's earlier work is done: ``torch.cuda.graph`` synchronizes when it is
+entered, a raw capture does not).  NOT ordered: a pair allocated INSIDE a stream capture (nothing is recorded: a fill of it is a
+node of that graph -- allocate before the capture).  Once a call has seen it complete nothing is kept of it, and a warm call does
+nothing for it; while one is pending on the device, every call reads the device's records.  WHAT STAYS THE CALLER'S: the operands
+a launch only READS (``q``, ``gate``, ``k``, ``v``, the weights, ``cos_sin``, ``positions``, ``slot_mapping``), also when one is
+laid over an entry-owned tensor, and the
 caller's own reads and writes of a returned tensor outside a call of an entry.  Entry-owned outputs are valid until the entry's next
 call at that token count from ANY host thread.  The pools are always the caller's.  Workspace: none.  The warm path allocates nothing
 and reads no device memory to the host; the one host wait of the entry is the one above, of a captured launch into a pair whose
