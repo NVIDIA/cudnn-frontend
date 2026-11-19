@@ -29,16 +29,16 @@ OFFERED = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
 NAME_OF = {engine_id: name for name, engine_id in OFFERED.items()}
 
 
-def facts(b=1, s_q=1, s_kv=2048, sm=148, replay=False, cc=(10, 0), **overrides):
-    """A paged 24 / 4-head D256 bf16 decode graph; a multi-token step carries the bottom-right causal mask."""
+def facts(b=1, s_q=1, s_kv=2048, sm=148, replay=False, cc=(10, 0), heads=(24, 4), **overrides):
+    """A paged D256 bf16 decode graph (24 / 4 heads unless named); a multi-token step carries the bottom-right causal mask."""
     kw = dict(causal=True, bottom_right=True) if s_q > 1 else {}
     kw.update(overrides)
     return SdpaGraphFacts(
         **dict(
             dict(
                 b=b,
-                h_q=24,
-                h_kv=4,
+                h_q=heads[0],
+                h_kv=heads[1],
                 s_q=s_q,
                 s_kv=s_kv,
                 d_qk=256,
@@ -65,13 +65,25 @@ def _lead_swap_ab(f):
 
 
 GRID = [
-    (b, s_q, s_kv, sm, replay)
+    (b, s_q, s_kv, sm, replay, heads)
+    for heads in ((24, 4), (32, 8), (8, 1))
     for sm in (148, 152)
     for replay in (False, True)
-    for s_q in (1, 2, 3, 6, 8)
-    for b in (1, 2, 4, 8, 16, 64)
-    for s_kv in (128, 512, 1024, 1536, 2048, 3072, 4096, 8192, 32768)
+    for s_q in (1, 2, 3, 4, 6, 8)
+    for b in (1, 2, 3, 4, 8, 9, 16, 64)
+    for s_kv in (128, 512, 1024, 1536, 1792, 2048, 3072, 4096, 8192, 32768)
 ]
+
+
+def _cell(cell, **overrides):
+    b, s_q, s_kv, sm, replay, heads = cell
+    return facts(b, s_q, s_kv, sm, replay, heads=heads, **overrides)
+
+
+def _clusters(f, knobs):
+    """Thread-block clusters of a packed set: one per KV-head group and token unit of every sequence."""
+    group = f.h_q // f.h_kv
+    return f.b * (f.h_q // group) * heur.decode_d256_q_units(f.s_q, group, knobs.tile_m)
 
 
 def test_knob_is_a_public_zero_one_knob_that_an_unset_record_does_not_carry():
@@ -144,12 +156,11 @@ def test_rule_adds_removes_and_reorders_nothing(monkeypatch):
     disappears or moves, and no split count changes."""
     marked = {}
     for cell in GRID:
-        f = facts(*cell)
-        marked[cell] = _plans(f)
+        marked[cell] = _plans(_cell(cell))
     monkeypatch.setattr(heur, "fused_selected", lambda *_: False)
     count = 0
     for cell in GRID:
-        plain = _plans(facts(*cell))
+        plain = _plans(_cell(cell))
         assert all(not k.cluster_reduce for _, k in plain)
         cleared = [(name, dataclasses.replace(k, cluster_reduce=None)) for name, k in marked[cell]]
         assert cleared == plain, cell
@@ -167,14 +178,19 @@ def test_rule_is_pure_and_every_marked_set_is_honoured(monkeypatch):
     monkeypatch.setattr(occupancy, "occupancy_map", refuse)
     monkeypatch.setattr(occupancy, "max_active_clusters", refuse)
     caps = SPECS[SWAP_AB].capabilities
+    seen = set()
     for cell in GRID:
-        f = facts(*cell)
+        f = _cell(cell)
         for name, knobs in _plans(f):
             if knobs.cluster_reduce:
                 assert name == SWAP_AB and knobs.pack_gqa and knobs.tile_m == 16 and 2 <= knobs.split_kv <= 8, cell
                 assert engines.mismatch(caps, f, knobs) is None, cell
-                units = f.b * 4
-                assert units <= heur.fused_active_clusters(f.device_sm_count, knobs.split_kv), cell
+                # one tile holds the packed rows, and the launch is inside the part's recorded cluster count for this split
+                assert f.s_q * (f.h_q // f.h_kv) <= 16, cell
+                assert 0 < _clusters(f, knobs) <= heur.FUSED_CLUSTER_BOUND[(f.device_sm_count, knobs.split_kv)], cell
+                seen.add((_clusters(f, knobs), knobs.split_kv))
+    # the recorded bounds are reached, and nothing past them is marked
+    assert {(16, 4), (8, 8)} <= seen and all(split in (4, 8) for _, split in seen)
 
 
 @pytest.mark.parametrize(
@@ -194,7 +210,14 @@ def test_rule_is_pure_and_every_marked_set_is_honoured(monkeypatch):
         (2, 1, 8192, False, 16, False),
         (4, 2, 1536, False, 4, True),
         (4, 1, 2560, False, 4, True),
-        (4, 1, 3072, False, 8, False),  # 16 clusters of 8 are past the bound without an occupancy row
+        (4, 1, 3072, False, 8, False),  # 16 clusters of 8 are past the recorded 8
+        # three users: 12 clusters of 4 are inside the recorded 16, 12 clusters of 8 are past the recorded 8
+        (3, 1, 1792, False, 4, True),
+        (3, 2, 2048, False, 8, False),
+        # eight and nine users split 2 ways into 32 and 36 clusters, past the recorded 16
+        (8, 1, 1792, False, 2, False),
+        (9, 1, 1792, False, 2, False),
+        (9, 2, 2048, False, 2, False),
         (8, 1, 2048, False, 4, False),
         (16, 1, 8192, False, 2, False),
         (64, 1, 2048, False, 1, False),
@@ -205,9 +228,31 @@ def test_rule_table_on_148_sms(b, s_q, s_kv, replay, split, reduced):
     assert lead.pack_gqa and (lead.split_kv, bool(lead.cluster_reduce)) == (split, reduced)
 
 
-def test_unpacked_and_multi_token_plans_are_not_marked():
-    """Three to eight tokens: the first plan stays the prefill kernel, and the decode tile's unpacked set keeps two launches unless
-    a caller sets the knob, which the row then honours."""
+@pytest.mark.parametrize(
+    "heads,b,s_q,s_kv,split,reduced",
+    [
+        # the rule is about packed rows in one tile and clusters, not about one head ratio
+        ((32, 8), 1, 4, 2048, 8, True),  # 16 rows of four tokens, 8 clusters of 8
+        ((32, 8), 2, 3, 2048, 4, True),  # 16 clusters of 4
+        ((32, 8), 2, 4, 4096, 8, False),  # 16 clusters of 8 are past the recorded 8
+        ((32, 8), 3, 3, 2048, 4, False),  # 24 clusters of 4 are past the recorded 16
+        ((16, 4), 1, 3, 2048, 8, True),  # 12 rows of three tokens, 4 clusters of 8
+        ((8, 1), 1, 1, 2048, 8, True),  # 8 rows, 1 cluster of 8
+        ((8, 1), 8, 2, 2048, 8, True),  # 16 rows of two tokens, 8 clusters of 8
+        ((8, 1), 9, 1, 2048, 8, False),  # 9 clusters of 8
+        ((8, 1), 16, 1, 2048, 4, True),  # 16 clusters of 4
+        ((8, 1), 17, 1, 2048, 4, False),  # 17 clusters of 4
+    ],
+)
+def test_rule_table_for_other_head_ratios(heads, b, s_q, s_kv, split, reduced):
+    lead = _lead_swap_ab(facts(b, s_q, s_kv, 148, heads=heads))
+    assert lead.pack_gqa and (lead.split_kv, bool(lead.cluster_reduce)) == (split, reduced)
+
+
+def test_unpacked_sets_are_not_marked():
+    """24 / 4 heads at three to eight tokens do not fit one packed tile: the first plan stays the prefill kernel, and the decode
+    tile's unpacked set keeps two launches unless a caller sets the knob, which the row then honours. No unpacked set of any
+    cell is marked."""
     for s_q in (3, 4, 6, 8):
         f = facts(1, s_q, 2048)
         plans = _plans(f)
@@ -215,29 +260,97 @@ def test_unpacked_and_multi_token_plans_are_not_marked():
         unpacked = [k for name, k in plans if name == SWAP_AB and not k.pack_gqa]
         assert unpacked and all(not k.cluster_reduce for k in unpacked)
         assert engines.mismatch(SPECS[SWAP_AB].capabilities, f, dataclasses.replace(unpacked[0], cluster_reduce=True)) is None
+    for cell in GRID:
+        assert all(k.pack_gqa for _, k in _plans(_cell(cell)) if k.cluster_reduce), cell
 
 
-def test_occupancy_row_and_measured_losses_steer_the_rule(monkeypatch):
-    assert heur.FUSED_ACTIVE_CLUSTERS.get((152, 8)) is None or heur.FUSED_ACTIVE_CLUSTERS[(152, 8)] >= 9
-    assert [heur.fused_active_clusters(1000, s) for s in (2, 4, 8)] == [250, 125, 62]  # a part without a row: half the SMs
-    f = facts(4, 1, 3072, sm=1000)
-    assert _lead_swap_ab(f).split_kv > 1
-    # a recorded occupancy admits what the closed form holds back, and nothing else moves
-    monkeypatch.setattr(heur, "FUSED_ACTIVE_CLUSTERS", {(148, 8): 18})
+def test_recorded_cluster_bound_steers_the_rule(monkeypatch):
+    """A part or a split count without a recorded row is never marked; a row admits up to its count and nothing else moves."""
+    assert heur.FUSED_CLUSTER_BOUND == {(148, 2): 16, (148, 4): 16, (148, 8): 8}
+    assert [heur.fused_cluster_bound(148, s) for s in (2, 3, 4, 8, 16)] == [16, 0, 16, 8, 0]
+    assert [heur.fused_cluster_bound(sm, 8) for sm in (152, 1000)] == [0, 0]
+    for sm in (152, 1000):
+        for cell in GRID:
+            f = _cell(cell[:3] + (sm,) + cell[4:])
+            assert all(not k.cluster_reduce for _, k in _plans(f)), (sm, cell)
+    # a raised row admits what the recorded one holds back
+    assert (_lead_swap_ab(facts(4, 1, 3072)).split_kv, _lead_swap_ab(facts(4, 1, 3072)).cluster_reduce) == (8, None)
+    monkeypatch.setattr(heur, "FUSED_CLUSTER_BOUND", {**heur.FUSED_CLUSTER_BOUND, (148, 8): 16})
     lead = _lead_swap_ab(facts(4, 1, 3072))
     assert (lead.split_kv, lead.cluster_reduce) == (8, True)
     assert _lead_swap_ab(facts(8, 1, 4096)).cluster_reduce is None
-    # a split count measured behind the two-launch form keeps it
-    monkeypatch.setattr(heur, "FUSED_LOSES", frozenset({8}))
+    # a removed row keeps the split and its two launches
+    monkeypatch.setattr(heur, "FUSED_CLUSTER_BOUND", {(148, 4): 16})
     assert (_lead_swap_ab(facts(1, 1, 2048)).split_kv, _lead_swap_ab(facts(1, 1, 2048)).cluster_reduce) == (8, None)
     assert _lead_swap_ab(facts(1, 1, 1536)).cluster_reduce is True
 
 
+def test_rule_marks_nothing_on_an_extension_without_the_reduced_launch(monkeypatch):
+    """An extension that predates the reduced launch over pages and lengths keeps every listed set as it was: the two-launch
+    plan of the same split stays in the list, instead of a marked set the adapter would decline."""
+    with_form = {cell: _plans(_cell(cell)) for cell in GRID[:480]}
+    assert any(k.cluster_reduce for plans in with_form.values() for _, k in plans)
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace())
+    for cell, plans in with_form.items():
+        older = _plans(_cell(cell))
+        assert all(not k.cluster_reduce for _, k in older), cell
+        assert older == [(name, dataclasses.replace(k, cluster_reduce=None)) for name, k in plans], cell
+
+
 def test_rule_proposes_nothing_off_the_verified_part():
     for cell in GRID:
-        f = facts(*cell, cc=(10, 3))
+        f = _cell(cell, cc=(10, 3))
         assert all(not k.cluster_reduce for _, k in _plans(f)), cell
     assert not heur.fused_selected(facts(sm=0), SdpaFwdKnobs(tile_m=16, pack_gqa=True, split_kv=8))
+
+
+def _function(tree, name):
+    return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_cluster_barrier_is_one_ordered_pair_behind_every_role():
+    """The reduction reads the peers' partials behind ONE ordered cluster barrier that every thread of every chunk passes.
+    Pinned in the kernel's source: the arrive and the wait occur once each, consecutively, at the top level of the kernel
+    function, behind the role chain and under the in-launch form's compile-time condition only; no role function returns
+    (an early return would let threads leave without arriving); and the host entry launches the split axis as one
+    thread-block cluster under the same condition, without which the pair would order nothing across chunks."""
+    path = Path(prep.__file__).parent / "kernels/sm100/d256_f16_swap_ab/kernel.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+    arrive, wait = "barrier_cluster_arrive_aligned", "barrier_cluster_wait_aligned"
+    calls = [n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and "barrier_cluster" in n.func.attr]
+    assert sorted(calls) == sorted([arrive, wait]), "exactly one ordered cluster-barrier pair, and no relaxed form"
+    kernel = _function(tree, "_kernel")
+    roles = ("_softmax_warp_group", "_mma_warp_group", "_tmaldg_warp_group")
+    chain = [
+        i
+        for i, node in enumerate(kernel.body)
+        if isinstance(node, ast.If) and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") in roles for c in ast.walk(node))
+    ]
+    assert len(chain) == 1, "one role chain at the top level of the kernel"
+    called = {c.func.id for c in ast.walk(kernel.body[chain[0]]) if isinstance(c, ast.Call) and getattr(c.func, "id", "") in roles}
+    assert called == set(roles)
+    reduce_arm = kernel.body[chain[0] + 1]
+    assert isinstance(reduce_arm, ast.If) and ast.unparse(reduce_arm.test) == "cutlass.const_expr(final_o_tensor is not None)"
+    assert not reduce_arm.orelse and kernel.body[-1] is reduce_arm
+    first, second = reduce_arm.body[0], reduce_arm.body[1]
+    assert ast.unparse(first) == f"nvvm.{arrive}()" and ast.unparse(second) == f"nvvm.{wait}()"
+    for role in roles:
+        assert not any(isinstance(n, ast.Return) for n in ast.walk(_function(tree, role))), f"{role} must not return early"
+    host = _function(tree, "_host")
+    clusters = [k for n in ast.walk(host) if isinstance(n, ast.Call) for k in n.keywords if k.arg == "cluster"]
+    assert len(clusters) == 1 and ast.unparse(clusters[0].value) == "(1, 1, SPLIT_KV) if args[-2] is not None else None"
+    # in this form the tensor-memory load in front of the release is issued only where its thread stores from it
+    softmax = _function(tree, "_softmax_warp_group")
+    guards = [n for n in ast.walk(softmax) if isinstance(n, ast.If) and ast.unparse(n.test) == "cutlass.const_expr(reduce_follows)"]
+    assert len(guards) == 1 and ast.unparse(guards[0].body[0]) == "o_loaded = o_loaded & (d_idx < cutlass.Int32(D_V))"
+
+
+def test_form_holds_the_split_counts_of_the_lean_group():
+    """The contract's split range is the lean group of the separate pass (read from its source: the module needs the DSL)."""
+    combine = ast.parse((Path(prep.__file__).parent / "kernels/sm100/split_combine.py").read_text())
+    lean = next(n.value.value for n in combine.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "G_LEAN_SMALL")
+    assert swap_ab.CLUSTER_REDUCE_SPLITS == (2, lean)
 
 
 @pytest.mark.parametrize("s_kv", [128, 2048, 16384])

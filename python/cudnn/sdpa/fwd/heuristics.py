@@ -3774,35 +3774,36 @@ def select_sm100_d192_half_geometry(facts, knobs):
 # CLUSTER_K_REDUCE on the SM100 D256 swap-AB decode tile: the split's partials reduced inside the launch
 # ---------------------------------------------------------------------------
 # The rule below never chooses a split. It marks knob sets the rules above already list for that engine, where the set's own
-# split is one the form reduces and the launch stays inside one wave of clusters. Clearing the mark in every listed set gives
-# the list of a tree without the form: no set is added, removed or reordered and no split count moves.
+# split is one the form reduces and the launch stays inside a recorded cluster count. Clearing the mark in every listed set
+# gives the list of a tree without the form: no set is added, removed or reordered and no split count moves.
 
-# Thread-block clusters of `split` one-SM blocks a part runs at once, keyed (SM count, split): the cluster occupancy read on
-# that part (cudnn.frost.occupancy.occupancy_map, a count). A part without a row takes the closed form of
-# fused_active_clusters. Recorded values only; the planning path makes no device query.
-FUSED_ACTIVE_CLUSTERS: Dict[Tuple[int, int], int] = {}
+# The largest count of thread-block clusters of `split` one-SM blocks, keyed (SM count, split), up to which the form has a
+# recorded measurement cell on that part with every cluster resident in one wave. A part or a split count without a row is
+# never marked: its plans keep two launches and take the form by an explicit knob only. Recorded values only; the planning
+# path makes no device query. Each row is confirmed or replaced by the exclusive-device measurement of the part.
+FUSED_CLUSTER_BOUND: Dict[Tuple[int, int], int] = {
+    (148, 2): 16,
+    (148, 4): 16,
+    (148, 8): 8,
+}
 
-# Split counts of the packed set the measured cells put behind the two-launch form: they keep it.
-FUSED_LOSES: frozenset = frozenset()
 
-
-def fused_active_clusters(sm_count: int, split: int) -> int:
-    """Clusters of ``split`` one-SM thread blocks assumed co-resident on a part with ``sm_count`` SMs: the recorded occupancy
-    where the part has a row, else half the SMs in clusters (a cluster is placed inside one group of SMs, so not every SM can
-    host a member; half is below every occupancy read so far)."""
-    recorded = FUSED_ACTIVE_CLUSTERS.get((int(sm_count), int(split)))
-    return recorded if recorded is not None else (int(sm_count) // 2) // int(split)
+def fused_cluster_bound(sm_count: int, split: int) -> int:
+    """Clusters of ``split`` one-SM thread blocks up to which a part with ``sm_count`` SMs has a recorded cell of the
+    in-launch reduction (:data:`FUSED_CLUSTER_BOUND`); 0 where it has none, which keeps every plan on two launches."""
+    return FUSED_CLUSTER_BOUND.get((int(sm_count), int(split)), 0)
 
 
 def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
     """Whether a LISTED knob set of the SM100 D256 swap-AB engine reduces its split inside the launch (``CLUSTER_K_REDUCE``).
 
-    A pure function of the facts and the set: the form's own domain (the swap-AB contract's ``cluster_reduce_decline``: the
-    part, the 16-column tile, 2 .. 8 chunks, no fold the separate pass carries), the packed whole-group set (listed first for
-    the one- and two-token classes; an unpacked set takes the form by an explicit knob only), every unit's cluster inside one
-    wave (``units <= fused_active_clusters``; past it an empty chunk would hold its SM until its cluster's slowest chunk
-    ends, where the two-launch form frees it at once), and a class the measured cells did not put behind the two-launch
-    form. The split is the set's own, so the summation order of a default plan is what it was."""
+    A pure function of the facts, the set and the installed extension: the form's own domain (the swap-AB contract's
+    ``cluster_reduce_decline``: the part, the 16-column tile, 2 .. 8 chunks, no fold the separate pass carries); an extension
+    that binds the reduced launch; the packed whole-group set of any head ratio and token count whose rows fit one tile (an
+    unpacked set has no recorded cell and takes the form by an explicit knob only); and at most the recorded cluster count
+    of the part for the set's split (``units <= fused_cluster_bound``: past one wave of clusters a chunk that ended would
+    hold its SM until its cluster's slowest chunk ends, where the two-launch form frees it at once). The split is the set's
+    own, so the summation order of a default plan is what it was."""
     from .kernels.sm100.d256_f16_swap_ab.contract import cluster_reduce_decline
     from .kernels.sm100.half_flavor_contract import padded_shape
 
@@ -3827,9 +3828,11 @@ def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
         return False
     pack_g = facts.h_q // facts.h_kv
     units = int(facts.b) * (int(facts.h_q) // pack_g) * decode_d256_q_units(facts.s_q, pack_g, knobs.tile_m)
-    if units <= 0 or units > fused_active_clusters(sm_count, split):
+    if units <= 0 or units > fused_cluster_bound(sm_count, split):
         return False
-    return split not in FUSED_LOSES
+    # A static property of the installed extension, not a device query: an older extension keeps every set unmarked, so a
+    # default graph keeps the two-launch plan of its split instead of falling to another plan.
+    return bool(getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_fused_split_paged", False))
 
 
 def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):

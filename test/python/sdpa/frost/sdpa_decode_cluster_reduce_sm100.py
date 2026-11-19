@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The SM100 D256 swap-AB split decode tile reducing its partials inside the launch (``CLUSTER_K_REDUCE``).
 
-Forward only, over a paged cache with per-batch lengths. Every cell runs the two-launch form and the in-launch form of the
-same split on the same inputs and compares raw bytes, beside an independent float64 reference. The module has no ``test_``
-prefix: ``test_sdpa_fwd_decode_d256_sm100.py`` exposes it through a guarded class.
+Forward only; a paged cache with per-batch lengths unless a cell says otherwise. Every cell runs the two-launch form and the
+in-launch form of the same split on the same inputs and compares raw bytes, beside an independent float64 reference. The
+module has no ``test_`` prefix: ``test_sdpa_fwd_decode_d256_sm100.py`` exposes it through a guarded class.
 """
 
 import math
@@ -16,7 +16,6 @@ from determinism_utils import assert_bitwise, assert_golden, assert_replays, sna
 
 D = 256
 H, KH = 24, 4
-G = H // KH
 # A partial the reduction reads but no chunk wrote would be a finite, dominant term: 3e30 as Stats, 3e30 as O.
 WS_POISON = 3.0e30
 O_ATOL = {torch.float16: 2e-2, torch.bfloat16: 5e-2}
@@ -33,11 +32,14 @@ def _device():
 
 
 class Runner:
-    """One declaration (dtype, tokens, declared cache, page, split, packing, mask) over a library of sequences.
+    """One declaration (dtype, heads, head width, tokens, declared cache, page, split, packing, mask) over a library of
+    sequences.
 
     A batch is an ordered list of sequence ids; a sequence keeps its Q rows, K/V rows and lengths in every batch, while its
     pages land on other pool pages. ``run(order, reduce)`` executes the standalone adapter and returns the whole O and Stats
-    storage (the declared rows and a sentinel margin) plus the workspace.
+    storage (the declared rows and a sentinel margin) plus the workspace. ``page=0`` is a dense cache; ``kv_lens=False`` /
+    ``q_lens_present=False`` drop the length operands (every sequence then has the declared lengths); ``causal`` is False,
+    True (bottom-right) or ``"top-left"``; ``window_left`` keeps the keys ``[q - W, q]`` of the diagonal.
     """
 
     def __init__(
@@ -56,44 +58,62 @@ class Runner:
         seed=0,
         margin=1,
         o_offset=0,
+        heads=(H, KH),
+        d=D,
+        window_left=None,
+        kv_lens=True,
+        q_lens_present=True,
     ):
         self.dtype, self.s_q, self.declared, self.page, self.split, self.pack, self.causal, self.stats = dtype, s_q, declared, page, split, pack, causal, stats
+        (self.h, self.kh), self.d, self.window_left, self.kv_lens, self.q_lens_present = heads, d, window_left, kv_lens, q_lens_present
+        self.g = self.h // self.kh
         # margin: token rows of NaN storage behind the declared ones; o_offset: elements the O storage starts past an aligned base.
         self.margin, self.o_offset = margin, o_offset
         self.lens = list(lens)
         self.q_lens = list(q_lens) if q_lens is not None else [s_q] * len(self.lens)
-        self.pages = -(-declared // page)
+        assert kv_lens or all(length == declared for length in self.lens), "without KV lengths every cache is the declared one"
+        assert q_lens_present or all(length == s_q for length in self.q_lens), "without Q lengths every row is live"
+        self.pages = -(-declared // page) if page else 0
+        rows = self.pages * page if page else declared
         rng = torch.Generator().manual_seed(seed)
         n = len(self.lens)
-        self.q = torch.randn(n, s_q, H, D, generator=rng).to(dtype)
-        self.k = torch.randn(n, self.pages * page, KH, D, generator=rng).to(dtype)
-        self.v = torch.randn(n, self.pages * page, KH, D, generator=rng).to(dtype)
+        self.q = torch.randn(n, s_q, self.h, d, generator=rng).to(dtype)
+        self.k = torch.randn(n, rows, self.kh, d, generator=rng).to(dtype)
+        self.v = torch.randn(n, rows, self.kh, d, generator=rng).to(dtype)
         self.seed = seed
         self._plans = {}
 
     def batch(self, order):
         b, dev = len(order), "cuda"
+        h, kh, d = self.h, self.kh, self.d
         index = torch.tensor(order)
         rng = torch.Generator().manual_seed(self.seed * 7919 + b * 31 + sum((i + 1) * s for i, s in enumerate(order)) % 104729)
-        pool = b * self.pages + 3
-        table = torch.randperm(pool, generator=rng)[: b * self.pages].view(b, self.pages).int()
-        k_pool = torch.zeros(pool, KH, self.page, D, dtype=self.dtype)
-        v_pool = torch.zeros(pool, KH, self.page, D, dtype=self.dtype)
-        k_seq = self.k.index_select(0, index).view(b * self.pages, self.page, KH, D).permute(0, 2, 1, 3)
-        v_seq = self.v.index_select(0, index).view(b * self.pages, self.page, KH, D).permute(0, 2, 1, 3)
-        k_pool[table.view(-1).long()] = k_seq
-        v_pool[table.view(-1).long()] = v_seq
+        table = None
+        if self.page:
+            pool = b * self.pages + 3
+            table = torch.randperm(pool, generator=rng)[: b * self.pages].view(b, self.pages).int()
+            k_store = torch.zeros(pool, kh, self.page, d, dtype=self.dtype)
+            v_store = torch.zeros(pool, kh, self.page, d, dtype=self.dtype)
+            k_seq = self.k.index_select(0, index).view(b * self.pages, self.page, kh, d).permute(0, 2, 1, 3)
+            v_seq = self.v.index_select(0, index).view(b * self.pages, self.page, kh, d).permute(0, 2, 1, 3)
+            k_store[table.view(-1).long()] = k_seq
+            v_store[table.view(-1).long()] = v_seq
+            k_dev, v_dev, table = k_store.to(dev), v_store.to(dev), table.to(dev)
+        else:
+            # a dense cache: BHSD strides over BSHD storage, like Q
+            k_dev = self.k.index_select(0, index).to(dev).transpose(1, 2)
+            v_dev = self.v.index_select(0, index).to(dev).transpose(1, 2)
         # O and Stats sit inside larger NaN-filled storage: the token rows past the declared ones must stay untouched.
         rows = self.s_q + self.margin
-        o_flat = torch.full((b * rows * H * D + 8,), float("nan"), dtype=self.dtype, device=dev)
-        o_store = o_flat[self.o_offset : self.o_offset + b * rows * H * D].view(b, rows, H, D)
-        lse_store = torch.full((b, H, rows), float("nan"), device=dev)
+        o_flat = torch.full((b * rows * h * d + 8,), float("nan"), dtype=self.dtype, device=dev)
+        o_store = o_flat[self.o_offset : self.o_offset + b * rows * h * d].view(b, rows, h, d)
+        lse_store = torch.full((b, h, rows), float("nan"), device=dev)
         return dict(
             order=list(order),
             q=self.q.index_select(0, index).to(dev).transpose(1, 2),  # BHSD strides over BSHD storage
-            k=k_pool.to(dev),
-            v=v_pool.to(dev),
-            table=table.to(dev),
+            k=k_dev,
+            v=v_dev,
+            table=table,
             kl=torch.tensor([self.lens[s] for s in order], dtype=torch.int32, device=dev),
             ql=torch.tensor([self.q_lens[s] for s in order], dtype=torch.int32, device=dev),
             o_store=o_store,
@@ -113,13 +133,12 @@ class Runner:
                 t["v"],
                 t["o"],
                 t["lse"] if self.stats else None,
-                is_causal=self.causal,
-                causal_bottom_right=self.causal,
-                seq_q_lens_present=True,
-                seq_kv_lens_present=True,
-                paged_page_size=self.page,
-                paged_max_seq_len_kv=self.declared,
-                paged_table_stride=t["table"].stride(),
+                is_causal=bool(self.causal),
+                causal_bottom_right=self.causal is True,
+                window_size_left=self.window_left,
+                seq_q_lens_present=self.q_lens_present,
+                seq_kv_lens_present=self.kv_lens,
+                **(dict(paged_page_size=self.page, paged_max_seq_len_kv=self.declared, paged_table_stride=t["table"].stride()) if self.page else {}),
                 split_kv=self.split,
                 pack_gqa=self.pack,
                 **({"cluster_reduce": True} if reduce else {}),
@@ -143,9 +162,9 @@ class Runner:
             t["v"],
             t["o"],
             lse_tensor=t["lse"] if self.stats else None,
-            seq_kv_lens=t["kl"],
-            seq_q_lens=t["ql"],
-            block_table=t["table"],
+            **({"seq_kv_lens": t["kl"]} if self.kv_lens else {}),
+            **({"seq_q_lens": t["ql"]} if self.q_lens_present else {}),
+            **({"block_table": t["table"]} if self.page else {}),
             workspace=ws,
         )
 
@@ -165,22 +184,25 @@ class Runner:
         return t, api, ws
 
     def reference(self, t):
-        """float64 O [b, s_q, H, D] and natural-log Stats [b, H, s_q] under the declaration's own mask and lengths."""
+        """float64 O [b, s_q, h, d] and natural-log Stats [b, h, s_q] under the declaration's own mask and lengths."""
         b = len(t["order"])
-        o = torch.zeros(b, self.s_q, H, D, dtype=torch.float64)
-        lse = torch.full((b, H, self.s_q), -math.inf, dtype=torch.float64)
+        o = torch.zeros(b, self.s_q, self.h, self.d, dtype=torch.float64)
+        lse = torch.full((b, self.h, self.s_q), -math.inf, dtype=torch.float64)
         for row, s in enumerate(t["order"]):
             nk, nq = self.lens[s], min(self.q_lens[s], self.s_q)
             if nk == 0 or nq == 0:
                 continue
             q = self.q[s].double()  # [s_q, H, D]
-            k = self.k[s, :nk].double().repeat_interleave(G, dim=1)  # [nk, H, D]
-            v = self.v[s, :nk].double().repeat_interleave(G, dim=1)
-            scores = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(D)
+            k = self.k[s, :nk].double().repeat_interleave(self.g, dim=1)  # [nk, h, d]
+            v = self.v[s, :nk].double().repeat_interleave(self.g, dim=1)
+            scores = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(self.d)
+            key = torch.arange(nk).view(1, 1, nk)
+            tok = torch.arange(self.s_q).view(1, self.s_q, 1)
+            diagonal = tok + (nk - nq if self.causal is True else 0)  # bottom-right: the last live row sees every key
             if self.causal:
-                key = torch.arange(nk).view(1, 1, nk)
-                tok = torch.arange(self.s_q).view(1, self.s_q, 1)
-                scores = scores.masked_fill(key > tok + nk - nq, -math.inf)
+                scores = scores.masked_fill(key > diagonal, -math.inf)
+            if self.window_left is not None:
+                scores = scores.masked_fill(key < diagonal - self.window_left, -math.inf)
             row_lse = torch.logsumexp(scores, -1)  # [H, s_q]
             dead = torch.isinf(row_lse)
             p = torch.where(dead.unsqueeze(-1), torch.zeros_like(scores), torch.softmax(scores, -1))
@@ -213,20 +235,20 @@ class Runner:
     def slabs(self, api, ws, b):
         """The partial O and Stats slabs of a workspace, as (splits, b, ...) views."""
         combine = api._dense_spec.combine
-        n_o, n_lse = self.split * b * self.s_q * H * D, self.split * b * H * self.s_q
+        n_o, n_lse = self.split * b * self.s_q * self.h * self.d, self.split * b * self.h * self.s_q
         assert combine.lse_offset % 4 == 0 and combine.lse_offset >= 4 * n_o
-        o = ws[:n_o].view(self.split, b, self.s_q, H, D)
-        lse = ws[combine.lse_offset // 4 : combine.lse_offset // 4 + n_lse].view(self.split, b, H, self.s_q)
+        o = ws[:n_o].view(self.split, b, self.s_q, self.h, self.d)
+        lse = ws[combine.lse_offset // 4 : combine.lse_offset // 4 + n_lse].view(self.split, b, self.h, self.s_q)
         return o, lse
 
     def separate_combine(self, two_launch_api, o_partial, lse_partial, b):
         """The two-launch plan's own reduction entry over given partial slabs, into fresh final buffers."""
-        o = torch.full((b, self.s_q, H, D), float("nan"), dtype=self.dtype, device="cuda")
-        lse = torch.full((b, H, self.s_q), float("nan"), device="cuda")
+        o = torch.full((b, self.s_q, self.h, self.d), float("nan"), dtype=self.dtype, device="cuda")
+        lse = torch.full((b, self.h, self.s_q), float("nan"), device="cuda")
         stream = torch.cuda.current_stream().cuda_stream
         final_lse, lse_strides = (lse.data_ptr(), lse.stride()) if self.stats else (None, (0, 0, 0))
         two_launch_api._dense_spec.combine.fn(
-            o_partial.data_ptr(), lse_partial.data_ptr(), o.data_ptr(), final_lse, (b, H, self.s_q, D), self.split, o.stride(), lse_strides, stream
+            o_partial.data_ptr(), lse_partial.data_ptr(), o.data_ptr(), final_lse, (b, self.h, self.s_q, self.d), self.split, o.stride(), lse_strides, stream
         )
         torch.cuda.synchronize()
         return o, lse
@@ -257,7 +279,7 @@ def _compare_forms(runner, order, *, reordered_control=False):
         # chunks), or the byte cells above could not see a reduction in another order.
         o_rev, _ = runner.separate_combine(api2, slab_o1.flip(0).contiguous(), slab_lse1.flip(0).contiguous(), b)
         assert not _same_bytes(o_rev, o_sep), "a reduction in the reverse split order reproduced every byte: the byte cells have no power"
-    return b * runner.s_q * H * D
+    return b * runner.s_q * runner.h * runner.d
 
 
 # name -> Runner keyword arguments. Lengths are per sequence; "declared" is the cache length the plan is compiled for.
@@ -287,6 +309,31 @@ CELLS = {
     # without a Stats output the reduction still runs on the partial Stats
     "bf16-q1-p-s8-nostats": dict(s_q=1, split=8, stats=False, lens=(2048, 600)),
     "bf16-q6-u-s4-nostats": dict(s_q=6, split=4, pack=False, causal=True, stats=False, lens=(1536,)),
+    # one user: a full cache, short live caches under the long declaration (seven of eight chunks empty), six tokens with Stats
+    "bf16-q1-p-s8-one-user": dict(s_q=1, split=8, lens=(2048,)),
+    "bf16-q1-p-s8-one-user-live128": dict(s_q=1, split=8, lens=(128,)),
+    "bf16-q1-p-s8-one-user-live1024": dict(s_q=1, split=8, lens=(1024,)),
+    "bf16-q6-u-s4-one-user": dict(s_q=6, split=4, pack=False, causal=True, lens=(2048,)),
+    # other head ratios: 8, 12 and 16 packed rows in one tile, with and without the length operands
+    "bf16-h8x1-q1-p-s8": dict(heads=(8, 1), s_q=1, split=8, lens=(2048, 700)),
+    "bf16-h16x4-q3-p-s8-causal": dict(heads=(16, 4), s_q=3, split=8, causal=True, lens=(2048, 5)),
+    "bf16-h32x8-q4-p-s8-causal": dict(heads=(32, 8), s_q=4, split=8, causal=True, lens=(2048, 1027), q_lens=(4, 3)),
+    "bf16-h32x2-q1-p-s4-no-q-lens": dict(heads=(32, 2), s_q=1, split=4, declared=1536, lens=(1536, 100), q_lens_present=False),
+    # more token units than one per head group: the second unit holds the last token alone
+    "bf16-q3-p-s8-two-units": dict(s_q=3, split=8, causal=True, lens=(2048, 900), q_lens=(3, 2)),
+    # head widths below the 256 envelope
+    "bf16-d200-q1-p-s8": dict(d=200, s_q=1, split=8, lens=(2048, 333)),
+    "f16-d192-q2-p-s4-causal": dict(dtype=torch.float16, d=192, s_q=2, split=4, causal=True, lens=(2048, 513)),
+    # every other split count of the form
+    "bf16-q1-p-s3": dict(s_q=1, split=3, declared=1536, lens=(1536, 400)),
+    "bf16-q1-p-s5": dict(s_q=1, split=5, declared=2560, lens=(2560, 1300)),
+    "bf16-q2-p-s6-causal": dict(s_q=2, split=6, causal=True, declared=1536, lens=(1536, 769)),
+    "bf16-q1-p-s7": dict(s_q=1, split=7, lens=(2048, 2047)),
+    # a dense cache with and without lengths; the top-left causal mask; a sliding window on the bottom-right diagonal
+    "bf16-q1-p-s8-dense-lens": dict(s_q=1, split=8, page=0, lens=(2048, 1000, 1)),
+    "bf16-q1-u-s2-dense-no-lens-causal": dict(s_q=1, split=2, page=0, pack=False, causal=True, kv_lens=False, q_lens_present=False, lens=(2048, 2048)),
+    "bf16-q2-p-s4-causal-top-left": dict(s_q=2, split=4, causal="top-left", lens=(2048, 700)),
+    "bf16-q1-p-s8-window": dict(s_q=1, split=8, causal=True, window_left=300, lens=(2048, 700, 100)),
 }
 
 
@@ -311,7 +358,8 @@ def test_byte_identity_element_budget(dtype, users, splits, needed):
     for i, split in enumerate(splits):
         runner = Runner(dtype=dtype, s_q=2, split=split, causal=True, lens=[2048] * users, seed=100 + i)
         compared += _compare_forms(runner, list(range(users)), reordered_control=True)
-    print(f"byte identity of the in-launch reduction: {compared} {str(dtype).split('.')[-1]} O elements compared, 0 differing")
+    # every compared element was asserted byte-equal by _compare_forms above
+    print(f"byte identity of the in-launch reduction: {compared} {str(dtype).split('.')[-1]} O elements compared and equal")
     assert compared >= needed
 
 
@@ -442,6 +490,28 @@ def test_warm_refill_stress():
     )
 
 
+def test_every_launch_reduces_its_own_partials():
+    """The reduction may read a partial only after the chunk that owns it stored it in THIS launch. Launches that reuse one
+    workspace with the same inputs cannot show an early read (the slab already holds the same bytes), so here the workspace
+    is refilled with the finite poison before every launch: an early read folds the poison and moves the stored bytes.
+    Uneven live lengths make chunks of one cluster end at different times; 32 clusters of 8 exceed one wave of the part."""
+    _device()
+    lens = [2048, 1, 700, 2048, 129, 0, 1536, 64]
+    runner = Runner(s_q=2, split=8, causal=True, lens=lens, seed=71, margin=0)
+    order = list(range(len(lens)))
+    t, api, ws = runner.run(order, True)
+    reference = snapshot(runner.check(t, "the reference launch"))
+    outputs = dict(o=t["o_store"][:, : runner.s_q], lse=t["lse_store"][:, :, : runner.s_q])
+    launches = 384
+    for launch in range(launches):
+        ws.fill_(WS_POISON)
+        t["o_store"].fill_(float("nan"))
+        t["lse_store"].fill_(float("nan"))
+        runner.launch(t, api, ws)
+        torch.cuda.synchronize()
+        assert_bitwise(snapshot(outputs), reference, f"launch {launch} of {launches} on a refilled workspace")
+
+
 def _graph(runner, order, *, knobs=None):
     """A paged cuDNN graph of the runner's declaration. ``knobs`` = a public record for the swap-AB engine; None = the
     default ranked list with the FROST engines enabled. Returns (graph, variant pack, batch tensors, workspace)."""
@@ -464,7 +534,7 @@ def _graph(runner, order, *, knobs=None):
         k=k,
         v=v,
         generate_stats=True,
-        attn_scale=1.0 / math.sqrt(D),
+        attn_scale=1.0 / math.sqrt(runner.d),
         use_padding_mask=True,
         seq_len_q=sq,
         seq_len_kv=sk,
@@ -508,31 +578,39 @@ def _record(split, pack, reduce=None):
     return record
 
 
-@pytest.mark.parametrize("users,declared,expect_split", [(1, 2048, 8), (2, 2048, 8), (4, 2048, 4), (1, 1536, 4)])
-def test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split(users, declared, expect_split):
-    """The heuristics' own lead plan for a two-token step: today's split with the knob on top, one launch, the public record
-    carrying the knob; a record without the knob rebuilds the two-launch plan of that split, byte for byte."""
+@pytest.mark.parametrize("users,declared", [(1, 2048), (2, 2048), (4, 2048), (1, 1536)])
+def test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split(users, declared):
+    """The heuristics' own lead plan for a two-token step: the split of the existing rules with the knob on top where the
+    part has a recorded cluster bound for it, ONE launch, the public record carrying the knob; a record without the knob
+    rebuilds the two-launch plan of that split, byte for byte. The compiled plan's own record says which form ran."""
     import cudnn
+    from cudnn.sdpa.fwd import heuristics as heur
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import SWAP_AB
     from frost_test_utils import _is_plan_for
 
     _device()
-    if torch.cuda.get_device_properties(0).multi_processor_count != 148:
-        pytest.skip("the expected splits are those of a 148-SM part")
-    runner = Runner(s_q=2, split=expect_split, causal=True, declared=declared, lens=[declared] * users, seed=61)
+    runner = Runner(s_q=2, causal=True, declared=declared, lens=[declared] * users, seed=61)
     order = list(range(users))
     g, pack, t = _graph(runner, order)
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     lead = next(i for i, n in enumerate(names) if _is_plan_for(n, SWAP_AB))
-    assert g.plans[lead].knobs.split_kv == expect_split and g.plans[lead].knobs.cluster_reduce is True
+    split = g.plans[lead].knobs.split_kv
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if users * KH > heur.fused_cluster_bound(sms, split):
+        assert not g.plans[lead].knobs.cluster_reduce
+        pytest.skip(f"no recorded cluster bound admits {users * KH} clusters of {split} on a {sms}-SM part: the plan keeps two launches")
+    assert g.plans[lead].knobs.pack_gqa and g.plans[lead].knobs.cluster_reduce is True
     engine_id, public = g.get_engine_and_knobs_at_index(lead)
-    assert public[cudnn.knob_type.CLUSTER_K_REDUCE] == 1 and public[cudnn.knob_type.SPLIT_KV] == expect_split
+    assert public[cudnn.knob_type.CLUSTER_K_REDUCE] == 1 and public[cudnn.knob_type.SPLIT_KV] == split
     _execute_graph(g, pack, t, lead)
-    assert g._compiled_plans[lead]._compiled.kernel_template == "decode_d256_f16"
+    compiled = g._compiled_plans[lead]._compiled
+    assert compiled.kernel_template == "decode_d256_f16" and compiled.implementation_config["cluster_reduce"] is True
     fused = snapshot(runner.check(t, "default plan"))
-    for record in ({key: value for key, value in public.items() if key != cudnn.knob_type.CLUSTER_K_REDUCE}, dict(public)):
+    without = {key: value for key, value in public.items() if key != cudnn.knob_type.CLUSTER_K_REDUCE}
+    for record, reduced in ((without, False), (dict(public), True)):
         g2, pack2, t2 = _graph(runner, order, knobs=record)
         _execute_graph(g2, pack2, t2, 0)
+        assert g2._compiled_plans[0]._compiled.implementation_config["cluster_reduce"] is reduced
         assert_bitwise(snapshot(runner.check(t2, "rebuilt record")), fused, "a public record against the default plan")
 
 

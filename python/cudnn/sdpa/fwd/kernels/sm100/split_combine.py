@@ -3511,8 +3511,8 @@ def lean_fold_quad(o_partial, lse_partial, o_out, n_batch, n_splits, batch, q_ro
     from +0), the reciprocal of the floored denominator, the dead-row SELECT, the four products and the half store of
     :func:`_store_half_quad`.  A caller that publishes its partials before calling it therefore stores the bytes the separate pass
     would store from the same slab; the decode suite compares the two forms byte for byte, so an edit to either sequence is an edit to
-    both.  ``n_splits`` is a Python int in ``2 .. G_LEAN_SMALL`` (a trace-time constant: the slots past it fold away, and each adds an
-    exact zero in the separate pass).  The partial slab must be 16-byte aligned and ``d_v`` a multiple of 4 -- the lean path's own
+    both.  ``n_splits`` is a Python int in ``2 .. G_LEAN_SMALL`` (a trace-time constant: a slot past it adds an exact +0 to each sum, as
+    it does in the separate pass; those adds are part of the sequence -- they keep the sign of a zero sum equal in both forms).  The partial slab must be 16-byte aligned and ``d_v`` a multiple of 4 -- the lean path's own
     conditions, which the separate pass checks at run time and the caller's plan guarantees here.  No sink, natural-log Stats.
 
     Returns ``(all_dead, den, m_safe)`` for :func:`lean_fold_stats`; every quad of a row returns the same three values."""

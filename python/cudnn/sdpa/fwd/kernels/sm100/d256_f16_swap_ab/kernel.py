@@ -662,6 +662,8 @@ def _softmax_warp_group(
     tok0,
     scale_log2: cutlass.Float32,
     use_pdl: cutlass.Constexpr[bool] = False,
+    # In-launch reduction: this role's code is followed by the reduction, behind the tensor-memory release at its end.
+    reduce_follows: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
     tidx = cute.arch.thread_idx()[0]
@@ -908,7 +910,12 @@ def _softmax_warp_group(
             if cutlass.const_expr(blk * 128 < D_V):
                 d_idx = lane + cutlass.Int32(blk * 128)
                 o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(O_CHUNK)), cutlass.Float32)
-                if n_tiles > cutlass.Int32(0):
+                o_loaded = n_tiles > cutlass.Int32(0)
+                if cutlass.const_expr(reduce_follows):
+                    # The reduction runs behind this role's tensor-memory release, so the load is issued only where this thread
+                    # stores from it (the store's own range guard): no path carries a loaded register unread across the release.
+                    o_loaded = o_loaded & (d_idx < cutlass.Int32(D_V))
+                if o_loaded:
                     # Empty range: O^T TMEM was never written, so the load is skipped
                     # rather than multiplied by 0 (NaN * 0 is NaN).
                     o_vals = nvvm.tcgen05_ld(
@@ -1096,6 +1103,7 @@ def _kernel(
             tok0=tok0,
             scale_log2=scale_softmax_log2,
             use_pdl=use_pdl,
+            reduce_follows=final_o_tensor is not None,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1382,7 +1390,9 @@ def cluster_combine_supported(d_qk: int, d_v: int) -> bool:
     """Whether THIS rendering has the in-launch reduction: 2 .. 8 chunks (one portable thread-block cluster, the lean group of the
     separate pass), the 16-column D256 rendering, O in the Q/K/V half type, a head width the four-column groups tile, and neither of
     the folds the separate pass carries instead (a sink, base-2 Stats).  The dense padded-Q trim needs nothing here: a trimmed row's
-    partials are dead in every chunk, which the reduction turns into O = 0 / Stats = -inf.  It selects no split count."""
+    partials are dead in every chunk, which the reduction turns into O = 0 / Stats = -inf.  It selects no split count.  A split
+    rendering's own Stats are natural-log whatever the graph asks (the separate pass applies the base), so this predicate cannot see
+    a base-2 request: the caller's contract (``contract.cluster_reduce_decline``) declines it before compile()."""
     return bool(
         2 <= SPLIT_KV <= _FOLD_MAX_SPLITS
         and N_Q == 16

@@ -920,6 +920,7 @@ class TestClusterReduce:
     test_batch_invariance = staticmethod(_checks.test_batch_invariance)
     test_replay_capture_and_golden = staticmethod(_checks.test_replay_capture_and_golden)
     test_warm_refill_stress = staticmethod(_checks.test_warm_refill_stress)
+    test_every_launch_reduces_its_own_partials = staticmethod(_checks.test_every_launch_reduces_its_own_partials)
     test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split = staticmethod(
         _checks.test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split
     )

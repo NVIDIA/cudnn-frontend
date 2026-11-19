@@ -5428,7 +5428,11 @@ def lower_dsl_prefill(
             scheduler=getattr(cfg, "SCHEDULER_POLICY", SCHED_NATURAL),
             pack_group=getattr(cfg, "PACK_G", cfg.QH_PER_KH if cfg.PACK_GQA else 1),
             split_kv=cfg.SPLIT_KV,
+            # whether the split's partials are reduced inside the launch (one launch) or by the separate pass
+            cluster_reduce=bool(getattr(api, "_cluster_combine", False)),
         )
+        # A kernel whose in-launch reduction is the plan's CLUSTER_K_REDUCE knob must have compiled the selected form.
+        reduce_by_knob = bool(getattr(kernel_module, "CLUSTER_COMBINE_BY_KNOB", False))
         if (
             kernel_template != selected_kernel.template
             or implementation_config["query_tile"] != selected_kernel.query_tile
@@ -5438,6 +5442,7 @@ def lower_dsl_prefill(
             or implementation_config["scheduler"] != knobs.sched_policy
             or params.split_kv != knobs.split_kv
             or bool(params.pack_gqa) != bool(knobs.pack_gqa)
+            or (reduce_by_knob and implementation_config["cluster_reduce"] != bool(knobs.cluster_reduce))
         ):
             raise RuntimeError(f"{spec.name}: compiled implementation disagrees with the selected configuration: {implementation_config}")
 
