@@ -402,10 +402,13 @@ def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_l
         pytest.skip("SM100-family GPU required")
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_forward._tma_gather4 import TMA_GATHER4_AVAILABLE
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if not TMA_GATHER4_AVAILABLE:
+    tma_gather4 = pytest.importorskip(
+        "cudnn.deepseek_sparse_attention.sparse_attention_forward._tma_gather4",
+        reason="Environment not supported: cudnn[cutedsl] not installed",
+    )
+    if not tma_gather4.TMA_GATHER4_AVAILABLE:
         pytest.skip("The persistent schedule needs the gather4 bridge; this DSL runs one query per CTA")
 
     torch.manual_seed(179)

@@ -50,6 +50,7 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint8, Uint32, con
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T
+from cutlass.experimental import primitives as prims
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cudnn._cutlass_compat import SmemAllocator, TmemAllocator
@@ -696,7 +697,6 @@ class SparseAttentionForwardSm100Head64:
                 cute.arch.grid_dim(),
                 clc_response_ptr,
             )
-            work_tile = tile_sched.initial_work_tile_info()
         # The TMEM allocation barrier also publishes the barrier inits above.
         tmem.allocate(self.TMEM_COLUMNS)
         tmem.wait_for_alloc()
@@ -1404,7 +1404,8 @@ class SparseAttentionForwardSm100Head64:
                 )
                 if const_expr(self.use_tma_gather4):
                     # Every store issuer has drained its reads of the O stage.
-                    self.softmax_sync_barrier.arrive_and_wait()
+                    # Only WG0 reaches this rendezvous, so it is unaligned.
+                    prims.barrier_cta_sync(self.softmax_sync_barrier.barrier_id, thread_count=self.softmax_sync_barrier.num_threads)
                     if warp_idx == Int32(0):
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive(o_writeback_mbar_ptr + q_slot)
