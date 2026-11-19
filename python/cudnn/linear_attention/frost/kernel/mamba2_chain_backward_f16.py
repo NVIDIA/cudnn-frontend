@@ -33,6 +33,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
@@ -809,7 +810,8 @@ def run_chain_backward(
     fold_buffers=(None,) * 4,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
@@ -1206,7 +1208,8 @@ def run_chain_summary_backward(
 ) -> None:
     """Replay the backward summary chain: one crossing into the DSL for the three launches."""
     buffers = dict(locals())
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

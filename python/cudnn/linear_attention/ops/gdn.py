@@ -1772,8 +1772,8 @@ def build_gdn_summary_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_summary", mutates_args=())
-def gdn_summary(
+@cpp_launched
+def run_gdn_summary(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -1924,6 +1924,9 @@ def gdn_summary(
     return final_state, transition, context
 
 
+gdn_summary = torch.library.custom_op("cudnn::gated_delta_net_summary", run_gdn_summary, mutates_args=())
+
+
 @gdn_summary.register_fake
 def gdn_summary_fake(
     k,
@@ -2059,8 +2062,8 @@ def build_gdn_summary_bwd_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_summary_bwd", mutates_args=())
-def gdn_summary_bwd(
+@cpp_launched
+def run_gdn_summary_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2225,6 +2228,9 @@ def gdn_summary_bwd(
     context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
     execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
     return d_initial_state, transition, context
+
+
+gdn_summary_bwd = torch.library.custom_op("cudnn::gated_delta_net_summary_bwd", run_gdn_summary_bwd, mutates_args=())
 
 
 @gdn_summary_bwd.register_fake

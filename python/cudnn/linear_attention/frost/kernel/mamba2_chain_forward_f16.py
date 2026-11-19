@@ -30,6 +30,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
@@ -582,7 +583,8 @@ def run_chain_forward(
     """Replay the chain forward: one crossing into the DSL for the four launches."""
     buffers = dict(locals())
     buffers["checkpoints"] = checkpoints if int(checkpoint_every_n_tokens) > 0 else None
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
@@ -940,7 +942,8 @@ def run_chain_summary(
 ) -> None:
     """Replay the summary chain: one crossing into the DSL for the three launches."""
     buffers = dict(locals())
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
