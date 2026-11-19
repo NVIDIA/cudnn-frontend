@@ -992,8 +992,9 @@ calls is PyTorch's or cuBLAS's, by name: the embedding lookup is PyTorch's gathe
 the concatenations launch other PyTorch kernels than the gather. A second run printed the same bytes.
 
 *The published checkpoint, against the model's own tokens* (reported; no line of it is a gate of this sample). The
-model decoded three prompts greedily on the stack `native`, 70 new tokens each: the default prompt and two arithmetic
-word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens. The drafter then ran over each
+model decoded three prompts greedily on the cuDNN Frontend rows of the stack `native` (the rows `fe-entries` selects
+today), 70 new tokens each: the default prompt and two arithmetic word problems whose text is not part of this
+repository, 58, 117 and 78 prompt tokens. The drafter then ran over each
 of them teacher-forced: one body pass per prompt position fills its cache, and from the last prompt position on every
 position is one draft step of five passes behind one row, handed the model's final-norm row of that position and the
 token the model chose there. The list is the one the recipe above made in the runs of 2026-11-17: the 342 ids of six
@@ -1204,8 +1205,9 @@ the same rows by both: there the recurrent state is gated by the state rule of t
 rows -- a block in front of it is another kernel at another row count -- is printed, not gated; with no layer gated
 the line is `REPORTED`.
 
-On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded model: at every step shape that ran
-up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was the decode
+On compute capability 10.0 (a 148-SM part), on the cuDNN Frontend rows of the stack `native` -- the rows `fe-entries`
+selects today; these runs were made before the stack had its library rows --, the two-layer seeded model: at every
+step shape that ran up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was the decode
 steps', and the recurrent state of the kept tokens was within the band (at one sequence the same bytes); the kernel
 check passed with the verify kernel in the shape its entry states and, at one sequence of six tokens, with 13
 launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries
@@ -1225,7 +1227,12 @@ one sequence of two tokens and of eight, three of three, two of eight -- with on
 the elements, and each sequence alone wrote the bytes it wrote among the others. At two and three sequences, on a
 part of this SM count, the verify entry takes another form than at one sequence and at four: one thread block per
 value head and sequence, each on an SM of its own, with 224,672 B of shared memory at six tokens and 231,744 B at
-eight, the largest step that form holds. These are the runs of one GPU class.
+eight, the largest step that form holds. These are the runs of one GPU class. With its library rows the stack ran
+seven of these step shapes on 2026-11-18 (PyTorch 2.14.0, FlashInfer 0.7.2.post1) -- one sequence of two, six and
+eight tokens, two and four sequences of six, four of eight and 16 of two --: every greedy token of the verify steps
+was the decode steps', the recurrent state of the kept tokens was within the band, and the kernel check passed, at
+one sequence of six tokens with 17 of 20 launches of a step target kernels (6 the target's own compiled kernels + 11
+cuDNN Frontend entries with byte-equal results), 15 of them in the shapes the census records.
 
 **The checks of a session that verifies behind its prompt.** `tie_out.speculative_checks(session, decode)` holds a
 run of a session built with `draft_tokens=` against decode steps of the same tokens, line by line. It replays what
@@ -1329,7 +1336,10 @@ width that differs. `text` is the tokenizer (`TextIO`), `stack` and
 whole run, the drafter in it; `session.plan_table()` prints the session's own three tables. A session with a drafter
 stands alone as well, without `share=`: it then loads the model itself. The loop reads the device once per step.
 `drafter=` needs `draft_tokens=`, and a session with a drafter serves one sequence: one request, as the drafter rows
-are for.
+are for. On `native` the three library rows serve the decode steps of the prompt and the verify step of such a
+session as they serve a plain run, and the drafter's passes call none of them: on compute capability 10.x the session
+needs FlashInfer at a validated version, and without it `plan_table` declines before anything is loaded, by the
+sentence of the section "The rows a library serves"; `fe-entries` runs the same session on the cuDNN Frontend rows.
 
 A step, in order. `speculate` hands the drafter what the step before left on the state: every final-norm row of
 that step, by reference (`state.hidden`), and the greedy token after each (`state.greedy`); the position of its first
@@ -1354,8 +1364,10 @@ the drafter: what its load and its cache hold (`memory_bytes`) and the working m
 an allowance of twice the largest chunk of a weight a reference multiply converts to fp64 at a time
 (`working_bytes`: 1.33 GiB at the published widths). At the
 published widths with 65,536 ids and 2,051 positions the drafter adds 3.3 GiB: a run of a plain session and such a
-session asks for about 43.6 GiB on `native` and about 61.2 GiB on `fe-cublas`, where the same run without a drafter
-asks for about 40.2 and 57.9 GiB. These are arithmetic on stated facts; a measured run is below.
+session asks for about 32.4 GiB on `native` (compute capability 10.0, where its library rows keep the weights of the
+down multiplies, the out-projections and the output head on their stored codes), about 43.6 GiB on `fe-entries` and
+about 61.2 GiB on `fe-cublas`, where the same run without a drafter asks for about 29.1, 40.2 and 57.9 GiB. These are
+arithmetic on stated facts; a measured run is below.
 
 **The checks of a speculative step.** Every block of the drafter but its embedding lookup is a reference chain, so
 the block check judges none of them. `tie_out.speculative_checks` holds a session with a drafter by two more lines.
@@ -1386,16 +1398,19 @@ of such a loop would be read as a speed. The bytes of a step are stated: the ver
 per sequence -- every weight once, six embedding rows, one recurrent state read and six written, three history
 columns read and eight written, the caches up to the step's last position -- and a draft pass's, five times.
 
-What ran (2026-11-18; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only). The seeded
+What ran (2026-11-18; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` with its library
+rows in PyTorch 2.14.0 with FlashInfer 0.7.2.post1, every other stack in PyTorch 2.13.0). The seeded
 two-layer model with its seeded drafter, one sequence, five drafted tokens, a prompt of 8 tokens and 32 new tokens
 through 10 steps of `speculate(force=)` whose drafted tokens were scheduled to be kept 0 to 5 in turn: on `native`,
 `fe-entries` and `fe-cublas` the 32 tokens were the plain session's, and what the drafter proposed in those steps was
 recorded beside the tokens they verified; every gated line of the comparison passed, `drafter cache` and
 `draft proposals` in 10 of 10 steps; replay with the proposals and the blocks of both kinds of step passed; the
 kernel check passed over 10 traced steps -- the embedding lookup of every pass and the model's in the wiring order,
-everything else the passes launch attributed to the drafter's fallback rows -- with, on `native` and `fe-entries`,
-13 of 20 launches of the verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries
-with byte-equal results); the acceptance line read "scheduled, not measured (reduction)"; and a second prompt set
+everything else the passes launch attributed to the drafter's fallback rows -- with 17 of 20 launches of the verify
+step target kernels on `native` (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal
+results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply)
+and 13 of 20 on `fe-entries` (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal
+results); the acceptance line read "scheduled, not measured (reduction)"; and a second prompt set
 behind `reset(fresh=False)` gave the ids, the kept counts and the proposals of the first. On `reference` every line
 passed and the run ended in `RAN`. One, three and seven drafted tokens and the four-layer model passed on `native`
 as well.
@@ -1416,7 +1431,8 @@ prompt step. A drafted token emitted by the caller failed no line of the compari
 the window of the next step is the session's -- and showed in the ids against the plain run's. A replay without the
 prompt was refused by name: such a session has no step in front of its prompt.
 
-On the published checkpoint (`native`, one sequence, five drafted tokens; the default prompt, 58 tokens through
+On the published checkpoint (the cuDNN Frontend rows -- the rows `native` selected when this run was made and
+`fe-entries` selects today; PyTorch 2.13.0 --, one sequence, five drafted tokens; the default prompt, 58 tokens through
 `prefill`; then the loop above on the drafter's own proposals until the end token or 256 new tokens; the draft
 vocabulary of this README's recipe as the runs of the section above made it -- the 342 ids of six dump files, then
 the lowest ids; the default prompt is one of the three prompts behind those dumps): the loop ended at the end token
@@ -1435,13 +1451,30 @@ verify step and a decode step launch other kernels for some blocks, and a greedy
 Replay with the proposals, the blocks of both kinds of step and the kernel check over 6 traced steps passed, with
 370 of 484 launches of the verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend
 entries with byte-equal results) and nothing stated about the kernels of the passes. The sentence asked for about
-43.3 GiB, PyTorch reserved 40.0 GiB and the device grew by 40.2 GiB, the GPU otherwise empty. The drafter's blocks
+43.3 GiB, PyTorch reserved 40.0 GiB and the device grew by 40.2 GiB, the GPU otherwise empty.
+
+With its library rows `native` runs three multiplies on other kernels -- inside the band of the reference multiply,
+not to the bytes of a multiply over a copy -- and a greedy run on a checkpoint follows its first other token: the
+plain run of the default prompt is another text there, and so is the loop. The same loop on `native` (PyTorch 2.14.0,
+FlashInfer 0.7.2.post1) ended at the end token after 231 new tokens in 71 steps and kept 3.27 tokens a step (1 + 161
+accepted drafted tokens / 71 steps); 9, 16, 20, 9, 7 and 10 steps kept one to six tokens; the first drafted token was
+accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, the fifth in
+10 of 17. With the passes handed something else it kept 1.05, 1.04 and 1.00 tokens a step, 2.58 with a later pass
+fed the model's row again and 3.31 with a later pass one position off. On the first 16 steps `drafter cache`,
+`draft proposals`, `position`, `prompt`, `recorded` and `rejected rows` passed; `tokens` was reported -- 39 of 45 kept
+tokens were the decode steps' greedy tokens on the same tokens, the first that differs kept token 17. Replay with the
+proposals, the blocks of both kinds of step and the kernel check over 6 traced steps passed, with 451 of 484 launches
+of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal
+results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN
+Frontend entries with byte-equal results), the 16 out-projections of the attention layers by membership, on the
+library's own CUTLASS multiply, and nothing stated about the kernels of the passes. The sentence asked for about
+32.2 GiB, PyTorch reserved 28.8 GiB and the device grew by 28.9 GiB, the GPU otherwise empty. The drafter's blocks
 are not compared with another implementation of the drafter in this repository.
 
 **Memory.** The memory sentence of a verify plan counts the state of its step shape -- a recurrent state per
 (sequence, token), `T + 2` history columns per sequence -- beside the flat working memory of every plan of the
-reduced models. Up to 32 rows of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence
-said: one sequence of six tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB
+reduced models. The figures of this paragraph are those of the runs on the cuDNN Frontend rows, above. Up to 32 rows
+of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said: one sequence of six tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB
 and grew the device by 3.8 GiB; the verify session alone, which keeps the out-projection of the linear-attention
 layer on its codes without a copy, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; three
 sequences of three tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.1 GiB and
@@ -1475,9 +1508,9 @@ such a session are not stated either. With a drafter it states the bytes of its 
 kernel check and the coverage line of such a session are about its verify
 steps: the decode steps of its prompt are replayed in front of the traced window and their kernels are not observed,
 which the run says beside its kernel verdict; what they launch was compared with a plain session's step in the runs
-above, by the driver of those runs. The attention layers'
-out-projection, the attention blocks and the MLP's down multiply on their target kernels. A captured verify step. A verify step of more than eight tokens per
-sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
+above, by the driver of those runs. The attention blocks on their target kernels; and, in `fe-entries`, the attention
+layers' out-projection and the MLP's down multiply, which `native` runs on the library's kernels. A captured verify
+step. A verify step of more than eight tokens per sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
 has run on compute capability 10.0 only; every other class is uncovered, not passing -- the rows of the
 out-projection on compute capability 10.3 and 10.7 among them.
 

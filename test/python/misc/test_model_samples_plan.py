@@ -150,7 +150,7 @@ def test_the_drafters_plan_its_table_and_its_keys():
     new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
     classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
     assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
-    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 22 and set(providers.KEYS) == set(providers.factories())
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 25 and set(providers.KEYS) == set(providers.factories())
     used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
     assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
     assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"

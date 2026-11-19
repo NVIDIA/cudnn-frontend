@@ -934,14 +934,15 @@ A session that is handed the drafter runs the whole step of speculative decoding
 - The comparison counts the launches of one kernel id; it does not place them. The embedding lookups of the passes
   and of the model are one id, so a lookup more is named with the count of the step and the plan, in front of the
   run that matches, and a lookup less is named at the first pass.
-- An arm that shifts an input is not an arm that takes it away -- again. On the checkpoint the loop kept 3.22 tokens
-  a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, with the two halves in
-  front of the first multiply exchanged 1.00; with a later pass one position off, 3.25. Acceptance does not see that
-  shift at all: the line that holds the positions of the later passes is `draft proposals`, on bytes and ids.
+- An arm that shifts an input is not an arm that takes it away -- again. On the checkpoint, on the cuDNN Frontend
+  rows, the loop kept 3.22 tokens a step; with zeros in the place of the hidden row 1.04, with the rows of another
+  text 1.05, with the two halves in front of the first multiply exchanged 1.00; with a later pass one position off,
+  3.25. Acceptance does not see that shift at all: the line that holds the positions of the later passes is
+  `draft proposals`, on bytes and ids.
 - Working memory is stated as arithmetic on what a pass holds at a time, then measured. A reference multiply
   accumulates a chunk of the weight in fp64; the allowance of a pass is twice the largest such chunk, 1.33 GiB at the
-  published widths -- not a share of what the drafter holds. On the checkpoint the run asked for about 43.3 GiB,
-  reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
+  published widths -- not a share of what the drafter holds. On the checkpoint, on the cuDNN Frontend rows, the run
+  asked for about 43.3 GiB, reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
 - The counts of a run live with its record. The comparison resets the session and puts its record back; the kept
   counts of the acceptance lines are part of that record, so the acceptance lines of a report printed behind the
   comparison are still the run's. Its bytes of a step are not: they follow where the session stands, and the
@@ -1050,3 +1051,8 @@ the stored weights (`providers/flashinfer_calls.py`). What building these rows s
   sample.
 - When a stack gains rows, every dated run of that stack in a README becomes a run of another row set. Say which
   rows a dated run selected, and move the counts that the tree computes to the stack that still selects those rows.
+- A figure of a greedy run on a checkpoint is a figure of a row set as well. A library's multiply is inside the band
+  of the reference multiply and is not the bytes of the multiply it replaces, so the run follows its first other
+  token: with the three library rows the plain run of the default prompt was another text, and the speculative loop
+  kept 3.27 tokens a step where it had kept 3.22 on the cuDNN Frontend rows. Such a figure is stated per row set
+  that ran, each with its versions; it is never carried over.

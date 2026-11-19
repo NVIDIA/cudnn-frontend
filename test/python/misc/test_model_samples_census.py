@@ -7661,15 +7661,21 @@ def test_the_loader_keeps_the_out_projection_weights_by_call_site(monkeypatch):
     ), "a step reads these weights at one byte per element, not two"
 
 
-def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True, **stand_in):
+def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True, drafter=False, total=0, **stand_in):
     """A session built with ``draft_tokens=`` on the stand-in providers and the stand-in profiler of :func:`_stand_ins`,
     behind a plain session on the same load: a prompt through ``prefill``, then ``steps`` verify steps of seeded ids, each
     keeping another count (``verify=False``: the prompt alone).  Returns the session, its run recorded and no traced pass
     made yet.  The ids are those of seed 1: with some ids the fp32 chains of the stand-ins leave the logits band on this
-    tiny geometry, which says nothing about the session; what a test of a defect asserts is that defect's own line."""
+    tiny geometry, which says nothing about the session; what a test of a defect asserts is that defect's own line.
+    ``drafter``: the session is handed the seeded drafter of the tiny model, whose plan is resolved on the same stand-ins
+    (its embedding lookup writes its gather into the log; its chains launch nothing there), and every step is the step
+    ``speculate`` runs, on seeded drafted tokens (``force=``; the ids of seed 0, for the reason above: a window of such a
+    session starts with the session's own greedy token, and behind the ids of seed 1 the stand-ins leave the band in
+    every stack).  ``total``: the memory of the device the plans are resolved for; 0 is a plan on stated device facts,
+    which asks nothing of an installation."""
     from model_samples import Session, TextIO, blocks, census
 
-    from model_samples.qwen_dense import QwenDense
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
 
     stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))
     build = _stand_ins(monkeypatch, **stand_in)
@@ -7677,7 +7683,7 @@ def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True,
     model = _tiny_model()
     monkeypatch.setattr(QwenDense, "_target", _census_of(model))
     text = TextIO.synthetic(model.geometry.vocab)
-    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, total, 80 * GIB if total else 0)
     tokens = drafted + 1
 
     def plan(per_sequence, **more):
@@ -7686,17 +7692,25 @@ def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True,
 
     common = dict(sequences=1, stack=stack, device="cpu", capacity=40, check_kernels=True)
     first = Session(model, text, **common)
-    session = Session(model, text, share=first, draft_tokens=drafted, **common)
+    session = Session(model, text, share=first, draft_tokens=drafted, drafter=QwenDenseDrafter.seeded(model) if drafter else None, **common)
     first.plan, session.plan, session.prefill_plan = plan(1), plan(tokens), plan(1, state_tokens=tokens)
+    if drafter:  # the drafter's own table, at one row per sequence, on the same stand-ins
+        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True}
+        its = session.drafter
+        session.draft_plan = blocks.plan(its.provider_table, its.regimes, facts, 1, 1, stack, model=its, options=options, factories=build)
     first._followers = (session,)  # as ``plan_table([session])`` leaves it: the load keeps what all three plans read
     first.load()
     session.load()
     session.read(session.prefill([text.encode("abc")]))
-    generator = torch.Generator().manual_seed(1)
+    generator = torch.Generator().manual_seed(0 if drafter else 1)
     for step in range(steps if verify else 0):
         ids = torch.randint(0, model.geometry.vocab, (1, tokens), generator=generator, dtype=torch.int32)
-        greedy = session.read(session.verify(ids))
-        assert len(greedy[0]) == tokens
+        if drafter:  # the window starts with the session's own greedy token; the drafted tokens behind it are these
+            ((window, greedy),) = session.read(session.speculate(ids[:, 1:].contiguous()))
+            assert window[1:] == ids[0, 1:].tolist() and len(greedy) == tokens
+        else:
+            greedy = session.read(session.verify(ids))
+            assert len(greedy[0]) == tokens
         session.accept(step % tokens)
     return session
 
@@ -8108,6 +8122,139 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
         census.Target(data)
 
 
+def test_the_library_rows_under_the_passes_of_a_speculative_step(monkeypatch):
+    """The rows of FlashInfer in a step of speculative decoding on ``native``: a session with a drafter on the CPU, the real
+    adapters over the stand-in of the library.  The library's rows serve the prompt's decode steps and the verify step as
+    they serve a session without a drafter, and the passes of the drafter call none of them.  The sites of a traced step
+    are the passes' and then the model's, so what the census records of a library kernel -- the kernel class of the 4-bit
+    multiply with its launch shape, the pick of the 8-bit one -- is held and printed at the MODEL's sites, behind the
+    passes: the other kernel class and another grid at the down multiply each fail the kernel check by name there, and
+    the kernel the library chose for the attention layers' out-projection is compared with the recorded pick of that
+    call site."""
+    from model_samples import census, tie_out
+    from model_samples.qwen_dense import configs
+
+    def run(**stand_in):
+        session = _draft_run(monkeypatch, stack="native", drafter=True, **stand_in)
+        session.trace(8)
+        return session, tie_out.run_checks(session, prompt_tokens=3)
+
+    def sentences(checks):
+        return [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
+
+    def chosen(checks):
+        return [line.strip() for line in checks.lines if line.strip().startswith("chosen by the library for ")]
+
+    session, checks = run()
+    traced, passes = session.traced, 5 * session.drafter.calls_per_pass()
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
+    # every plan of the session made its first use before the load, and the library was called at the rows of both kinds of step
+    assert session.plan.first_used and session.prefill_plan.first_used and session.draft_plan.first_used
+    assert {call for call in LIBRARY_CALLS} == {("mm_fp4", "cute-dsl", 1), ("mm_fp4", "cute-dsl", 6), ("bmm_fp8", "auto", 1), ("bmm_fp8", "auto", 6)}
+    assert all(row.key.startswith(("torch_ref.", "torch.")) for row in session.draft_plan.rows.values()), "no row of the drafter's table is a library's"
+    # the three tables: the library's rows in the verify plan and in the prompt's decode plan, a chain in every row of the drafter's but its lookup
+    tables = session._tables()
+    assert tables.count("  by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (PyTorch chains 2) | PyTorch 2 | unverified in CI: 3\n") == 2
+    assert tables.count("  by provider: fallbacks 12 (PyTorch chains 12) | PyTorch 1\n") == 1 and tables.count("served by (") == 3
+    # a step of this session reads every weight of a multiply on its stored codes: the model's own bytes, no copy among them
+    moved = session.report().bytes
+    assert moved["copies"] == moved["weights"] and 0 < moved["stored"] < moved["weights"], moved
+    # the sites: five passes of the drafter, then the model's; the claim is the verify plan's and counts from the model's first site
+    assert (traced.first, len(traced.sites)) == (passes, passes + 20) and passes == 90
+    assert all(site.block.startswith("draft.") for site in traced.sites[:passes]) and traced.sites[passes].block == "embedding"
+    claim = traced.claim
+    assert sorted(claim.classes) == [7, 16] and set(claim.classes.values()) == {"Sm100BlockScaledSplitKGemmKernel"}, "the two down multiplies of the model"
+    assert traced._classes() == {index + passes: named for index, named in claim.classes.items()}
+    assert [traced.sites[index].block for index in traced._classes()] == ["mlp.down", "mlp.down"]
+    assert all(traced.sites[index].block.startswith("draft.") for index in claim.classes), "uncounted, the class would stand at a site of a pass"
+    assert len(claim.picks) == 1 and set(claim.picks.values()) == {NVJET_FP8}
+    assert traced._picks() == {index + passes: pick for index, pick in claim.picks.items()}
+    assert [(traced.sites[index].block, traced.sites[index].site) for index in traced._picks()] == [("projection.fp8.out", "full_attention.out")]
+    assert all(index + passes in traced._recorded() for index in claim.classes), "a class is recorded with a launch shape, and stands where that stands"
+    # the lines: the down multiply in the recorded class and shape, the out-projection's kernel beside the recorded pick of ITS call site
+    assert _line(checks, "mlp.down: ").strip() == (
+        "mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step (2 calls x 1 per call); fi_mm_fp4 by name, and in the "
+        "kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records: grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B"
+    )
+    assert _line(checks, "projection.fp8.out at full_attention.out: ").strip() == (
+        "projection.fp8.out at full_attention.out: flashinfer.gemm.bmm_fp8 [BACKEND auto], 1 launch per step (1 call x 1 per call); "
+        "cublaslt_fp8_gemm by name (no launch shape is declared for it)"
+    )
+    digest = hashlib.sha256(FI_CUTLASS_FP8.encode()).hexdigest()[:12]
+    assert chosen(checks) == [
+        "chosen by the library for projection.fp8.out at full_attention.out (printed and compared, never gated): "
+        f"{FI_CUTLASS_FP8[:69]}... (1,360 characters, sha256 {digest}) x 3 over the traced steps; "
+        f"not the pick the census records ({NVJET_FP8}): another kernel of the same entry"
+    ]
+    assert (
+        _line(checks, "draft.embedding: ")
+        .strip()
+        .endswith("5 launches per step (5 calls x 1 per call); embedding_gather by name (no launch shape is declared for it)")
+    )
+    assert "22 on exact rows, in the wiring order" in _line(checks, "kernels "), "the five lookups of the passes and the 17 of the model"
+    planned = "kernel identity, as planned: 17 of 20 launches of a step are target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries"
+    assert _line(checks, "kernel identity, as planned").strip().startswith(planned)
+    line = _line(checks, "target census verify")
+    assert "15 launches of a step compared by launch shape (4 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results" in line
+    assert "each in the recorded one; 2 more by membership alone" in line
+    assert f"    {tie_out.DRAFTER_KERNELS}" in checks.lines, "nothing is stated about the kernels of the passes"
+    blocks_lines = [line for line in checks.lines if line.startswith("  blocks ")]
+    assert ["8 of 8 provider blocks" in blocks_lines[0], "9 of 9 provider blocks" in blocks_lines[1]] == [True, True] and len(blocks_lines) == 2
+    for block in ("projection.fp8.out at full_attention.out", "mlp.down", "output_head"):
+        judged = [line for line in checks.lines if line.strip().startswith(f"{block}  ") and "[band: bf16_rounding]" in line]
+        assert judged and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), block
+    held = "(projection.fp8.in, projection.fp8.out, mlp.gate_up, mlp.down, output_head)"
+    assert held in _line(checks, "on demand") and _line(checks, "stored weights").strip().startswith("stored weights    9 of 9 weights")
+    # were a shape recorded for the library's call and a class for the block's other call site alone, the library's line would
+    # state its own shape and no class: the lookup is per call site, behind the passes as without them
+    library_site = next(index for index, site in enumerate(traced.sites) if (site.block, site.site) == ("projection.fp8.out", "full_attention.out"))
+    entry_site = next(index for index, site in enumerate(traced.sites) if (site.block, site.site) == ("projection.fp8.out", "linear_attention.out"))
+    assert library_site - passes not in claim.recorded and min(library_site, entry_site) >= passes
+    recorded, classes = dict(claim.recorded), dict(claim.classes)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(census.Claim, "recorded", property(lambda self: {**recorded, library_site - passes: FP8_SHAPE}))
+        scoped.setattr(census.Claim, "classes", property(lambda self: {**classes, entry_site - passes: "TheClassOfTheOtherCallSite"}))
+        stated = [line for line in traced.details() if line.startswith("projection.fp8.out at full_attention.out: ")]
+    assert stated == [
+        "projection.fp8.out at full_attention.out: flashinfer.gemm.bmm_fp8 [BACKEND auto], 1 launch per step (1 call x 1 per call); "
+        "cublaslt_fp8_gemm by name, and in the launch shape the census records: grid (1, 80, 1), block (256, 1, 1), shared memory 227,328 B"
+    ]
+
+    # the controls, at the model's sites of the traced step: (1) the other kernel class in the recorded shape, (2) the recorded
+    # class in another grid, (3) the same call after a tuning of the operation in this process
+    every = "kernels: step 0 (and 2 more of the 3 traced steps): "
+    recorded_in = "the target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)"
+    _, checks = run(library_defect="class")
+    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
+    assert sentences(checks) == [
+        f"{every}mlp.down (layer {layer}) launched {FI_PERSISTENT!r}; {recorded_in} has the kernel class Sm100BlockScaledSplitKGemmKernel of fi_mm_fp4 there"
+        for layer in (0, 1)
+    ]
+    _, checks = run(library_defect="shape")
+    other = "launched fi_mm_fp4 with grid (1, 1, 40), block (192, 1, 1), shared memory 231,424 B"
+    assert not checks.ok and sentences(checks) == [
+        f"{every}mlp.down (layer {layer}) {other}; {recorded_in} has grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B" for layer in (0, 1)
+    ], checks.text()
+    _, checks = run(library_defect="has tuned")
+    served = "the adapter served the call with the form [BACKEND cute-dsl, TUNED True]"
+    assert not checks.ok and sentences(checks) == [
+        f"kernels: form: mlp.down (layer 0): {served} (flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
+        f"kernels: form: output_head: {served} (torch_ref.quantize + flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
+    ], checks.text()
+    # such a session needs the library's package as a plain run does: on a device its plans decline before anything is loaded,
+    # and the stack of the cuDNN Frontend rows runs the same session without it
+    with pytest.raises(NotImplementedError, match="needs flashinfer-python 0.7.2.post1, which is not installed: pip install -c "):
+        _draft_run(monkeypatch, stack="native", drafter=True, total=180 * GIB, library_installed=None)
+    without = _draft_run(monkeypatch, stack="fe-entries", drafter=True, total=180 * GIB, library_installed=None)
+    assert without.record.count == 3 and LIBRARY_CALLS == [], "no row of fe-entries calls the library"
+    # the 8-bit multiply stays the library's choice: the recorded pick passes and the line says that it is that pick
+    _, checks = run(library_defect="pick")
+    assert checks.ok and chosen(checks) == [
+        "chosen by the library for projection.fp8.out at full_attention.out (printed and compared, never gated): "
+        f"{NVJET_FP8} x 3 over the traced steps; the pick the census records"
+    ], checks.text()
+
+
 def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypatch):
     """A library row's adapter on its own: what it plans, when it calls the library, what it keeps of a weight.  A plan on
     stated device facts asks nothing of the installation and makes no call.  On a device, the first use is the call of the
@@ -8251,6 +8398,7 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     requirement file is a lower bound at the validated version; the constraints file pins what the census was recorded
     with; the adapter's list is the same; none of them names Triton.  And the sentences that state this policy are in the
     area's guide and READMEs as they were agreed."""
+    from model_samples import providers
     from model_samples.providers import ENTRY_NAMES, KEYS, flashinfer_calls
     from model_samples.qwen_dense import QwenDense
 
@@ -8303,7 +8451,8 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     for sentence in (
         "A library's own tuner may choose among that library's kernels for a call a row names; the choice is printed with the kernel check and is "
         "never a row.",
-        "The list of provider keys is closed; it changes only together with a kernel or a declared library entry.",
+        "The list of provider keys is closed; it changes only together with a kernel, with the reference chain of a block that a kernel is to serve, or "
+        "with a declared library entry.",
         "A third-party provider may build its own kernels at its first use; a sample makes that first use while the run is planned, before anything "
         "is loaded, and says so in one line.",
         "A third-party provider is imported inside its adapter, on a device; its version is read from the distribution's metadata there and held to "
@@ -8321,6 +8470,30 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     )
     for sentence in AREA_POLICY:
         assert sentence in area, sentence
+    # the list of keys says of itself what the tripwire says, and what no provider module does
+    stated = " ".join((providers.__doc__ or "").split())
+    assert (
+        "it changes only together with a kernel, with the reference chain of a block that a kernel is to serve, or with a declared library entry." in stated
+        and "no provider module imports a third-party package: an adapter to one imports it inside the functions that run on a device." in stated
+    )
+    # where the area README's first paragraph goes on from the library rows to speculative decoding, and where its table of modules has the adapter
+    assert (
+        "The two attention blocks are still on their fallback rows, printed as `not yet`; their kernels and a captured decode step (a step recorded "
+        "once and replayed without Python between its launches) follow in that stack. Speculative decoding has its first pieces: the loader of the "
+        "checkpoint's drafter (its tensors, its rows of the output head, its 8-bit weights); the drafter's draft pass on reference blocks,"
+    ) in area
+    # ... and what its table of tests says of the library rows in a step of speculative decoding, and of the Dependabot entry
+    assert (
+        "the same rows in a step of speculative decoding, behind the drafter's passes: the kernel class and the launch shape of the 4-bit multiply and "
+        "the recorded pick of the 8-bit one held and printed at the model's call sites;" in area
+        and "a launch in another shape than the recorded one at the model's site, a kernel class and a recorded pick at the model's site);" in area
+    )
+    modules = [line.split("|")[1].strip() for line in (MODELS / "README.md").read_text().splitlines() if line.startswith("| `providers/")]
+    assert modules == ["`providers/fe.py`", "`providers/library.py`", "`providers/flashinfer_calls.py`", "`providers/torch_ref.py`"]
+    assert (
+        "| `providers/flashinfer_calls.py` | adapters to library kernels of FlashInfer on the stored weights: the 4-bit multiply (`flashinfer.gemm.mm_fp4`,"
+        in area
+    )
     assert "FlashInfer is an optional package of this stack alone." in family
     script = " ".join((MODELS / "qwen_dense" / "00_decode.py").read_text().split())
     assert fix in area and fix in family and fix in script

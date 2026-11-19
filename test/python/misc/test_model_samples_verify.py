@@ -1185,6 +1185,35 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     # them the in-projection in front of the linear-attention layer is a multiply over a copy in the verify plan and its entry
     # in the decode plan of the same sequences, so that layer is fed other rows and its state is printed, not gated
     assert "at every step shape that ran up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows --" in section
+    # those runs name their rows: the stack has had three library rows since (the decode session of such a run multiplied over copies)
+    assert (
+        "On compute capability 10.0 (a 148-SM part), on the cuDNN Frontend rows of the stack `native` -- the rows `fe-entries` selects today; these "
+        "runs were made before the stack had its library rows --, the two-layer seeded model: at every step shape that ran up to 32 rows" in section
+    )
+    assert "The figures of this paragraph are those of the runs on the cuDNN Frontend rows, above. Up to 32 rows of a step PyTorch reserved" in section
+    # ... and what the stack ran with its library rows: the step shapes, and the counts of the one shape the census has a section for
+    assert (
+        "With its library rows the stack ran seven of these step shapes on 2026-11-18 (PyTorch 2.14.0, FlashInfer 0.7.2.post1) -- one sequence of two, "
+        "six and eight tokens, two and four sequences of six, four of eight and 16 of two --: every greedy token of the verify steps was the decode "
+        "steps', the recurrent state of the kept tokens was within the band, and the kernel check passed, at one sequence of six tokens with 17 of 20 "
+        "launches of a step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results), 15 of them in "
+        "the shapes the census records." in section
+    )
+    six, six_model = _plan(1, 6)
+    held = QwenDense.target().claim(six, six_model, census.configuration_of(six), installed=RECORDED)
+    assert (held.numbers()["target_code"], held.numbers()["target_port"], len(held.recorded)) == (6, 11, 15)
+    # ... and what is not here is what no stack has: the two multiplies of the library are rows of `native`
+    library = {label: row.key for label, _, _, row, _ in _plan(1, 6)[0].parts() if "flashinfer." in row.key}
+    assert library == {
+        "projection.fp8.out at full_attention.out": "flashinfer.bmm_fp8",
+        "mlp.down": "flashinfer.mm_fp4",
+        "output_head": "torch_ref.quantize+flashinfer.mm_fp4",
+    }
+    assert not any("flashinfer." in row.key for _, _, _, row, _ in _plan(1, 6, "fe-entries")[0].parts())
+    assert (
+        "The attention blocks on their target kernels; and, in `fe-entries`, the attention layers' out-projection and the MLP's down multiply, which "
+        "`native` runs on the library's kernels. A captured verify step." in section
+    )
     assert "at every step shape that ran --" not in section, "16 sequences of three, four and five tokens ran too, and their kept state was not gated"
     in_projection = "projection.fp8.in"
     for sequences, tokens in ((16, 3), (16, 4), (16, 5)):  # 48, 64 and 80 rows
@@ -3386,7 +3415,8 @@ def test_the_report_of_a_speculative_session():
 def test_the_memory_sentence_with_the_drafter(monkeypatch):
     """The one memory sentence of a run counts the drafter of a session that has one, at the published widths on stated
     facts: what its load holds besides the model's table, the bf16 copies its reference blocks multiply on, its cache,
-    and the working memory of a pass -- on ``native`` and on ``fe-cublas``; the sentence names the drafter."""
+    and the working memory of a pass -- on ``native``, whose library rows keep three more weights without a copy, on
+    ``fe-entries`` and on ``fe-cublas``; the sentence names the drafter."""
     import inspect
 
     from model_samples import Session, TextIO, blocks
@@ -3406,7 +3436,11 @@ def test_the_memory_sentence_with_the_drafter(monkeypatch):
     widest = 5120 * 17408  # the down weight: every one of its 5,120 rows in one chunk, 17,408 wide -- the largest chunk a multiply converts to fp64
     assert drafter.working_bytes() == 2 * 8 * widest and round(drafter.working_bytes() / gib, 2) == 1.33
     assert QwenDenseDrafter.seeded(model, rows=4096).working_bytes() == drafter.working_bytes(), "the listed head rows are not the widest product"
-    for stack, with_drafter, without, alone, alone_without in (("native", "43.6", "40.2", "43.1", "39.8"), ("fe-cublas", "61.2", "57.9", "60.8", "57.5")):
+    for stack, with_drafter, without, alone, alone_without in (
+        ("native", "32.4", "29.1", "32.0", "28.7"),
+        ("fe-entries", "43.6", "40.2", "43.1", "39.8"),
+        ("fe-cublas", "61.2", "57.9", "60.8", "57.5"),
+    ):
         common = dict(sequences=1, stack=stack, device="cuda:0", capacity=2051)
 
         def sentence(**more):
@@ -3468,7 +3502,8 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
     sites = passes + model_sites
     log = [[Call(site.block, site.layer, 6, "cudnn.GdnVerifyFused #1" if site.form else "", tuple(site.form)) for site in sites]]
     name = "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)"
-    claim = SimpleNamespace(recorded={2: VERIFY_SHAPE}, name=name)  # the model's third site: where its census has the fused verify step
+    # the model's third site: where its census has the fused verify step (no kernel class, no pick: no library kernel stands there)
+    claim = SimpleNamespace(recorded={2: VERIFY_SHAPE}, classes={}, picks={}, name=name)
 
     def judged(step, at=sites, calls=log, first=len(passes), count=1):
         traced = census.Traced.of(at, calls, step, count, "", 6, claim, first)
@@ -3504,7 +3539,7 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
     bare = passes + [model_sites[0], *model_sites[2:]]
     bare_log = [[Call(site.block, site.layer, 6, "cudnn.GdnVerifyFused #1" if site.form else "", tuple(site.form)) for site in bare]]
     copy = [("Memcpy HtoD (Pageable -> Device)", None)]
-    held = SimpleNamespace(recorded={1: VERIFY_SHAPE}, name=name)
+    held = SimpleNamespace(recorded={1: VERIFY_SHAPE}, classes={}, picks={}, name=name)
     clean = census.Traced.of(bare, bare_log, _engine_step(), 1, "", 6, held, 54).judge()
     copied = census.Traced.of(bare, bare_log, _engine_step(between=copy), 1, "", 6, held, 54).judge()
     assert clean == (census.PASS, [])
@@ -3539,15 +3574,47 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
     )
     # the details name a recorded shape at the model's site (its lookup), not at the pass's site of the same index
     counted = SimpleNamespace(
-        recorded={0: ((40, 1, 1), (128, 1, 1), 0), 2: VERIFY_SHAPE}, name=name, coverage=lambda: [], line=lambda status: f"census {status}"
+        recorded={0: ((40, 1, 1), (128, 1, 1), 0), 2: VERIFY_SHAPE},
+        classes={},
+        picks={0: GATHER},
+        name=name,
+        coverage=lambda: [],
+        line=lambda status: f"census {status}",
     )
     named = census.Traced.of(sites, log, _engine_step(), 1, "", 6, counted, 54)
     status, lines = named.judge()
     recorded = [line for line in named.details() if "in the launch shape the census records" in line]
     assert (status, lines, len(recorded)) == (census.PASS, [], 1) and recorded[0].startswith("embedding: torch.index_select, 1 launch per step")
+    # a kernel class and a pick of the census are a site's like the shape: held and printed at the model's site.  The pick of the
+    # model's lookup is compared with the ONE launch of that row, not with the three lookups of the passes' row of the same index
+    assert (named._classes(), named._picks()) == ({}, {54: GATHER})
+    chosen = [line for line in named.details() if line.startswith("chosen by the library for ")]
+    assert chosen == [
+        f"chosen by the library for embedding (printed and compared, never gated): {census._named(GATHER)} x 1 over the traced steps; "
+        "the pick the census records"
+    ]
+    classed = SimpleNamespace(recorded={2: VERIFY_SHAPE}, classes={2: "gdn_verify_fused"}, picks={}, name=name)
+    other = SimpleNamespace(recorded={2: VERIFY_SHAPE}, classes={2: "AnotherKernelClass"}, picks={}, name=name)
+    assert census.Traced.of(sites, log, _engine_step(), 1, "", 6, classed, 54).judge() == (census.PASS, [])
+    wrong = census.Traced.of(sites, log, _engine_step(), 1, "", 6, other, 54)
+    assert wrong._classes() == {56: "AnotherKernelClass"} and wrong.judge() == (
+        census.FAIL,
+        [
+            f"step 0: linear_attention.step (layer 0) launched {VERIFY_SYMBOL[:157] + '...'!r}; the {name} has the kernel class AnotherKernelClass of gdn_verify_fused there"
+        ],
+    )
+    assert census.Traced.of(sites, log, _engine_step(), 1, "", 6, other, 0).judge() == (
+        census.PASS,
+        [],
+    ), "counted from the drafter's first site, the class would be held to no launch"
     # what a dump says of a site: the claim's identities are the model's sites', a pass has none
     stated = SimpleNamespace(
-        recorded={}, name=name, known=True, identities=[SimpleNamespace(text=lambda index=index: f"model site {index}") for index in range(4)]
+        recorded={},
+        classes={},
+        picks={},
+        name=name,
+        known=True,
+        identities=[SimpleNamespace(text=lambda index=index: f"model site {index}") for index in range(4)],
     )
     stated.dump = lambda: {}
     dumped = census.Traced.of(sites, log, _engine_step(), 1, "", 6, stated, 54).dump()["sites"]
@@ -3562,7 +3629,7 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     sentences that state a behaviour, a count or a figure, each against the code or against the arithmetic it states;
     the runs as they were printed; no count of the launches of a pass.  And the sentences of the area README and of
     the guide."""
-    from model_samples import Session, TextIO, loop, sampling, tie_out
+    from model_samples import Session, TextIO, census, loop, sampling, tie_out
     from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
     from model_samples.timing import Report
 
@@ -3625,6 +3692,11 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "the drafter in it; `session.plan_table()` prints the session's own three tables.",
         "A session with a drafter stands alone as well, without `share=`: it then loads the model itself.",
         "The loop reads the device once per step.",
+        # the package of the stack `native` (the decline itself: the census module's test of the library rows behind the passes)
+        "On `native` the three library rows serve the decode steps of the prompt and the verify step of such a session as they serve a plain run, "
+        "and the drafter's passes call none of them: on compute capability 10.x the session needs FlashInfer at a validated version, and without it "
+        '`plan_table` declines before anything is loaded, by the sentence of the section "The rows a library serves"; `fe-entries` runs the same '
+        "session on the cuDNN Frontend rows.",
         "The plan table of such a session (`session.plan_table()`) has a third table under one line",
         # the working memory (its arithmetic: the test of the memory sentence) and what a rejected draft leaves (the test of the overwritten cache)
         "an allowance of twice the largest chunk of a weight a reference multiply converts to fp64 at a time (`working_bytes`: 1.33 GiB",
@@ -3647,20 +3719,28 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     added = (drafter.memory_bytes(1, 2051) + drafter.working_bytes()) / gib
     assert f"with 65,536 ids and 2,051 positions the drafter adds {added:.1f} GiB:" in text and f"{added:.1f}" == "3.3"
     assert (
-        "asks for about 43.6 GiB on `native` and about 61.2 GiB on `fe-cublas`, where the same run without a drafter asks for about 40.2 and 57.9 GiB."
+        "asks for about 32.4 GiB on `native` (compute capability 10.0, where its library rows keep the weights of the down multiplies, the "
+        "out-projections and the output head on their stored codes), about 43.6 GiB on `fe-entries` and about 61.2 GiB on `fe-cublas`, where the same "
+        "run without a drafter asks for about 29.1, 40.2 and 57.9 GiB."
     ) in text
     # the runs, as they were printed
     printed = (
-        "What ran (2026-11-18; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only).",
+        "What ran (2026-11-18; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` with its library rows in PyTorch 2.14.0 "
+        "with FlashInfer 0.7.2.post1, every other stack in PyTorch 2.13.0).",
         "a prompt of 8 tokens and 32 new tokens through 10 steps of `speculate(force=)` whose drafted tokens were scheduled to be kept 0 to 5 in turn:",
         "`drafter cache` and `draft proposals` in 10 of 10 steps;",
         "the kernel check passed over 10 traced steps --",
-        "the default prompt, 58 tokens through `prefill`; then the loop above on the drafter's own proposals until the end token or 256 new tokens;",
+        # the checkpoint: the run of the cuDNN Frontend rows names its rows, and the run of `native` with its library rows stands beside it
+        "On the published checkpoint (the cuDNN Frontend rows -- the rows `native` selected when this run was made and `fe-entries` selects today; "
+        "PyTorch 2.13.0 --, one sequence, five drafted tokens; the default prompt, 58 tokens through `prefill`; then the loop above on the drafter's "
+        "own proposals until the end token or 256 new tokens;",
         "On the first 16 steps `drafter cache`, `draft proposals`, `position`, `prompt`, `recorded` and `rejected rows` passed;",
         "`tokens` was reported -- 38 of 46 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs kept token 13 -- "
         "and the loop's text is another text than a plain run's from its 14th new token on:",
         "Replay with the proposals, the blocks of both kinds of step and the kernel check over 6 traced steps passed,",
-        "13 of 20 launches of the verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results);",
+        "with 17 of 20 launches of the verify step target kernels on `native` (6 the target's own compiled kernels + 11 cuDNN Frontend entries with "
+        "byte-equal results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply) and 13 of 20 "
+        "on `fe-entries` (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results);",
         "One, three and seven drafted tokens and the four-layer model passed on `native` as well.",
         "In one process on `native`, twenty-one runs with one thing wrong each, between two runs of the tree as it is.",
         "So did three ways of feeding the prompt to something the verify steps do not stand on -- a state of its own for the model's layers, "
@@ -3676,6 +3756,20 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "a later pass fed the model's row again kept 2.48; a later pass one position off kept 3.25,",
         "370 of 484 launches of the verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)",
         "The sentence asked for about 43.3 GiB, PyTorch reserved 40.0 GiB and the device grew by 40.2 GiB, the GPU otherwise empty.",
+        "With its library rows `native` runs three multiplies on other kernels -- inside the band of the reference multiply, not to the bytes of a "
+        "multiply over a copy -- and a greedy run on a checkpoint follows its first other token: the plain run of the default prompt is another text "
+        "there, and so is the loop.",
+        "The same loop on `native` (PyTorch 2.14.0, FlashInfer 0.7.2.post1) ended at the end token after 231 new tokens in 71 steps and kept 3.27 "
+        "tokens a step (1 + 161 accepted drafted tokens / 71 steps); 9, 16, 20, 9, 7 and 10 steps kept one to six tokens; the first drafted token was "
+        "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, the fifth in 10 of 17.",
+        "With the passes handed something else it kept 1.05, 1.04 and 1.00 tokens a step, 2.58 with a later pass fed the model's row again and 3.31 "
+        "with a later pass one position off.",
+        "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs kept token 17.",
+        "with 451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with "
+        "byte-equal results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN Frontend entries "
+        "with byte-equal results), the 16 out-projections of the attention layers by membership, on the library's own CUTLASS multiply, and nothing "
+        "stated about the kernels of the passes.",
+        "The sentence asked for about 32.2 GiB, PyTorch reserved 28.8 GiB and the device grew by 28.9 GiB, the GPU otherwise empty.",
         "The drafter's blocks are not compared with another implementation of the drafter in this repository.",
     )
     assert [sentence for sentence in printed if sentence not in text] == []
@@ -3687,6 +3781,28 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     turns = [step % 6 for step in range(10)]  # the seeded run: ten steps scheduled to keep 0 to 5 drafted tokens in turn, behind the prompt's first token
     assert 1 + sum(count + 1 for count in turns) == 32
     assert f"{1 + drafted / sum(by_kept):.2f}" == "3.22"
+    with_library = (9, 16, 20, 9, 7, 10)  # the run of native with its library rows: the steps by kept count
+    reached_there = [sum(with_library[draft:]) for draft in range(6)]
+    drafted_there = sum(count * steps for count, steps in enumerate(with_library))
+    assert (sum(with_library), reached_there, drafted_there) == (71, [71, 62, 46, 26, 17, 10], 161) and f"{1 + drafted_there / 71:.2f}" == "3.27"
+    # every step counts in full: the new tokens of a run are the prompt's first, a token a step and the accepted drafted tokens, less
+    # what the last step kept behind the end token (nothing on the cuDNN Frontend rows, two tokens on native)
+    assert 1 + sum(by_kept) + drafted == 204 and 1 + sum(with_library) + drafted_there == 231 + 2
+    assert [f"{1 + accepted / steps:.2f}" for accepted, steps in ((11, 219), (9, 221), (0, 230), (142, 90), (162, 70))] == [
+        "1.05",
+        "1.04",
+        "1.00",
+        "2.58",
+        "3.31",
+    ]
+    # what the two plans of the checkpoint run count and ask for, from the tree: the verify plan's three numbers and where they are held
+    # (the census section of one sequence of six tokens), and the memory sentence of the run at its capacity
+    for stack, numbers, compared, by_membership in (("native", (484, 130, 321), 435, 16), ("fe-entries", (484, 49, 321), 370, 0)):
+        published, published_model = _plan(1, 6, stack, model=QwenDense())
+        claim = QwenDense.target().claim(published, published_model, census.configuration_of(published), installed=RECORDED)
+        counted = claim.numbers()
+        assert (counted["launches"], counted["target_code"], counted["target_port"]) == numbers, stack
+        assert (len(claim.recorded), sum(numbers[1:]) - len(claim.recorded)) == (compared, by_membership), stack
     assert [f"{1 + accepted / steps:.2f}" for accepted, steps in ((7, 196), (10, 195), (0, 203), (121, 82), (142, 63))] == [
         "1.04",
         "1.05",
@@ -3708,8 +3824,12 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     assert "for a session with a drafter also `drafter cache` and `draft proposals`" in area and "`test/python/misc/test_model_samples_verify.py`" in area
     guide_text = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     guide = " ".join(guide_text.split())
-    sections = [section.split("\n", 1)[0] for section in guide_text.split("\n## ")]
-    assert sections[-2:] == ["What the speculative step taught", "What building the speculative script taught"], "the section, and the script's behind it"
+    sections = [section.split("\n", 1)[0] for section in guide_text.rstrip().split("\n## ")[1:]]
+    assert sections[-3:] == [
+        "What the speculative step taught",
+        "What building the speculative script taught",
+        "What the rows a library serves taught",
+    ], "the section, and the script's behind it; the last three sections of the guide, in the order they were built"
     lessons = (
         "- The cut of a step follows the one host read.",
         "a cache kept beside the state would have carried the first prompt set into the second,",
@@ -3718,10 +3838,15 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "- The window of a step is the session's.",
         "- A traced step is the step the loop runs.",
         "`Traced.first` shifts it, and the host test holds a launch in another shape at the model's site with both of its sentences.",
-        "On the checkpoint the loop kept 3.22 tokens a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, "
-        "with the two halves in front of the first multiply exchanged 1.00; with a later pass one position off, 3.25.",
+        "On the checkpoint, on the cuDNN Frontend rows, the loop kept 3.22 tokens a step; with zeros in the place of the hidden row 1.04, with the "
+        "rows of another text 1.05, with the two halves in front of the first multiply exchanged 1.00; with a later pass one position off, 3.25.",
         "the allowance of a pass is twice the largest such chunk, 1.33 GiB at the published widths",
-        "On the checkpoint the run asked for about 43.3 GiB, reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.",
+        "On the checkpoint, on the cuDNN Frontend rows, the run asked for about 43.3 GiB, reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU "
+        "otherwise empty.",
+        # ... and the lesson of the rows a library serves that these two figures gave
+        "- A figure of a greedy run on a checkpoint is a figure of a row set as well.",
+        "with the three library rows the plain run of the default prompt was another text, and the speculative loop kept 3.27 tokens a step where it "
+        "had kept 3.22 on the cuDNN Frontend rows. Such a figure is stated per row set that ran, each with its versions; it is never carried over.",
         "and a count of block calls -- 18 a pass -- is the wiring's.",
         "so the acceptance lines of a report printed behind the comparison are still the run's. Its bytes of a step are not:",
         "- What a step hands on by reference is held by identity, where it is handed on.",
