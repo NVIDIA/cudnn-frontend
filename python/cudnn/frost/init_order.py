@@ -30,16 +30,17 @@ This module is the ONE implementation of the ordering.  An entry makes three cal
 
 THE RULE (:func:`order_behind`).  The ordering follows the ALLOCATION, never the way a tensor reached the call: every range
 the launch writes is compared, by address, with every range of every record of the launch's device -- of this entry or of
-any other.  A record that is hit and whose initialization may be pending: the same stream -- nothing, stream order holds;
-another stream -- THAT stream waits for the event (``cudaStreamWaitEvent``; the host does not wait) and the record stays for
-the next stream; a capturing stream -- it cannot wait for an event recorded outside the capture, so the HOST waits for that
-ONE event (``cudaEventSynchronize``) before the captured launch.  That is the one host wait of the ordering: it is set-up,
-bounded by what the allocating stream had queued, never part of a replay, and a caller avoids it by allocating before the
-capture and letting that stream's work finish (``torch.cuda.graph`` synchronizes the device when it is entered; a raw
-capture does not).  Never a synchronization of a stream or of the device.  A record whose event is complete is dropped by
-ANY call that walks the device's records, hit or not, so every flow reaches "no record" and a warm call then pays one truth
-test.  Operands a launch only READS are not ordered here, and neither are the caller's own reads and writes of a returned
-tensor outside a call.
+any other.  A record that is hit and whose initialization may be pending: an eager launch stream waits for the event
+(``cudaStreamWaitEvent``; the host does not wait) and the record stays for the next stream -- whatever its raw handle, the
+allocating stream's too: a handle does not name a stream for good, and on the allocating stream itself the event is already
+behind the launch in stream order, so that wait is free; a capturing stream -- it cannot wait for an event recorded outside
+the capture, so the HOST waits for that ONE event (``cudaEventSynchronize``) before the captured launch and no stream wait
+is enqueued.  That is the one host wait of the ordering: it is set-up, bounded by what the allocating stream had queued,
+never part of a replay, and a caller avoids it by allocating before the capture and letting that stream's work finish
+(``torch.cuda.graph`` synchronizes the device when it is entered; a raw capture does not).  Never a synchronization of a
+stream or of the device.  A record whose event is complete is dropped by ANY call that walks the device's records, hit or
+not, so every flow reaches "no record" and a warm call then pays one truth test.  Operands a launch only READS are not
+ordered here, and neither are the caller's own reads and writes of a returned tensor outside a call.
 
 WHAT A CALL COSTS WHILE A RECORD IS PENDING: every call of every entry of the device walks the device's records -- address
 arithmetic per record, one capture-mode exchange, and event queries: one per record it drops and one per allocating stream
@@ -55,11 +56,11 @@ clones -- copy an entry before it allocates).  A record holds no tensor: an even
 and integers.  It stays true when its tensors are freed -- until the event completes that stream may still write those
 bytes -- so a launch into a block that a later allocation reused is ordered behind it too, and it is gone at the first call
 behind its completion.  Host threads: every change is one dictionary operation and a walk reads a copy; no lock.  A record
-another host thread dropped is skipped, and a drop never raises.  The streams are compared by raw handle
-(``torch.cuda.current_stream`` returns a new object per call); the per-thread stream handle is never the same stream.  A
-STREAM IS KNOWN BY ITS RAW HANDLE, so it must outlive the work it has queued: a caller-made stream destroyed with an
-initialization still pending, whose handle the driver then gives to a new stream, is taken for the allocating stream and a
-launch on the new one is not ordered (torch's own streams are never destroyed).
+another host thread dropped is skipped, and a drop never raises.  THE LAUNCH STREAM IS NEVER COMPARED WITH THE ALLOCATING
+ONE: a raw handle is all a record can keep of a stream, the driver can give the handle of a destroyed stream to the next
+new one while the destroyed stream's queued work still runs, and the per-thread stream handle is another stream in every
+host thread.  The handle a record keeps only saves event queries (the paragraph above), where taking two streams for one
+leaves a complete record for a later walk and never drops a pending one.
 
 Not recorded: an allocation on a device without streams (a host entry), and one made INSIDE a stream capture -- its fill is
 a node of the captured graph, ordered in front of the captured launches by the graph itself, and an event recorded there
@@ -174,7 +175,7 @@ def order_behind(pending: Records, stream, written: Iterable[Tuple[int, int]]) -
             else:
                 continue
             break
-    handle = capturing = None
+    capturing = None
     held = set()  # the allocating streams found holding a pending record: their later records are pending too
     with device_context(pending.device), capture.relaxed_capture_check(required=bool(hits)) as relaxed:
         if not relaxed:
@@ -199,7 +200,7 @@ def order_behind(pending: Records, stream, written: Iterable[Tuple[int, int]]) -
                         pending.pop(serial, None)  # complete: dropped by any call, hit or not
                         continue
                     held.add(init_handle)
-                if hit and (handle != init_handle or handle == 2):  # 2: the per-thread stream, another one in each thread
+                if hit:  # on the allocating stream's raw handle too: a new stream can have got it, and on the same one it is free
                     stream.wait_event(done)  # the launch stream waits, the host does not; the record stays for the next stream
         finally:
             walk = done = None  # a precaution: a dropped event is released here, while the capture check is still relaxed

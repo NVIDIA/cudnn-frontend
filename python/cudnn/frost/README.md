@@ -1298,10 +1298,11 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     waits for that one event before the launch (a capturing stream cannot wait
     for an event recorded outside the capture); it is set-up, bounded by what
     the allocating stream had queued, never replayed, and a caller avoids it
-    by allocating before the capture and letting that work finish. An
-    allocating stream is known by its raw handle, so it outlives the work it
-    has queued. An accessor returns a copy of the
-    entry's table. The test is a WARM launch on another stream than the
+    by allocating before the capture and letting that work finish. An eager
+    launch stream waits for the event whatever its raw handle, the allocating
+    stream's too (a destroyed stream's handle can go to the next new one; on
+    the allocating stream itself the wait is free). An accessor returns a copy
+    of the entry's table. The test is a WARM launch on another stream than the
     allocation's, with that stream held behind pending work
     (`test/python/init_order_schedules.py`). On the helper today:
     `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`.

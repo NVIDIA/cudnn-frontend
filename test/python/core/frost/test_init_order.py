@@ -45,14 +45,16 @@ def _walk(s, pending, stream, written):
 
 def test_one_record_is_decided_by_its_state(monkeypatch):
     """Complete: dropped by ANY call, hit or not.  Pending and not hit: one query, nothing enqueued, kept -- also under a
-    capture (no host wait for bytes the launch does not write).  Pending and hit: the allocating stream itself -- nothing
-    enqueued; another stream -- THAT stream waits for the event; both kept for the next stream.  Hit under a capture: the
-    host waits for this ONE event without querying it, and the record is dropped.  The allocating stream is the same stream
-    also as another object, and the per-thread handle never is.  The capture status of the legacy default stream is never
-    read (it cannot capture, and the driver answers for it only on a host thread with a current context: a thread whose
-    first CUDA call is this launch has none); its launch gets the stream wait like any other.  No branch synchronizes a
-    stream or the device (the stand-ins raise).  A failed read restores the capture check; a failed exchange reads and drops
-    nothing, and stops only a launch that writes a recorded allocation."""
+    capture (no host wait for bytes the launch does not write).  Pending and hit: the launch stream waits for the event and
+    the record is kept for the next stream -- on ANY raw handle, the allocating stream's too (a new stream can have been
+    given the handle of a destroyed one, and the per-thread handle is another stream in every thread; on the allocating
+    stream itself the wait is free).  Hit under a capture: the host waits for this ONE event without querying it, the record
+    is dropped and NO stream wait is enqueued (a capturing stream cannot wait for an event recorded outside the capture) --
+    on the allocating stream's handle like on any other.  The capture status of the legacy default stream is never read (it
+    cannot capture, and the driver answers for it only on a host thread with a current context: a thread whose first CUDA
+    call is this launch has none); its launch gets the stream wait like any other.  No branch synchronizes a stream or the
+    device (the stand-ins raise).  A failed read restores the capture check; a failed exchange reads and drops nothing, and
+    stops only a launch that writes a recorded allocation."""
     s = stand_ins(monkeypatch)
     pending = init_order.pending_of(DEV)
     inside, outside = ((1500, 1600),), ((5000, 5100),)
@@ -70,12 +72,13 @@ def test_one_record_is_decided_by_its_state(monkeypatch):
     assert decide(False, outside, OTHER, captured=True) == (["query"], True), "not hit under a capture: no host wait"
     assert decide(True, outside, OTHER) == (["query"], False), "complete: dropped by a call that does not write it"
     assert decide(True, outside, OTHER, captured=True) == (["query"], False)
-    assert decide(False, inside, INIT) == ([status(INIT), "query"], True), "the allocating stream as another object: stream order holds"
     assert decide(False, inside, OTHER) == ([status(OTHER), "query", ("wait_event", OTHER)], True)
-    assert decide(True, inside, OTHER) == ([status(OTHER), "query"], False)
-    assert decide(False, inside, OTHER, captured=True) == ([status(OTHER), "synchronize"], False)
-    assert decide(False, inside, INIT, captured=True) == ([status(INIT), "synchronize"], False)
+    assert decide(False, inside, INIT) == ([status(INIT), "query", ("wait_event", INIT)], True), "the allocating stream's handle: waited for too"
     assert decide(False, inside, 2, init=2) == ([status(2), "query", ("wait_event", 2)], True), "the per-thread stream"
+    assert decide(True, inside, OTHER) == ([status(OTHER), "query"], False)
+    assert decide(True, inside, INIT) == ([status(INIT), "query"], False), "complete: no wait on any handle"
+    assert decide(False, inside, OTHER, captured=True) == ([status(OTHER), "synchronize"], False)
+    assert decide(False, inside, INIT, captured=True) == ([status(INIT), "synchronize"], False), "captured on the allocating stream: no stream wait"
     for legacy in (0, 1):
         assert decide(False, inside, legacy) == (["query", ("wait_event", legacy)], True), "the legacy default stream: no status read"
 

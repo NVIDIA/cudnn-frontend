@@ -11,7 +11,8 @@ that work is still queued.  What every such case must do, or it shows nothing:
   other streams' work is done, which hides the overlap;
 * take its side stream from :func:`side_stream`: ``torch.cuda.Stream()`` is one of a small pool of streams handed out in
   turn, so a "new" stream can be one the case already uses.  For the same reason a capture runs on a stream of the case's
-  own (``torch.cuda.graph(graph, stream=...)``; the context's default is one stream shared by every capture of the process);
+  own (``torch.cuda.graph(graph, stream=...)``; the context's default is one stream shared by every capture of the process).
+  A stream that is to be destroyed is made with the driver (:func:`recycled_handle`): torch's own are never destroyed;
 * give the side stream's allocator pool the blocks the entry will allocate (:func:`pooled`), so no allocation synchronizes
   the schedule away;
 * warm torch's own kernels the parked stream will run (:func:`warm_fills`): they are loaded at their first use, and that
@@ -69,6 +70,55 @@ def pooled(dev, make_blocks, stream=None):
         del blocks
     torch.cuda.synchronize()
     return stream
+
+
+@contextmanager
+def recycled_handle(dev):
+    """``(first, successor)``: a stream of the case's own, made with the driver so that it can be DESTROYED, and a function
+    that destroys it -- the work it has queued still runs -- and returns the stream the driver makes NEXT, which has been
+    observed to get the destroyed stream's raw handle (the case skips when it does not: the schedule shows nothing then)."""
+    drv = pytest.importorskip("cuda.bindings.driver")
+    raw = []
+
+    def make():
+        with torch.cuda.device(dev):
+            err, handle = drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING)
+        assert int(err) == 0, f"cuStreamCreate failed: {err}"
+        raw.append(handle)
+        return torch.cuda.ExternalStream(int(handle), device=dev)
+
+    def successor():
+        gone = raw.pop()
+        handle = int(gone)
+        assert int(drv.cuStreamDestroy(gone)[0]) == 0  # returns at once; the stream's queued work is not cancelled
+        stream = make()
+        if stream.cuda_stream != handle:
+            pytest.skip("the driver gave the new stream another raw handle: the schedule shows nothing")
+        return stream
+
+    try:
+        yield make(), successor
+    finally:
+        torch.cuda.synchronize(dev)
+        for handle in raw:
+            drv.cuStreamDestroy(handle)
+
+
+@contextmanager
+def raw_capture(graph, stream):
+    """A RAW capture of ``graph`` on ``stream`` around the block (``capture_begin`` does not synchronize the device, which
+    ``torch.cuda.graph`` does when it is entered), ENDED also when the block raises: a capture left open makes the context
+    unusable for every later case.  The block runs on the caller's current stream.  ``stream`` None: no capture."""
+    if stream is None:
+        yield
+        return
+    with torch.cuda.stream(stream):
+        graph.capture_begin()
+    try:
+        yield
+    finally:
+        with torch.cuda.stream(stream):
+            graph.capture_end()
 
 
 def previous_owner(make, value):
