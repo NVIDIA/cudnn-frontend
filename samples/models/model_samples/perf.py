@@ -97,7 +97,7 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "The time between the host reads of two consecutive tokens of a timed request, pooled over the run's timed requests; percentiles are nearest-rank. "
             "The intervals span a growing attention cache as well as jitter: the file gives the first and the last timed position."
         ),
-        None,
+        "None: a percentile of this loop is not a service's tail latency.",
     ),
     "time_to_first_token": (
         "ms",

@@ -151,6 +151,7 @@ def test_rate_is_never_a_median_step():
     assert wall["value"] is None and wall["reason"] == "not printed for a reduced model", "no figure of a rate where no rate is printed"
     _defines("decode_rate", "1000 / time per output token in ms. Never a median step turned into a rate.")
     _defines("tokens_per_second_wall", "new tokens / (time the last token's ids reach the host - time the request is handed to the text path)")
+    _defines("tokens_per_second_wall", "It holds the time to first token and is not the decode rate; where no decode rate is printed it is null too.")
     _says("area", "| `decode rate` | 1000 / time per output token, in tokens per second per sequence;")
     _says(
         "area", "Never a median step turned into a rate, and not output tokens / wall time, which holds every time to first token (that figure is in the file)."
@@ -172,6 +173,9 @@ def test_percentiles_nearest_rank():
     assert perf.summary([]) == {"n": 0}
     _defines("token_to_token_interval", "pooled over the run's timed requests; percentiles are nearest-rank.")
     _says("area", "pooled over the timed requests: median, p90 and p99 by nearest rank.")
+    _defines("token_to_token_interval", "The intervals span a growing attention cache as well as jitter")
+    _says("area", "Not a service's tail latency: the intervals span a growing attention cache as well as jitter")
+    assert perf.DEFINITIONS["token_to_token_interval"][2] == "None: a percentile of this loop is not a service's tail latency."
 
 
 def test_run_value_is_median_over_timed_requests():
@@ -206,6 +210,9 @@ def test_time_to_first_token_starts_at_the_request():
     assert "The load is outside it" in first["definition"] and "without the network" in first["serving_counterpart"]
     _defines("time_to_first_token", "from the request being handed to the text path to the first new token's ids on the host", "Of a run: the median over")
     _says("area", "and the host read; the median over the timed requests. The load is outside it.")
+    same = "prefills the prompt in one pass and adds its queue and its network path"
+    assert f"not the same quantity: a serving engine {same}." in first["serving_counterpart"]
+    _says("area", f"A serving engine {same}: the same pair of events, not the same quantity")
 
 
 def test_step_is_the_median_interval_at_the_traced_positions():
@@ -303,6 +310,8 @@ def test_record_class_reasons_in_the_order_of_the_conditions():
     _says("area", "Otherwise it is `orientation` and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`.")
     _says("area", "*Record class*: what a run may call its numbers, on the second line of its report: `orientation` with every reason, or a controlled run.")
     _says("family", "Every run of the mode is `orientation` today and says why on the second line of its report")
+    _says("family", "its blocks are launched from Python, a fallback row is left in every stack, and the mode does not observe the GPU's other")
+    _says("area", "and no stack of this area is captured: every run today is `orientation`.")
 
 
 # ---------------------------------------------------------------------------------------------- a session on the CPU, stand-in providers
@@ -608,6 +617,10 @@ def test_timed_request_has_no_recorder_no_text(monkeypatch, tmp_path):
     assert all(request["end_state_sha256"] == outcome.data["raw"]["requests"][0]["end_state_sha256"] for request in outcome.data["raw"]["requests"][2:4])
     # the count the run printed before the load: every decode step of the stack, the replay of the checks among them
     assert sum(event[0] == "step" for event in events) == perf.Protocol(2, 6, 2).decode_steps(5)
+    _says("area", "the mode separates what is checked from what is timed, and what is timed from what is traced.")
+    _says(
+        "area", "A run makes, in this order: one checked request, launched as every other, with the recorder of the checks on, and the reference checks on it"
+    )
     inside = "no recorder, no call log, no profiler, no text"
     _says("area", f"Inside a timed request there is nothing but the step: {inside}.", "with the recorder of the checks on")
     _says("guide", f"Nothing but the step runs inside a timed request: {inside};")
@@ -637,7 +650,8 @@ def test_every_stamp_stands_where_its_definition_says(monkeypatch, tmp_path):
     assert kinds[zeroings[0] + 1 : zeroings[1]].count("sync") == 4, "the warm-up request too: its zeroing and its own stage"
     assert outcome.passed and outcome.data["protocol"]["restart"].endswith("zeroed in place at position 0, the device synchronised behind the zeroing")
     assert outcome.data["startup"]["zeroing the state_s"] >= 0.0
-    _defines("startup", "the zeroing of the state", "no other stage enters a rate or the time to first token")
+    _defines("startup", "Import, describe and plan are host times; every later stage", "the zeroing of the", "has the device synchronised at both ends.")
+    _defines("startup", "The stage of the timed requests spans the requests the statistics are taken from; no other stage enters a rate or the time to")
     _says("area", "timed requests, each from the state zeroed in place (the device is synchronised behind the zeroing, which is outside every statistic);")
     _says("area", "*Token-to-token interval*: the time between the host reads of two consecutive tokens of a timed request.")
     _says("area", "from the request being handed to the text path to the first new token's ids on the host: render, tokenize, the copy of the ids,")
@@ -756,6 +770,9 @@ def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkey
     assert "            what a step also launches was not observed" in unseen
     whole = perf.screen(_data(kernels={**kernels, "absent": 0, "fallback_calls": 0, "kernels_per_step": 485, "copies_per_step": 1}))
     assert "            not yet: no block calls on fallback rows; a step also launches 163 kernels and 1 copy" in whole
+    three = "the target's own compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins"
+    _defines("launches_per_step", f"the launches of a step that are on the target kernel set, by provider and as three numbers -- {three}.")
+    _says("area", "The `kernels` lines give the launches of a step that are on the target kernel set, by provider and as three numbers, and what else")
 
 
 # ---------------------------------------------------------------------------------------------- the screen and the file
@@ -820,6 +837,8 @@ def test_orientation_stands_in_the_rate_line():
     _says("area", "every time then carries `reduced model:`, no rate is printed, and the text is written nowhere.")
     _says("script", "the same protocol runs on the reduced seeded model and prints no rate.")
     _says("guide", "The rate of a run that is not a controlled run says so in its own line, and line 2 says it of every other number.")
+    _says("area", "Line 2, `record class`, says what the numbers of a run are.")
+    _says("area", "The line `with draft tokens` says `not run by this script`: this script decodes without a drafter.")
     controlled = perf.screen(_checkpoint_form(record={"class": "controlled", "reasons": []}))
     assert controlled[1] == "record class          controlled run in one process; a number of record is the median of 3 such runs"
     assert _line(controlled, "decode rate").startswith("decode rate           9.9  tokens/s per sequence   (")
@@ -846,6 +865,7 @@ def test_the_step_line_says_what_was_not_measured():
     assert "step                  100.000  ms at the 51 traced positions, 58 to 108; GPU busy not measured (this version)" in lines
     assert _line(lines, "time to first token   ").endswith(" ms for a 58-token prompt (58 decode steps: this sample has no prefill kernel)")
     assert not any("launch overhead" in line or line.startswith("note ") for line in lines)
+    _says("area", "This version does not take GPU busy from the traced request, so the step is not taken apart and the line says `GPU busy not measured`;")
     one = perf.screen(_checkpoint_form(traced={"steps": 1, "last_position": 58}))
     assert "step                  100.000  ms at the traced position, 58; GPU busy not measured (this version)" in one
     why = "the profiler's trace could not be exported (No space left on device)"
@@ -986,6 +1006,8 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     paragraph = _flat(_TEXTS["area"].read_text(encoding="utf-8")).split("**The report file**", 1)[1].split("The report, with dots", 1)[0]
     assert re.findall(r"`([a-z_]+)`(?= \(|,| and|\.)", paragraph.split("no local path:", 1)[1]) == sections.split()[4:], "the sections, in the file's order"
     _says("guide", "One definition per statistic, written in the report file, with a host test of its arithmetic on constructed time stamps.")
+    _says("area", "**The statistics**, each with one definition, which the report file carries beside the number:")
+    _says("area", "in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB")
 
 
 def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
@@ -1095,10 +1117,10 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     assert outcome.data["statistics"]["decode_rate"]["reason"] == "not printed: a stored weight no longer holds the bytes of its load"
     monkeypatch.undo()
 
-    # a replay that gives another token at its last step alone: nothing is timed behind it
-    outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "replay", defect={"token": _Nth(1 + 11 + 11)})
+    # a replay that gives another token at its last step alone, the 67th, far behind the 16 steps of the tokens' own pass: nothing is timed behind it
+    outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "replay", steps=62, requests=1, warmup=1, defect={"token": _Nth(1 + 67 + 67)})
     assert not outcome.passed and outcome.data is None and any("  replay " in line and line.endswith("FAIL") for line in lines)
-    assert sum(event[0] == "step" for event in events) == 2 * 11 and "profiler" not in events
+    assert sum(event[0] == "step" for event in events) == 2 * 67 and "profiler" not in events
     monkeypatch.undo()
 
     events_before = []
@@ -1131,6 +1153,8 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     assert any("  replay " in line and line.endswith("FAIL") for line in "\n".join(said).split("\n")) and "profiler" not in events_before
     assert not any("decode performance report" in line for line in said)
     _says("area", "a check of the checked request that fails ends the run before anything is timed, and no file is written.")
+    _says("area", "the timed requests and the traced request gave the checked request's token ids, step for step, every timed request left the")
+    _says("area", "state in the same bytes and the stored weights still hold the bytes of their load; the kernels of the traced steps are the plan's.")
 
 
 # ---------------------------------------------------------------------------------------------- the flags and main()
@@ -1305,12 +1329,17 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
     assert data["protocol"]["prompt"] == {"tokens": 26, "sha256": data["protocol"]["prompt"]["sha256"], "source": "the seeded prompt"}
     assert str(tmp_path) not in err and str(tmp_path) not in written.read_text()
     assert "[00] seeded weights: the output is not language; ids hash " in lines[-2] and lines[-3].startswith("[00] GPU memory: PyTorch peak ")
+    _says("area", "# The report goes to standard error, a report file report-<UTC time>.json to the current directory, the text to standard output.")
+    _says("script", "The report goes to standard error and, with every number, its definition, the protocol and the environment, into a report file")
+    _says("script", "(``--perf-report FILE``; default ``report-<UTC time>.json`` in the current directory);")
     # the same command again: a second file beside the first, or an ERROR that keeps the first (the name holds the second)
     code = sample.main(
         ["--perf", "--perf-steps", "6", "--perf-requests", "2", "--perf-warmup", "2", "--perf-report", "mine.json", "--dump-census", "census.json"]
     )
     again = capsys.readouterr().err.splitlines()
     assert code == 0 and again[-1] == "[00] PASS" and len(list(tmp_path.glob("*.json"))) == 3
+    _says("area", "default `report-<UTC time>.json` in the current directory, so one command can be run twice;")
+    _says("family", "The default name carries a time stamp, so the same command can be run twice.")
     assert json.loads((tmp_path / "census.json").read_text())["traced_steps"] == 6, "the launch records of the traced request"
     # a report file that cannot be written after all: the run is done and keeps its verdict, and its last line is the ERROR
     perf = importlib.import_module("model_samples.perf")
@@ -1362,12 +1391,14 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     assert args.perf is False and args.sequences == [1, 4] and args.force_tokens == 32 and not args.check_kernels and args.perf_steps is None
     monkeypatch.chdir(tmp_path)
     capsys.readouterr()
-    monkeypatch.delitem(sys.modules, "model_samples.perf", raising=False)  # another test of this module imported it
+    package = importlib.import_module("model_samples")
+    monkeypatch.delitem(sys.modules, "model_samples.perf", raising=False)  # another test of this module imported it:
+    monkeypatch.delattr(package, "perf", raising=False)  # neither the module nor the package's name for it is there before the run
     code = sample.main(["--check-kernels", "--sequences", "1", "--force-tokens", "4"])
     out, err = capsys.readouterr()
     lines = err.splitlines()
     assert code == 0 and lines[-1] == "[00] PASS" and out == "" and not list(tmp_path.iterdir())
-    assert "model_samples.perf" not in sys.modules, "an ordinary run does not import the mode's module"
+    assert "model_samples.perf" not in sys.modules and not hasattr(package, "perf"), "an ordinary run does not import the mode's module"
     assert (sample._record_steps(True, False), sample._record_steps(False, False)) == (32, None), "what an ordinary run records, as before"
     assert sample._record_steps(True, True) is None, "with a checkpoint the mode's checked request is recorded whole: the checks replay all of it"
     _says("guide", "An ordinary run prints what it printed before the mode existed and does not import the mode's module:")
@@ -1467,6 +1498,8 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     for flag in sample_flags:
         assert f'"{flag}"' in script and f"``{flag}" in script.split('"""', 2)[1], f"{flag}: a flag of the parser, named in the script's docstring"
     counts = _sample_script(monkeypatch).PERF_COUNTS  # the parser's defaults: the flag table's and the script's own text
+    assert f"| `--perf-warmup N` | `{counts['--perf-warmup'][0]}` | {counts['--perf-warmup'][1]} |" in family
+    assert counts["--perf-requests"][1] == "timed requests" and "| `--perf-requests N` | `3` | timed requests; " in family
     assert {flag: default for flag, (default, _) in counts.items()} == {flag: int(sample_flags[flag].strip(" `")) for flag in counts}
     _says(
         "script",
