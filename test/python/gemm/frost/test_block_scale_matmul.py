@@ -3969,12 +3969,17 @@ def _sf_prefix(scales, shape):
 
 def _sm120_sf_plan(g, python):
     """Index of the first FROST (``python``) or cuDNN backend plan of ``g`` that passes check_support, left selected
-    and built; ``None`` when that engine offers none."""
+    and built; ``None`` when that engine offers none. That includes a graph no engine proposes a plan for, which
+    ``create_execution_plans`` reports by raising: the cuDNN 9.29 and 9.30 backends reject an F8_128x4 scale tensor
+    declared at other than the packed blob's extents at finalize, where 9.24 accepts it."""
     from cudnn.engines import is_python_engine
 
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    try:
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError:
+        return None
     for i in range(g.get_execution_plan_count()):
         if is_python_engine(g.get_engine_and_knobs_at_index(i)[0]) != python:
             continue
@@ -4278,8 +4283,8 @@ def test_sm120_block_scale_sf_check_leaves_an_empty_call_to_the_launch_path():
 @requires_sm120
 def test_sm120_block_scale_engine_route_declines_sf_declared_past_the_packed_blob():
     """B29 through the FROST engine: SFA declared [2, 256, 16] for M=100 (each batch plane laid out for 256 rows) leaves
-    the graph without a FROST plan that passes check_support, so it is routed to another engine; the packed declaration
-    keeps its FROST plan."""
+    the graph without a FROST plan that passes check_support, so it is routed to another engine, or to none where the
+    cuDNN backend rejects that declaration too (9.29 and 9.30 do); the packed declaration keeps its FROST plan."""
     for sfa_dim, served in (((2, 256, 16), False), ((2, 128, 16), True)):
         g, _ = _build_sm120_sf_graph(2, 100, 128, sfa_dim, (2, 16, 128))
         assert (_sm120_sf_plan(g, python=True) is not None) == served, f"SFA declared {list(sfa_dim)}"

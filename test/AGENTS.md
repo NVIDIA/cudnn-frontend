@@ -240,6 +240,18 @@ scheduler domain stays the same. The D64 origins-helper host control exercises
 the actual helper and engine admission across SM100/SM103/SM107, including all
 eight dtype/Stats-layout/compact combinations of the SM107 scheduler clamp.
 
+A family check compares a range, never one minor version: the CI `sm120` lanes
+include GB10 (SM 12.1), so `_current_arch() == 120` is false there. In
+`gemm/frost`, branch on `active_family() == "sm120"` (or `120 <= arch < 130`).
+A helper that falls back to an sm100 config on SM 12.1 loses coverage without a
+report, because the frost conftest turns the arch decline into a skip; only a
+`pytest.raises(..., match=...)` around it fails. Detector: `git grep -nE
+'_current_arch\(\) *== *12[0-9]' test/python/gemm`. Likewise, a helper that
+looks for one engine's plan must catch `cudnnGraphNotSupportedError` from
+`create_execution_plans`: it raises when no engine at all proposes a plan
+(the cuDNN 9.29 and 9.30 backends decline an F8_128x4 scale tensor declared
+past the packed blob, which 9.24 accepts).
+
 Shared SDPA test helpers accept both public knob mappings and native knob
 dataclasses. Normalize mappings with `SdpaFwdKnobs.from_public` before attribute
 access or `dataclasses.replace`, preserving native callers and caller-owned
