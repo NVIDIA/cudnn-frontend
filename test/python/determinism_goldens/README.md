@@ -10,8 +10,8 @@ This report holds test coverage, measured results, and failure diagnostics.
 `test_sdpa_fwd_decode_d256_sm100.py::TestClusterReduce`) covers the SM100 D256
 swap-AB split decode tile with its partial results reduced by the separate
 pass and, with `CLUSTER_K_REDUCE=1`, inside the launch. It is forward-only and
-uses the standalone adapter over a paged cache with per-batch KV and Q
-lengths; four cells go through `pygraph.sdpa` and the public knob record.
+uses the standalone adapter; four cells go through `pygraph.sdpa` and the
+public knob record.
 
 Every cell runs both forms of one split count on the same inputs. Each form is
 compared with a float64 reference under the declaration's mask and lengths
@@ -24,24 +24,26 @@ wrote would dominate the reduction and fail the reference.
 
 | Group | Cells | What varies |
 | --- | --- | --- |
-| Numerics and two-form bytes | 18 | splits 2, 4, 8; packed 1 and 2 tokens, unpacked 3, 4, 6, 8 tokens; FP16/BF16; pages 16, 32, 64; bottom-right causal; lengths 0, 1, 64, 127, 128, 129, 1,000 and full under one 2,048-key declaration; more chunks than declared tiles; 1 to 5 tiles per chunk; padded query rows; output storage that is not 8-byte addressable; no Stats output |
+| Numerics and two-form bytes | 37 | every split count from 2 to 8; head ratios 24/4, 8/1, 16/4, 32/8 and 32/2 (6, 8, 12 and 16 packed rows in one tile); head widths 256, 200 and 192; packed 1 to 4 tokens, two token units of one head group, unpacked 1, 3, 4, 6 and 8 tokens; FP16/BF16; pages 16, 32, 64 and a dense cache; padding, bottom-right causal, top-left causal and sliding-window masks; with and without the KV and Q length operands; one user with a full cache and with 128 and 1,024 live keys under a 2,048-key declaration; lengths 0, 1, 64, 127, 128, 129, 1,000 and full; more chunks than declared tiles; 1 to 5 tiles per chunk; padded query rows; output storage that is not 8-byte addressable; no Stats output |
 | Element budget | 2 | 64 users x 2 tokens at 4, 8 and 8 chunks (2,359,296 BF16 O elements) and 24 users at 8 chunks (294,912 FP16), full caches; a reduction in the reverse split order must not reproduce the bytes |
 | Two chunks commute | 1 | the reverse-order control reproduces the bytes at 2 chunks, so those cells carry no weight in the budget |
 | Stale partials | 2 | a full-length launch, then one with live lengths 1 / 100 / 0 on the same workspace without refilling it; both forms |
+| Partials of this launch | 1 | 384 in-launch launches with uneven chunks, the workspace refilled with the finite value before each one: a reduction that read a partial before its chunk stored it would move the bytes |
 | Batch invariance | 4 | one sequence alone, among 8, among 64, reordered, duplicated and with other neighbours, at a fixed split; packed 2 tokens x 8 chunks and unpacked 6 tokens x 4 chunks; both forms |
 | Replay, capture and golden | 2 | eight fresh-buffer replays with concurrent GPU work per form; a retained CUDA graph against eager execution; changed lengths and queries under the retained graph; one golden per path that both forms reproduce |
 | Warm refill stress | 1 | clusters of two, ten key tiles per chunk, 256 warm and 256 poisoned launches behind the cluster-of-two control |
-| Graph plan and public record | 4 | the default plan of a two-token step carries the knob and its record; a record with and without the knob rebuilds the same bytes |
+| Graph plan and public record | 4 | the default plan of a two-token step carries the knob and its record; the compiled plan's record names the form that ran; a record with and without the knob rebuilds the same bytes |
 | Declines | 8 | explicit records and standalone requests outside the form; an unaligned workspace |
+
+A right-band mask and the NHD pool layout are admitted by the form and have no
+cell here.
 
 Measured on one B200-class development GPU (compute capability 10.0, 148 SMs;
 CuTe DSL 4.8.0, cuDNN 9.27 debug libraries, PyTorch 2.13.0+cu130), shared with
-other users, source `16789af0b` plus this change:
-**40 passed, 2 skipped** before the goldens existed (the two golden
-comparisons), then 2 passed recording them and 2 passed checking them with
-`CUDNN_DETERMINISM_GOLDENS` set. The element-budget cells printed
-`2359296 bfloat16 O elements compared, 0 differing` and
-`294912 float16 O elements compared, 0 differing`.
+other users: **62 passed** with `CUDNN_DETERMINISM_GOLDENS` set, so the two
+golden comparisons ran. The element-budget cells printed
+`2359296 bfloat16 O elements compared and equal` and
+`294912 float16 O elements compared and equal`.
 
 The warm stress passed behind its control (the unsafe ring failed 200 of 200
 launches at cluster size two). This kernel holds one thread block per SM, so
@@ -53,8 +55,9 @@ The two golden cases (`sdpa-decode-d256-swap-ab-bf16-packed-split8`,
 `sdpa-decode-d256-swap-ab-f16-unpacked-split4`) are recorded for that runtime
 only. SM103 was not run: the knob is declined there, and the status page says
 unverified. `test_sdpa_fwd_decode_cluster_reduce.py` holds the cells that need
-no device (53 passed): the knob record, the heuristics rule and its table, the
-declines and the launch-frame parity of the native and Python binders.
+no device (71 passed): the knob record, the heuristics rule and its tables,
+the recorded cluster bound, the declines, the source pin of the cluster
+barrier and the launch-frame parity of the native and Python binders.
 
 ```text
 suite=sdpa/frost/test_sdpa_fwd_decode_d256_sm100.py -k TestClusterReduce

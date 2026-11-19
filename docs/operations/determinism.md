@@ -168,23 +168,25 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in), including bottom-right causal when `S_q <= S_kv` | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The SM100 D256 swap-AB split decode tile reduces its per-chunk partial results
 in the separate reduction pass or, with `CLUSTER_K_REDUCE=1`, inside its own
 launch. Both forms add the partials in split order with the same operations.
-In the tested configurations (2, 4 and 8 chunks; FP16/BF16; packed one- and
-two-token units and unpacked three- to eight-token units; pages of 16, 32 and
-64; bottom-right causal masks and per-batch lengths) they store identical O
-and Stats bytes, so the knob does not change a plan's result at a fixed split
-count. The result still follows the split count, which the heuristics choose
-from the declared cache length and the batch: a caller that needs a sequence's
-bytes to stay equal across batch sizes fixes `SPLIT_KV`. At a fixed split
-count the tested sequences keep their bytes alone, among 8 and among 64,
-reordered, duplicated and with changed neighbours, in both forms. Bytes are
-not equal across split counts, to the unsplit plan, or to another engine.
-SM103 execution is unverified. See the
+In the tested configurations (2 to 8 chunks; FP16/BF16; head ratios 24/4, 8/1,
+16/4, 32/8 and 32/2; head widths 256, 200 and 192; packed units of one to four
+tokens and unpacked units of one to eight; pages of 16, 32 and 64 and a dense
+cache; padding, bottom-right and top-left causal masks and a sliding window;
+with and without per-batch lengths) they store identical O and Stats bytes, so
+the knob does not change a plan's result at a fixed split count. The result
+still follows the split count, which the heuristics choose from the declared
+cache length and the batch: a caller that needs a sequence's bytes to stay
+equal across batch sizes fixes `SPLIT_KV`. At a fixed split count the tested
+sequences keep their bytes alone, among 8 and among 64, reordered, duplicated
+and with changed neighbours, in both forms. Bytes are not equal across split
+counts, to the unsplit plan, or to another engine. SM103 execution is
+unverified. See the
 [coverage record](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18).
-| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in), including bottom-right causal when `S_q <= S_kv` | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
