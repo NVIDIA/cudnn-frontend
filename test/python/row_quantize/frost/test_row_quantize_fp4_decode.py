@@ -12,7 +12,8 @@ against the independent references of ``row_quantize_fp4_decode_utils`` (the blo
 byte of EVERY finite bf16 block maximum under eleven global scales, the exact cells (codes bitwise), the equality with the NVFP4 form
 of the add + RMSNorm + quantize step, blocks with a NaN or an infinity, output ownership per output, the bit-neutral arms, the wait
 behind a predecessor that released early, the release beside a dependent launch, CUDA-graph replay, the warm path's allocation /
-synchronization discipline and the profiler's record of a launch.
+synchronization discipline, the ordering of a launch behind an entry-owned pair's initialization that is pending on another stream
+(eager, captured, per row count, on a recycled block; its decision table on the host) and the profiler's record of a launch.
 
 No cell arms a timer of its own: every device cell synchronizes under the suite's per-test watchdog (``CUDNN_TEST_TIMEOUT`` in
 ``test/python/conftest.py``).  The kernel has no barrier and no shared memory, so a trip of that watchdog on a launch is a hang of the
@@ -340,6 +341,92 @@ def test_compile_and_outputs_decline_a_bad_row_count():
         with pytest.raises(NotImplementedError, match="serves CUDA devices only; the entry's device is cpu"):
             k.compile(rows)
     assert not k.compiled and not k.buffers, "a declined compile allocates nothing"
+
+
+def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_most(monkeypatch):
+    """What a call does for an entry-owned pair whose initialization may be pending, on stand-ins for the event, the streams and
+    the driver (no device; the device cells run the schedules).  Complete: the record is dropped.  Pending on the launch stream:
+    nothing is enqueued and the record stays.  Pending on another stream: THAT stream waits for the event and the record stays
+    for the next stream.  Pending under a capture: the host waits for this one event, without querying it first, and the record
+    is dropped.  No branch synchronizes a stream or the device; every read of the event runs with the thread's capture check
+    relaxed, and the check is restored also when the read raises.  A pair of another row count is never touched, and an entry
+    on a device without streams records nothing."""
+    calls, capturing = [], [False]
+
+    class Event:
+        def __init__(self, complete, fails=False):
+            self.complete, self.fails = complete, fails
+
+        def query(self):
+            calls.append("query")
+            if self.fails:
+                raise RuntimeError("the event's query failed")
+            return self.complete
+
+        def synchronize(self):
+            calls.append("synchronize")
+            self.complete = True
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait_event", self.name, event))
+
+        def synchronize(self):
+            raise AssertionError("a stream was synchronized")
+
+        wait_stream = synchronize
+
+    class Driver:
+        class CUstreamCaptureMode:
+            CU_STREAM_CAPTURE_MODE_RELAXED = "relaxed"
+
+        mode, fails = "global", False
+
+        @classmethod
+        def cuThreadExchangeStreamCaptureMode(cls, mode):
+            if cls.fails:
+                return 1, cls.mode
+            previous, cls.mode = cls.mode, mode
+            calls.append(("capture mode", mode))
+            return 0, previous
+
+    def no_device_synchronization(*args, **kwargs):
+        raise AssertionError("the device was synchronized")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    monkeypatch.setattr(torch.cuda, "synchronize", no_device_synchronization)
+    k = make_entry("cpu")
+    k.outputs(3), k.outputs(4)
+    assert k._init == {}, "an entry on a device without streams records no initialization"
+    init, other, untouched = Stream("init"), Stream("other"), (Event(False), Stream("of another row count"))
+
+    def decide(event, stream, captured=False):
+        calls.clear()
+        capturing[0] = captured
+        k._init = {3: (event, init), 4: untouched}
+        k._order_behind_init(3, stream, Driver)
+        assert calls[0] == ("capture mode", "relaxed") and calls[-1] == ("capture mode", "global") and Driver.mode == "global"
+        assert k._init[4] is untouched
+        return calls[1:-1], 3 in k._init
+
+    pending = Event(False)
+    assert decide(pending, init) == (["query"], True)
+    assert decide(pending, other) == (["query", ("wait_event", "other", pending)], True)
+    assert decide(pending, other, captured=True) == (["synchronize"], False)
+    assert decide(Event(False), init, captured=True) == (["synchronize"], False)
+    assert decide(Event(True), other) == (["query"], False)
+    k._init = {3: (Event(False, fails=True), init)}
+    with pytest.raises(RuntimeError, match="the event's query failed"):
+        k._order_behind_init(3, other, Driver)
+    assert Driver.mode == "global", "the capture check is restored behind a failed read"
+    Driver.fails = True
+    calls.clear()
+    with pytest.raises(RuntimeError, match="cuThreadExchangeStreamCaptureMode failed"):
+        k._order_behind_init(3, other, Driver)
+    assert not calls and 3 in k._init, "nothing is read and nothing is dropped when the capture check cannot be relaxed"
 
 
 def test_declines_an_unserved_compute_capability_by_name():
@@ -1713,6 +1800,207 @@ def test_warm_call_allocates_nothing_and_never_synchronizes():
     torch.cuda.synchronize()
     assert torch.cuda.memory_stats(dev)["allocation.all.allocated"] == allocated, "a warm call allocated device memory"
     _assert_same(mine, want, "the warm calls' bytes")
+
+
+# The initialization of an entry-owned pair is stream work of the stream that allocated it (Rule 5).  The cells below park a stream
+# behind a delay kernel, allocate a row count's pair on it (``compile(rows)``) and launch from ANOTHER stream while that work is
+# still queued.  Every cell first warms the entry with a real launch: a cold first launch synchronizes while the kernel's module
+# loads, which hides the overlap.
+DELAY = 1_000_000_000  # cycles of the delay kernel: about half a second on the validated part
+
+
+def _park(stream, work=None, cycles=DELAY):
+    """Park ``stream`` behind a delay kernel, run ``work()`` on it, and return an event recorded behind both: pending until the
+    delay has run.  A cell queries it to PROVE that its call overlapped the parked work, and -- where the call must not wait on
+    the host -- that it did not."""
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is unavailable")
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(cycles)
+        if work is not None:
+            work()
+        marker = torch.cuda.Event()
+        marker.record(stream)
+    return marker
+
+
+def _pooled(dev, rows, stream=None):
+    """``stream`` (a fresh side stream when none is given) with blocks of the two output sizes of ``rows`` in its allocator pool,
+    so the allocation inside ``compile(rows)`` on it is a pool hit and no allocation can synchronize the schedule away."""
+    stream = torch.cuda.Stream(device=dev) if stream is None else stream
+    with torch.cuda.stream(stream):
+        blocks = _outs(rows, dev)
+        del blocks
+    torch.cuda.synchronize()
+    return stream
+
+
+def _warm_entry_and_reference(dev, arm, rows, seed):
+    """A fresh entry warmed by a real one-row launch, operands of ``rows`` rows, and their bytes written into READY caller-owned
+    outputs, held to the suite's reference: ``(entry, x, scale, want)``."""
+    k = make_entry(dev, arm)
+    x = make_operands(rows, dev, seed=seed)
+    scale = scale_tensor(ODD_SCALE_BITS, dev)
+    _snap(k, x[:1], scale)
+    want = _snap(k, x, scale, **_outs(rows, dev))
+    assert_reference(want["codes"], want["scales"], x, scale, label=f"rows {rows}: caller-owned outputs")
+    return k, x, scale, want
+
+
+@pytest.mark.parametrize("arm, arm_id", list(zip(LAUNCH_ARMS, LAUNCH_ARM_IDS)), ids=LAUNCH_ARM_IDS)
+def test_warm_launch_waits_for_an_initialization_pending_on_another_stream(arm, arm_id):
+    """``compile(rows)`` on a side stream behind a delay, the call on the original stream: the launch is ordered behind the
+    pair's zero-fill although the host does not wait (the side stream's work is still pending when the call returns).  The codes
+    AND every byte of the scale buffer are those of ready caller-owned outputs; without the ordering the kernel's block scales
+    are written first and the delayed zero-fill erases every live scale byte."""
+    dev = _device_or_skip()
+    rows = 7
+    k, x, scale, want = _warm_entry_and_reference(dev, arm, rows, seed=131)
+    pending = _park(_pooled(dev, rows), lambda: k.compile(rows))
+    codes, scales = k(x, scale)
+    assert not pending.query(), "the call did not overlap the pending initialization (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert codes is k.outputs(rows)["codes"] and scales is k.outputs(rows)["scales"]
+    _assert_same(dict(codes=codes, scales=scales), want, f"{arm_id}: entry-owned outputs initialized on another stream")
+
+
+def test_warm_launch_on_a_side_stream_waits_for_an_initialization_pending_on_the_original_stream():
+    """The roles of the streams exchanged: ``compile(rows)`` on the original stream behind a delay, the call on a side stream."""
+    dev = _device_or_skip()
+    rows = 7
+    k, x, scale, want = _warm_entry_and_reference(dev, (True, None), rows, seed=132)
+    original = _pooled(dev, rows, torch.cuda.current_stream(dev))
+    side = torch.cuda.Stream(device=dev)
+    pending = _park(original, lambda: k.compile(rows))
+    with torch.cuda.stream(side):
+        codes, scales = k(x, scale)
+    assert not pending.query(), "the call did not overlap the pending initialization (or it waited on the host)"
+    torch.cuda.synchronize()
+    _assert_same(dict(codes=codes, scales=scales), want, "entry-owned outputs initialized on the original stream, written on a side stream")
+
+
+def test_captured_call_waits_on_the_host_for_a_pending_initialization_and_for_nothing_else():
+    """The documented setup of a capture -- ``compile(rows)`` first -- on a side stream behind a delay, then a RAW capture
+    (``torch.cuda.graph`` synchronizes the device when it is entered, which hides the schedule) and a replay at once.  A capturing
+    stream cannot wait for an event recorded outside the capture, so the captured call waits for that ONE event on the host: the
+    initialization is complete when the capture ends, unrelated work on a third stream is still pending (no stream or device
+    synchronization), and both replays -- the second on new operand values -- write the bytes of ready caller-owned outputs."""
+    dev = _device_or_skip()
+    rows = 6
+    k, x, scale, want = _warm_entry_and_reference(dev, (True, None), rows, seed=133)
+    side = _pooled(dev, rows)
+    unrelated = _park(torch.cuda.Stream(device=dev), cycles=4 * DELAY)
+    pending = _park(side, lambda: k.compile(rows))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(torch.cuda.Stream(device=dev)):
+            graph.capture_begin()
+            try:
+                codes, scales = k(x, scale)
+            finally:
+                graph.capture_end()
+        left_pending, synchronized_more = not pending.query(), unrelated.query()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_same(dict(codes=codes, scales=scales), want, "replay 1, launched as soon as the capture ended")
+        x.copy_(make_operands(rows, dev, seed=134))
+        want = _snap(k, x, scale, **_outs(rows, dev))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_same(dict(codes=codes, scales=scales), want, "replay 2, on new operand values")
+        assert not left_pending, "the captured call left the initialization pending"
+        assert not synchronized_more, "the captured call waited for more than the initialization's event"
+    finally:
+        graph.reset()
+
+
+def test_warm_call_does_nothing_for_an_initialization_that_is_complete(monkeypatch):
+    """Once a call has seen the initialization complete, the warm path is what it was: three calls on the original stream and
+    three on the stream that initialized the pair allocate no device memory, raise nothing under
+    ``set_sync_debug_mode('error')``, and read or wait for no event and no stream."""
+    dev = _device_or_skip()
+    rows = 8
+    k, x, scale, want = _warm_entry_and_reference(dev, (True, None), rows, seed=135)
+    side = _pooled(dev, rows)
+    pending = _park(side, lambda: k.compile(rows))
+    codes, scales = k(x, scale)
+    assert not pending.query(), "the call did not overlap the pending initialization (or it waited on the host)"
+    torch.cuda.synchronize()
+    _assert_same(dict(codes=codes, scales=scales), want, "the call that met the pending initialization")
+    k(x, scale)  # the call that sees it complete
+    torch.cuda.synchronize()
+    touched = []
+    for name in ("query", "synchronize", "wait"):
+        monkeypatch.setattr(torch.cuda.Event, name, lambda *a, _name=name, **kw: touched.append(f"Event.{_name}"))
+    for name in ("wait_event", "wait_stream", "synchronize"):
+        monkeypatch.setattr(torch.cuda.Stream, name, lambda *a, _name=name, **kw: touched.append(f"Stream.{_name}"))
+    allocated = torch.cuda.memory_stats(dev)["allocation.all.allocated"]
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            k(x, scale)
+            with torch.cuda.stream(side):
+                k(x, scale)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    assert not touched, f"a warm call behind a complete initialization touched {sorted(set(touched))}"
+    assert torch.cuda.memory_stats(dev)["allocation.all.allocated"] == allocated, "a warm call allocated device memory"
+    _assert_same(dict(codes=codes, scales=scales), want, "the warm calls' bytes")
+
+
+def test_row_counts_initialized_on_two_streams_are_ordered_one_by_one():
+    """Two row counts, each pair initialized on its own parked stream; the second stream is parked for longer.  The first row
+    count is launched while both are pending and again after ITS initialization completed; the second row count is launched
+    afterwards, while its own initialization is still pending: its launch still waits for it (the completion of one pair says
+    nothing about another), and neither pair's bytes are disturbed."""
+    dev = _device_or_skip()
+    first, second = 5, 9
+    k, x, scale, want_second = _warm_entry_and_reference(dev, (True, None), second, seed=136)
+    want_first = _snap(k, x[:first], scale, **_outs(first, dev))
+    streams = _pooled(dev, first), _pooled(dev, second)
+    early = _park(streams[0], lambda: k.compile(first))
+    late = _park(streams[1], lambda: k.compile(second), cycles=4 * DELAY)
+    got_first = k(x[:first], scale)
+    assert not early.query() and not late.query(), "the first call did not overlap both pending initializations"
+    early.synchronize()  # this row count's initialization and nothing else: the other stream stays parked
+    k(x[:first], scale)  # the call that sees the first pair's initialization complete
+    got_second = k(x, scale)
+    assert not late.query(), "the second row count's call did not overlap its pending initialization (or it waited on the host)"
+    torch.cuda.synchronize()
+    _assert_same(dict(zip(("codes", "scales"), got_first)), want_first, f"rows {first}, initialized on the first stream")
+    _assert_same(dict(zip(("codes", "scales"), got_second)), want_second, f"rows {second}, initialized on the second stream")
+
+
+def test_entry_owned_codes_on_a_recycled_block_wait_for_what_its_stream_still_owes_it():
+    """The entry-owned ``codes`` are not initialized, but their block can be a recycled one: a tensor filled and freed on the
+    parked stream right before ``compile(rows)`` hands its block to the entry while its fill is still queued.  A call on the
+    original stream that uses the entry's ``codes`` (its ``scales`` are the caller's here) is ordered behind that fill too: the
+    event is recorded behind everything the allocating stream had queued."""
+    dev = _device_or_skip()
+    rows = 7
+    k, x, scale, want = _warm_entry_and_reference(dev, (True, None), rows, seed=137)
+    side = _pooled(dev, rows)
+    recycled = []
+
+    def previous_owner_then_compile():
+        old = torch.empty(rows, WIDTH // 2, dtype=U8, device=dev)
+        old.fill_(0xEE)
+        recycled.append(old.data_ptr())
+        del old
+        k.compile(rows)
+
+    pending = _park(side, previous_owner_then_compile)
+    if k.outputs(rows)["codes"].data_ptr() != recycled[0]:
+        pytest.skip("the allocator did not hand the freed block to the entry: the schedule shows nothing")
+    mine = _outs(rows, dev)
+    codes, scales = k(x, scale, scales=mine["scales"])
+    assert not pending.query(), "the call did not overlap the pending fill (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert codes is k.outputs(rows)["codes"] and scales is mine["scales"]
+    _assert_same(dict(codes=codes, scales=scales), want, "entry-owned codes on a recycled block")
 
 
 def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_up():

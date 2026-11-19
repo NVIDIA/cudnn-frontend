@@ -46,14 +46,20 @@ the entry's device, under that device, and the caller's current device is restor
 Output ownership is PER OUTPUT.  An output the caller passes is the caller's and is returned as given (never re-sliced: rows past
 ``rows`` are untouched).  An output the caller does not pass is the entry's: one pair per row count, ``scales`` zero-filled,
 allocated by ``compile(rows)`` / ``outputs(rows)`` or at the first call of that row count -- call ``compile(rows)`` for every row
-count before a stream capture.  Entry-owned outputs are valid until the entry's next call at that row count from ANY host thread
-(stream order does not serialize host calls): two host threads that share one entry pass their own outputs or build one entry each;
-a caller that sweeps many row counts passes its own outputs (the per-row-count pairs are never freed).  A returned entry-owned
-output cannot come back as an operand of a call that would write it: a call at that row count whose ``x``, ``scale`` or passed
-output overlaps an entry-owned output it does not pass is declined (``ValueError``) before the launch.  THE KERNEL WRITES THE LIVE
-ROWS' SCALE BYTES ONLY: a caller-owned ``scales`` buffer serves one row count, or its owner clears it when the row count shrinks
-(after a call with more rows, a call with fewer leaves the earlier bytes in the rows between ``rows`` and ``scale_rows(rows)``).
-Workspace: none.  The warm path allocates nothing and reads no device memory to the host.
+count before a stream capture.  THE INITIALIZATION OF A PAIR IS STREAM WORK (the allocation and the zero-fill, on torch's current
+stream of the entry's device at that moment), and a call orders itself behind it on WHATEVER stream it launches: the same stream by
+stream order, another stream by a stream-side wait for the event recorded behind the initialization -- no host wait, never a
+synchronization of a stream or of the device -- so ``compile(rows)`` may run on any stream.  A captured call cannot carry that
+dependency: one that finds the initialization still pending waits for that ONE event on the host before its captured launch.  Once
+the initialization is seen complete a call does nothing for it.  ``outputs(rows)`` returns the pair without waiting: see its
+contract for a caller that touches the tensors itself.  Entry-owned outputs are valid until the entry's next call at that row
+count from ANY host thread (stream order does not serialize host calls): two host threads that share one entry pass their own
+outputs or build one entry each; a caller that sweeps many row counts passes its own outputs (the per-row-count pairs are never
+freed).  A returned entry-owned output cannot come back as an operand of a call that would write it: a call at that row count
+whose ``x``, ``scale`` or passed output overlaps an entry-owned output it does not pass is declined (``ValueError``) before the
+launch.  THE KERNEL WRITES THE LIVE ROWS' SCALE BYTES ONLY: a caller-owned ``scales`` buffer serves one row count, or its owner
+clears it when the row count shrinks (after a call with more rows, a call with fewer leaves the earlier bytes in the rows between
+``rows`` and ``scale_rows(rows)``).  Workspace: none.  The warm path allocates nothing and reads no device memory to the host.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -292,6 +298,8 @@ class RowQuantizeFp4Decode:
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[int, Dict[str, Any]] = {}
         self._buffer_views: Dict[int, Dict[str, Any]] = {}
+        #: per row count, while the pair's initialization may still be pending: ``(event recorded behind it, the stream it is on)``
+        self._init: Dict[int, Tuple[Any, Any]] = {}
 
     # ---- the form and the compile key ----
     def cfg_for(self, rows: int) -> Cfg:
@@ -336,17 +344,57 @@ class RowQuantizeFp4Decode:
     def outputs(self, rows: int) -> Dict[str, Any]:
         """The entry-owned output buffers of ``rows``: ``codes`` (uint8 ``[rows, width / 2]``) and ``scales`` (E4M3
         ``[scale_rows(rows), width / 16]``, zero-filled).  Allocated once per row count; see the module docstring for their
-        lifetime."""
+        lifetime.  The pair is returned WITHOUT waiting for its initialization: the allocation and the zero-fill are stream work
+        of torch's current stream of the entry's device at the first ``outputs(rows)`` / ``compile(rows)`` / call of the row count.
+        A call of the entry orders itself behind that work on whatever stream it launches (:meth:`_order_behind_init`); a caller
+        that reads or writes the returned tensors ITSELF before the entry has been called at that row count does so on that
+        stream, or orders its own stream behind it first (the rule for any tensor created on another stream)."""
         rows = validate_rows(rows)
         if rows not in self.buffers:
             import torch
 
             cfg, dev = self.cfg, self.device
-            self.buffers[rows] = dict(
-                codes=torch.empty(rows, cfg.WIDTH // 2, dtype=torch.uint8, device=dev),
-                scales=torch.zeros(scale_rows(rows), cfg.WIDTH // BLOCK, dtype=torch.float8_e4m3fn, device=dev),
-            )
+            with device_context(dev):
+                self.buffers[rows] = dict(
+                    codes=torch.empty(rows, cfg.WIDTH // 2, dtype=torch.uint8, device=dev),
+                    scales=torch.zeros(scale_rows(rows), cfg.WIDTH // BLOCK, dtype=torch.float8_e4m3fn, device=dev),
+                )
+                # Inside a stream capture the fill is a node of the captured graph and an event recorded there cannot be queried.
+                if dev.type == "cuda" and not torch.cuda.is_current_stream_capturing():
+                    stream = torch.cuda.current_stream(dev)
+                    done = torch.cuda.Event()
+                    done.record(stream)  # behind all the allocation enqueued and all this stream still owes a recycled block
+                    self._init[rows] = (done, stream)
         return self.buffers[rows]
+
+    def _order_behind_init(self, rows: int, stream, driver) -> None:
+        """Order a launch on ``stream`` that writes the entry-owned outputs of ``rows`` behind their initialization (Rule 5):
+        the launch may be on another stream than the one the pair was allocated on, where the zero-fill of ``scales`` -- or a
+        write the allocating stream still owes a recycled block -- would otherwise land on top of the kernel's bytes.  Complete:
+        the record is dropped, and a warm call does nothing here.  Pending, the same stream: stream order holds.  Pending,
+        another stream: that stream waits for the event (``cudaStreamWaitEvent``; the host does not wait).  Pending, ``stream``
+        capturing: a dependency on an event recorded outside the capture cannot be captured, so the HOST waits for this one
+        event (``cudaEventSynchronize``) before the captured launch -- never a stream or device synchronization -- and the
+        captured graph holds the kernel alone.  ``torch.cuda.graph`` synchronizes the device when it is entered, so only a
+        capture begun without it can meet a pending initialization.  The event is read with this thread's capture check
+        relaxed and restored: while ANY thread captures in the default mode, querying an event is refused and invalidates that
+        capture."""
+        import torch
+
+        done, init_stream = self._init[rows]
+        capturing = torch.cuda.is_current_stream_capturing()
+        err, previous = driver.cuThreadExchangeStreamCaptureMode(driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+        if int(err) != 0:
+            raise RuntimeError(f"{NAME}: cuThreadExchangeStreamCaptureMode failed: {err}")
+        try:
+            if capturing:
+                done.synchronize()
+            if capturing or done.query():
+                self._init.pop(rows, None)
+            elif stream != init_stream:
+                stream.wait_event(done)
+        finally:
+            driver.cuThreadExchangeStreamCaptureMode(previous)
 
     def _output_view(self, t):
         """The DSL view of an output: the code and scale bytes through their ``uint8`` view (one byte per element)."""
@@ -387,9 +435,11 @@ class RowQuantizeFp4Decode:
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan time: the typed declines of the device, the part and the DSL, then ONE trace-compile of the entry's form (a no-op
         once compiled).  With ``rows`` it also allocates the entry-owned outputs of that row count -- call it for every row count
-        before a stream capture.  Needs no operand: the compile binds the entry-owned outputs of ``rows``, and of ONE row when no
-        row count is given -- so the first ``compile()`` allocates that one-row pair (2,560 code bytes and one 128-row scale
-        band) even for a caller that passes its own outputs on every call."""
+        before a stream capture, on any stream: a later call orders itself behind the allocation's stream work
+        (:meth:`_order_behind_init`).  The compile's own operands are temporaries nothing launches on; their blocks return to
+        the allocator of the stream that filled them.  Needs no operand: the compile binds the entry-owned outputs of
+        ``rows``, and of ONE row when no row count is given -- so the first ``compile()`` allocates that one-row pair (2,560
+        code bytes and one 128-row scale band) even for a caller that passes its own outputs on every call."""
         if rows is not None:
             validate_rows(rows)
         if self.key() not in self.compiled:
@@ -451,9 +501,10 @@ class RowQuantizeFp4Decode:
                         owned, owned_views = self.outputs(rows), self._owned_views(rows)
                     results[name] = owned[name]
                     views[name] = owned_views[name]
-            self.compiled[key](
-                _flat(x), _flat(scale), views["codes"], views["scales"], cutlass.Int32(rows), cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
-            )
+            stream = torch.cuda.current_stream(self.device)
+            if owned is not None and rows in self._init:
+                self._order_behind_init(rows, stream, cuda)
+            self.compiled[key](_flat(x), _flat(scale), views["codes"], views["scales"], cutlass.Int32(rows), cuda.CUstream(stream.cuda_stream))
         return results["codes"], results["scales"]
 
 
