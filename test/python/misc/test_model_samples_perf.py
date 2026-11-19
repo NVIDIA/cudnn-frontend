@@ -1122,7 +1122,7 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
     assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
     # a name this version does not know, on a file of this version's own shape: the name decides, and nothing is rendered
     later = f"model-sample-performance/{int(perf.SCHEMA.rsplit('/', 1)[1]) + 1}"
-    for name in (later, "kernel-census/2", "model-sample-performance", 2):
+    for name in (later, perf.SCHEMA + "0", "kernel-census/2", "model-sample-performance", 2):
         assert refused({**data, "schema": name}) == refusal.format(repr(name)), name
     assert refused({key: value for key, value in data.items() if key != "schema"}) == refusal.format("None"), "a file that names no schema"
     assert refused([]) == refused({}) == refusal.format("None"), "and what is no report file at all"
