@@ -921,9 +921,7 @@ class TestClusterReduce:
     test_replay_capture_and_golden = staticmethod(_checks.test_replay_capture_and_golden)
     test_warm_refill_stress = staticmethod(_checks.test_warm_refill_stress)
     test_every_launch_reduces_its_own_partials = staticmethod(_checks.test_every_launch_reduces_its_own_partials)
-    test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split = staticmethod(
-        _checks.test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split
-    )
+    test_default_plan_takes_the_form_inside_the_recorded_bound = staticmethod(_checks.test_default_plan_takes_the_form_inside_the_recorded_bound)
     test_explicit_record_outside_the_form_is_declined = staticmethod(_checks.test_explicit_record_outside_the_form_is_declined)
     test_standalone_request_outside_the_form_is_declined = staticmethod(_checks.test_standalone_request_outside_the_form_is_declined)
     test_python_frame_refuses_an_unaligned_workspace = staticmethod(_checks.test_python_frame_refuses_an_unaligned_workspace)

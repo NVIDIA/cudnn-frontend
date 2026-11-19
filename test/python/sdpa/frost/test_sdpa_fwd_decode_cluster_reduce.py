@@ -70,9 +70,11 @@ GRID = [
     for sm in (148, 152)
     for replay in (False, True)
     for s_q in (1, 2, 3, 4, 6, 8)
-    for b in (1, 2, 3, 4, 8, 9, 16, 64)
+    for b in (1, 2, 3, 4, 8, 9, 10, 15, 16, 64)
     for s_kv in (128, 512, 1024, 1536, 1792, 2048, 3072, 4096, 8192, 32768)
 ]
+# The recorded rows of the two parts, and a 152-SM part's one-wave cluster counts (its rows are exactly those).
+ROWS = {(148, 2): 16, (148, 4): 16, (148, 8): 8, (152, 2): 76, (152, 4): 36, (152, 8): 15}
 
 
 def _cell(cell, **overrides):
@@ -158,19 +160,20 @@ def test_contract_predicate_rows(kwargs, reason):
 
 def test_rule_adds_removes_and_reorders_nothing(monkeypatch):
     """Clearing the knob in every listed set gives the list of a tree without the rule, entry for entry: no set appears,
-    disappears or moves, and no split count changes."""
+    disappears or moves, and no split count changes. On both parts with recorded rows, and on each of them something is
+    marked, so the comparison is not empty there."""
     marked = {}
     for cell in GRID:
         marked[cell] = _plans(_cell(cell))
     monkeypatch.setattr(heur, "fused_selected", lambda *_: False)
-    count = 0
+    count = {148: 0, 152: 0}
     for cell in GRID:
         plain = _plans(_cell(cell))
         assert all(not k.cluster_reduce for _, k in plain)
         cleared = [(name, dataclasses.replace(k, cluster_reduce=None)) for name, k in marked[cell]]
         assert cleared == plain, cell
-        count += sum(bool(k.cluster_reduce) for _, k in marked[cell])
-    assert count > 0
+        count[cell[3]] += sum(bool(k.cluster_reduce) for _, k in marked[cell])
+    assert count[148] > 0 and count[152] > 0, count
 
 
 def test_rule_is_pure_and_every_marked_set_is_honoured(monkeypatch):
@@ -193,9 +196,12 @@ def test_rule_is_pure_and_every_marked_set_is_honoured(monkeypatch):
                 # one tile holds the packed rows, and the launch is inside the part's recorded cluster count for this split
                 assert f.s_q * (f.h_q // f.h_kv) <= 16, cell
                 assert 0 < _clusters(f, knobs) <= heur.FUSED_CLUSTER_BOUND[(f.device_sm_count, knobs.split_kv)], cell
-                seen.add((_clusters(f, knobs), knobs.split_kv))
+                seen.add((f.device_sm_count, _clusters(f, knobs), knobs.split_kv))
     # the recorded bounds are reached, and nothing past them is marked
-    assert {(16, 4), (8, 8)} <= seen and all(split in (4, 8) for _, split in seen)
+    assert {(148, 16, 4), (148, 8, 8)} <= seen and all(split in (4, 8) for sm, _, split in seen if sm == 148)
+    # 152 SMs: the rows of 4 and 8 chunks are reached exactly; the existing rules split 2 ways only below that row
+    assert {(152, 36, 4), (152, 15, 8)} <= seen and {split for sm, _, split in seen if sm == 152} == {2, 4, 8}
+    assert max(n for sm, n, split in seen if (sm, split) == (152, 2)) == 72
 
 
 @pytest.mark.parametrize(
@@ -234,23 +240,80 @@ def test_rule_table_on_148_sms(b, s_q, s_kv, replay, split, reduced):
 
 
 @pytest.mark.parametrize(
-    "heads,b,s_q,s_kv,split,reduced",
+    "b,s_q,s_kv,replay,split,reduced",
     [
-        # the rule is about packed rows in one tile and clusters, not about one head ratio
-        ((32, 8), 1, 4, 2048, 8, True),  # 16 rows of four tokens, 8 clusters of 8
-        ((32, 8), 2, 3, 2048, 4, True),  # 16 clusters of 4
-        ((32, 8), 2, 4, 4096, 8, False),  # 16 clusters of 8 are past the recorded 8
-        ((32, 8), 3, 3, 2048, 4, False),  # 24 clusters of 4 are past the recorded 16
-        ((16, 4), 1, 3, 2048, 8, True),  # 12 rows of three tokens, 4 clusters of 8
-        ((8, 1), 1, 1, 2048, 8, True),  # 8 rows, 1 cluster of 8
-        ((8, 1), 8, 2, 2048, 8, True),  # 16 rows of two tokens, 8 clusters of 8
-        ((8, 1), 9, 1, 2048, 8, False),  # 9 clusters of 8
-        ((8, 1), 16, 1, 2048, 4, True),  # 16 clusters of 4
-        ((8, 1), 17, 1, 2048, 4, False),  # 17 clusters of 4
+        # one user: the splits of the existing rules, reduced in the launch as on the other part
+        (1, 1, 1024, False, 1, False),
+        (1, 1, 1536, False, 4, True),
+        (1, 2, 2048, False, 8, True),
+        (1, 1, 3072, False, 8, True),
+        (1, 1, 4096, False, 16, False),  # 16 chunks are past one cluster: two launches as before
+        (1, 2, 1024, True, 4, True),  # a replay-declared graph splits earlier
+        # 8 chunks: one wave holds 15 clusters, so two and three users are marked and four (16 clusters) are not
+        (2, 2, 2048, False, 8, True),
+        (3, 1, 2048, False, 8, True),
+        (3, 2, 2048, False, 8, True),
+        (4, 1, 2048, False, 8, False),
+        (4, 2, 2048, False, 8, False),
+        (4, 1, 3072, False, 8, False),
+        # 4 chunks: one wave holds 36 clusters, so four to nine users are marked and ten (40 clusters) are not
+        (4, 2, 1536, False, 4, True),
+        (4, 1, 2560, False, 4, True),
+        (5, 1, 2048, False, 4, True),
+        (8, 1, 2048, False, 4, True),
+        (9, 1, 2048, False, 4, True),
+        (9, 2, 2048, False, 4, True),
+        (10, 1, 8192, False, 4, False),
+        # 2 chunks: one wave holds 76 clusters, and the existing rules split 2 ways up to 72
+        (9, 1, 1792, False, 2, True),
+        (10, 1, 2048, False, 2, True),
+        (16, 1, 8192, False, 2, True),
+        (18, 1, 8192, False, 2, True),
+        # unsplit plans have nothing to reduce
+        (12, 1, 2048, False, 1, False),
+        (64, 1, 2048, False, 1, False),
     ],
 )
-def test_rule_table_for_other_head_ratios(heads, b, s_q, s_kv, split, reduced):
-    lead = _lead_swap_ab(facts(b, s_q, s_kv, 148, heads=heads))
+def test_rule_table_on_152_sms(b, s_q, s_kv, replay, split, reduced):
+    """The measured part: each row is the count of clusters of that size one wave holds, so the marked plans are the ones
+    whose clusters are all resident at once, and one cluster more keeps two launches."""
+    lead = _lead_swap_ab(facts(b, s_q, s_kv, 152, replay))
+    assert lead.pack_gqa and (lead.split_kv, bool(lead.cluster_reduce)) == (split, reduced)
+
+
+@pytest.mark.parametrize(
+    "sm,heads,b,s_q,s_kv,split,reduced",
+    [
+        # the rule is about packed rows in one tile and clusters, not about one head ratio
+        (148, (32, 8), 1, 4, 2048, 8, True),  # 16 rows of four tokens, 8 clusters of 8
+        (148, (32, 8), 2, 3, 2048, 4, True),  # 16 clusters of 4
+        (148, (32, 8), 2, 4, 4096, 8, False),  # 16 clusters of 8 are past the recorded 8
+        (148, (32, 8), 3, 3, 2048, 4, False),  # 24 clusters of 4 are past the recorded 16
+        (148, (16, 4), 1, 3, 2048, 8, True),  # 12 rows of three tokens, 4 clusters of 8
+        (148, (8, 1), 1, 1, 2048, 8, True),  # 8 rows, 1 cluster of 8
+        (148, (8, 1), 8, 2, 2048, 8, True),  # 16 rows of two tokens, 8 clusters of 8
+        (148, (8, 1), 9, 1, 2048, 8, False),  # 9 clusters of 8
+        (148, (8, 1), 16, 1, 2048, 4, True),  # 16 clusters of 4
+        (148, (8, 1), 17, 1, 2048, 4, False),  # 17 clusters of 4
+        # 152 SMs: 15 clusters of 8, 36 of 4 and 76 of 2 are one wave
+        (152, (32, 8), 1, 4, 2048, 8, True),  # 8 clusters of 8
+        (152, (32, 8), 2, 1, 2048, 8, False),  # 16 clusters of 8, one past the wave
+        (152, (32, 8), 2, 3, 2048, 4, True),  # 16 clusters of 4
+        (152, (32, 8), 5, 1, 8192, 4, False),  # 40 clusters of 4
+        (152, (32, 8), 9, 1, 8192, 2, True),  # 72 clusters of 2
+        (152, (16, 4), 1, 3, 2048, 8, True),  # 12 rows of three tokens, 4 clusters of 8
+        (152, (16, 4), 9, 3, 2048, 4, True),  # 36 clusters of 4, the row
+        (152, (8, 1), 1, 1, 2048, 8, True),  # 1 cluster of 8
+        (152, (8, 1), 15, 1, 2048, 8, True),  # 15 clusters of 8, the row
+        (152, (8, 1), 15, 2, 2048, 8, True),  # the same with 16 rows of two tokens
+        (152, (8, 1), 16, 1, 2048, 8, False),  # one cluster more
+        (152, (8, 1), 36, 1, 2048, 4, True),  # 36 clusters of 4, the row
+        (152, (8, 1), 37, 1, 2560, 4, False),  # one cluster more
+        (152, (8, 1), 64, 1, 4096, 2, True),  # 64 clusters of 2
+    ],
+)
+def test_rule_table_for_other_head_ratios(sm, heads, b, s_q, s_kv, split, reduced):
+    lead = _lead_swap_ab(facts(b, s_q, s_kv, sm, heads=heads))
     assert lead.pack_gqa and (lead.split_kv, bool(lead.cluster_reduce)) == (split, reduced)
 
 
@@ -304,13 +367,19 @@ def test_form_needs_a_head_width_of_whole_warps():
 
 def test_recorded_cluster_bound_steers_the_rule(monkeypatch):
     """A part or a split count without a recorded row is never marked; a row admits up to its count and nothing else moves."""
-    assert heur.FUSED_CLUSTER_BOUND == {(148, 2): 16, (148, 4): 16, (148, 8): 8}
+    assert heur.FUSED_CLUSTER_BOUND == ROWS
     assert [heur.fused_cluster_bound(148, s) for s in (2, 3, 4, 8, 16)] == [16, 0, 16, 8, 0]
-    assert [heur.fused_cluster_bound(sm, 8) for sm in (152, 1000)] == [0, 0]
-    for sm in (152, 1000):
+    assert [heur.fused_cluster_bound(152, s) for s in (2, 3, 4, 8, 16)] == [76, 0, 36, 15, 0]
+    assert [heur.fused_cluster_bound(sm, 8) for sm in (132, 1000)] == [0, 0]
+    for sm in (132, 1000):
         for cell in GRID:
             f = _cell(cell[:3] + (sm,) + cell[4:])
             assert all(not k.cluster_reduce for _, k in _plans(f)), (sm, cell)
+    # 152 SMs: a set at the row's count is marked and the same set with one cluster more is not, for each split of the form
+    for split, row in ((2, 76), (4, 36), (8, 15)):
+        knobs = SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, sched_policy=0, pack_gqa=True, split_kv=split)
+        assert [heur.fused_selected(facts(b, 1, 2048, 152, heads=(8, 1)), knobs) for b in (1, row, row + 1)] == [True, True, False], split
+    assert not heur.fused_selected(facts(1, 1, 2048, 152), SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, sched_policy=0, pack_gqa=True, split_kv=3))
     # a raised row admits what the recorded one holds back
     assert (_lead_swap_ab(facts(4, 1, 3072)).split_kv, _lead_swap_ab(facts(4, 1, 3072)).cluster_reduce) == (8, None)
     monkeypatch.setattr(heur, "FUSED_CLUSTER_BOUND", {**heur.FUSED_CLUSTER_BOUND, (148, 8): 16})
@@ -340,6 +409,28 @@ def test_rule_proposes_nothing_off_the_verified_part():
         f = _cell(cell, cc=(10, 3))
         assert all(not k.cluster_reduce for _, k in _plans(f)), cell
     assert not heur.fused_selected(facts(sm=0), SdpaFwdKnobs(tile_m=16, pack_gqa=True, split_kv=8))
+
+
+def test_rows_of_152_sms_mark_nothing_on_another_compute_capability():
+    """152 SMs is also the SM count of compute capability 10.3 parts, and the table's key is (SM count, split). The form's
+    own domain carries the capability: every set the rows mark on a 10.0 device stays unmarked on a 10.3 device with the
+    same SM count, the rule answers no for it, and the row declines the knob there by name."""
+    caps = SPECS[SWAP_AB].capabilities
+    marked = set()
+    for cell in GRID:
+        if cell[3] != 152:
+            continue
+        lead = _lead_swap_ab(_cell(cell))
+        if lead is None or not lead.cluster_reduce:
+            continue
+        marked.add(lead.split_kv)
+        other = _cell(cell, cc=(10, 3))
+        assert other.device_sm_count == 152 and all(not k.cluster_reduce for _, k in _plans(other)), cell
+        assert not heur.fused_selected(other, dataclasses.replace(lead, cluster_reduce=None)), cell
+        assert "verified on compute capability 10.0 only" in engines.mismatch(caps, other, lead), cell
+        # the two-launch set of the same split is still served there
+        assert engines.mismatch(caps, other, dataclasses.replace(lead, cluster_reduce=None)) is None, cell
+    assert marked == {2, 4, 8}
 
 
 def _function(tree, name):
