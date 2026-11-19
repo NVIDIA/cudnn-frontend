@@ -8565,8 +8565,8 @@ review and integration CI remain separate from this bounded packet.
 
 ### SM107 D256 per-tensor FP8 two-warpgroup body — 2026-11-19
 
-The two-warpgroup D256 per-tensor FP8 body (Q resident in TMEM, two softmax
-warpgroups on alternating KV steps) is selected through the standalone adapter
+The two-warpgroup D256 per-tensor FP8 body (Q resident in TMEM, one softmax
+warpgroup per KV-step parity) is selected through the standalone adapter
 on an explicit `cga=2` with `softmax_precision=HALF`; the public record keeps
 `cga=1`. `TestMidFp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py`
 gained the admission test (route assertion, declines, default width), the

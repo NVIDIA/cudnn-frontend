@@ -340,12 +340,22 @@ def test_d256_pair_refilled_stage_warm_stress():
     )
 
 
-@pytest.mark.parametrize("dtype_name", ["e4m3", "e5m2"])
-@pytest.mark.parametrize("mask", ["dense", "causal"])
-def test_d256_pair_release_dependence(tmp_path, dtype_name, mask):
+_PAIR_RENDERINGS = {
+    "e4m3-dense-bf16-stats": ("e4m3", "dense", "bf16", "lse"),
+    "e5m2-dense-bf16-stats": ("e5m2", "dense", "bf16", "lse"),
+    "e4m3-causal-bf16-stats": ("e4m3", "causal", "bf16", "lse"),
+    "e5m2-causal-bf16-stats": ("e5m2", "causal", "bf16", "lse"),
+    "e4m3-bottom-right-fp16-nostats": ("e4m3", "bottom_right", "fp16", "nolse"),
+    "e5m2-dense-e4m3-stats": ("e5m2", "dense", "e4m3", "lse"),
+}
+
+
+@pytest.mark.parametrize("rendering", list(_PAIR_RENDERINGS))
+def test_d256_pair_release_dependence(tmp_path, rendering):
     """Every shared-memory slot credit of the two-warpgroup body (alpha, running max, final stats) is an arrive whose address
     depends on the loaded words through the release-zero argument (Rule 11), pinned on the PTX of a fresh compile of each
-    shipped rendering (both FP8 input types, dense and causal)."""
+    rendering family: both FP8 input types, dense / causal / bottom-right causal, BF16 / FP16 / FP8 output, with and without Stats."""
+    dtype_name, mask, out_name, lse_name = _PAIR_RENDERINGS[rendering]
     import os
     from pathlib import Path
     import subprocess
@@ -363,14 +373,17 @@ def test_d256_pair_release_dependence(tmp_path, dtype_name, mask):
         import cudnn, torch
         assert Path(cudnn.__file__).resolve().parent.parent == Path(sys.argv[1]).resolve()
         from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-        dtype = torch.float8_e4m3fn if sys.argv[3] == "e4m3" else torch.float8_e5m2
+        dtype_name, mask, out_name, lse_name = sys.argv[3:7]
+        dtype = torch.float8_e4m3fn if dtype_name == "e4m3" else torch.float8_e5m2
+        out_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "e4m3": torch.float8_e4m3fn}[out_name]
         q8 = torch.zeros(1, 1, 256, 256, device="cuda", dtype=dtype)
         k8 = torch.zeros(1, 1, 256, 256, device="cuda", dtype=dtype)
-        out = torch.empty(1, 1, 256, 256, device="cuda", dtype=torch.bfloat16)
-        lse = torch.empty(1, 1, 256, device="cuda", dtype=torch.float32)
+        out = torch.empty(1, 1, 256, 256, device="cuda", dtype=out_dtype)
+        lse = torch.empty(1, 1, 256, device="cuda", dtype=torch.float32) if lse_name == "lse" else None
         api = SdpaFwdDslSm100(
             sample_q=q8, sample_k=k8, sample_v=k8, sample_o=out, sample_lse=lse, scale_softmax=256**-0.5,
-            pertensor_fp8=True, has_amax_o=False, cga=2, softmax_precision=cudnn.data_type.HALF, is_causal=sys.argv[4] == "causal",
+            pertensor_fp8=True, has_amax_o=False, cga=2, softmax_precision=cudnn.data_type.HALF,
+            is_causal=mask != "dense", causal_bottom_right=mask == "bottom_right",
         )
         assert api.check_support()
         api.compile()
@@ -386,7 +399,11 @@ def test_d256_pair_release_dependence(tmp_path, dtype_name, mask):
         CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0",
     )
     result = subprocess.run(
-        [sys.executable, "-c", source, str(source_root), str(test_root), dtype_name, mask], env=env, capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", source, str(source_root), str(test_root), dtype_name, mask, out_name, lse_name],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     bodies = [p.read_text() for p in tmp_path.glob("*.ptx") if "tcgen05.mma" in p.read_text()]
