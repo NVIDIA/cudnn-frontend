@@ -171,7 +171,7 @@ barrier, no warp shuffle and no shared memory. The global scale is read in front
 
 | question | answer |
 | --- | --- |
-| device | compute capability 10.x; validated on cc 10.0. The kernel's rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets: cc 10.3 and cc 10.7 are admitted on that basis and have not run on a device, and any other 10.x minor is admitted by the range alone. 9.0 and 12.x are declined by type |
+| device | compute capability 10.x; validated on cc 10.0. The kernel's rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets, and from the kernel's entry on the `sm_103a` and `sm_107a` renderings are the `sm_100a` text: cc 10.3 and cc 10.7 are admitted on that basis and have not run on a device, and any other 10.x minor is admitted by the range alone. 9.0 and 12.x are declined by type |
 | rows | 1 .. 1024 per call (runtime argument); 1025 and up declined by name. Six thread blocks of 320 threads share an SM, so one scheduling wave holds 888 rows on a 148-SM part and 1,272 on a 212-SM part: the 1024-row call crosses a wave on a part of at most 170 SMs, and no served call does on a 212-SM part. The kernel holds no state between thread blocks |
 | width | 5120, fixed at construction; another multiple of 512 up to 16384 is declined by name |
 | forms | one kernel body; three launch arms (plain, wait, wait + release) |
@@ -181,7 +181,8 @@ barrier, no warp shuffle and no shared memory. The global scale is read in front
 | DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 both compiler flavours of the DSL (CUDA 12.9 and CUDA 13.4) assemble the kernel and are served; on cc 10.0 both ran under CuTe DSL 4.8.0 and 4.8.1 and wrote the same bytes. On cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT). Other DSL versions are served unverified |
 
 Tests: `test/python/row_quantize/frost/test_row_quantize_fp4_decode.py` (host declines, the config's limits and tables, the
-rendering pinned per target with the compiled kernel's operand wiring and tied to the entry's own launch arguments, the
+rendering pinned per target with the byte every global load and store addresses and the compiled kernel's operand wiring, and
+tied to the entry's own launch arguments, the scale positions against the layout a block-scaled FP4 multiply reads, the
 launch facts against the configuration arithmetic and against the profiler's record of a launch, the device cells against
 the references above under eleven global scales, the scale byte of every finite bf16 block maximum, the exact cells, the
 equality with the NVFP4 form of the add + RMSNorm + quantize step, blocks with a NaN or an infinity, output ownership, the

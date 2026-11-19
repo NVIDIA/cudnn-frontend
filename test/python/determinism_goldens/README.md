@@ -3656,6 +3656,24 @@ under each of 4.8.0 / CUDA 13.4, 4.8.0 / CUDA 12.9 and 4.8.1 / CUDA 13.4 are tho
 sdpa/frost/test_tile_dsl_quant_helpers.py norm/frost core/frost/test_frost_kernel_name_prefix.py core/test_import_boundaries.py -m L0
 -q -ra` on that host under 4.8.0 with CUDA 13.4: 253 passed, 231 skipped (the device cases).
 
+Re-run on the same part and runtimes (2026-11-19 UTC), from a clean tree with the files of this change as they stand before this
+text.  Since the record above the
+module gained three cases that need no device (the `sm_103a` and the `sm_107a` rendering are the `sm_100a` text; the scale positions
+against the layout a block-scaled FP4 multiply reads), its rendering cases evaluate the byte every global access addresses, and its
+reference holds a block whose global scale and stored scale are powers of two to ONE code.  The kernel did not change: its 36
+renderings (four targets with the CUDA 13.4 compiler and two with CUDA 12.9, three launch arms, CuTe DSL 4.8.0 and 4.8.1) are
+byte-identical cubins to those of the record above (18 distinct).  CuTe DSL 4.8.0 with CUDA 13.4: the strict determinism command ->
+20 passed, 0 skipped; the functional command -> 130 passed, 1 skipped (the two-device case): the module 125 passed, the symbol-prefix
+test 5 passed; the helpers' cases 43 passed.  CuTe DSL 4.8.0 with CUDA 12.9: strict -> 20 passed, 0 skipped against the SAME set;
+functional -> 128 passed, 3 skipped (the `sm_107a` rendering case and the `sm_107a` text case, each with the entry's own decline; the
+two-device case); the helpers' cases 42 passed, 1 skipped.  CuTe DSL 4.8.1 with CUDA 13.4: functional -> 130 passed, 1 skipped; the
+determinism suite checked strictly against the 4.8.1 record of 2026-11-18 -> 20 passed, 0 skipped.  CuTe DSL 4.8.1 with CUDA 12.9:
+functional -> 128 passed, 3 skipped; strict against the same 4.8.1 record -> 20 passed, 0 skipped; the helpers' cases
+42 passed, 1 skipped.  The measured lines are those of the record above (launch facts 9 of 9 cells equal; the wait
+case 8 of 8 launches behind a control seen in 4 of 4 eager launches and 4 of 4 replays; the same two-code counts per global scale; no
+code outside its bracket and none in an exact block that is not the one code); the three `sm_100a` cubins each run compiled are the
+host's renderings.  The host command above: 256 passed, 231 skipped.
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
