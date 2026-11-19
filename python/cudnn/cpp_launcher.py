@@ -76,7 +76,7 @@ _capturing = threading.Lock()  # one recording at a time: it patches the DSL's c
 _NOT_REPLAYED = object()  # the recording does not apply to this call: run the function
 _DECLINED = -1  # a signature whose call could not be recorded
 _MISSING = object()  # a parameter the call leaves out and that has no default
-_VALUES = frozenset({bool, int, float, str, type(None)})  # argument types keyed by value
+_VALUES = frozenset({bool, int, str, type(None)})  # argument types keyed by value
 _TENSORS = set()  # torch.Tensor and torch.nn.Parameter, once torch is loaded
 _EMPTY = {"empty", "empty_strided", "empty_like", "new_empty", "new_empty_strided"}
 _FILL_VALUES = {"zeros": 0, "zeros_like": 0, "new_zeros": 0, "ones": 1, "ones_like": 1, "new_ones": 1}
@@ -240,6 +240,8 @@ def _key(values, env, stream):
 
 
 def _item(v):
+    if isinstance(v, float):
+        return v or repr(v)  # 0.0 == -0.0, and they are different arguments
     if isinstance(v, _torch.Tensor):
         return (v.dtype, v.shape, v.stride(), v.device)
     if _stream_like(v):
@@ -561,7 +563,7 @@ class _Capture:
             where, offset = place(int(v))
             return {"int": int(v)} if where is None else {"where": where, "offset": offset, "as": "int"}
         if isinstance(v, Real):
-            return {"float": float_bits(v)}
+            return {"float_bits": float_bits(v)}
         if isinstance(v, tvm_ffi.Tensor) or hasattr(cls, "__tvm_ffi_object__"):
             obj = v if isinstance(v, tvm_ffi.Tensor) else v.__tvm_ffi_object__()
             if not isinstance(obj, tvm_ffi.Tensor):
@@ -578,7 +580,7 @@ class _Capture:
         if hasattr(cls, "__tvm_ffi_int__"):
             return {"int": int(v.__tvm_ffi_int__())}
         if hasattr(cls, "__tvm_ffi_float__"):
-            return {"float": float_bits(v.__tvm_ffi_float__())}
+            return {"float_bits": float_bits(v.__tvm_ffi_float__())}
         raise _Decline(f"a kernel argument {cls.__name__}")
 
     def tensor(self, t, place):

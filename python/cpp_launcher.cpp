@@ -272,7 +272,7 @@ class Launcher {
     //    "steps": [step, ...]}, a step being
     //   {"memset": {"slot": s, "offset": o, "width": 1 | 2 | 4, "value": v, "count": n}}  or
     //   {"function": i, "args": [arg, ...]}, an arg being
-    //     null, {"int": v}, {"float": bits of the double}, {"bool": v} constants
+    //     null, {"int": v}, {"float_bits": the bits of the double}, {"bool": v} constants
     //     {"stream": true}                                             the stream
     //     {"slot": s, "offset": o, "as": "tensor" | "int" | "pointer",
     //      "dim": [...], "stride": [...], "dtype": [code, bits, lanes]} an address in a slot; slot -1 is the null
@@ -329,8 +329,8 @@ class Launcher {
                     step.proto[i] = any(ffi::kInt, a.at("int").get<int64_t>());
                 } else if (a.contains("bool")) {
                     step.proto[i] = any(ffi::kBool, a.at("bool").get<bool>());
-                } else if (a.contains("float")) {
-                    step.proto[i] = any(ffi::kFloat, a.at("float").get<int64_t>());
+                } else if (a.contains("float_bits")) {
+                    step.proto[i] = any(ffi::kFloat, a.at("float_bits").get<int64_t>());
                 } else if (a.contains("stream")) {
                     step.binds.push_back(Bind{As::STREAM, static_cast<int>(i)});
                 } else {
