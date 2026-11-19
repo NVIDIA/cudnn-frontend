@@ -201,6 +201,10 @@ class SparseAttentionForwardSm100Head64:
         # compatibility cp.async path keeps its proven two-stage allocation
         # and schedule.
         self.num_kv_stages = 3 if self.use_tma_gather4 else 2
+        # The persistent gather4 schedule stages the next query's Q in the KV
+        # stage of its tile 1 while the current query's O occupies the stage
+        # of its last tile; with fewer than three stages they are the same.
+        assert not self.use_tma_gather4 or self.num_kv_stages == 3, "the persistent gather4 schedule needs three KV stages"
         self.num_tail_stages = 1 if self.use_tma_gather4 else self.num_kv_stages
         self.num_kv_parts = 2
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.THREADS_PER_CTA)
