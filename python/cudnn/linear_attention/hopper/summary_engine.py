@@ -112,6 +112,15 @@ class KdaSummaryHopperPlan(CompiledPlan):
     def get_workspace_size(self):
         return 0
 
+    def _launch(self, params, x, spans, variant_pack, ctx):
+        del spans, variant_pack
+        from ..cake import compiler
+
+        groups = 16 if "transition" in x else 8
+        if self.seqs:
+            with device_context(self.device):
+                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (512, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
+
     def execute(self, graph, variant_pack, ctx):
         from ..cake import compiler
 
@@ -174,10 +183,7 @@ class KdaSummaryHopperPlan(CompiledPlan):
             for stride in strides:
                 params.i64(stride)
         params.i32(self.heads).i32(int(self.cu64)).f32(self.scale)
-        groups = 16 if "transition" in x else 8
-        if self.seqs:
-            with device_context(self.device):
-                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (512, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
+        self._launch(params, x, spans, variant_pack, ctx)
 
 
 class KdaSummaryHopperCudaEngine(BaseEngine):
