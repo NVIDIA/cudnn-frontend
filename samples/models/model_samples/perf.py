@@ -27,9 +27,16 @@ this order:
 launch call and ``t_token`` when its ids are on the host.  Between two host reads are the step's launch calls, its
 kernels, the one host read and keeping the ids in a list; inside the time to first token are render, tokenize, the copy
 of the ids, the prompt's decode steps and the first host read.  Everything else of a run is outside every statistic.
-``DEFINITIONS`` holds the one definition of every statistic; the file carries each beside its number.  The GPU side of a
-step (GPU busy, and what a step spends between its launches) is not taken from the traced request in this version: the
-``step`` line says so.
+``DEFINITIONS`` holds the one definition of every statistic; the file carries each beside its number.
+
+**The GPU side** comes from the launch records of the traced request and never from a timed one.  GPU busy of a step is
+the union of the intervals of its kernel and copy records (``timing.step_facts``); the step less GPU busy and less the
+loop's own host time is its launch overhead (``step_split``), printed as a term of the ``step`` line only where it is
+larger than GPU busy, which is taken under the profiler and is an upper bound.  The per-kernel table (``kernel_table``)
+gives every row the time its launches add to the GPU's timeline (``added_ms``): a row is a block, found by its place in
+the wiring by the kernel check's own walk (``census.Row``), and the blocks on fallback rows that no exact kernel
+separates are one row.  The added times of a step partition the union, so the rows sum to GPU busy.  A step launched
+from Python says so over its table: a kernel's time there is not its time inside a captured sequence.
 
 **What a run may call itself** (``record_class``).  A run is a ``controlled`` run only when it observed every condition
 itself -- a checkpoint, every block on a claimed target kernel, a captured launch sequence, the three statements of its
@@ -42,6 +49,7 @@ baseline and no figure of another GPU class.
 from __future__ import annotations
 
 import ctypes
+import decimal
 import gc
 import hashlib
 import json
@@ -56,7 +64,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import census, tie_out
-from .timing import now
+from .timing import now, step_facts
 
 SCHEMA = "model-sample-performance/1"
 WIDTH = 110  # of the screen: no line is wider
@@ -68,6 +76,9 @@ UNOBSERVED = "this version does not observe the GPU"
 NOT_COMPUTED = "the timed requests did not compute the checked request's tokens"
 CLOCK = "time.perf_counter, one process"  # of every statistic that is taken from stamps
 NOT_THE_PLAN = "the kernels of the traced steps are not the plan's"
+LABEL = 58  # of the per-kernel table: the widest name of a row
+#: what the per-kernel table of a step launched from Python says of itself
+FROM_PYTHON = "launched from Python: not the time of a kernel inside a captured sequence"
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
 DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
@@ -115,16 +126,41 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
         "ms",
         (
             "The median token-to-token interval over the timed steps at the positions the traced request covers, all timed requests. Equal to the median of the"
-            " token-to-token interval when the whole request is traced. This version does not take GPU busy from the traced request, so the step is not taken "
-            "apart."
+            " token-to-token interval when the whole request is traced."
         ),
         "A serving engine's step is not measured directly: it is its time per output token, times the kept tokens per step with draft tokens.",
+    ),
+    "gpu_busy": (
+        "ms",
+        (
+            "Per traced step: the length of the union of the intervals of every kernel and copy between two host reads, from the profiler's kernel activity "
+            "records; the median over the traced steps. An upper bound: tracing lengthens kernels."
+        ),
+        "The same method as the kernel-busy sum of a traced serving step.",
     ),
     "host": (
         "ms",
         (
             "From a token's ids on the host to the next step's first launch call: the loop's own work (keeping the ids); the median over the timed steps at the"
             " traced positions."
+        ),
+        None,
+    ),
+    "launch_overhead": (
+        "ms",
+        (
+            "step - GPU busy - host: time inside a step in which the GPU waited for the next launch, or the host for the read. Printed as a term of the step "
+            "only where it is larger than GPU busy; otherwise the line says that launch overhead and host are not resolved by this method, because GPU busy is "
+            "taken under the profiler and is an upper bound. The file holds the remainder as computed, which can be negative, and the launch overhead per "
+            "block call."
+        ),
+        None,
+    ),
+    "tracing_stretch": (
+        "%",
+        (
+            "The median time from a step's first launch to its ids on the host in the traced request, divided by the same in the timed requests at the same "
+            "positions, minus 1."
         ),
         None,
     ),
@@ -144,6 +180,35 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "also counts the kernels and copies a step launches beside them."
         ),
         "The verdict of a kernel census.",
+    ),
+    "kernel_launches": (
+        "launches",
+        (
+            "Of a row of the per-kernel table: the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median "
+            "per step."
+        ),
+        "The kernel census of a traced serving step.",
+    ),
+    "kernel_time_per_launch": (
+        "us",
+        (
+            "Of a row: the time a launch adds to the GPU's timeline -- its end minus the later of its start and the latest end of any earlier record of the "
+            "step, not below zero; the median over the row's launches in all traced steps. It needs time stamps finer than a microsecond: the file records "
+            "the resolution found, and where the profiler hands over whole microseconds the column is not printed. The file also holds the median recorded "
+            "duration."
+        ),
+        (
+            "The same method as the timeline-exclusive duration of a per-kernel analysis of a traced serving step; comparable only on one GPU class, SM count, "
+            "clock and launch path."
+        ),
+    ),
+    "kernel_time_per_step": (
+        "ms",
+        (
+            "Of a row: per traced step the sum of the row's added times, the median over the steps; its share is that over GPU busy. Within one step the "
+            "added times of all records sum exactly to that step's GPU busy."
+        ),
+        "The same shares as in a per-kernel analysis of a traced serving step.",
     ),
     "memory": (
         "GiB",
@@ -231,6 +296,10 @@ class Request:
         """Per forced step: from the ids of the token before on the host to the step's first launch call."""
         return [(launch - read) * 1e3 for read, launch in zip([self.t_first, *self.t_token], self.t_launch)]
 
+    def in_step_ms(self) -> List[float]:
+        """Per forced step: from its first launch call to its ids on the host."""
+        return [(token - launch) * 1e3 for launch, token in zip(self.t_launch, self.t_token)]
+
     def time_per_output_token_ms(self) -> float:
         """(last token on the host - first new token on the host) / (new tokens - 1): the request has one new token more
         than forced steps."""
@@ -262,6 +331,120 @@ def summary(samples: Sequence[float]) -> dict:
         "p90": nearest_rank(samples, 90),
         "p99": nearest_rank(samples, 99),
     }
+
+
+def step_split(step_ms: float, host_ms: float, busy_ms: Optional[float], untraced_ms: float = 0.0, traced_ms: float = 0.0) -> dict:
+    """What the ``step`` line takes a step apart into, from the step and the loop's host time at the traced positions and
+    GPU busy of the traced steps (``None``: not measured).  ``remainder_ms`` = step - GPU busy - host, as computed: GPU
+    busy is taken under the profiler and is an upper bound, so the remainder can be negative.  ``resolved``: whether
+    launch overhead is printed as a term of the step -- only where the remainder is larger than GPU busy.  ``stretch``:
+    the time from a step's first launch to its ids on the host in the traced request (``traced_ms``) over the same in
+    the timed requests (``untraced_ms``), minus 1; ``None`` where it cannot be formed."""
+    if busy_ms is None:
+        return {"remainder_ms": None, "resolved": False, "stretch": None}
+    remainder = step_ms - busy_ms - host_ms
+    return {"remainder_ms": remainder, "resolved": remainder > busy_ms, "stretch": traced_ms / untraced_ms - 1 if untraced_ms > 0 else None}
+
+
+def added_ms(step: Sequence[census.Launch]) -> List[float]:
+    """Per launch record of a traced step, in start order: the time the record adds to the GPU's timeline, in ms -- its end
+    minus the later of its start and the latest end of any earlier record of the step, not below zero.  The added times
+    of a step partition the union of its records' intervals: a stretch in which two records run is counted once, for
+    the one that started first, and the sum is the step's GPU busy."""
+    added, reach = [], None
+    for record in step:
+        begin = record.start if reach is None or record.start > reach else reach
+        added.append(max(record.end - begin, 0.0))
+        reach = record.end if reach is None or record.end > reach else reach
+    return added
+
+
+def _recorded_us(record: census.Launch) -> float:
+    """The duration of a launch record in microseconds as the trace holds it; of a record that carries none (it was not
+    read from a trace) its end less its start, to the nanosecond."""
+    return record.duration if record.duration is not None else round((record.end - record.start) * 1e3, 3)
+
+
+def time_resolution_us(steps: Sequence[Sequence[census.Launch]]) -> Optional[float]:
+    """The resolution of the profiler's time stamps as the launch records of the traced steps show it, in microseconds:
+    one over ten to the most decimals of a microsecond that a recorded duration has -- 1.0 where every duration is a
+    whole number of microseconds.  ``None`` where there is no record."""
+    durations = {_recorded_us(record) for step in steps for record in step}
+    places = [-decimal.Decimal(repr(duration)).normalize().as_tuple().exponent for duration in durations]
+    return 10.0 ** -max(0, *places) if places else None
+
+
+def _row_label(row: census.Row, relations: Sequence[str]) -> str:
+    """The name of a row of the per-kernel table: its block; for the blocks of a wiring gap their names, with ``(one row)``
+    where they are several, behind what the row is -- ``not yet:`` where the census of the target kernel set says so
+    of one of its block calls (``relations``: the identities of the row's calls), ``fallback:`` where no identity is
+    stated, ``host path:`` for host blocks alone."""
+    if row.relation == "read":
+        return "host read"
+    if row.relation == "exact":
+        return (row.blocks[0] + (" (declared stand-in)" if census.STAND_IN in relations else ""))[:LABEL]
+    prefix = "host path: " if row.relation == "host" else ("not yet: " if census.NOT_YET in relations else "fallback: ")
+    names = " + ".join(row.blocks) + (" (one row)" if len(row.blocks) > 1 else "")
+    if len(prefix + names) > LABEL:
+        names = f"{row.blocks[0]} + {len(row.blocks) - 1} more (one row)"
+    return (prefix + names)[:LABEL]
+
+
+def kernel_table(traced: Optional[census.Traced], busy: Sequence[float], unobserved: str = "") -> dict:
+    """The file's ``per_kernel`` section: per row of the walk's table (``census.Row``) what its launch records are and what
+    they add to the GPU's timeline, over the traced steps.  ``busy``: GPU busy of every traced step, in ms.  A table is
+    made only of a pass whose kernel check holds: where a record has no row (the check failed), or nothing was observed
+    (``unobserved``: why), ``rows`` is ``None`` and ``reason`` says why no table is printed."""
+    table = {"launch_path": "python", "launch_path_note": FROM_PYTHON, "us_per_launch_printed": False, "reason": None, "rows": None}
+    if traced is None or traced.status != PASS or traced.result is None or not busy:
+        failed = traced is not None and traced.status == FAIL
+        return {**table, "reason": NOT_THE_PLAN if failed else f"the kernels of the traced steps were not observed ({unobserved or 'no launch record'})"}
+    rows, steps, sites = traced.result.table, traced.steps, traced.sites
+    kernels, copied, ms = ([[] for _ in rows] for _ in range(3))  # per row: its kernels, its copies and its added ms in every traced step
+    added, recorded = ([[] for _ in rows] for _ in range(2))  # per row: the added and the recorded time of every launch, in us
+    copies: Dict[Tuple[str, str], bool] = {}  # (kind, name) of a record -> whether the kernel check counts it as a copy
+    for step, held in zip(steps, traced.result.attributed):
+        totals = [[0, 0, 0.0] for _ in rows]  # kernels, copies, added ms of this step
+        for record, row, adds in zip(step, held, added_ms(step)):
+            copy = copies.setdefault((record.kind, record.name), census.canonical(record) == census.COPY)
+            totals[row][1 if copy else 0] += 1
+            totals[row][2] += adds
+            added[row].append(adds * 1e3)
+            recorded[row].append(_recorded_us(record))
+        for row, (launched, copy, adds) in enumerate(totals):
+            kernels[row].append(launched)
+            copied[row].append(copy)
+            ms[row].append(adds)
+    stated = traced.claim is not None and traced.claim.known
+    identities = [traced.claim.identities[index - traced.first] if stated and index >= traced.first else None for index in range(len(sites))]
+    gpu_busy, median, resolution = statistics.median(busy), statistics.median, time_resolution_us(steps)
+    made = []
+    for number, row in enumerate(rows):
+        blocks = []
+        for name in row.blocks:
+            calls = [index for index in row.sites if sites[index].block == name]
+            identity = "; ".join(dict.fromkeys(identities[index].text() for index in calls if identities[index] is not None))
+            blocks.append({"block": name, "calls_per_step": len(calls), "entry": sites[calls[0]].entry, "identity": identity or None})
+        exact = row.relation == "exact"
+        shapes = Counter((r.name, r.grid, r.block, r.shared_memory) for r, at in zip(steps[0], traced.result.attributed[0]) if exact and at == number)
+        made.append(
+            {
+                "label": _row_label(row, [identities[index].relation for index in row.sites if identities[index] is not None]),
+                "relation": row.relation,
+                "blocks": blocks,
+                "launches_per_step": median([k + c for k, c in zip(kernels[number], copied[number])]),
+                "planned_launches_per_step": sum(k.launches for index in row.sites for k in sites[index].kernels if k.relation == "exact") if exact else None,
+                "kernels_per_step": median(kernels[number]),
+                "copies_per_step": median(copied[number]),
+                "us_per_launch_added": median(added[number]) if added[number] else None,
+                "us_per_launch_recorded": median(recorded[number]) if recorded[number] else None,
+                "ms_per_step": median(ms[number]),
+                "ms_per_step_mean": statistics.fmean(ms[number]),
+                "share_percent": median(ms[number]) / gpu_busy * 100 if gpu_busy > 0 else None,
+                "launch_shapes": [dict(zip(("symbol", "grid", "block", "shared_memory", "launches"), (*shape, n))) for shape, n in shapes.items()] or None,
+            }
+        )
+    return {**table, "us_per_launch_printed": resolution is not None and resolution < 1.0, "rows": made}
 
 
 def record_class(
@@ -428,19 +611,63 @@ def screen(data: dict, unwritten: str = "") -> List[str]:
     prompt = protocol["prompt"]["tokens"]
     route = f"({prompt} decode steps: this sample has no prefill kernel)"
     lines += _wrapped("time to first token", f"{prefix}{stats['time_to_first_token']['value']:.1f}  ms for a {prompt}-token prompt {route}")
-    covered = "over every timed step"
-    if traced["steps"] == 1:
-        covered = f"at the traced position, {traced['first_position']}"
-    elif traced["steps"]:
-        covered = f"at the {traced['steps']} traced positions, {traced['first_position']} to {traced['last_position']}"
-    lines += _wrapped("step", f"{prefix}{stats['step']['value']:.3f}  ms {covered}; GPU busy not measured ({traced['gpu_busy_reason']})")
+    lines += _step_lines(stats, traced, prefix)
     lines += ["with draft tokens     not run by this script (plain decode)"]
     peak = "peak reserved not observed" if memory["peak_reserved_gib"] is None else f"peak reserved {memory['peak_reserved_gib']:.1f} GiB"
     held = [f"weights {memory['weights_gib']:.1f} GiB", f"state and cache {memory['state_gib']:.2f} GiB", f"{peak}  (GiB = 2^30 bytes)"]
     lines += _packed("memory", held)
+    overhead = stats["launch_overhead"]
+    if overhead["value"] is not None:  # a term of the step: what it is, from the run's own figures
+        per_call = overhead["host_time_per_block_call_us"]
+        each = "" if per_call is None else f" = {per_call:.0f} us per block call"
+        share = f"{prefix}launch overhead {overhead['value'] / stats['step']['value'] * 100:.0f} % of a step{each}"
+        lines += _wrapped("note", f"{share}: time in this sample's call path from Python, not kernel time")
+    lines += [""] + _kernel_lines(data["per_kernel"], prefix)
     if unwritten:
         return lines + [""] + _wrapped("report file", f"not written: {unwritten}")
     lines += [""] + _packed("report file", [data["report_file"], "(every number, its definition, the protocol, the environment)"], joint=" ")
+    return lines
+
+
+def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
+    """The ``step`` line in its three forms.  GPU busy not measured: the step, the positions it was taken at and why.
+    Measured: the step taken apart, ``step = GPU busy + launch overhead + host``, only where launch overhead is larger
+    than GPU busy; otherwise the step, GPU busy as the upper bound it is, and that the rest is not resolved.  Under
+    both a line with the traced steps, their positions and by how much tracing lengthened a step."""
+    value, busy, overhead = f"{prefix}{stats['step']['value']:.3f}  ms", stats["gpu_busy"]["value"], stats["launch_overhead"]["value"]
+    one, first, last = traced["steps"] == 1, traced["first_position"], traced["last_position"]
+    if busy is None:
+        at = f"at the traced position, {first}" if one else f"at the {traced['steps']} traced positions, {first} to {last}"
+        return _wrapped("step", f"{value} {at if traced['steps'] else 'over every timed step'}; GPU busy not measured ({traced['gpu_busy_reason']})")
+    if overhead is not None:
+        lines = _wrapped("step", f"{value} = GPU busy {busy:.3f} + launch overhead {overhead:.3f} + host {stats['host']['value']:.3f}")
+    else:
+        bound = f"GPU busy {busy:.3f} ms in a traced request (an upper bound: tracing lengthens kernels)"
+        lines = _packed("step", [f"{value} (not traced)", bound, "launch overhead and host together: not resolved by this method"])
+    stretch = stats["tracing_stretch"]["value"]
+    lengthens = "the stretch of tracing was not formed" if stretch is None else f"tracing lengthens a step by {stretch:.1f} %"
+    steps = f"the traced step, position {first}" if one else f"{traced['steps']} traced steps, positions {first} to {last}"
+    return lines + _packed("", [f"(GPU busy from {steps}", f"{lengthens})"], joint="; ", hang=";")
+
+
+def _kernel_lines(table: dict, prefix: str) -> List[str]:
+    """The per-kernel table of the screen, from the file's ``per_kernel`` section: per row its launches of a step, the time
+    a launch adds to the GPU's timeline, the row's time per step and its share of GPU busy; or the one line that says
+    why there is no table.  ``us/launch`` is not printed for a row of fallback or host blocks (a chain of many
+    kernels), nor at all where the profiler's stamps are whole microseconds."""
+    if table["rows"] is None:
+        return _wrapped("per kernel, per step", f"not printed: {table['reason']}")
+    fine = table["us_per_launch_printed"]
+    columns = f"{'launches':>9}" + (f"{'us/launch':>11}" if fine else "") + f"{'ms/step':>9}  share of GPU busy"
+    each = "= the time a launch adds to the GPU's timeline" if fine else "not printed: the profiler's time stamps are whole microseconds here"
+    lines = [f"{f'per kernel, per step ({prefix}traced request)':<{LABEL + 2}}{columns}", f"  {table['launch_path_note']}", f"  us/launch {each}"]
+    for row in table["rows"]:
+        count, each = row["launches_per_step"], "--"
+        if row["relation"] in ("exact", "read") and row["us_per_launch_added"] is not None:
+            each = f"{row['us_per_launch_added']:.2f}"
+        launches = f"{count:,.0f}" if float(count).is_integer() else f"{count:,.1f}"
+        share = "--" if row["share_percent"] is None else f"{row['share_percent']:.1f} %"
+        lines.append(f"  {row['label']:<{LABEL}}{launches:>9}" + (f"{each:>11}" if fine else "") + f"{row['ms_per_step']:>9.3f}{share:>9}")
     return lines
 
 
@@ -477,10 +704,20 @@ class Outcome:
     data: Optional[dict] = None
 
 
-def _statistics(timed: Sequence[Request], covered: int, sequences: int, rate_missing: str) -> dict:
+def _statistics(
+    timed: Sequence[Request],
+    covered: int,
+    sequences: int,
+    rate_missing: str,
+    busy: Sequence[float] = (),
+    traced: Optional[Request] = None,
+    calls: int = 0,
+    unmeasured: str = "no traced step was observed",
+) -> dict:
     """The entries of the file's ``statistics`` section, each with its definition and its serving counterpart.  ``covered``:
     the traced positions, the first so many steps of every timed request (0: none was observed, and the step is taken
-    over every timed step)."""
+    over every timed step).  ``busy``: GPU busy of every traced step, in ms, with the traced request (``traced``) and
+    the block calls of a step (``calls``); empty where it was not measured, and ``unmeasured`` says why."""
 
     def entry(key: str, **values) -> dict:
         unit, definition, counterpart = DEFINITIONS[key]
@@ -510,7 +747,27 @@ def _statistics(timed: Sequence[Request], covered: int, sequences: int, rate_mis
     samples["host"] = [host for request in timed for host in request.host_ms()[:last]]
     for key, of in samples.items():
         stats[key].update(summary(of), value=stats[key].get("value", statistics.median(of)))
-    for key, section in (("launches_per_step", "kernels"), ("memory", "memory"), ("startup", "startup")):
+    # the GPU side of the step, from the traced request: GPU busy, what is left of the step beside it and the loop's host time, tracing's stretch
+    measured = bool(busy) and traced is not None
+    untraced = statistics.median([inside for request in timed for inside in request.in_step_ms()[:last]])
+    under = statistics.median(traced.in_step_ms()[:last]) if measured else 0.0
+    split = step_split(stats["step"]["value"], stats["host"]["value"], statistics.median(busy) if measured else None, untraced, under)
+    missing = f"GPU busy not measured ({unmeasured})"
+    stats["gpu_busy"] = entry("gpu_busy", value=statistics.median(busy) if measured else None, reason=None if measured else missing, **summary(busy))
+    stats["launch_overhead"] = entry(
+        "launch_overhead",
+        value=split["remainder_ms"] if split["resolved"] else None,
+        reason=None if split["resolved"] else ("not resolved by this method: the remainder is not larger than GPU busy" if measured else missing),
+        remainder_ms=split["remainder_ms"],
+        host_time_per_block_call_us=split["remainder_ms"] * 1e3 / calls if measured and calls else None,
+    )
+    formed = split["stretch"] is not None
+    reason = None if formed else ("not formed: the timed requests spend no time in a step" if measured else missing)
+    events = "t_token[i] - t_launch[i] at the traced positions: the traced request over the timed requests"
+    stats["tracing_stretch"] = entry("tracing_stretch", events=events, value=split["stretch"] * 100 if formed else None, reason=reason)
+    sections = {"launches_per_step": "kernels", "memory": "memory", "startup": "startup"}
+    sections.update(kernel_launches="per_kernel", kernel_time_per_launch="per_kernel", kernel_time_per_step="per_kernel")
+    for key, section in sections.items():
         stats[key] = entry(key, value=None, reason=f"see the section {section} of this file")
     return stats
 
@@ -652,6 +909,11 @@ def run(
         status, unobserved, kernel_lines = tie_out.kernel_check(session)
     say("\n".join([*before.lines, *kernel_lines]))
     covered = len(session.traced.steps or []) if status != NOT_OBSERVED else 0  # the traced positions: the first so many timed steps
+    # GPU busy, idle, kernels and copies of every traced step: the union of the intervals of the step's own launch records
+    observed = (session.traced.steps or [])[:covered]
+    facts_of = [fact for one in observed for fact in step_facts([(launch.name, launch.start, launch.end) for launch in one])]
+    busy = [fact[0] for fact in facts_of] if len(facts_of) == covered else []
+    unmeasured = "" if busy else (unobserved or "the launch records could not be cut into the traced steps")
     kernels = kernel_facts(session, status)
     passed = held == PASS and status != FAIL
     kinds = f"{session.traced.differences} kind{'s' if session.traced.differences != 1 else ''} of difference"
@@ -674,6 +936,7 @@ def run(
     host = {"logical_cores": os.cpu_count(), "usable_cores": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None}
     teardown = {key: os.environ.get(key) for key in ("TEARDOWN_CUPTI", "DISABLE_CUPTI_LAZY_REINIT", "KINETO_LOG_LEVEL")}
     prompt_hash = hashlib.sha256(b"".join(int(i).to_bytes(4, "little") for prompt in prompts for i in prompt.tolist())).hexdigest()
+    stats = _statistics(timed, covered, session.sequences, rate_missing, busy, traced, session.report().calls_per_step, unmeasured)
     data = {
         "schema": SCHEMA,
         "kind": "run",
@@ -728,7 +991,7 @@ def run(
             "kernels": third,
             "last_line": f"{tag} {verdict(passed, before.judged, unobserved)}",
         },
-        "statistics": _statistics(timed, covered, session.sequences, rate_missing),
+        "statistics": stats,
         "raw": {"requests": raw},
         "traced": {
             "steps": covered,
@@ -736,9 +999,13 @@ def run(
             "last_position": prompt_tokens + covered - 1 if covered else None,
             "record_budget": protocol.trace_records,
             "records_of_the_sizing_step": sizing,
-            "gpu_busy_ms": None,
-            "gpu_busy_reason": "this version" if covered else (unobserved or "the launch records could not be cut into the traced steps"),
+            "gpu_busy_ms": stats["gpu_busy"]["value"],
+            "gpu_busy_reason": unmeasured or None,
+            "per_step": {key: [fact[index] for fact in facts_of] if busy else [] for index, key in enumerate(("gpu_busy_ms", "idle_ms", "kernels", "copies"))},
+            "tracing_stretch_percent": stats["tracing_stretch"]["value"],
+            "time_resolution_us": time_resolution_us(observed),
         },
+        "per_kernel": kernel_table(session.traced, busy, unmeasured),
         "memory": {
             "weights_gib": weights / GIB,
             "weights_gb": weights / 1e9,

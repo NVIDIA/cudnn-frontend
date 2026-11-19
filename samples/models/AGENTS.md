@@ -121,6 +121,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
     Only the profiler's own start and stop -- and, where launch records are asked for, the export and the read of its
     trace -- are reported as a missing trace, in a sentence that names no path; an error of a step under it propagates.
+    The token-to-token interval and the rate come from the host clock of requests that are not traced; GPU busy and
+    the device time of a kernel come from kernel activity records of a traced request at the same positions, behind
+    the last timed request. The two are never taken from one pass, and a report says which is which. A row of the
+    per-kernel table is found by its place in the wiring, never by a kernel's name, and a traced pass whose kernel
+    check does not hold prints no table.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands

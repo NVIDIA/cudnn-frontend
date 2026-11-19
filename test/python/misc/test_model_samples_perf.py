@@ -7,6 +7,10 @@
 * every statistic on constructed time stamps: the time per output token, the rate, the nearest-rank percentiles, the run's
   value as the median over its timed requests, the time to first token, and the step and the loop's host time at the
   traced positions;
+* the GPU side on constructed launch records: GPU busy as the union of a step's intervals, the step taken apart and the
+  rule for printing launch overhead as a term, tracing's stretch; the rows of the per-kernel table by the place in the
+  wiring, the time a launch adds to the GPU's timeline, the rows against GPU busy, the resolution of the stamps; the
+  launch records of ``--dump-census`` with their start and end;
 * the judged positions from the request and the page of the attention cache; the reference checks at judged positions
   through ``tie_out.run_checks``; the record class from its conditions;
 * the protocol through a real ``Session`` on the CPU with stand-in providers and a stand-in profiler: no profiler pass
@@ -234,12 +238,12 @@ def test_step_is_the_median_interval_at_the_traced_positions():
     every = perf._statistics(timed, 0, 1, "")
     assert every["step"]["n"] == 8 and every["step"]["value"] == every["token_to_token_interval"]["value"] == pytest.approx(10.0)
     assert three["step"]["events"] == "t_token[i] - t_token[i - 1] at the traced positions"
-    assert "gpu_busy" not in three and "launch_overhead" not in three and "tracing_stretch" not in three, "not statistics of this version"
-    assert "does not take GPU busy from the traced request" in three["step"]["definition"]
+    assert three["gpu_busy"]["value"] is None and three["gpu_busy"]["reason"] == "GPU busy not measured (no traced step was observed)", "no record handed in"
+    assert three["launch_overhead"]["value"] is None and three["launch_overhead"]["remainder_ms"] is None and three["tracing_stretch"]["value"] is None
     _defines("host", "From a token's ids on the host to the next step's first launch call", "the median over the timed steps at the traced positions")
     _defines("step", "The median token-to-token interval over the timed steps at the positions the traced request covers, all timed requests.")
     _says("area", "| `step` | the median token-to-token interval over the timed steps at the positions the traced request covers (the line names them).")
-    _says("area", "the loop's own host time, from a token's ids on the host to the next step's first launch call, is in the file")
+    _says("area", "host = the loop's own time from a token's ids on the host to the next step's first launch call;")
     assert three["step"]["clock"] == three["host"]["clock"] == perf.CLOCK and "clock" not in three["memory"] and "clock" not in three["launches_per_step"]
 
 
@@ -546,7 +550,7 @@ def test_no_profiler_before_the_last_timed_request(monkeypatch, tmp_path):
     assert (few.data["traced"]["steps"], few.data["traced"]["first_position"], few.data["traced"]["last_position"]) == (3, 5, 7)
     assert few.passed and few.data["statistics"]["step"]["n"] == 2 * 3, "the kernel check holds on both passes; the step is taken at those positions"
     at = lines.index(_line(lines, "step "))
-    assert (lines[at] + " " + lines[at + 1].strip()).endswith(" ms at the 3 traced positions, 5 to 7; GPU busy not measured (this version)")
+    assert lines[at + 3].startswith("                      (GPU busy from 3 traced steps, positions 5 to 7; tracing lengthens a step by "), lines[at : at + 4]
     one, lines, events, _ = _mode(monkeypatch, tmp_path / "one", budget=1)  # a budget below one step: the sizing step is the traced request
     assert one.data["traced"]["steps"] == 1 and events.count("profiler") == 1 and one.passed
     _says("area", "The first profiler pass of the process starts behind the last timed request: the traced request feeds its prompt untraced")
@@ -816,7 +820,7 @@ def _checkpoint_form(**changes):
     base = {
         "model": {"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False},
         "record": {"reasons": ["fallback rows present", "kernel identity not claimed on this GPU class", "launched from Python"]},
-        "traced": {"steps": 51, "first_position": 58, "last_position": 108, "gpu_busy_reason": "this version"},
+        "traced": {"steps": 51, "first_position": 58, "last_position": 108},
     }
     for section, values in changes.items():
         base[section] = {**base[section], **values} if isinstance(values, dict) and section in base else values
@@ -824,6 +828,21 @@ def _checkpoint_form(**changes):
     data["statistics"]["decode_rate"].update(value=9.9, reason=None, total=9.9)
     data["statistics"]["step"]["value"] = 100.0
     data["protocol"]["prompt"]["tokens"] = 58
+    return _gpu_side(data)
+
+
+def _gpu_side(data, busy=12.5, overhead=87.47, host=0.03, stretch=3.2, why=""):
+    """The GPU side of a report's data, set: GPU busy in ms (``None``: not measured, and ``why``), launch overhead where it
+    is a term of the step (``None``: not resolved), the loop's host time, tracing's stretch in percent."""
+    stats = data["statistics"]
+    stats["gpu_busy"].update(value=busy, reason=None if busy is not None else f"GPU busy not measured ({why})")
+    stats["host"]["value"] = host
+    stats["launch_overhead"].update(value=overhead, remainder_ms=None if busy is None else stats["step"]["value"] - busy - host)
+    stats["launch_overhead"]["host_time_per_block_call_us"] = None if overhead is None else overhead * 1e3 / 484
+    stats["tracing_stretch"]["value"] = None if busy is None else stretch
+    data["traced"].update(gpu_busy_ms=busy, gpu_busy_reason=why or None)
+    if busy is None:
+        data["per_kernel"] = {**data["per_kernel"], "rows": None, "reason": f"the kernels of the traced steps were not observed ({why})"}
     return data
 
 
@@ -873,21 +892,26 @@ def test_orientation_stands_in_the_rate_line():
 
 
 def test_the_step_line_says_what_was_not_measured():
-    """The ``step`` line names the positions it was taken at and says that GPU busy was not measured, with the reason: this
-    version, or why no traced step was observed.  No line of the screen takes the step apart."""
+    """Where GPU busy was not measured the ``step`` line names the positions the step was taken at and says so, with the
+    reason: no line of the screen takes the step apart, and no table is printed."""
     from model_samples import perf
 
-    lines = perf.screen(_checkpoint_form())
-    assert "step                  100.000  ms at the 51 traced positions, 58 to 108; GPU busy not measured (this version)" in lines
+    cut = "the launch records could not be cut into the traced steps"
+    lines = perf.screen(_gpu_side(_checkpoint_form(), busy=None, overhead=None, why=cut))
+    at = lines.index(_line(lines, "step  "))
+    said = lines[at] + " " + lines[at + 1].strip()
+    assert said == f"step                  100.000  ms at the 51 traced positions, 58 to 108; GPU busy not measured ({cut})"
     assert _line(lines, "time to first token   ").endswith(" ms for a 58-token prompt (58 decode steps: this sample has no prefill kernel)")
-    assert not any("launch overhead" in line or line.startswith("note ") for line in lines)
-    _says("area", "This version does not take GPU busy from the traced request, so the step is not taken apart and the line says `GPU busy not measured`;")
-    one = perf.screen(_checkpoint_form(traced={"steps": 1, "last_position": 58}))
-    assert "step                  100.000  ms at the traced position, 58; GPU busy not measured (this version)" in one
+    assert not any("launch overhead" in line or line.startswith(("note ", "per kernel, per step (")) for line in lines)
+    _says("area", "Where the traced steps could not be observed the line says `GPU busy not measured`, with the reason, and no table is printed")
+    one = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 1, "last_position": 58}), busy=None, overhead=None, why=cut))
+    assert _line(one, "step  ").startswith("step                  100.000  ms at the traced position, 58; GPU busy not measured (the launch records ")
     why = "the profiler's trace could not be exported (No space left on device)"
-    unmeasured = perf.screen(_checkpoint_form(traced={"steps": 0, "gpu_busy_reason": why}))
+    unmeasured = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, overhead=None, why=why))
     at = unmeasured.index("step                  100.000  ms over every timed step; GPU busy not measured (the profiler's trace could not")
     assert unmeasured[at + 1] == "                      be exported (No space left on device))"
+    table = unmeasured.index("per kernel, per step  not printed: the kernels of the traced steps were not observed (the profiler's trace")
+    assert unmeasured[table + 1] == "                      could not be exported (No space left on device))" and unmeasured[table - 1] == ""
     memory = lines.index(_line(lines, "memory                "))
     assert (
         " GiB | state and cache " in lines[memory] and lines[memory + 1] == "                      peak reserved not observed  (GiB = 2^30 bytes)"
@@ -899,10 +923,22 @@ def test_the_step_line_says_what_was_not_measured():
     _says("area", "peak reserved: PyTorch's peak between the emptied pool behind the checks and the end of the timed requests; in GiB (2^30 bytes)")
 
 
+def _wide_row():
+    """A row of the per-kernel table whose every value is as wide as a run can make it."""
+    row = {
+        "label": "not yet: projection.fp8.out + 123 more (one row)",
+        "relation": "fallback",
+        "launches_per_step": 1234567.5,
+        "us_per_launch_added": 1234567.891,
+    }
+    return {**row, "ms_per_step": 12345.678, "share_percent": 100.0}
+
+
 def test_no_line_wider_than_110(monkeypatch, tmp_path):
     """No line of the screen is wider than 110 characters, in every form a run of this version prints: the reduced model,
-    a checkpoint, a target stack with its three numbers, each form of the ``step`` line, a failed statement, kernels that
-    were not observed with a long reason, long names, six-digit values."""
+    a checkpoint, a target stack with its three numbers, each form of the ``step`` line, the per-kernel table with and
+    without its ``us/launch`` column and with large values, a failed statement, kernels that were not observed with a
+    long reason, long names, six-digit values."""
     from model_samples import perf
 
     long_reason = "the profiler's trace could not be exported (" + "a reason that the exporter words at length " * 3 + ")"
@@ -914,7 +950,11 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
         _checkpoint_form(kernels=target),
         _checkpoint_form(kernels={**target, "stated": False, "not_stated": "kernel identity: not stated for this run (" + "no recorded section " * 6 + ")"}),
         _checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}),
-        _checkpoint_form(traced={"steps": 0, "gpu_busy_reason": long_reason}),
+        _gpu_side(_checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}), busy=123456.789, overhead=None),
+        _gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, overhead=None, why=long_reason),
+        _checkpoint_form(per_kernel={"us_per_launch_printed": True, "rows": [dict(_wide_row(), label="x" * perf.LABEL), _wide_row()]}),
+        _checkpoint_form(per_kernel={"rows": [_wide_row()], "reason": None}),
+        _checkpoint_form(per_kernel={"rows": None, "reason": perf.NOT_THE_PLAN}),
         _checkpoint_form(checks={"timed_requests": "FAIL (request 3, step 255)", "kernels": f"NOT OBSERVED ({long_reason})"}),
         _checkpoint_form(
             checks={
@@ -938,7 +978,7 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)  # and the lines a run printed are those of its data
     said = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
     assert max(len(line) for line in said) <= 110, "the text out line behind the screen too"
-    assert said[: len(perf.screen(outcome.data))] == perf.screen(outcome.data) and 24 <= len(perf.screen(outcome.data)) <= 30
+    assert said[: len(perf.screen(outcome.data))] == perf.screen(outcome.data) and 34 <= len(perf.screen(outcome.data)) <= 40
     assert perf.screen(json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))) == perf.screen(outcome.data), "the file's data and nothing else"
     unwritten = perf.screen(outcome.data, "--perf-report late.json: No space left on device")
     assert (
@@ -963,9 +1003,10 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
 
     data = json.loads(text, parse_constant=refuse)
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
-    sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced memory startup text_path"
+    sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
+    sections += " startup text_path"
     assert list(data) == sections.split() and data["schema"] == "model-sample-performance/1" and data["kind"] == "run"
-    assert "per_kernel" not in data and "fingerprints" not in data and "report_text" not in data, "of later versions"
+    assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
     assert data["record"] == {
@@ -1171,6 +1212,547 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     _says("area", "a check of the checked request that fails ends the run before anything is timed, and no file is written.")
     _says("area", "the timed requests and the traced request gave the checked request's token ids, step for step, every timed request left the")
     _says("area", "state in the same bytes and the stored weights still hold the bytes of their load; the kernels of the traced steps are the plan's.")
+
+
+# ---------------------------------------------------------------------------------------------- the GPU side: GPU busy, the step taken apart, the per-kernel table
+COPY_IN = "Memcpy HtoD (Pageable -> Device)"
+
+
+def _records(sites, start=0.0, us=4.3, period=0.01, also=()):
+    """Constructed launch records of one step for ``sites`` (``census.Site``), in start order: per site one record per planned
+    launch of an exact entry, named after its kernel; one per family of a fallback or host entry; one copy behind a
+    fallback site; then the host read.  A record lasts ``us`` microseconds and one starts every ``period`` ms from
+    ``start``, so none overlaps.  ``also``: ``(index, name)`` -- another kernel, or another copy, launched behind the
+    records of that site."""
+    from model_samples.census import FAMILIES, Launch
+
+    names = {"embedding_gather": GATHER, "gdn_decode_fused": SYMBOL, "pytorch": ELEMENTWISE, "cublas": NVJET}
+    names.update({kernel: pattern.pattern.lstrip("^") + "Cfg" for kernel, pattern in FAMILIES if pattern.pattern.startswith("^cudnn_kernel_frost_")})
+    records = []
+
+    def launch(name, copy=False):
+        at = start + period * len(records)
+        shape = () if copy else ((1, 1, 1), (128, 1, 1), 0)
+        records.append(Launch(name, "copy" if copy else "kernel", at, at + us / 1e3, *shape, duration=us))
+
+    for index, site in enumerate(sites):
+        for kernel in site.kernels:
+            for _ in range(kernel.launches or 1):
+                launch(names[kernel.id])
+        if any(kernel.relation == "fallback" for kernel in site.kernels):
+            launch(COPY_IN, copy=True)
+        for name in [name for at, name in also if at == index]:
+            launch(name, copy=name.startswith("Memcpy"))
+    launch(HOST_READ, copy=True)
+    return records
+
+
+def _walked(sites, steps, claim=None):
+    """What a session keeps of a traced pass, from constructed records: the kernel check's walk over ``steps`` (each a list
+    of launch records that ends in its host read) against ``sites``, and its verdict; and GPU busy of every step."""
+    from model_samples import census, timing
+
+    traced = census.Traced(list(sites), [], steps=[list(step) for step in steps], claim=claim)
+    traced.result = census.compare(traced.steps, traced.sites)
+    traced.status = census.FAIL if traced.result.failures else census.PASS
+    return traced, [timing.step_facts([(launch.name, launch.start, launch.end) for launch in step])[0][0] for step in steps]
+
+
+def _site(block, layer=-1, *kernels):
+    """A block call of a step with census entries by name: ``pytorch`` and ``cublas`` are fallback families, ``host`` the
+    host path, any other name an exact kernel of one launch per call."""
+    from model_samples.census import Kernel, Site
+
+    family = {"pytorch": Kernel("pytorch", "PyTorch"), "cublas": Kernel("cublas", "cuBLAS"), "host": Kernel("pytorch", "PyTorch", "host")}
+    return Site(block, layer, tuple(family.get(name) or Kernel(name, "cuDNN FE", "exact", launches=1) for name in kernels), entry=f"entry of {block}")
+
+
+def _native(monkeypatch):
+    """``(sites, claim)`` of a step of the 64-layer model on the stack ``native``, compute capability 10.0 with 148 SMs,
+    planned on stated facts: the family's own wiring, each call with the census entries of the row that serves it."""
+    from model_samples import Session, TextIO, blocks, census
+    from model_samples.qwen_dense import QwenDense
+
+    monkeypatch.setattr(census, "installed_versions", lambda packages: {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"})
+    model = QwenDense()
+    session = Session(model, TextIO.synthetic(272), stack="native", device="cpu", capacity=8)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, "native", model=model, options={"device": "cpu"})
+    parts = [(name, layer, at, session.plan.at(name, at)[1]) for (name, layer), at in zip(model.wiring(), census.call_sites(model))]
+    return [census.Site(name, layer, tuple(block.kernels), block.entry, site=at) for name, layer, at, block in parts], session.claim()
+
+
+def _fine_stamps(monkeypatch):
+    """For ``_mode(on_say=...)``: from the run's first line on, the stand-in profiler hands over records of 0.4375 us, one
+    every microsecond -- stamps finer than a microsecond, and a GPU busy far below the step of a session on the CPU."""
+    from model_samples import loop
+
+    def install(line):
+        coarse = loop.trace_steps
+        if getattr(coarse, "fine", False):
+            return
+
+        def fine(step, count, device=None, records=None):
+            mine = []
+            made = coarse(step, count, device, mine)
+            if records is not None:
+                records.extend(record._replace(start=record.start / 1e3, end=record.start / 1e3 + 0.0004375, duration=0.4375) for record in mine)
+            return made
+
+        fine.fine = True
+        monkeypatch.setattr(loop, "trace_steps", fine)
+
+    return install
+
+
+def test_added_time_partitions_the_union():
+    """GPU busy of a step is the length of the union of the intervals of its kernel and copy records: a stretch in which
+    two records run is counted once.  The time a launch adds to the GPU's timeline is its end minus the later of its
+    start and the latest end of any earlier record, not below zero; the added times of a step are the terms of that
+    union, so their sum IS the step's GPU busy."""
+    from model_samples import perf, timing
+    from model_samples.census import Launch
+
+    spans = [(0.0, 1.0), (0.5, 1.5), (0.625, 0.875), (1.5, 2.0), (3.0, 3.25)]  # ms: overlapping, nested, touching, behind a gap
+    step = [Launch(ELEMENTWISE, "kernel", start, end) for start, end in spans] + [Launch(HOST_READ, "copy", 4.0, 4.125)]
+    assert perf.added_ms(step) == [1.0, 0.5, 0.0, 0.5, 0.25, 0.125], "the overlapped half once, the nested record nothing, the read its own time"
+    ((busy, idle, kernels, copies),) = timing.step_facts([(launch.name, launch.start, launch.end) for launch in step])
+    assert busy == sum(perf.added_ms(step)) == 2.375 and idle == 4.125 - 2.375 and (kernels, copies) == (5, 1)
+    assert sum(end - start for start, end in spans) + 0.125 == 3.125, "the sum of the durations counts the overlapped stretches twice"
+    late = [
+        Launch(ELEMENTWISE, "kernel", 0.0, 2.0),
+        Launch(NVJET, "kernel", 0.5, 1.0),
+        Launch(ELEMENTWISE, "kernel", 1.5, 2.5),
+        Launch(HOST_READ, "copy", 2.5, 2.75),
+    ]
+    assert perf.added_ms(late) == [2.0, 0.0, 0.5, 0.25], "the latest end of ANY earlier record, not of the one before"
+    assert perf.added_ms([]) == [] and perf.added_ms(step[:1]) == [1.0]
+    # two exact rows whose launches overlap: the second adds 2 us of the 7 it lasts, and the file holds both figures
+    sites = [_site("x", 0, "gate_quant"), _site("y", 0, "swiglu_fp4")]
+    kinds = _records(sites)
+    overlapping = [kinds[0]._replace(start=0.0, end=0.010, duration=10.0), kinds[1]._replace(start=0.005, end=0.012, duration=7.0)]
+    overlapping.append(kinds[2]._replace(start=0.020, end=0.021, duration=1.0))
+    rows = perf.kernel_table(*_walked(sites, [overlapping]))["rows"]
+    assert [(row["us_per_launch_added"], row["us_per_launch_recorded"]) for row in rows] == [(10.0, 10.0), (pytest.approx(2.0), 7.0), (pytest.approx(1.0), 1.0)]
+    assert sum(row["ms_per_step"] for row in rows) == pytest.approx(0.013) and rows[1]["share_percent"] == pytest.approx(200 / 13)
+    _defines("gpu_busy", "the length of the union of the intervals of every kernel and copy between two host reads", "the median over the traced steps")
+    _defines("kernel_time_per_launch", "its end minus the later of its start and the latest end of any earlier record of the step, not below zero")
+    _defines("kernel_time_per_step", "Within one step the added times of all records sum exactly to that step's GPU busy.")
+    _says("area", "GPU busy = the union of the intervals of every kernel and copy of a traced step, from kernel activity records")
+    _says("area", "the time a launch adds to the GPU's timeline: its end less the later of its start and the latest end of any earlier launch of the step")
+
+
+def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
+    """step = the median interval at the traced positions; host = from a read to the next launch; the remainder = step -
+    GPU busy - host.  Launch overhead is a term of the ``step`` line only where the remainder is larger than GPU busy;
+    otherwise the line gives GPU busy as an upper bound and says that the rest is not resolved.  The file holds the
+    remainder as computed, also where it is negative.  The stretch of tracing is the traced request's time in a step
+    over the timed requests' at the same positions, minus 1."""
+    from model_samples import perf
+
+    assert perf.step_split(10.0, 1.0, 2.0, 9.0, 9.9) == {"remainder_ms": 7.0, "resolved": True, "stretch": pytest.approx(0.1)}
+    assert perf.step_split(10.0, 1.0, 6.0)["remainder_ms"] == 3.0 and not perf.step_split(10.0, 1.0, 6.0)["resolved"], "GPU busy is the larger part"
+    assert perf.step_split(10.0, 1.0, 4.5)["remainder_ms"] == 4.5 and not perf.step_split(10.0, 1.0, 4.5)["resolved"], "equal is not larger"
+    assert perf.step_split(10.0, 1.0, 11.0) == {"remainder_ms": -2.0, "resolved": False, "stretch": None}, "an upper bound can pass the untraced step"
+    assert perf.step_split(10.0, 1.0, None) == {"remainder_ms": None, "resolved": False, "stretch": None}
+    # ten-millisecond steps, each launched 1 ms behind the read before it; the last step of each request is longer and not traced
+    timed = [_request(0.0, [0.010, 0.020, 0.030, 0.090]), _request(0.0, [0.010, 0.020, 0.030, 0.090])]
+    traced = _request(0.0, [0.0109, 0.0218, 0.0327], kind="traced", launches=[0.001, 0.0119, 0.0228])  # in a step: 9.9 ms against 9
+    assert traced.in_step_ms() == pytest.approx([9.9, 9.9, 9.9]) and timed[0].in_step_ms() == pytest.approx([9.0, 9.0, 9.0, 59.0])
+    stats = perf._statistics(timed, 3, 1, "", busy=[2.0, 2.5, 2.0], traced=traced, calls=35)
+    assert stats["step"]["value"] == pytest.approx(10.0) and stats["host"]["value"] == pytest.approx(1.0)
+    assert stats["gpu_busy"]["value"] == 2.0 and (stats["gpu_busy"]["n"], stats["gpu_busy"]["maximum"]) == (3, 2.5), "the median over the traced steps"
+    overhead = stats["launch_overhead"]
+    assert overhead["value"] == overhead["remainder_ms"] == pytest.approx(7.0) and overhead["host_time_per_block_call_us"] == pytest.approx(200.0)
+    assert stats["tracing_stretch"]["value"] == pytest.approx(10.0) and stats["tracing_stretch"]["clock"] == perf.CLOCK
+    slow = _request(0.0, [0.010, 0.070, 0.130, 0.190], launches=[0.001, 0.011, 0.071, 0.131])  # in a step: 9 ms, then 59 ms three times
+    first = perf._statistics([slow, slow], 1, 1, "", busy=[2.0], traced=_request(0.0, [0.0109], kind="traced", launches=[0.001]))
+    assert first["tracing_stretch"]["value"] == pytest.approx(10.0), "against the timed requests at the traced position, not over all their steps"
+    upper = perf._statistics(timed, 3, 1, "", busy=[11.0, 11.0, 11.0], traced=traced, calls=35)["launch_overhead"]
+    assert upper["value"] is None and upper["remainder_ms"] == pytest.approx(-2.0) and upper["host_time_per_block_call_us"] < 0
+    assert upper["reason"] == "not resolved by this method: the remainder is not larger than GPU busy"
+    unseen = perf._statistics(timed, 0, 1, "", unmeasured="this PyTorch build records no kernel activity")
+    assert unseen["gpu_busy"]["reason"] == unseen["launch_overhead"]["reason"] == "GPU busy not measured (this PyTorch build records no kernel activity)"
+    assert unseen["tracing_stretch"]["reason"] == unseen["gpu_busy"]["reason"] and unseen["gpu_busy"]["n"] == 0
+    instant = _request(1.0, [1.010, 1.020], launches=[1.010, 1.020])  # each step's ids are on the host at the stamp of its launch
+    still = perf._statistics([instant], 2, 1, "", busy=[1.0, 1.0], traced=traced)["tracing_stretch"]
+    assert still["value"] is None and still["reason"] == "not formed: the timed requests spend no time in a step"
+    _defines("launch_overhead", "step - GPU busy - host", "Printed as a term of the step only where it is larger than GPU busy;")
+    _defines("launch_overhead", "The file holds the remainder as computed, which can be negative, and the launch overhead per block call.")
+    _defines("tracing_stretch", "in the traced request, divided by the same in the timed requests at the same positions, minus 1.")
+    # form A: the equation, its second line and the note
+    lines = perf.screen(_checkpoint_form())
+    at = lines.index("step                  100.000  ms = GPU busy 12.500 + launch overhead 87.470 + host 0.030")
+    assert lines[at + 1] == "                      (GPU busy from 51 traced steps, positions 58 to 108; tracing lengthens a step by 3.2 %)"
+    note = lines.index("note                  launch overhead 87 % of a step = 181 us per block call: time in this sample's call path")
+    assert lines[note + 1] == "                      from Python, not kernel time" and lines.index(_line(lines, "memory  ")) < note and lines[note + 2] == ""
+    one = perf.screen(_checkpoint_form(traced={"steps": 1, "last_position": 58}))
+    assert "                      (GPU busy from the traced step, position 58; tracing lengthens a step by 3.2 %)" in one
+    # form B: GPU busy is not the smaller part -- the step, GPU busy as the upper bound it is, and no term for the rest; no note
+    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=60.0, overhead=None))
+    at = bound.index("step                  100.000  ms (not traced)")
+    assert bound[at + 1 : at + 4] == [
+        "                      GPU busy 60.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
+        "                      launch overhead and host together: not resolved by this method",
+        "                      (GPU busy from 51 traced steps, positions 58 to 108; tracing lengthens a step by 3.2 %)",
+    ]
+    assert not any(line.startswith("note ") or "launch overhead 39" in line for line in bound), "the remainder is in the file, not on the screen"
+    unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
+    at = unformed.index("                      (GPU busy from 51 traced steps, positions 58 to 108;")  # wider than a line: it breaks at the separator
+    assert unformed[at + 1] == "                      the stretch of tracing was not formed)"
+    reduced = perf.screen(_gpu_side(_data(), busy=1.0, overhead=9.0))
+    assert _line(reduced, "note   ").startswith("note                  reduced model: launch overhead ") and " ms = GPU busy 1.000 + " in _line(
+        reduced, "step  "
+    )
+    _says("area", "*Launch overhead*: the part of a step in which the GPU waited for the next launch, or the host for the read: the step less GPU busy")
+    _says("area", "launch overhead = step - GPU busy - host. Launch overhead is printed as a term only where it is larger than GPU busy;")
+    _says("area", "otherwise the line gives GPU busy as the upper bound it is and says that launch overhead and host are not resolved by this method")
+    _says("area", "| `note` | while launch overhead is a term of the step: its share of the step and the time per block call, and what it is --")
+
+
+def test_rows_by_wiring_position_not_by_name(monkeypatch):
+    """A launch record gets its row from its place in the wiring, as the kernel check finds it, never from its kernel's
+    name: two blocks that launch the same kernel are two rows, and a library kernel inside a fallback chain is that
+    chain's row wherever else its name is launched.  On the family's own plan the exact rows hold the planned launches."""
+    from model_samples import census, perf
+
+    sites = [_site("first", 0, "gate_quant"), _site("chain", 0, "pytorch", "cublas"), _site("second", 0, "gate_quant"), _site("tail", -1, "cublas")]
+    traced, busy = _walked(sites, [_records(sites), _records(sites, start=1.0)])
+    assert traced.status == "PASS" and [row.blocks for row in traced.result.table] == [("first",), ("second",), ("chain",), ("tail",), ()]
+    assert [row.relation for row in traced.result.table] == ["exact", "exact", "fallback", "fallback", "read"]
+    assert (
+        traced.result.attributed == [[0, 2, 2, 2, 1, 3, 3, 4]] * 2
+    ), "the gate kernel of `second` is not a launch of `first`; the library kernel of `tail` not of `chain`"
+    names = [record.name for record in traced.steps[0]]
+    assert names[0] == names[4] and names[2] == names[5] == NVJET, "one kernel name in two rows, twice"
+    rows = perf.kernel_table(traced, busy)["rows"]
+    assert [row["label"] for row in rows] == ["first", "second", "fallback: chain", "fallback: tail", "host read"]
+    assert [(row["launches_per_step"], row["kernels_per_step"], row["copies_per_step"]) for row in rows] == [
+        (1, 1, 0),
+        (1, 1, 0),
+        (3, 2, 1),
+        (2, 1, 1),
+        (1, 0, 1),
+    ]
+    assert [row["planned_launches_per_step"] for row in rows] == [1, 1, None, None, None] and rows[2]["blocks"][0]["entry"] == "entry of chain"
+    assert rows[0]["launch_shapes"] == [{"symbol": names[0], "grid": (1, 1, 1), "block": (128, 1, 1), "shared_memory": 0, "launches": 1}]
+    assert rows[2]["launch_shapes"] is None and sum(row["launches_per_step"] for row in rows) == len(traced.steps[0]), "the rows hold every record of a step"
+    twice = [
+        _site("first", 0, "gate_quant"),
+        census.Site("pair", 0, (census.Kernel("swiglu_fp4", "cuDNN FE", "exact", launches=2),)),
+        _site("pair", 1, "swiglu_fp4"),
+    ]
+    pair = perf.kernel_table(*_walked(twice, [_records(twice)]))["rows"][1]
+    assert (pair["launches_per_step"], pair["planned_launches_per_step"], pair["blocks"][0]["calls_per_step"]) == (3, 3, 2), "calls x launches per call"
+    # a block that launches its exact kernel and a chain of its own: the kernel is its exact row, the chain's records the row of the gap they stand in
+    mixed = [_site("x", 0, "gate_quant"), _site("both", 0, "swiglu_fp4", "pytorch"), _site("y", 0, "gate_quant")]
+    held = perf.kernel_table(*_walked(mixed, [_records(mixed)]))["rows"]
+    assert [(row["label"], row["launches_per_step"]) for row in held] == [("x", 1), ("both", 1), ("y", 1), ("fallback: both", 2), ("host read", 1)]
+    # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches
+    sites, claim = _native(monkeypatch)
+    traced, busy = _walked(sites, [_records(sites)], claim)
+    rows = perf.kernel_table(traced, busy)["rows"]
+    exact = [(row["label"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows if row["relation"] == "exact"]
+    assert exact == [
+        ("embedding", 1, 1),
+        ("add_norm_quantize", 129, 129),
+        ("projection.fp8.in", 64, 64),
+        ("linear_attention.step", 48, 48),
+        ("mlp.gate_up", 64, 64),
+        ("attention.gate_quantize", 16, 16),
+    ]
+    three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
+    assert sum(planned for _, _, planned in exact) == traced.result.exact == 49 + 273 + 0, three
+    assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
+    assert rows[-1]["label"] == "host read" and rows[-1]["launches_per_step"] == 1 and rows[-1]["blocks"] == []
+    _defines("kernel_launches", "the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median per step.")
+    _says("area", "A row is a block, found by its place in the wiring, as the kernel check finds it, never by a kernel's name")
+    _says("guide", "A row of the per-kernel table is found by its place in the wiring, never by a kernel's name,")
+
+
+def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
+    """The records between two exact kernels belong to the blocks the wiring has there on fallback or host entries: such
+    blocks are one row together and the row says so; the same blocks in another layer are the same row.  A row of a
+    stack that declares a target kernel set says ``not yet`` where the census says so of its block."""
+    from model_samples import census, perf
+
+    sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch"), _site("g", 0, "pytorch", "cublas"), _site("y", 0, "swiglu_fp4"), _site("f", 1, "pytorch")]
+    sites += [
+        _site("x", 1, "gate_quant"),
+        _site("f", 2, "pytorch"),
+        _site("g", 2, "pytorch", "cublas"),
+        _site("y", 2, "swiglu_fp4"),
+        _site("choice", -1, "host"),
+    ]
+    traced, busy = _walked(sites, [_records(sites)])
+    table = traced.result.table
+    assert [(row.blocks, row.relation, row.sites) for row in table] == [
+        (("x",), "exact", (0, 5)),
+        (("y",), "exact", (3, 8)),
+        (("f", "g"), "fallback", (1, 2, 6, 7)),
+        (("f",), "fallback", (4,)),
+        (("choice",), "host", (9,)),
+        ((), "read", ()),
+    ]
+    rows = perf.kernel_table(traced, busy)["rows"]
+    assert [row["label"] for row in rows] == ["x", "y", "fallback: f + g (one row)", "fallback: f", "host path: choice", "host read"]
+    assert rows[2]["launches_per_step"] == 2 * (2 + 3) and [block["calls_per_step"] for block in rows[2]["blocks"]] == [2, 2]
+    assert rows[3]["launches_per_step"] == 2 and rows[4]["launches_per_step"] == 1 and rows[2]["us_per_launch_added"] == pytest.approx(4.3)
+    lines = perf._kernel_lines(perf.kernel_table(traced, busy), "")
+    assert lines[5] == f"  {'fallback: f + g (one row)':<58}{10:>9}{'--':>11}{0.043:>9.3f}{'55.6 %':>9}", "no time per launch for a chain of many kernels"
+    assert (
+        lines[7] == f"  {'host path: choice':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'5.6 %':>9}" and lines[8].startswith("  host read   ") and " 4.30 " in lines[8]
+    )
+    _says("area", "the median over the row's launches; not printed for a row of fallback or host blocks, a chain of many kernels.")
+    # with the identities a census states for the calls: a declared stand-in says so, a block the census calls not yet says so
+    relations = ["stand-in", "not yet", "not yet", "target", "not yet", "stand-in", "not yet", "not yet", "target", "host"]
+    stated = census.Claim("a census", "plain", "a device", 1, identities=[census.Identity(relation, reason="a chain") for relation in relations])
+    named = [row["label"] for row in perf.kernel_table(*_walked(sites, [_records(sites)], stated))["rows"]]
+    assert named == ["x (declared stand-in)", "y", "not yet: f + g (one row)", "not yet: f", "host path: choice", "host read"]
+    # a list of blocks wider than the label column is shortened; the file holds every block
+    many = [_site("exact", 0, "gate_quant")] + [_site(f"a_block_with_a_long_name_{n}", 0, "pytorch") for n in range(4)]
+    wide = perf.kernel_table(*_walked(many, [_records(many)]))["rows"][1]
+    assert wide["label"] == "fallback: a_block_with_a_long_name_0 + 3 more (one row)" and len(wide["blocks"]) == 4 and len(wide["label"]) <= perf.LABEL
+    # the family's plan: the attention preparation and the attention core of a layer have no exact kernel between them
+    sites, claim = _native(monkeypatch)
+    rows = perf.kernel_table(*_walked(sites, [_records(sites)], claim))["rows"]
+    behind = [(row["label"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows if row["relation"] != "exact"]
+    assert behind == [
+        ("not yet: projection.fp8.out", [64]),
+        ("not yet: mlp.down", [64]),
+        ("not yet: attention.prepare + attention.core (one row)", [16, 16]),
+        ("not yet: output_head + token_choice (one row)", [1, 1]),
+        ("host read", []),
+    ]
+    assert rows[8]["blocks"][0]["identity"].startswith("not yet (") and rows[9]["blocks"][1] == {
+        "block": "token_choice",
+        "calls_per_step": 1,
+        "entry": "torch.argmax",
+        "identity": "host path, not compared",
+    }
+    _says("area", "the blocks on fallback rows that no exact kernel separates are one row, and the row says so (`one row`)")
+
+
+def test_shares_sum_to_gpu_busy(monkeypatch, tmp_path):
+    """Within one step the added times of all records are that step's GPU busy, so over the traced steps the rows' mean
+    time per step sums to the mean GPU busy exactly, and the medians the screen prints sum to GPU busy up to the
+    difference between a median of sums and a sum of medians: nothing where the steps are alike."""
+    from model_samples import perf
+
+    sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch"), _site("y", 0, "swiglu_fp4"), _site("g", 0, "pytorch"), _site("z", 0, "gate_quant")]
+    alike, busy = _walked(sites, [_records(sites, start=at) for at in (0.0, 1.0, 2.0)])
+    rows = perf.kernel_table(alike, busy)["rows"]
+    assert sum(row["share_percent"] for row in rows) == pytest.approx(100.0) and sum(row["ms_per_step"] for row in rows) == pytest.approx(busy[0])
+    assert [row["share_percent"] for row in rows] == pytest.approx(
+        [12.5, 12.5, 12.5, 25.0, 25.0, 12.5]
+    ), "x, y, z; f and g with their copy; the read: eight records"
+    # steps that differ: one of the first chain's launches two kernels more, one of the second's does
+    steps = [_records(sites), _records(sites, start=1.0, also=[(1, ELEMENTWISE)] * 2), _records(sites, start=2.0, also=[(3, ELEMENTWISE)] * 2)]
+    traced, busy = _walked(sites, steps)
+    rows = perf.kernel_table(traced, busy)["rows"]
+    for step, held, of_step in zip(traced.steps, traced.result.attributed, busy):
+        per_row = [sum(added for added, row in zip(perf.added_ms(step), held) if row == number) for number in range(len(rows))]
+        assert sum(per_row) == pytest.approx(of_step, rel=1e-12), "the rows of one step partition its GPU busy"
+    assert sum(row["ms_per_step_mean"] for row in rows) == pytest.approx(sum(busy) / 3, rel=1e-12), "exact, whatever the steps are"
+    assert [row["launches_per_step"] for row in rows] == [1, 1, 1, 2, 2, 1] and rows[3]["ms_per_step"] == pytest.approx(
+        2 * 0.0043
+    ), "the median step of each row"
+    assert sum(row["ms_per_step"] for row in rows) == pytest.approx(8 * 0.0043) and sorted(busy)[1] == pytest.approx(10 * 0.0043)
+    assert sum(row["share_percent"] for row in rows) == pytest.approx(
+        80.0
+    ), "a sum of medians is not the median of the sums: the screen's shares need not reach 100 %"
+    # a run: the same tie-out on what the file holds
+    data = _mode(monkeypatch, tmp_path)[0].data
+    means, of_steps = [row["ms_per_step_mean"] for row in data["per_kernel"]["rows"]], data["traced"]["per_step"]["gpu_busy_ms"]
+    assert sum(means) == pytest.approx(sum(of_steps) / len(of_steps), rel=1e-12) and data["traced"]["gpu_busy_ms"] == data["statistics"]["gpu_busy"]["value"]
+    assert sum(row["launches_per_step"] for row in data["per_kernel"]["rows"]) == data["traced"]["records_of_the_sizing_step"]
+    _says("area", "The added times of a step partition the union, so the rows sum to GPU busy")
+    _defines("kernel_time_per_step", "per traced step the sum of the row's added times, the median over the steps; its share is that over GPU busy.")
+
+
+def test_undeclared_record_prints_no_table(monkeypatch, tmp_path):
+    """A table is made only of traced steps whose every record the kernel check attributed.  A kernel no block of the plan
+    launches, a copy between two exact rows, a step whose exact launches are not the plan's: the check fails, the record
+    has no row, and the screen says why there is no table.  GPU busy, a union that needs no attribution, is still
+    measured.  Kernels that were not observed: no table either, with the reason."""
+    from model_samples import perf
+
+    sites = [_site("x", 0, "gate_quant"), _site("y", 0, "swiglu_fp4"), _site("f", 0, "pytorch")]
+    for index, extra in ((0, "a_kernel_no_pattern_names"), (0, COPY_IN), (0, ELEMENTWISE), (2, SYMBOL)):
+        traced, busy = _walked(sites, [_records(sites), _records(sites, start=1.0, also=[(index, extra)])])
+        assert traced.status == "FAIL" and -1 in traced.result.attributed[1] and -1 not in traced.result.attributed[0], extra
+        table = perf.kernel_table(traced, busy)
+        assert table["rows"] is None and table["reason"] == "the kernels of the traced steps are not the plan's", extra
+        assert perf._kernel_lines(table, "") == ["per kernel, per step  not printed: the kernels of the traced steps are not the plan's"]
+    clean, busy = _walked(sites, [_records(sites)])
+    assert perf.kernel_table(clean, busy)["rows"] and perf.kernel_table(clean, [])["rows"] is None and perf.kernel_table(None, busy)["rows"] is None
+    # through a run: traced steps that launch another kernel than the plan's -- no table, GPU busy all the same, and no rate
+    defect = {"at the first profiler pass": {"symbol": OTHER_SYMBOL}}
+    (tmp_path / "kernel").mkdir()
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path / "kernel", defect=defect)
+    assert not outcome.passed and outcome.data["per_kernel"]["rows"] is None and outcome.data["statistics"]["gpu_busy"]["value"] > 0
+    assert "per kernel, per step  not printed: the kernels of the traced steps are not the plan's" in lines
+    assert not any(line.startswith("per kernel, per step (") for line in lines)
+    (tmp_path / "blind").mkdir()
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path / "blind", profiler=NO_PROFILER)
+    assert outcome.data["per_kernel"] == {
+        **outcome.data["per_kernel"],
+        "rows": None,
+        "reason": f"the kernels of the traced steps were not observed ({NO_PROFILER})",
+    }
+    at = lines.index("per kernel, per step  not printed: the kernels of the traced steps were not observed (this PyTorch build")
+    assert lines[at + 1] == "                      records no kernel activity)" and outcome.data["traced"]["per_step"]["gpu_busy_ms"] == []
+    _says("area", "A table is printed only where the kernel check holds: a record that no block of the plan accounts for prints no table")
+    _says("guide", "and a traced pass whose kernel check does not hold prints no table.")
+
+
+def test_whole_microsecond_stamps_print_no_us_per_launch(monkeypatch, tmp_path):
+    """The time one launch adds needs stamps finer than a microsecond.  The resolution is read from the durations the
+    trace holds -- a launch record keeps its duration as the trace has it, which its start and end on the profiler's
+    clock no longer show -- and where every one is a whole number of microseconds the ``us/launch`` column is not
+    printed and the table says so; the time per step and the shares stay."""
+    from model_samples import census, perf
+
+    def lasting(*durations):
+        return [[census.Launch(ELEMENTWISE, "kernel", float(index), index + us / 1e3, duration=us) for index, us in enumerate(durations)]]
+
+    assert perf.time_resolution_us(lasting(5.0, 12.0, 300.0)) == 1.0 and perf.time_resolution_us(lasting(4.375, 12.0)) == pytest.approx(0.001)
+    assert perf.time_resolution_us(lasting(5.6, 2.25)) == pytest.approx(0.01) and perf.time_resolution_us(lasting(0.5)) == pytest.approx(0.1)
+    assert perf.time_resolution_us([]) is None and perf.time_resolution_us([[]]) is None
+    bare = [[census.Launch(ELEMENTWISE, "kernel", 3.0, 3.0105), census.Launch(NVJET, "kernel", 4.0, 4.25)]]  # no duration: end - start, to the nanosecond
+    assert perf.time_resolution_us(bare) == pytest.approx(0.1) and perf._recorded_us(bare[0][0]) == 10.5
+    # the reader keeps the duration the trace holds; the stamps of a long-running clock have lost its last decimals
+    trace = {"traceEvents": [{"ph": "X", "cat": "kernel", "name": NVJET, "ts": 3000000000000.999, "dur": 4.375, "args": {}}]}
+    trace["traceEvents"].append({"ph": "X", "cat": "gpu_memcpy", "name": HOST_READ, "ts": 3000000000011, "dur": 7, "args": {"bytes": 4}})
+    (tmp_path / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
+    kernel, read = census.read_trace(str(tmp_path / "trace.json"))
+    assert (kernel.duration, read.duration) == (4.375, 7.0) and isinstance(read.duration, float)
+    assert (kernel.end - kernel.start) * 1e3 != 4.375 and (kernel.end - kernel.start) * 1e3 == pytest.approx(4.375, abs=2e-3)
+    assert perf.time_resolution_us([[kernel, read]]) == pytest.approx(0.001) and perf.time_resolution_us([[read]]) == 1.0
+    # the table of whole-microsecond stamps: no us/launch column, and the line that says why; of finer ones: the column
+    sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch")]
+    whole = perf.kernel_table(*_walked(sites, [_records(sites, us=7.0)]))
+    assert whole["us_per_launch_printed"] is False and whole["rows"][0]["us_per_launch_added"] == pytest.approx(7.0), "computed and in the file"
+    assert perf._kernel_lines(whole, "") == [
+        f"{'per kernel, per step (traced request)':<60} launches  ms/step  share of GPU busy",
+        "  launched from Python: not the time of a kernel inside a captured sequence",
+        "  us/launch not printed: the profiler's time stamps are whole microseconds here",
+        f"  {'x':<58}{1:>9}{0.007:>9.3f}{'25.0 %':>9}",
+        f"  {'fallback: f':<58}{2:>9}{0.014:>9.3f}{'50.0 %':>9}",
+        f"  {'host read':<58}{1:>9}{0.007:>9.3f}{'25.0 %':>9}",
+    ]
+    fine = perf.kernel_table(*_walked(sites, [_records(sites)]))
+    assert fine["us_per_launch_printed"] is True and perf._kernel_lines(fine, "reduced model: ") == [
+        f"{'per kernel, per step (reduced model: traced request)':<60} launches  us/launch  ms/step  share of GPU busy",
+        "  launched from Python: not the time of a kernel inside a captured sequence",
+        "  us/launch = the time a launch adds to the GPU's timeline",
+        f"  {'x':<58}{1:>9}{'4.30':>11}{0.004:>9.3f}{'25.0 %':>9}",
+        f"  {'fallback: f':<58}{2:>9}{'--':>11}{0.009:>9.3f}{'50.0 %':>9}",
+        f"  {'host read':<58}{1:>9}{'4.30':>11}{0.004:>9.3f}{'25.0 %':>9}",
+    ]
+    # a run: the stand-in profiler's stamps are whole microseconds, and the file says which resolution it found
+    for name in ("whole", "fine"):
+        (tmp_path / name).mkdir()
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path / "whole")
+    assert outcome.data["traced"]["time_resolution_us"] == 1.0 and outcome.data["per_kernel"]["us_per_launch_printed"] is False
+    assert "  us/launch not printed: the profiler's time stamps are whole microseconds here" in lines and not any(
+        "us/launch  ms/step" in line for line in lines
+    )
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path / "fine", on_say=_fine_stamps(monkeypatch))
+    assert outcome.data["traced"]["time_resolution_us"] == pytest.approx(0.0001) and outcome.data["per_kernel"]["us_per_launch_printed"] is True
+    assert "  us/launch = the time a launch adds to the GPU's timeline" in lines and any(
+        line.endswith("launches  us/launch  ms/step  share of GPU busy") for line in lines
+    )
+    _defines("kernel_time_per_launch", "It needs time stamps finer than a microsecond: the file records the resolution found, and where the profiler hands")
+    _says("area", "where the profiler hands over whole microseconds the `us/launch` column is not printed and the table says so")
+
+
+def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
+    """The per-kernel table of a run: behind the ``memory`` line (and the ``note``), in front of ``report file``; under its
+    head line the sentence that a kernel launched from Python does not show its time inside a captured sequence; then
+    the exact rows in the wiring order, the rows of the blocks between them, the host read.  With stamps finer than a
+    microsecond and a GPU busy below the step, the ``step`` line is the equation and the ``note`` line is printed."""
+    from model_samples import perf
+
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path, on_say=_fine_stamps(monkeypatch))
+    data = outcome.data
+    assert outcome.passed and data["per_kernel"]["launch_path"] == data["protocol"]["launch_path"] == "python" and data["per_kernel"]["reason"] is None
+    head = lines.index(f"{'per kernel, per step (reduced model: traced request)':<60} launches  us/launch  ms/step  share of GPU busy")
+    assert (
+        lines[head + 1]
+        == "  launched from Python: not the time of a kernel inside a captured sequence"
+        == "  " + perf.FROM_PYTHON
+        == "  " + data["per_kernel"]["launch_path_note"]
+    )
+    labels = [row["label"] for row in data["per_kernel"]["rows"]]
+    assert labels == ["embedding", "linear_attention.step", "fallback: add_norm_quantize + projection.fp8.in (one row)", labels[3], "host read"]
+    assert labels[3] == "fallback: projection.fp8.out + 9 more (one row)" and len(data["per_kernel"]["rows"][3]["blocks"]) == 10
+    assert [line[2:60].rstrip() for line in lines[head + 3 : head + 8]] == labels and lines[head + 8] == "" and lines[head - 1] == ""
+    assert lines[head + 9].startswith("report file           ") and lines[head - 2].startswith(("note   ", " " * 22))
+    exact = [row for row in data["per_kernel"]["rows"] if row["relation"] == "exact"]
+    assert [(row["launches_per_step"], row["planned_launches_per_step"]) for row in exact] == [(1, 1), (1, 1)], "as the kernel check counted them"
+    assert all(row["us_per_launch_added"] == pytest.approx(0.4375) and row["us_per_launch_recorded"] == 0.4375 for row in data["per_kernel"]["rows"])
+    step = lines.index(_line(lines, "step  "))
+    assert " ms = GPU busy 0.017 + launch overhead " in lines[step] and lines[step + 1].startswith(
+        "                      (GPU busy from 6 traced steps, positions 5 to 10; "
+    )
+    assert (
+        _line(lines, "note   ").startswith("note                  reduced model: launch overhead ") and data["statistics"]["launch_overhead"]["value"] > 0.017
+    )
+    assert (
+        data["statistics"]["gpu_busy"]["value"] == pytest.approx(39 * 0.0004375)
+        and data["traced"]["tracing_stretch_percent"] == data["statistics"]["tracing_stretch"]["value"]
+    )
+    assert data["statistics"]["gpu_busy"]["n"] == data["traced"]["steps"] == len(data["traced"]["per_step"]["gpu_busy_ms"]) == 6, "every traced step"
+    assert perf.screen(json.loads(json.dumps(data))) == lines[lines.index("cuDNN Frontend model sample: decode performance report") :][: len(perf.screen(data))]
+    _says("area", "its second line says that it is launched from Python: a kernel's time there is not its time inside a captured sequence")
+    _says("area", "An ordinary run prints no time per block; the performance mode prints the device time of every block's kernels.")
+    _says("area", "Neither prints a limit (floor, speed-of-light figure)")
+    _says("guide", "The token-to-token interval and the rate come from the host clock of requests that are not traced; GPU busy and the device time of a")
+    _says("guide", "kernel come from kernel activity records of a traced request at the same positions, behind the last timed request.")
+    _says("guide", "The two are never taken from one pass, and a report says which is which.")
+
+
+def test_dump_census_schema_2(monkeypatch, capsys, tmp_path):
+    """``--dump-census`` writes every launch record with its start and its end, in milliseconds on the profiler's clock, and
+    says ``schema 2``: of an ordinary run and of the traced request of the performance mode."""
+    sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch")]
+    traced, _ = _walked(sites, [_records(sites), _records(sites, start=1.0)])
+    dumped = traced.dump()
+    assert dumped["fields"] == [
+        "name",
+        "kernel",
+        "kind",
+        "grid",
+        "block",
+        "shared_memory",
+        "registers",
+        "graph_id",
+        "graph_node_id",
+        "bytes",
+        "start_ms",
+        "end_ms",
+    ]
+    assert [record[-2:] for record in dumped["steps"][1]] == [[launch.start, launch.end] for launch in traced.steps[1]] and dumped["steps"][1][0][-2] == 1.0
+    sample = _sample_on_the_cpu(monkeypatch, [])
+    monkeypatch.chdir(tmp_path)
+    for arguments, steps in (
+        (["--sequences", "1", "--force-tokens", "4"], 32),
+        (["--perf", "--perf-steps", "6", "--perf-requests", "1", "--perf-warmup", "1"], 6),
+    ):
+        code = sample.main([*arguments, "--dump-census", "census.json"])
+        assert code == 0 and capsys.readouterr().err.splitlines()[-1] == "[00] PASS"
+        written = json.loads((tmp_path / "census.json").read_text(encoding="utf-8"))
+        (tmp_path / "census.json").unlink()
+        assert (written["schema"], written["traced_steps"]) == (2, steps) and written["runs"][0]["fields"][-2:] == ["start_ms", "end_ms"]
+        records = [record for step in written["runs"][0]["steps"] for record in step]
+        assert records and all(len(record) == 12 and record[-2] <= record[-1] for record in records)
+        assert all([record[-2] for record in step] == sorted(record[-2] for record in step) for step in written["runs"][0]["steps"]), "in start order"
+    _says(
+        "family",
+        "per launch its kernel id, name, grid, block, shared memory, registers per thread, and its start and end in milliseconds on the profiler's clock",
+    )
+    _says("script", "(kernel, grid, block, shared memory, start and end per launch)")
 
 
 # ---------------------------------------------------------------------------------------------- the flags and main()
@@ -1693,7 +2275,9 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
         "other processes not observed",
         "clocks not observed",
     ]
-    form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today})
+    sites, claim = _native(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
+    table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
+    form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
     form["memory"].update(weights_gib=37.3, state_gib=0.5, peak_reserved_gib=40.0)
     shown = perf.screen({**form, "report_file": "report-<UTC time>.json"})
 

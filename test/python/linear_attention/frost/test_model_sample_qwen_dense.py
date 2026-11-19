@@ -298,7 +298,10 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     checks, a warm-up request, two timed requests, the traced request and the kernel check on it.  The run ends in ``[00]
     PASS`` -- or, where the profiler's records cannot be had, in ``RAN <stack> stack (kernels not observed: ...)`` --
     prints the report in its reduced-model form (no rate; ``orientation`` with ``reduced model`` among its reasons) on
-    standard error, leaves standard output empty and writes the report file.  No time of it is held against anything."""
+    standard error, leaves standard output empty and writes the report file.  Where the kernels were observed the file
+    holds GPU busy of every traced step and the per-kernel table of real launches: its rows hold every record of a
+    step, an exact row the launches the plan has for it, and the rows' mean time per step sums to the mean GPU busy.
+    No time of it is held against anything."""
     import json
 
     if not torch.cuda.is_available():  # decided here, before a child is started
@@ -354,6 +357,15 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     kernels = data["kernels"]
     if not unobserved:
         assert 1 <= data["traced"]["steps"] <= 16 and requests[4]["ids_sha256"] == requests[0]["ids_sha256"], "the traced request too"
+        # the GPU side: GPU busy of every traced step, and the per-kernel table of the launches the kernel check attributed
+        busy, rows = data["traced"]["per_step"]["gpu_busy_ms"], data["per_kernel"]["rows"]
+        assert len(busy) == data["traced"]["steps"] and min(busy) > 0 and data["statistics"]["gpu_busy"]["value"] == data["traced"]["gpu_busy_ms"] > 0
+        assert any(line.startswith("per kernel, per step (reduced model: traced request)") for line in screen) and rows[-1]["label"] == "host read"
+        assert sum(row["launches_per_step"] for row in rows) == data["traced"]["records_of_the_sizing_step"], "the rows hold every record of a step"
+        exact = [row for row in rows if row["relation"] == "exact"]
+        assert exact and all(row["launches_per_step"] == row["planned_launches_per_step"] for row in exact), "as the plan has them"
+        assert abs(sum(row["ms_per_step_mean"] for row in rows) - sum(busy) / len(busy)) <= 1e-9 * sum(busy), "the rows partition GPU busy"
+        assert 0 < data["traced"]["time_resolution_us"] <= 1 and data["per_kernel"]["us_per_launch_printed"] == (data["traced"]["time_resolution_us"] < 1)
     if kernels["stated"]:  # a target stack on a GPU the census has a section for: the three numbers add up
         assert kernels["on_target"] == kernels["code"] + kernels["port"] + kernels["stand_ins"] and kernels["launches"] == 20
     else:
