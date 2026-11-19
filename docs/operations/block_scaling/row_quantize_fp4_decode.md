@@ -112,17 +112,23 @@ allocated by `compile(rows)` / `outputs(rows)` or at the first call of that row 
 allocates the pair of ONE row (2,560 code bytes and one 128-row scale band): the compile binds it, also for a caller that
 passes its own outputs on every call. Call `compile(rows)` for every row
 count before a CUDA-graph capture; it may run on any stream. The initialization of a pair (its allocation and the zero-fill)
-is stream work of torch's current stream of the entry's device at that moment, and a call orders its launch behind it on
-whatever stream it runs: on the same stream by stream order, on another stream by a stream-side wait for an event recorded
-behind the initialization. The host does not wait, and no stream and no device is synchronized. A capturing stream cannot
-wait for an event recorded outside the capture, so a captured call that finds the initialization still pending waits for
-that one event on the host before its captured launch (`torch.cuda.graph` synchronizes the device when it is entered, so
-only a capture begun another way can meet a pending initialization). Once a call has seen the initialization complete,
-calls do nothing for it. `outputs(rows)` returns the pair without waiting: a caller that reads or writes the returned
-tensors itself, before the entry has been called at that row count, does so on the allocating stream or orders its own
-stream behind it first. Entry-owned outputs are valid until the entry's next call at that row count from ANY host
-thread: stream order does not serialize host calls, so two host threads that share one entry pass their own outputs or build
-one entry each. The per-row-count pairs are never freed, so a caller that sweeps many row counts passes its own outputs. An
+is stream work of torch's current stream of the entry's device at that moment, and every launch of the entry that writes one
+of the pair's tensors is ordered behind it on whatever stream it runs, however the tensor reached the call: the entry's own
+output of the row count, or a tensor taken with `outputs(rows)` and passed back as an explicit output, whole or as a view, at
+this row count or another. On the same stream the order is stream order; on another stream it is a stream-side wait for an
+event recorded behind the initialization. The host does not wait, and no stream and no device is synchronized. A capturing
+stream cannot wait for an event recorded outside the capture, so a captured call that finds the initialization still pending
+waits for that one event on the host before its captured launch. A pair allocated before `torch.cuda.graph` is entered is
+complete by then (the context synchronizes the device); an initialization started inside the context on another stream or by
+another host thread, or met under a capture begun another way, can still be pending. Once a launch has seen the
+initialization complete, calls do nothing for it. `outputs(rows)` returns the pair without waiting: a caller that reads or
+writes the returned tensors itself, outside a call of the entry, while their initialization may be pending, does that on the
+stream that was current when they were allocated, or orders its own stream behind that one. Entry-owned outputs are valid
+until the entry's next call at that row count from ANY host thread: stream order does not serialize host calls, so two host
+threads that share one entry pass their own outputs or build one entry each. The entry's first use is not serialized either:
+`compile()` -- and `compile(rows)` or `outputs(rows)` for every row count whose entry-owned pair is used -- runs in one host
+thread before another thread uses the entry. The per-row-count pairs are never freed, so a caller that sweeps many row counts
+passes its own outputs. An
 entry-owned output is an operand of the launch like a passed one, so the overlap rule covers it: a call whose `x`, `scale` or
 passed output overlaps an entry-owned output that the call does not pass is declined with `ValueError` before the launch.
 
@@ -196,7 +202,8 @@ launch facts against the configuration arithmetic and against the profiler's rec
 the references above under eleven global scales, the scale byte of every finite bf16 block maximum, the exact cells, the
 equality with the NVFP4 form of the add + RMSNorm + quantize step, blocks with a NaN or an infinity, output ownership, the
 bit-neutral arms, the wait behind a predecessor that released early, the release beside a dependent launch, CUDA-graph
-replay, a launch behind an entry-owned pair's initialization that is pending on another stream -- eager in both directions,
-captured, for two row counts and on a recycled block) and `test_row_quantize_fp4_decode_determinism.py` (replay, batch
-invariance, locality, goldens). Source:
+replay, a launch behind the pending initialization of every entry-owned pair it writes -- the pair by default and passed
+back whole, as one of the two or as a view, slices of another row count's pair; eager in both directions, from two streams, in
+a raw capture and in the `torch.cuda.graph` flow, for two row counts and on a recycled block) and
+`test_row_quantize_fp4_decode_determinism.py` (replay, batch invariance, locality, goldens). Source:
 `python/cudnn/row_quantize/frost/`.
