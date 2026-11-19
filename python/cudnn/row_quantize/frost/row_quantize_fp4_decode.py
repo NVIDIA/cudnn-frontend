@@ -401,10 +401,15 @@ class RowQuantizeFp4Decode:
         ``torch.cuda.graph`` is entered is complete by then (the context synchronizes the device); an initialization started
         inside the context on another stream or by another thread, or under a capture begun another way, can still be
         pending here.  The event is read with this thread's capture check relaxed and restored: while ANY thread captures in
-        the default mode, querying an event is refused and invalidates that capture."""
+        the default mode, querying an event is refused and invalidates that capture.  A record that is gone -- another host
+        thread's launch saw the initialization complete and dropped it behind the caller's snapshot -- is nothing to order
+        behind."""
         import torch
 
-        done, init_stream, _ = self._init[rows]
+        record = self._init.get(rows)
+        if record is None:
+            return
+        done, init_stream, _ = record
         capturing = torch.cuda.is_current_stream_capturing()
         err, previous = driver.cuThreadExchangeStreamCaptureMode(driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
         if int(err) != 0:

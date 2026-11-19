@@ -411,7 +411,8 @@ def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_mos
     stream.  Pending under a capture: the host waits for this one event, without querying it first, and the record is dropped.
     No branch synchronizes a stream or the device; every read of the event runs with the thread's capture check relaxed, and the
     check is restored also when the read raises.  A pair of another row count is never touched, and an entry on a device without
-    streams records nothing."""
+    streams records nothing.  A record that is gone when the pair is looked up -- another host thread's launch saw the
+    initialization complete and dropped it -- is nothing to order behind: no event and no capture check is read."""
     calls, capturing, Event, Stream, Driver = _ordering_stand_ins(monkeypatch)
     k = make_entry("cpu")
     k.outputs(3), k.outputs(4)
@@ -437,6 +438,11 @@ def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_mos
     with pytest.raises(RuntimeError, match="the event's query failed"):
         k._order_behind_init(3, other, Driver)
     assert Driver.mode == "global", "the capture check is restored behind a failed read"
+    calls.clear()
+    k._init = {4: untouched}
+    k._order_behind_init(3, other, Driver)
+    assert not calls and k._init == {4: untouched} and Driver.mode == "global", "a record that is gone: nothing is read, nothing raises"
+    k._init = {3: (Event(False), init, ())}
     Driver.fails = True
     calls.clear()
     with pytest.raises(RuntimeError, match="cuThreadExchangeStreamCaptureMode failed"):
@@ -450,9 +456,12 @@ def test_a_launch_is_ordered_behind_every_pending_pair_it_writes_and_behind_no_o
     pair passed back (the same tensors), one of the two beside a caller-owned output, a view or a slice of one, the pair of
     ANOTHER row count whole or sliced, outputs of two pairs at once -- and no other.  The test is one of ADDRESSES: the bytes a
     launch of ``rows`` rows writes (not the tensor's size: rows past the call's are not written) against the pair's two
-    allocations, half-open.  A caller-owned output is ordered behind nothing and reads no event, with records present; the
-    per-pair decision is the one of the case above (a pending pair on another stream: that stream waits and the record stays; a
-    complete one: dropped), taken for every pair that is hit and for no other."""
+    allocations, half-open -- EVERY written range against BOTH allocations, so a written operand that lies over the OTHER
+    tensor of a pair (the codes over a pair's scale bytes, the scales over a pair's code bytes) is ordered too.  A caller-owned
+    output is ordered behind nothing and reads no event, with records present; the per-pair decision is the one of the case
+    above (a pending pair on another stream: that stream waits and the record stays; a complete one: dropped), taken for every
+    pair that is hit and for no other -- and a record that another host thread dropped behind the walk's snapshot is skipped
+    without ending the walk."""
     calls, capturing, Event, Stream, Driver = _ordering_stand_ins(monkeypatch)
     k = make_entry("cpu")
     own, nine, big = k.outputs(3), k.outputs(9), k.outputs(200)
@@ -480,6 +489,10 @@ def test_a_launch_is_ordered_behind_every_pending_pair_it_writes_and_behind_no_o
     assert ordered_behind(3, codes=nine["codes"], scales=nine["scales"]) == [9], "the pair of another row count"
     assert ordered_behind(3, codes=big["codes"][100:], scales=big["scales"][128:]) == [200], "slices that start inside another pair"
     assert ordered_behind(3, codes=nine["codes"], scales=own["scales"]) == [3, 9], "outputs of two pairs: both are waited for"
+    over_scales = big["scales"].view(U8).reshape(32, WIDTH // 2)  # the scale bytes of a pair, bound as the call's CODES
+    assert ordered_behind(3, codes=over_scales, scales=mine["scales"]) == [200], "a written operand over the OTHER tensor of a pair"
+    over_codes = big["codes"].view(E4M3)[:16].reshape(128, BLOCKS)  # the code bytes of a pair, bound as the call's SCALES
+    assert ordered_behind(3, codes=mine["codes"], scales=over_codes) == [200], "the scales over the code bytes of a pair"
     assert ordered_behind(3, codes=mine["codes"], scales=mine["scales"]) == [], "caller-owned outputs"
     assert not calls, "a call with caller-owned outputs read an event or the capture check"
 
@@ -508,6 +521,22 @@ def test_a_launch_is_ordered_behind_every_pending_pair_it_writes_and_behind_no_o
     calls.clear()
     k._order_behind_pending(3, dict(codes=nine["codes"], scales=mine["scales"]), launch, Driver)
     assert calls == [relaxed, "synchronize", restored] and set(k._init) == {200}, "under a capture: the host waits for the ONE event"
+
+    # two host threads on one pending pair: the record of pair 3 is dropped by the OTHER thread (its launch saw the initialization
+    # complete) behind this walk's snapshot, here at the moment this walk reads pair 9's event.  Nothing is read for pair 3,
+    # nothing raises, and the walk goes on to the next record that is hit (a second record over the bytes of pair 9).
+    class DropsPairThree(Event):
+        def query(self):
+            k._init.pop(3)
+            return super().query()
+
+    capturing[0] = False
+    calls.clear()
+    racing, last = DropsPairThree(False), Event(False)
+    k._init = {9: (racing, init, _spans(nine)), 3: (Event(False), init, _spans(own)), 77: (last, init, _spans(nine)), 200: untouched}
+    k._order_behind_pending(3, dict(codes=nine["codes"], scales=own["scales"]), launch, Driver)
+    waits = [relaxed, "query", ("wait_event", "launch", racing), restored, relaxed, "query", ("wait_event", "launch", last), restored]
+    assert calls == waits and set(k._init) == {9, 77, 200} and Driver.mode == "global", "a record dropped behind the snapshot"
     k._init = {}
     calls.clear()
     k._order_behind_pending(3, whole, launch, Driver)
