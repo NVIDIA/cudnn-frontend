@@ -3798,7 +3798,8 @@ def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
     """Whether a LISTED knob set of the SM100 D256 swap-AB engine reduces its split inside the launch (``CLUSTER_K_REDUCE``).
 
     A pure function of the facts, the set and the installed extension: the form's own domain (the swap-AB contract's
-    ``cluster_reduce_decline``: the part, the 16-column tile, 2 .. 8 chunks, one token unit, no fold the separate pass carries); an extension
+    ``cluster_reduce_decline``: the part, the 16-column tile, 2 .. 8 chunks, one token unit, a head width of whole warps, no fold
+    the separate pass carries); an extension
     that binds the reduced launch; the packed whole-group set of any head ratio and token count whose rows fit one tile (an
     unpacked set has no recorded cell and takes the form by an explicit knob only); and at most the recorded cluster count
     of the part for the set's split (``units <= fused_cluster_bound``: past one wave of clusters a chunk that ended would
@@ -3818,6 +3819,7 @@ def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
         tile=knobs.tile_m,
         split_kv=split,
         q_rows=facts.s_q * pack_g,
+        d_v=facts.d_v,
         thd=facts.thd,
         has_sink=facts.has_sink,
         stats_log2=facts.has_stats_log2,

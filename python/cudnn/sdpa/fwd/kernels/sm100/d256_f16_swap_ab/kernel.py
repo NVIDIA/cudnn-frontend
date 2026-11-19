@@ -914,6 +914,8 @@ def _softmax_warp_group(
                 if cutlass.const_expr(reduce_follows):
                     # The reduction runs behind this role's tensor-memory release, so the load is issued only where this thread
                     # stores from it (the store's own range guard): no path carries a loaded register unread across the release.
+                    # The load is warp-collective, so the guard must be one value per warp: the form's head widths are multiples
+                    # of 32 (cluster_combine_supported), and a warp's 32 threads are 32 consecutive columns.
                     o_loaded = o_loaded & (d_idx < cutlass.Int32(D_V))
                 if o_loaded:
                     # Empty range: O^T TMEM was never written, so the load is skipped
@@ -1388,7 +1390,8 @@ CLUSTER_COMBINE_BY_KNOB = True
 
 def cluster_combine_supported(d_qk: int, d_v: int) -> bool:
     """Whether THIS rendering has the in-launch reduction: 2 .. 8 chunks (one portable thread-block cluster, the lean group of the
-    separate pass), the 16-column D256 rendering, O in the Q/K/V half type, a head width the four-column groups tile, and neither of
+    separate pass), the 16-column D256 rendering, O in the Q/K/V half type, a head width of whole warps (a multiple of 32: the
+    four-column groups tile it, and the epilogue's range guard in front of its warp-collective load is uniform per warp), and neither of
     the folds the separate pass carries instead (a sink, base-2 Stats).  The dense padded-Q trim needs nothing here: a trimmed row's
     partials are dead in every chunk, which the reduction turns into O = 0 / Stats = -inf.  It selects no split count.  A split
     rendering's own Stats are natural-log whatever the graph asks (the separate pass applies the base), so this predicate cannot see
@@ -1400,7 +1403,7 @@ def cluster_combine_supported(d_qk: int, d_v: int) -> bool:
         and CFG.TILE_K == 256
         and CFG.TILE_O == 256
         and 0 < d_v <= CFG.TILE_O
-        and d_v % 4 == 0
+        and d_v % 32 == 0
         and CFG.DTYPE_O == CFG.DTYPE_QKV
         and not CFG.HAS_SINK
         and not CFG.STATS_LOG2
@@ -1440,7 +1443,7 @@ def compile(  # noqa: A001
     if cluster_combine and (not cluster_combine_supported(d_qk, d_v) or use_pdl or not has_lse):
         raise ValueError(
             f"cluster_combine needs 2 .. {_FOLD_MAX_SPLITS} KV chunks on the 16-column D256 rendering with partial Stats, O in the Q/K/V type, "
-            "d_v a multiple of 4, and no sink, base-2 Stats or programmatic dependent launch"
+            "d_v a multiple of 32, and no sink, base-2 Stats or programmatic dependent launch"
         )
     gmem = cute.AddressSpace.gmem
 

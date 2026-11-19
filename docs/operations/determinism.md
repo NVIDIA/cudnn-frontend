@@ -174,7 +174,7 @@ The SM100 D256 swap-AB split decode tile reduces its per-chunk partial results
 in the separate reduction pass or, with `CLUSTER_K_REDUCE=1`, inside its own
 launch. Both forms add the partials in split order with the same operations.
 In the tested configurations (2 to 8 chunks; FP16/BF16; head ratios 24/4, 8/1,
-16/4, 32/8 and 32/2; head widths 256, 200 and 192; packed units of one to four
+16/4, 32/8 and 32/2; head widths 256, 224 and 192; packed units of one to four
 tokens and unpacked units of one to eight; pages of 16, 32 and 64 with
 per-batch lengths and a dense cache without them; padding, bottom-right and
 top-left causal masks and a sliding window) they store identical O and Stats

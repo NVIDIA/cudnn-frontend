@@ -16,20 +16,22 @@ CGA = 1
 # One unit's chunks form one thread-block cluster and reduce with the separate pass's lean group, which holds 8 splits.
 CLUSTER_REDUCE_SPLITS = (2, 8)
 CLUSTER_REDUCE_QUERY_TILE = 16
+# The form's head widths: whole warps of the epilogue (its range guard sits in front of a warp-collective load).
+CLUSTER_REDUCE_WIDTH_STEP = 32
 # The compute capabilities the form has run on. Another part of the line stays declined until a device run exists for it.
 CLUSTER_REDUCE_VERIFIED_CCS = ((10, 0),)
 
 
 def cluster_reduce_decline(
-    *, device_cc, d_shape, tile, split_kv, q_rows=None, thd=False, has_sink=False, stats_log2=False, gated=False, o_matches_qkv=True, use_pdl=False
+    *, device_cc, d_shape, tile, split_kv, q_rows=None, d_v=None, thd=False, has_sink=False, stats_log2=False, gated=False, o_matches_qkv=True, use_pdl=False
 ):
     """Why ``CLUSTER_K_REDUCE=1`` is not served for this plan, or None.
 
     The one statement of the form's domain: the engine row (:func:`mismatch`), the heuristics' proposal and the standalone
     adapter's support check all read it, so a set the heuristics mark is a set the row admits and the adapter builds.
     ``d_shape`` is the kernel flavor the graph rides, ``tile`` the Q tile, ``q_rows`` the plan's tokens times the heads one
-    tile packs (None = not stated), ``o_matches_qkv`` whether O is stored in the Q/K/V half type. A graph outside it keeps its
-    two-launch and unsplit plans; only the request is declined."""
+    tile packs and ``d_v`` the head width of O (None = not stated), ``o_matches_qkv`` whether O is stored in the Q/K/V half
+    type. A graph outside it keeps its two-launch and unsplit plans; only the request is declined."""
     lo, hi = CLUSTER_REDUCE_SPLITS
     if tuple(device_cc) not in CLUSTER_REDUCE_VERIFIED_CCS:
         return "CLUSTER_K_REDUCE=1 is verified on compute capability 10.0 only; it is unverified on this device"
@@ -39,6 +41,8 @@ def cluster_reduce_decline(
         return f"CLUSTER_K_REDUCE=1 needs {lo} to {hi} KV chunks (SPLIT_KV) in one thread-block cluster"
     if q_rows is not None and q_rows > tile:
         return "CLUSTER_K_REDUCE=1 is implemented for one token unit per head group (tokens x packed heads within TILE_M)"
+    if d_v is not None and d_v % CLUSTER_REDUCE_WIDTH_STEP:
+        return f"CLUSTER_K_REDUCE=1 is implemented for head widths that are multiples of {CLUSTER_REDUCE_WIDTH_STEP}"
     if thd or has_sink or stats_log2 or gated or not o_matches_qkv:
         return (
             "CLUSTER_K_REDUCE=1 does not carry a sink, base-2 Stats, ragged queries, an epilogue gate or a quantized output; "
@@ -76,6 +80,7 @@ def mismatch(facts, knobs):
             tile=tile,
             split_kv=knobs.split_kv or 1,
             q_rows=facts.s_q * group,
+            d_v=facts.d_v,
             thd=facts.thd,
             has_sink=facts.has_sink,
             stats_log2=facts.has_stats_log2,

@@ -319,8 +319,8 @@ CELLS = {
     "bf16-h16x4-q3-p-s8-causal": dict(heads=(16, 4), s_q=3, split=8, causal=True, lens=(2048, 5)),
     "bf16-h32x8-q4-p-s8-causal": dict(heads=(32, 8), s_q=4, split=8, causal=True, lens=(2048, 1027), q_lens=(4, 3)),
     "bf16-h32x2-q1-p-s4-no-q-lens": dict(heads=(32, 2), s_q=1, split=4, declared=1536, lens=(1536, 100), q_lens_present=False),
-    # head widths below the 256 envelope
-    "bf16-d200-q1-p-s8": dict(d=200, s_q=1, split=8, lens=(2048, 333)),
+    # head widths below the 256 envelope (whole warps: multiples of 32)
+    "bf16-d224-q1-p-s8": dict(d=224, s_q=1, split=8, lens=(2048, 333)),
     "f16-d192-q2-p-s4-causal": dict(dtype=torch.float16, d=192, s_q=2, split=4, causal=True, lens=(2048, 513)),
     # every other split count of the form
     "bf16-q1-p-s3": dict(s_q=1, split=3, declared=1536, lens=(1536, 400)),
@@ -639,22 +639,23 @@ def test_explicit_record_outside_the_form_is_declined(change, match):
 
 
 @pytest.mark.parametrize(
-    "kwargs,match",
+    "kwargs,match,width",
     [
-        (dict(split_kv=16), "2 to 8 KV chunks"),
-        (dict(split_kv=1), "2 to 8 KV chunks"),
-        (dict(split_kv=4, use_pdl=True), "programmatic-dependent-launch"),
-        (dict(split_kv=4, has_sink=True), "does not carry a sink"),
-        (dict(split_kv=4, stats_log2=True), "does not carry a sink"),
+        (dict(split_kv=16), "2 to 8 KV chunks", D),
+        (dict(split_kv=1), "2 to 8 KV chunks", D),
+        (dict(split_kv=4, use_pdl=True), "programmatic-dependent-launch", D),
+        (dict(split_kv=4, has_sink=True), "does not carry a sink", D),
+        (dict(split_kv=4, stats_log2=True), "does not carry a sink", D),
+        (dict(split_kv=8), "multiples of 32", 200),
     ],
-    ids=["split16", "unsplit", "pdl", "sink", "log2-stats"],
+    ids=["split16", "unsplit", "pdl", "sink", "log2-stats", "width200"],
 )
-def test_standalone_request_outside_the_form_is_declined(kwargs, match):
+def test_standalone_request_outside_the_form_is_declined(kwargs, match, width):
     """The standalone adapter's twin of the row decline: typed, before any kernel is built."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _device()
-    runner = Runner(s_q=1, lens=(2048,), seed=5)
+    runner = Runner(s_q=1, lens=(2048,), seed=5, d=width)
     t = runner.batch([0])
     api = SdpaFwdDslSm100(
         t["q"],

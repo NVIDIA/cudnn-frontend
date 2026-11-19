@@ -24,7 +24,7 @@ wrote would dominate the reduction and fail the reference.
 
 | Group | Cells | What varies |
 | --- | --- | --- |
-| Numerics and two-form bytes | 36 | every split count from 2 to 8; head ratios 24/4, 8/1, 16/4, 32/8 and 32/2 (6, 8, 12 and 16 packed rows in one tile); head widths 256, 200 and 192; packed 1 to 4 tokens, unpacked 2, 3, 4, 6 and 8 tokens; FP16/BF16; pages 16, 32, 64 with per-batch lengths and a dense cache without length operands; padding, bottom-right causal, top-left causal and sliding-window masks; a paged plan without the Q length operand; one user with a full cache and with 128 and 1,024 live keys under a 2,048-key declaration; lengths 0, 1, 64, 127, 128, 129, 1,000 and full; more chunks than declared tiles; 1 to 5 tiles per chunk; padded query rows; output storage that is not 8-byte addressable; no Stats output |
+| Numerics and two-form bytes | 36 | every split count from 2 to 8; head ratios 24/4, 8/1, 16/4, 32/8 and 32/2 (6, 8, 12 and 16 packed rows in one tile); head widths 256, 224 and 192; packed 1 to 4 tokens, unpacked 2, 3, 4, 6 and 8 tokens; FP16/BF16; pages 16, 32, 64 with per-batch lengths and a dense cache without length operands; padding, bottom-right causal, top-left causal and sliding-window masks; a paged plan without the Q length operand; one user with a full cache and with 128 and 1,024 live keys under a 2,048-key declaration; lengths 0, 1, 64, 127, 128, 129, 1,000 and full; more chunks than declared tiles; 1 to 5 tiles per chunk; padded query rows; output storage that is not 8-byte addressable; no Stats output |
 | Element budget | 3 | 64 users x 2 packed tokens at 4, 8 and 8 chunks (2,359,296 BF16 O elements), 24 users x 6 unpacked tokens at 4 and 8 chunks (1,769,472 BF16) and 24 users x 2 packed tokens at 8 chunks (294,912 FP16), full caches; a reduction in the reverse split order must not reproduce the bytes |
 | Two chunks commute | 1 | the reverse-order control reproduces the bytes at 2 chunks, so those cells carry no weight in the budget |
 | Stale partials | 2 | a full-length launch, then one with live lengths 1 / 100 / 0 on the same workspace without refilling it; both forms |
@@ -33,14 +33,14 @@ wrote would dominate the reduction and fail the reference.
 | Replay, capture and golden | 2 | eight fresh-buffer replays with concurrent GPU work per form; a retained CUDA graph against eager execution; changed lengths and queries under the retained graph; one golden per path that both forms reproduce |
 | Warm refill stress | 1 | clusters of two, ten key tiles per chunk, 256 warm and 256 poisoned launches behind the cluster-of-two control |
 | Graph plan and public record | 4 | the default plan of a two-token step carries the knob and its record; the compiled plan's record names the form that ran; a record with and without the knob rebuilds the same bytes |
-| Declines | 8 | explicit records and standalone requests outside the form; an unaligned workspace |
+| Declines | 9 | explicit records and standalone requests outside the form (a head width of 200 among them); an unaligned workspace |
 
 A right-band mask and the NHD pool layout are admitted by the form and have no
 cell here.
 
 Measured on one B200-class development GPU (compute capability 10.0, 148 SMs;
 CuTe DSL 4.8.0, cuDNN 9.27 debug libraries, PyTorch 2.13.0+cu130), shared with
-other users: **62 passed** with `CUDNN_DETERMINISM_GOLDENS` set, so the two
+other users: **63 passed** with `CUDNN_DETERMINISM_GOLDENS` set, so the two
 golden comparisons ran. The element-budget cells printed
 `2359296 bfloat16 O elements compared and equal`,
 `1769472 bfloat16 O elements compared and equal` and
@@ -56,7 +56,7 @@ The two golden cases (`sdpa-decode-d256-swap-ab-bf16-packed-split8`,
 `sdpa-decode-d256-swap-ab-f16-unpacked-split4`) are recorded for that runtime
 only. SM103 was not run: the knob is declined there, and the status page says
 unverified. `test_sdpa_fwd_decode_cluster_reduce.py` holds the cells that need
-no device (73 passed): the knob record, the heuristics rule and its tables,
+no device (76 passed): the knob record, the heuristics rule and its tables,
 the recorded cluster bound, the declines, the source pin of the cluster
 barrier and the launch-frame parity of the native and Python binders.
 

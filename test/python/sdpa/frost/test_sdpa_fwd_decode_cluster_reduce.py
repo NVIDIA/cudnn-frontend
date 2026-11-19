@@ -143,6 +143,8 @@ def test_row_declines_a_request_outside_the_form(overrides, knobs, reason):
         (dict(d_shape=(128, 128)), "16-column D256"),
         (dict(split_kv=9), "2 to 8"),
         (dict(q_rows=17), "one token unit per head group"),
+        (dict(d_v=200), "multiples of 32"),
+        (dict(d_v=136), "multiples of 32"),
     ],
 )
 def test_contract_predicate_rows(kwargs, reason):
@@ -150,6 +152,7 @@ def test_contract_predicate_rows(kwargs, reason):
     assert swap_ab.cluster_reduce_decline(**base) is None
     assert all(swap_ab.cluster_reduce_decline(**{**base, "split_kv": s}) is None for s in range(2, 9))
     assert swap_ab.cluster_reduce_decline(**{**base, "q_rows": 16}) is None
+    assert all(swap_ab.cluster_reduce_decline(**{**base, "d_v": d}) is None for d in (160, 192, 224, 256))
     assert reason in swap_ab.cluster_reduce_decline(**{**base, **kwargs})
 
 
@@ -277,6 +280,26 @@ def test_row_declines_more_than_one_token_unit_with_the_knob():
         assert "one token unit per head group" in engines.mismatch(caps, f, dataclasses.replace(knobs, cluster_reduce=True)), (heads, s_q)
     one_unit = facts(1, 4, 2048, heads=(32, 8))
     assert engines.mismatch(caps, one_unit, SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, sched_policy=0, pack_gqa=True, split_kv=8, cluster_reduce=True)) is None
+
+
+def test_form_needs_a_head_width_of_whole_warps():
+    """In the in-launch form the epilogue's tensor-memory load sits behind its store's range guard, and that load is
+    warp-collective: the guard must be one value per warp, which holds for head widths that are multiples of 32. Another
+    width of the envelope (200) keeps its two-launch plans: the row declines the knob, the rule does not mark the set, and
+    the kernel refuses to build the form."""
+    caps = SPECS[SWAP_AB].capabilities
+    knobs = SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, sched_policy=0, pack_gqa=True, split_kv=8)
+    for width, served in ((256, True), (224, True), (192, True), (200, False), (232, False)):
+        f = facts(1, 1, 2048, d_qk=width, d_v=width)
+        assert engines.mismatch(caps, f, knobs) is None, width
+        reason = engines.mismatch(caps, f, dataclasses.replace(knobs, cluster_reduce=True))
+        assert (reason is None) if served else ("multiples of 32" in reason), width
+        lead = _lead_swap_ab(f)
+        assert lead.split_kv == 8 and bool(lead.cluster_reduce) is served, width
+    source = (Path(prep.__file__).parent / "kernels/sm100/d256_f16_swap_ab/kernel.py").read_text()
+    supported = _function(ast.parse(source), "cluster_combine_supported")
+    assert "d_v % 32 == 0" in ast.unparse(supported)
+    assert swap_ab.CLUSTER_REDUCE_WIDTH_STEP == 32
 
 
 def test_recorded_cluster_bound_steers_the_rule(monkeypatch):
@@ -460,6 +483,7 @@ def test_standalone_adapter_declines_like_the_row_and_adds_the_installation_chec
         s_q_max=1,
         h_q=24,
         h_kv=4,
+        head_dim_v=256,
         pack_gqa=True,
         split_kv=16 if change == "split16" else 8,
         thd=False,
