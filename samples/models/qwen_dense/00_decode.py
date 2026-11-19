@@ -359,16 +359,36 @@ def _perf_arguments(parser, args) -> None:
     args.check_kernels = True  # the kernels of the traced steps are one of the three statements of the report's checks
 
 
+def _perf_longest(args) -> tuple:
+    """``(forced steps, flag, name)`` of the longest request of a run of the performance mode.  The checked request and
+    every timed request run ``--perf-steps`` forced steps behind the first new token and the traced request at most as
+    many; the warm-up request runs ``--perf-warmup``, which may be the larger count.  One session serves every request of
+    the run: it is built for the longest of them, and ``--max-model-len`` is held against that one."""
+    if args.perf_warmup > args.perf_steps:
+        return args.perf_warmup, "--perf-warmup", "the warm-up request"
+    return args.perf_steps, "--perf-steps", "a timed request"
+
+
+def _positions(args, prompt_tokens: int, rule) -> int:
+    """The positions a sequence of one prompt set reaches, which its session is built for: the prompt and its new tokens.
+    In the performance mode the new tokens of the longest request of the run (``_perf_longest``): its first new token and
+    its forced steps."""
+    return prompt_tokens + (_perf_longest(args)[0] + 1 if args.perf else rule.limit)
+
+
 def _perf_limit(args, request, prompt_tokens: int) -> list:
-    """The count a request of the performance mode decodes -- its first new token and ``--perf-steps`` forced steps -- held
-    against ``--max-model-len`` in the mode's own words (``ValueError``).  Returns the line a run prints for a request body
-    whose own limit does not apply, in a list, or no line."""
+    """The longest request of a run of the performance mode (``_perf_longest``) -- the prompt, the first new token and that
+    request's forced steps -- held against ``--max-model-len`` in the mode's own words (``ValueError``: which request is
+    the longest, and every count to take lower).  Returns the line a run prints for a request body whose own limit does
+    not apply, in a list, or no line."""
+    steps, flag, longest = _perf_longest(args)
     room = args.max_model_len - prompt_tokens - 1
-    if room < args.perf_steps:
-        fewer = f"take --perf-steps {room:,} or fewer, or " if room >= 2 else ""
+    if room < steps:
+        over = [name for name, count in (("--perf-steps", args.perf_steps), ("--perf-warmup", args.perf_warmup)) if count > room]
+        fewer = f"take {' and '.join(over)} {room:,} or fewer, or " if room >= 2 else ""  # a timed request has at least 2 steps
         raise ValueError(
-            f"{request.shown}: {prompt_tokens:,} prompt tokens, the first new token and --perf-steps {args.perf_steps:,} are "
-            f"{prompt_tokens + 1 + args.perf_steps:,} positions and --max-model-len is {args.max_model_len:,}; {fewer}raise --max-model-len"
+            f"{request.shown}: {prompt_tokens:,} prompt tokens, the first new token and {flag} {steps:,} ({longest}, the longest request of "
+            f"this run) are {prompt_tokens + 1 + steps:,} positions and --max-model-len is {args.max_model_len:,}; {fewer}raise --max-model-len"
         )
     beside = f"does not apply beside --perf, which decodes --perf-steps {args.perf_steps:,} forced steps behind the first new token"
     return [] if request.max_tokens is None else [f'{request.shown}: its "{request.limit_field}": {request.max_tokens} {beside}']
@@ -599,7 +619,7 @@ def main(argv=None) -> int:
             device=device,
             overrides=overrides,
             reference_precision=args.reference_precision,
-            capacity=max(int(prompts[0].numel()) + rule.limit for prompts, _, rule in prompt_sets),
+            capacity=max(_positions(args, int(prompts[0].numel()), rule) for prompts, _, rule in prompt_sets),
             checkpoint=checkpoint,
             share=runs[0][0] if runs else None,
             record_steps=_record_steps(real, args.perf),

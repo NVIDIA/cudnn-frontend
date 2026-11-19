@@ -81,8 +81,12 @@ protocol, every statistic with its definition, the labels and the report file ar
 | `--perf-report FILE` | `report-<UTC time>.json` in the current directory | the report file: every number, its definition, the protocol, the environment. The default name carries a time stamp, so the same command can be run twice. A file that exists, a file that `--dump-tokens`, `--dump-census` or `--text-out` names too, an empty name or a folder that cannot be written is an `ERROR` before the load: a report file is never written over |
 | `--perf-trace-records N` | `160000` | the most launch records the traced request may hold. Its first step is traced alone and sizes the rest (it is always traced, also where its records alone pass N); where the timed steps do not all fit, it traces the first steps that do, and the report says how many and at which positions |
 
-A prompt whose tokens, its first new token and the timed steps do not fit `--max-model-len` is an `ERROR` before the
-load that names `--perf-steps`, like every request beyond the context. Every run of the mode is `orientation` today
+One session serves every request of a run and is built for the longest of them: the checked request and the timed
+requests run `--perf-steps` forced steps behind the first new token, the traced request at most as many, and the
+warm-up request `--perf-warmup`, which may be the larger count. A prompt whose tokens, its first new token and the
+forced steps of that longest request do not fit `--max-model-len` is an `ERROR` before the load, like every request
+beyond the context: it says which request is the longest and names every count to take lower (`--perf-steps`,
+`--perf-warmup`). No count is changed to make a run fit. Every run of the mode is `orientation` today
 and says why on the second line of its report: its blocks are launched from Python, a fallback row is left in every
 stack, and the mode does not observe the GPU's other processes or its clock yet.
 

@@ -16,6 +16,8 @@
   every statistic, no local path);
 * the sample's flags, each refusal before the load, ``main()`` with ``--perf`` to its last line, and an ordinary run
   that prints what it printed and does not import the mode's module;
+* the session of a run, built for its longest request: a warm-up request longer than the timed one runs to its report,
+  the context is held against it before the load, and nothing a request computes moves with the session's size;
 * the public text of the mode: a sentence of the READMEs, of the guide or of the script that says what the mode does is
   held beside the assertion that shows it (``_says``), and so are the definitions the report file carries
   (``_defines``); the words, the ``stage`` row, the flag table and the example of the report against the code.
@@ -1251,15 +1253,16 @@ def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
         assert same == f"[00] ERROR --perf-report and {flag} name one file, same.json: a report file is never written over"
     assert not (tmp_path / "same.json").exists(), "nothing was written (--text-out is held by the same lines; the flag needs a checkpoint)"
     # a request beyond the context, in the mode's own words: 26 prompt tokens, the first new token and 256 timed steps against 40 positions
+    # (the default warm-up of 32 steps does not fit the 13 that are left either: test_the_context_is_held_against_the_longest_request has the rule)
     late = error(["--perf", "--max-model-len", "40"])
-    words = "the seeded prompt: 26 prompt tokens, the first new token and --perf-steps 256 are 283 positions and --max-model-len is 40; "
-    assert late == f"[00] ERROR {words}take --perf-steps 13 or fewer, or raise --max-model-len"
-    assert error(["--perf", "--max-model-len", "28"]).endswith("--perf-steps 256 are 283 positions and --max-model-len is 28; raise --max-model-len")
+    words = "the seeded prompt: 26 prompt tokens, the first new token and --perf-steps 256 (a timed request, the longest request of this run) are 283 "
+    assert late == f"[00] ERROR {words}positions and --max-model-len is 40; take --perf-steps and --perf-warmup 13 or fewer, or raise --max-model-len"
+    assert error(["--perf", "--max-model-len", "28"]).endswith(" of this run) are 283 positions and --max-model-len is 28; raise --max-model-len")
     body = sample.serving_options.Request([], None, {}, "--messages body.json", max_tokens=8, limit_field="max_tokens")
     fits = sample._arguments(["--perf", "--perf-steps", "8"])
     beside = '--messages body.json: its "max_tokens": 8 does not apply beside --perf, which decodes --perf-steps 8 forced steps behind the first new token'
     assert sample._perf_limit(fits, body, 26) == [beside] and sample._perf_limit(fits, sample.serving_options.Request([], None, {}, "a prompt"), 26) == []
-    _says("family", "is an `ERROR` before the load that names `--perf-steps`, like every request beyond the context.")
+    _says("family", "do not fit `--max-model-len` is an `ERROR` before the load, like every request beyond the context:")
     _says("family", "A file that exists, a file that `--dump-tokens`, `--dump-census` or `--text-out` names too, an empty name or a folder that cannot")
     _says("family", "be written is an `ERROR` before the load: a report file is never written over |")
     _says("area", "a file that exists, or that another output flag of the run names, is an `ERROR` before the load: a report file is never written over)")
@@ -1376,6 +1379,160 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
         "area", "the performance mode of the seeded model (`--perf`) on both stacks, in a fresh interpreter: `[NN] PASS`, the report in its reduced-model form"
     )
     _says("area", "Without `--model` the same protocol runs on the reduced seeded model:", "The GPU test of this area runs that form.")
+
+
+def _capacities(monkeypatch):
+    """The capacity of every session the script builds from here on, in the order it builds them (a list that fills)."""
+    package = importlib.import_module("model_samples")
+    built, session = [], package.Session
+    monkeypatch.setattr(package, "Session", lambda model, text, **options: built.append(options["capacity"]) or session(model, text, **options))
+    return built
+
+
+def test_the_session_is_built_for_the_longest_request(monkeypatch, capsys, tmp_path):
+    """One session serves every request of a run of the mode, so it is built for the longest of them: the warm-up request
+    where ``--perf-warmup`` is larger than ``--perf-steps``, a timed request otherwise.  A run whose warm-up is longer
+    than its timed request -- the default warm-up of 32 steps behind 2 and behind 16 timed steps; a warm-up equal to, one
+    above and far above the timed request -- runs to ``[00] PASS`` and writes its report, with every count as it was
+    given; what the requests compute and launch does not move with the size of the session; and an ordinary run builds
+    the session it built."""
+    with monkeypatch.context() as patch:  # the runs themselves, to their last line
+        sample = _sample_on_the_cpu(patch, [])
+        built = _capacities(patch)
+        patch.chdir(tmp_path)
+
+        def run(name, *counts):
+            """One run of the mode to its last line: ``(the data of its report file, its lines, the capacity of its session)``."""
+            capsys.readouterr()
+            del built[:]
+            code = sample.main(["--perf", "--perf-requests", "1", *counts, "--perf-report", f"{name}.json"])
+            out, err = capsys.readouterr()
+            lines = err.splitlines()
+            assert code == 0 and lines[-1] == "[00] PASS" and out == "", lines[-3:]
+            (capacity,) = built
+            return json.loads((tmp_path / f"{name}.json").read_text(encoding="utf-8")), lines, capacity
+
+        # the default warm-up of 32 forced steps behind a timed request of 2 and of 16: to the last line, with the report file
+        for steps in (2, 16):
+            data, lines, capacity = run(f"default_warmup_behind_{steps}", "--perf-steps", str(steps))
+            assert capacity == 59 and data["checks"]["last_line"] == "[00] PASS" and data["checks"]["timed_requests"] == "PASS"
+            protocol = data["protocol"]
+            counts = (protocol["warmup_steps"], protocol["timed_steps"], protocol["timed_requests"], protocol["new_tokens_per_request"])
+            assert counts == (32, steps, 1, steps + 1), "the counts as they were given: the default warm-up, the timed steps, one new token more"
+            assert f"protocol    warm-up 32 steps | timed {steps} steps x 1, end token ignored | launched from Python, not captured" in lines
+            before = next(line for line in lines if line.startswith("[00] performance mode: at most "))
+            assert f"one warm-up request of 32 decode steps behind its first new token, 1 timed request of {steps} decode steps each" in before
+            requests = data["raw"]["requests"]
+            assert [(made["kind"], len(made["t_token_s"])) for made in requests] == [("checked", steps), ("warm-up", 32), ("timed", steps), ("traced", steps)]
+            assert requests[2]["ids_sha256"] == requests[0]["ids_sha256"] and requests[2]["end_state_sha256"] == requests[0]["end_state_sha256"]
+            assert f"checks (1 sequence, {26 + steps} steps replayed: 26 prompt + {steps} decode; " in " ".join(lines)
+        # a warm-up below, equal to, one above and far above a timed request of 6 steps: the session follows the longer of the two ...
+        runs = {warmup: run(f"warmup_{warmup}_behind_6", "--perf-steps", "6", "--perf-warmup", str(warmup)) for warmup in (2, 6, 7, 300)}
+        assert {warmup: capacity for warmup, (_, _, capacity) in runs.items()} == {2: 33, 6: 33, 7: 34, 300: 327}
+        small, far = runs[2][0], runs[300][0]
+        assert [len(made["t_token_s"]) for made in far["raw"]["requests"]] == [6, 300, 6, 6] and far["protocol"]["warmup_steps"] == 300
+        assert "protocol    warm-up 300 steps | timed 6 steps x 1, end token ignored | launched from Python, not captured" in runs[300][1]
+        # ... and nothing a request computes or launches moves with it: the ids of the checked, the timed and the traced request, the
+        # kernels of a step, the traced steps and the checks are those of the small session, whatever the warm-up made of the session
+        for warmup, (data, _, _) in runs.items():
+            assert [data["raw"]["requests"][index]["ids_sha256"] for index in (0, 2, 3)] == [small["raw"]["requests"][0]["ids_sha256"]] * 3, warmup
+            assert data["kernels"] == small["kernels"] and data["traced"] == small["traced"] and data["checks"] == small["checks"], warmup
+        # what does follow the session is its allocation: the attention cache has that many positions (here 2 tensors x 8 x 2 bytes each),
+        # and the digest of an end state reads every byte of it -- equal sessions give equal digests, a larger one another
+        assert (far["memory"]["state_gib"] - small["memory"]["state_gib"]) * GIB == pytest.approx(32 * (327 - 33))
+        assert runs[6][0]["raw"]["requests"][2]["end_state_sha256"] == small["raw"]["requests"][2]["end_state_sha256"]
+        assert far["raw"]["requests"][2]["end_state_sha256"] != small["raw"]["requests"][2]["end_state_sha256"]
+        written = {"default_warmup_behind_2.json", "default_warmup_behind_16.json", *(f"warmup_{warmup}_behind_6.json" for warmup in runs)}
+        assert {path.name for path in tmp_path.iterdir()} == written, "six runs, six report files, nothing else"
+    with monkeypatch.context() as patch:  # the session alone, as a number: runs that end at their load
+        planned = _sample_on_the_cpu(patch, [], loads=False)
+        built = _capacities(patch)
+        patch.chdir(tmp_path)
+
+        def capacity(*arguments):
+            del built[:]
+            with pytest.raises(AssertionError, match="reached a load"):
+                planned.main(list(arguments))
+            return list(built)
+
+        # the seeded prompt is 26 tokens; a request is its prompt, its first new token and its forced steps
+        assert capacity("--perf") == [26 + 1 + 256], "the default protocol: a timed request is the longest, and the session is the one it was"
+        assert capacity("--perf", "--perf-steps", "2") == capacity("--perf", "--perf-steps", "16") == [26 + 1 + 32], "the default warm-up is the longest"
+        assert capacity("--perf", "--perf-steps", "16", "--perf-warmup", "4") == [26 + 1 + 16], "a shorter warm-up: the timed request"
+        assert capacity("--perf", "--perf-steps", "6", "--perf-warmup", "300") == [26 + 1 + 300]
+        assert capacity("--perf", "--perf-steps", "2", "--sequences", "4") == [59], "per sequence, whatever the sequence count"
+        assert capacity() == [26 + 32, 26 + 32], "an ordinary run, at 1 and at 4 sequences: its prompt and its new tokens, as before"
+        assert capacity("--sequences", "1", "--force-tokens", "4") == [26 + 4]
+        capsys.readouterr()
+        longest = planned._perf_longest
+        assert longest(planned._arguments(["--perf"])) == (256, "--perf-steps", "a timed request")
+        assert longest(planned._arguments(["--perf", "--perf-steps", "2"])) == (32, "--perf-warmup", "the warm-up request")
+        assert longest(planned._arguments(["--perf", "--perf-steps", "32"])) == (32, "--perf-steps", "a timed request"), "equal counts: the timed request"
+        rule = importlib.import_module("model_samples").StopRule((), max_new_tokens=7)
+        assert planned._positions(planned._arguments(["--perf"]), 58, rule) == 58 + 257 and planned._positions(planned._arguments([]), 58, rule) == 58 + 7
+        given = planned._arguments(["--perf", "--perf-steps", "2"])  # neither a count that was given nor a default is changed to make a run fit
+        assert (given.perf_warmup, given.perf_steps, given.force_tokens) == (32, 2, 3)
+    _says("family", "One session serves every request of a run and is built for the longest of them:")
+    _says("family", "the warm-up request `--perf-warmup`, which may be the larger count.", "No count is changed to make a run fit.")
+
+
+def test_the_context_is_held_against_the_longest_request(monkeypatch, capsys, tmp_path):
+    """``--max-model-len`` is held against the longest request of a run of the mode before anything is planned or loaded:
+    the warm-up request where it is the longer one.  The ``ERROR`` says which request is the longest and names every
+    count that has to come down, and with it what to take; a run that fits exactly goes on to its load."""
+    sample = _sample_on_the_cpu(monkeypatch, [], loads=False)
+    monkeypatch.chdir(tmp_path)
+    head = "[00] ERROR the seeded prompt: 26 prompt tokens, the first new token and "
+    warmup, timed = "(the warm-up request, the longest request of this run)", "(a timed request, the longest request of this run)"
+
+    def error(*flags):
+        capsys.readouterr()
+        assert sample.main(["--perf", *flags]) == 1
+        lines = capsys.readouterr().err.splitlines()
+        assert sum(line.startswith("[00] ERROR") for line in lines) == 1 and not any(line.startswith(("[00] planning", "served by")) for line in lines)
+        return lines[-1]
+
+    def fits(*flags):
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main(["--perf", *flags])
+        capsys.readouterr()
+
+    # the warm-up request is the longest: the default 32 steps behind 2 timed steps are 59 positions
+    assert error("--perf-steps", "2", "--max-model-len", "40") == (
+        f"{head}--perf-warmup 32 {warmup} are 59 positions and --max-model-len is 40; take --perf-warmup 13 or fewer, or raise --max-model-len"
+    )
+    fits("--perf-steps", "2", "--max-model-len", "59")
+    assert error("--perf-steps", "2", "--max-model-len", "58").endswith(
+        " are 59 positions and --max-model-len is 58; take --perf-warmup 31 or fewer, or raise --max-model-len"
+    )
+    assert error("--perf-steps", "20", "--perf-warmup", "30", "--max-model-len", "40") == (
+        f"{head}--perf-warmup 30 {warmup} are 57 positions and --max-model-len is 40; take --perf-steps and --perf-warmup 13 or fewer, or raise --max-model-len"
+    )
+    # at the default context: a warm-up that does not fit beside the prompt is refused here, not found by the run
+    assert error("--perf-warmup", "4000") == (
+        f"{head}--perf-warmup 4,000 {warmup} are 4,027 positions and --max-model-len is 2,051; take --perf-warmup 2,024 or fewer, or raise --max-model-len"
+    )
+    fits("--perf-warmup", "2024")
+    # a timed request is the longest: a warm-up that fits the room is not named, one that does not is
+    assert error("--perf-warmup", "13", "--max-model-len", "40") == (
+        f"{head}--perf-steps 256 {timed} are 283 positions and --max-model-len is 40; take --perf-steps 13 or fewer, or raise --max-model-len"
+    )
+    assert error("--perf-warmup", "14", "--max-model-len", "40").endswith("; take --perf-steps and --perf-warmup 13 or fewer, or raise --max-model-len")
+    assert error("--perf-steps", "32", "--max-model-len", "40") == (  # equal counts: the timed request names the longest
+        f"{head}--perf-steps 32 {timed} are 59 positions and --max-model-len is 40; take --perf-steps and --perf-warmup 13 or fewer, or raise --max-model-len"
+    )
+    # the room that is left: 2 steps are the fewest a timed request has, so with less there is nothing to take but a larger context
+    assert error("--perf-steps", "3", "--perf-warmup", "5", "--max-model-len", "29").endswith(
+        f"--perf-warmup 5 {warmup} are 32 positions and --max-model-len is 29; take --perf-steps and --perf-warmup 2 or fewer, or raise --max-model-len"
+    )
+    assert error("--perf-steps", "2", "--perf-warmup", "5", "--max-model-len", "29").endswith("is 29; take --perf-warmup 2 or fewer, or raise --max-model-len")
+    assert error("--perf-steps", "2", "--perf-warmup", "5", "--max-model-len", "28").endswith(
+        f"--perf-warmup 5 {warmup} are 32 positions and --max-model-len is 28; raise --max-model-len"
+    )
+    fits("--perf-steps", "2", "--perf-warmup", "1", "--max-model-len", "29")
+    assert not list(tmp_path.iterdir()), "a refusal writes nothing"
+    _says("family", "A prompt whose tokens, its first new token and the forced steps of that longest request do not fit `--max-model-len`")
+    _says("family", "it says which request is the longest and names every count to take lower (`--perf-steps`, `--perf-warmup`).")
 
 
 def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
