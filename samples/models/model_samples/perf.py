@@ -74,7 +74,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import census, observe, tie_out
 from .timing import now, step_facts
 
-SCHEMA = "model-sample-performance/3"
+SCHEMA = "model-sample-performance/4"
 WIDTH = 110  # of the screen: no line is wider
 ORIENTATION, CONTROLLED = "orientation", "controlled"
 PASS, FAIL, NOT_OBSERVED = census.PASS, census.FAIL, census.NOT_OBSERVED
@@ -1061,7 +1061,13 @@ def run(
             "intervals_per_request": protocol.steps,
             "profiler_first_started": "behind the last timed request, in the traced request" if covered else None,  # None: no traced step was observed
             "stop_rule": "forced",
-            "in_a_timed_request": {"recorder": "off (a record of 0 steps)", "call_log": "off", "profiler": "not started", "text": "none"},
+            "in_a_timed_request": {
+                "recorder": "off (a record of 0 steps)",
+                "call_log": "off",
+                "profiler": "not started",
+                "text": "none",
+                "sampler": watch.in_a_request(),
+            },
             "restart": "every request starts from the state zeroed in place at position 0, the device synchronised behind the zeroing",
             "prompt": {"tokens": prompt_tokens, "sha256": prompt_hash, "source": source},
             "first_timed_position": prompt_tokens,

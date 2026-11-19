@@ -341,7 +341,7 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         raise AssertionError(f"the report file holds {constant}")
 
     data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
-    assert data["schema"] == "model-sample-performance/3" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["schema"] == "model-sample-performance/4" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
     assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
     requests = data["raw"]["requests"]
     assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
@@ -363,8 +363,11 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     if watched["source"] == "nvidia-smi":  # the driver's tool was found: a reading before the load, before the warm-up request and behind the timed requests
         assert [made["when"] for made in watched["readings"]] == ["before the load", "before the warm-up request", "behind the last timed request"]
         assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced"]
+        child = "a child process that the timing process neither reads nor polls between its start and its stop"
+        assert data["protocol"]["in_a_timed_request"]["sampler"] in (child, "none (the sampler could not be started)")
     else:
         assert watched["reason"] and seen["verdict"] == "not observed" and clocks["verdict"] == "no"
+        assert data["protocol"]["in_a_timed_request"]["sampler"] == f"none ({watched['reason']})"
     assert all(entry["definition"] and entry["unit"] for entry in data["statistics"].values()), "a definition and a unit beside every statistic"
     memory = data["memory"]  # the peak of the timed part is PyTorch's own, between the settle and the last timed request: inside the process's
     assert (

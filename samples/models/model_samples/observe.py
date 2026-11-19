@@ -87,6 +87,8 @@ NO_CLOCK_SAMPLE = "no clock sample inside a timed request"
 NO_CLOCK = "the driver reports no SM clock"
 CLOCK_MOVED = "the host's clock moved during the timed requests"
 NO_READING = "no reading was made"
+#: what the file's ``protocol`` says of the sampler inside a timed request
+SAMPLER = "a child process that the timing process neither reads nor polls between its start and its stop"
 #: every reason a ``not observed`` can carry
 REASONS = (
     NOT_FOUND,
@@ -147,7 +149,10 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "host's load average and the cores this process may use. Read from the driver by a child process; a field that cannot be read is not observed "
             "with the reason. A sample belongs to a request when its time stamp lies between the request being handed to the text path and its last "
             "token's ids on the host. The screen's clock is the median and the minimum over the samples of all timed requests. none seen is stated only "
-            "when this process itself is in the driver's list and the device's memory in use agrees with this process's own."
+            "when this process itself is in the driver's list and the device's memory in use agrees with this process's own. <n> seen is the number of "
+            "distinct other compute processes over every reading and every sample, the reading before the load and the time between two requests "
+            "included, and is stated only when no reading and no timed request's samples showed a list without this process itself; of such a list "
+            "no count is stated: not observed, with the reason."
         ),
         "The same observations as a serving benchmark's sampler makes.",
     ),
@@ -573,6 +578,13 @@ class Observer:
         """The loops end and their files are read: called outside every request, behind the traced request."""
         if self.sampler is not None:
             self.sampler.stop()
+
+    def in_a_request(self) -> str:
+        """What the sampler is to a timed request, for the file's ``protocol``: ``SAMPLER`` where its child process was
+        started, else that none ran, with the reason."""
+        if self.sampler is not None and not self.failed:
+            return SAMPLER
+        return f"none ({self.reason or self.failed or 'not started'})"
 
     def driver(self) -> dict:
         """The driver's version for the file's ``environment``, or why it is not there."""

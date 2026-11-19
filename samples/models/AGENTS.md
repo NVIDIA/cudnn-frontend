@@ -243,7 +243,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
     The GPU is observed through the driver's `nvidia-smi` tool in child processes, with no package added, and never by
     a call of the timing process inside a request: the sampler is started in front of the warm-up request and its
     files are read behind the traced request, and its loops end with the pipe the run holds: at the stop, or when the
-    run is gone.
+    run is gone. The report file says what the sampler was to the timed requests of its run, or that none ran, with
+    the reason (`protocol`).
     A list of processes counts as empty only beside the run's own entry and a device memory in use that the run's own
     explains. A count of other processes is stated only of a list that shows the run's own entry too. A `not observed`
     carries a reason from a closed list, never the tool's path or its own words; no process name is asked for, and

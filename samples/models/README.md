@@ -305,7 +305,9 @@ sequence is not captured.
 can be run twice; a file that exists, or that another output flag of the run names, is an `ERROR` before the load:
 a report file is never written over) is strict JSON with units in its field names and no local path: `record` (the class and its reasons), `model`, `environment`,
 `observation` (every reading, the samples of every request behind the checked one as counts and extremes, the two
-verdicts of the `GPU` lines and the rules behind them), `kernels`, `protocol` (the counts, the prompt's hash, where the profiler first started), `checks` (every
+verdicts of the `GPU` lines and the rules behind them), `kernels`, `protocol` (the counts, the prompt's hash, where
+the profiler first started, what a timed request ran with and what the sampler is beside it: a child process that
+the timing process neither reads nor polls between its start and its stop, or none, with the reason), `checks` (every
 judged position with its reason, the lines of the checks, the three verdicts, the run's last line),
 `statistics` (per statistic its definition, what it corresponds to in a serving benchmark, its value and, where there
 are samples, their count, median, mean, extremes and percentiles), `raw` (every stamp of every request, relative to
@@ -315,7 +317,7 @@ stamps as found), `per_kernel` (every row of the table: its blocks, its launches
 and the recorded time of a launch, its time per step as median and as mean, its share, the launch shapes of an exact
 row and of a library's row, there with the name of the kernel the library launched), `memory`, `startup` (the seconds
 of every stage) and `text_path`. The file's first field names its schema,
-`model-sample-performance/3`. The screen is rendered from the data of a file of this schema (`screen` in
+`model-sample-performance/4`. The screen is rendered from the data of a file of this schema (`screen` in
 `model_samples/perf.py`); handed a file of another schema, written by another version of the mode, it renders nothing
 and says so in one sentence that names both schemas.
 

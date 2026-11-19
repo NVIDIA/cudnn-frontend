@@ -17,7 +17,8 @@
   before the last timed request, nothing but the step inside a timed request, the three statements of the ``checks``
   lines, and what a statement that does not hold does to the rate line and to the last line;
 * the screen (no line wider than 110 characters, in every form) and the report file (strict JSON, a definition beside
-  every statistic, no local path; its schema, and a file of another schema refused in one sentence that names both);
+  every statistic, no local path; its schema, and a file of another schema -- one of each of the two before it among
+  them -- refused in one sentence that names both);
 * the sample's flags, each refusal before the load, ``main()`` with ``--perf`` to its last line, and an ordinary run
   that prints what it printed and does not import the mode's module;
 * the session of a run, built for its longest request: a warm-up request longer than the timed one runs to its report,
@@ -28,7 +29,8 @@
 * the observation of the GPU: on constructed samples the cut by the bounds of a request, the own-process test behind
   ``none seen``, the memory rule, every form of the clock line; through a stand-in for the driver's tool, written by the
   test, a reading, a tool that fails, and the sampler's child process whose loops end with its pipe; through a session,
-  every call of the observer against the stamps of the requests.  No test asks the driver of the host it runs on.
+  every call of the observer against the stamps of the requests, and what the file's ``protocol`` says of the sampler.
+  No test asks the driver of the host it runs on.
 
 No GPU, no weights on disk, no profiler."""
 
@@ -635,6 +637,7 @@ def test_timed_request_has_no_recorder_no_text(monkeypatch, tmp_path):
         "call_log": "off",
         "profiler": "not started",
         "text": "none",
+        "sampler": "none (no CUDA device)",  # this session is on the CPU: no sampler ran beside it, and the file says so
     }
     assert all(request["end_state_sha256"] == outcome.data["raw"]["requests"][0]["end_state_sha256"] for request in outcome.data["raw"]["requests"][2:4])
     # the count the run printed before the load: every decode step of the stack, the replay of the checks among them
@@ -1030,7 +1033,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
     sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
     sections += " startup text_path"
-    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/3" and data["kind"] == "run"
+    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/4" and data["kind"] == "run"
     assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
@@ -1092,12 +1095,28 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     _says("area", "in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB")
 
 
+def _schema_3(data):
+    """The report file of the same run as the mode wrote it before it observed the GPU, schema
+    ``model-sample-performance/3``: 18 sections and 16 statistics -- no statistic of the GPU and the host, no load of the
+    host, an ``observation`` section of five entries and a driver entry that say the GPU was not observed, and nothing of
+    a sampler among what a timed request ran with."""
+    import copy
+
+    older = copy.deepcopy(data)
+    older["schema"] = "model-sample-performance/3"
+    unobserved = "this version does not observe the GPU"
+    del older["statistics"]["gpu_and_host"], older["environment"]["host"]["load"], older["protocol"]["in_a_timed_request"]["sampler"]
+    older["environment"]["driver"] = {"value": None, "reason": f"not observed ({unobserved})"}
+    older["observation"] = {"source": "none", "reason": unobserved, "reason_short": "this version", "other_compute_processes": None, "clocks": None}
+    return older
+
+
 def _schema_1(data):
-    """The report file of the same run as the mode wrote it before it took the GPU side of a step from the traced
-    request, schema ``model-sample-performance/1``: 17 sections and 10 statistics -- no ``per_kernel`` section, none of
-    the six statistics of the GPU side, a ``traced`` section of seven entries that says GPU busy was not taken, and the
-    definition of the step with the sentence that said so.  That version did not observe the GPU either: no statistic
-    of the GPU and the host, no load of the host, and an ``observation`` section and a driver entry that say so."""
+    """From a file of schema ``model-sample-performance/2`` (``_schema_2``), the report file of the same run as the mode
+    wrote it before it took the GPU side of a step from the traced request, schema ``model-sample-performance/1``: 17
+    sections and 10 statistics -- no ``per_kernel`` section, none of the six statistics of the GPU side, a ``traced``
+    section of seven entries that says GPU busy was not taken, and the definition of the step with the sentence that
+    said so."""
     import copy
 
     older = copy.deepcopy(data)
@@ -1109,19 +1128,16 @@ def _schema_1(data):
     for key in ("per_step", "tracing_stretch_percent", "time_resolution_us"):
         del older["traced"][key]
     older["traced"].update(gpu_busy_ms=None, gpu_busy_reason="this version")
-    unobserved = "this version does not observe the GPU"
-    del older["statistics"]["gpu_and_host"], older["environment"]["host"]["load"]
-    older["environment"]["driver"] = {"value": None, "reason": f"not observed ({unobserved})"}
-    older["observation"] = {"source": "none", "reason": unobserved, "reason_short": "this version", "other_compute_processes": None, "clocks": None}
     return older
 
 
 def _schema_2(data):
     """The report file of the same run as the mode wrote it while launch overhead was the median step less the median GPU
-    busy less the median host time, schema ``model-sample-performance/2``: the sections and the statistics of this
-    version, and a ``launch_overhead`` of seven entries -- no label, no count, median, mean, extremes or percentiles
-    of per-step remainders -- whose remainder is the difference of the three medians, under the definition that said
-    so.  The same field names as this version's, and other numbers behind them."""
+    busy less the median host time, schema ``model-sample-performance/2``: the sections and the statistics of the
+    file it is handed (this version's, or those of ``_schema_3``), and a ``launch_overhead`` of seven entries -- no
+    label, no count, median, mean, extremes or percentiles of per-step remainders -- whose remainder is the difference
+    of the three medians, under the definition that said so.  The same field names as that file's, and other numbers
+    behind them."""
     import copy
 
     older = copy.deepcopy(data)
@@ -1140,43 +1156,50 @@ def _schema_2(data):
 
 def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_path):
     """The report file names its schema in its first field, and the screen is rendered from the data of a file of that
-    schema alone.  Handed a file of another schema -- the file of the same run as the mode wrote it before it took the
-    GPU side of a step, read back from disk; the file as it was while launch overhead came from three medians, whose
-    every field name this version reads; a file of this version's own shape under the next name and under a name of
-    something else; a file that names no schema; something that is no report file -- ``perf.screen`` renders nothing and
-    says so in one sentence that names both schemas: a ``ValueError``, never the ``KeyError`` of an entry the other
-    schema does not have."""
+    schema alone.  Handed a file of another schema -- the file of the same run as the mode wrote it before it observed
+    the GPU, as it was while launch overhead came from three medians, and as the mode wrote it before it took the GPU
+    side of a step, each read back from disk; this version's own file with the launch overhead of three medians under
+    that file's name, whose every field name this version reads; a file of this version's own shape under the next
+    name and under a name of something else; a file that names no schema; something that is no report file --
+    ``perf.screen`` renders nothing and says so in one sentence that names both schemas: a ``ValueError``, never the
+    ``KeyError`` or the ``TypeError`` of an entry the other schema does not have."""
     from model_samples import perf
 
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)
     data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
-    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/3"
+    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/4"
     _says("area", f"The file's first field names its schema, `{perf.SCHEMA}`.")
     assert perf.screen(data) == perf.screen(outcome.data) and perf.screen(data)[0] in lines, "a file of this schema is rendered: the screen of its run"
     _says("area", "The screen is rendered from the data of a file of this schema (`screen` in `model_samples/perf.py`);")
-    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/3'"
+    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/4'"
 
     def refused(file):
         with pytest.raises(ValueError) as said:  # a KeyError is not one: it would pass through and fail the test
             perf.screen(file)
         return str(said.value)
 
-    # the file of the version before: written and read back as a file, 17 sections and 10 statistics where this version has 18 and 17
-    older = _schema_1(data)
-    assert (len(older), len(older["statistics"]), len(data), len(data["statistics"])) == (17, 10, 18, 17)
+    # the files of the three versions before, each written and read back as a file: 18 sections and 16 statistics twice, and 17 and 10,
+    # where this version has 18 and 17
+    third = _schema_3(data)
+    second = _schema_2(third)
+    older = _schema_1(second)
+    assert [(len(file), len(file["statistics"])) for file in (older, second, third, data)] == [(17, 10), (18, 16), (18, 16), (18, 17)]
     assert list(older["traced"])[-2:] == ["gpu_busy_ms", "gpu_busy_reason"] and len(older["traced"]) == 7
-    assert perf.write_report(str(tmp_path / "older.json"), older) == ""
-    read = json.loads((tmp_path / "older.json").read_text(encoding="utf-8"))
-    assert read == older and "per_kernel" not in read and "gpu_busy" not in read["statistics"], "what the screen of this version would look for"
-    assert refused(read) == refusal.format("'model-sample-performance/1'")
-    assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
+    assert list(third) == list(second) == list(data) and len(third["observation"]) == 5 and list(third["protocol"]["in_a_timed_request"])[-1] == "text"
+    for number, file in ((1, older), (2, second), (3, third)):
+        assert file["schema"] == f"model-sample-performance/{number}" and perf.write_report(str(tmp_path / f"schema_{number}.json"), file) == ""
+        read = json.loads((tmp_path / f"schema_{number}.json").read_text(encoding="utf-8"))
+        assert read == file and read["observation"]["other_compute_processes"] is None, "what the screen of this version would take apart"
+        assert refused(read) == refusal.format(f"'model-sample-performance/{number}'")
+        assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
+    assert "per_kernel" not in older and "gpu_busy" not in older["statistics"], "and what it would look for"
     # the file that took launch overhead from three medians: every section, every statistic and every field name this version reads is
     # there, and the numbers behind three of them are others -- it is refused by its name, not rendered under this version's
-    second = _schema_2(data)
-    assert (len(second), len(second["statistics"]), list(second)) == (18, 16, list(data)) and perf.write_report(str(tmp_path / "second.json"), second) == ""
-    was, now = second["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
+    as_two = _schema_2(data)
+    assert (len(as_two), len(as_two["statistics"]), list(as_two)) == (18, 17, list(data)) and perf.write_report(str(tmp_path / "as_two.json"), as_two) == ""
+    was, now = as_two["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
     assert set(now) - set(was) == {"label", "n", "median", "mean", "minimum", "maximum", "p90", "p99"} and not set(was) - set(now)
-    assert refused(json.loads((tmp_path / "second.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/2'")
+    assert refused(json.loads((tmp_path / "as_two.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/2'")
     form = _checkpoint_form()  # made-up parts: a median step of 400 ms with medians of 80 and 40 beside it, a mean step of 410 with means of 82 and 41
     was, now = _schema_2(form)["statistics"]["launch_overhead"], form["statistics"]["launch_overhead"]
     assert (was["remainder_ms"], was["value"]) == (280.0, 280.0) and (now["remainder_ms"], now["value"]) == (287.0, 287.0), "one field name, two numbers"
@@ -3202,6 +3225,8 @@ def test_none_seen_needs_the_own_process():
     empty = observe.summary([reading(listed=False, own=None, used=0.0)], [], [], [("timed", 1.0, 2.0)], 4242)
     assert empty["other_compute_processes"]["verdict"] == "not observed" and empty["readings"][0]["this_process_listed"] is False
     _defines("gpu_and_host", "none seen is stated only when this process itself is in the driver's list and the device's memory in use agrees with")
+    _defines("gpu_and_host", "and is stated only when no reading and no timed request's samples showed a list without this process itself;")
+    _defines("gpu_and_host", "of such a list no count is stated: not observed, with the reason.")
     _says("area", "`none seen` only when no other process was in the driver's list in a reading or in a sample, this process itself was in every reading")
     _says("area", "this process itself was in every reading and in a sample of every timed request, and the device's memory in use agreed with")
     _says("area", "A process list the run could not read, or in which it did not find itself, or beside a device memory in use that its own does not")
@@ -3229,6 +3254,8 @@ def test_own_process_is_not_another(monkeypatch, tmp_path):
     assert made["other_compute_processes"] == {"verdict": "seen", "seen": 2, "reason": None}
     assert made["requests"][0]["other_compute_processes"] == 2 and made["requests"][0]["this_process_listed"]
     assert observe.others_text(made) == "2 seen" and observe.others_reason(made) == "shared GPU"
+    _defines("gpu_and_host", "<n> seen is the number of distinct other compute processes over every reading and every sample, the reading before the")
+    _defines("gpu_and_host", "the reading before the load and the time between two requests included,")
     assert made["readings"][0]["other_compute_processes"] == 1 and made["readings"][0]["other_memory_mib"] == [900.0]
     assert "777" not in json.dumps(made) and "888" not in json.dumps(made), "no id of another process in the file"
     early = observe.summary([before, behind], [], samples[:1], [("timed", 1.0, 2.0)], own)
@@ -3435,6 +3462,13 @@ def test_the_observer_is_called_outside_every_request(monkeypatch, tmp_path):
     assert order[: marks[0]].count("stamp") == checked and marks[1] == marks[0] + 1, "behind the checked request; the sampler starts behind the reading"
     assert order[marks[1] : marks[2]].count("stamp") == warm + timed, "the warm-up request and both timed requests: not one call among their stamps"
     assert order[marks[2] : marks[3]].count("stamp") == traced and order[marks[3] :].count("stamp") == 0, "the traced request, then the stop"
+    # ... and the file says of the sampler what this order shows: nothing was asked of the keeper or of its files between the start and the stop
+    beside = outcome.data["protocol"]["in_a_timed_request"]
+    assert list(beside) == ["recorder", "call_log", "profiler", "text", "sampler"]
+    assert beside["sampler"] == observe.SAMPLER == "a child process that the timing process neither reads nor polls between its start and its stop"
+    _says("area", "`protocol` (the counts, the prompt's hash, where the profiler first started, what a timed request ran with and")
+    _says("area", "what the sampler is beside it: a child process that the timing process neither reads nor polls between its start and its stop,")
+    _says("guide", "The report file says what the sampler was to the timed requests of its run, or that none ran, with the reason (`protocol`).")
     watched = outcome.data["observation"]
     assert (watched["source"], watched["reason"], watched["sampler_period_ms"], watched["clock_lock_declared_mhz"]) == ("nvidia-smi", None, 50, None)
     assert [made["when"] for made in watched["readings"]] == ["before the warm-up request", "behind the last timed request"]
@@ -3638,6 +3672,7 @@ def test_not_observed_names_no_path(monkeypatch, tmp_path):
     from model_samples import observe
 
     assert observe.Observer(torch.device("cpu")).reason == "no CUDA device", "a session that is not on a GPU"
+    assert observe.Observer(torch.device("cpu")).in_a_request() == "none (no CUDA device)"
     with monkeypatch.context() as patch:  # the GPU is named to the tool by its UUID, with the prefix the tool takes
         patch.setattr(torch.cuda, "get_device_properties", lambda device: types.SimpleNamespace(uuid="0f9a1c2e-5b7d-4e6f-8a90-123456789abc"))
         named = observe.target_of(torch.device("cuda", 0))
@@ -3685,6 +3720,7 @@ def test_not_observed_names_no_path(monkeypatch, tmp_path):
     assert outcome.data["environment"]["driver"] == {"value": None, "reason": "not observed (nvidia-smi ended with an error)"}
     assert {made["reason"] for made in watched["readings"]} == {"nvidia-smi ended with an error"}
     assert watched["sampler_period_ms"] == observe.PERIOD_MS == 50, "the period the run's loops were started with"
+    assert outcome.data["protocol"]["in_a_timed_request"]["sampler"] == observe.SAMPLER, "the keeper was started: its loops gave nothing"
     asked = [call for call in _calls(run) if not call["argv"][-1].startswith("--loop-ms=")]
     assert len(asked) == 2, "one call a reading: a tool that failed is not asked for its list too (the two loops of the sampler start beside the run)"
     printed = "\n".join(lines) + json.dumps(outcome.data)
@@ -3712,6 +3748,15 @@ def test_not_observed_names_no_path(monkeypatch, tmp_path):
     assert (
         absent.driver() == {"value": None, "reason": "not observed (nvidia-smi not found)"} and missing["readings"][0]["host_load"] == absent.readings[0].load
     )
+    # what the file's protocol says where no sampler ran: none, with the reason -- the tool is not there, the session is not on a GPU, the
+    # sampler was not asked for yet, its child could not be started
+    assert absent.in_a_request() == "none (nvidia-smi not found)"
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "executable", "")
+        early = asking.in_a_request()
+        asking.start()
+    assert (early, asking.failed, asking.in_a_request()) == ("none (not started)", observe.NO_SAMPLER, "none (the sampler could not be started)")
+    _says("area", "its stop, or none, with the reason), `checks` (every")
     with monkeypatch.context() as patch:  # a PyTorch that names no id for the GPU
         patch.setattr(observe, "target_of", lambda device: device.uuid)
         assert observe.Observer(torch.device("cuda", 0)).reason == "PyTorch names no id for this GPU"
