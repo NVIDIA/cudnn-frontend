@@ -2295,6 +2295,7 @@ class TestMidFp8Implementation:
         test_d256_pair_body_reference_and_replay as _pair_replay,
         test_d256_pair_refilled_stage_warm_stress as _pair_warm,
         test_d256_pair_release_dependence as _pair_release,
+        test_d256_pair_batch_invariance as _pair_batch,
         test_d192_cga1_causal_public_record as _cga1,
         test_wide_envelopes_keep_the_adapter_block_output_decline as _block_output,
     )
@@ -2306,6 +2307,7 @@ class TestMidFp8Implementation:
     test_d256_pair_replay = staticmethod(_pair_replay)
     test_d256_pair_warm_stress = staticmethod(_pair_warm)
     test_d256_pair_release_dependence = staticmethod(_pair_release)
+    test_d256_pair_batch_invariance = staticmethod(_pair_batch)
     test_cga1 = staticmethod(_cga1)
     test_block_output_decline = staticmethod(_block_output)
 

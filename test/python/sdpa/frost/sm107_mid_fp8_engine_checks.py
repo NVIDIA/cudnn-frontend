@@ -389,3 +389,44 @@ def test_d256_pair_release_dependence(tmp_path):
     # final-stat slot (two words).
     sites = warm_stress.assert_release_dependence(bodies[0], sites=4, words=1)
     assert sorted(site.loaded_registers for site in sites if site.dependent) == [1, 1, 1, 2]
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_d256_pair_batch_invariance(causal):
+    """A sequence's O/Stats bytes do not depend on its batch neighbors: alone, reordered, and next to changed neighbors."""
+    from determinism_utils import assert_bitwise, snapshot
+
+    b, hq, hkv, sq, skv = 3, 4, 2, 1024 if causal else 200, 1024
+    q8, k8, v8 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv)
+    out = torch.empty(b, hq, sq, 256, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(b, hq, sq, device="cuda", dtype=torch.float32)
+    api, _ = _d256_pair_adapter(q8, k8, v8, out, lse, is_causal=causal)
+    q1, k1, v1 = (x[1:2].contiguous() for x in (q8, k8, v8))
+    api1, _ = _d256_pair_adapter(q1, k1, v1, out[1:2].contiguous(), lse[1:2].contiguous(), is_causal=causal)
+
+    def run(adapter, q, k, v):
+        o = torch.full((q.shape[0], hq, q.shape[2], 256), float("nan"), device="cuda", dtype=torch.bfloat16)
+        s = torch.full((q.shape[0], hq, q.shape[2]), float("nan"), device="cuda", dtype=torch.float32)
+        workspace = torch.empty(max(adapter.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+        adapter.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=s, workspace=workspace)
+        torch.cuda.synchronize()
+        return snapshot({"o": o, "lse": s})
+
+    full = run(api, q8, k8, v8)
+    _d256_pair_check(full["o"], full["lse"], q8, k8, v8, causal=causal)
+    # the same sequence alone, through an adapter built for the single-sequence shape
+    alone = run(api1, q1, k1, v1)
+    assert_bitwise(alone, {name: value[1:2] for name, value in full.items()}, "alone")
+    # reordered batch
+    order = [2, 0, 1]
+    reordered = run(api, q8[order].contiguous(), k8[order].contiguous(), v8[order].contiguous())
+    assert_bitwise(reordered, {name: value[order] for name, value in full.items()}, "reordered")
+    # changed neighbors: sequence 1 keeps its bytes while 0 and 2 change
+    q2, k2, v2 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, seed=7)
+    q2[1], k2[1], v2[1] = q8[1], k8[1], v8[1]
+    changed = run(api, q2, k2, v2)
+    assert_bitwise({name: value[1:2] for name, value in changed.items()}, {name: value[1:2] for name, value in full.items()}, "changed neighbors")
+    for name in full:
+        assert not torch.equal(changed[name][0], full[name][0]) and not torch.equal(
+            changed[name][2], full[name][2]
+        ), f"{name}: the changed neighbors did not change"
