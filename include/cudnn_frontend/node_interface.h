@@ -34,16 +34,18 @@ namespace graph {
 // uid -> (byte alignment, element bytes) that execute() enforces on the caller's pointer and override strides.
 using AlignedOperands = std::unordered_map<Tensor_attributes::uid_t, std::pair<int64_t, int64_t>>;
 
-// First dimension (extent > 1, stride != 1) whose byte stride is not a multiple of `alignment`, or -1.
+// First addressed dimension (extent > 1, stride != 1) whose byte stride is not a multiple of `alignment`, or -1.
+// A ragged offset replaces the batch stride, but not the remaining physical strides.
 inline int64_t
 misaligned_stride_dimension(std::vector<int64_t> const& dim,
                             std::vector<int64_t> const& stride,
                             int64_t element_bytes,
-                            int64_t alignment) {
+                            int64_t alignment,
+                            bool is_ragged = false) {
     if (element_bytes <= 0 || alignment <= 1) {
         return -1;
     }
-    for (size_t i = 0; i < dim.size() && i < stride.size(); ++i) {
+    for (size_t i = is_ragged ? 1 : 0; i < dim.size() && i < stride.size(); ++i) {
         auto const stride_multiple = alignment / std::gcd(alignment, element_bytes);
         if (dim[i] > 1 && stride[i] != 1 && stride[i] % stride_multiple != 0) {
             return static_cast<int64_t>(i);

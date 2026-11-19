@@ -129,6 +129,7 @@ struct PlanMetadata {
     std::unordered_map<uid_t, Tensor_attributes::pass_by_values_t> scalars;
     Workspace workspace;
     std::unordered_map<uid_t, std::pair<int64_t, int64_t>> aligned;
+    std::unordered_set<uid_t> ragged_aligned;
     Replacements replacements;
     std::unordered_map<uid_t, std::shared_ptr<Tensor_attributes>> tensors;
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> dumps;
@@ -351,6 +352,30 @@ parse(json const &j) {
                     aligned->second.second == static_cast<int64_t>(detail::get_data_type_size(tensor->get_data_type())),
                     "Serialized aligned element width disagrees with tensor storage");
             }
+        }
+    }
+
+    if (j.contains("ragged_aligned_operands")) {
+        auto const &values = j.at("ragged_aligned_operands");
+        require(values.is_array(), "Serialized ragged aligned operands must be a UID array");
+        for (auto const &value : values) {
+            auto const key = integer(value);
+            require(result.aligned.count(key) != 0, "Serialized ragged alignment has no aligned operand");
+            require(result.ragged_aligned.insert(key).second, "Serialized ragged alignment UID is repeated");
+        }
+    }
+    for (auto const &[key, alignment] : result.aligned) {
+        (void)alignment;
+        auto const tensor = result.tensors.find(key);
+        if (tensor == result.tensors.end()) continue;
+        bool const ragged = tensor->second->get_ragged_offset() != nullptr;
+        if (j.contains("ragged_aligned_operands")) {
+            require((result.ragged_aligned.count(key) != 0) == ragged,
+                    "Serialized ragged alignment disagrees with tensor addressing");
+        } else if (ragged) {
+            // Legacy structured blobs already contain enough information. Opaque
+            // legacy blobs keep their existing dense-stride validation.
+            result.ragged_aligned.insert(key);
         }
     }
 
