@@ -79,7 +79,17 @@ never written. Without it the entry returns a view of ONE entry-owned `[160, wid
 the entry's NEXT call from any host thread. Stream order does not serialize host calls, so two host threads that share
 one entry, on one stream or two, pass their own `out` (or build one entry each). The entry-owned buffer is allocated
 at the first `compile()` or call that passes no `out`; compile without `out` before a CUDA-graph capture if a captured
-call will use it.
+call will use it. The buffer is allocated on torch's current stream of the entry's device at that moment and that
+stream can still write it (torch fills it under deterministic algorithms; a recycled block can carry a write the
+stream still owes it): every launch that writes its bytes, by default or as a view passed back as `out`, by this
+entry or by another entry that orders its launches the same way (today `AddNormQuantDecode`, `AttentionPrepareDecode` and `AttentionGateQuantDecode`),
+is ordered behind that work on whatever stream it runs. On the allocating
+stream that is stream order; on another stream the launch stream waits for an event recorded behind the allocation,
+without a host wait and without synchronizing a stream or the device; a captured call that finds the work still
+pending waits for that one event on the host before its launch (set-up, never part of a replay). Once a call has seen
+it complete nothing is kept of it; while it is pending on the device, every call of such an entry on that
+device reads the device's records. The caller's: `attn`, `gate` and `scale`, which a launch only reads, and its own
+reads and writes of the returned view outside a call.
 
 **Layout.** `attn`, `gate` and `out` are contiguous and start at a 16-byte aligned address (`scale`: 4-byte); every
 operand lives on the entry's device.

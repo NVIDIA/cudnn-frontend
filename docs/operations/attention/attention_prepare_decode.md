@@ -118,7 +118,7 @@ it: under deterministic algorithms torch fills it, and a recycled block can carr
 Every launch that writes bytes of the pair waits for that work on whatever stream it runs and however the tensor
 reached the call: the entry's own output, a tensor taken with `outputs(tokens)` and passed back as `q_out` /
 `gate_out` or as a pool, whole or as a view, at this token count or another, by this entry or by another entry that
-orders its launches the same way (today `AddNormQuantDecode` and `AttentionPrepareDecode`);
+orders its launches the same way (today `AddNormQuantDecode`, `AttentionPrepareDecode` and `AttentionGateQuantDecode`);
 the test is one of addresses. On the allocating stream that is stream order; on another stream the launch
 stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a stream or
 the device, so `compile(tokens)` may run on any stream. A captured call that finds the work still pending waits for

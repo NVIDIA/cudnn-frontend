@@ -1302,9 +1302,9 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     entry's table. The test is a WARM launch on another stream than the
     allocation's, with that stream held behind pending work
     (`test/python/init_order_schedules.py`). On the helper today:
-    `AddNormQuantDecode`, `AttentionPrepareDecode`. Not yet, to follow:
-    `AttentionGateQuantDecode`, `GdnDecodeFused`, `GdnVerifyFused`,
-    `SharedExpertDecode` (they allocate: record and order),
+    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`.
+    Not yet, to follow in a separate change: `GdnDecodeFused`,
+    `GdnVerifyFused`, `SharedExpertDecode` (they allocate: record and order),
     `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order). Until
-    then a launch of one of those into a buffer another entry allocated is
-    ordered by the caller.
+    then a launch of one of those five into a buffer another entry allocated
+    is ordered by the caller.

@@ -21,6 +21,7 @@ import sys
 import textwrap
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,6 +41,18 @@ from gate_quant_utils import (  # noqa: E402  (the operand builders, the referen
 
 from cudnn.attention_gate.frost import gate_quant_decode as entry  # noqa: E402
 from cudnn.attention_gate.frost.kernel import gate_quant_decode_config as kcfg  # noqa: E402
+from cudnn.frost import init_order  # noqa: E402
+from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fixture)
+    deterministic_fill,
+    host_allocations,
+    park,
+    pooled,
+    previous_owner,
+    settled_records,
+    spans_of,
+    stand_ins,
+    warm_fills,
+)
 from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
@@ -233,6 +246,59 @@ def test_typed_declines_name_the_operand(name):
         _check(ops, width=2048)
     with pytest.raises(exc, match=token):  # the same decline from the binding checks a warm launch re-runs
         entry.check_binding(ops["attn"], ops["gate"], ops["scale"], ops.get("out"), width=2048)
+
+
+def test_the_entry_owned_buffer_is_recorded_before_a_launch_can_find_it(monkeypatch):
+    """The record of the buffer's allocation, on stand-ins (no device): the buffer is allocated and only THEN an event is recorded
+    on the stream that is current at that moment, with the buffer's whole byte range, BEFORE the entry holds the buffer.  A second
+    ``output`` allocates and records nothing.  The records are the device's, one object for every entry.  What a launch is
+    ordered by is the live rows of its resolved ``out``, not a taller tensor's extent."""
+    s = stand_ins(monkeypatch)
+    dev = torch.device("cuda", 5)
+    host_allocations(monkeypatch, dev, s.calls)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(multi_processor_count=148))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    k = entry.AttentionGateQuantDecode(dev, 2048)
+    assert k._pending is init_order.pending_of(dev) and entry.AttentionGateQuantDecode(dev, 6144)._pending is k._pending
+    held, real = [], init_order.record
+    monkeypatch.setattr(init_order, "record", lambda pending, tensors: (held.append(k.out_buffer), real(pending, tensors)))
+    view = k.output(3)
+    assert s.calls == [("empty", (kcfg.MAX_ROWS, 2048)), ("enter", dev), ("record", 100), ("leave", dev)]
+    assert held == [None], "the record is made before the entry holds the buffer"
+    ((_, handle, spans),) = k._pending.values()
+    assert handle == 100 and spans == spans_of((k.out_buffer,)) and view.data_ptr() == k.out_buffer.data_ptr()
+    s.calls.clear()
+    assert k.output(5).data_ptr() == view.data_ptr() and not s.calls and len(k._pending) == 1, "allocated and recorded once"
+    mine = _e4m3(9, 2048)
+    assert k._launch_writes(3, mine) == ((mine.data_ptr(), mine.data_ptr() + 3 * 2048),) and mine.numel() > 3 * 2048
+
+
+def test_a_call_orders_its_launch_behind_a_pending_record_over_the_out_it_writes(monkeypatch):
+    """The wiring, on stand-ins with the launch intercepted (no device): IN FRONT of the launch and on the LAUNCH stream, a call
+    is ordered behind a pending record over the bytes of the ``out`` it writes -- passed, or the entry's buffer -- and behind
+    none over an operand it only reads; without a record nothing but the launch happens."""
+    s = stand_ins(monkeypatch)
+    k = entry.AttentionGateQuantDecode("cpu", 2048)
+    monkeypatch.setattr(entry, "_flat", lambda t: t)
+    k.compiled[k.key(3)] = lambda *args: s.calls.append(("launch", int(args[-1])))
+    ops = _host_operands()
+
+    def ordering_of_a_call(over=None, out=None):
+        k._pending.clear()
+        event = s.Event(False)
+        if over is not None:
+            k._pending[0] = (event, 7, spans_of((over,)))
+        s.calls.clear()
+        k(ops["attn"], ops["gate"], ops["scale"], out)
+        return [c for c in s.calls if c[0] in ("wait_event", "launch")], [("wait_event", 100, event), ("launch", 100)]
+
+    got, ordered = ordering_of_a_call(ops["out"], ops["out"])
+    assert got == ordered, "a record over the passed out"
+    got, ordered = ordering_of_a_call(k.output(3))
+    assert got == ordered, "a record over the entry-owned buffer"
+    for name in ("attn", "gate", "scale"):
+        assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
+    assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
 
 
 def test_declines_an_unserved_compute_capability_by_name():
@@ -1014,6 +1080,100 @@ def test_warm_call_allocates_nothing_and_never_synchronizes():
     torch.cuda.synchronize()
     assert torch.cuda.memory_stats(dev)["allocation.all.allocated"] == allocated, "a warm call allocated device memory"
     assert torch.equal(_bytes(mine), want)
+
+
+# The allocation of the entry-owned buffer is stream work of the stream that allocated it (Rule 5; ``cudnn.frost.init_order``):
+# the entry does not initialize it, but torch fills it under deterministic algorithms and a recycled block can carry a queued
+# write.  The cells below warm an entry with a CALLER-OWNED ``out`` (it has no buffer yet), park a side stream behind a delay
+# kernel, let ``output(rows)`` allocate the buffer on it and launch from the original stream while that work is still queued
+# (``init_order_schedules`` says what every such cell must do).
+def _warm_entry_without_a_buffer(dev, rows, width, seed):
+    """``(entry, attn, gate, scale, want)``: the entry warmed by a real launch into a caller-owned ``out``, whose bytes -- held to
+    the suite's reference -- are ``want``."""
+    k = entry.AttentionGateQuantDecode(dev, width)
+    attn, gate = make_operands(rows, width, dev, seed=seed)
+    scale = scale_tensor(0.02, dev)
+    mine = _run(k, attn, gate, scale, torch.empty(rows, width, dtype=E4M3, device=dev))
+    assert_reference(mine, attn, gate, scale, label=f"rows {rows}: a caller-owned out")
+    assert k.out_buffer is None, "the warm-up allocated the entry-owned buffer"
+    warm_fills(dev, E4M3, U8)
+    return k, attn, gate, scale, _bytes(mine).clone()
+
+
+def _park_the_buffers_allocation(dev, k, rows, fill):
+    """``output(rows)`` on a side stream parked behind a delay, with stream work queued on the buffer's block: ``(view, marker)``."""
+    view, recycled = [], []
+
+    def allocate():
+        if fill.startswith("a previous owner"):
+            recycled.append(previous_owner(lambda: torch.empty(kcfg.MAX_ROWS, k.width, dtype=U8, device=dev), 0xEE))
+            view.append(k.output(rows))
+        else:
+            with deterministic_fill():
+                view.append(k.output(rows))
+
+    marker = park(pooled(dev, lambda: torch.empty(kcfg.MAX_ROWS, k.width, dtype=U8, device=dev)), allocate)
+    if recycled and view[0].data_ptr() != recycled[0]:
+        pytest.skip("the allocator did not hand the freed block to the entry: the schedule shows nothing")
+    return view[0], marker
+
+
+@pytest.mark.usefixtures("settled_records")
+@pytest.mark.parametrize("out_reaches_the_call", ("by default", "the view passed back"))
+@pytest.mark.parametrize("fill", ("the fill torch adds under deterministic algorithms", "a previous owner's fill of a recycled block"))
+def test_warm_launch_waits_for_what_the_allocating_stream_still_owes_the_entry_owned_buffer(fill, out_reaches_the_call):
+    """The launch that writes the entry-owned buffer -- by default, or as the view ``output(rows)`` returned, passed back as
+    ``out`` -- is ordered behind the stream work queued on the buffer's block although the host does not wait; unordered, that
+    work lands on the kernel's bytes."""
+    dev = _device_or_skip()
+    rows, width = 7, 2048
+    k, attn, gate, scale, want = _warm_entry_without_a_buffer(dev, rows, width, 131)
+    view, pending = _park_the_buffers_allocation(dev, k, rows, fill)
+    out = k(attn, gate, scale) if out_reaches_the_call == "by default" else k(attn, gate, scale, view)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert out.data_ptr() == k.out_buffer.data_ptr() and out.shape == (rows, width)
+    differing = int((_bytes(out) != want).sum())
+    assert differing == 0, f"the entry-owned buffer behind {fill}, {out_reaches_the_call}: {differing} of {want.numel()} bytes differ"
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_warm_call_does_nothing_for_an_allocation_whose_stream_work_is_complete(monkeypatch):
+    """A record is dropped by the first call that sees its event complete -- one with a caller-owned ``out`` too -- and then
+    the warm path is what it was: calls with the entry-owned buffer and with a caller-owned ``out`` allocate no device memory,
+    raise nothing under ``set_sync_debug_mode('error')``, read or wait for no event and no stream, and do not enter the ordering
+    step."""
+    dev = _device_or_skip()
+    rows, width = 8, 2048
+    k, attn, gate, scale, want = _warm_entry_without_a_buffer(dev, rows, width, 135)
+    view, pending = _park_the_buffers_allocation(dev, k, rows, "the fill torch adds under deterministic algorithms")
+    out = k(attn, gate, scale)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert torch.equal(_bytes(out), want), "the call that met the pending fill"
+    mine = torch.empty(rows, width, dtype=E4M3, device=dev)
+    k(attn, gate, scale, mine)  # a caller-owned out: the call writes no entry-owned byte and still drops what is complete
+    assert not k._pending, "a complete record was kept by a call that does not write its allocation"
+    touched = []
+    monkeypatch.setattr(init_order, "order_behind", lambda *a, **kw: touched.append("the ordering step"))
+    for name in ("query", "synchronize", "wait"):
+        monkeypatch.setattr(torch.cuda.Event, name, lambda *a, _name=name, **kw: touched.append(f"Event.{_name}"))
+    for name in ("wait_event", "wait_stream", "synchronize"):
+        monkeypatch.setattr(torch.cuda.Stream, name, lambda *a, _name=name, **kw: touched.append(f"Stream.{_name}"))
+    allocated = torch.cuda.memory_stats(dev)["allocation.all.allocated"]
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            k(attn, gate, scale)
+            k(attn, gate, scale, mine)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    assert not touched, f"a warm call behind a complete allocation touched {sorted(set(touched))}"
+    assert torch.cuda.memory_stats(dev)["allocation.all.allocated"] == allocated, "a warm call allocated device memory"
+    assert torch.equal(_bytes(out), want) and torch.equal(_bytes(mine), want), "the warm calls' bytes"
 
 
 def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_up():

@@ -151,7 +151,7 @@ torch adds to `out` / `codes` under deterministic algorithms, a write the stream
 launch that writes bytes of the set waits for it on whatever stream it runs and however the tensor reached the call:
 the entry's own output, a tensor taken with `outputs(rows)` and passed back as an output or as `residual`, whole or as
 a view, at this row count or another, by this entry or by another entry that orders its launches the same way
-(today `AddNormQuantDecode` and `AttentionPrepareDecode`); the test is one of addresses.
+(today `AddNormQuantDecode`, `AttentionPrepareDecode` and `AttentionGateQuantDecode`); the test is one of addresses.
 On the allocating stream that is stream order; on another stream the launch stream waits for an event recorded behind
 the initialization, without a host wait and without synchronizing a stream or the device, so `compile(rows)` may run
 on any stream. A capturing stream cannot wait for an event recorded outside its capture: a captured call that finds
