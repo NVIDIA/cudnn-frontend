@@ -3674,6 +3674,22 @@ case 8 of 8 launches behind a control seen in 4 of 4 eager launches and 4 of 4 r
 code outside its bracket and none in an exact block that is not the one code); the three `sm_100a` cubins each run compiled are the
 host's renderings.  The host command above: 256 passed, 231 skipped.
 
+Second re-run on the same part (2026-11-19 UTC), CuTe DSL 4.8.0 with CUDA 13.4, from a clean tree with the files of this change as
+they stand before this text.  Since the record above the entry orders a launch behind the initialization of its entry-owned outputs
+(an event recorded on the allocating stream behind the allocation; on another stream a stream-side wait for it; under a stream
+capture a host wait for that one event), and the module gained nine cases: one that needs no device (the decision on stand-ins for
+the event, the streams and the driver) and eight on a device (`compile(rows)` on a side stream behind a delay kernel and the call on
+the original stream, per launch arm; the streams exchanged; a raw capture replayed twice while unrelated work is pending on a third
+stream; the warm path after the initialization completed; two row counts initialized on two streams; entry-owned codes on a recycled
+block).  The kernel and its config did not change: the 36 renderings are byte-identical, cubin and PTX text, to those of the record
+above.  The strict determinism command -> 20 passed, 0 skipped; the functional command -> 139 passed, 1 skipped (the two-device
+case): the module 134 passed, the symbol-prefix test 5 passed, and none of the nine new cases skipped; the three `sm_100a` cubins
+the run compiled are the host's renderings.  Against the entry as it stood before, all nine fail: with the pair of seven rows
+initialized on another stream the kernel's block scales were written first and the pending zero-fill erased them (2,240 of 2,240
+live scale bytes zero, 0 code bytes differing), and on a recycled block a pending write of the block's previous owner replaced the
+codes.  The other three compilers of the record above were not run again (the kernel is unchanged).  The host command above:
+257 passed, 239 skipped.
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
