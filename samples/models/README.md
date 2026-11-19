@@ -227,6 +227,9 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 # The protocol written out (these are the defaults) and a file name of your own:
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf \
     --perf-warmup 32 --perf-steps 256 --perf-requests 3 --perf-report my_gpu.json
+
+# An operator who fixed the GPU's clock outside the sample declares it; the sample sets nothing:
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf --perf-clock-lock <MHz>
 ```
 
 **The protocol.** A *timed request* is the prompt, its first new token and `--perf-steps` forced decode steps behind
