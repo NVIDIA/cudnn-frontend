@@ -1305,6 +1305,17 @@ def _fine_stamps(monkeypatch):
     return install
 
 
+def _corresponds(key, *phrases):
+    """The serving counterpart the report file carries beside the statistic ``key`` holds every one of ``phrases``; with
+    none given, the statistic has no counterpart."""
+    from model_samples import perf
+
+    counterpart = perf.DEFINITIONS[key][2]
+    assert (counterpart is None) == (not phrases), key
+    for phrase in phrases:
+        assert phrase in counterpart, f"{key}: {phrase}"
+
+
 def test_added_time_partitions_the_union():
     """GPU busy of a step is the length of the union of the intervals of its kernel and copy records: a stretch in which
     two records run is counted once.  The time a launch adds to the GPU's timeline is its end minus the later of its
@@ -1336,6 +1347,12 @@ def test_added_time_partitions_the_union():
     assert [(row["us_per_launch_added"], row["us_per_launch_recorded"]) for row in rows] == [(10.0, 10.0), (pytest.approx(2.0), 7.0), (pytest.approx(1.0), 1.0)]
     assert sum(row["ms_per_step"] for row in rows) == pytest.approx(0.013) and rows[1]["share_percent"] == pytest.approx(200 / 13)
     _defines("gpu_busy", "the length of the union of the intervals of every kernel and copy between two host reads", "the median over the traced steps")
+    _defines("gpu_busy", "An upper bound: tracing lengthens kernels.")
+    _corresponds("gpu_busy", "The same method as the kernel-busy sum of a traced serving step.")
+    _defines("kernel_time_per_launch", "the median over the row's launches in all traced steps.", "The file also holds the median recorded duration.")
+    _corresponds("kernel_time_per_launch", "The same method as the timeline-exclusive duration of a per-kernel analysis of a traced serving step;")
+    _corresponds("kernel_time_per_launch", "comparable only on one GPU class, SM count, clock and launch path.")
+    _says("area", "from kernel activity records, the median over the traced steps (an upper bound: tracing lengthens kernels);")
     _defines("kernel_time_per_launch", "its end minus the later of its start and the latest end of any earlier record of the step, not below zero")
     _defines("kernel_time_per_step", "Within one step the added times of all records sum exactly to that step's GPU busy.")
     _says("area", "GPU busy = the union of the intervals of every kernel and copy of a traced step, from kernel activity records")
@@ -1380,6 +1397,12 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     _defines("launch_overhead", "step - GPU busy - host", "Printed as a term of the step only where it is larger than GPU busy;")
     _defines("launch_overhead", "The file holds the remainder as computed, which can be negative, and the launch overhead per block call.")
     _defines("tracing_stretch", "in the traced request, divided by the same in the timed requests at the same positions, minus 1.")
+    _defines("launch_overhead", "time inside a step in which the GPU waited for the next launch, or the host for the read.")
+    _defines("launch_overhead", "because GPU busy is taken under the profiler and is an upper bound.")
+    _corresponds("launch_overhead")
+    _corresponds("tracing_stretch")
+    _says("area", "(the remainder as computed is in the file).")
+    _says("area", "A line under it says how many steps were traced, at which positions, and by how much tracing lengthened a step.")
     # form A: the equation, its second line and the note
     lines = perf.screen(_checkpoint_form())
     at = lines.index("step                  100.000  ms = GPU busy 12.500 + launch overhead 87.470 + host 0.030")
@@ -1466,6 +1489,11 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
     assert rows[-1]["label"] == "host read" and rows[-1]["launches_per_step"] == 1 and rows[-1]["blocks"] == []
     _defines("kernel_launches", "the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median per step.")
+    _corresponds("kernel_launches", "The kernel census of a traced serving step.")
+    _says("area", "the device time of every block's kernels, from the launch records of the traced request.")
+    _says(
+        "area", "`launches`: the kernel and copy records of a step the kernel check attributes to the row.", "the host read that ends a step is the last row."
+    )
     _says("area", "A row is a block, found by its place in the wiring, as the kernel check finds it, never by a kernel's name")
     _says("guide", "A row of the per-kernel table is found by its place in the wiring, never by a kernel's name,")
 
@@ -1568,6 +1596,9 @@ def test_shares_sum_to_gpu_busy(monkeypatch, tmp_path):
     assert sum(row["launches_per_step"] for row in data["per_kernel"]["rows"]) == data["traced"]["records_of_the_sizing_step"]
     _says("area", "The added times of a step partition the union, so the rows sum to GPU busy")
     _defines("kernel_time_per_step", "per traced step the sum of the row's added times, the median over the steps; its share is that over GPU busy.")
+    _corresponds("kernel_time_per_step", "The same shares as in a per-kernel analysis of a traced serving step.")
+    _says("area", "`ms/step` and its share of GPU busy: the row's added times of a step, the median over the traced steps.")
+    _says("area", "(the medians up to the difference between a median of sums and a sum of medians; the means in the file exactly).")
 
 
 def test_undeclared_record_prints_no_table(monkeypatch, tmp_path):
@@ -1704,6 +1735,25 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
         and data["traced"]["tracing_stretch_percent"] == data["statistics"]["tracing_stretch"]["value"]
     )
     assert data["statistics"]["gpu_busy"]["n"] == data["traced"]["steps"] == len(data["traced"]["per_step"]["gpu_busy_ms"]) == 6, "every traced step"
+    assert list(data["traced"])[-5:] == ["gpu_busy_ms", "gpu_busy_reason", "per_step", "tracing_stretch_percent", "time_resolution_us"]
+    assert list(data["traced"]["per_step"]) == ["gpu_busy_ms", "idle_ms", "kernels", "copies"] and data["traced"]["per_step"]["copies"] == [1] * 6
+    _says("area", "GPU busy, idle time, kernels and copies of every traced step; the resolution of the profiler's time stamps as found),")
+    assert list(data["per_kernel"]) == ["launch_path", "launch_path_note", "us_per_launch_printed", "reason", "rows"]
+    fields = "label relation blocks launches_per_step planned_launches_per_step kernels_per_step copies_per_step us_per_launch_added us_per_launch_recorded"
+    assert all(list(row) == [*fields.split(), "ms_per_step", "ms_per_step_mean", "share_percent", "launch_shapes"] for row in data["per_kernel"]["rows"])
+    _says("area", "`per_kernel` (every row of the table: its blocks, its launches against the planned ones, the added and the recorded time of a launch,")
+    _says("area", "its time per step as median and as mean, its share, the launch shapes of an exact row),")
+    # what the GPU cell of the area holds of the table, and the tests of this module that the README's row names
+    cells = (MODELS.parents[1] / "test" / "python" / "linear_attention" / "frost" / "test_model_sample_qwen_dense.py").read_text(encoding="utf-8")
+    cell = cells.split("def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(", 1)[1].split("@pytest.mark.L1", 1)[0]
+    for held in ('"the rows hold every record of a step"', 'row["launches_per_step"] == row["planned_launches_per_step"]', '"the rows partition GPU busy"'):
+        assert held in cell, held
+    _says("area", "and in it the per-kernel table of real launches -- the rows hold every record of a step, an exact row its planned launches,")
+    _says("area", "and the rows' mean time per step sums to the mean GPU busy |")
+    _says("area", "the GPU side on constructed launch records (GPU busy as the union of a step's intervals with an overlapped stretch counted once,")
+    named = "added_time_partitions_the_union step_equation_only_where_the_remainder_exceeds_gpu_busy rows_by_wiring_position_not_by_name"
+    named += " adjacent_fallback_blocks_share_a_row shares_sum_to_gpu_busy undeclared_record_prints_no_table whole_microsecond_stamps_print_no_us_per_launch"
+    assert all(callable(globals()[f"test_{name}"]) for name in [*named.split(), "table_of_a_python_step_carries_its_line", "dump_census_schema_2"])
     assert perf.screen(json.loads(json.dumps(data))) == lines[lines.index("cuDNN Frontend model sample: decode performance report") :][: len(perf.screen(data))]
     _says("area", "its second line says that it is launched from Python: a kernel's time there is not its time inside a captured sequence")
     _says("area", "An ordinary run prints no time per block; the performance mode prints the device time of every block's kernels.")
@@ -1719,6 +1769,9 @@ def test_dump_census_schema_2(monkeypatch, capsys, tmp_path):
     sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch")]
     traced, _ = _walked(sites, [_records(sites), _records(sites, start=1.0)])
     dumped = traced.dump()
+    assert traced.status == "PASS" and traced.result.attributed[0] == traced.result.attributed[1], "a second later: the same check, the same rows"
+    _says("family", "Registers per thread, and the start and the end of every launch, are recorded in `--dump-census` and compared with nothing.")
+    _says("family", "Nothing the check says is a timing.")
     assert dumped["fields"] == [
         "name",
         "kernel",
