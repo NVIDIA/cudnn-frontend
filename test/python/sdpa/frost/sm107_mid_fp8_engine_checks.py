@@ -416,7 +416,7 @@ def test_d256_pair_release_dependence(tmp_path, rendering):
         fp8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
         out_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, **fp8}[out_name]
         q8 = torch.zeros(1, 1, 256, 256, device="cuda", dtype=fp8[dtype_name])
-        k8 = torch.zeros(1, 1, 256, 256, device="cuda", dtype=fp8[dtype_name])
+        k8 = torch.zeros(1, 1, 512, 256, device="cuda", dtype=fp8[dtype_name])  # S_q != S_kv: a square bottom-right lowers to top-left
         out = torch.empty(1, 1, 256, 256, device="cuda", dtype=out_dtype)
         lse = torch.empty(1, 1, 256, device="cuda", dtype=torch.float32) if stats else None
         api = SdpaFwdDslSm100(
@@ -425,7 +425,11 @@ def test_d256_pair_release_dependence(tmp_path, rendering):
         )
         assert api.check_support()
         api.compile()
-        assert api._k_mod.CFG.SOFTMAX_WARPGROUPS == 2
+        cfg = api._k_mod.CFG
+        assert cfg.SOFTMAX_WARPGROUPS == 2
+        assert (bool(cfg.BOTTOM_RIGHT), bool(cfg.HAS_SINK), cfg.WINDOW_LEFT) == (
+            bool(mask.get("causal_bottom_right")), bool(mask.get("has_sink")), mask.get("window_size_left", 0)
+        ), "the compiled rendering carries the requested mask form"
         """)
     test_root = Path(__file__).resolve().parents[2]
     source_root = Path(cudnn.__file__).resolve().parent.parent
