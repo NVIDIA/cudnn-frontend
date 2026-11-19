@@ -35,18 +35,21 @@ one: the compile and the launch run under the entry's device and the caller's cu
 is implicit state exactly like the stream).
 
 Output ownership.  With ``out`` the caller owns the storage and gets its own tensor back.  Without it the entry returns a view of ONE
-entry-owned ``[160, width]`` buffer, allocated at the first compile or call that passes no ``out`` (never on a warm path; allocate it
-outside a capture by compiling without ``out`` first): its bytes are valid until the entry's NEXT call from ANY host thread.  Stream order
-does not serialize host calls, so two host threads that share one entry -- on one stream or two -- pass their own ``out`` (or build one
-entry each).  The buffer's allocation is stream work of torch's current stream of the entry's device at that moment (the buffer is not
-initialized by the entry, but under deterministic algorithms torch fills it, and its block can be a recycled one that stream still owes
-a write), and every launch that writes its bytes -- by default, or as a view passed back as ``out``, by this entry or by another
-entry that orders its launches the same way -- is ordered behind it on whatever stream it runs: nothing on the same stream, a stream-side wait on another (no host
-wait, no synchronization), a host wait for that ONE event when the launch stream is capturing (set-up, never part of a replay; a buffer
-allocated before the capture on the capturing thread's stream needs none); nothing once a call has seen it complete, and while it is
-pending on the device every call reads the device's records (``cudnn.frost.init_order``).  The caller's: ``attn``, ``gate`` and
-``scale``, which a launch only reads, and its own reads and writes of the returned view outside a call.  Workspace: none.  The launch
-reads no device memory to the host (Rule 3) -- the one host wait of the entry is the one above; the warm path allocates nothing (Rule 1).
+entry-owned ``[160, width]`` buffer, allocated at the first compile, ``output(rows)`` or call that passes no ``out`` (never on a warm
+path; allocate it outside a capture by compiling without ``out`` first): its bytes are valid until the entry's NEXT call from ANY host
+thread.  Stream order does not serialize host calls, so two host threads that share one entry -- on one stream or two -- pass their own
+``out`` (or build one entry each).  The buffer's allocation is stream work of torch's current stream of the entry's device at that
+moment (the buffer is not initialized by the entry, but under deterministic algorithms torch fills it, and its block can be a recycled
+one that stream still owes a write), and every launch that writes its bytes -- by default, or as a view passed back as ``out``, by
+this entry or by another entry that orders its launches the same way -- is ordered behind it on whatever stream it runs: nothing on
+the same stream, a stream-side wait on another (no host wait, no synchronization), a host wait for that ONE event when the launch
+stream is capturing (set-up, never part of a replay; a buffer allocated before the capture needs none once its stream's earlier work
+is done: ``torch.cuda.graph`` synchronizes when it is entered, a raw capture does not); nothing once a call has seen it complete, and
+while it is pending on the device every call reads the device's records (``cudnn.frost.init_order``).  Not ordered: a buffer
+allocated INSIDE a stream capture (nothing is recorded: allocate before the capture), and a launch on a new stream that got the raw
+handle of a destroyed allocating stream (a stream outlives the work it has queued).  The caller's: ``attn``, ``gate`` and ``scale``,
+which a launch only reads, and its own reads and writes of the returned view outside a call.  Workspace: none.  The launch reads no
+device memory to the host (Rule 3) -- the one host wait of the entry is the one above; the warm path allocates nothing (Rule 1).
 """
 
 from dataclasses import replace

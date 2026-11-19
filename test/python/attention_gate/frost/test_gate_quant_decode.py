@@ -1138,6 +1138,27 @@ def test_warm_launch_waits_for_what_the_allocating_stream_still_owes_the_entry_o
 
 
 @pytest.mark.usefixtures("settled_records")
+def test_buffer_allocated_by_compile_without_out_is_ordered_like_one_allocated_by_output():
+    """The entry's OTHER allocating route: ``compile(attn, gate, scale)`` without ``out`` on the parked side stream (under
+    deterministic algorithms), then a call by default on the original stream."""
+    dev = _device_or_skip()
+    rows, width = 7, 2048
+    k, attn, gate, scale, want = _warm_entry_without_a_buffer(dev, rows, width, 136)
+
+    def allocate():
+        with deterministic_fill():
+            k.compile(attn, gate, scale)
+
+    pending = park(pooled(dev, lambda: torch.empty(kcfg.MAX_ROWS, width, dtype=U8, device=dev)), allocate)
+    assert k.out_buffer is not None, "compile without out did not allocate the buffer"
+    out = k(attn, gate, scale)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    differing = int((_bytes(out) != want).sum())
+    assert differing == 0, f"the buffer allocated by compile on another stream: {differing} of {want.numel()} bytes differ"
+
+
+@pytest.mark.usefixtures("settled_records")
 def test_warm_call_does_nothing_for_an_allocation_whose_stream_work_is_complete(monkeypatch):
     """A record is dropped by the first call that sees its event complete -- one with a caller-owned ``out`` too -- and then
     the warm path is what it was: calls with the entry-owned buffer and with a caller-owned ``out`` allocate no device memory,
