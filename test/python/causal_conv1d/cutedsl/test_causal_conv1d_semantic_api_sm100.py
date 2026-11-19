@@ -310,6 +310,7 @@ def test_row_major_input_with_a_size_one_dim_takes_the_native_route(batch, chann
             assert torch.equal(a, b), name
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("deterministic", [False, True], ids=("atomic", "deterministic"))
 def test_packed_sequence_count_reuses_one_plan(monkeypatch, deterministic: bool) -> None:
     """Packed N varies per microbatch at fixed total_T; one fwd and one bwd plan serve every N.
