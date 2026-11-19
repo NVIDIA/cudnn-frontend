@@ -112,6 +112,23 @@ next call at that token count from ANY host thread. An entry-owned output is an 
 one: a call whose other operand overlaps an entry-owned output that the call does not pass is declined with
 `ValueError` before the launch. The pools are always the caller's.
 
+**A launch is ordered behind the stream work of an entry-owned pair's allocation.** The pair is allocated on torch's
+current stream of the entry's device at that moment. The entry does not initialize it, but that stream can still write
+it: under deterministic algorithms torch fills it, and a recycled block can carry a write the stream still owes it.
+Every launch that writes bytes of the pair waits for that work on whatever stream it runs and however the tensor
+reached the call: the entry's own output, a tensor taken with `outputs(tokens)` and passed back as `q_out` /
+`gate_out` or as a pool, whole or as a view, at this token count or another, by this entry or by another entry that
+orders its launches the same way (today `AddNormQuantDecode` and `AttentionPrepareDecode`);
+the test is one of addresses. On the allocating stream that is stream order; on another stream the launch
+stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a stream or
+the device, so `compile(tokens)` may run on any stream. A captured call that finds the work still pending waits for
+that one event on the host before its launch (a capturing stream cannot wait for an event recorded outside its
+capture): set-up, never part of a replay, and not needed for a pair allocated before the capture on the capturing
+thread's stream. Once a call has seen the work complete nothing is kept of it; while it is pending on the device,
+every call of such an entry on that device reads the device's records. What stays the caller's: the operands a
+launch only reads, and the caller's own reads and writes of a returned tensor outside a call. `outputs(tokens)`
+returns a copy of the entry's table (the same tensors) without waiting.
+
 Everything the entry does not serve is declined by name. At construction, without torch and without the DSL:
 `TypeError` for a `geometry` that is not an `AttentionPrepareGeometry` of `int` fields or a launch knob that is not a
 `bool`; `ValueError` for a non-positive geometry field, an `eps` that is not a finite positive Python `float` or

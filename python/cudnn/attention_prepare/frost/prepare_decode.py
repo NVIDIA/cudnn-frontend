@@ -63,14 +63,30 @@ behind it (Rule 5).
 Output ownership is PER OUTPUT.  ``q_out`` / ``gate_out`` the caller passes are the caller's and are returned as given (rows past
 the call's tokens are untouched).  An output the caller does not pass is the entry's: one pair per token count, allocated by
 ``compile(rows)`` / ``outputs(rows)`` or at the first call of that token count -- call ``compile(rows)`` for every token count before
-a stream capture.  Entry-owned outputs are valid until the entry's next call at that token count from ANY host thread.  The pools
-are always the caller's.  Workspace: none.  The warm path allocates nothing and reads no device memory to the host.
+a stream capture.  THE ALLOCATION OF AN ENTRY-OWNED PAIR IS STREAM WORK of torch's current stream of the entry's device at that
+moment: the pair is not initialized by the entry, but under deterministic algorithms torch fills it, and its blocks can be recycled
+ones that stream still owes a write.  EVERY launch that writes bytes of the pair is ordered behind that work on WHATEVER stream it
+runs, HOWEVER the tensor reached the call -- the entry's own output of the token count, a tensor taken with ``outputs`` and passed
+back as ``q_out`` / ``gate_out`` or as a pool, whole or as a view, at this token count or another, by this entry or by another
+entry that orders its launches the same way (``cudnn.frost.init_order``; the test is one of addresses: the bytes a launch writes
+against the pair's allocations).  The same stream: by stream order.  Another stream: by a stream-side wait for the event recorded behind the allocation
+-- no host wait, never a synchronization of a stream or of the device -- so ``compile(rows)`` may run on any stream.  A captured
+launch cannot carry that dependency: a call that finds the work still pending under a capture waits for that ONE event on the host
+before its captured launch (set-up, never part of a replay; a pair allocated before the capture on the capturing thread's stream
+needs no wait).  Once a call has seen it complete nothing is kept of it, and a warm call does nothing for it; while one is pending
+on the device, every call reads the device's records.  WHAT STAYS THE CALLER'S: the operands a launch only READS (``q``, ``gate``,
+``k``, ``v``, the weights, ``cos_sin``, ``positions``, ``slot_mapping``), also when one is laid over an entry-owned tensor, and the
+caller's own reads and writes of a returned tensor outside a call of an entry.  Entry-owned outputs are valid until the entry's next
+call at that token count from ANY host thread.  The pools are always the caller's.  Workspace: none.  The warm path allocates nothing
+and reads no device memory to the host; the one host wait of the entry is the one above, of a captured launch into a pair whose
+allocation's stream work is still pending.
 """
 
 from math import gcd
 from typing import Any, Dict, Optional, Tuple
 
 from cudnn._torch_stream import device_context  # imports no framework at module level
+from cudnn.frost import init_order  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
@@ -522,6 +538,8 @@ class AttentionPrepareDecode:
         self.device = resolve_device(device)
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[int, Dict[str, Any]] = {}
+        #: the device's records of entry-owned allocations whose initialization may be pending (shared by every entry of the device)
+        self._pending = init_order.pending_of(self.device)
 
     # ---- the form and the compile key ----
     def cfg_for(self, rows: int) -> Cfg:
@@ -567,14 +585,28 @@ class AttentionPrepareDecode:
     # ---- entry-owned outputs ----
     def outputs(self, rows: int) -> Dict[str, Any]:
         """The entry-owned output buffers of ``rows`` tokens: ``q_out`` and ``gate_out``, bf16 ``[rows, HEADS, HEAD_DIM]``.
-        Allocated once per token count; see the module docstring for their lifetime."""
+        Allocated once per token count; see the module docstring for their lifetime and for what is ordered behind their
+        allocation.  Returns a copy of the entry's table (the same tensors), without waiting."""
+        return dict(self._owned(rows))
+
+    def _owned(self, rows: int) -> Dict[str, Any]:
+        """The entry's own table of the pair of ``rows`` tokens, allocated on first use.  The allocation's stream work is recorded
+        (:mod:`cudnn.frost.init_order`) BEFORE the pair is in the table."""
         rows = validate_rows(rows)
         if rows not in self.buffers:
             import torch
 
             shape = (rows, self.cfg.HEADS, self.cfg.HEAD_DIM)
-            self.buffers[rows] = {name: torch.empty(shape, dtype=torch.bfloat16, device=self.device) for name in OUTPUT_SLOTS}
+            bufs = {name: torch.empty(shape, dtype=torch.bfloat16, device=self.device) for name in OUTPUT_SLOTS}
+            init_order.record(self._pending, bufs.values())
+            self.buffers[rows] = bufs
         return self.buffers[rows]
+
+    def _launch_writes(self, rows: int, written: Dict[str, Any]) -> Tuple[Tuple[int, int], ...]:
+        """The byte ranges a launch of ``rows`` tokens WRITES of ``written`` (the resolved outputs and the pools, by name): the
+        bounds of the live tokens of an output and of a whole pool (which pool rows are written is device data) -- what the
+        launch is ordered by (:func:`cudnn.frost.init_order.order_behind`)."""
+        return tuple(_footprint(t, _written_shape(self.cfg, rows, name, t))[:2] for name, t in written.items())
 
     def _check_entry_owned(self, rows: int, operands: Dict[str, Any]) -> None:
         """The overlap check of :func:`check_binding` for the outputs a call does not pass: the launch writes the entry's own
@@ -601,7 +633,8 @@ class AttentionPrepareDecode:
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan time: the typed declines of the device, the part and the DSL, then ONE trace-compile of the entry's form (a no-op
         once compiled).  With ``rows`` it also allocates the entry-owned outputs of that token count -- call it for every token
-        count before a stream capture.  Needs no operand."""
+        count before a stream capture, on any stream: a later launch that writes them is ordered behind the allocation's stream
+        work.  Needs no operand."""
         if rows is not None:
             validate_rows(rows)
         if self.key() not in self.compiled:
@@ -626,7 +659,7 @@ class AttentionPrepareDecode:
                 args = [cutlass.Int64(0)] * (len(mod.OPERANDS) + len(mod.STRIDES)) + [cutlass.Int32(0), cutlass.Int64(0), cutlass.Int32(1)]
                 self.compiled[self.key()] = cute.compile(mod.launch, self.cfg, *args, make_fake_stream())
         if rows is not None:
-            self.outputs(rows)
+            self._owned(rows)
 
     # ---- launch ----
     def __call__(self, q, gate, k, v, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slot_mapping, q_out=None, gate_out=None):
@@ -634,7 +667,8 @@ class AttentionPrepareDecode:
         given, else the entry-owned buffer of this token count.  Compiles on first use.  Every launch re-runs the binding checks
         before the compiled kernel is looked up, the overlap check on the RESOLVED operands (``ValueError``: an entry-owned output
         the launch would write must not overlap another operand; a returned output fed back in needs a caller-owned output).  The
-        launch is scoped to the entry's device and the caller's current device is restored behind it."""
+        launch is ordered behind the pending stream work of every entry-owned allocation of the device it writes (the module
+        docstring), scoped to the entry's device, and the caller's current device is restored behind it."""
         import torch
 
         cfg = self.cfg
@@ -663,17 +697,21 @@ class AttentionPrepareDecode:
 
         with device_context(self.device):
             if q_out is None or gate_out is None:
-                owned = self.outputs(rows)
+                owned = self._owned(rows)
                 q_out = owned["q_out"] if q_out is None else q_out
                 gate_out = owned["gate_out"] if gate_out is None else gate_out
             values = launch_arguments(cfg, rows, q, gate, k, v, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slot_mapping, q_out, gate_out)
             wide = [cutlass.Int64(value) for value in values[:-3]]
+            stream = torch.cuda.current_stream(self.device)
+            if self._pending:  # empty in the steady state: a warm call does nothing here
+                written = dict(q_out=q_out, gate_out=gate_out, k_pool=k_pool, v_pool=v_pool)
+                init_order.order_behind(self._pending, stream, self._launch_writes(rows, written))
             self.compiled[key](
                 *wide,
                 cutlass.Int32(values[-3]),
                 cutlass.Int64(values[-2]),
                 cutlass.Int32(values[-1]),
-                cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream),
+                cuda.CUstream(stream.cuda_stream),
             )
         return q_out, gate_out
 
