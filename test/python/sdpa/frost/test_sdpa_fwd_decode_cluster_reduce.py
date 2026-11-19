@@ -142,12 +142,14 @@ def test_row_declines_a_request_outside_the_form(overrides, knobs, reason):
         (dict(use_pdl=True), "programmatic-dependent-launch"),
         (dict(d_shape=(128, 128)), "16-column D256"),
         (dict(split_kv=9), "2 to 8"),
+        (dict(q_rows=17), "one token unit per head group"),
     ],
 )
 def test_contract_predicate_rows(kwargs, reason):
     base = dict(device_cc=(10, 0), d_shape=(256, 256), tile=16, split_kv=8)
     assert swap_ab.cluster_reduce_decline(**base) is None
     assert all(swap_ab.cluster_reduce_decline(**{**base, "split_kv": s}) is None for s in range(2, 9))
+    assert swap_ab.cluster_reduce_decline(**{**base, "q_rows": 16}) is None
     assert reason in swap_ab.cluster_reduce_decline(**{**base, **kwargs})
 
 
@@ -262,6 +264,19 @@ def test_unpacked_sets_are_not_marked():
         assert engines.mismatch(SPECS[SWAP_AB].capabilities, f, dataclasses.replace(unpacked[0], cluster_reduce=True)) is None
     for cell in GRID:
         assert all(k.pack_gqa for _, k in _plans(_cell(cell)) if k.cluster_reduce), cell
+
+
+def test_row_declines_more_than_one_token_unit_with_the_knob():
+    """Tokens times packed heads past one tile launch several token units per head group: the row serves that set in two
+    launches and declines the knob on it (the in-launch form has no device cell for it)."""
+    caps = SPECS[SWAP_AB].capabilities
+    for heads, s_q, pack in (((24, 4), 3, True), ((32, 2), 2, True), ((24, 4), 17, False)):
+        f = facts(1, s_q, 2048, heads=heads)
+        knobs = SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, sched_policy=0, pack_gqa=pack, split_kv=8)
+        assert engines.mismatch(caps, f, knobs) is None, (heads, s_q)
+        assert "one token unit per head group" in engines.mismatch(caps, f, dataclasses.replace(knobs, cluster_reduce=True)), (heads, s_q)
+    one_unit = facts(1, 4, 2048, heads=(32, 8))
+    assert engines.mismatch(caps, one_unit, SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, sched_policy=0, pack_gqa=True, split_kv=8, cluster_reduce=True)) is None
 
 
 def test_recorded_cluster_bound_steers_the_rule(monkeypatch):
@@ -442,6 +457,10 @@ def test_standalone_adapter_declines_like_the_row_and_adds_the_installation_chec
         _device_cc=(10, 7) if change == "rubin" else (10, 0),
         _decode_q_tile=lambda: 0 if change == "prefill" else 16,
         flavor=(256, 256),
+        s_q_max=1,
+        h_q=24,
+        h_kv=4,
+        pack_gqa=True,
         split_kv=16 if change == "split16" else 8,
         thd=False,
         has_sink=change == "sink",

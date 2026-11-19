@@ -3798,7 +3798,7 @@ def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
     """Whether a LISTED knob set of the SM100 D256 swap-AB engine reduces its split inside the launch (``CLUSTER_K_REDUCE``).
 
     A pure function of the facts, the set and the installed extension: the form's own domain (the swap-AB contract's
-    ``cluster_reduce_decline``: the part, the 16-column tile, 2 .. 8 chunks, no fold the separate pass carries); an extension
+    ``cluster_reduce_decline``: the part, the 16-column tile, 2 .. 8 chunks, one token unit, no fold the separate pass carries); an extension
     that binds the reduced launch; the packed whole-group set of any head ratio and token count whose rows fit one tile (an
     unpacked set has no recorded cell and takes the form by an explicit knob only); and at most the recorded cluster count
     of the part for the set's split (``units <= fused_cluster_bound``: past one wave of clusters a chunk that ended would
@@ -3809,13 +3809,15 @@ def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
 
     split = int(knobs.split_kv or 1)
     sm_count = int(facts.device_sm_count or 0)
-    if split < 2 or sm_count <= 0 or knobs.tile_m is None:
+    if split < 2 or sm_count <= 0 or knobs.tile_m is None or not (knobs.pack_gqa and facts.h_kv):
         return False
+    pack_g = facts.h_q // facts.h_kv
     declined = cluster_reduce_decline(
         device_cc=facts.device_cc,
         d_shape=padded_shape(facts),
         tile=knobs.tile_m,
         split_kv=split,
+        q_rows=facts.s_q * pack_g,
         thd=facts.thd,
         has_sink=facts.has_sink,
         stats_log2=facts.has_stats_log2,
@@ -3824,9 +3826,6 @@ def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
     )
     if declined is not None:
         return False
-    if not (knobs.pack_gqa and facts.h_kv):
-        return False
-    pack_g = facts.h_q // facts.h_kv
     units = int(facts.b) * (int(facts.h_q) // pack_g) * decode_d256_q_units(facts.s_q, pack_g, knobs.tile_m)
     if units <= 0 or units > fused_cluster_bound(sm_count, split):
         return False

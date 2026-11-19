@@ -319,8 +319,6 @@ CELLS = {
     "bf16-h16x4-q3-p-s8-causal": dict(heads=(16, 4), s_q=3, split=8, causal=True, lens=(2048, 5)),
     "bf16-h32x8-q4-p-s8-causal": dict(heads=(32, 8), s_q=4, split=8, causal=True, lens=(2048, 1027), q_lens=(4, 3)),
     "bf16-h32x2-q1-p-s4-no-q-lens": dict(heads=(32, 2), s_q=1, split=4, declared=1536, lens=(1536, 100), q_lens_present=False),
-    # more token units than one per head group: the second unit holds the last token alone
-    "bf16-q3-p-s8-two-units": dict(s_q=3, split=8, causal=True, lens=(2048, 900), q_lens=(3, 2)),
     # head widths below the 256 envelope
     "bf16-d200-q1-p-s8": dict(d=200, s_q=1, split=8, lens=(2048, 333)),
     "f16-d192-q2-p-s4-causal": dict(dtype=torch.float16, d=192, s_q=2, split=4, causal=True, lens=(2048, 513)),
@@ -329,9 +327,9 @@ CELLS = {
     "bf16-q1-p-s5": dict(s_q=1, split=5, declared=2560, lens=(2560, 1300)),
     "bf16-q2-p-s6-causal": dict(s_q=2, split=6, causal=True, declared=1536, lens=(1536, 769)),
     "bf16-q1-p-s7": dict(s_q=1, split=7, lens=(2048, 2047)),
-    # a dense cache with and without lengths; the top-left causal mask; a sliding window on the bottom-right diagonal
-    "bf16-q1-p-s8-dense-lens": dict(s_q=1, split=8, page=0, lens=(2048, 1000, 1)),
-    "bf16-q1-u-s2-dense-no-lens-causal": dict(s_q=1, split=2, page=0, pack=False, causal=True, kv_lens=False, q_lens_present=False, lens=(2048, 2048)),
+    # a dense cache (a split serves it without length operands); the top-left causal mask; a sliding window on the bottom-right diagonal
+    "bf16-q1-p-s8-dense": dict(s_q=1, split=8, page=0, kv_lens=False, q_lens_present=False, lens=(2048, 2048)),
+    "bf16-q2-u-s2-dense-causal": dict(s_q=2, split=2, page=0, pack=False, causal=True, kv_lens=False, q_lens_present=False, lens=(2048, 2048)),
     "bf16-q2-p-s4-causal-top-left": dict(s_q=2, split=4, causal="top-left", lens=(2048, 700)),
     "bf16-q1-p-s8-window": dict(s_q=1, split=8, causal=True, window_left=300, lens=(2048, 700, 100)),
 }
@@ -345,18 +343,19 @@ def test_reduction_matches_reference_and_two_launch_bytes(name):
 
 
 @pytest.mark.parametrize(
-    "dtype,users,splits,needed",
-    [(torch.bfloat16, 64, (4, 8, 8), 2_000_000), (torch.float16, 24, (8,), 250_000)],
-    ids=["bf16", "f16"],
+    "dtype,users,splits,needed,unpacked_tokens",
+    [(torch.bfloat16, 64, (4, 8, 8), 2_000_000, 0), (torch.float16, 24, (8,), 250_000, 0), (torch.bfloat16, 24, (4, 8), 1_500_000, 6)],
+    ids=["bf16", "f16", "bf16-unpacked"],
 )
-def test_byte_identity_element_budget(dtype, users, splits, needed):
+def test_byte_identity_element_budget(dtype, users, splits, needed, unpacked_tokens):
     """A one-ulp fp32 difference reaches a stored half element with probability about 2^-16 (bf16) or 2^-13 (f16), so byte
     identity is asserted over enough elements to see one: full caches, random scores (every chunk carries comparable weight),
-    4 and 8 chunks, with the reverse-order control."""
+    4 and 8 chunks, with the reverse-order control. Packed two-token units, and unpacked six-token units of the same budget."""
     _device()
     compared = 0
     for i, split in enumerate(splits):
-        runner = Runner(dtype=dtype, s_q=2, split=split, causal=True, lens=[2048] * users, seed=100 + i)
+        shape = dict(s_q=unpacked_tokens, pack=False) if unpacked_tokens else dict(s_q=2)
+        runner = Runner(dtype=dtype, split=split, causal=True, lens=[2048] * users, seed=100 + i, **shape)
         compared += _compare_forms(runner, list(range(users)), reordered_control=True)
     # every compared element was asserted byte-equal by _compare_forms above
     print(f"byte identity of the in-launch reduction: {compared} {str(dtype).split('.')[-1]} O elements compared and equal")

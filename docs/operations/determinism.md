@@ -175,9 +175,10 @@ in the separate reduction pass or, with `CLUSTER_K_REDUCE=1`, inside its own
 launch. Both forms add the partials in split order with the same operations.
 In the tested configurations (2 to 8 chunks; FP16/BF16; head ratios 24/4, 8/1,
 16/4, 32/8 and 32/2; head widths 256, 200 and 192; packed units of one to four
-tokens and unpacked units of one to eight; pages of 16, 32 and 64 and a dense
-cache; padding, bottom-right and top-left causal masks and a sliding window;
-with and without per-batch lengths) they store identical O and Stats bytes, so
+tokens and unpacked units of one to eight; pages of 16, 32 and 64 with
+per-batch lengths and a dense cache without them; padding, bottom-right and
+top-left causal masks and a sliding window) they store identical O and Stats
+bytes, so
 the knob does not change a plan's result at a fixed split count. The result
 still follows the split count, which the heuristics choose from the declared
 cache length and the batch: a caller that needs a sequence's bytes to stay

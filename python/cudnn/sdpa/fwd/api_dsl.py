@@ -4014,6 +4014,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             d_shape=self.flavor,
             tile=tile,
             split_kv=self.split_kv,
+            q_rows=int(self.s_q_max) * ((int(self.h_q) // int(self.h_kv)) if self.pack_gqa else 1),
             thd=self.thd,
             has_sink=self.has_sink,
             stats_log2=self.stats_log2,
