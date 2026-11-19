@@ -676,6 +676,8 @@ pytest core/test_determinism_utils.py
 | --- | --- | --- | --- |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
+| `causal_conv1d/cutedsl/test_causal_conv1d_packed_determinism.py`, `test_causal_conv1d_packed_public_determinism.py`, `test_causal_conv1d_packed_goldens.py` | `causal_conv1d(..., backend="se")`, packed FP16/BF16/FP32 | output and final history | input, weight, bias, initial history; parameter gradients tested for replay, not assumed batch invariant |
+| `causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py` | SM103 BF16 width-four SiLU persistent backward, packed and dense | output | dX, dW, db; tiled-parent dX comparison, public graph replay, parameter repeatability, warm staging stress |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -8500,3 +8502,81 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+## SE packed port and persistent backward integration
+
+The new explicit `backend="se"` route is qualified independently from the
+prototype benchmark. The packed suites cover FP16/BF16/FP32, widths 2 through
+8, identity/SiLU, empty sequences, strided tensors, initial/final history,
+all gradients, changed-offset graph replay, full-graph AOT autograd, and
+invalid-offset traps in isolated processes. The persistent suite checks the
+SM103 dispatch, byte-exact dX against the tiled parent, FP64 numerical
+references, replay, and warm staging stress. Parameter reduction grouping can
+change with packing; repeatability does not imply batch invariance.
+
+Qualification on 2026-11-19 used an exclusive NVIDIA B300 SXM6 AC (SM103,
+148 SMs), driver 615.71.10, Torch 2.14.1+cu130, cuDNN 9.29.0.2, CuTe DSL
+4.8.0, and TVM-FFI 0.1.15.post2. CUDA 13.4 and CUDA 12.9 compiler flavors
+ran against the same CUDA 13 Torch environment. The Python implementation
+resolved to the candidate worktree; the nanobind package was an existing
+Frontend 1.32.0 build.
+
+| Selection | Compiler | Result | Runtime |
+| --- | --- | --- | --- |
+| Packed/private/public, determinism, decode replay, persistent, schedule; excluding goldens/stress | CUDA 13.4 | 241 passed | 846.49 s |
+| Packed FP32, tiled FP32 SiLU, semantic API, device scope | CUDA 13.4 | 123 passed; 15 two-GPU cases skipped | 104.53 s |
+| Public packed, public determinism, persistent, golden recording | CUDA 12.9 | 135 passed | 421.03 s |
+| Final persistent and staging suites plus strict golden comparison | CUDA 13.4 | 36 passed | 116.16 s |
+| Final persistent and staging suites plus strict golden comparison | CUDA 12.9 | 36 passed | 45.24 s |
+| Public dense signed-zero tail versus the original dense parent | CUDA 13.4 / 12.9 | 1 passed per compiler | 7.19 / 10.23 s |
+
+The final suites include dense launch-boundary rejection without large
+allocations, full-graph autograd, changed-offset replay on a nondefault stream,
+and strict deterministic mode. The initial public rerun found a singleton
+batch-stride mismatch: the adapter now constructs the BDT view in the correct
+order and uses the existing output-layout helper. The corrected suite above
+passes; that initial failure was not a numerical mismatch.
+
+Thirty-two new golden files cover 15 packed cases and one persistent case per
+compiler. Before recording, packed cases pass full FP64 references for every
+output/gradient; the large persistent case checks eight fixed channels across
+all tokens against FP64 and checks every output for finiteness. The 30 packed
+input/output hash records exactly match the previous port on SM103; only the
+TVM-FFI environment version changes their record key. The two persistent
+records cover a new schedule and its fixed parameter-reduction grouping.
+Strict replay runs without the recording variable.
+
+Five staging cases each compare all output and partial-scratch bytes across
+3,000 warm and 3,000 shared-memory-poisoned launches. Each compiler run has
+zero mismatches in all 30,000 launches; the unsafe control fails 200/200 in
+each process (60,000 measured launches across both compiler lanes).
+Packed persistent uses 294 CTAs (1.99 per SM) and one refill, dense persistent
+uses 296 CTAs and 54 refills, and the three tiled cases use 320/384/320 CTAs
+with 3/2/3 refills. Cold references come from two agreeing cache-flushed
+launches: these stress checks measure stability, while the independent FP64
+checks establish numerical accuracy separately. The zero-count rate bound
+is below 0.0998% per block at 95% confidence; it is not a proof of absence of
+races. Persistent PTX and SASS retain the async-proxy fence before stage reuse in
+five compiled variants per compiler (packed C=768/2048 with/without bias,
+and dense C=2048). A dedicated public dense test also checks full dX bytes
+against the original dense kernel under signed-zero underflow at sequence
+tails; the tail correction preserves the parent's padded arithmetic.
+
+Other GPU architectures and actual two-device behavior remain unverified.
+The CUDA 12 compiler run does not qualify a complete CUDA 12 deployment.
+Repository CI is separate from these local runs.
+
+Commands (from `test/python`; run with the intended compiler flavor):
+
+```bash
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_packed*.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_schedule_unit.py -m L0 -q -rs
+```
+
+The focused signed-zero regression command was:
+
+```bash
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  -m L0 -q -rs -x -k dense_signed_zero_tail_matches_parent
+```

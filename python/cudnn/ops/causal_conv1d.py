@@ -522,6 +522,8 @@ def _validate_causal_conv1d_sequence_contract(
     initial_states: Optional[Tensor],
     return_final_states: bool,
     final_states_out: Optional[Tensor],
+    *,
+    defer_alias_check: bool = False,
 ) -> None:
     """Validate sequence and mathematical-state semantics only.
 
@@ -582,7 +584,7 @@ def _validate_causal_conv1d_sequence_contract(
             raise TypeError(f"{name} dtype must match x dtype {x.dtype}, got {state.dtype}")
         if state is not None and state.device != x.device:
             raise ValueError(f"{name} device must match x device {x.device}, got {state.device}")
-    if final_states_out is not None:
+    if final_states_out is not None and not defer_alias_check:
         # The final state is written after the forward, and autograd saves the
         # inputs for backward, so an aliased output would corrupt them.
         for name, tensor in (
@@ -720,6 +722,11 @@ def causal_conv1d(
     modes fail explicitly without changing the public state shape to match a
     backend cache convention.
 
+    ``backend="se"`` selects the CuTe DSL SE implementation. Packed calls
+    support matching FP16/BF16/FP32 parameters, widths 2 through 8, identity or
+    SiLU, and optional initial/final history. See the API guide for dense
+    restrictions and the SM103 persistent backward schedule.
+
     ``backend="cake"`` opts into deterministic Cake training kernels on
     SM100a/SM103a/SM107a with CUDA 13.4+. This route requires native channel-last
     BF16 storage, width four, SiLU, channels divisible by eight, FP32 or BF16
@@ -732,12 +739,31 @@ def causal_conv1d(
     under ``warn_only=True``) because dbias accumulates with FP32 atomics.
     """
 
-    if backend not in ("auto", "cake"):
-        raise ValueError("backend must be 'auto' or 'cake'")
+    if backend not in ("auto", "cake", "se"):
+        raise ValueError("backend must be 'auto', 'cake', or 'se'")
     _reset_causal_conv1d_last_route()
     normalized_activation = _normalize_causal_conv1d_activation(activation)
     if seq_idx is not None and cu_seqlens is not None:
         raise ValueError("seq_idx and cu_seqlens are mutually exclusive")
+    if backend == "se":
+        _validate_causal_conv1d_sequence_contract(
+            x,
+            weight,
+            bias,
+            seq_idx,
+            cu_seqlens,
+            initial_states,
+            return_final_states,
+            final_states_out,
+            defer_alias_check=torch.compiler.is_compiling(),
+        )
+        if seq_idx is not None:
+            raise NotImplementedError("SE causal_conv1d does not implement seq_idx")
+        from cudnn.causal_conv1d_se.api import causal_conv1d as se_causal_conv1d
+
+        result = se_causal_conv1d(x, weight, bias, normalized_activation, cu_seqlens, initial_states, return_final_states, final_states_out)
+        _record_causal_conv1d_route("se")
+        return result
     if backend == "cake":
         _validate_causal_conv1d_sequence_contract(x, weight, bias, seq_idx, cu_seqlens, initial_states, return_final_states, final_states_out)
         if normalized_activation != "silu" or seq_idx is not None or initial_states is not None or return_final_states or final_states_out is not None:

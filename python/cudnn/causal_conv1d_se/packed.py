@@ -20,7 +20,9 @@ from torch import Tensor
 @cache
 def _source_digest():
     here = Path(__file__).resolve().parent
-    return sha256(b"".join((here / name).read_bytes() for name in ("packed.py", "packed_kernel.py", "kernel.py"))).hexdigest()
+    return sha256(
+        b"".join((here / name).read_bytes() for name in ("packed.py", "packed_kernel.py", "persistent_backward.py", "schedule.py", "kernel.py"))
+    ).hexdigest()
 
 
 def _tensor_byte_span(tensor: Tensor) -> Tuple[int, int]:
@@ -78,6 +80,23 @@ def _validate(x, weight, cu, bias, initial, silu, return_final):
     _require_dsl()
     if torch.cuda.get_device_capability(x.device) not in {(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)}:
         raise NotImplementedError("packed causal_conv1d requires SM80/86/89/90/100/103/120")
+
+
+def _backward_schedule(x, weight, bias, initial, dy, dfinal, silu):
+    from .schedule import backward_schedule
+
+    with torch.cuda.device(x.device):
+        capability = torch.cuda.get_device_capability(x.device)
+        multiprocessors = torch.cuda.get_device_properties(x.device).multi_processor_count
+    native = (
+        all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (x, dy))
+        and (bias is None or (bias.is_contiguous() and bias.data_ptr() % 16 == 0))
+        and weight.data_ptr() % 16 == 0
+        and x.dtype == weight.dtype == dy.dtype
+        and initial is None
+        and dfinal is None
+    )
+    return backward_schedule(x.shape[0], x.shape[1], weight.shape[1], str(x.dtype), silu, native, capability, multiprocessors)
 
 
 def _compiled(direction, tensors, width, silu):
@@ -156,6 +175,11 @@ def _compiled(direction, tensors, width, silu):
         )
     key = repr((_source_digest(), direction, width, silu, fast, weight_vector, index32, signatures))
     fn = {"forward": launch_packed_forward, "backward": launch_packed_backward, "state_backward": launch_packed_state_backward}[direction]
+    if direction == "backward" and fast and index32 and _backward_schedule(x, w, b, initial, dy, dfinal, silu)[0] == "persistent":
+        from .persistent_backward import launch_supported_backward
+
+        fn = launch_supported_backward
+    key = repr((key, fn.__name__))
     with torch.cuda.device(tensors[0].device):
         extra = (
             (width,)
@@ -251,8 +275,7 @@ def _backward(
     di = torch.empty_like(initial) if initial is not None else None
     dz = torch.empty(x.shape, device=x.device, dtype=torch.float32)
     partial_dtype = torch.float64 if x.dtype == torch.float32 else torch.float32
-    partial_bytes = 8 if partial_dtype == torch.float64 else 4
-    splits = max(1, min(64, (16 * 1024 * 1024) // (x.shape[1] * (weight.shape[1] + 1) * partial_bytes)))
+    _, splits = _backward_schedule(x, weight, bias, initial, dy, dfinal, silu)
     partials = torch.empty((splits, weight.shape[1] + 1, x.shape[1]), device=x.device, dtype=partial_dtype)
     _launch("backward", (x, weight, bias, cu, initial, dy, dfinal, dz, dx, dw, db, di, partials), weight.shape[1], silu)
     return dx, dw, db, di

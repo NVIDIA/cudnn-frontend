@@ -1,6 +1,6 @@
 # CuTe DSL causal-convolution SE benchmarks
 
-Compare the NCW, NWH, and fused projection/mixer kernels in `python/cudnn/causal_conv1d_se` with the cuDNN SE backend through the frontend bindings. Dense BF16 NWH K4 SiLU cases also compare the existing frontend bulk implementation. These are low-level candidates; public operator routing is unchanged.
+Compare the NCW, NWH, and fused projection/mixer kernels in `python/cudnn/causal_conv1d_se` with the cuDNN SE backend through the frontend bindings. Dense BF16 NWH K4 SiLU cases also compare the existing frontend bulk implementation. The original runners exercise low-level candidates. Default public routing is unchanged; the explicit `backend="se"` integration and its CAKE comparison are described below.
 
 The directory contains a fixed workload runner, its comparison/timing helpers, workload manifests, and result collectors. Correctness tests live in `test/python/causal_conv1d/cutedsl`. Historical performance and compilation measurements, optimization details, and remaining acceptance gaps are recorded in [PR #1945](https://github.com/NVIDIA/cudnn-frontend/pull/1945).
 
@@ -29,7 +29,7 @@ Back-to-back backward receives the gradient of `y_gated` and uses the saved, inp
 
 Parameter-gradient accumulation uses atomics and is not bitwise deterministic. The backward launchers reset parameter outputs by default. Compile with the final `accumulate=True` argument to preserve existing parameter gradients and add to them, matching the backend ABI. Data gradients are overwritten in either mode. The fused back-to-back kernels need no global intermediate workspace. Standard backward retains a caller-owned compute-dtype `dz` workspace for the wide-filter NWH path; the fused NCW and short-filter NWH paths do not use that workspace.
 
-The candidate launchers perform no allocation, tensor conversion, or synchronization. Compile outside capture and pass the active CUDA stream at execution. Full public API integration, including argument checks and architecture admission, is still required.
+The candidate launchers perform no allocation, tensor conversion, or synchronization. Compile outside capture and pass the active CUDA stream at execution. The explicit `backend="se"` route now integrates packed calls and SM103 BF16 K4 SiLU dense calls, including validation and autograd. The generic NCW, wider NWH, and fused back-to-back launchers remain low-level candidates.
 
 ## Existing API contracts and replacement scope
 
@@ -123,3 +123,32 @@ The focused tests check independent numerical references, causal boundaries, out
 From the repository root, `summarize_bitwise.py --input <bitwise-directory> --output <summary-directory>` exports per-output comparisons, missing cases, backend exclusions, and nondeterministic parameter reductions. Repeat `--input` for other GPUs. Its exit status is nonzero unless every expected case passes; inspect the exported statuses to distinguish backend exclusions from mismatches.
 
 The current FP32 NWH rounding profiles target the verified cuDNN 9.29 backend with NVRTC 13.4–13.6 and need revalidation when the backend or compiler changes. The full seven-architecture performance matrix has not been rerun after the modern-compiler correction; six historical backend performance losses remain open. Public autograd/FakeTensor routing, validation, and cache/workspace ownership also remain integration work.
+
+## Packed SE and persistent backward versus Cake
+
+`compare_backward.py` compares the integrated private SE launch with Cake on
+the same BF16 width-four SiLU backward workload. `backward_workloads.json`
+defines the eight packed cases; five have equal sequence lengths and also
+support dense mode. Use an idle SM103 GPU with Cake's CUDA 13.4 dependencies.
+For each case, run three fresh processes:
+
+```bash
+for repeat in 0 1 2; do
+  python benchmark/causal_conv1d_se/compare_backward.py \
+    --case long_train --mode packed --repeat "$repeat" \
+    --output "/tmp/packed-long-$repeat.json"
+done
+```
+
+Change `--mode` to `dense` for a uniform batch. The output retains all 21
+randomized timing rounds, source hashes, compiler/GPU identity, selected
+schedule, and full-output errors against Cake. Compilation, allocations,
+metadata construction and filter preparation precede timing. Dense returned
+gradient conversion is included. Each CUDA Graph replay contains 20 calls.
+The ratio is Cake time divided by SE time; values above one favor SE.
+These numbers measure preallocated backward work, not Python dispatch or a
+complete allocating forward/autograd call.
+
+The BF16 implementations have different parameter accumulation methods: SE
+uses FP32 sums; Cake uses compensated partial sums and an FP64 final reduction.
+Run the independent numerical tests before accepting performance results.

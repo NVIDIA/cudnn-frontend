@@ -41,7 +41,7 @@ The result is an ordinary Tensor or tuple. Kernel compilation, architecture
 class names, schedule choice, workspace allocation, intermediate result
 wrappers, and CUDA stream handles are backend details.
 
-The current optimized route covers dense and `cu_seqlens`-packed BF16-activation
+The default `backend="auto"` route covers dense and `cu_seqlens`-packed BF16-activation
 width-four SiLU forward and backward, including mathematical `W - 1` initial
 and final state. Weights may be BF16, or FP32 without bias (BF16 activations
 with an FP32 depthwise filter); the FP32-weight epilogue is only tested without
@@ -55,14 +55,14 @@ exists.
 and the inputs are saved for backward, so an aliased output would corrupt them;
 overlapping storage is rejected with `ValueError`.
 
-Packed `cu_seqlens` values are validated on the device to avoid a host read.
+For `backend="auto"`, packed `cu_seqlens` values are validated on the device to avoid a host read.
 Malformed metadata—including a first offset other than zero, a final offset
 other than the runtime token total, non-increasing offsets, or an empty
 sequence—executes a device trap. The resulting sticky CUDA failure is not a
 recoverable Python exception; the process must discard that CUDA context before
 continuing GPU work.
 
-The backward honors `torch.use_deterministic_algorithms`. By default dweight
+The default backend honors `torch.use_deterministic_algorithms`. Its dweight
 accumulates with FP32 atomics and is not bitwise reproducible across launches.
 When deterministic algorithms are enabled, bias-free calls select a deterministic
 dweight route (unique FP32 partials followed by a fixed-order reduction). Calls
@@ -127,3 +127,69 @@ The deterministic package is copied unchanged from
 [miles-ext-kernels at f55fb996](https://github.com/radixark/miles-ext-kernels/tree/f55fb99674be5edb0e1f6a0e4d6a911335da86ce/miles_ext_kernels/cake/_vendor/cake_causal_conv1d_det_train),
 with build manifests and file hashes in `_cake/_vendor/VENDORED_CAUSAL_CONV1D.json`.
 No Miles or FlashInfer installation is required.
+
+## SE backend
+
+`causal_conv1d(..., backend="se")` selects the CuTe DSL SE implementation.
+It supports autograd and `torch.compile`; `backend="auto"` keeps its existing
+routing. CuTe DSL 4.8.0 or newer is required.
+
+```python
+# Dense: BF16 channel-last physical storage, SM103, width four, SiLU.
+y = causal_conv1d(x_btd.transpose(1, 2), weight, bias, "silu", backend="se")
+
+# Packed: x_tc concatenates the sequences without padding.
+y, final = causal_conv1d(
+    x_tc.T[None], weight, bias, "silu", backend="se",
+    cu_seqlens=offsets, initial_states=initial,
+    return_final_states=True,
+)
+```
+
+Packed calls support matching FP16, BF16, or FP32 activations and parameters,
+filter widths 2 through 8, and identity or SiLU activation. Channels must be
+positive and divisible by eight. The existing packed schedules admit
+SM80/86/89/90/100/103/120. Initial and final history contain exactly `W - 1`
+samples. Input, weight, bias, and initial-history gradients are supported;
+double backward is unsupported. Strided packed inputs use the existing scalar
+or tiled schedules. The wrapper preserves dense input memory formats when
+returning its output.
+
+Offsets are contiguous CUDA int32 values on the input device. They start at
+zero, end at the token count, and are nondecreasing. Repeated offsets represent
+empty sequences. An all-empty pack is supported. Offset values are checked
+on the device without a host read; invalid values cause a device trap and
+invalidate the CUDA context. Every replay reads the current offsets.
+
+Dense SE currently admits SM103 BF16 width-four SiLU with matching parameters,
+positive batch and token counts, and channel-last physical storage. It
+prepares a contiguous `[4, channels]` filter for forward and saves that tensor
+for backward. Broadcast output gradients are materialized at the allocating
+autograd boundary. Dense initial/final history is not supported by this route;
+use an equivalent packed call when history is needed.
+
+For contiguous BF16, width-four SiLU packed backward on SM103, the persistent
+schedule is selected at 8192 or more tokens and 768 or 2048 channels, with no
+state gradients. Other cases retain the tiled schedules. Dense backward uses
+the persistent schedule at 2048 channels and at least 100 million activation
+elements, with more than one token per sequence. The kernel retains its input
+and pending-gradient windows in registers across eight-token TMA stages.
+
+Packed parameter gradients and the persistent dense path use fixed-order
+reductions. They are repeatable for a fixed configuration. Parameter gradients
+can change bits when sequence packing or reduction grouping changes. The
+small dense tiled path uses atomic parameter reductions and rejects strict
+`torch.use_deterministic_algorithms(True)`; `warn_only=True` permits it with a
+warning. These modes do not promise agreement with another backend's bits.
+
+The BF16 persistent parameter path accumulates in FP32 without compensation.
+Cake's corresponding path uses compensated intermediate sums and an FP64
+final reduction. Performance comparisons therefore need separate numerical
+checks; matching the output dtype does not establish equal worst-case
+accumulation error. See the [determinism support page](../determinism.md) for
+validated guarantees and the test coverage report for hardware-specific results.
+
+Dense calls also require legal CUDA launch geometry: batch and the selected
+forward token-tile count must each fit 65535, and channels must leave room for
+signed int32 tile arithmetic. Unsupported geometry raises before compilation;
+packed offsets avoid the dense batch-grid limit.

@@ -76,6 +76,10 @@ arbitrary user callbacks.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
+| `cudnn.ops.causal_conv1d(..., backend="se")`, packed | fprop, dgrad, history gradients | matching FP16/BF16/FP32 | Unverified | SM100: Unverified; SM103: Supported (tested configurations) | Unsupported |
+| `cudnn.ops.causal_conv1d(..., backend="se")`, packed | wgrad, bgrad | matching FP16/BF16/FP32 parameters | Unverified | SM100: Unverified; SM103: Replay only | Unsupported |
+| `cudnn.ops.causal_conv1d(..., backend="se")`, dense persistent SM103 route | fprop, dgrad, wgrad, bgrad | BF16 | Unsupported for this route | SM100: Unsupported for this route; SM103: Replay only | Unsupported for this route |
+| `cudnn.ops.causal_conv1d(..., backend="se")`, dense tiled route | wgrad, bgrad | BF16 | Unsupported for this route | SM100: Unsupported for this route; SM103: Not guaranteed (atomic parameter reduction) | Unsupported for this route |
 | `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Supported (GH200, tested configurations) | Unverified | Unsupported |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
@@ -1218,3 +1222,23 @@ forward/backward calls on SM90 and SM100. This case has no bias. General batch
 invariance, dBias determinism, FP16 byte determinism, concurrency, golden hashes,
 and other GPUs (including SM103) remain unverified.
 This does not establish determinism for frontend kernel plans.
+
+
+## SE causal convolution
+
+The explicit `cudnn.ops.causal_conv1d(..., backend="se")` route has SM103
+repeatability coverage for packed FP16/BF16/FP32 forward, final history, and
+all gradients. Sequence batch-invariance checks cover width-eight SiLU with
+history in all three dtypes, plus the width-four BF16 persistent route's
+forward and dX. Repacking uses fixed inputs and upstream gradients, including
+empty and repeated sequences. Parameter gradients have a fixed reduction
+order for a fixed pack, but their bytes can change when packing or split
+count changes. They are replay-only.
+
+Dense SM103 BF16 K4 SiLU persistent calls have forward/backward replay
+coverage under strict deterministic mode. Dense tiled parameter reductions
+use atomics and reject strict mode (or warn under `warn_only=True`). Dense
+initial/final history is unsupported by this route. Packed SM80/86/89/90/100/120
+execution remains unverified for this integration; SM107 is not admitted.
+See the operation guide for dispatch restrictions and the golden coverage
+report for commands, runtime versions, and measured stress coverage.

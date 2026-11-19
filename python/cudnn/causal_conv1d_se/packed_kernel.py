@@ -1217,6 +1217,11 @@ def _packed_backward_rows(
     index_type: cutlass.Constexpr,
     finite_parameters: cutlass.Constexpr = False,
 ):
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    paired = cutlass.const_expr(
+        all((x.element_type.width == 16, width == 4, silu, CuTeDSL._get_dsl().get_arch_enum().major == 10, CuTeDSL._get_dsl().get_arch_enum().minor == 3))
+    )
     vector = 128 // x.element_type.width
     window = cute.make_rmem_tensor(cute.make_layout((width, vector), stride=(vector, 1)), cutlass.Float32)
     pending = cute.make_rmem_tensor(cute.make_layout((rows, vector), stride=(vector, 1)), cutlass.Float32)
@@ -1265,8 +1270,18 @@ def _packed_backward_rows(
                 pre = cute.make_rmem_tensor((vector,), cutlass.Float32)
                 pre.store(biases.load())
                 for k in cutlass.range_constexpr(width):
-                    for v in cutlass.range_constexpr(vector):
-                        pre[v] = cute.math.fma(window[(j + k) % width, v], weights[k, v], pre[v])
+                    if cutlass.const_expr(paired):
+                        for v in cutlass.range_constexpr(0, vector, 2):
+                            p0, p1 = cute.arch.fma_packed_f32x2(
+                                (window[(j + k) % width, v], window[(j + k) % width, v + 1]),
+                                (weights[k, v], weights[k, v + 1]),
+                                (pre[v], pre[v + 1]),
+                                ftz=False,
+                            )
+                            pre[v], pre[v + 1] = p0, p1
+                    else:
+                        for v in cutlass.range_constexpr(vector):
+                            pre[v] = cute.math.fma(window[(j + k) % width, v], weights[k, v], pre[v])
                 for v in cutlass.range_constexpr(vector):
                     if cutlass.const_expr(x.element_type == cutlass.Float32):
                         grad[v] = _compensated_silu_gradient_fp32(grad[v], pre[v])
@@ -1275,18 +1290,25 @@ def _packed_backward_rows(
                         grad[v] = grad[v] * sigmoid * (1.0 + pre[v] * (1.0 - sigmoid))
             if cutlass.const_expr(j < rows):
                 for k in cutlass.range_constexpr(width):
-                    for v in cutlass.range_constexpr(vector):
-                        if cutlass.const_expr(x.element_type == cutlass.Float32):
-                            if cutlass.const_expr(finite_parameters):
-                                accum[k, v], accum[k + width + 1, v] = _compensated_product_finite(
-                                    window[(j + k) % width, v], grad[v], accum[k, v], accum[k + width + 1, v]
-                                )
+                    if cutlass.const_expr(paired):
+                        for v in cutlass.range_constexpr(0, vector, 2):
+                            p0, p1 = cute.arch.fma_packed_f32x2(
+                                (window[(j + k) % width, v], window[(j + k) % width, v + 1]), (grad[v], grad[v + 1]), (accum[k, v], accum[k, v + 1]), ftz=False
+                            )
+                            accum[k, v], accum[k, v + 1] = p0, p1
+                    else:
+                        for v in cutlass.range_constexpr(vector):
+                            if cutlass.const_expr(x.element_type == cutlass.Float32):
+                                if cutlass.const_expr(finite_parameters):
+                                    accum[k, v], accum[k + width + 1, v] = _compensated_product_finite(
+                                        window[(j + k) % width, v], grad[v], accum[k, v], accum[k + width + 1, v]
+                                    )
+                                else:
+                                    accum[k, v], accum[k + width + 1, v] = _compensated_product(
+                                        window[(j + k) % width, v], grad[v], accum[k, v], accum[k + width + 1, v]
+                                    )
                             else:
-                                accum[k, v], accum[k + width + 1, v] = _compensated_product(
-                                    window[(j + k) % width, v], grad[v], accum[k, v], accum[k + width + 1, v]
-                                )
-                        else:
-                            accum[k, v] = cute.math.fma(window[(j + k) % width, v], grad[v], accum[k, v])
+                                accum[k, v] = cute.math.fma(window[(j + k) % width, v], grad[v], accum[k, v])
                 for v in cutlass.range_constexpr(vector):
                     if cutlass.const_expr(x.element_type == cutlass.Float32):
                         if cutlass.const_expr(finite_parameters):
@@ -1304,8 +1326,18 @@ def _packed_backward_rows(
                 if cutlass.const_expr(boundary):
                     valid_grad = pos < ends[r]
                 if valid_grad:
-                    for v in cutlass.range_constexpr(vector):
-                        pending[r, v] = cute.math.fma(grad[v], weights[width - 1 - j + r, v], pending[r, v])
+                    if cutlass.const_expr(paired):
+                        for v in cutlass.range_constexpr(0, vector, 2):
+                            p0, p1 = cute.arch.fma_packed_f32x2(
+                                (grad[v], grad[v + 1]),
+                                (weights[width - 1 - j + r, v], weights[width - 1 - j + r, v + 1]),
+                                (pending[r, v], pending[r, v + 1]),
+                                ftz=False,
+                            )
+                            pending[r, v], pending[r, v + 1] = p0, p1
+                    else:
+                        for v in cutlass.range_constexpr(vector):
+                            pending[r, v] = cute.math.fma(grad[v], weights[width - 1 - j + r, v], pending[r, v])
         # A row drains after its last possible future gradient, even if that
         # future position is outside the pack or in another sequence.
         if cutlass.const_expr(j >= width - 1):
