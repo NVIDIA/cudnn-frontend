@@ -1301,7 +1301,7 @@ def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(m
     plan, the prompt's decode plan and the drafter's are printed with ONE memory sentence, the drafter in it, behind the
     line that says what a prompt and a step are; a count of drafted tokens no verify row of the stack holds is declined
     by that row's sentence -- a ``SKIP``, before any load; so is a GPU with less free memory than the sentence asks for."""
-    from model_samples import loop
+    from model_samples import EnvironmentMismatch, loop
 
     def run(*arguments, **facts):
         return _sample_main(monkeypatch, capsys, list(arguments), script=SPECULATIVE_SCRIPT, **facts)
@@ -1333,6 +1333,9 @@ def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(m
     with pytest.raises(AssertionError, match="reached a load"):
         run("--speculative-config", eight, "--stack", "reference")
     capsys.readouterr()
+    code, out = run("--speculative-config", eight.replace("8", "64"), "--stack", "reference")  # ... as far as its schedule fits the context
+    last = out.splitlines()[-1]
+    assert code == 1 and last.startswith("[02] ERROR the seeded prompt: 26 prompt tokens + 2,082 new tokens (--force-tokens 2082) are 2,108 positions"), last
     code, out = run("--speculative-config", eight, "--stack", "reference", "--force-tokens", "37")  # a count that was typed is held, before the plan
     short = "[02] ERROR --force-tokens 37: the seeded run schedules its steps to keep 0 to 8 drafted tokens in turn and needs 38 new tokens to keep every count once"
     assert code == 1 and out.splitlines() == [short]
@@ -1343,6 +1346,14 @@ def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(m
     assert code == 0 and out.splitlines()[-1] == "[02] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is 9.0", out
     code, out = run("--provider", "mlp.down=nothing")
     assert code == 1 and out.splitlines()[-1].startswith("[02] ERROR --provider mlp.down=nothing: not a declared row"), out
+
+    def stale():  # an environment that is not the tree's ends the run in one ERROR line, behind the plan: a GPU that is not served skips first
+        raise EnvironmentMismatch("cudnn 1.33.0 was imported from an editable checkout, but the installed distribution says 1.29.0")
+
+    code, out = run(environment=stale)
+    assert code == 1 and out.splitlines()[-1] == "[02] ERROR cudnn 1.33.0 was imported from an editable checkout, but the installed distribution says 1.29.0"
+    code, out = run(cc=(9, 0), environment=stale)
+    assert code == 0 and out.splitlines()[-1].startswith("[02] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x"), out
     # --provider selects its row in both kinds of step: an entry's key of one kind is declined by that row's sentence, a fallback key serves both
     code, out = run("--provider", "linear_attention.step=fe.gdn_decode_fused")
     assert code == 0 and out.splitlines()[-1] == "[02] SKIP cudnn.GdnDecodeFused serves rows 1-65,535; this run has 1 sequences x 6 tokens per sequence"

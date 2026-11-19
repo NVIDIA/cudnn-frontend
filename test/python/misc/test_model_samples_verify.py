@@ -3735,13 +3735,13 @@ def test_the_traced_pass_of_a_session_with_a_drafter_runs_whole_steps(monkeypatc
 
 
 # ---------------------------------------------------------------- what a session refuses of a drafter that is not its own; a snapshot behind a keep
-def test_a_drafter_of_another_checkpoint_or_of_other_widths_is_refused_by_name():
+def test_a_checkpoints_drafter_on_seeded_weights_or_a_drafter_of_other_widths_is_refused_by_name():
     """Two refusals of ``drafter=``, each by its own sentence where the session is built -- before a plan, a load or a pass.
     A drafter that was described from a checkpoint drafts on that checkpoint's weights: on a session whose weights are
     seeded -- the session that loads was handed no checkpoint, or a seeded one -- it would propose from rows of another
     head than the model's.  And a drafter of another model's widths, which ended in a tensor-size error inside the
     warm-up step of the load: the sentence names the first width that differs and both values."""
-    import dataclasses
+    from dataclasses import replace
 
     from model_samples import Checkpoint, Session, TextIO
     from model_samples.qwen_dense import Geometry, QwenDense
@@ -3750,7 +3750,7 @@ def test_a_drafter_of_another_checkpoint_or_of_other_widths_is_refused_by_name()
     text, seeded = TextIO.synthetic(model.geometry.vocab), _seeded_drafter(model)
     common = dict(stack="reference", device="cpu", draft_tokens=5)
     # what "described from a checkpoint" is to a session: the drafter names the checkpoint's own tensors (a seeded one names none)
-    described = dataclasses.replace(seeded, label="checkpoint tiny (local)", prefix="mtp.", keys={"drafter.fc.weight": "mtp.fc.weight"})
+    described = replace(seeded, label="checkpoint tiny (local)", prefix="mtp.", keys={"drafter.fc.weight": "mtp.fc.weight"})
     assert seeded.keys == {} and described.keys
     sentence = (
         "the drafter was described from a checkpoint and the weights of this session are seeded: hand the session that loads that checkpoint "
@@ -3767,18 +3767,29 @@ def test_a_drafter_of_another_checkpoint_or_of_other_widths_is_refused_by_name()
     assert Session(model, text, drafter=described, checkpoint=on_disk, **common).drafter is described
     assert Session(model, text, drafter=described, share=loads, **common).drafter is described
     assert all(Session(model, text, drafter=seeded, **common, **more).drafter is seeded for more in ({}, {"share": plain})), "the seeded pair"
+    # ... and on the OWNER of the weights, the end of the chain of share=, never on the session one share= away: a session in
+    # between that was handed nothing runs on the checkpoint all the same; one that was handed a checkpoint it never reads does not
+    middle = Session(model, text, stack="reference", device="cpu", share=loads)
+    handed = Session(model, text, stack="reference", device="cpu", share=plain, checkpoint=on_disk)
+    assert middle.checkpoint is None and Session(model, text, drafter=described, share=middle, **common).drafter is described
+    with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+        Session(model, text, drafter=described, share=handed, **common)
+    # a session WITH a drafter as the loader and in the middle of a chain, another one behind it: the walk goes through both
+    first = Session(model, text, drafter=described, checkpoint=on_disk, **common)
+    last = Session(model, text, drafter=described, share=Session(model, text, drafter=described, share=first, **common), **common)
+    assert last._weights_owner() is first and first._weights_owner() is first and middle._weights_owner() is loads
     # a drafter of other widths: the first width that differs, by name, with both values
     for field, value, said in (
         ("hidden", 96, "its hidden is 96, the model's 64"),
         ("mlp", 128, "its mlp is 128, the model's 96"),
         ("vocab", 300, "its vocab is 300, the model's 272"),
     ):
-        other = QwenDense(dataclasses.replace(model.geometry, **{field: value}), reductions=("tiny geometry",))
+        other = QwenDense(replace(model.geometry, **{field: value}), reductions=("tiny geometry",))
         with pytest.raises(
             ValueError, match=f"^{re.escape('the drafter was described for a model of other widths than this session' + chr(39) + 's: ' + said)}$"
         ):
             Session(model, text, drafter=_seeded_drafter(other), **common)
-    deeper = QwenDense(dataclasses.replace(model.geometry, layer_kinds=("linear_attention",) * 3 + ("full_attention",)), reductions=("tiny geometry",))
+    deeper = QwenDense(replace(model.geometry, layer_kinds=("linear_attention",) * 3 + ("full_attention",)), reductions=("tiny geometry",))
     assert Session(deeper, text, drafter=seeded, **common).drafter is seeded, "the depth of a model is no width of its drafter: its one layer is its own"
     assert isinstance(model.geometry, Geometry) and "layer_kinds" in vars(model.geometry)
     # the refusals come before the two a session with a drafter had, in no plan: nothing was resolved for a refused session

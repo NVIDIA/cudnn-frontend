@@ -1466,21 +1466,23 @@ at `null`, which is the key left out), or refused, each by name (`serving_option
 | `parallel_drafting` | accepted at the value that changes nothing | `false`, `null` | the drafter's passes run one after the other, each on the proposal of the pass before |
 | `use_heterogeneous_vocab` | accepted at the value that changes nothing | `false`, `null` | the drafter proposes ids of the model's own vocabulary |
 | `model`, `quantization`, `revision`, `code_revision`, `draft_load_config`, `draft_lm_head_quantization` | refused at any value | `null` | the drafter is the checkpoint's own, loaded as its loader loads it |
+| `index_share_for_mtp_iteration` | refused at any value | `null` | it overrides a field of the drafter's own configuration: the drafter runs as its checkpoint describes it |
 | `max_model_len` | refused at any value | `null` | the drafter has no context length of its own: its cache has the positions of the model's (--max-model-len) |
-| `synthetic_acceptance_rates`, `synthetic_acceptance_length` | refused at any value | `null` | the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn or scheduled is not served |
+| `synthetic_acceptance_rates`, `synthetic_acceptance_length`, `fly_window_size`, `fly_entropy_threshold`, `fly_entropy_top_k` | refused at any value | `null` | the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn, scheduled or loosened is not served |
 | `num_speculative_tokens_per_batch_size` | refused at any value | `null` | one request: the number of drafted tokens is one number (num_speculative_tokens) |
 | `enforce_eager`, `tensor_parallel_size`, `draft_tensor_parallel_size` | refused at any value | `null` | one process on one GPU, launched from Python |
 | `moe_backend`, `attention_backend`, `kv_cache_dtype` | refused at any value | `null` | which kernel serves a block is a row of the table a run prints (--stack, --provider) |
-| `index_share_for_mtp_iteration`, `disable_eagle_block_drop`, `disable_lookahead_block_hashes`, `prompt_lookup_max`, `prompt_lookup_min`, `suffix_decoding_max_tree_depth`, `suffix_decoding_max_cached_requests`, `suffix_decoding_max_spec_factor`, `suffix_decoding_min_token_prob`, `dspark_draft_topk`, `xpress_topc`, `fly_window_size`, `fly_entropy_threshold`, `fly_entropy_top_k` | refused at any value | `null` | it is an option of another speculative method, or of a cache keyed by content, which a sample does not have |
+| `disable_eagle_block_drop`, `disable_lookahead_block_hashes`, `prompt_lookup_max`, `prompt_lookup_min`, `suffix_decoding_max_tree_depth`, `suffix_decoding_max_cached_requests`, `suffix_decoding_max_spec_factor`, `suffix_decoding_min_token_prob`, `dspark_draft_topk`, `xpress_topc` | refused at any value | `null` | it is an option of another speculative method, or of a cache keyed by content, which a sample does not have |
 
 A key no row holds is an `ERROR` that names it. The three keys that are read must be named: a serving engine's own
 defaults for them select another method or another launch set. The count of drafted tokens is any whole number from 1 to
-the parser; which counts a stack serves is its rows' answer, at the plan: a provider stack holds a verify step of two
-to eight tokens per sequence, so eight drafted tokens end in a `SKIP` with that row's sentence before anything is
-loaded, and the stack `reference` serves any count. The kernel census has a section for five drafted tokens alone, so
-another count runs, checks its kernels against the entries' own facts and prints `kernel identity: not stated for this
-run`. The key names and the values of this table were read in the public release 0.33.0 of a serving engine
-(2026-10-31). A run prints one line for the object, with the names of its keys and the values the table knows:
+the parser; which counts a stack serves is its rows' answer, at the plan: a provider stack holds a verify step of two to
+eight tokens per sequence, so eight drafted tokens end in a `SKIP` with that row's sentence before anything is loaded,
+and the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context
+length). The kernel census has a section for five drafted tokens alone, so another count runs, checks its kernels
+against the entries' own facts and prints `kernel identity: not stated for this run`. The key names and the values of
+this table were read in the public release 0.33.0 of a serving engine (2026-10-31). A run prints one line for the
+object, with the names of its keys and the values the table knows:
 
 ```text
 [02] --speculative-config: the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".
@@ -1488,11 +1490,12 @@ run`. The key names and the values of this table were read in the public release
 ```
 
 **What a run reports.** The report of `00_decode.py`, and in the place of its rate two acceptance lines: `kept tokens
-per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .. 6: ..` and `accepted per draft: 1:
-x of n, 2: y of x, ..` -- per drafted token the steps that kept it among those that kept the one before. Every step
-counts in full, the last one included, whose tokens behind an end token are not written. The acceptance length is a
-figure of this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another
-list. The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
+per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .. 6: ..` and `accepted per draft: 1: x
+of n, 2: y of x, ..` -- per drafted token the steps that kept it among those that kept the one before. Every step counts
+in full, the last one included, whose tokens behind an end token are not written. The acceptance length is a figure of
+this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list. Nor
+with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (the last run of this
+section has two). The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
 acceptance line)": a draft pass multiplies in fp64 on copies, and a rate of such a loop would be read as a speed. The
 `bytes per step` line is the verify step's arithmetic at six tokens per sequence and a draft pass's, five times. The
 `text out` line says how many tokens came out in how many steps. The report is printed before the checks.
@@ -1519,9 +1522,10 @@ drafter ran on reference blocks: none of its blocks was compared with a provider
 
 On a checkpoint `position`, `prompt`, `recorded`, `rejected rows`, `drafter cache`, `draft proposals`, replay, the
 blocks and the kernel check are gated as on the seeded model; `tokens` is reported, with the first kept token that
-differs; nothing is scheduled and no plain run is made for the ids. The comparison covers the first 16 steps behind
-the prompt, the block check the first 16 prompt steps and the first 8 steps, the traced pass 16 steps. The last line
-of a run is the verdict of `00_decode.py` with the tag `[02]` ([../README.md](../README.md) has the table).
+differs; nothing is scheduled and no plain run is made for the ids, so the tokens a checkpoint run writes are held by no
+line of that run: the loop that writes them is the one the default run proves. The comparison covers the first 16 steps
+behind the prompt, the block check the first 16 prompt steps and the first 8 steps, the traced pass 16 steps. The last
+line of a run is the verdict of `00_decode.py` with the tag `[02]` ([../README.md](../README.md) has the table).
 
 **What ran** (2026-11-19; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only). The
 default run -- the seeded two-layer model with its seeded drafter, a prompt of 26 tokens, then 32 new tokens in 10
@@ -1544,26 +1548,27 @@ tree as it is, which passed; each of the three ended in `[02] FAIL`. A drafted t
 chose another failed `ids` alone; one drafted token kept beyond the compared count failed `tokens`, `drafter cache`,
 `draft proposals`, `acceptance` and `ids`; one kept below it failed `acceptance` alone.
 
-**The last run with a checkpoint** (2026-11-19; the published checkpoint; cuDNN Frontend 1.34.0, CuTe DSL 4.8.0,
-PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; the third command of this section as
-it is written, and once more on the default stack `fe-cublas`: the default prompt as a chat request body with
-`max_tokens` 256, 58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with
-65,536 ids). Both runs ended in `[02] PASS`, and both stopped at the end token. On `native` the loop wrote 204 new
-tokens in 63 steps: 3.22 kept tokens a step (1 + 140 accepted drafted tokens / 63 steps); 14, 11, 11, 9, 10 and 8
-steps kept one to six tokens; the first drafted token was accepted in 49 of 63 steps, the second in 38 of those 49,
-the third in 27 of 38, the fourth in 18 of 27, the fifth in 8 of 18 -- the counts of the library loop in the section
-"The verify step", on the same prompt and list. On `fe-cublas` it wrote 249 new tokens in 74 steps: 3.38 kept tokens a
-step (1 + 176 / 74); 13, 14, 14, 10, 11 and 12 steps kept one to six tokens; 61 of 74, 47 of 61, 33 of 47, 23 of 33
-and 12 of 23. The stacks launch other kernels for the same blocks and a greedy run follows its first other token: an
-acceptance length is a figure of its stack as well as of its prompt and its list. In both runs `position`, `prompt`,
-`recorded`, `rejected rows`, `drafter cache` and `draft proposals` passed on the first 16 steps, and replay with the
-proposals and the blocks of both kinds of step passed; `tokens` was reported -- on `native` 38 of 46 kept tokens were
-the decode steps' on the same tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the first kept
-token 30. On `native` the kernel check passed over 16 traced steps, with 370 of 484 launches of the verify step target
-kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothing stated
-about the kernels of the passes. The memory sentence asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8
-GiB and the device grew by 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, where PyTorch reserved 58.5 GiB and the
-device grew by 58.7 GiB; the GPU was otherwise empty at the start of each.
+**The last run with a checkpoint** (2026-11-19; the published checkpoint; cuDNN Frontend 1.34.0, CuTe DSL 4.8.0, PyTorch
+2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; the third command of this section as it is
+written, and once more on the default stack `fe-cublas`: the default prompt as a chat request body with `max_tokens`
+256, 58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids).
+Both runs ended in `[02] PASS`, and both stopped at the end token. On `native` the loop wrote 204 new tokens in 63
+steps: 3.22 kept tokens a step (1 + 140 accepted drafted tokens / 63 steps); 14, 11, 11, 9, 10 and 8 steps kept one to
+six tokens; the first drafted token was accepted in 49 of 63 steps, the second in 38 of those 49, the third in 27 of 38,
+the fourth in 18 of 27, the fifth in 8 of 18 -- the counts of the library loop in the section "The verify step", on the
+same prompt and list. On `fe-cublas` it wrote 249 new tokens in 74 steps: 3.38 kept tokens a step (1 + 176 / 74; the
+last step kept six tokens and the end token was its fourth, so two accepted drafted tokens were not written); 13, 14,
+14, 10, 11 and 12 steps kept one to six tokens; 61 of 74, 47 of 61, 33 of 47, 23 of 33 and 12 of 23. The stacks launch
+other kernels for the same blocks and a greedy run follows its first other token: an acceptance length is a figure of
+its stack as well as of its prompt and its list. In both runs `position`, `prompt`, `recorded`, `rejected rows`,
+`drafter cache` and `draft proposals` passed on the first 16 steps, and replay with the proposals and the blocks of both
+kinds of step passed; `tokens` was reported -- on `native` 38 of 46 kept tokens were the decode steps' on the same
+tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the first kept token 30. On `native` the kernel
+check passed over 16 traced steps, with 370 of 484 launches of the verify step target kernels (49 the target's own
+compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothing stated about the kernels of the
+passes. The memory sentence asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by
+40.0 GiB, and for about 61.0 GiB on `fe-cublas`, where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the
+GPU was otherwise empty at the start of each.
 
 **What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference
 chain, and a run says "kernel identity of the drafter's passes: not stated". More than one request: `--sequences` is

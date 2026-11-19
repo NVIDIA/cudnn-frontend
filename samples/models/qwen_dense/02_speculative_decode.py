@@ -385,7 +385,7 @@ def main(argv=None) -> int:
         return 0
     device = torch.device("cuda", torch.cuda.current_device())
     real = args.model is not None
-    checkpoint, requests, described = None, [], 0.0
+    checkpoint, described = None, 0.0
     try:  # what a user can get wrong: one ERROR line, before the plan
         if args.sequences != 1:
             raise ValueError(f"--sequences {args.sequences}: {loop.ONE_SEQUENCE}")

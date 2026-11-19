@@ -110,7 +110,7 @@ error). `[NN]` is the script's tag: `[00]` for `00_decode.py`, `[02]` for `02_sp
 | last line | exit code | meaning |
 |---|---|---|
 | `[NN] PASS` | 0 | every check of the run held |
-| `[NN] SKIP <requirement>` | 0 | this GPU, library version or free-memory budget is not served; the sentence names the fix |
+| `[NN] SKIP <requirement>` | 0 | this GPU, library version or free-memory budget is not served; the sentence names the fix. `02_speculative_decode.py` also skips for a count of drafted tokens no row of the stack holds, and for a checkpoint without a drafter |
 | `[NN] RAN reference stack (no provider checked)` | 0 | `--stack reference`: every block ran on the reference, so no provider was verified. `00_decode.py` checks nothing there; `02_speculative_decode.py` compares its run with decode steps of the same tokens there too, and a line of that comparison that fails is `FAIL` |
 | `[NN] RAN (no provider block was judged)` | 0 | `--provider` flags put every judged block on its reference row: the run compared the reference with itself, and its blocks line is `REPORTED` |
 | `[NN] RAN <stack> stack (kernels not observed: <reason>)` | 0 | the kernels were to be checked (`--check-kernels`; always in the stacks `native` and `fe-entries`) and the profiler's launch records could not be had (no profiler library in the environment, another profiler attached, a trace that could not be exported or read, records without launch arguments): the other checks held, the kernel check observed nothing. Never printed as `PASS`; a check that failed is `FAIL` whatever was observed |

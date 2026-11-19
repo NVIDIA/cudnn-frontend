@@ -7456,7 +7456,7 @@ def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: stated))
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples, "Session", session)
-    monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=None: _tiny_model()))
+    monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=2, vocab=15520: _tiny_model()))
     monkeypatch.setattr(QwenDense, "_target", _census_of(_tiny_model()))
     paths = list(sys.path)
     spec = importlib.util.spec_from_file_location(

@@ -155,21 +155,22 @@ SPECULATIVE_NEUTRAL = {
     "use_heterogeneous_vocab": ((False,), "the drafter proposes ids of the model's own vocabulary"),
 }
 _OWN_DRAFTER = "the drafter is the checkpoint's own, loaded as its loader loads it"
-_ACCEPTANCE = "the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn or scheduled is not served"
+_ACCEPTANCE = "the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn, scheduled or loosened is not served"
 _ONE_PROCESS = "one process on one GPU, launched from Python"
 _ROWS = "which kernel serves a block is a row of the table a run prints (--stack, --provider)"
 _OTHER_METHOD = "it is an option of another speculative method, or of a cache keyed by content, which a sample does not have"
+_FLY = ("fly_window_size", "fly_entropy_threshold", "fly_entropy_top_k")  # of a rejection sample method that is not served
 #: every other key of a speculative configuration this module knows, each with the reason it is refused whatever its value
 SPECULATIVE_REFUSED = {
     **dict.fromkeys(("model", "quantization", "revision", "code_revision", "draft_load_config", "draft_lm_head_quantization"), _OWN_DRAFTER),
+    "index_share_for_mtp_iteration": "it overrides a field of the drafter's own configuration: the drafter runs as its checkpoint describes it",
     "max_model_len": "the drafter has no context length of its own: its cache has the positions of the model's (--max-model-len)",
-    **dict.fromkeys(("synthetic_acceptance_rates", "synthetic_acceptance_length"), _ACCEPTANCE),
+    **dict.fromkeys(("synthetic_acceptance_rates", "synthetic_acceptance_length", *_FLY), _ACCEPTANCE),
     "num_speculative_tokens_per_batch_size": "one request: the number of drafted tokens is one number (num_speculative_tokens)",
     **dict.fromkeys(("enforce_eager", "tensor_parallel_size", "draft_tensor_parallel_size"), _ONE_PROCESS),
     **dict.fromkeys(("moe_backend", "attention_backend", "kv_cache_dtype"), _ROWS),
     **dict.fromkeys(
         (
-            "index_share_for_mtp_iteration",
             "disable_eagle_block_drop",
             "disable_lookahead_block_hashes",
             "prompt_lookup_max",
@@ -180,9 +181,6 @@ SPECULATIVE_REFUSED = {
             "suffix_decoding_min_token_prob",
             "dspark_draft_topk",
             "xpress_topc",
-            "fly_window_size",
-            "fly_entropy_threshold",
-            "fly_entropy_top_k",
         ),
         _OTHER_METHOD,
     ),
@@ -425,6 +423,12 @@ def parse_speculative_config(text: str, shown: str) -> tuple:
         raise ValueError(f"{shown}: not JSON ({error})") from None
     if not isinstance(config, dict):
         raise ValueError(f"{shown}: {_show(config, 40)} is not a JSON object; a speculative configuration is one, with its keys")
+    for name in config:  # a key no table holds, whatever it holds: a name that is mistyped is not taken for a key left out
+        if name not in SPECULATIVE_READ and name not in SPECULATIVE_NEUTRAL and name not in SPECULATIVE_REFUSED:
+            raise ValueError(
+                f"{shown}: {_show(name, 64)} is not a key this sample holds: a key of a speculative configuration selects what is launched, "
+                "so none is ignored. Leave the key out"
+            )
     config = {name: value for name, value in config.items() if value is not None}  # null is the key left out
     read, neutral = [], []
     for name, (values, reason) in SPECULATIVE_READ.items():
@@ -447,13 +451,8 @@ def parse_speculative_config(text: str, shown: str) -> tuple:
                     f"Accepted: {accepted}, or the key left out"
                 )
             neutral.append(f"{name} {_show(value)}")
-        elif name in SPECULATIVE_REFUSED:  # what the key holds is somebody's own -- a model's path, a revision -- and is not printed back
+        else:  # a refused key: what it holds is somebody's own -- a model's path, a revision -- and is not printed back
             raise ValueError(f'{shown}: "{name}" is not served: {SPECULATIVE_REFUSED[name]}. Leave the key out')
-        else:
-            raise ValueError(
-                f"{shown}: {_show(name, 64)} is not a key this sample holds: a key of a speculative configuration selects what is launched, "
-                "so none is ignored. Leave the key out"
-            )
     line = f"{shown}: the speculative configuration of a serving engine. Read: " + ", ".join(read) + "."
     if neutral:
         line += " At the value that changes nothing: " + ", ".join(neutral) + "."

@@ -52,4 +52,4 @@ The stack of the first sample, `fe-cublas`, is a reference path: every quantised
 
 ## Tests
 
-The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and of the speculative script's own lines in the same modules; the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.
+The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and so are the speculative script's own lines, in the same modules; the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.

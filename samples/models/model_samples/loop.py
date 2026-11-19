@@ -206,7 +206,7 @@ class Session:
         if drafter is not None and sequences != 1:
             raise ValueError(f"{ONE_SEQUENCE}; got sequences={sequences}")
         if drafter is not None:  # ... and it drafts for the weights and the widths this session's steps run on: said here, before any plan
-            loaded = checkpoint if share is None else share.checkpoint  # of the session that loads: None draws seeded weights
+            loaded = checkpoint if share is None else share._weights_owner().checkpoint  # of the session that loads: None draws seeded weights
             if getattr(drafter, "keys", None) and (loaded is None or getattr(loaded, "synthetic_weights", False)):
                 raise ValueError(
                     "the drafter was described from a checkpoint and the weights of this session are seeded: hand the session that loads "

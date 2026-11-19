@@ -603,8 +603,8 @@ def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
     kernels are not checked on this stack unless asked: no kernel line, and no statement about the drafter's kernels."""
     out = _speculative_run(speculative, capsys, [])
     lines = out.splitlines()
-    assert "stack fe-cublas, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused [PDL False, PDL_RELEASE False, TOKENS 6]" in out
-    assert "cudnn.GdnDecodeFused [PDL False, PDL_RELEASE False]" in out, "the plain run and the prompt's decode steps on the fused decode entry"
+    assert "stack fe-cublas, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused " in out and "cudnn.GdnDecodeFused " in out
+    assert "[PDL " not in out, "an entry's form is printed with the kernel table, which this stack prints on request"
     assert "\n  kernels  " not in out and "kernel identity" not in out, "the default stack declares no target and its kernels are checked on request"
     stages = next(line for line in lines if line.startswith("[02] the session with the drafter: stage  "))
     forms = [part.strip() for part in stages.split("stage  ", 1)[1].split(" | ") if part.strip().startswith("compile and first launch linear_attention.step ")]
@@ -631,7 +631,7 @@ def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(cap
     out = _speculative_run(None, capsys, ["--stack", "fe-entries"], "fe-entries")
     lines = out.splitlines()
     assert "stack fe-entries, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS 6]" in out
-    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the prompt's decode steps on the fused decode entry in the target's form"
+    assert "cudnn.GdnDecodeFused " in out and "cudnn.GdnDecodeFused [" not in out, "the prompt's decode entry: a row of its plan; no form is printed for it"
     assert out.count("\nkernels, planned (decided before the load") == 1, "the kernel table of the verify plan"
     traced = [line for line in lines if line.startswith("traced pass (")]
     assert not traced or traced[0].endswith(" | behind the prompt's 26 decode steps, replayed untraced")
