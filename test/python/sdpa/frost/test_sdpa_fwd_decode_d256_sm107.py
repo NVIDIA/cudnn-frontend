@@ -199,8 +199,10 @@ def test_sm107_decode_body_matches_the_sm100_body():
     """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits, the SM100-only live-column specialization, and the
-    header prose. The optional cluster reducer and
+    keyword on the ring waits, the SM100-only live-column specialization, the SM100-only
+    hooks of its in-launch reduction (the fold's import, the ``reduce_follows`` flag with
+    the epilogue's per-thread load guard, the knob marker), and the header prose. The
+    optional cluster reducer and
     its host/compiler bindings are separate implementations, exercised by the cluster
     binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
@@ -254,10 +256,24 @@ def test_sm107_decode_body_matches_the_sm100_body():
                 '            nvvm.fence_proxy("async.shared", space="cta")',
             )
         ): "",
+        # The in-launch reduction of a split (CLUSTER_K_REDUCE) exists on the SM100 tile only. Each hook is
+        # pinned as exact text, so an edit to one fails here; the partial producer around them stays shared.
+        "from cudnn.sdpa.fwd.kernels.sm100.split_combine import G_LEAN_SMALL as _FOLD_MAX_SPLITS, lean_fold_quad, lean_fold_stats": "",
+        "    reduce_follows: cutlass.Constexpr[bool] = False,": "",
+        "\n".join(
+            (
+                "                o_loaded = n_tiles > cutlass.Int32(0)",
+                "                if cutlass.const_expr(reduce_follows):",
+                "                    o_loaded = o_loaded & (d_idx < cutlass.Int32(D_V))",
+                "                if o_loaded:",
+            )
+        ): "                if n_tiles > cutlass.Int32(0):",
+        "            reduce_follows=final_o_tensor is not None,": "",
+        "CLUSTER_COMBINE_BY_KNOB = True": "",
     }
     a_src = "\n".join(a)
     for specialized, shared in sm100_only.items():
-        assert a_src.count(specialized) == 1, f"the declared SM100-only live-column delta changed:\n{specialized}"
+        assert a_src.count(specialized) == 1, f"a declared SM100-only delta changed:\n{specialized}"
         a_src = a_src.replace(specialized, shared)
     a = [ln for ln in a_src.splitlines() if ln.strip()]
     b = [ln for ln in b if ln.strip() not in ("desc_version=DESC_VERSION,",)]
