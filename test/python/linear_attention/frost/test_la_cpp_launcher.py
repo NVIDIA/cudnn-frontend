@@ -201,25 +201,34 @@ BODIES = {
     "gdp": (gdp.run_gdp_fwd, gdp.run_gdp_bwd, gdp.run_gdp_summary, gdp.run_gdp_summary_bwd),
     "mamba2": (run_mamba2_fwd, run_mamba2_bwd, run_mamba2_summary, run_mamba2_summary_bwd),
 }
-# name: make_case's layout, one long sequence and a packed batch of short ones
-LAYOUTS = {"one_sequence": dict(T=2048, H=32), "packed": dict(seq_lens=[272] * 17, H=8)}
+# name: make_case's layout of the recorded calls and of the replay with other values, which has the same tokens and sequences
+LAYOUTS = {
+    "one_sequence": (dict(T=2048, H=32), dict(T=2048, H=32)),
+    "packed": (dict(seq_lens=[272] * 17, H=8), dict(seq_lens=[80 + 24 * i for i in range(17)], H=8)),
+}
 
 
 def tensors(result):
     return [t for t in result if t is not None]
 
 
+def python_ran(*args):
+    raise AssertionError("the op's Python launched a kernel where its recording was to run")
+
+
 def assert_replays(monkeypatch, bodies, draw):
-    """``draw(seed)`` is a call on one draw of values: its third run is a replay and equals its first, and the replay of
-    another draw at the same shapes equals that draw's Python."""
+    """``draw(seed, layout)`` is a call on one draw of values: its third run is a replay and equals its first, and the
+    replay of another draw at the same shapes, with other sequence boundaries, equals that draw's Python."""
     for body in bodies:
         body.recordings.clear()
-    call = draw(SEED)
+    call = draw(SEED, 0)
     first = call()  # runs the API
     call()  # records it
-    assert_bitwise(tensors(call()), tensors(first))
-    other = draw(SEED + 100)
-    replayed = other()
+    other = draw(SEED + 100, 1)
+    with monkeypatch.context() as recordings_only:
+        recordings_only.setattr(cpp_launcher, "launch", python_ran)
+        assert_bitwise(tensors(call()), tensors(first))
+        replayed = other()
     for body in bodies:
         assert set(recorded_kinds(body)) == {"_Recording"}
         body.recordings.clear()
@@ -237,8 +246,8 @@ def cotangent(case, seed):
 def test_training_step_is_replayed(monkeypatch, variant, layout):
     """GDN-2, GDP and Mamba-2: the public op's forward and its autograd backward."""
 
-    def draw(seed):
-        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout])
+    def draw(seed, which):
+        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout][which])
         args = op_args(case)
         count = len(LEAF_NAMES[variant])
         leaves = [t.detach().requires_grad_(True) for t in args[:count]]
@@ -260,8 +269,8 @@ def test_training_step_is_replayed(monkeypatch, variant, layout):
 def test_summaries_are_replayed(monkeypatch, variant, layout):
     """Every family's summary and summary backward."""
 
-    def draw(seed):
-        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout])
+    def draw(seed, which):
+        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout][which])
         d_o = cotangent(case, seed)
         if variant == "mamba2":
             return lambda: (*mamba2_summary(case), *mamba2_summary_bwd(case, d_o))
