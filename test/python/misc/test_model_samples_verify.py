@@ -3138,6 +3138,102 @@ def test_a_session_with_a_drafter_stands_alone_on_its_own_seed_and_keeps_the_ove
     assert out == stream[: len(out)] and session.record.forced == 0 and session.record.count >= 2
 
 
+def _not_drawn_from(session, seed):
+    """The tensors of the session's loaded drafter that are NOT the ones its drafter's own load draws from ``seed``, by
+    name: the listed head rows with their block scales and ids, the five 8-bit weights with their scales, the norms."""
+    from model_samples import Checkpoint
+    from model_samples.qwen_dense.drafter import MULTIPLIES, NORMS
+
+    def tensors(weights):
+        held = {"head": weights.head.codes, "head scales": weights.head.block_scales, "head ids": weights.head_ids}
+        for name, _ in MULTIPLIES:
+            held[name], held[f"{name} scales"] = getattr(weights, name).codes, getattr(weights, name).scale
+        return {**held, **{name: getattr(weights, name) for name, _ in NORMS}}
+
+    drawn = tensors(session.drafter.load(Checkpoint.synthetic(session.drafter, seed), "cpu"))
+    return [name for name, tensor in tensors(session.draft_weights).items() if not torch.equal(tensor, drawn[name])]
+
+
+def _behind(links, seed, handed=False, drafted=3, new=12):
+    """A plain session that loads the tiny model -- built with ``seed=`` (0: with none), or ``handed`` the seeded
+    checkpoint of that seed and no seed -- and a session with the seeded drafter ``links`` shares behind it: every
+    session on the weights of the one before it (``share=``) and built with ``seed=7``, the last one handed seed 7's
+    checkpoint as well: arguments of a session that shares, which no load reads.  ``links=0``: the session with the
+    drafter stands alone, built like the plain one, on a load of its own.  All loaded, the plain run and the loop on
+    the drafter's own proposals made: ``(the sessions in order, the plain run's tokens, the loop's)``."""
+    from model_samples import Checkpoint, Session, TextIO
+
+    model = _tiny_model()
+    text, common = TextIO.synthetic(model.geometry.vocab), dict(stack="reference", device="cpu", capacity=5 + new + drafted)
+
+    def loader():
+        return {"checkpoint": Checkpoint.synthetic(model, seed)} if handed else {"seed": seed} if seed else {}
+
+    chain = [Session(model, text, **common, **loader())]
+    for _ in range(links - 1):
+        chain.append(Session(model, text, share=chain[-1], seed=7, **common))
+    how = dict(share=chain[-1], seed=7, checkpoint=Checkpoint.synthetic(model, 7)) if links else loader()
+    chain.append(Session(model, text, draft_tokens=drafted, drafter=_seeded_drafter(model), **common, **how))
+    for each in chain:
+        each.load()
+    prompts = [torch.randint(0, model.geometry.vocab, (5,), generator=torch.Generator().manual_seed(1))]
+    ids = chain[0].prefill(prompts)
+    stream = chain[0].read(ids)
+    for _ in range(new + drafted - 1):
+        ids = chain[0].step(ids)
+        stream += chain[0].read(ids)
+    out, _, _ = _engine_loop(chain[-1], prompts, None, new, scheduled=False)
+    return chain, stream, out
+
+
+@pytest.mark.parametrize("seed, handed", [(0, False), (3, False), (11, True)])
+@pytest.mark.parametrize("links", [2, 3])
+def test_a_drafter_behind_a_chain_of_shares_is_loaded_from_the_session_that_loaded_the_weights(links, seed, handed):
+    """``share=`` may name a session that shares in turn: the weights are then those of the session at the end of the
+    chain, the one that loaded them, and no session in between holds a checkpoint.  A session with a drafter two or
+    three links behind the loader gets its drafter from the LOADER's checkpoint: for a loader on its default seed, on
+    a seed of its own and on a seeded checkpoint it was handed, every tensor of the drafter is the one drawn from the
+    loader's seed, whatever the sessions behind it were built with, and the loop emits the loader's tokens."""
+    chain, stream, out = _behind(links, seed, handed)
+    plain, session = chain[0], chain[-1]
+    assert [each._weights_owner() for each in chain] == [plain] * len(chain) and [each.checkpoint for each in chain[1:-1]] == [None] * (links - 1)
+    assert (plain.checkpoint.seed, session.checkpoint.seed) == (seed, 7) and all(each.weights is plain.weights for each in chain)
+    assert session.draft_weights.embedding is plain.weights.embedding and _not_drawn_from(session, seed) == [], "the loader's seed, through every link"
+    assert len(_not_drawn_from(session, 7)) == 19, "not what a session behind the loader was built with: of seed 7's draw only the listed ids are the same"
+    assert out == stream[: len(out)] and session.record.count >= 2, "speculative steps behind the chain: the loader's tokens"
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    assert "the load now follows `share=` to its end (`Session._weights_owner`) and draws a seeded drafter from the seed its checkpoint records." in guide
+
+
+@pytest.mark.parametrize("links", [0, 1])
+def test_the_seeded_drafter_is_drawn_from_the_seed_of_the_checkpoint_the_model_was_loaded_from(links):
+    """A session that is handed a seeded checkpoint and no seed -- ``Session(checkpoint=Checkpoint.synthetic(model, 11),
+    drafter=...)`` -- loads the model at seed 11, and its drafter is drawn from the seed of that checkpoint, not from
+    the session's own (0): the rows it proposes from are rows of the head its model loaded.  Alone, and one share
+    behind a plain session that was handed the checkpoint (then neither from that session's seed nor from its own)."""
+    chain, stream, out = _behind(links, 11, handed=True)
+    session, checkpoint = chain[-1], chain[0].checkpoint
+    assert (session.seed, checkpoint.seed) == (7 if links else 0, 11)
+    table, head = checkpoint.load("embed_tokens.weight", "cpu"), checkpoint.load("lm_head.weight", "cpu")
+    index, drawn = session.draft_weights.head_ids.long(), session.draft_weights.head
+    assert torch.equal(session.weights.embedding, table), "the model is seed 11's"
+    assert torch.equal(drawn.codes, head.codes[index]) and torch.equal(drawn.block_scales, head.block_scales[index]) and drawn.scale == head.scale
+    assert _not_drawn_from(session, 11) == [] and len(_not_drawn_from(session, session.seed)) == 19, "the checkpoint's seed, not the session's"
+    assert out == stream[: len(out)] and session.record.count >= 2
+
+
+@pytest.mark.parametrize("seed", [0, 3])
+@pytest.mark.parametrize("links", [0, 1])
+def test_a_drafter_on_its_sessions_seed_or_one_share_behind_it_is_drawn_as_it_was(links, seed):
+    """What the two tests above leave where it was: ``Session(seed=S, drafter=...)`` alone, and a session with the
+    drafter directly on the weights of a session built with ``seed=S`` (0: the default, no argument).  Either way the
+    seed is that of the checkpoint the loading session made for itself, and the drafter's tensors are that seed's."""
+    chain, stream, out = _behind(links, seed)
+    session = chain[-1]
+    assert chain[0].checkpoint.seed == chain[0].seed == seed and _not_drawn_from(session, seed) == []
+    assert len(_not_drawn_from(session, seed + 1)) == 19 and out == stream[: len(out)] and session.record.count >= 2
+
+
 def test_the_report_of_a_speculative_session():
     """The report of a session with a drafter: the first-token line names the drafter's passes over the prompt; the
     acceptance lines are the measured ones for a run on the drafter's own proposals and say "scheduled, not measured" for
