@@ -387,7 +387,9 @@ class RowQuantizeFp4Decode:
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan time: the typed declines of the device, the part and the DSL, then ONE trace-compile of the entry's form (a no-op
         once compiled).  With ``rows`` it also allocates the entry-owned outputs of that row count -- call it for every row count
-        before a stream capture.  Needs no operand."""
+        before a stream capture.  Needs no operand: the compile binds the entry-owned outputs of ``rows``, and of ONE row when no
+        row count is given -- so the first ``compile()`` allocates that one-row pair (2,560 code bytes and one 128-row scale
+        band) even for a caller that passes its own outputs on every call."""
         if rows is not None:
             validate_rows(rows)
         if self.key() not in self.compiled:

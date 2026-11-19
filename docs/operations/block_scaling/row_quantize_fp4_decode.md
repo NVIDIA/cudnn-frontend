@@ -108,7 +108,9 @@ next multiple of 128 are padding.
 
 **Output ownership is per output.** An output the caller passes is the caller's and is returned as given; rows past the
 call's are never written. An output the caller does not pass is the entry's: one pair per row count, `scales` zero-filled,
-allocated by `compile(rows)` / `outputs(rows)` or at the first call of that row count. Call `compile(rows)` for every row
+allocated by `compile(rows)` / `outputs(rows)` or at the first call of that row count. `compile()` without a row count
+allocates the pair of ONE row (2,560 code bytes and one 128-row scale band): the compile binds it, also for a caller that
+passes its own outputs on every call. Call `compile(rows)` for every row
 count before a CUDA-graph capture. Entry-owned outputs are valid until the entry's next call at that row count from ANY host
 thread: stream order does not serialize host calls, so two host threads that share one entry pass their own outputs or build
 one entry each. The per-row-count pairs are never freed, so a caller that sweeps many row counts passes its own outputs. An
