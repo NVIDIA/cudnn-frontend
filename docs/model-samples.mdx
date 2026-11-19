@@ -10,6 +10,7 @@ Model samples run one open-weight model family end to end in a single process: t
 | Family | Sample | What it runs |
 |---|---|---|
 | [Dense Qwen 3.5 architecture](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/models/qwen_dense) | `00_decode.py` | Plain greedy decode. By default: the model at its published layer widths with two layers and seeded weights, token ids in and out, self-checking. With `--model`: text in and text out on a checkpoint from local disk, with the checkpoint's own tokenizer and chat template. The linear-attention step runs on [`cudnn.GdnDecodeFused`](/operations/LinearAttention/gdn_decode_flashinfer_backend). |
+| | `02_speculative_decode.py` | Speculative decoding with the checkpoint's drafter, for one request. The prompt goes through decode steps; then every step is the drafter's passes, one verify step of the drafted tokens and one host read. By default: the seeded model with a seeded drafter and scheduled drafts, self-checking against decode steps of the same tokens. With `--model`, `--draft-vocab` and `--speculative-config`: text out, and the tokens a step kept. Every block of the drafter is a reference chain; the sample states no speed. |
 
 ## Run
 
@@ -23,7 +24,7 @@ pip install -e .                         # a minute or two; deprecation warnings
 python samples/models/qwen_dense/00_decode.py
 ```
 
-The default run needs no checkpoint and no extra package. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. The fused linear-attention step serves compute capability 10.x and 12.x.
+The default run needs no checkpoint and no extra package. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. So does `python samples/models/qwen_dense/02_speculative_decode.py`, with the tag `[02]`. The fused linear-attention step serves compute capability 10.x and 12.x.
 
 To run a checkpoint from local disk, install the sample-only packages, fetch the checkpoint and pass its directory. The sample downloads nothing: fetching a checkpoint is your own step, and its weights carry their own licence. The checkpoint the sample was last run with is `nvidia/Qwen3.8-27B-NVFP4` on the Hugging Face hub, a checkpoint of this architecture: 22 GB of disk, and on the stack `fe-cublas` a GPU of compute capability 10.x or 12.x with about 57 GiB of free memory. The run below takes about two and a half minutes.
 
@@ -51,4 +52,4 @@ The stack of the first sample, `fe-cublas`, is a reference path: every quantised
 
 ## Tests
 
-The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.
+The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and so are the speculative script's own lines, in the same modules; the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.

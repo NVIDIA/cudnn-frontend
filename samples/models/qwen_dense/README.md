@@ -10,6 +10,7 @@ global scale). Area rules, the helper layer and the words a run uses: [../README
 | script | what it runs | status |
 |---|---|---|
 | `00_decode.py` | plain greedy decode in one process: on the reduced seeded model, token ids in and out, self-checking; with `--model`, text in and text out on a checkpoint from local disk, from a prompt, chat messages or the request body a chat client sends, with the generated text on standard output | this page |
+| `02_speculative_decode.py` | speculative decoding with the checkpoint's drafter, one request in one process: the prompt through decode steps, then per step the drafter's passes on reference blocks, one verify step and one host read; on the reduced seeded model self-checking against decode steps of the same tokens, with `--model` text out and the tokens a step kept | the section "Speculative decoding" |
 
 ```bash
 python samples/models/qwen_dense/00_decode.py                          # 2 layers, 1 and 4 sequences, 32 tokens each
@@ -105,6 +106,8 @@ inputs of a request are the same, and the sample takes them as they are.
 | `"stream": true` | the text of sequence 0 goes to standard output as it is generated; `--no-stream` writes it once; `--text-out FILE` writes it to a file | every other line of the run goes to standard error |
 | concurrent requests | `--sequences N` | a fixed set of sequences that start together, each with the same prompt; nothing is admitted while a step runs |
 | which kernels serve the model | `--stack`, and `--provider BLOCK=KEY` for one block | a kernel choice is a row of the table a run prints before it loads anything |
+| a speculative configuration: the JSON object that asks an engine to draft tokens | `02_speculative_decode.py --speculative-config JSON` | every key of it is answered: read, accepted at the value that changes nothing, or refused by name (the section "Speculative decoding"). `00_decode.py` refuses the flag with the name of that script |
+| a draft vocabulary for the checkpoint's drafter | `02_speculative_decode.py --draft-vocab FILE` | a JSON list of token ids; the section "The checkpoint's drafter" has a recipe |
 | a host, a port, an API key, a served model name, several GPUs, a memory budget | not here | one process on one GPU; the plan prints the memory a run needs before it loads anything |
 
 A request body, with a system turn, the reasoning switched off and what a client adds on its own:
@@ -623,9 +626,10 @@ instead of producing them one by one. `nvidia/Qwen3.8-27B-NVFP4` carries one.
 
 **What is here today is its loader and its draft pass on reference blocks, both reached from the library**
 (`QwenDenseDrafter`, `model_samples/qwen_dense/drafter.py`). A session that is handed the drafter runs its passes
-in front of every verify step (`Session.speculate`, in the section "The verify step"). No script of this folder
-drafts yet, and `00_decode.py` neither reads the drafter nor has a flag for it. The loader is called from Python, from
-the root of this checkout:
+in front of every verify step (`Session.speculate`, in the section "The verify step"), and `02_speculative_decode.py`
+is the script that drafts with it (the section "Speculative decoding"). `00_decode.py` neither reads the drafter nor
+drafts: it declares `--speculative-config` and `--draft-vocab` to refuse them with the name of that script. The loader
+is called from Python, from the root of this checkout:
 
 ```python
 import sys
@@ -716,7 +720,8 @@ list, and that sentence points to this section.
 **A recipe for the list.** Any ids of the model can be listed. One way to choose them needs nothing but this sample:
 let the model answer prompts of the kind you will give it, write the ids of every run with `--dump-tokens`, and list
 what the model read and wrote in those runs, then the lowest ids that are not among them until the list is as long as
-you want it.
+you want it. The files of both scripts of this folder are read alike: `02_speculative_decode.py` writes the same
+`prompt_ids` and `ids`, and the kept count of every step beside them.
 
 ```bash
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --dump-tokens ids_1.json
@@ -925,7 +930,7 @@ not.
 **What is not here.** The drafter has a draft pass on reference blocks, reached from the library
 (`QwenDenseDrafter.body`, `propose`, `draft`): every block of it is a reference chain in every stack, and its embedding
 lookup is PyTorch's gather. A session that is handed the drafter runs its passes (`Session.speculate`, in the next
-section); no script takes the list yet: the loader takes it as `draft_vocab=`. No kernel serves a block of the
+section); `02_speculative_decode.py` takes the list as `--draft-vocab FILE`, the loader as `draft_vocab=`. No kernel serves a block of the
 drafter and none has read these 8-bit weights: the kernel census holds the model's steps and no draft pass, so
 nothing here says which kernels a pass has in the target kernel set.
 The loader and the pass have run on the CPU and on one GPU class, compute capability 10.0; a class they have not
@@ -938,9 +943,9 @@ Speculative decoding drafts a few tokens ahead and lets the model check them in 
 token it kept last and the tokens drafted behind it -- `T` tokens per sequence at once -- and the step returns, for
 each of them, the greedy token that follows it. A run keeps the drafted tokens up to the first one the model would
 not have chosen, and goes on from there. This section is that step, the model's side of speculative decoding, and
-the step a session makes of it and the drafter's passes (**The speculative step**, below). No script runs either
-yet: both are reached from the helper layer, and for a verify step alone the caller names the tokens it is fed and
-how many of them are kept.
+the step a session makes of it and the drafter's passes (**The speculative step**, below). `02_speculative_decode.py`
+runs the second (the section "Speculative decoding"); both are reached from the helper layer as well, and for a
+verify step alone the caller names the tokens it is fed and how many of them are kept.
 
 ```python
 decode = Session(model, text, sequences=1, stack="native")                          # one token per sequence: the decode step
@@ -1187,7 +1192,8 @@ results). The sentence asked for about 40.0 GiB, PyTorch reserved 38.9 GiB and t
 39.0 GiB, the GPU otherwise empty.
 
 **The speculative step.** `Session.speculate` runs one step of speculative decoding: the drafter's passes on
-reference blocks, one verify step, one host read. It is reached from the library; no script drafts yet. The drafter's
+reference blocks, one verify step, one host read. It is the step of `02_speculative_decode.py`, and is reached from
+the library too. The drafter's
 cache is filled by one pass of the drafter per prompt position, at one row. The census records a step, not a prompt:
 these passes are in no section.
 
@@ -1212,8 +1218,10 @@ These lines share one load between the two sessions: the plain session reads the
 the checks hold the loop against (`tie_out.speculative_checks`); the session with the drafter runs on them
 (`share=plain`) and keeps the drafter's weights and its cache. `checkpoint`, `model` and `drafter` are those of the
 loader's call in the section "The checkpoint's drafter". The session that loads is handed the checkpoint
-(`checkpoint=`): a session that is handed none draws seeded weights, and its drafter's with them -- `checkpoint` is
-`None` for the seeded pair (`QwenDenseDrafter.seeded(model)`). `text` is the tokenizer (`TextIO`), `stack` and
+(`checkpoint=`): a session that is handed none draws seeded weights, and the drafter of a checkpoint is refused
+there, by name, where the session is built -- `checkpoint` is `None` for the seeded pair
+(`QwenDenseDrafter.seeded(model)`). A drafter of another model's widths is refused there as well, by the first
+width that differs. `text` is the tokenizer (`TextIO`), `stack` and
 `device` a session's, `sys` the standard module, `prompt` the ids of one prompt, `limit` the new tokens asked for,
 `positions` at least the prompt, the new tokens and four more: the last window reaches that far. The first
 `plan_table` resolves every plan of the run and prints the plain session's table and one memory sentence for the
@@ -1350,7 +1358,7 @@ than two and more, so the last bits of its output may differ by design (`docs/op
 only"). The rows therefore gate no batch invariance on this block; a run with more than one sequence prints whether
 the bytes were equal and, beside it, this statement.
 
-**What is not here.** A script that drafts: the speculative step is reached from the library. Kernels for the
+**What is not here.** Kernels for the
 drafter: every block of its passes but the embedding lookup is a reference chain, so no rate is printed for such a
 run and the kernel census holds no draft pass. A drafter at more than one sequence. Without a drafter nothing decides how many tokens to keep:
 the caller says it. One count
@@ -1371,6 +1379,202 @@ out-projection, the attention blocks and the MLP's down multiply on their target
 sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
 has run on compute capability 10.0 only; every other class is uncovered, not passing -- the rows of the
 out-projection on compute capability 10.3 and 10.7 among them.
+
+## Speculative decoding
+
+`02_speculative_decode.py` runs speculative decoding with the checkpoint's drafter in one process, for one request. The
+prompt goes through decode steps; then every step is the drafter's passes -- five by default -- ONE verify step of the
+drafted tokens behind the token the run kept last, one host read, and the acceptance on the host: the loop keeps a
+drafted token while it equals the greedy token of the row in front of it. The drafter is the one of the section "The
+checkpoint's drafter", every block of it a reference chain in every stack but its embedding lookup; the step is
+`Session.speculate` of the section "The verify step". The loop itself is in the script.
+
+```bash
+python samples/models/qwen_dense/02_speculative_decode.py                  # 2 layers, seeded weights, a seeded drafter: self-checking
+python samples/models/qwen_dense/02_speculative_decode.py --stack native   # the verify step and the prompt's decode steps on the target kernel set
+
+# with a checkpoint: the packages and the download of the first command block of this page, and a draft vocabulary
+python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}' \
+    --draft-vocab draft_vocab.json --messages request.json --max-tokens 256 > answer.txt
+```
+
+| you need | |
+|---|---|
+| for the default run | this checkout and a GPU of compute capability 10.x or 12.x: no checkpoint, no extra package |
+| with `--model` | the packages of `samples/models/requirements.txt`, the checkpoint on local disk (22 GB), and a draft vocabulary: a JSON list of token ids, `--draft-vocab FILE`. The recipe of the section "The checkpoint's drafter" makes one from the files `--dump-tokens` writes, of this script or of `00_decode.py`. Without a list the run ends in one `ERROR` line that names that recipe |
+| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stacks `native` and `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes, about 64 GiB elsewhere. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
+
+**What a run is.** A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then
+every step is five draft passes and one verify step of six tokens, and keeps one to six of them. A run says so before it
+loads anything, as a rule and counts, never as a time:
+
+```text
+[02] prompt of 58 tokens = 58 decode steps and 57 passes of the drafter before the first token; then every step is 5 draft passes and one verify step of 6 tokens, and keeps 1 to 6 of them
+```
+
+Every token of a speculative run after the first is a greedy token of a verify step; the first is the greedy token of
+the prompt's last decode step. The drafter decides how many tokens a step keeps, never which. In the stacks `native` and
+`fe-entries` on compute capability 10.0 a verify step and a decode step launch different kernels for two blocks (the
+sections `plain` and `verify` of the kernel census: the linear-attention step, and the out-projection of the
+linear-attention layers up to 16 rows of a step); in `fe-cublas` for one, the linear-attention step. The speculative run
+is compared with decode steps of the same tokens at the steps the family's declared band decides. On a checkpoint, which
+declares no band, the comparison is reported: there a verify step and a decode step of the same tokens do not choose the
+same greedy token everywhere (this page has the run), so the text of a speculative run and the text of the plain script
+part early; each is the greedy text of its own kind of step.
+
+The generated text goes to standard output piece by piece: the tokens a step kept are written between its host read and
+the next launch. Tokens of a step behind an end token or the limit of new tokens are not written. Every other line of
+a run goes to standard error, as for `00_decode.py`.
+
+**The default run** needs no checkpoint: the reduced seeded model with its seeded drafter (`QwenDenseDrafter.seeded`,
+a draft vocabulary of a quarter of the ids drawn from the seed). Seeded weights draft nothing a model accepts, so the
+run prints one more reduction -- "acceptance is scheduled, not measured: the drafted tokens of every step are replaced
+by the plain run's tokens for 0, 1, .., 5 positions in turn and by another token behind them" -- and schedules: a plain
+session of the same process decodes the token stream first, and every step verifies drafted tokens that are cut from
+it (`speculate(force=)`, `tie_out.forced_drafts`). The drafter still runs every pass and its own proposals are
+recorded; the count a step keeps is still the comparison's. With the default 32 new tokens that is 10 steps that keep
+0, 1, 2, 3, 4, 5, 0, 1, 2, 3 drafted tokens. The acceptance line of such a run reads `scheduled, not measured
+(reduction)`. A run of fewer new tokens than the schedule needs to keep every count once (17 at five drafted tokens)
+is an `ERROR` before the plan; left to its default, the count follows the schedule.
+
+| flag | default | meaning |
+|---|---|---|
+| `--speculative-config JSON` | `{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}` | the speculative configuration of a serving engine, as the text of its JSON object; every key is answered (the table below), and a run prints one line for it |
+| `--draft-vocab FILE` | -- | with `--model`, required: the JSON list of token ids the drafter proposes from. Without `--model` the flag is an error: the seeded run draws its list from the seed |
+| `--sequences 1` | `1` | accepted at 1 only: this script serves one request. Another count is one `ERROR` line before the plan: "a session with a drafter serves one sequence: one request, as the drafter rows are for" |
+| `--force-tokens N` | `32` without `--model`, or what the schedule needs if that is more; off with it | produce exactly N new tokens, ignoring the end token |
+| `--stack`, `--provider BLOCK=KEY`, `--check-kernels` | as in `00_decode.py` | the stack and the rows of the MODEL's blocks, in both kinds of its steps: a row selected with `--provider` must serve the verify step and the decode step, or the plan declines by that row's sentence. A block of the drafter has one row; naming one in `--provider` is a usage error |
+| `--dump-tokens FILE` | -- | the file of `00_decode.py` with `"sample": "qwen_dense/02_speculative_decode"`, the drafted tokens of a step (`draft_tokens`) and, per prompt, `kept`: the drafted tokens every step kept |
+| `--model`, `--prompt`, `--messages`, `--max-tokens`, `--max-model-len`, `--temperature`, `--text-out`, `--no-stream`, `--layers`, `--reference-precision` | as in `00_decode.py` | the flag table at the top of this page; a request body is answered field by field ("Coming from a serving engine") |
+| `--dump-census FILE` | -- | not in this script: a usage error. The launch records of a draft pass have no kernel census to be held against yet; `00_decode.py` writes those of a decode step |
+
+**The speculative configuration of a serving engine.** `--speculative-config` takes the JSON object that asks a
+serving engine to draft, as it is written there. A key of this object selects what is launched, so -- unlike a field of
+a request body -- nothing of it is printed and ignored: a key is read, accepted at the value that changes nothing (and
+at `null`, which is the key left out), or refused, each by name (`serving_options.py` holds the three tables as data):
+
+| key | answer | accepted | another value is refused because |
+|---|---|---|---|
+| `method` | read; must be named | `"mtp"` | the drafter is the checkpoint's own, the method mtp; no other method is served |
+| `num_speculative_tokens` | read; must be named | a whole number from 1 | it is the number of tokens a step drafts: a whole number from 1 |
+| `use_local_argmax_reduction` | read; must be named | `true` | the draft token is the largest of the listed rows of the head; without it an engine launches another set |
+| `rejection_sample_method` | accepted at the value that changes nothing | `"standard"`, `null` | a drafted token is kept while it equals the greedy token in front of it: nothing is drawn |
+| `draft_sample_method` | accepted at the value that changes nothing | `"greedy"`, `null` | the drafter proposes the token of its largest logit |
+| `enable_adaptive_verification` | accepted at the value that changes nothing | `false`, `null` | every step verifies every token it drafted |
+| `disable_padded_drafter_batch` | accepted at the value that changes nothing | `false`, `null` | one request: there is no batch of drafts to pad |
+| `parallel_drafting` | accepted at the value that changes nothing | `false`, `null` | the drafter's passes run one after the other, each on the proposal of the pass before |
+| `use_heterogeneous_vocab` | accepted at the value that changes nothing | `false`, `null` | the drafter proposes ids of the model's own vocabulary |
+| `model`, `quantization`, `revision`, `code_revision`, `draft_load_config`, `draft_lm_head_quantization` | refused at any value | `null` | the drafter is the checkpoint's own, loaded as its loader loads it |
+| `index_share_for_mtp_iteration` | refused at any value | `null` | it overrides a field of the drafter's own configuration: the drafter runs as its checkpoint describes it |
+| `max_model_len` | refused at any value | `null` | the drafter has no context length of its own: its cache has the positions of the model's (--max-model-len) |
+| `synthetic_acceptance_rates`, `synthetic_acceptance_length`, `fly_window_size`, `fly_entropy_threshold`, `fly_entropy_top_k` | refused at any value | `null` | the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn, scheduled or loosened is not served |
+| `num_speculative_tokens_per_batch_size` | refused at any value | `null` | one request: the number of drafted tokens is one number (num_speculative_tokens) |
+| `enforce_eager`, `tensor_parallel_size`, `draft_tensor_parallel_size` | refused at any value | `null` | one process on one GPU, launched from Python |
+| `moe_backend`, `attention_backend`, `kv_cache_dtype` | refused at any value | `null` | which kernel serves a block is a row of the table a run prints (--stack, --provider) |
+| `disable_eagle_block_drop`, `disable_lookahead_block_hashes`, `prompt_lookup_max`, `prompt_lookup_min`, `suffix_decoding_max_tree_depth`, `suffix_decoding_max_cached_requests`, `suffix_decoding_max_spec_factor`, `suffix_decoding_min_token_prob`, `dspark_draft_topk`, `xpress_topc` | refused at any value | `null` | it is an option of another speculative method, or of a cache keyed by content, which a sample does not have |
+
+A key no row holds is an `ERROR` that names it. The three keys that are read must be named: a serving engine's own
+defaults for them select another method or another launch set. The count of drafted tokens is any whole number from 1 to
+the parser; which counts a stack serves is its rows' answer, at the plan: a provider stack holds a verify step of two to
+eight tokens per sequence, so eight drafted tokens end in a `SKIP` with that row's sentence before anything is loaded,
+and the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context
+length). The kernel census has a section for five drafted tokens alone, so another count runs, checks its kernels
+against the entries' own facts and prints `kernel identity: not stated for this run`. The key names and the values of
+this table were read in the public release 0.33.0 of a serving engine (2026-10-31). A run prints one line for the
+object, with the names of its keys and the values the table knows:
+
+```text
+[02] --speculative-config: the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".
+[02] ERROR --speculative-config: "use_local_argmax_reduction" is not named: the draft token is the largest of the listed rows of the head; without it an engine launches another set. Accepted: true
+```
+
+**What a run reports.** The report of `00_decode.py`, and in the place of its rate two acceptance lines: `kept tokens
+per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .. 6: ..` and `accepted per draft: 1: x
+of n, 2: y of x, ..` -- per drafted token the steps that kept it among those that kept the one before. Every step counts
+in full, the last one included, whose tokens behind an end token are not written. The acceptance length is a figure of
+this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list. Nor
+with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (the last run of this
+section has two). The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
+acceptance line)": a draft pass multiplies in fp64 on copies, and a rate of such a loop would be read as a speed. The
+`bytes per step` line is the verify step's arithmetic at six tokens per sequence and a draft pass's, five times. The
+`text out` line says how many tokens came out in how many steps. The report is printed before the checks.
+
+**What a run proves, per stack.** The default run proves the loop on the seeded model and says per stack what it
+gated. The lines are those of `tie_out.speculative_checks` (the section "The verify step" has each), one line of the
+script's own, and the checks of every run.
+
+| stack | what is gated |
+|---|---|
+| every stack | `tokens`: every kept token is the decode step's on the same tokens, inside the declared band, and the loop's greedy rule holds -- every window starts with the greedy token kept last, every kept drafted token is the greedy token of the row in front of it. `ids`, the script's own line: the new tokens are the plain session's of the same process (a drafted token that a loop emitted reaches no other line). `acceptance`: every step kept the count it was scheduled to keep, and every count from 0 to 5 was kept. `position`: the session stands where the decode steps stand, an integer. `prompt`: after the prompt, what every layer stands on and the logits of every prompt step are the decode session's bytes. `rejected rows`: a second replay with other tokens behind the kept ones is byte-identical -- a kept row does not read what a rejected draft wrote. `drafter cache`, `draft proposals`: what the drafter's passes are handed. `kept state`: the recurrent state of a linear-attention layer both runs fed the same rows, inside the fused step's band. `replay`, with the drafter's proposals, byte-identical |
+| `reference` | also `bytes`: the logits of every kept row and what every layer stands on after every step are the decode steps' bytes. The run compares the reference with itself block by block and ends in `[02] RAN reference stack (no provider checked)`, or in `[02] FAIL` |
+| `fe-cublas`, `native`, `fe-entries` | also the blocks of both kinds of step against the reference, teacher-forced; `bytes` is reported |
+| `native` and `fe-entries`, and any stack with `--check-kernels` | also the kernel check of whole steps: the lookups of the drafter's passes and the verify plan's rows one by one, everything else a pass launches attributed to the drafter's fallback rows |
+
+On `native`, at one sequence of six tokens on compute capability 10.0 with 148 SMs, a run proves what the verify step
+proves -- on the 64-layer model 370 of the 484 launches of a verify step are target kernels (49 the target's own
+compiled kernels + 321 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 13
+of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results) -- now behind a real
+prefill, in one session, with kept counts the comparison decides. No block of the drafter is on a kernel yet: under the
+kernel check a run prints "kernel identity of the drafter's passes: not stated (the kernel census holds the verify
+step and the output head behind it; no section holds a draft pass)", and its last line before the verdict is "the
+drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)".
+
+On a checkpoint `position`, `prompt`, `recorded`, `rejected rows`, `drafter cache`, `draft proposals`, replay, the
+blocks and the kernel check are gated as on the seeded model; `tokens` is reported, with the first kept token that
+differs; nothing is scheduled and no plain run is made for the ids, so the tokens a checkpoint run writes are held by no
+line of that run: the loop that writes them is the one the default run proves. The comparison covers the first 16 steps
+behind the prompt, the block check the first 16 prompt steps and the first 8 steps, the traced pass 16 steps. The last
+line of a run is the verdict of `00_decode.py` with the tag `[02]` ([../README.md](../README.md) has the table).
+
+**What ran** (2026-11-19; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only). The
+default run -- the seeded two-layer model with its seeded drafter, a prompt of 26 tokens, then 32 new tokens in 10
+steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on `fe-cublas`,
+`native` and `fe-entries` and in `[02] RAN reference stack (no provider checked)` on `reference`. In each of the four
+the 32 new tokens were the plain run's of the same process (ids hash `11bfb9f9bcf5`, which is also what `00_decode.py
+--sequences 1 --force-tokens 32 --stack native` printed), nothing was written to standard output, and every gated line
+of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count. `bytes` passed on `reference`
+and was reported on the other three. On `native` and `fe-entries` the kernel check passed over 10 traced steps, with
+13 of 20 launches of the verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries
+with byte-equal results). On `native`, three drafted tokens (`"num_speculative_tokens": 3`) passed in 13 steps, with
+"kernel identity: not stated for this run"; eight ended in `[02] SKIP cudnn.GdnVerifyFused serves 8 tokens per
+sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per sequence` before anything was loaded. The
+four-layer model (`--layers 4`, on the default stack) passed. The memory sentence of the default run asked for about
+6.3 GiB on `fe-cublas` and `reference` and about 6.1 GiB on `native` and `fe-entries`; PyTorch reserved between 3.8
+and 4.6 GiB in the four runs, and the device grew by about 0.2 GiB more in each.
+
+In one process on `native`, three runs of the script with one thing wrong in its loop each, between two runs of the
+tree as it is, which passed; each of the three ended in `[02] FAIL`. A drafted token written out where the verify step
+chose another failed `ids` alone; one drafted token kept beyond the compared count failed `tokens`, `drafter cache`,
+`draft proposals`, `acceptance` and `ids`; one kept below it failed `acceptance` alone.
+
+**The last run with a checkpoint** (2026-11-19; the published checkpoint; cuDNN Frontend 1.34.0, CuTe DSL 4.8.0, PyTorch
+2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; the third command of this section as it is
+written, and once more on the default stack `fe-cublas`: the default prompt as a chat request body with `max_tokens`
+256, 58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids).
+Both runs ended in `[02] PASS`, and both stopped at the end token. On `native` the loop wrote 204 new tokens in 63
+steps: 3.22 kept tokens a step (1 + 140 accepted drafted tokens / 63 steps); 14, 11, 11, 9, 10 and 8 steps kept one to
+six tokens; the first drafted token was accepted in 49 of 63 steps, the second in 38 of those 49, the third in 27 of 38,
+the fourth in 18 of 27, the fifth in 8 of 18 -- the counts of the library loop in the section "The verify step", on the
+same prompt and list. On `fe-cublas` it wrote 249 new tokens in 74 steps: 3.38 kept tokens a step (1 + 176 / 74; the
+last step kept six tokens and the end token was its fourth, so the last two of them were not written); 13, 14,
+14, 10, 11 and 12 steps kept one to six tokens; 61 of 74, 47 of 61, 33 of 47, 23 of 33 and 12 of 23. The stacks launch
+other kernels for the same blocks and a greedy run follows its first other token: an acceptance length is a figure of
+its stack as well as of its prompt and its list. In both runs `position`, `prompt`, `recorded`, `rejected rows`,
+`drafter cache` and `draft proposals` passed on the first 16 steps, and replay with the proposals and the blocks of both
+kinds of step passed; `tokens` was reported -- on `native` 38 of 46 kept tokens were the decode steps' on the same
+tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the first kept token 30. On `native` the kernel
+check passed over 16 traced steps, with 370 of 484 launches of the verify step target kernels (49 the target's own
+compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothing stated about the kernels of the
+passes. The memory sentence asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by
+40.0 GiB, and for about 61.0 GiB on `fe-cublas`, where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the
+GPU was otherwise empty at the start of each.
+
+**What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference
+chain, and a run says "kernel identity of the drafter's passes: not stated". More than one request: `--sequences` is
+accepted at 1. A rate. A count or a position per sequence. A captured step. `--dump-census`. A text equal to the plain
+script's on a checkpoint. Any GPU class but compute capability 10.0: the script has run there only, and a class it has
+not run on is uncovered, not passing.
 
 ## Who serves each block (stack `fe-cublas`)
 

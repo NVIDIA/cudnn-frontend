@@ -7410,3 +7410,145 @@ def test_a_traced_pass_of_engine_steps_replays_the_prompt_untraced(monkeypatch):
     assert idle.traced.steps is None and idle.traced.missing == why and idle.report().trace_missing == why
     status, unobserved, lines = tie_out.kernel_check(idle)
     assert (status, unobserved) == (census.NOT_OBSERVED, why) and lines[0].endswith(f"not observed: {why}    {census.NOT_OBSERVED}")
+
+
+# ---------------------------------------------------------------- the speculative script on a target stack, to its last line
+def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
+    """``main()`` of ``02_speculative_decode.py`` to its LAST line, on the CPU: stated device facts (compute capability
+    10.0), the tiny geometry with its seeded drafter, and the stand-in providers and stand-in profiler of
+    :func:`_stand_ins` under every plan of the run -- the plain plan, the verify plan, the prompt's decode plan and the
+    drafter's (its lookup is the stand-in of PyTorch's gather, which writes a launch into the log; its chains are the
+    reference's).  Returns ``(exit code, the lines the run printed, what it wrote to standard output)``."""
+    import importlib.util
+
+    from model_samples import blocks, census
+    from model_samples.qwen_dense import QwenDense
+
+    model_samples = importlib.import_module("model_samples")  # the package as an object: its names are patched below
+    stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))  # three rows per thread block, as the tiny census records it
+    build = _stand_ins(monkeypatch, **stand_in)
+    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
+    stated = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    real_session = model_samples.Session
+
+    def session(model, text, **options):  # a session of the script on the CPU, every one of its plans on the stated facts and the stand-ins
+        made = real_session(model, text, **dict(options, device="cpu"))
+
+        def plan(of, tokens, overrides, **more):
+            plan_options = {"reference_precision": made.reference_precision, "device": "cpu", "check_kernels": made.check_kernels, **more}
+            table, regimes = of.provider_table, of.regimes
+            return blocks.plan(
+                table, regimes, stated, 1, tokens, made.stack, overrides, model=of, options=plan_options, source=of.table_source, factories=build
+            )
+
+        made.plan = plan(model, made.tokens, made.overrides)
+        if made.draft_tokens is not None:
+            made.prefill_plan = plan(model, 1, made.overrides, state_tokens=made.tokens)
+        if made.drafter is not None:
+            made.draft_plan = plan(made.drafter, 1, {})
+        return made
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (80 * GIB, 180 * GIB))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: stated))
+    monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
+    monkeypatch.setattr(model_samples, "Session", session)
+    monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=2, vocab=15520: _tiny_model()))
+    monkeypatch.setattr(QwenDense, "_target", _census_of(_tiny_model()))
+    paths = list(sys.path)
+    spec = importlib.util.spec_from_file_location(
+        "model_sample_qwen_dense_02_speculative_decode_census_run", MODELS / "qwen_dense" / "02_speculative_decode.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    capsys.readouterr()
+    try:
+        spec.loader.exec_module(module)
+        code = module.main(["--force-tokens", "24", *arguments])
+    finally:
+        sys.path[:] = paths
+    captured = capsys.readouterr()
+    return code, captured.err.splitlines(), captured.out
+
+
+def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, capsys):
+    """``main()`` of ``02_speculative_decode.py`` with ``--stack native``, on stand-in providers and the stand-in profiler,
+    to its last line.  The kernel check runs without a flag, on whole steps -- the lookups of the drafter's passes and
+    the verify plan's rows, one by one --, and under it the run says what it states of the drafter's kernels: nothing.
+    Launch records that hold: ``[02] PASS``.  A launch more between two exact rows of the verify step: ``[02] FAIL``,
+    exit code 1.  The profiler out: ``[02] RAN native stack (kernels not observed: <reason>)``, never ``PASS``.  A count
+    of drafted tokens the census holds no section for states no identity; the default count states the verify plan's
+    three numbers.  Standard output stays empty: a seeded run has no language."""
+    drafter = "    kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
+    drafter += "no section holds a draft pass)"
+    unseen = "    the prompt's decode steps: 26 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
+    three = [
+        "--stack",
+        "native",
+        "--force-tokens",
+        "11",
+        "--speculative-config",
+        '{"method": "mtp", "num_speculative_tokens": 3, "use_local_argmax_reduction": true}',
+    ]
+    code, lines, out = _speculative_run(monkeypatch, capsys, three)
+    assert (code, lines[-1], out) == (0, "[02] PASS", ""), lines[-6:]
+    (kernels,) = _kernel_lines(lines)
+    assert kernels.endswith("    PASS") and "16 on exact rows, in the wiring order" in kernels, "three lookups of the passes and the verify plan's 13"
+    assert lines.count(drafter) == 1 and lines.count(unseen) == 1 and lines.index(kernels.join(("  ", ""))) < lines.index(unseen) < lines.index(drafter)
+    unstated = "kernel identity: not stated for this run (no recorded section for 4 tokens per sequence on cc 10.0 / 148 SMs: "
+    assert any(line.strip().startswith(unstated) for line in lines), "three drafted tokens: a step shape the census holds no section for"
+    # 11 new tokens at three drafted tokens: the first from the prompt, then steps that keep 1, 2, 3 and 4 tokens -- four steps, every count once
+    assert "  acceptance        4 of 4 steps kept the count they were scheduled to keep; every count from 0 to 3 was kept at least once    PASS" in lines
+    blocks_lines = [line for line in lines if line.startswith("  blocks  ")]
+    assert len(blocks_lines) == 2 and all(line.endswith("    PASS") for line in blocks_lines), "the stand-ins of both kinds of step against the reference"
+    assert lines[-2] == "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    assert not any(line.startswith("kernels, planned") and "1 sequence, cc" in line for line in lines), "the kernel table is the verify plan's alone"
+
+    # one launch more in front of the in-projection of the verify step, between two exact rows: the kernel check fails the run
+    code, lines, out = _speculative_run(monkeypatch, capsys, three, projection_defect="extra")
+    assert (code, lines[-1], out) == (1, "[02] FAIL", ""), lines[-6:]
+    assert _kernel_lines(lines)[0].endswith("    FAIL") and any("nothing may sit between two exact rows" in line for line in lines)
+    assert lines.count(drafter) == 1, "what is not stated is said beside a failed check too"
+
+    # the profiler out: every other line holds, the kernels were not observed -- RAN, with the stack's name and the reason
+    reason = "the profiler failed (no tracing library)"
+    code, lines, out = _speculative_run(monkeypatch, capsys, three, profiler=reason)
+    assert (code, lines[-1], out) == (0, f"[02] RAN native stack (kernels not observed: {reason})", "") and "[02] PASS" not in lines
+    assert _kernel_lines(lines) == [f"kernels           not observed: {reason}    NOT OBSERVED"]
+    assert f"traced pass           not available: {reason}" in lines and lines.count(drafter) == 1
+
+    # the default configuration on a stack without a target, with its kernels checked: five lookups of the passes and the model's
+    code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-cublas", "--check-kernels"])
+    assert (code, lines[-1], out) == (0, "[02] PASS", ""), lines[-6:]
+    assert _kernel_lines(lines)[0].endswith("    PASS") and lines.count(drafter) == 1 and not any("kernel identity, as planned" in line for line in lines)
+    code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-cublas"])  # ... and without the flag nothing is traced for a check
+    assert (code, lines[-1]) == (0, "[02] PASS") and _kernel_lines(lines) == [] and drafter not in lines
+
+    # the default configuration on native: six tokens per sequence, the step shape the census records -- the three numbers, before the load
+    # and under the check, and every launch in its recorded shape
+    code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "native"])
+    planned = (
+        "kernel identity, as planned: 13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
+        "with byte-equal results); not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1"
+    )
+    load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
+    stated = [index for index, line in enumerate(lines) if line.strip().startswith(planned)]
+    assert len(stated) == 2 and stated[0] < load < stated[1], "with the plan, and again under the kernel check"
+    (kernels,) = _kernel_lines(lines)
+    assert kernels.endswith("    PASS") and "18 on exact rows, in the wiring order" in kernels, "five lookups of the passes and the verify plan's 13"
+    assert any(line.strip().startswith("target census verify / cc 10.0 / 148 SMs") and ": NOT CLAIMED (fallback rows present" in line for line in lines)
+    assert lines.count(drafter) == 1 and out == ""
+    # On this tiny geometry the fp32 chains of the stand-ins leave the seeded model's declared logits band on a row of a rejected draft
+    # at six tokens per sequence.  The band is the model's and no stand-in widens it: the token line of the run's own checks fails,
+    # every line of the comparison with decode steps holds, and a failed line of the checks ends the run in FAIL.
+    failed = [line.split()[0] for line in lines if line.endswith("    FAIL")]
+    tokens = [line for line in lines if line.startswith("  tokens  ")]
+    assert (
+        failed == ["tokens"]
+        and tokens[0].endswith("    PASS")
+        and "greedy tokens equal to the reference stack's" in tokens[1]
+        and tokens[1].endswith("    FAIL")
+    )
+    assert (code, lines[-1]) == (1, "[02] FAIL")
