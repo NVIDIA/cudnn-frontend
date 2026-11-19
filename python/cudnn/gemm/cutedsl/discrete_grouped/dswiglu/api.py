@@ -127,13 +127,13 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
         self.glu_layout = validate_glu_layout(glu_layout)
+        super().__init__()
         self._canonical_dglu = None
         if glu_layout == "gate_then_up":
             from cudnn.gemm.cutedsl.grouped.dglu.api import GroupedGemmDgluSm100
 
             if detect_framework(sample_a) != "torch":
                 raise NotImplementedError("gate_then_up requires actual torch sample tensors; TensorDesc and other frameworks are unsupported")
-            super().__init__()
             self._canonical_dglu = GroupedGemmDgluSm100(
                 sample_a=sample_a,
                 sample_c=sample_c,
@@ -169,8 +169,6 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             return
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
-
-        super().__init__()
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")

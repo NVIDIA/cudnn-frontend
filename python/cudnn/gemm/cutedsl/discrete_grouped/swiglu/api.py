@@ -135,6 +135,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
         glu_layout = validate_glu_layout(glu_layout)
+        super().__init__()
         self._canonical_api = None
         if glu_layout == "gate_then_up":
             # Keep the legacy entry point and supplied output buffers. Only the
@@ -144,14 +145,11 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             canonical_kwargs.pop("__class__", None)
             from cudnn.gemm.cutedsl.grouped.glu._blockscaled_api import GroupedGemmGluBlockScaledAPI
 
-            super().__init__()
             self._canonical_api = GroupedGemmGluBlockScaledAPI(**canonical_kwargs)
             self._kernel = self._canonical_api._kernel
             return
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
-
-        super().__init__()
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")

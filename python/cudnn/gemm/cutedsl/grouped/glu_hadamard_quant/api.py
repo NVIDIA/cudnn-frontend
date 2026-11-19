@@ -978,6 +978,7 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
         n_full, _, l = b_nkl(b_tensor)
+        b_shape = tuple(b_tensor.shape)
         if sfb_tensor is None:
             raise ValueError("sfb_tensor is required in dense mode")
     else:
@@ -1068,7 +1069,7 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         weight_mode,
         act_func,
         a_tensor.shape[1:],
-        tuple(b_tensor.shape) if is_dense else b_shape,
+        b_shape,
         c_tensor.shape[1:],
         a_tensor.dtype,
         b_tensor.dtype if is_dense else b_dtype,

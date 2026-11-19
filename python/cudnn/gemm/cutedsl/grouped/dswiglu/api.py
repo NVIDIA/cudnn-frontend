@@ -129,13 +129,13 @@ class GroupedGemmDswigluSm100(APIBase):
         :param glu_layout: "interleaved_32" (default), or "gate_then_up" for canonical gate/up halves.
         """
         self.glu_layout = validate_glu_layout(glu_layout)
+        super().__init__()
         self._canonical_dglu = None
         if glu_layout == "gate_then_up":
             from cudnn.gemm.cutedsl.grouped.dglu.api import GroupedGemmDgluSm100
 
             if detect_framework(sample_a) != "torch":
                 raise NotImplementedError("gate_then_up requires actual torch sample tensors; TensorDesc and other frameworks are unsupported")
-            super().__init__()
             self._canonical_dglu = GroupedGemmDgluSm100(
                 sample_a=sample_a,
                 sample_c=sample_c,
@@ -175,7 +175,6 @@ class GroupedGemmDswigluSm100(APIBase):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDswigluSm100; pass torch tensors")
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
-        super().__init__()
         self._framework = framework
 
         self._warn_experimental_api()

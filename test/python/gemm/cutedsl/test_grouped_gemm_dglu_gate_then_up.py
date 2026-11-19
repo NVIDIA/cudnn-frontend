@@ -223,14 +223,18 @@ def test_gate_then_up_dglu_changed_input_graph_replay(precision):
         # Both atomic and deterministic modes accumulate into caller-owned dprob.
         dprob.zero_()
         captured = run(cfg, inputs, canonical=True, dprob=dprob)
-    for value in (0.5, -0.25, 0.5):
-        inputs["c_tensor"].fill_(value)
+    for input_value in (0.5, -0.25, 0.5):
+        inputs["c_tensor"].fill_(input_value)
         graph.replay()
-        snapshots = {name: value.clone() for name, value in captured.items() if value is not None and (name != "d_col_tensor" or precision == "mxfp8")}
+        snapshots = {
+            name: output_tensor.clone()
+            for name, output_tensor in captured.items()
+            if output_tensor is not None and (name != "d_col_tensor" or precision == "mxfp8")
+        }
         expected = run(cfg, inputs, canonical=True)
-        for name, value in snapshots.items():
-            assert torch.isfinite(value.float()).all()
-            assert_bytes(value, expected[name])
+        for name, output_tensor in snapshots.items():
+            assert torch.isfinite(output_tensor.float()).all()
+            assert_bytes(output_tensor, expected[name])
 
 
 @torch_fork_set_rng(seed=3)
