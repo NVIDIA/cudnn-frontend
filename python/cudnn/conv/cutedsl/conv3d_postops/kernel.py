@@ -1,21 +1,25 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+# Device algorithm source: pkuwangh/mlsys@72c2384a5c325198d6600906d5835d1ef6faabac
+# mlsys/gpu/kernels/wan_vae/mega_wan_vae/kernels/conv.py
 
-"""SM100 fused Conv3D epilogues for video-VAE inference."""
+"""SM100 Conv3D with BF16/TF32 arithmetic and specialized post-operations.
+
+Runtime geometry is independent of channel/tile specialization. Fused padded
+output preserves caller-owned history; contiguous output performs no padding
+or cache writes. TF32 operands are rounded before this kernel executes.
+"""
 
 import math
-from dataclasses import dataclass
 
 import cutlass
-from cuda.bindings import driver as cuda_driver
+from cuda.bindings import driver
 from cutlass import cute
 from cutlass.experimental import cuda
 from cutlass.experimental import primitives as prims
 
-from cudnn._cutlass_helpers.static_persistent_tile_scheduler import (
-    PersistentTileSchedulerParams,
-    StaticPersistentTileScheduler,
-)
+from ._config import ConvConfig, ConvSpecialization, LaunchPolicy
+from ._scheduler import TileSchedule
 
 
 def _contiguous_tma_layout(shape: tuple[int, ...], dtype: type[cutlass.Numeric]) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -23,17 +27,67 @@ def _contiguous_tma_layout(shape: tuple[int, ...], dtype: type[cutlass.Numeric])
 
     NDHWC becomes C,W,H,D,N; KTRSC becomes C,S,R,T,K.
     """
-    if not 1 <= len(shape) <= 5 or any(type(extent) is not int or extent <= 0 for extent in shape):
-        raise ValueError("Tensor rank must be between 1 and 5")
     dims = shape[::-1]
-    stride_bytes = dtype.width // 8
+    stride_bytes = cutlass.Int64(dtype.width // 8)
     strides = []
     for extent in dims[:-1]:
         stride_bytes *= extent
-        if stride_bytes % 16:
-            raise ValueError("TMA inter-dimension strides must be multiples of 16 bytes")
         strides.append(stride_bytes // 16)
     return dims, tuple(strides)
+
+
+@cute.jit
+def _flat_nthwc_offset(n, t, h, w, c, frames, height, width, channels):
+    """Promote before multiplication, even on the 32-bit coordinate fast path."""
+    return (((cutlass.Int64(n) * frames + t) * height + h) * width + w) * channels + c
+
+
+@cute.jit
+def _zero_prepared_padding(
+    padded,
+    vector_idx,
+    vector_stride,
+    zpq,
+    shape,
+    channels: cutlass.Constexpr,
+    *,
+    padded_plane_div,
+    padded_width_div,
+    auxiliary_rows_div,
+    border_rows_div,
+    wide_index: cutlass.Constexpr,
+):
+    """Zero missing history and spatial borders, leaving existing history intact."""
+    z, h, w = zpq
+    batches, previous_frames = shape
+    padded_h, padded_w = h + 2, w + 2
+    history_rows = (2 - previous_frames) * padded_h * padded_w
+    border_rows = 2 * padded_w + 2 * h
+    auxiliary_rows = history_rows + (z + previous_frames) * border_rows
+    index_type: cutlass.Constexpr = cutlass.Int64 if wide_index else cutlass.Int32
+    while vector_idx < batches * auxiliary_rows * (channels // 8):
+        coordinate_idx = index_type(vector_idx)
+        channel = coordinate_idx % (channels // 8) * 8
+        auxiliary_row = coordinate_idx // (channels // 8)
+        batch = auxiliary_row // auxiliary_rows_div
+        local_row = auxiliary_row % auxiliary_rows_div
+        pt, ph, pw = index_type(0), index_type(0), index_type(0)
+        if local_row < history_rows:
+            pt = local_row // padded_plane_div
+            ph = (local_row % padded_plane_div) // padded_width_div
+            pw = local_row % padded_width_div
+        else:
+            border = (local_row - history_rows) % border_rows_div
+            pt = (local_row - history_rows) // border_rows_div + 2 - previous_frames
+            if border < 2 * padded_w:
+                ph = border // padded_width_div * (h + 1)
+                pw = border % padded_width_div
+            else:
+                ph = (border - 2 * padded_w) // 2 + 1
+                pw = (border - 2 * padded_w) % 2 * (w + 1)
+        destination = _flat_nthwc_offset(batch, pt, ph, pw, channel, z + 2, padded_h, padded_w, channels)
+        (padded.iterator.raw_ptr() + destination).store(cutlass.vector.full((8,), 0, padded.element_type), alignment=16)
+        vector_idx += vector_stride
 
 
 @cute.kernel
@@ -41,58 +95,83 @@ def _conv3d_postops_kernel(
     # Leading specialization label remains visible before DSL name truncation.
     operation: cutlass.Constexpr[str],
     # Persistent tile scheduler parameters
-    tile_sched_params: PersistentTileSchedulerParams,
+    schedule: cutlass.Constexpr[TileSchedule],
     # Constexpr knobs
     mma_tiler: cutlass.Constexpr[tuple[int, int, int]],
     mma_inst_shape_mnk: cutlass.Constexpr[tuple[int, int, int]],
     # Host-computed: T*R*S*ceil_div(Ci, 64), including each channel tail.
     k_tile_cnt: cutlass.Constexpr[int],
-    num_ab_stage: cutlass.Constexpr[int],
-    num_c_stage: cutlass.Constexpr[int],
+    policy: cutlass.Constexpr[LaunchPolicy],
     use_2cta_instrs: cutlass.Constexpr[bool],
-    # Output spatial dimensions (Z, P, Q) decompose linear M into (n, z, p, q).
-    zpq: cutlass.Constexpr[tuple[int, int, int]],
-    batches: cutlass.Constexpr[int],
+    # Conv geometry consumed by the im2col TMA producer / epilogue:
+    # zpq      = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q)
+    # trs      = filter spatial dims (T, R, S) used to decompose K-tile index
+    # lower_pad_dhw / stride_dhw / dilation_dhw = standard conv params
+    zpq,
+    batches,
     # Host-built TMA descriptors, consumed by the device-side
     # prims.cp_async_bulk_tensor_* / prims.prefetch_tensormap calls.
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
+    storage: cutlass.Constexpr = cutlass.BFloat16,
     conv_bias: cute.Tensor = None,
     gamma: cute.Tensor = None,
     packed_x: cute.Tensor = None,
-    packed_shape: cutlass.Constexpr = None,
+    packed_shape=None,
     prep_padded: cute.Tensor = None,
     prep_cache: cute.Tensor = None,
-    PREP_SHAPE: cutlass.Constexpr = None,
+    PREP_SHAPE=None,
     residual: cute.Tensor = None,
     residual_bias: cute.Tensor = None,
     prep_residual: cute.Tensor = None,
-    SPATIAL_SHAPE: cutlass.Constexpr = None,
+    SPATIAL_SHAPE=None,
+    runtime_clusters_m=None,
+    volume_div=None,
+    plane_div=None,
+    width_div=None,
+    padded_plane_div=None,
+    padded_width_div=None,
+    auxiliary_rows_div=None,
+    border_rows_div=None,
+    spatial_border_div=None,
+    wide_index: cutlass.Constexpr = False,
 ) -> None:
-    """Run valid 3x3x3 BF16 convolution with optional fused post-operations.
+    """Run TMA -> tcgen05 MMA -> dtype-aware TMA store; see module contract.
 
-    Stride and dilation are fixed at one; any input padding is caller-provided.
-    Tile geometry and pipeline stages are compile-time parameters. The host
-    supplies matching tensor-map descriptors and the reduction tile count.
+    Tile sizes, channel layout and pipeline stages are specialized. N/T/H/W
+    and history length are runtime values for the TMA path. The host prepares
+    tensor maps and fast divisors without reading or synchronizing GPU data.
     """
+    num_ab_stage: cutlass.Constexpr = policy.ab_stages
+    num_c_stage: cutlass.Constexpr = policy.c_stages
     FUSE_NORM: cutlass.Constexpr = gamma is not None
-    ab_dtype = cutlass.BFloat16
-    c_dtype = cutlass.BFloat16
+    if cutlass.const_expr(volume_div is None):
+        volume_div, plane_div, width_div = zpq[0] * zpq[1] * zpq[2], zpq[1] * zpq[2], zpq[2]
+    ab_dtype = storage
+    c_dtype = storage
+    fp32: cutlass.Constexpr = storage == cutlass.Float32
+    bands: cutlass.Constexpr = 2 if fp32 else 1
+    retained_type: cutlass.Constexpr = cutlass.Float32 if fp32 else cutlass.Uint32
+    retention_scale: cutlass.Constexpr = 2 if fp32 else 1
     acc_dtype = cutlass.Float32
-    num_acc_stage = 2
+    num_acc_stage = 1 if fp32 else 2
+    # Bound Tensor Core summation error while retaining full-channel tiles.
+    # Promotion reuses the epilogue warps and the same two TMEM bands.
+    promotion_tiles: cutlass.Constexpr = 64
+    promotion_count: cutlass.Constexpr = (k_tile_cnt + promotion_tiles - 1) // promotion_tiles if fp32 else 1
     trs = (3, 3, 3)
     lower_pad_dhw = (0, 0, 0)
     stride_dhw = (1, 1, 1)
     dilation_dhw = (1, 1, 1)
     if cutlass.const_expr(mma_tiler[0] != (256 if use_2cta_instrs else 128)):
         raise ValueError("Convolution core requires 128 rows per CTA")
-    if cutlass.const_expr(mma_tiler[1] != 160):
-        raise ValueError("Fused convolution requires tile N=160")
-    if cutlass.const_expr(mma_tiler[2] != 64):
-        raise ValueError("Convolution core requires tile K=64")
-    if cutlass.const_expr(mma_inst_shape_mnk != (mma_tiler[0], mma_tiler[1], 16)):
-        raise ValueError("MMA instruction shape must be (tileM, tileN, 16)")
+    if cutlass.const_expr(mma_tiler[1] not in (96, 160, 192, 256)):
+        raise ValueError("Wan convolution uses tile N=96, N=160, N=192 or N=256")
+    if cutlass.const_expr(mma_tiler[2] != (32 if fp32 else 64)):
+        raise ValueError("Convolution core requires BF16 K64 or TF32 K32")
+    if cutlass.const_expr(mma_inst_shape_mnk != (mma_tiler[0], mma_tiler[1], 8 if fp32 else 16)):
+        raise ValueError("MMA instruction K must be 16 for BF16 or 8 for TF32")
     if cutlass.const_expr(num_ab_stage < 1 or num_c_stage < 1 or num_c_stage > 8):
         raise ValueError("AB stages must be positive; C stages must be in [1, 8]")
     if cutlass.const_expr(k_tile_cnt <= 0):
@@ -100,34 +179,32 @@ def _conv3d_postops_kernel(
     if cutlass.const_expr(packed_shape is not None):
         if cutlass.const_expr(use_2cta_instrs or FUSE_NORM or k_tile_cnt != 7):
             raise ValueError("Packed C12 gather requires raw 1CTA and seven K tiles")
-        if cutlass.const_expr(packed_x is None):
-            raise ValueError("Packed C12 gather requires an input tensor")
-        if cutlass.const_expr(zpq != tuple(d - 2 for d in packed_shape[1:])):
-            raise ValueError("Packed gather output geometry must match the padded input")
+        if cutlass.const_expr(packed_x is None or trs != (3, 3, 3) or lower_pad_dhw != (0, 0, 0) or stride_dhw != (1, 1, 1) or dilation_dhw != (1, 1, 1)):
+            raise ValueError("Packed gather requires C12 input and unpadded unit-stride 3x3x3")
     if cutlass.const_expr(FUSE_NORM):
-        if cutlass.const_expr(mma_tiler[1] != 160):
-            raise ValueError("Fused normalization requires tileN=160")
         if cutlass.const_expr(conv_bias is None or gamma is None):
             raise ValueError("Fused normalization requires conv_bias and gamma")
-        if cutlass.const_expr(conv_bias.element_type != cutlass.BFloat16 or gamma.element_type != cutlass.BFloat16):
-            raise TypeError("Fused conv_bias and gamma must be BF16")
-        if cutlass.const_expr(conv_bias.shape not in ((160,), (320,)) or gamma.shape != conv_bias.shape):
-            raise ValueError("Fused conv_bias and gamma must have shape (160,) or (320,)")
+        if cutlass.const_expr(conv_bias.element_type != c_dtype or gamma.element_type != c_dtype):
+            raise TypeError("Fused conv_bias and gamma must match the convolution storage dtype")
+        if cutlass.const_expr(conv_bias.shape not in ((96,), (160,), (192,), (256,), (320,)) or gamma.shape != conv_bias.shape):
+            raise ValueError("Fused conv_bias and gamma require 96, 160, 192, 256, or 320 channels")
+        if cutlass.const_expr(mma_tiler[1] != (160 if gamma.shape[0] == 320 else gamma.shape[0])):
+            raise ValueError("Normalization tile width must match the channel family")
     if cutlass.const_expr(PREP_SHAPE is not None):
-        if cutlass.const_expr(not FUSE_NORM):
+        if cutlass.const_expr(not FUSE_NORM or packed_shape is not None):
             raise ValueError("Next-convolution preparation requires normalization")
         if cutlass.const_expr(prep_padded is None or prep_cache is None):
-            raise ValueError("Preparation requires padded/cache outputs")
+            raise ValueError("Preparation requires padded and cache tensors")
     if cutlass.const_expr(residual is not None):  # noqa: SIM102 - preserve DSL specialization guard
-        if cutlass.const_expr(SPATIAL_SHAPE is None and (not FUSE_NORM or prep_residual is None)):
-            raise ValueError("Residual fusion requires normalization and a saved-sum output")
+        if cutlass.const_expr(SPATIAL_SHAPE is None and not FUSE_NORM):
+            raise ValueError("Residual fusion requires prepared or spatial output")
     if cutlass.const_expr(SPATIAL_SHAPE is not None and (FUSE_NORM or PREP_SHAPE is not None or residual is None or conv_bias is None or prep_padded is None)):
         raise ValueError("Spatial residual output requires bias/residual and output without norm/history")
 
     norm_channels: cutlass.Constexpr = gamma.shape[0] if FUSE_NORM else 160
-    paired_norm: cutlass.Constexpr = FUSE_NORM and norm_channels == 320
+    paired_norm: cutlass.Constexpr = FUSE_NORM and norm_channels == 2 * mma_tiler[1]
     if cutlass.const_expr(paired_norm and not use_2cta_instrs):
-        raise ValueError("C320 normalization requires 2CTA MMA")
+        raise ValueError("Two-tile normalization requires 2CTA MMA")
 
     # Warp / thread / cluster identity
     warp_idx = cute.arch.warp_idx()
@@ -158,8 +235,7 @@ def _conv3d_postops_kernel(
         # None selects the CTA_1 no-multicast commit path (arrive on own mbar).
         _commit_mask = None
 
-    # Wide TMEM loads let four lanes share each fused-normalization row.
-    epilogue_warp_ids = tuple(range((16 if residual is not None or paired_norm else 8) if FUSE_NORM else 4))
+    epilogue_warp_ids = tuple(range(policy.epilogue_warps))
     mma_warp_id = len(epilogue_warp_ids)
     tma_warp_id = mma_warp_id + 1
 
@@ -226,20 +302,25 @@ def _conv3d_postops_kernel(
     )
 
     if cutlass.const_expr(paired_norm):
-        norm_params = cutlass.Array(cutlass.BFloat16, 640, space=cutlass.AddressSpace.smem, alignment=16)
-        if tidx < 160:
+        norm_params = cutlass.Array(
+            c_dtype,
+            2 * norm_channels,
+            space=cutlass.AddressSpace.smem,
+            alignment=16,
+        )
+        if tidx < norm_channels // 2:
             norm_params.store(
                 (conv_bias.iterator.raw_ptr() + tidx * 2).load(count=2, alignment=4),
                 tidx * 2,
             )
             norm_params.store(
                 (gamma.iterator.raw_ptr() + tidx * 2).load(count=2, alignment=4),
-                320 + tidx * 2,
+                norm_channels + tidx * 2,
             )
         # Publish ordinary SMEM loads independently of the async TMA barriers.
         prims.barrier_cta_sync(
             3,
-            thread_count=32 * (len(epilogue_warp_ids) + 2 + (4 if PREP_SHAPE is not None else 0)),
+            thread_count=policy.threads,
         )
 
     # mbarrier_init: one warp / one lane initializes every barrier.
@@ -281,11 +362,12 @@ def _conv3d_postops_kernel(
         n_dim=mma_inst_shape_mnk[1],
     )
     # BF16 uses the F16 instruction kind; idesc selects BF16 operands.
-    mma_kind = prims.Tcgen05MMAKind.F16
+    mma_kind = prims.Tcgen05MMAKind.TF32 if fp32 else prims.Tcgen05MMAKind.F16
 
     # Persistent tile scheduler.
-    tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
-    work_tile = tile_sched.initial_work_tile_info()
+    work_index = cute.arch.block_idx()[2]
+    work_stride = cute.arch.grid_dim()[2]
+    tile_idx, valid_tile = schedule.get_work(work_index, runtime_clusters_m, wide_index)
 
     # tcgen05 TMEM allocation knob (always 512 cols on Blackwell).
     num_tmem_cols = 512
@@ -323,8 +405,11 @@ def _conv3d_postops_kernel(
     # The filter coord (s, r, t) and C-element offset are loop-carried and
     # advanced by a colexicographic carry (add + compare + conditional reset),
     # so the loop body never divides the linear k by T*R*S.
-    producer_warp_end = 9 if cutlass.const_expr(packed_shape is not None) else tma_warp_id + 1
-    auxiliary_threads = 64 if FUSE_NORM and not paired_norm else 128
+    producer_warp_end = policy.auxiliary_start_warp
+    auxiliary_threads = 32 * policy.auxiliary_warps
+    if cutlass.const_expr(policy.helper_registers):  # noqa: SIM102 - static selection before warp-role branch
+        if warp_idx >= mma_warp_id:
+            prims.setmaxregister(policy.helper_registers, "decrease")
     if warp_idx >= producer_warp_end:
         if cutlass.const_expr(SPATIAL_SHAPE is not None):
             batches, channels = SPATIAL_SHAPE
@@ -337,75 +422,51 @@ def _conv3d_postops_kernel(
             vector_idx = linear_cta * auxiliary_threads + tidx - producer_warp_end * 32
             while vector_idx < batches * z * border_rows * (channels // 8):
                 channel = vector_idx % (channels // 8) * 8
-                border_row = vector_idx // (channels // 8)
-                nt = border_row // border_rows
-                border = border_row % border_rows
-                ph = cutlass.Int64(h)
+                border_row = (cutlass.Int64 if wide_index else cutlass.Int32)(vector_idx // (channels // 8))
+                nt = border_row // spatial_border_div
+                border = border_row % spatial_border_div
+                ph = (cutlass.Int64 if wide_index else cutlass.Int32)(h)
                 pw = border
                 if border >= w + 1:
                     ph = border - w - 1
-                    pw = cutlass.Int64(w)
-                offset = ((nt * (h + 1) + ph) * (w + 1) + pw) * channels + channel
-                zeros = cutlass.vector.full((8,), 0, cutlass.BFloat16)
+                    pw = (cutlass.Int64 if wide_index else cutlass.Int32)(w)
+                offset = _flat_nthwc_offset(nt, 0, ph, pw, channel, 1, h + 1, w + 1, channels)
+                zeros = cutlass.vector.full((8,), 0, c_dtype)
                 (prep_padded.iterator.raw_ptr() + offset).store(zeros, alignment=16)
                 vector_idx += total_ctas * auxiliary_threads
         if cutlass.const_expr(PREP_SHAPE is not None):
-            # The caller owns history interiors. Initialize only missing
-            # history planes and spatial borders, disjoint from TMA stores.
-            Z_out, P_out, Q_out = zpq
-            batches, previous_frames = PREP_SHAPE
-            padded_h = P_out + 2
-            padded_w = Q_out + 2
-            history_rows = (2 - previous_frames) * padded_h * padded_w
-            border_rows = 2 * padded_w + 2 * P_out
-            auxiliary_rows = history_rows + (Z_out + previous_frames) * border_rows
             bx, by, bz = cute.arch.block_idx()
             gx, gy, gz = cute.arch.grid_dim()
             # The persistent scheduler places clusters along grid Z, not X.
-            # Row/vector coordinates fit in 32 bits for encoder shapes. Widen
-            # only element offsets, which can exceed 2 Gi elements after padding.
-            index_type: cutlass.Constexpr = cutlass.Int32 if batches * auxiliary_rows * (norm_channels // 8) < 2**31 else cutlass.Int64
             linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (cutlass.Int64(by) + cutlass.Int64(gy) * bz)
             total_ctas = cutlass.Int64(gx) * gy * gz
             vector_idx = linear_cta * auxiliary_threads + tidx - producer_warp_end * 32
-            while vector_idx < batches * auxiliary_rows * (norm_channels // 8):
-                coordinate_idx = index_type(vector_idx)
-                channel = coordinate_idx % (norm_channels // 8) * 8
-                auxiliary_row = coordinate_idx // (norm_channels // 8)
-                batch = auxiliary_row // auxiliary_rows
-                local_row = auxiliary_row % auxiliary_rows
-                pt = index_type(0)
-                ph = index_type(0)
-                pw = index_type(0)
-                if local_row < history_rows:
-                    pt = local_row // (padded_h * padded_w)
-                    ph = local_row // padded_w % padded_h
-                    pw = local_row % padded_w
-                else:
-                    border = (local_row - history_rows) % border_rows
-                    pt = (local_row - history_rows) // border_rows + 2 - previous_frames
-                    if border < 2 * padded_w:
-                        ph = border // padded_w * (P_out + 1)
-                        pw = border % padded_w
-                    else:
-                        ph = (border - 2 * padded_w) // 2 + 1
-                        pw = (border - 2 * padded_w) % 2 * (Q_out + 1)
-                values = cutlass.vector.full((8,), 0, cutlass.BFloat16)
-                destination = (((cutlass.Int64(batch) * (Z_out + 2) + pt) * padded_h + ph) * padded_w + pw) * norm_channels + channel
-                (prep_padded.iterator.raw_ptr() + destination).store(values, alignment=16)
-                vector_idx += total_ctas * auxiliary_threads
+            _zero_prepared_padding(
+                prep_padded,
+                vector_idx,
+                total_ctas * auxiliary_threads,
+                zpq,
+                PREP_SHAPE,
+                norm_channels,
+                padded_plane_div=padded_plane_div,
+                padded_width_div=padded_width_div,
+                auxiliary_rows_div=auxiliary_rows_div,
+                border_rows_div=border_rows_div,
+                wide_index=wide_index,
+            )
     elif warp_idx >= tma_warp_id:
         if cutlass.const_expr(packed_shape is not None):
-            # Four producer warps gather the C16-padded activation into the
-            # K64 shared-memory tiles consumed by the tensor-core pipeline.
+            # Four producer warps gather flat TRSC in aligned eight-BF16 vectors.
+            # Each writer arrives asynchronously after its copies finish. Writer
+            # zero expects packed-weight TMA bytes, so full means A AND B are ready.
             ab_stage_idx = 0
             producer_tid = tidx - 160
             batch_count, input_t, input_h, input_w = packed_shape
             Z_out, P_out, Q_out = zpq
             total_rows = batch_count * Z_out * P_out * Q_out
-            while work_tile.is_valid_tile:
-                m_start = work_tile.tile_idx[0] * 128
-                n_start = work_tile.tile_idx[1] * mma_tiler[1]
+            while valid_tile:
+                m_start = tile_idx[0] * 128
+                n_start = tile_idx[1] * mma_tiler[1]
                 for k in cutlass.range(7, unroll=1):
                     full = ab_full_mbar_ptr.subview(ab_stage_idx)
                     empty = ab_empty_mbar_ptr.subview(ab_stage_idx)
@@ -431,15 +492,17 @@ def _conv3d_postops_kernel(
                     a_ptr = cutlass.inttoptr(
                         sA.data_ptr().toint(),
                         cutlass.AddressSpace.smem,
-                        cutlass.BFloat16,
+                        c_dtype,
                     )
                     for chunk in cutlass.range_constexpr(8):
                         local_row = producer_tid // 8 + chunk * 16
                         row = m_start + local_row
-                        q = row % Q_out
-                        p = row // Q_out % P_out
-                        z = row // (Q_out * P_out) % Z_out
-                        batch = row // (Q_out * P_out * Z_out)
+                        batch = row // volume_div
+                        remainder = row % volume_div
+                        z = remainder // plane_div
+                        remainder = remainder % plane_div
+                        p = remainder // width_div
+                        q = remainder % width_div
                         offset = cutlass.Int64(0)
                         source_bytes = cutlass.Int32(0)
                         if row < total_rows and tap < 27:
@@ -453,13 +516,15 @@ def _conv3d_postops_kernel(
                             "ca",
                             cp_size=source_bytes,
                         )
+                    # Each lane contributes one arrival AFTER its asynchronous
+                    # copies complete. Their bytes are not part of the TMA count.
                     prims.cp_async_mbarrier_arrive(full, noinc=True)
                     ab_stage_idx += 1
                     if ab_stage_idx == num_ab_stage:
                         ab_stage_idx = 0
                         ab_empty_phase_bit = ab_empty_phase_bit ^ 1
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_index += work_stride
+                tile_idx, valid_tile = schedule.get_work(work_index, runtime_clusters_m, wide_index)
         else:
             ab_stage_idx = 0
             Z_out, P_out, Q_out = zpq
@@ -467,9 +532,9 @@ def _conv3d_postops_kernel(
             pad_d, pad_h, pad_w = lower_pad_dhw
             str_d, str_h, str_w = stride_dhw
             dil_d, dil_h, dil_w = dilation_dhw
-            while work_tile.is_valid_tile:
+            while valid_tile:
                 for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
-                    cur_tile_coord = work_tile.tile_idx
+                    cur_tile_coord = tile_idx
                     mma_tile_coord_mnl = (
                         cur_tile_coord[0] // (2 if use_2cta_instrs else 1),
                         channel_half if paired_norm else cur_tile_coord[1],
@@ -478,12 +543,12 @@ def _conv3d_postops_kernel(
                     # M index for this CTA's portion of the M-tile.
                     m_off_cta = mma_tile_coord_mnl[0] * mma_tiler[0] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
                     # Output (n, z, p, q) from linear M (col-major Q-fastest).
-                    n_idx = m_off_cta // (Q_out * P_out * Z_out)
-                    rem = m_off_cta % (Q_out * P_out * Z_out)
-                    z_idx = rem // (Q_out * P_out)
-                    rem = rem % (Q_out * P_out)
-                    p_idx = rem // Q_out
-                    q_idx = rem % Q_out
+                    n_idx = m_off_cta // volume_div
+                    rem = m_off_cta % volume_div
+                    z_idx = rem // plane_div
+                    rem = rem % plane_div
+                    p_idx = rem // width_div
+                    q_idx = rem % width_div
                     # Spatial anchors for im2col TMA: idx*stride - pad_lower.
                     w_anchor = q_idx * str_w - pad_w
                     h_anchor = p_idx * str_h - pad_h
@@ -570,15 +635,14 @@ def _conv3d_postops_kernel(
                                     t_idx = 0
                                     c_chunk_idx += 1
 
-                # Advance to next persistent work-tile (static schedule).
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_index += work_stride
+                tile_idx, valid_tile = schedule.get_work(work_index, runtime_clusters_m, wide_index)
 
     # ---- MMA consumer warp ----
     elif warp_idx == mma_warp_id:
         # MMA and all epilogue warps participate in this barrier so the MMA warp
         # can pick up the tmem_ptr written by the allocator (epilogue warp 0).
-        # This subset has 160 raw or 288 fused threads, excluding producers.
+        # Producers, scheduler, and padding warps do not participate.
         tmem_bar_id = 1
         tmem_bar_threads = 32 * (1 + len(epilogue_warp_ids))
         prims.barrier_cta_sync(tmem_bar_id, thread_count=tmem_bar_threads)
@@ -624,7 +688,7 @@ def _conv3d_postops_kernel(
         num_k_blocks = cute.size(mma_tiler, mode=[2]) // mma_inst_shape_mnk[2]
 
         # Persistent loop: outer = work tiles (acc stages); inner = K-tiles.
-        while work_tile.is_valid_tile:
+        while valid_tile:
             for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
                 current_acc_stage = acc_stage_idx
                 acc_empty_mbar_ptr_stage = acc_empty_mbar_ptr.subview(current_acc_stage)
@@ -634,7 +698,7 @@ def _conv3d_postops_kernel(
                 acc_stage_idx += 1
                 if acc_stage_idx == num_acc_stage:
                     acc_stage_idx = 0
-                    acc_empty_phase_bit = acc_empty_phase_bit ^ 1
+                    acc_empty_phase_bit = acc_empty_phase_bit ^ (promotion_count % 2)
 
                 if is_leader_cta:
                     # Wait until the previous result has been consumed (epilogue
@@ -655,11 +719,11 @@ def _conv3d_postops_kernel(
                     # int advances the raw column id directly, with no element/byte
                     # scaling. Each acc stage owns a full mma_tiler[1]-wide column
                     # band, so the per-stage stride is exactly mma_tiler[1] columns.
-                    tmem_ptr_for_mma = tmem_ptr.data_ptr() + current_acc_stage * mma_tiler[1]
+                    tmem_ptr_for_mma = tmem_ptr.data_ptr() + current_acc_stage * mma_tiler[1] * bands
                     tmem_ptr_curr = cutlass.Array(tmem_ptr_for_mma, dtype=cutlass.Int32, addrspace=6)
 
-                    # scale_d=False (overwrite) only on the very first MMA of this
-                    # C-tile's K-loop; True (accumulate) for every subsequent MMA.
+                    # BF16 overwrites only at the first MMA of an output tile.
+                    # FP32 also restarts after each promoted partial sum.
                     # We use a runtime expression on (k_idx, kb_idx) instead of a
                     # mutable Python local — the local would freeze at trace time
                     # and re-trigger overwrite on every dynamic outer iteration of
@@ -678,7 +742,6 @@ def _conv3d_postops_kernel(
                         ):
                             pass
                         if cutlass.const_expr(packed_shape is not None):
-                            # Publish the cp.async gather to the MMA async proxy.
                             cute.arch.fence_view_async_shared()
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
 
@@ -686,7 +749,7 @@ def _conv3d_postops_kernel(
                         desc_a_cur_ = desc_a_cur
                         desc_b_cur_ = desc_b_cur
                         for kb_idx in cutlass.range_constexpr(num_k_blocks):
-                            scale_d_now = (k_idx > 0) | (kb_idx > 0)
+                            scale_d_now = ((k_idx % promotion_tiles if fp32 else k_idx) > 0) | (kb_idx > 0)
                             if prims.elect_sync():
                                 prims.tcgen05_mma(
                                     mma_kind,
@@ -720,17 +783,27 @@ def _conv3d_postops_kernel(
                                 group=_cta_group,
                             )
 
-                    if prims.elect_sync():
-                        # K-tile loop done — signal accumulator full to epilogue
-                        # warps (both CTAs of the group in 2cta; own CTA in 1cta).
-                        prims.tcgen05_commit(
-                            acc_full_mbar_ptr_stage,
-                            multicast_mask=_commit_mask,
-                            group=_cta_group,
-                        )
+                        if cutlass.const_expr(fp32):  # noqa: SIM102 - exclude promotion from BF16 code
+                            if (k_idx + 1) % promotion_tiles == 0 or k_idx + 1 == k_tile_cnt:
+                                if prims.elect_sync():
+                                    prims.tcgen05_commit(acc_full_mbar_ptr_stage, multicast_mask=_commit_mask, group=_cta_group)
+                                if k_idx + 1 < k_tile_cnt:
+                                    current_empty_phase_bit = current_empty_phase_bit ^ 1
+                                    while not prims.mbarrier_try_wait_parity(acc_empty_mbar_ptr_stage, current_empty_phase_bit, time_limit=10000000):
+                                        pass
+                                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                    if cutlass.const_expr(not fp32):  # noqa: SIM102 - preserve compile-time selection
+                        if prims.elect_sync():
+                            # K-tile loop done — signal accumulator full to epilogue
+                            # warps (both CTAs of the group in 2cta; own CTA in 1cta).
+                            prims.tcgen05_commit(
+                                acc_full_mbar_ptr_stage,
+                                multicast_mask=_commit_mask,
+                                group=_cta_group,
+                            )
 
-            tile_sched.advance_to_next_work()
-            work_tile = tile_sched.get_current_work()
+            work_index += work_stride
+            tile_idx, valid_tile = schedule.get_work(work_index, runtime_clusters_m, wide_index)
 
         # Producer tail: drain the remaining acc stages before exit so the
         # kernel doesn't race against epilogue warps still signalling
@@ -753,6 +826,8 @@ def _conv3d_postops_kernel(
 
     # ---- Epilogue warps: raw 0-3, fused 0-7 ----
     elif warp_idx < mma_warp_id:
+        if cutlass.const_expr(policy.epilogue_registers):
+            prims.setmaxregister(policy.epilogue_registers, "increase")
         # Per-CTA M tile size — 2cta cluster halves mma_tiler[0] across the pair.
         mma_tiler_per_cta_m = mma_tiler[0] // 2 if cutlass.const_expr(use_2cta_instrs) else mma_tiler[0]
         # Raw warps own 32 rows; fused warps own 16 channel-cooperative rows.
@@ -803,11 +878,11 @@ def _conv3d_postops_kernel(
         # epilogue subtiles within each tile.
         acc_stage_idx = 0
         epi_stage_idx = 0
-        while work_tile.is_valid_tile:
+        while valid_tile:
             if cutlass.const_expr(paired_norm):
-                # Both N160 halves belong to this M task. Keep BF16 N0 values
+                # Both channel halves belong to this M task. Keep BF16 N0 values
                 # and contiguous-channel FP32 partials live until N1 arrives.
-                retained = cutlass.Array(cutlass.Uint32, 40, space=cutlass.AddressSpace.rmem)
+                retained = cutlass.Array(retained_type, subtile_cnt * 8 * retention_scale, space=cutlass.AddressSpace.rmem)
                 partials = cutlass.Array(cutlass.Float32, 32, space=cutlass.AddressSpace.rmem)
             for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
                 current_acc_stage = acc_stage_idx
@@ -818,26 +893,49 @@ def _conv3d_postops_kernel(
                 acc_stage_idx += 1
                 if acc_stage_idx == num_acc_stage:
                     acc_stage_idx = 0
-                    acc_full_phase_bit = acc_full_phase_bit ^ 1
+                    acc_full_phase_bit = acc_full_phase_bit ^ (promotion_count % 2)
 
-                cur_tile_coord = work_tile.tile_idx
+                cur_tile_coord = tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // (2 if use_2cta_instrs else 1),
                     channel_half if paired_norm else cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
 
-                # Wait for MMA warp to commit acc_full for this stage.
-                # try_wait_parity is one non-blocking attempt; loop until the MMA
-                # warp's commit advances the phase.
-                while not prims.mbarrier_try_wait_parity(acc_full_mbar_ptr_stage, current_full_phase_bit, time_limit=10000000):
-                    pass
-                # The MMA completion handshake precedes this warp's TMEM loads.
-                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-
-                # Per-stage TMEM column origin. Lower 16 bits of tmem_raw_addr is
-                # the column id; upper 16 bits is the row id (always 0 for warp 0).
-                base_col_id = (tmem_raw_addr & 0xFFFF) + (current_acc_stage * mma_tiler[1])
+                base_col_id = (tmem_raw_addr & 0xFFFF) + current_acc_stage * mma_tiler[1] * bands
+                # BF16 performs one ordinary accumulator wait. FP32 repeatedly
+                # sums short MMA reductions with SIMT round-to-nearest adds.
+                # Only four warps own the 128 TMEM rows; every epilogue warp
+                # joins the barrier before releasing the partial band to MMA.
+                for promotion in cutlass.range(promotion_count, unroll=1):
+                    while not prims.mbarrier_try_wait_parity(acc_full_mbar_ptr_stage, current_full_phase_bit, time_limit=10000000):
+                        pass
+                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                    if cutlass.const_expr(fp32):
+                        if warp_idx < 4:
+                            for part in cutlass.range_constexpr(mma_tiler[1] // 32):
+                                partial_ptr = prims.make_tmem_ptr_from_warp_row_col(tmem_raw_addr, warp_idx, base_col_id + part * 32, cutlass.Float32)
+                                sum_ptr = prims.make_tmem_ptr_from_warp_row_col(
+                                    tmem_raw_addr, warp_idx, base_col_id + mma_tiler[1] + part * 32, cutlass.Float32
+                                )
+                                promotion_value = prims.tcgen05_ld("32x32b", partial_ptr, num=32)
+                                prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                                if promotion > 0:
+                                    promotion_previous = prims.tcgen05_ld("32x32b", sum_ptr, num=32)
+                                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                                    promotion_value = promotion_value + promotion_previous
+                                prims.tcgen05_st("32x32b", sum_ptr, promotion_value)
+                            prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                        prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
+                        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                        if promotion + 1 < promotion_count:
+                            if prims.elect_sync():
+                                promote_empty = prims.mapa(acc_empty_mbar_ptr_stage, cta_rank_in_cluster & -2)
+                                prims.mbarrier_arrive(promote_empty, count=1, scope=prims.MemScope.CLUSTER)
+                            current_full_phase_bit = current_full_phase_bit ^ 1
+                if cutlass.const_expr(fp32):
+                    base_col_id = base_col_id + mma_tiler[1]
 
                 # Per-tile output (im2col store) spatial coords. The 2CTA cluster
                 # splits M (the NZPQ pixel axis) across the pair, so the spatial
@@ -847,19 +945,18 @@ def _conv3d_postops_kernel(
                 m_off_cta = mma_tile_coord_mnl[0] * mma_tiler[0] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
                 # Bare output pixels (col-major Q-fastest). No pad/stride: the C
                 # descriptor uses zero corners, so output has no halo concept.
-                n_out = m_off_cta // (Q_out * P_out * Z_out)
-                rem_m = m_off_cta % (Q_out * P_out * Z_out)
-                z_out = rem_m // (Q_out * P_out)
-                rem_m = rem_m % (Q_out * P_out)
-                p_out = rem_m // Q_out
-                q_out = rem_m % Q_out
+                n_out = m_off_cta // volume_div
+                rem_m = m_off_cta % volume_div
+                z_out = rem_m // plane_div
+                rem_m = rem_m % plane_div
+                p_out = rem_m // width_div
+                q_out = rem_m % width_div
                 # K-out channel base for this N-tile (no cta_rank, see above).
                 k_off_base = mma_tile_coord_mnl[1] * mma_tiler[1]
 
                 if cutlass.const_expr(FUSE_NORM):
-                    # Residual loads need more latency hiding: sixteen warps own
-                    # one row/lane, versus eight warps and two rows for norm-only.
-                    rows_per_lane: cutlass.Constexpr = 1 if residual is not None or paired_norm else 2
+                    # Sixteen epilogue warps own one row/lane; eight own two.
+                    rows_per_lane: cutlass.Constexpr = 16 // len(epilogue_warp_ids)
                     lane = tidx % 32
                     lane_col = lane % 4
                     # Warp rank modulo four fixes the accessible 32-row TMEM band.
@@ -868,28 +965,26 @@ def _conv3d_postops_kernel(
                     drain_half = warp_idx // 8
                     if cutlass.const_expr(not paired_norm):
                         retained = cutlass.Array(
-                            cutlass.Uint32,
-                            20 * rows_per_lane,
+                            retained_type,
+                            subtile_cnt * 4 * rows_per_lane * retention_scale,
                             space=cutlass.AddressSpace.rmem,
                         )
                     if cutlass.const_expr(residual is not None):
                         # Drain before global residual traffic. Reuse the same packed
                         # words for raw values, then overwrite them with summed values.
-                        for drain_subtile in cutlass.range_constexpr(5):
+                        for drain_subtile in cutlass.range_constexpr(subtile_cnt):
                             drain_addr = (((tmem_raw_addr >> 16) + row_base) << 16) | (base_col_id + drain_subtile * 32)
                             drain_ptr = cutlass.inttoptr(drain_addr, 6, cutlass.Float32)
                             drain_values = prims.tcgen05_ld("16x256b", drain_ptr, num=4)
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                            drain_selected = cutlass.Array(cutlass.BFloat16, 8, space=cutlass.AddressSpace.rmem)
-                            if drain_half == 0:
-                                for j in cutlass.range_constexpr(8):
-                                    drain_selected[j] = drain_values[(j // 2) * 4 + j % 2].to(cutlass.BFloat16)
-                            else:
-                                for j in cutlass.range_constexpr(8):
-                                    drain_selected[j] = drain_values[(j // 2) * 4 + j % 2 + 2].to(cutlass.BFloat16)
+                            drain_selected = cutlass.Array(c_dtype, 8, space=cutlass.AddressSpace.rmem)
+                            for j in cutlass.range_constexpr(8):
+                                index = (j // 2) * 4 + j % 2
+                                selected = drain_values[index] if drain_half == 0 else drain_values[index + 2]
+                                drain_selected[j] = selected.to(c_dtype)
                             retained.store(
-                                drain_selected.load(0, 8).bitcast(cutlass.Uint32),
-                                (channel_half * 5 + drain_subtile) * 4,
+                                drain_selected.load(0, 8).bitcast(retained_type),
+                                (channel_half * subtile_cnt + drain_subtile) * 4 * retention_scale,
                             )
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if prims.elect_sync():
@@ -908,9 +1003,9 @@ def _conv3d_postops_kernel(
                     if cutlass.const_expr(channel_half == 0):
                         for part in cutlass.range_constexpr(32 * rows_per_lane):
                             partials[part] = cutlass.Float32(0.0)
-                    for norm_subtile in cutlass.range_constexpr(5):
+                    for norm_subtile in cutlass.range_constexpr(subtile_cnt):
                         rounded = cutlass.Array(
-                            cutlass.BFloat16,
+                            c_dtype,
                             8 * rows_per_lane,
                             space=cutlass.AddressSpace.rmem,
                         )
@@ -919,47 +1014,92 @@ def _conv3d_postops_kernel(
                             norm_ptr = cutlass.inttoptr(norm_addr, 6, cutlass.Float32)
                             norm_rmem = prims.tcgen05_ld("16x256b", norm_ptr, num=4)
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                            if cutlass.const_expr(paired_norm):
-                                if drain_half == 0:
-                                    for j in cutlass.range_constexpr(8):
-                                        rounded[j] = norm_rmem[(j // 2) * 4 + j % 2].to(cutlass.BFloat16)
-                                else:
-                                    for j in cutlass.range_constexpr(8):
-                                        rounded[j] = norm_rmem[(j // 2) * 4 + j % 2 + 2].to(cutlass.BFloat16)
+                            if cutlass.const_expr(rows_per_lane == 1):
+                                for j in cutlass.range_constexpr(8):
+                                    index = (j // 2) * 4 + j % 2
+                                    selected = norm_rmem[index] if drain_half == 0 else norm_rmem[index + 2]
+                                    rounded[j] = selected.to(c_dtype)
                             else:
-                                rounded.store(norm_rmem.to(cutlass.BFloat16), 0)
+                                rounded.store(norm_rmem.to(c_dtype), 0)
                         else:
                             rounded.store(
-                                retained.load((channel_half * 5 + norm_subtile) * 4, 4).bitcast(cutlass.BFloat16),
+                                retained.load(
+                                    (channel_half * subtile_cnt + norm_subtile) * 4 * retention_scale,
+                                    4 * retention_scale,
+                                ).bitcast(c_dtype),
                                 0,
                             )
-                        math_width = 1 if paired_norm else 2
+                        math_width = 1 if norm_channels == 320 else 2
                         for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                             scalar = j * math_width
-                            channel = channel_half * 160 + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8 + lane_col * 2 + scalar % 2
+                            channel = channel_half * mma_tiler[1] + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8 + lane_col * 2 + scalar % 2
                             if cutlass.const_expr(paired_norm):
                                 bias_pair = (norm_params.data_ptr() + channel).load(count=math_width, alignment=2 * math_width)
                             else:
                                 bias_pair = (conv_bias.iterator.raw_ptr() + channel).load(count=2, alignment=4)
                             value = rounded.load(scalar, math_width).to(cutlass.Float32)
                             rounded.store(
-                                (value + bias_pair.to(cutlass.Float32)).to(cutlass.BFloat16),
+                                (value + bias_pair.to(cutlass.Float32)).to(c_dtype),
                                 scalar,
                             )
                         if cutlass.const_expr(residual is not None):
-                            for pair in cutlass.range_constexpr(4):
+                            # N96/N192 benefit from full-sector BF16 residual transactions.
+                            # Exchange adjacent-lane BF16 pairs to move four values
+                            # per lane; preserve the TMEM/reduction lane mapping.
+                            # Other tiles retain the pairwise instruction path.
+                            if cutlass.const_expr(mma_tiler[1] in (96, 192) and not fp32):
                                 skip_row = row_base + lane // 4 + drain_half * 8
                                 skip_pixel = cutlass.Int64(m_off_cta) + skip_row
                                 if skip_pixel < batches * Z_out * P_out * Q_out:
-                                    channel = channel_half * 160 + norm_subtile * 32 + pair * 8 + lane_col * 2
-                                    offset = skip_pixel * norm_channels + channel
-                                    skip = (residual.iterator.raw_ptr() + offset).load(count=2, alignment=4)
-                                    if cutlass.const_expr(residual_bias is not None):
-                                        skip_bias = (residual_bias.iterator.raw_ptr() + channel).load(count=2, alignment=4)
-                                        skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
-                                    summed_pair = (rounded.load(pair * 2, 2).to(cutlass.Float32) + skip.to(cutlass.Float32)).to(cutlass.BFloat16)
-                                    rounded.store(summed_pair, pair * 2)
-                                    (prep_residual.iterator.raw_ptr() + offset).store(summed_pair, alignment=4)
+                                    for group in cutlass.range_constexpr(2):
+                                        channel = channel_half * mma_tiler[1] + norm_subtile * 32 + group * 16 + (lane_col % 2) * 8 + (lane_col // 2) * 4
+                                        offset = skip_pixel * norm_channels + channel
+                                        skip_quad = (residual.iterator.raw_ptr() + offset).load(count=4, alignment=8)
+                                        if cutlass.const_expr(residual_bias is not None):
+                                            bias_quad = (residual_bias.iterator.raw_ptr() + channel).load(count=4, alignment=8)
+                                            skip_quad = (skip_quad.to(cutlass.Float32) + bias_quad.to(cutlass.Float32)).to(c_dtype)
+                                        # A two-lane mask keeps tail-row predicates safe.
+                                        words = skip_quad.bitcast(cutlass.Uint32)
+                                        neighbor0 = cute.arch.shuffle_sync(words[0], lane ^ 1, mask=cutlass.Uint32(3) << ((lane // 2) * 2))
+                                        neighbor1 = cute.arch.shuffle_sync(words[1], lane ^ 1, mask=cutlass.Uint32(3) << ((lane // 2) * 2))
+                                        pairs = cutlass.Array(cutlass.Uint32, 2, space=cutlass.AddressSpace.rmem)
+                                        if lane_col % 2 == 0:
+                                            pairs[0] = words[0]
+                                            pairs[1] = neighbor0
+                                        else:
+                                            pairs[0] = neighbor1
+                                            pairs[1] = words[1]
+                                        for part in cutlass.range_constexpr(2):
+                                            skip = pairs.load(part, 1).bitcast(c_dtype)
+                                            summed_pair = (rounded.load(group * 4 + part * 2, 2).to(cutlass.Float32) + skip.to(cutlass.Float32)).to(c_dtype)
+                                            rounded.store(summed_pair, group * 4 + part * 2)
+                                        residual_lo = rounded.load(group * 4, 2).bitcast(cutlass.Uint32)[0]
+                                        residual_hi = rounded.load(group * 4 + 2, 2).bitcast(cutlass.Uint32)[0]
+                                        residual_neighbor_lo = cute.arch.shuffle_sync(residual_lo, lane ^ 1, mask=cutlass.Uint32(3) << ((lane // 2) * 2))
+                                        residual_neighbor_hi = cute.arch.shuffle_sync(residual_hi, lane ^ 1, mask=cutlass.Uint32(3) << ((lane // 2) * 2))
+                                        if lane_col % 2 == 0:
+                                            pairs[0] = residual_lo
+                                            pairs[1] = residual_neighbor_lo
+                                        else:
+                                            pairs[0] = residual_neighbor_hi
+                                            pairs[1] = residual_hi
+                                        if cutlass.const_expr(prep_residual is not None):
+                                            (prep_residual.iterator.raw_ptr() + offset).store(pairs.load(0, 2).bitcast(c_dtype), alignment=8)
+                            else:
+                                for pair in cutlass.range_constexpr(4):
+                                    skip_row = row_base + lane // 4 + drain_half * 8
+                                    skip_pixel = cutlass.Int64(m_off_cta) + skip_row
+                                    if skip_pixel < batches * Z_out * P_out * Q_out:
+                                        channel = channel_half * mma_tiler[1] + norm_subtile * 32 + pair * 8 + lane_col * 2
+                                        offset = skip_pixel * norm_channels + channel
+                                        skip = (residual.iterator.raw_ptr() + offset).load(count=2, alignment=4)
+                                        if cutlass.const_expr(residual_bias is not None):
+                                            skip_bias = (residual_bias.iterator.raw_ptr() + channel).load(count=2, alignment=4)
+                                            skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(c_dtype)
+                                        summed_pair = (rounded.load(pair * 2, 2).to(cutlass.Float32) + skip.to(cutlass.Float32)).to(c_dtype)
+                                        rounded.store(summed_pair, pair * 2)
+                                        if cutlass.const_expr(prep_residual is not None):
+                                            (prep_residual.iterator.raw_ptr() + offset).store(summed_pair, alignment=4)
                         for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                             scalar = j * math_width
                             value = rounded.load(scalar, math_width).to(cutlass.Float32)
@@ -967,12 +1107,17 @@ def _conv3d_postops_kernel(
                             # for each of four adjacent channels per virtual lane.
                             # Physical lanes retain two channels from each group
                             # of eight; neighboring pairs complete a virtual lane.
-                            channel_group = (channel_half * 160 + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8) // 8 % 16
+                            if cutlass.const_expr(norm_channels == 96):
+                                # Scalar Torch lanes accumulate c, c+32, c+64.
+                                # Each physical lane owns two channels per eight.
+                                channel_group = scalar // (2 * rows_per_lane)
+                            else:
+                                channel_group = (channel_half * mma_tiler[1] + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8) // 8 % 16
                             part = ((scalar // 2) % rows_per_lane) * 32 + channel_group * 2 + scalar % 2
                             partials.store(partials.load(part, math_width) + value * value, part)
                         retained.store(
-                            rounded.load(0, 8 * rows_per_lane).bitcast(cutlass.Uint32),
-                            (channel_half * 5 + norm_subtile) * 4 * rows_per_lane,
+                            rounded.load(0, 8 * rows_per_lane).bitcast(retained_type),
+                            (channel_half * subtile_cnt + norm_subtile) * 4 * rows_per_lane * retention_scale,
                         )
 
                     # All accumulators are now register-owned. Release TMEM before
@@ -988,18 +1133,30 @@ def _conv3d_postops_kernel(
                     # changing the four-physical-lanes-per-row TMEM mapping.
                     denominators = cutlass.Array(cutlass.Float32, rows_per_lane, space=cutlass.AddressSpace.rmem)
                     for row_half in cutlass.range_constexpr(rows_per_lane):
-                        virtual_lanes = cutlass.Array(cutlass.Float32, 16, space=cutlass.AddressSpace.rmem)
-                        for q in cutlass.range_constexpr(16):
-                            lo = partials[row_half * 32 + q * 2]
-                            hi = partials[row_half * 32 + q * 2 + 1]
-                            # Even physical lanes produce ((p0+p1)+p2)+p3.
-                            # Odd-lane values are not consumed by the final sum.
-                            virtual_lanes[q] = ((lo + hi) + cute.arch.shuffle_sync(lo, lane ^ 1)) + cute.arch.shuffle_sync(hi, lane ^ 1)
-                        for offset in cutlass.range_constexpr(4):
-                            step = 8 >> offset
-                            for q in cutlass.range_constexpr(step):
-                                virtual_lanes[q] = virtual_lanes[q] + virtual_lanes[q + step]
-                        total = cute.arch.shuffle_sync(virtual_lanes[0], (lane // 4) * 4) + cute.arch.shuffle_sync(virtual_lanes[0], (lane // 4) * 4 + 2)
+                        if cutlass.const_expr(norm_channels == 96):
+                            sums = cutlass.Array(cutlass.Float32, 2, space=cutlass.AddressSpace.rmem)
+                            for part in cutlass.range_constexpr(2):
+                                base = row_half * 32 + part
+                                # Virtual shuffle-down offsets 16 and 8 are
+                                # local; offsets 4 and 2 cross physical lanes.
+                                channel_sum = (partials[base] + partials[base + 4]) + (partials[base + 2] + partials[base + 6])
+                                channel_sum = channel_sum + cute.arch.shuffle_sync(channel_sum, lane ^ 2)
+                                channel_sum = channel_sum + cute.arch.shuffle_sync(channel_sum, lane ^ 1)
+                                sums[part] = channel_sum
+                            total = cute.arch.shuffle_sync(sums[0] + sums[1], (lane // 4) * 4)
+                        else:
+                            virtual_lanes = cutlass.Array(cutlass.Float32, 16, space=cutlass.AddressSpace.rmem)
+                            for q in cutlass.range_constexpr(16):
+                                lo = partials[row_half * 32 + q * 2]
+                                hi = partials[row_half * 32 + q * 2 + 1]
+                                # Even physical lanes produce ((p0+p1)+p2)+p3.
+                                # Odd-lane values are not consumed by the final sum.
+                                virtual_lanes[q] = ((lo + hi) + cute.arch.shuffle_sync(lo, lane ^ 1)) + cute.arch.shuffle_sync(hi, lane ^ 1)
+                            for offset in cutlass.range_constexpr(4):
+                                step = 8 >> offset
+                                for q in cutlass.range_constexpr(step):
+                                    virtual_lanes[q] = virtual_lanes[q] + virtual_lanes[q + step]
+                            total = cute.arch.shuffle_sync(virtual_lanes[0], (lane // 4) * 4) + cute.arch.shuffle_sync(virtual_lanes[0], (lane // 4) * 4 + 2)
                         denominator = cute.math.sqrt(total, fastmath=False)
                         if denominator < 1e-12:
                             denominator = cutlass.Float32(1e-12)
@@ -1023,27 +1180,29 @@ def _conv3d_postops_kernel(
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
 
                         if cutlass.const_expr(FUSE_NORM):
-                            retained_values = retained.load(subtile_idx * 4 * rows_per_lane, 4 * rows_per_lane).bitcast(cutlass.BFloat16)
+                            retained_values = retained.load(subtile_idx * 4 * rows_per_lane * retention_scale, 4 * rows_per_lane * retention_scale).bitcast(
+                                c_dtype
+                            )
                             fused_rmem = cutlass.Array(
                                 c_dtype,
                                 8 * rows_per_lane,
                                 space=cutlass.AddressSpace.rmem,
                                 alignment=4,
                             )
-                            math_width = 1 if paired_norm else 2
+                            math_width = 1 if norm_channels == 320 else 2
                             for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                                 scalar = j * math_width
                                 col = subtile_idx * 32 + (scalar // (2 * rows_per_lane)) * 8 + lane_col * 2 + scalar % 2
                                 value = retained_values[scalar : scalar + math_width].to(cutlass.Float32)
-                                normalized = (value / denominators[(scalar // 2) % rows_per_lane]).to(cutlass.BFloat16)
-                                scaled = (normalized.to(cutlass.Float32) * (norm_channels**0.5)).to(cutlass.BFloat16)
+                                normalized = (value / denominators[(scalar // 2) % rows_per_lane]).to(c_dtype)
+                                scaled = (normalized.to(cutlass.Float32) * (norm_channels**0.5)).to(c_dtype)
                                 if cutlass.const_expr(paired_norm):
-                                    gamma_pair = (norm_params.data_ptr() + 320 + col).load(count=math_width, alignment=2 * math_width)
+                                    gamma_pair = (norm_params.data_ptr() + norm_channels + col).load(count=math_width, alignment=2 * math_width)
                                 else:
                                     gamma_pair = (gamma.iterator.raw_ptr() + col).load(count=2, alignment=4)
-                                affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(cutlass.BFloat16)
+                                affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(c_dtype)
                                 value = affine.to(cutlass.Float32)
-                                activated = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(cutlass.BFloat16)
+                                activated = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(c_dtype)
                                 fused_rmem.store(activated, scalar)
 
                         # Raw lanes store four 16B vectors. Fused lanes store eight
@@ -1058,16 +1217,16 @@ def _conv3d_postops_kernel(
                                 smem_thr_ptr.data_ptr().store_swizzled(
                                     vec_io,
                                     alignment=4,
-                                    swizzle=cutlass.Swizzle(2, 4, 3),
+                                    swizzle=cutlass.Swizzle(3 if fp32 else 2, 4, 3),
                                 )
                                 if cutlass.const_expr(PREP_SHAPE is not None):
-                                    pixel = cutlass.Int64(m_off_cta) + row
-                                    batch = pixel // (Z_out * P_out * Q_out)
-                                    time = pixel // (P_out * Q_out) % Z_out
-                                    spatial = pixel % (P_out * Q_out)
+                                    pixel = (cutlass.Int64 if wide_index else cutlass.Int32)(m_off_cta) + row
+                                    batch = pixel // volume_div
+                                    time = (pixel % volume_div) // plane_div
+                                    spatial = pixel % plane_div
                                     if batch < batches and time >= Z_out - cache_frames:
                                         cache_offset = (
-                                            ((batch * cache_frames + time - Z_out + cache_frames) * P_out * Q_out + spatial) * norm_channels
+                                            ((cutlass.Int64(batch) * cache_frames + time - Z_out + cache_frames) * P_out * Q_out + spatial) * norm_channels
                                             + subtile_idx * 32
                                             + col
                                         )
@@ -1092,7 +1251,7 @@ def _conv3d_postops_kernel(
                                 smem_thr_ptr.data_ptr().store_swizzled(
                                     vec_io,
                                     alignment=16,
-                                    swizzle=cutlass.Swizzle(2, 4, 3),
+                                    swizzle=cutlass.Swizzle(3 if fp32 else 2, 4, 3),
                                 )
 
                         # Make swizzled SMEM stores visible to the TMA proxy.
@@ -1133,8 +1292,8 @@ def _conv3d_postops_kernel(
                         scope=prims.MemScope.CLUSTER,
                     )
 
-            tile_sched.advance_to_next_work()
-            work_tile = tile_sched.get_current_work()
+            work_index += work_stride
+            tile_idx, valid_tile = schedule.get_work(work_index, runtime_clusters_m, wide_index)
 
         # The issuing lane drains global writes, not only SMEM reads.
         if warp_idx == epilogue_warp_ids[0] and store_issuer:
@@ -1171,79 +1330,41 @@ def _conv3d_postops_kernel(
             prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=_cta_group)
 
 
-_conv3d_postops_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@dataclass(frozen=True)
-class Conv3dConfig:
-    """Padded NTHWC dimensions for the fixed 3x3x3, N160, 2CTA kernel."""
-
-    n: int
-    t: int
-    h: int
-    w: int
-    ci: int
-    co: int
-    max_active_clusters: int
-
-    @property
-    def input_shape(self) -> tuple[int, ...]:
-        """Return the contiguous NTHWC convolution input shape."""
-        return self.n, self.t, self.h, self.w, self.ci
-
-    @property
-    def packed_weight_shape(self) -> tuple[int, ...]:
-        """OTRSC filters with each input-channel row padded to K64."""
-        return self.co, 3, 3, 3, (self.ci + 63) // 64 * 64
-
-    @property
-    def output_shape(self) -> tuple[int, ...]:
-        """Return the NTHWC shape after valid 3x3x3 convolution."""
-        return self.n, self.t - 2, self.h - 2, self.w - 2, self.co
+def _coordinate_divisor(value, wide_index: bool):
+    """Build a fast 32-bit divisor on the host, or preserve a wide divisor."""
+    return value if wide_index else cute.fast_divmod_create_divisor(value)
 
 
 class Conv3dPostOpsLaunch:
-    """Specialize the convolution launch for its geometry and fused post-operations."""
-
     def __init__(
         self,
-        config: Conv3dConfig,
+        config: ConvSpecialization,
         fuse_norm: bool = False,
-        prepare_output: bool = False,
-        previous_frames: int | None = None,
         has_residual: bool = False,
         has_residual_bias: bool = False,
         spatial_output: bool = False,
+        wide_index: bool = False,
+        prepare_output: bool = False,
     ) -> None:
-        """Record convolution geometry and validate the selected fusion options."""
         self.config = config
         self.fuse_norm = fuse_norm
         self.prepare_output = prepare_output
-        self.previous_frames = previous_frames
+        self.policy = LaunchPolicy.for_conv(
+            config, fuse_norm=fuse_norm, has_residual=has_residual, spatial_output=spatial_output, prepare_output=prepare_output
+        )
         self.has_residual = has_residual
         self.has_residual_bias = has_residual_bias
         self.spatial_output = spatial_output
-        if self.prepare_output and not self.fuse_norm:
-            raise ValueError("Prepared output requires normalization")
-        if self.previous_frames is not None and not self.prepare_output:
-            raise ValueError("History is only valid for prepared output")
+        self.wide_index = wide_index
 
     def __repr__(self) -> str:
-        """Identify the launch specialization by shape, schedule, and fusion options."""
         cfg = self.config
-        operation = "Raw"
-        if self.prepare_output:
-            operation = "NormSiluPad"
-        elif self.fuse_norm:
-            operation = "NormSilu"
-        elif self.spatial_output:
-            operation = "BiasResidualPad"
         return (
-            f"Conv3d{operation}_"
-            f"{cfg.n}x{cfg.t}x{cfg.h}x{cfg.w}x{cfg.ci}_{cfg.co}_"
-            f"2cta_n160_k3_clusters{cfg.max_active_clusters}_prev{self.previous_frames}"
+            f"Conv3d{'NormSilu' if self.fuse_norm else 'Raw'}_"
+            f"{cfg.ci}_{cfg.co}_"
+            f"2cta_n{cfg.tile_n}_k3_ctas{cfg.ctas}_norm{self.fuse_norm}"
             f"_res{self.has_residual}_rb{self.has_residual_bias}"
-            f"_spatial{self.spatial_output}"
+            f"_pad{self.prepare_output}_spatial{self.spatial_output}_wide{self.wide_index}_{cfg.precision}"
         )
 
     @cute.jit
@@ -1252,7 +1373,7 @@ class Conv3dPostOpsLaunch:
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
-        stream: cuda_driver.CUstream,
+        stream: driver.CUstream,
         conv_bias: cute.Tensor = None,
         gamma: cute.Tensor = None,
         prep_padded: cute.Tensor = None,
@@ -1260,9 +1381,11 @@ class Conv3dPostOpsLaunch:
         residual: cute.Tensor = None,
         residual_bias: cute.Tensor = None,
         prep_residual: cute.Tensor = None,
+        *,
+        geometry,
+        history: cutlass.Int32,
     ) -> None:
-        """Build tensor maps and launch the shape-specialized convolution pipeline."""
-        cfg = self.config
+        cfg = ConvConfig(*geometry, ci=self.config.ci, co=self.config.co, ctas=self.config.ctas, precision=self.config.precision)
         tma_a_desc, tma_b_desc, tma_c_desc = _make_tensor_maps(
             cfg,
             a,
@@ -1272,67 +1395,69 @@ class Conv3dPostOpsLaunch:
             spatial_output=self.spatial_output,
         )
         groups = 2
-        tiles = (
-            cute.ceil_div(math.prod(cfg.output_shape[:-1]), 128),
-            1 if self.fuse_norm else cute.ceil_div(cfg.co, 160),
-            1,
+        scheduler = TileSchedule(
+            tiles_n=1 if self.fuse_norm else (cfg.co + cfg.tile_n - 1) // cfg.tile_n,
+            cluster_m=groups,
         )
-        scheduler = PersistentTileSchedulerParams(tiles, (groups, 1, 1))
-        grid = StaticPersistentTileScheduler.get_grid_shape(scheduler, cfg.max_active_clusters)
-        ab_stages, c_stages = 8, 2
-        if cutlass.const_expr(self.fuse_norm and cfg.co == 320 and cfg.ci == 320):
-            # The longer K135 convolution benefits from a deeper output-store
-            # queue; C160->C320 keeps its measured faster eight/two schedule.
-            ab_stages, c_stages = 6, 6
+        clusters_m = (math.prod(cfg.output_shape[:-1]) + 255) // 256
+        grid = (groups, 1, cutlass.min(clusters_m * scheduler.tiles_n, cfg.ctas // groups))
+        policy = self.policy
         # Each spatial filter position has its own independently zero-filled
         # channel tail. Flattening TRS*C before ceil-div truncates C=160 work.
-        reduction_tiles = 3 * 3 * 3 * ((cfg.ci + 63) // 64)
+        logical_k = 32 if cfg.precision == "tf32" else 64
+        reduction_tiles = 27 * ((cfg.ci + logical_k - 1) // logical_k)
+        z, h, w = cfg.output_shape[1:4]
+        hp, wp = h + 2, w + 2
+        auxiliary_rows = (2 - history) * hp * wp + (z + history) * (2 * wp + 2 * h)
+        volume_div = _coordinate_divisor(z * h * w, self.wide_index)
+        plane_div = _coordinate_divisor(h * w, self.wide_index)
+        width_div = _coordinate_divisor(w, self.wide_index)
+        padded_plane_div = _coordinate_divisor(hp * wp, self.wide_index)
+        padded_width_div = _coordinate_divisor(wp, self.wide_index)
+        auxiliary_rows_div = _coordinate_divisor(auxiliary_rows, self.wide_index)
+        border_rows_div = _coordinate_divisor(2 * wp + 2 * h, self.wide_index)
+        spatial_border_div = _coordinate_divisor(h + w + 1, self.wide_index)
+        cluster_divisor = _coordinate_divisor(clusters_m, self.wide_index)
         _conv3d_postops_kernel(
             (
                 "conv_bias_residual_pad"
                 if self.spatial_output
-                else (
-                    "conv_residual_norm_silu_pad"
-                    if self.has_residual and self.prepare_output
-                    else (
-                        "conv_norm_silu_pad"
-                        if self.prepare_output
-                        else "conv_residual_norm_silu" if self.has_residual else "conv_norm_silu" if self.fuse_norm else "conv_raw"
-                    )
-                )
+                else "conv_residual_norm_prepare" if self.has_residual else "conv_norm_silu_prepare" if self.fuse_norm else "conv_raw"
             ),
             scheduler,
-            (128 * groups, 160, 64),
-            (128 * groups, 160, 16),
+            (128 * groups, cfg.tile_n, 32 if cfg.precision != "bf16" else 64),
+            (128 * groups, cfg.tile_n, 8 if cfg.precision != "bf16" else 16),
             reduction_tiles,
-            ab_stages,
-            c_stages,
+            policy,
             True,
             cfg.output_shape[1:4],
             cfg.n,
             tma_a_desc,
             tma_b_desc,
             tma_c_desc,
+            a.element_type,
             conv_bias,
             gamma,
             prep_padded=prep_padded,
             prep_cache=prep_cache,
-            PREP_SHAPE=(cfg.n, self.previous_frames) if self.prepare_output else None,
+            PREP_SHAPE=(cfg.n, history) if self.prepare_output else None,
             residual=residual,
             residual_bias=residual_bias,
             prep_residual=prep_residual,
             SPATIAL_SHAPE=(cfg.n, cfg.co) if self.spatial_output else None,
+            runtime_clusters_m=cluster_divisor,
+            volume_div=volume_div,
+            plane_div=plane_div,
+            width_div=width_div,
+            padded_plane_div=padded_plane_div,
+            padded_width_div=padded_width_div,
+            auxiliary_rows_div=auxiliary_rows_div,
+            border_rows_div=border_rows_div,
+            spatial_border_div=spatial_border_div,
+            wide_index=self.wide_index,
         ).launch(
             grid=grid,
-            block=(
-                (
-                    ((576 if cfg.co == 320 or self.has_residual else 320) + ((128 if cfg.co == 320 else 64) if self.prepare_output else 0))
-                    if self.fuse_norm
-                    else (320 if self.spatial_output else 192)
-                ),
-                1,
-                1,
-            ),
+            block=(policy.threads, 1, 1),
             min_blocks_per_mp=1 if self.fuse_norm or self.spatial_output else 0,
             cluster=(groups, 1, 1),
             stream=stream,
@@ -1341,7 +1466,7 @@ class Conv3dPostOpsLaunch:
 
 
 def _make_tensor_maps(
-    cfg: Conv3dConfig,
+    cfg: ConvConfig,
     x: cute.Tensor,
     weight: cute.Tensor,
     output: cute.Tensor,
@@ -1350,8 +1475,9 @@ def _make_tensor_maps(
     spatial_output: bool = False,
 ) -> tuple[cuda.TensorMap, cuda.TensorMap, cuda.TensorMap]:
     """Build public tensor maps inside the JIT host wrapper."""
-    dtype = cutlass.BFloat16
-    a_dims, a_strides = _contiguous_tma_layout(cfg.input_shape, dtype)
+    dtype = x.element_type
+    component_channels = cfg.ci
+    a_dims, a_strides = _contiguous_tma_layout((*cfg.input_shape[:-1], component_channels), dtype)
     b_dims, b_strides = _contiguous_tma_layout(cfg.packed_weight_shape, dtype)
     c_dims, c_strides = _contiguous_tma_layout(cfg.output_shape, dtype)
     output_offset = 0
@@ -1363,16 +1489,14 @@ def _make_tensor_maps(
         pad_hw = 2 if prepared_output else 1
         pad_t = 2 if prepared_output else 0
         c_strides_bytes = (
-            c * dtype.width // 8,
-            (w + pad_hw) * c * dtype.width // 8,
-            (h + pad_hw) * (w + pad_hw) * c * dtype.width // 8,
-            (t + pad_t) * (h + pad_hw) * (w + pad_hw) * c * dtype.width // 8,
+            cutlass.Int64(c) * dtype.width // 8,
+            cutlass.Int64(w + pad_hw) * c * dtype.width // 8,
+            cutlass.Int64(h + pad_hw) * (w + pad_hw) * c * dtype.width // 8,
+            cutlass.Int64(t + pad_t) * (h + pad_hw) * (w + pad_hw) * c * dtype.width // 8,
         )
-        if any(stride % 16 for stride in c_strides_bytes):
-            raise ValueError("Output TMA strides must be multiples of 16 bytes")
         c_strides = tuple(stride // 16 for stride in c_strides_bytes)
         if prepared_output:
-            output_offset = (2 * (h + 2) * (w + 2) + (w + 2) + 1) * c
+            output_offset = (cutlass.Int64(2) * (h + 2) * (w + 2) + (w + 2) + 1) * c
 
     tma_a_desc = cuda.create_tensor_map_im2col(
         global_address=x.iterator.toint(),
@@ -1381,7 +1505,7 @@ def _make_tensor_maps(
         global_strides=a_strides,
         lower_corner=(0, 0, 0),
         upper_corner=(-2, -2, -2),
-        channels_per_pixel=64,
+        channels_per_pixel=32 if cfg.precision != "bf16" else 64,
         pixels_per_column=128,
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
@@ -1390,7 +1514,7 @@ def _make_tensor_maps(
         dtype=dtype,
         global_dims=b_dims,
         global_strides=b_strides,
-        box_dims=(64, 1, 1, 1, 80),
+        box_dims=(32 if cfg.precision != "bf16" else 64, 1, 1, 1, cfg.tile_n // 2),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     tma_c_desc = cuda.create_tensor_map_im2col(
@@ -1402,6 +1526,9 @@ def _make_tensor_maps(
         upper_corner=(0, 0, 0),
         channels_per_pixel=32,
         pixels_per_column=128,
-        swizzle=cuda.TensorMapSwizzle.s64b,
+        swizzle=cuda.TensorMapSwizzle.s128b if cfg.precision != "bf16" else cuda.TensorMapSwizzle.s64b,
     )
     return tma_a_desc, tma_b_desc, tma_c_desc
+
+
+_conv3d_postops_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
