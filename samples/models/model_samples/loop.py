@@ -20,7 +20,10 @@ sample's own loop -- there is no ``generate()`` here.  ``trace`` replays the fir
 lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
 what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
 traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
-say about that set (``claim``).
+say about that set (``claim``).  ``trace_request`` is the other form of a traced pass, for a request that is timed and
+then traced (``model_samples.perf``): it replays nothing and traces steps of the request that is running, issued by the
+caller's own loop body; such a request starts from ``reset(fresh=False, recorded=False)`` -- the state zeroed in place,
+nothing recorded.
 
 A session's plan is for one number of tokens per sequence (``tokens``).  At one, its step is the decode step (``prefill``,
 ``step``).  At more, its step is the verify step of speculative decoding (``verify``): every sequence is fed that many
@@ -532,11 +535,15 @@ class Session:
         self._report.calls_per_step = self._calls
         self.reset(fresh=True)
 
-    def reset(self, fresh: bool = True) -> None:
+    def reset(self, fresh: bool = True, recorded: bool = True) -> None:
         """Back to the start of a prompt set: zero state at position 0 and an empty record (both records of a session built
         with ``draft_tokens=``: its prompt's and its verify steps'); ``fresh`` allocates them anew.  What a drafter reads
         of the step before it -- the final-norm rows, the greedy ids, the kept count -- and the drafter's cache are
-        part of the state and go with it: a second prompt set starts from nothing of the first."""
+        part of the state and go with it: a second prompt set starts from nothing of the first.
+
+        ``recorded=False`` is for a request that is timed (the performance mode: ``reset(fresh=False, recorded=False)``,
+        the state zeroed in place): its steps keep nothing for the checks.  The record is then one of 0 steps, the form
+        the traced pass runs on -- a step copies no ids and no logits into it -- until the next reset that records."""
         if fresh or self.state is None:
             self.state = self._fresh_state()
             self.record = self._record(self.record_steps)
@@ -548,6 +555,9 @@ class Session:
             self.record.accepted_all.clear()
             if self.prompt_record is not None:
                 self.prompt_record.count, self.prompt_record.prompt = 0, None
+        steps = self.record_steps if recorded else 0
+        if self.record.inputs.shape[0] != steps:  # a request that keeps nothing, or the first one behind it that records again
+            self.record, self.prompt_record = self._record(steps), self._prompt_record(steps)
         self._open = False
         self._calls = 0
         self._report.clock.launch.clear()
@@ -903,6 +913,32 @@ class Session:
             (self.state, self.record, self.prompt_record), self._calls, self._call_log = kept, calls, None
         if records:
             self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, claim, len(passes))
+
+    def trace_request(self, step, steps: int) -> None:
+        """The traced steps of a request that is running (the performance mode's traced request): ``step(i)`` for ``i`` in
+        ``range(steps)`` under the profiler, with launch records.  ``step`` is the caller's own loop body -- one
+        ``Session.step`` from where the state stands and its host read (``read``) -- so a traced step is launched as the
+        untraced steps of the request were.  Unlike ``trace`` nothing is replayed, swapped or put back: the state, its
+        allocations and the ids are the request's own, and the prompt in front of the traced steps is the caller's, fed
+        untraced and closed by its host read.  It keeps what ``trace`` keeps for the kernel check (``self.traced``: the
+        sites of a step, one call log per traced step, the launch records cut into steps, or why there are none)."""
+        self._decode_only("Session.trace_request")
+        if self.on_demand is not None or self.draft_tokens is not None:  # the reference of a run's checks, as in ``trace``; a session behind a prompt
+            raise ValueError("Session.trace_request traces decode steps of a session that runs on its own weights (no on_demand, no draft_tokens)")
+        sites, claim = census.expected(self.plan, self.model), self.claim()
+        call_log: List[list] = []
+        launches: list = []
+
+        def logged(i: int) -> None:
+            self._call_log = []
+            call_log.append(self._call_log)
+            step(i)
+
+        try:
+            self._report.trace, self._report.trace_missing = trace_steps(logged, steps, self.device, records=launches)
+        finally:
+            self._call_log = None
+        self.traced = census.Traced.of(sites, call_log, launches, steps, self._report.trace_missing, self.sequences, claim)
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""

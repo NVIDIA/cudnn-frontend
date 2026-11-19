@@ -179,10 +179,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
     a test reads a run's lines from standard error. The text of sequence 0 of a checkpoint goes to standard output (or to
     the file of `--text-out`) and nothing else does; it is written piece by piece inside the loop, each piece flushed,
     between the host read of a step and the next launch, so its write is counted in that step's turnaround and never
-    inside a block. Seeded weights give no language, and their text is written nowhere. A request gets one text: a run
-    with a list of sequence counts writes the text of a prompt with the first count, and a later count reports whether
-    its sequence 0 produced the same text. A line of a run never goes to standard output, also where standard error
-    is closed (`print` writes to standard output when it is handed no stream). The GPU test of a default run holds
+    inside a block -- or once, after the report, with `--no-stream` and always in the performance mode. Seeded
+    weights give no language, and their text is written nowhere. A request gets one text: a run with a list of
+    sequence counts writes the text of a prompt with the first count, and a later count reports whether its
+    sequence 0 produced the same text. A line of a run never goes to standard output, also where standard error is
+    closed (`print` writes to standard output when it is handed no stream). The GPU test of a default run holds
     both streams: the run's lines on standard error and an empty standard output, in this process and in a fresh
     interpreter.
 18. **A request body is answered field by field, beside the script.** A sample that takes the body a serving engine's
@@ -202,6 +203,22 @@ does not hold is printed as not known and ignored, so a new name for one of them
     before the load to somebody who comes from a serving engine -- the decoding rule beside the checkpoint's own
     generation settings, the decode steps a prompt takes before the first new token -- states what is exact at that
     point, a rule and a count, never a time: the report measures the time.
+19. **The performance mode states what it observed, never what it assumes.** One definition per statistic, written in
+    the report file, with a host test of its arithmetic on constructed time stamps. Nothing but the step runs inside a
+    timed request: no recorder, no call log, no profiler, no text; and no profiler pass runs in the process before its
+    last timed request. The report says at which positions the blocks were held against the reference, that every
+    timed request gave the checked request's tokens and state, and that the kernels of the traced steps are the
+    plan's; a run in which one of the three does not hold prints no rate, and kernels that could not be observed are
+    reported as not observed, the rate staying `orientation` with that reason. Another process, the clock and a
+    limit reason are observed or printed as not observed; `none seen` is printed only when the run's own process is
+    in the driver's list; the report never prints the word 'locked'. The rate of a run that is not a controlled run
+    says so in its own line, and line 2 says it of every other number. A report holds no speed-up, no baseline and
+    no figure of a second GPU class. The screen is rendered from the data the report file holds and from nothing
+    else, at no more than 110 characters a line; a line of it that would be longer breaks at a separator or between
+    two words. An ordinary run prints what it printed before the mode existed and does not import the mode's module:
+    the mode is a branch of its own in the script, and a pull request that touches the loop, the census, the checks
+    or the timing shows the area's plain runs line by line against the tree it started from
+    (`test/python/misc/test_model_samples_perf.py`).
 
 ## What the first GPU run of this area taught
 

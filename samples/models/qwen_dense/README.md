@@ -66,6 +66,30 @@ A list of messages alone is also a valid file, and `tools` takes JSON tool schem
 checkpoint's chat template: for `nvidia/Qwen3.8-27B-NVFP4`, `enable_thinking: false` leaves out the reasoning the model
 otherwise writes before its answer.
 
+## The performance mode
+
+`--perf` runs the timed-request protocol on this script and prints the decode performance report of this GPU; the
+protocol, every statistic with its definition, the labels and the report file are in
+[../README.md](../README.md#the-performance-mode). Its flags:
+
+| flag | default | meaning |
+|---|---|---|
+| `--perf` | off | run the protocol and print the report: one checked request with the reference checks on it (also at four positions of the timed steps), a warm-up request, the timed requests with nothing but the step inside, then one traced request and the kernel check on it. Implies one sequence count and one prompt, the kernel check (as `--check-kernels`), forced steps with the end token ignored, and the text written once, after the report (as `--no-stream`). Not with `--stack reference`, `--max-tokens`, `--force-tokens`, a list of sequence counts or several prompts: each is refused before the load |
+| `--perf-warmup N` | `32` | forced decode steps of the warm-up request |
+| `--perf-steps N` | `256` | timed decode steps of a request, behind its first new token: 257 new tokens and 256 intervals at the default, one token more than a serving request of 256 output tokens. At least 2 |
+| `--perf-requests N` | `3` | timed requests; the time per output token and the time to first token of a run are the median over them, the token-to-token intervals are pooled |
+| `--perf-report FILE` | `report-<UTC time>.json` in the current directory | the report file: every number, its definition, the protocol, the environment. The default name carries a time stamp, so the same command can be run twice. A file that exists, a file that `--dump-tokens`, `--dump-census` or `--text-out` names too, an empty name or a folder that cannot be written is an `ERROR` before the load: a report file is never written over |
+| `--perf-trace-records N` | `160000` | the most launch records the traced request may hold. Its first step is traced alone and sizes the rest (it is always traced, also where its records alone pass N); where the timed steps do not all fit, it traces the first steps that do, and the report says how many and at which positions |
+
+One session serves every request of a run and is built for the longest of them: the checked request and the timed
+requests run `--perf-steps` forced steps behind the first new token, the traced request at most as many, and the
+warm-up request `--perf-warmup`, which may be the larger count. A prompt whose tokens, its first new token and the
+forced steps of that longest request do not fit `--max-model-len` is an `ERROR` before the load, like every request
+beyond the context: it says which request is the longest and names every count to take lower (`--perf-steps`,
+`--perf-warmup`). No count is changed to make a run fit. Every run of the mode is `orientation` today
+and says why on the second line of its report: its blocks are launched from Python, a fallback row is left in every
+stack, and the mode does not observe the GPU's other processes or its clock yet.
+
 ## Coming from a serving engine
 
 This sample is one process with greedy token choice, not a serving engine: no socket, no queue, no sampling. But the

@@ -158,11 +158,17 @@ launched from Python instead, one launch after the other. *Clock not locked*: th
 is, one reason no timing here is a measurement of record. *Teacher-forced*: a provider block and its reference block are
 run on the same operands and the same state, call by call, so that an error cannot accumulate from block to block.
 
+Words of the performance mode (`--perf`; "The performance mode" below). *Timed request*: one prompt from a zero state,
+its first new token, then a fixed number of forced decode steps -- what a serving benchmark calls a request. *Judged
+position*: a position of a request at which every provider block is held against its reference block. *Token-to-token
+interval*: the time between the host reads of two consecutive tokens of a timed request. *Record class*: what a run
+may call its numbers, on the second line of its report: `orientation` with every reason, or a controlled run.
+
 | line | definition |
 |---|---|
 | header | the model (the reductions of the default run, or the checkpoint's directory name, shard count, size and manifest hash), the GPU, the sequence counts, the stack; the `cudnn` version, editable checkout or wheel, a source hash, the installed distribution; the reference's accumulation precision |
 | `served by` | per block: calls per step, provider, entry, the rows the entry serves, and the entry's published record (the GPU class and rows of a published measurement of that entry, `none`, or the reason a row is a fallback: not a measurement of this run or this GPU); the declared regime; then the memory the run needs against what is free, in GiB (2^30 bytes) -- and, where the run keeps a weight on its stored format alone, the part of that need which is the checks' (the reference's bf16 copy of one such weight at a time). Decided and printed before anything is loaded |
-| `stage` | seconds of import, describe (a checkpoint's tokenizer, chat template and shard headers; no weights), plan, read (or draw), merge, dequantise, compile and first launch of each compiled form, warm-up |
+| `stage` | seconds of import, describe (a checkpoint's tokenizer, chat template and shard headers; no weights), plan, read (or draw), merge, dequantise, lay out (a stored weight brought into the row order its kernel multiplies on) and checksum (of every weight the run keeps on its stored format alone) where the stack has such weights, compile and first launch of each compiled form, warm-up |
 | `greedy decoding`, a request body's line, `first token:` (with a checkpoint, before anything is loaded) | the decoding rule beside the sampling settings the checkpoint's own `generation_config.json` names, which are not applied; for a request body, every field of it and what the sample does with it; and what the prompt costs before the first new token: one decode step per prompt token, as a count. The family README has the three ("Coming from a serving engine") |
 | `decoding`, `checks on` | two lines that say what comes next, printed before the phases in which a run prints nothing on standard error: the prompt and the decode loop, and the checks. The first says where the text goes: with a checkpoint to standard output, piece by piece as it is generated (or once after the report with `--no-stream`, or to the file of `--text-out`); a seeded run writes its text nowhere |
 | `text path` | render = chat messages to prompt text; tokenize = prompt text to ids, also per prompt token; ids to GPU = the copy of the prompt's ids to the device; text out = ids to text per produced token, inside the loop, with the write of the piece where the text is written as it is generated. With a checkpoint, the first call of the process and the same call repeated |
@@ -179,6 +185,111 @@ run on the same operands and the same state, call by call, so that an error cann
 | `kernels` (a line of `checks`) | only with `--check-kernels`: every launch of the traced steps against the plan. The form a provider row names is compared on the objects: with the entry's own form, and with what the entry instance that served each call of the traced steps states (the call log: one per traced step, and a step without its log fails); a row of an entry that states its launch and names no form fails. Every exact kernel must be there once per call, in the wiring order, under the entry's own symbol and with exactly the entry's grid, block and shared memory; every other launch must belong to a family that a fallback row or the host path at that place declares; copies are counted, and one between two exact rows is not declared. For a block whose entry is called in several forms all of this holds per call site: a call is held to the form of its own site and to the entry instance of that form, and a line says which instance served how many calls of a step. `PASS`, `FAIL` with one line per kind of difference, or `NOT OBSERVED` with the reason. The kernels a library chose inside the fallback rows are printed and not gated. In a stack that declares a target kernel set, every launch on a target kernel must also have the launch shape the census recorded for it on this GPU class, SM count and row count, and the lines under the check end with `target census <configuration> / <class> (recorded <date>): EQUAL` or `NOT CLAIMED (<every reason that applies>)` |
 | `GPU memory`, `first launch` | PyTorch's peak and the growth on the device since the plan, in GiB; what the first launch of a compiled form took outside PyTorch's pool, in MiB |
 
+## The performance mode
+
+`--perf` turns a run of a decode sample into the decode performance report of this GPU: one process, one sequence
+count, one prompt. An ordinary run measures once, while its checks record its first steps and its text is written
+between its steps; the mode separates what is checked from what is timed, and what is timed from what is traced.
+
+```bash
+# The report goes to standard error, a report file report-<UTC time>.json to the current directory, the text to standard output.
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf
+
+# The protocol written out (these are the defaults) and a file name of your own:
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf \
+    --perf-warmup 32 --perf-steps 256 --perf-requests 3 --perf-report my_gpu.json
+```
+
+**The protocol.** A *timed request* is the prompt, its first new token and `--perf-steps` forced decode steps behind
+it: with the default of 256 steps, 257 new tokens and 256 intervals, one token more than a serving request of 256
+output tokens. A run makes, in this order: one checked request, launched as every other, with the recorder of the
+checks on, and the reference checks on it -- replay over the whole request, every provider block against the
+reference at the judged positions, the tokens on the first 16 steps; a warm-up request; `--perf-requests` timed
+requests, each from the state zeroed in place (the device is synchronised behind the zeroing, which is outside every
+statistic); one traced request; and the checks behind it. Inside a timed request there is nothing but the step: no
+recorder, no call log, no profiler, no text. The first profiler pass of the process starts behind the last timed
+request: the traced request feeds its prompt untraced and then traces the first timed positions, its first step
+alone -- whose launch records size the rest -- then as many further steps as `--perf-trace-records` holds. The judged
+positions are the first 16 of the request, the two on either side of the first page boundary of the attention cache
+inside the timed steps, and the last two timed positions: for the default prompt of 58 tokens, 0-15, 63, 64, 312 and
+313. A page is 64 positions, the page of the paged attention cache that the attention core of the target kernel set
+reads; the attention blocks of this sample read one contiguous cache today, and the two positions are judged all the
+same, so that the judged positions do not move when the paged cache arrives. Before the load the run prints how many
+decode steps of the stack all of this is at most, the replay of the checks among them, as a count; a check of the
+checked request that fails ends the run before anything is timed, and no file is written.
+
+**The statistics**, each with one definition, which the report file carries beside the number:
+
+| line | definition |
+|---|---|
+| `decode rate` | 1000 / time per output token, in tokens per second per sequence; time per output token = (the last token's ids on the host - the first new token's ids on the host) / (new tokens - 1) of a timed request, and of a run the median over its timed requests. Never a median step turned into a rate, and not output tokens / wall time, which holds every time to first token (that figure is in the file). The line also gives how far the timed requests are apart. Not printed for a reduced model, nor where a statement of the `checks` lines does not hold |
+| `token-to-token interval` | the time between the host reads of two consecutive tokens, pooled over the timed requests: median, p90 and p99 by nearest rank. Not a service's tail latency: the intervals span a growing attention cache as well as jitter |
+| `time to first token` | from the request being handed to the text path to the first new token's ids on the host: render, tokenize, the copy of the ids, the prompt's decode steps (one per prompt token: no stack of this sample has a prefill kernel) and the host read; the median over the timed requests. The load is outside it. A serving engine prefills the prompt in one pass and adds its queue and its network path: the same pair of events, not the same quantity |
+| `step` | the median token-to-token interval over the timed steps at the positions the traced request covers (the line names them). This version does not take GPU busy from the traced request, so the step is not taken apart and the line says `GPU busy not measured`; the loop's own host time, from a token's ids on the host to the next step's first launch call, is in the file |
+| `memory` | weights, state and cache: the family's arithmetic over the tensors held on the device; peak reserved: PyTorch's peak between the emptied pool behind the checks and the end of the timed requests; in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB |
+
+**The labels.** Line 2, `record class`, says what the numbers of a run are. A run is a controlled run only when it
+observed every condition itself: a checkpoint, every block on a claimed target kernel, a captured launch sequence,
+the three statements of the `checks` lines, no other process on the GPU, the clocks. Otherwise it is `orientation`
+and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`. No version of
+the mode observes the GPU's other processes or its clock yet (`not observed`, never assumed), and no stack of this
+area is captured: every run today is `orientation`. The `scope` line behind it is always there: a decode-loop rate
+is not a served rate. The `kernels` lines give the launches of a step that are on the target kernel set, by provider and as
+three numbers, and what else a step launches; on a stack that declares no target they say so. The `checks` lines are
+three statements, each with its own verdict: the blocks against the reference at the judged positions; the timed
+requests and the traced request gave the checked request's token ids, step for step, every timed request left the
+state in the same bytes and the stored weights still hold the bytes of their load; the kernels of the traced steps
+are the plan's. A statement that does not hold prints its `FAIL`, the rate line says why no rate is printed, and the
+run ends in `[00] FAIL`; kernels that could not be observed are `NOT OBSERVED` with the reason, the run keeps its
+rate as `orientation` with the reason `kernels not observed`, and it ends in
+`[00] RAN <stack> stack (kernels not observed: <reason>)`. The line `with draft tokens` says `not run by this script`:
+this script decodes without a drafter. A report holds no speed-up, no baseline and no figure of another GPU class.
+
+**The report file** (`--perf-report FILE`; default `report-<UTC time>.json` in the current directory, so one command
+can be run twice; a file that exists, or that another output flag of the run names, is an `ERROR` before the load:
+a report file is never written over) is strict JSON with units in its field names and no local path: `record` (the class and its reasons), `model`, `environment`,
+`observation`, `kernels`, `protocol` (the counts, the prompt's hash, where the profiler first started), `checks` (every
+judged position with its reason, the lines of the checks, the three verdicts, the run's last line),
+`statistics` (per statistic its definition, what it corresponds to in a serving benchmark, its value and, where there
+are samples, their count, median, mean, extremes and percentiles), `raw` (every stamp of every request, relative to
+its start, and the hashes of its ids and of its end state), `traced` (the steps the traced request covered and their
+positions), `memory`, `startup` (the seconds of every stage) and `text_path`.
+
+The report, with dots where a run prints a value (a checkpoint on the stack `native`; the checks' own lines come
+before it, the `text out` line and the last lines of a run after it):
+
+```text
+cuDNN Frontend model sample: decode performance report
+record class          orientation, not a number of record: fallback rows present;
+                      kernel identity not claimed on this GPU class; launched from Python;
+                      other processes not observed; clocks not observed
+scope       a decode-loop rate, not a served rate: one process, no request queue, no scheduler, no network
+model       <checkpoint>, ... layers | ... sequence | greedy
+GPU         <name>, compute capability ..., ... SMs
+            other compute processes: not observed (this version)
+            clocks observed: no (this version does not observe the GPU)
+kernels     ... of ... launches per step are on the target kernel set: cuDNN Frontend ..., PyTorch ...
+            = ... the target's own compiled kernels + ... cuDNN Frontend entries with byte-equal results
+              + ... declared stand-ins
+            not yet: ... block calls on fallback rows + ... launch of the target that has no block yet
+            a step also launches ... kernels and ... copies
+protocol    warm-up ... steps | timed ... steps x ..., end token ignored | launched from Python, not captured
+checks      blocks against the reference at positions ...: PASS
+            timed requests give the checked request's tokens and state: PASS | kernels, traced steps: PASS
+
+decode rate (orientation)   ...  tokens/s per sequence   (... ms per token; ... requests within ... %)
+                      token-to-token interval: median ..., p90 ..., p99 ... ms
+time to first token   ...  ms for a ...-token prompt (... decode steps: this sample has no prefill kernel)
+step                  ...  ms at the ... traced positions, ... to ...; GPU busy not measured (this version)
+with draft tokens     not run by this script (plain decode)
+memory                weights ... GiB | state and cache ... GiB | peak reserved ... GiB  (GiB = 2^30 bytes)
+
+report file           report-<UTC time>.json (every number, its definition, the protocol, the environment)
+```
+
+Without `--model` the same protocol runs on the reduced seeded model: every time then carries `reduced model:`, no
+rate is printed, and the text is written nowhere. The GPU test of this area runs that form.
+
 ## What is verified where
 
 | what | by | where |
@@ -191,7 +302,8 @@ run on the same operands and the same state, call by call, so that an error cann
 | what a run holds of a weight, without a GPU: per multiply block the stored tensor the loader keeps when asked (8-bit codes with their scale; packed 4-bit codes with their block scales and global scale), bit for bit what the bf16 copy is made from, and the bytes the family states for each form against what a load holds; which forms the plans of a run ask for (a follower on a fallback row keeps the copy); a weight kept in the row order its provider multiplies on: the layout asked of the provider, the same bytes in that order and in no other stored form, the checksum taken of them, the copy made from them bit for bit the copy of the checkpoint's order, a layout without its stored weight named; a session on weights that were loaded for another plan, in both directions, and on a stored weight in another row order than its block multiplies on: an error that names the block before its first step; the reference's copies made for one call -- every check line equal to the same run with its copies kept, the copies counted, the run's weights untouched, a wrong element still failing its band; each such copy gone when its call returns (weak references to the tensors, through the checked pass and through the reference's own passes); a block that writes into its stored weight -- every block line holds, because its reference moved with it, and the run fails on the weight by block and layer, before the checks or during them, where the same block in a run with its copies fails its band; the checksum behind that on stated tensors (one byte, two rows exchanged, two bytes exchanged along a row, a scale); the maker of such copies refused for every session but the reference of the checks, which is not traced; and, with a test's own blocks on the stored format on every multiply (two provider rows multiply on a stored weight today, the in-projection's and the gate / up step's), a run without a copy of any multiplied weight through all its checks, with its memory sentence and its bytes of a step | `test/python/misc/test_model_samples_census.py` | any host, level L0 |
 | the loader of a checkpoint's drafter without a GPU: the 8-bit quantisation with one scale per row against a quantiser written from the format's definition, bytes and scales -- a row of zeros, a row at the smallest scale, quotients exactly between two codes, and two elements that a multiplication by the reciprocal of the scale would code differently; the draft vocabulary (each id once, in ascending order, inside the model's vocabulary, with what was dropped counted) and every file its reader refuses; the family README's call of the loader and its recipe for a draft vocabulary, run as they are written; a checkpoint directory with a drafter, generated in the test: the manifest from the headers alone, the rows of the head against the bytes of the shard file read by the header's offsets, the 8-bit weights and the order of the parts of the merged ones, what a load reads; every drafter the loader declines, by name; two tensor lists bound to one checkpoint. And the drafter's draft pass, whose blocks are reference chains that no tie-out judges: the quantiser of a row of a step against a quantiser written from the format's definition (a row of zeros at the smallest scale, a product that saturates, two rows of two magnitudes, and the two elements that a division by the scale would code differently); the joint quantiser of the two normed halves, their order and their one scale; the gate with one rounding and SiLU x up with two against their formulas, element by element, with the model's own chains byte for byte what they were; the token choice over equal columns; a pass over 2 and over 6 rows of a sequence against that many passes of one row, rows and cache byte for byte, at one sequence and at two; through a recording stand-in for the blocks, what every pass of a step is handed for every kept count; every block of the drafter's plan, as the plan builds it, against the function it stands for, and one pass through the plan's blocks against the same pass written out from the functions; every block of a pass over two sequences through the tap of the tie-out, each sequence alone; the family README's draft step, run as it is written; the model's stored forms and the drafter with its copies loaded together from a checkpoint generated in the test, with `memory_bytes()` against what is held | `test/python/misc/test_model_samples_drafter.py` | any host, level L0; the checkpoint tests skip visibly without `safetensors` |
 | a session with a drafter without a GPU, the seeded drafter of a tiny model on the CPU: the step through `speculate` with scheduled drafted tokens (the ids of the plain session, every count kept, the drafter's own proposals recorded) and on the drafter's own proposals; every line of the comparison with the two of the drafter; replay with the proposals; eight wrong passes, each failing the line that sees it; a second prompt set and a restored snapshot; the refusals; the kernel check of such a step on constructed records (the gathers, a copy between two exact rows, two host reads, a launch in another shape than the recorded one at the model's site); the report's acceptance lines and bytes; the memory sentence with the drafter at the published widths | `test/python/misc/test_model_samples_verify.py` | any host, level L0 |
-| the default run of each sample: `[NN] PASS` with its own checks; the same run on the stack `fe-entries`, in a fresh interpreter: the cuDNN Frontend rows of `native` with their tie-out and the kernel check on real launches | `test/python/linear_attention/frost/test_model_sample_qwen_dense.py` | one GPU the family serves; L0 runs two layers, L1 four |
+| the performance mode without a GPU: every statistic on constructed time stamps (the time per output token, the rate, the nearest-rank percentiles, the run's value as the median over its timed requests, the time to first token, the step and the loop's host time at the traced positions); the judged positions from the request and the family's page; the record class from its conditions; through a session on the CPU with stand-in providers and a stand-in profiler: no profiler pass before the last timed request, nothing but the step inside a timed request, the reference checks at the judged positions, the three statements of the `checks` lines, a timed request that computes other tokens, traced steps that launch another kernel, kernels that cannot be observed, a check that fails before anything is timed; the screen in every form at no more than 110 characters a line; the report file (strict JSON, a definition beside every statistic, no path, never written over); the three numbers of the `kernels` lines on the family's own tables; every refusal of the flags before the load; `main()` with `--perf` to its last line, also where a statement of the checks does not hold; an ordinary run that prints what it printed and does not import the mode's module; every stamp of a timed request at its event, with the device synchronised between the zeroing of the state and the request; each number of the screen against the field of the file its label names; and the public text of the mode -- the sentences of this page's section, of the family's flag table, of the guide's rule and of the script's own text, each asserted beside the behaviour it states, with this page's words, its `stage` row and its example of the report against the code | `test/python/misc/test_model_samples_perf.py` | any host, level L0 |
+| the default run of each sample: `[NN] PASS` with its own checks; the same run on the stack `fe-entries`, in a fresh interpreter: the cuDNN Frontend rows of `native` with their tie-out and the kernel check on real launches; the performance mode of the seeded model (`--perf`) on both stacks, in a fresh interpreter: `[NN] PASS`, the report in its reduced-model form, the report file | `test/python/linear_attention/frost/test_model_sample_qwen_dense.py` | one GPU the family serves; L0 runs two layers, L1 four |
 | the kernel check on the stack `fe-cublas` (`--check-kernels`), and the stack `native` itself | by hand; the family README states the GPU class of the last run | no test of this repository runs them: `native` will need packages a CI image does not have, which is why `fe-entries` exists |
 | a real checkpoint: text out, and the sample's checks on the first 16 steps of every prompt | by hand, with a run record; the family README states the checkpoint, the versions and the GPU class of the last run | a GPU with room for the stack; never in CI |
 

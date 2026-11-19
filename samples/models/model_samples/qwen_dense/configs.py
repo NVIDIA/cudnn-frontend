@@ -54,6 +54,11 @@ BOTH = ("fe-cublas", "reference")
 TARGET_STACKS = ("native", "fe-entries")
 #: every stack with provider rows (all but the reference), and every stack
 PROVIDER_STACKS = ("fe-cublas", *TARGET_STACKS)
+#: the positions of one page of the paged attention cache that the attention core of the target kernel set reads (the census
+#: names that kernel).  The attention blocks of this family read one contiguous cache today; the performance mode of a sample
+#: judges the two positions on either side of the first page boundary inside its timed steps all the same, so that its
+#: judged positions do not move when the paged cache arrives
+ATTENTION_PAGE = 64
 EVERY = (*BOTH, *TARGET_STACKS)
 
 #: the forms the target calls the add + RMSNorm + quantise kernel in, by call site of the wiring: the residual mode (the first

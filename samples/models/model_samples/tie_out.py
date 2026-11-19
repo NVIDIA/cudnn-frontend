@@ -673,6 +673,7 @@ class Checks:
     kernels: str = ""  # the kernel check, when it was asked for: PASS | FAIL | NOT OBSERVED
     unobserved: str = ""  # why the kernels were not observed
     on_demand: Optional[OnDemand] = None  # what the reference's copies of the weights the run keeps no copy of cost
+    positions: Tuple[int, ...] = ()  # of a run with judged positions: the steps at which its blocks were held against the reference
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -680,6 +681,23 @@ class Checks:
 
 def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
+
+
+#: ``run_checks(kernels=DEFERRED)``: the kernel check of this run is made later, by its caller, behind a traced request that has
+#: not run yet (``kernel_check``); ``Checks.kernels`` then holds this word and the caller prints no verdict before that check
+DEFERRED = "DEFERRED"
+
+
+def positions_text(positions: Sequence[int]) -> str:
+    """Step positions as a run prints them: in ascending order, three or more consecutive ones as ``first-last``
+    (``0-15, 63, 64, 312, 313``)."""
+    runs: List[List[int]] = []
+    for position in sorted(set(positions)):
+        if runs and position == runs[-1][-1] + 1:
+            runs[-1].append(position)
+        else:
+            runs.append([position])
+    return ", ".join(f"{run[0]}-{run[-1]}" if len(run) > 2 else ", ".join(str(position) for position in run) for run in runs)
 
 
 def changed_weights(weights) -> List[str]:
@@ -784,8 +802,9 @@ def run_checks(
     prompt_tokens: int,
     max_steps: Optional[int] = None,
     second_reference: bool = False,
-    kernels: Optional[bool] = None,
+    kernels: Optional[object] = None,  # True | False | DEFERRED; None: the session's own decision
     max_prompt_steps: Optional[int] = None,
+    positions: Optional[Sequence[int]] = None,
 ) -> Checks:
     """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
     ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
@@ -794,7 +813,18 @@ def run_checks(
     records): a failure fails the run; kernels that could not be observed are reported, and ``Checks.unobserved`` says why.
     Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that declares a target
     kernel set is checked without being asked, so no caller can print a verdict for such a run that never looked at its
-    kernels.  For such a session ``kernels=False`` is refused.
+    kernels.  For such a session ``kernels=False`` is refused.  ``kernels=DEFERRED`` is for a caller that traces after
+    these checks (the performance mode: no profiler pass comes before its last timed request): no kernel line is printed
+    here, ``Checks.kernels`` says ``DEFERRED``, and the caller makes the check itself behind its traced request
+    (``kernel_check``) before it prints a verdict.
+
+    ``positions`` are judged positions: steps of the recorded run, counted from 0, at which the blocks are held against
+    the reference.  The run is then replayed up to the last of them -- past ``max_steps``, which stays the bound of the
+    reference stack's own pass (``tokens``) -- with the block check and the batch-invariance check on at the judged
+    positions alone and off at every other step; ``replay`` holds the ids and logits of every replayed step.  The first
+    line of the checks then names the positions, and ``Checks.positions`` holds them: what was judged, for a caller that
+    says so.  A position the run did not record is a ``ValueError``, never left out; so is a session built with
+    ``draft_tokens=``.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
@@ -818,13 +848,19 @@ def run_checks(
         kernels = session.check_kernels
     elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
         raise ValueError(f"stack {session.stack} declares a target kernel set: its kernel check cannot be switched off")
+    if positions is not None and session.draft_tokens is not None:
+        raise ValueError("judged positions are steps of a decode run; a session built with draft_tokens= has two kinds of step")
     session._closed("run_checks")
     main = session.record
-    steps = min(main.count, main.inputs.shape[0])
+    steps = last = min(main.count, main.inputs.shape[0])  # ``steps``: of the reference stack's own pass; ``last``: the steps replayed here
     if max_steps is not None:
         steps = min(steps, max_steps)
-    inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
-    accepted = list(main.accepted[:steps])  # per step the tokens behind the first that the run kept: 0 for a decode step
+    judged_at = None if positions is None else frozenset(positions)
+    if judged_at and not 0 <= min(judged_at) <= max(judged_at) < last:  # a position that was asked for is judged, or the run says no
+        raise ValueError(f"judged positions {positions_text(judged_at)}: the run recorded {last} steps, the positions 0 to {last - 1}")
+    last = steps if judged_at is None else max(steps, max(judged_at, default=-1) + 1)
+    inputs, logits, ids = main.inputs[:last].clone(), main.logits[:last].clone(), main.outputs[:last].clone()
+    accepted = list(main.accepted[:last])  # per step the tokens behind the first that the run kept: 0 for a decode step
     proposals = None if main.proposals is None else main.proposals[:steps].clone()  # of a session with a drafter: what it proposed
     # a session built with draft_tokens=: the prompt its verify steps stand on, whole, and what it recorded of the prompt's steps
     drafted = session.draft_tokens is not None
@@ -878,13 +914,14 @@ def run_checks(
             session.tap = prompt_tap if t < judged_prompt else None
             prompt_tap.step = t
             session._feed(prompt[:, t].contiguous())
-        session.tap = tap
-        for t in range(steps):
+        for t in range(last):  # every step replayed; the blocks judged at every one, or at the judged positions alone
+            session.tap = tap if judged_at is None or t in judged_at else None
             tap.step = t
             session._advance(inputs[t], accepted[t])
     finally:
         session.tap = None
-    replay_ok = bytes_equal(session.record.logits[:steps], logits) and bytes_equal(session.record.outputs[:steps], ids)
+    replay_ok = bytes_equal(session.record.logits[:last], logits) and bytes_equal(session.record.outputs[:last], ids)
+    logits, ids = logits[:steps], ids[:steps]  # the reference stack's own pass stays on the first ``steps``
     if proposals is not None:  # ... and what the drafter proposed in front of every step
         replay_ok = replay_ok and bytes_equal(session.record.proposals[:steps], proposals)
     if drafted:  # ... and the prompt's steps, which the verify steps stand on
@@ -933,6 +970,11 @@ def run_checks(
         f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {'the first ' if steps < main.count else ''}{steps} steps: "
         f"{min(prompt_tokens, steps)} prompt + {max(steps - prompt_tokens, 0)} decode)"
     ]
+    if judged_at is not None:  # judged positions: what was replayed, where the blocks were judged, what the token line covers
+        lines = [
+            f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {last} steps replayed: {min(prompt_tokens, last)} prompt + "
+            f"{max(last - prompt_tokens, 0)} decode; blocks judged at positions {positions_text(judged_at)}; tokens on the first {steps} steps)"
+        ]
     if session.tokens > 1:  # the steps of this session are verify steps: no prompt goes through them one token at a time
         lines = [
             f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''} x {session.tokens} tokens per sequence, "
@@ -963,7 +1005,9 @@ def run_checks(
     if cost.copies:  # what the checks cost beyond the run: said only where a copy was made on demand
         lines.append(on_demand_line(cost, getattr(session.weights, "uncopied", ())))
     status, unobserved = "", ""
-    if kernels:
+    if kernels is DEFERRED:  # the caller's, behind its traced request
+        status = DEFERRED
+    elif kernels:
         status, unobserved, kernel_lines = kernel_check(session)
         lines += kernel_lines
         if drafted:  # the traced window holds the verify steps alone: what this check did not look at is said beside its verdict
@@ -974,7 +1018,7 @@ def run_checks(
             lines.append(f"    {DRAFTER_KERNELS}")
     session.reset(fresh=True)
     ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
-    return Checks(lines, ok, judged, status, unobserved, cost)
+    return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())))
 
 
 @dataclass

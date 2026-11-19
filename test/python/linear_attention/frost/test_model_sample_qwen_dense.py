@@ -10,7 +10,8 @@ that sentence -- unless a check failed before it: a skip never covers a failure.
 standard error, and standard output must stay empty: it is kept for generated text, which a seeded run does not have.
 Each sequence count also reports its
 traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
-bytes of a step.  The
+bytes of a step.  The performance mode of the same seeded model (``--perf``) runs on both stacks in a fresh interpreter:
+its verdict, its report in the reduced-model form and its report file are held, none of its times.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
 the four-layer one (three + one).
@@ -244,6 +245,76 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert any(line.split()[:1] == ["projection.fp8.in"] and line.endswith("fallback: bf16 copy of 8-bit weights") for line in out.splitlines())
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
     frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])
+def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stack, tmp_path):
+    """``--perf`` on the reduced seeded model, on the two stacks the tests of this repository run, in a fresh interpreter
+    (the kernel check reads kernel names from the profiler: the module docstring): the checked request and its reference
+    checks, a warm-up request, two timed requests, the traced request and the kernel check on it.  The run ends in ``[00]
+    PASS`` -- or, where the profiler's records cannot be had, in ``RAN <stack> stack (kernels not observed: ...)`` --
+    prints the report in its reduced-model form (no rate; ``orientation`` with ``reduced model`` among its reasons) on
+    standard error, leaves standard output empty and writes the report file.  No time of it is held against anything."""
+    import json
+
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    report = tmp_path / "report.json"
+    arguments = ["--stack", stack, "--perf", "--perf-steps", "16", "--perf-requests", "2", "--perf-warmup", "4", "--perf-report", str(report)]
+    start = time.perf_counter()
+    code, out, written = _fresh_interpreter(arguments)
+    tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
+    verdict = tagged[-1] if tagged else "no output"
+    frost_routing.measured(f"model sample qwen_dense 00_decode --stack {stack} --perf", f"{verdict}; {time.perf_counter() - start:.0f} s")
+    if verdict.startswith("[00] SKIP"):
+        assert " FAIL" not in out and "[00] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
+        pytest.skip(verdict)
+    unobserved = verdict.startswith(f"[00] RAN {stack} stack (kernels not observed: ")
+    assert code == 0 and (verdict == "[00] PASS" or unobserved) and " FAIL" not in out, out[-8000:]
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
+    lines = out.splitlines()
+    screen = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
+    screen = screen[: next(index for index, line in enumerate(screen) if line.startswith("[00] "))]  # the report and its text out line
+    assert max(len(line) for line in screen) <= 110, max(screen, key=len)
+    assert any(line.startswith("report file           report.json") for line in screen) and any(line.startswith("text out  ") for line in screen)
+    assert screen[1].startswith("record class          orientation, not a number of record: reduced model; ")
+    assert "decode rate           not printed for a reduced model" in screen and not any("tokens/s" in line for line in screen)
+    assert any(line.startswith("checks      blocks against the reference at positions 0-15, ") and line.endswith(": PASS") for line in screen)
+    said = " ".join(line.strip() for line in screen)
+    assert "timed requests give the checked request's tokens and state: PASS" in said
+    assert ("kernels, traced steps: NOT OBSERVED (" if unobserved else "kernels, traced steps: PASS") in said
+    assert "protocol    warm-up 4 steps | timed 16 steps x 2, end token ignored | launched from Python, not captured" in screen
+    assert any(line.startswith("[00] performance mode: at most ") for line in tagged), "what the mode will run, before the load"
+
+    def refuse(constant):
+        raise AssertionError(f"the report file holds {constant}")
+
+    data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
+    assert data["schema"] == "model-sample-performance/1" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
+    requests = data["raw"]["requests"]
+    assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
+    assert requests[2]["ids_sha256"] == requests[3]["ids_sha256"] == requests[0]["ids_sha256"], "every timed request: the checked request's ids"
+    assert requests[2]["end_state_sha256"] == requests[3]["end_state_sha256"] == requests[0]["end_state_sha256"], "and its end state, byte for byte"
+    assert data["protocol"]["profiler_first_started"] == (None if unobserved else "behind the last timed request, in the traced request")
+    # the record class: every reason, in the order of the conditions; a stack that declares a target kernel set names its identity
+    identity = "no target kernel set declared" if stack == "fe-cublas" else "kernel identity not claimed on this GPU class"
+    observed = ["kernels not observed"] if unobserved else []
+    reasons = ["reduced model", "fallback rows present", identity, "launched from Python", *observed, "other processes not observed", "clocks not observed"]
+    assert data["record"]["reasons"] == reasons and data["record"]["performance_claim_eligible"] is False
+    assert all(entry["definition"] and entry["unit"] for entry in data["statistics"].values()), "a definition and a unit beside every statistic"
+    memory = data["memory"]  # the peak of the timed part is PyTorch's own, between the settle and the last timed request: inside the process's
+    assert (
+        0 < memory["peak_reserved_gib"] <= memory["process_peak_reserved_gib"] and memory["weights_gib"] + memory["state_gib"] <= memory["peak_allocated_gib"]
+    )
+    kernels = data["kernels"]
+    if not unobserved:
+        assert 1 <= data["traced"]["steps"] <= 16 and requests[4]["ids_sha256"] == requests[0]["ids_sha256"], "the traced request too"
+    if kernels["stated"]:  # a target stack on a GPU the census has a section for: the three numbers add up
+        assert kernels["on_target"] == kernels["code"] + kernels["port"] + kernels["stand_ins"] and kernels["launches"] == 20
+    else:
+        assert (stack == "fe-cublas") == (not kernels["declared"]), "fe-cublas declares no target kernel set; fe-entries does"
 
 
 @pytest.mark.L1
