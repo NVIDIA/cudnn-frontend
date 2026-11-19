@@ -236,6 +236,9 @@ navigation:
           - page: Shared-Expert Decode Pair (SM100-class)
             path: ../../operations/moe/shared_expert_decode.md
             slug: shared_expert_decode
+          - page: CuTe MoK (SM100 / SM103)
+            path: ../../operations/cutemok.md
+            slug: cutemok
       - section: Normalizations
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
