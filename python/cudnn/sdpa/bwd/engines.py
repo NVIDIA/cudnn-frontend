@@ -2182,6 +2182,30 @@ def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
     return "D256 backward serves exact (256, 256) and (192, 128) head dimensions"
 
 
+def _d192_dense_bounds_mismatch(facts: "ga.SdpaGraphFacts", version, *, input_bytes: int = 2) -> Optional[str]:
+    from .d128_contract import ACCUMULATION, select_implementation, validate_dense_bounds
+
+    try:
+        validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv)
+    except ValueError as error:
+        return str(error)
+    # Unlike D128, these fixed D192 rows have no recompute fallback. Match
+    # their standalone checks, including the FP8 pair's two L2 divisors.
+    implementation = select_implementation(
+        facts.device_cc,
+        version,
+        facts.b,
+        facts.h_q,
+        facts.s_q,
+        facts.s_kv,
+        192**-0.5 if facts.scale is None else facts.scale,
+        d_qk=192,
+        d_v=128,
+        input_bytes=input_bytes,
+    )
+    return None if implementation == ACCUMULATION else "the d192 declaration is outside the accumulation envelope"
+
+
 def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     """The native pairs, plus dense head pairs below (256, 256) that compute on its geometry (``_sm100_d256_envelope``)."""
     if _native_d256_head_mismatch(facts, version) is None:
@@ -2199,7 +2223,7 @@ def _sm100_d256_launch_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional
 
 def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     if _d192_accumulation_serves(facts):
-        return None
+        return _d192_dense_bounds_mismatch(facts, version)
     from .d128_contract import ACCUMULATION_PARTS
 
     return f"the d192 accumulation row serves dense MHA (192, 128) without windows on {ACCUMULATION_PARTS}"
@@ -2209,7 +2233,7 @@ def _sm100_d192_fp8_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Option
     from .d128_contract import D192_FP8_CCS
 
     if _d192_accumulation_serves(facts, D192_FP8_CCS, deterministic_ok=True):
-        return None
+        return _d192_dense_bounds_mismatch(facts, version, input_bytes=1)
     return "the d192 fp8 kernel pair serves dense MHA (192, 128) without windows on cc 10.0 / 10.3 / 10.7"
 
 

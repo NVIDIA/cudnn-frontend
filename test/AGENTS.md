@@ -831,6 +831,13 @@ checks both sides of 65535; its large-index L1 sibling surrounds the output
 with owned storage so an Int32 offset wrap corrupts a canary, not another
 allocation. Compile-only target checks remain separate from native evidence.
 
+When a fixed engine shares a selector with a family that has a fallback,
+reject fallback selections before recommending that fixed engine. Test graph
+eligibility, recommendation and standalone admission with metadata-only
+descriptors on both sides of each bound. D192's dense boundary suite covers
+rounded Stats, batch/head grids and both FP8 scheduler divisors; D128's suite
+separately preserves its legal recompute fallback.
+
 For descriptor stride products, inspect the traced multiplication intermediates,
 not just the final cast or Python annotation. MXFP8 V scales use a separate
 plane stride: `test_mxfp8_v_scale_plane_stride_multiplies_in_int64` checks the
