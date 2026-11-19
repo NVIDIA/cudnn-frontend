@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg, validate_workspace_aliases
 from ..canonical import (
     canonical_b_fake,
     canonical_mx_fake,
@@ -48,7 +48,6 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 from cudnn.frost.workspace import Workspace, align_up
-from ._workspace import validate_workspace_aliases
 
 
 def _get_rubin_kernel():

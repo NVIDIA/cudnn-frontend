@@ -3,13 +3,15 @@
 """
 Unified API for Grouped GEMM dSReLU Backward Kernel (SM100+)
 
-This module provides a single API class that supports both contiguous (dense)
-and discrete weight modes for block-scaled grouped GEMM with dSReLU activation
-gradient in MoE (Mixture of Experts) workloads.
+This module provides a single API class and wrapper for grouped GEMM with the
+(prob-weighted) squared-ReLU activation gradient in MoE (Mixture of Experts)
+workloads. The backend follows the operand dtypes: BF16 A/B select the BF16 kernel
+(``_bf16_api.py``), FP8/FP4 operands the block-scaled kernel with optional output
+quantization (``_blockscaled_api.py``).
 
 Dense mode
     All expert weights are packed contiguously in a 3-D tensor (N, K, L).
-    Callers supply ``sample_b`` and ``sample_sfb``.
+    Callers supply ``sample_b`` (and ``sample_sfb`` for block-scaled).
 
 Discrete mode
     Each expert has its own memory allocation.  Callers supply
@@ -19,161 +21,67 @@ Discrete mode
 
 from __future__ import annotations
 
-from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
-    BlockScaledMoEGroupedGemmQuantBwdKernel,
-    EpilogueType,
-)
-from ..backend_utils import _torch_stream_context
+from ..backend_utils import GroupedGemmBackend, _torch_stream_context, backend_cache_key, select_grouped_gemm_backend, wrapper_workspace
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
-import math
 import os
-from typing import Tuple, Optional
+from typing import Any, Tuple, Optional
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.datatypes import _convert_to_cutlass_data_type, _convert_to_cutlass_data_type_or_none
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn._torch_stream import device_context
+from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.api_base import APIBase, TupleDict, ceil_div
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
-    allocate_byte_workspace,
     canonicalize_unit_dim_strides,
-    cuda_is_available,
-    default_stream,
     detect_framework,
     framework_dtype,
-    get_compute_capability,
-    has_tcgen05,
-    get_data_ptr,
+    get_device,
     get_shape,
     get_strides,
-    is_torch_tensor,
 )
 
+# Backend selection and the block-scaled-only argument checks are shared with the forward.
+from ..srelu.api import _block_scaled_dtype_pairs, _check_block_scaled_activation_options
+from ..srelu._bf16_options import bf16_kernel_requirement_error, resolve_bf16_srelu_options
+from ._blockscaled_api import (
+    GroupedGemmDsreluBlockScaledAPI,
+    _cta_tile_m,
+    _dprob_n_slots,
+    _reduce_dbias_slots,
+    _reduce_dprob_slots,
+)
 
-def _resolve_cluster_shape_mn(mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Optional[Tuple[int, int]]) -> Tuple[int, int]:
-    """The cluster shape the kernel will actually run with, defaults applied.
-
-    Shared with ``GroupedGemmDsreluSm100.__init__`` so the wrapper cannot resolve a
-    different default than the class it is about to construct. M=256 selects the 2-SM
-    tcgen05 MMA atom (M=128 is 1-SM), and that CTA pair has to share a cluster along M --
-    hence (2, 1). check_support asserts both halves of the pairing.
-    """
-    if cluster_shape_mn is not None:
-        return cluster_shape_mn
-    use_2cta_instrs = mma_tiler_mn[0] == 256
-    return (2, 1) if use_2cta_instrs else (1, 1)
-
-
-def _dprob_n_slots(n_out: int, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Optional[Tuple[int, int]], deterministic: bool) -> int:
-    """Extent of dprob's dim 1.
-
-    Non-deterministic (default): 1 -- every N-tile atomically accumulates into the same
-    ``dprob[token]``, so the fp32 summation order follows tile scheduling.
-
-    Deterministic: one slot per N-tile, so each ``(token, tile_n)`` pair has exactly one
-    writer and the caller can reduce over dim 1 in a fixed order.
-
-    The extent must cover every ``tile_n_idx`` the scheduler can emit, which is *not*
-    ``ceil_div(n_out, tile_n)``: MoEPersistentTileScheduler counts whole clusters and then
-    expands to CTAs (``cta_tile_n_idx = cluster_tile_n_idx * cluster_n + cta_id_in_cluster``,
-    over ``ceil_div(n_out, tile_n * cluster_n)`` clusters), so the bound rounds up to a
-    multiple of ``cluster_n``. The two agree only at ``cluster_n == 1``; using the narrower
-    form would index past the end of the workspace for any wider cluster.
-    """
-    if not deterministic:
-        return 1
-    cluster_n = _resolve_cluster_shape_mn(mma_tiler_mn, cluster_shape_mn)[1]
-    return ceil_div(n_out, mma_tiler_mn[1] * cluster_n) * cluster_n
-
-
-def _cta_tile_m(mma_tiler_mn: Tuple[int, int]) -> int:
-    """Rows one CTA's epilogue owns, and so the granularity of a deterministic dbias slot.
-
-    Mirrors the kernel's ``cta_tile_shape_mnk[0] = mma_tiler[0] // thr_id_size``. Shared with
-    ``GroupedGemmDsreluSm100.__init__`` for the same reason ``_resolve_cluster_shape_mn`` is:
-    the wrapper must not derive a different value than the class it is about to construct.
-    """
-    return mma_tiler_mn[0] // (2 if mma_tiler_mn[0] == 256 else 1)
-
-
-def _reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream):
-    """Collapse the per-N-tile dprob slots into the caller's ``(valid_m, 1, 1)`` output.
-
-    ``dprob_workspace`` is None whenever the kernel wrote dprob directly -- the non-deterministic
-    path -- and then there is nothing to collapse. Every token owns the same number of slots, so
-    this is a plain sum over dim 1; dbias needs a segment sum instead. Accumulates onto the
-    output, matching what the atomic does on the non-deterministic path.
-
-    Issued on ``current_stream``, the stream execute() ran the kernel on. On torch's current
-    stream instead, a caller who passes a different stream would have the reduction read the
-    workspace before the kernel finished writing it.
-    """
-    if dprob_workspace is None:
-        return dprob_tensor
-    import torch
-
-    with _torch_stream_context(current_stream, dprob_workspace.device):
-        reduced = torch.sum(dprob_workspace, dim=1, keepdim=True)
-        return reduced if dprob_tensor is None else dprob_tensor.add_(reduced)
-
-
-def _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_offsets, cta_tile_m):
-    """Segment-sum the per-M-block dbias slots into a per-expert ``(expert, n, 1)`` bf16 tensor.
-
-    ``dbias_workspace`` is None whenever the kernel wrote dbias directly -- no dbias at all, or
-    the non-deterministic path -- and then there is nothing to collapse.
-
-    Expert ``e`` owns the contiguous block range whose first token falls in
-    ``[padded_offsets[e-1], padded_offsets[e])``. Done as a one-hot matmul because ``index_add_``
-    and ``scatter_add_`` are themselves non-deterministic on CUDA, and slicing per expert would
-    need ``padded_offsets`` on the host -- a sync in the training loop. A cumsum-and-subtract
-    would be deterministic too but cancels catastrophically across experts of different
-    magnitude. Comparing in token space rather than block space saves the division.
-    """
-    if dbias_workspace is None:
-        return dbias_tensor
-    import torch
-
-    m_blocks, n_out = dbias_workspace.shape[0], dbias_workspace.shape[1]
-    with _torch_stream_context(current_stream, dbias_workspace.device):
-        block_tok = torch.arange(0, m_blocks * cta_tile_m, cta_tile_m, device=dbias_workspace.device, dtype=padded_offsets.dtype).unsqueeze(0)
-        starts = torch.cat((padded_offsets.new_zeros(1), padded_offsets[:-1])).unsqueeze(1)
-        # Built in the workspace dtype so the matmul is a straight bf16 GEMM: cuBLAS accumulates
-        # it in fp32 internally and rounds once, which is still better than the default path
-        # rounding on every M-tile, at half the memory and one store instead of two.
-        onehot = ((block_tok >= starts) & (block_tok < padded_offsets.unsqueeze(1))).to(dbias_workspace.dtype)
-        reduced = (onehot @ dbias_workspace.reshape(m_blocks, n_out)).reshape(-1, n_out, 1)
-        # Accumulate, like dprob and like the atomic on the non-deterministic path: a caller
-        # summing dbias across micro-batches into one buffer must not get overwrite semantics
-        # from the flag alone.
-        return reduced if dbias_tensor is None else dbias_tensor.add_(reduced)
-
-
-def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if _convert_to_cutlass_data_type_or_none(tensor.dtype) is cutlass.Uint8:
-        cute_tensor = from_dlpack(tensor, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
-        cute_tensor.element_type = cutlass.Float4E2M1FN
-        return cute_tensor
-    return tensor
+_JAX_BF16_ERROR = (
+    "The BF16 grouped GEMM dSReLU backend supports torch tensors only (it has no JAX entry point); "
+    "pass torch tensors. JAX arrays are served only by the block-scaled backend"
+)
 
 
 class GroupedGemmDsreluSm100(APIBase):
     """Unified API for grouped GEMM dSReLU backward operation on SM100+ GPUs.
 
-    This kernel performs block-scaled grouped GEMM with dSReLU activation
-    gradient (dSReLU), designed for MoE workloads.  It supports
-    both dense (contiguous) and discrete (per-expert pointer) weight layouts
-    through the ``BlockScaledMoEGroupedGemmQuantBwdKernel``.
+    Computes ``dH = A @ B_e`` per expert fused with the gradient of ``D = prob * srelu(C)``:
+    ``d_row = dH * prob * srelu'(C)``, ``dprob += sum_n srelu(C) * dH`` and optionally the
+    recomputed forward output ``d_srelu = prob * srelu(C)``. The backend follows the operand
+    dtypes and is selected in ``check_support()``: BF16 ``sample_a``/``sample_b`` (or
+    ``b_dtype``) select the BF16 kernel, FP8/FP4 operands the block-scaled kernel (alpha scaling,
+    block scale factors, dbias and optional output quantization).
 
     Weight mode is auto-detected from the constructor arguments:
 
-    - **Dense**: provide ``sample_b`` and ``sample_sfb``.
+    - **Dense**: provide ``sample_b`` (and ``sample_sfb`` for block-scaled).
     - **Discrete**: provide ``num_experts``, ``b_shape``, and ``b_dtype``.
+
+    BF16 backend: ``sample_c`` is the BF16 pre-activation the forward saved, ``sample_d_row``
+    receives the BF16 ``dZ``, ``sample_d_srelu`` (optional) the BF16 recomputed forward output,
+    and ``sample_prob``/``sample_dprob`` are required; the scale-factor, alpha, dbias, amax,
+    norm-const and ``sample_d_col`` arguments must be omitted. With ``deterministic=True`` the
+    BF16 ``execute()`` finishes the dprob reduction itself (see ``GroupedGemmDsreluBf16API``).
+    The BF16 ``execute()`` takes caller-owned scratch of ``scratch_workspace_bytes()`` bytes as
+    ``workspace=``; see docs/operations/gemm_fusions/grouped_gemm_dsrelu.md.
 
     Example::
 
@@ -243,1264 +151,205 @@ class GroupedGemmDsreluSm100(APIBase):
         use_dsrelu_reuse: bool = False,
         deterministic: bool = False,
         tanh_clamp_scale: Optional[float] = None,
+        tanh_mode: str = "approx",
     ):
         """Initialize the GroupedGemmDsreluSm100 API.
 
-        :param sample_a: Sample A tensor (valid_m, k, 1)
-        :param sample_c: Sample C tensor -- forward activations (valid_m, n, 1)
-        :param sample_d_row: Sample D row output tensor (valid_m, n, 1)
-        :param sample_d_col: Sample D col output tensor (valid_m, n, 1)
-        :param sample_sfa: Sample scale factor A tensor
-        :param sample_padded_offsets: End offset for each expert after padding
-        :param sample_alpha: Per-group alpha scaling factors
-        :param sample_prob: Per-row probability tensor (valid_m, 1, 1)
-        :param sample_dprob: Gradient of probability tensor (valid_m, 1, 1), must be zero-initialized
-        :param sample_b: (Dense) Sample B tensor (n, k, l)
-        :param sample_sfb: (Dense) Sample scale factor B tensor
-        :param sample_dbias: Optional dbias output tensor (expert_cnt, n, 1) bfloat16, in both modes
-        :param sample_dprob_workspace: Determinism scratch, required iff ``deterministic``:
-            ``dprob_workspace_shape(valid_m)``, float32
-        :param sample_dbias_workspace: Determinism scratch, required iff ``deterministic`` and
-            ``sample_dbias``: ``dbias_workspace_shape(valid_m, n)``, bfloat16
-        :param num_experts: (Discrete) Number of experts
-        :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
-        :param b_dtype: (Discrete) Data type of B tensors
-        :param sample_sfd_row: Optional row scale factor for D
-        :param sample_sfd_col: Optional column scale factor for D
-        :param sample_amax: Optional amax tensor for quantization, shape (expert_cnt, 1)
-        :param sample_norm_const: Optional normalization constant
-        :param acc_dtype: Accumulator data type
-        :param mma_tiler_mn: MMA tiler shape (M, N)
-        :param cluster_shape_mn: Cluster shape (M, N)
-        :param sf_vec_size: Scale factor vector size
-        :param vector_f32: Use vectorized f32 operations
-        :param m_aligned: Alignment for group M dimension
-        :param discrete_col_sfd: Generate discrete col-major scale factor tensor
-        :param b_major: Major dimension for B tensor, one of "k" or "n"
-        :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
-        :param use_dsrelu_reuse: Reuse relu(C)^2 (or, when clamped, c^2) between d_srelu and dprob
-        :param tanh_clamp_scale: Optional soft-clamp scale ``s``, must match the forward pass that
-            produced ``sample_c``. Must be finite and > 0. ``None`` (default) is bit-identical
-            to today's unclamped DSRELU.
-        :param deterministic: Compute dprob and dbias run-to-run bit-exactly. dprob and dbias keep
-            their shapes and dtypes; what the flag adds is the two scratch tensors above, which the
-            kernel writes instead, and a reduction the caller runs after execute():
-            ``reduce_dprob_workspace`` and ``reduce_dbias_workspace``.
-            grouped_gemm_dsrelu_wrapper_sm100 allocates and reduces both for you
+        The arguments up to ``tanh_clamp_scale`` keep their block-scaled meaning (see
+        ``GroupedGemmDsreluBlockScaledAPI``). The arguments are stored here; the backend is
+        selected and built, and the configuration validated, in ``check_support()``.
+
+        :param use_dsrelu_reuse: The BF16 epilogue always computes ``relu(C)^2`` (clamped: ``c^2``)
+            once and uses it for both ``d_srelu`` and dprob, so the BF16 backend accepts either
+            value and builds the same kernel for both.
+        :param tanh_mode: ``"approx"`` (default) or ``"accurate"``; any other value, ``None``
+            included, raises ``ValueError`` in ``check_support()``. Like ``tanh_clamp_scale`` it
+            must match the forward pass that produced ``sample_c``: the backward recomputes ``t``
+            and the forward output (``d_srelu``) from ``c``. With ``tanh_clamp_scale`` set it
+            selects the tanh: ``"approx"`` is MUFU ``tanh.approx.f32`` (capped at 1) on both
+            backends; ``"accurate"`` is a Cephes-style FP32 tanh on the BF16 backend and raises
+            ``ValueError`` on the block-scaled one, which has no accurate tanh. Without a clamp
+            scale no tanh is evaluated and both backends ignore the mode. NaN pre-activations
+            propagate on the BF16 backend in every mode; the block-scaled kernel maps them to +0
+            (clamped: the ``mul.rn.sat.f32`` in ``moe_kernel_helpers.tanh_clamp_unit``; plain: its
+            relu select).
         """
+        super().__init__()
+        self._pending_init_kwargs = dict(locals())
+        self._pending_init_kwargs.pop("self")
+        self._pending_init_kwargs.pop("__class__", None)
         framework = detect_framework(sample_a)
         if sample_a is not None and framework not in ("torch", "jax"):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDsreluSm100; pass torch tensors or JAX arrays")
-        if framework == "jax":
-            if sample_b is not None:
-                raise ValueError(
-                    "Dense weight mode (sample_b/sample_sfb) is not expressible as JAX arrays "
-                    "(the expert-outermost strided B layout (n, k, l) has no row-major equivalent); "
-                    "use discrete mode (num_experts, b_shape, b_dtype) with per-expert weight pointers"
+        self._implementation = None
+
+    def check_support(self) -> bool:
+        if self._implementation is None:
+            kwargs = self._pending_init_kwargs
+            defining_b_dtype = kwargs["sample_b"].dtype if kwargs["sample_b"] is not None else kwargs["b_dtype"]
+            backend = select_grouped_gemm_backend(
+                operation="grouped_gemm_dsrelu_sm100",
+                a_dtype=getattr(kwargs["sample_a"], "dtype", None),
+                b_dtype=defining_b_dtype,
+                scale_controls=(
+                    ("sample_d_col", kwargs["sample_d_col"]),
+                    ("sample_sfa", kwargs["sample_sfa"]),
+                    ("sample_sfb", kwargs["sample_sfb"]),
+                    ("sample_alpha", kwargs["sample_alpha"]),
+                    ("sample_dbias", kwargs["sample_dbias"]),
+                    ("sample_dbias_workspace", kwargs["sample_dbias_workspace"]),
+                    ("sample_sfd_row", kwargs["sample_sfd_row"]),
+                    ("sample_sfd_col", kwargs["sample_sfd_col"]),
+                    ("sample_sfd_col_d_srelu", kwargs["sample_sfd_col_d_srelu"]),
+                    ("sample_amax", kwargs["sample_amax"]),
+                    ("sample_norm_const", kwargs["sample_norm_const"]),
+                    ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
+                    ("vector_f32", kwargs["vector_f32"] if kwargs["vector_f32"] else None),
+                    ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
+                ),
+                block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
+            )
+            self.backend = backend
+            if backend is GroupedGemmBackend.BF16:
+                if detect_framework(kwargs["sample_a"]) == "jax":
+                    raise ValueError(_JAX_BF16_ERROR)
+                # Rule 7: the BF16 kernel modules import cutlass.experimental (cudnn.frost.tile_dsl) at module
+                # scope, so the DSL is checked before they are imported, and only on this branch.
+                requirement = bf16_kernel_requirement_error("GroupedGemmDsreluSm100 (BF16)")
+                if requirement:
+                    raise ImportError(requirement)
+                from ._bf16_api import GroupedGemmDsreluBf16API
+
+                self._implementation = GroupedGemmDsreluBf16API(
+                    sample_a=kwargs["sample_a"],
+                    sample_c=kwargs["sample_c"],
+                    sample_d_row=kwargs["sample_d_row"],
+                    sample_padded_offsets=kwargs["sample_padded_offsets"],
+                    sample_prob=kwargs["sample_prob"],
+                    sample_dprob=kwargs["sample_dprob"],
+                    sample_b=kwargs["sample_b"],
+                    num_experts=kwargs["num_experts"],
+                    b_shape=kwargs["b_shape"],
+                    b_dtype=kwargs["b_dtype"],
+                    sample_d_srelu=kwargs["sample_d_srelu"],
+                    sample_dprob_workspace=kwargs["sample_dprob_workspace"],
+                    acc_dtype=kwargs["acc_dtype"],
+                    mma_tiler_mn=kwargs["mma_tiler_mn"],
+                    cluster_shape_mn=kwargs["cluster_shape_mn"],
+                    m_aligned=kwargs["m_aligned"],
+                    b_major=kwargs["b_major"],
+                    use_dynamic_sched=kwargs["use_dynamic_sched"],
+                    deterministic=kwargs["deterministic"],
+                    tanh_clamp_scale=kwargs["tanh_clamp_scale"],
+                    tanh_mode=kwargs["tanh_mode"],
                 )
-            if _convert_to_cutlass_data_type_or_none(getattr(sample_a, "dtype", None)) in (cutlass.Float4E2M1FN, cutlass.Uint8) or (
-                b_dtype is not None and _convert_to_cutlass_data_type_or_none(b_dtype) in (cutlass.Float4E2M1FN, cutlass.Uint8)
-            ):
-                raise ValueError(
-                    "Packed fp4 A/B tensors (float4_e2m1fn / raw uint8) are not expressible as JAX arrays "
-                    "(JAX has no packed fp4 dtype); use fp8 inputs from JAX, or torch tensors for fp4"
+            else:
+                _check_block_scaled_activation_options("grouped_gemm_dsrelu_sm100", kwargs["tanh_clamp_scale"], kwargs["tanh_mode"], "acc")
+                self._implementation = GroupedGemmDsreluBlockScaledAPI(
+                    sample_a=kwargs["sample_a"],
+                    sample_b=kwargs["sample_b"],
+                    sample_c=kwargs["sample_c"],
+                    sample_d_row=kwargs["sample_d_row"],
+                    sample_d_col=kwargs["sample_d_col"],
+                    sample_d_srelu=kwargs["sample_d_srelu"],
+                    sample_sfa=kwargs["sample_sfa"],
+                    sample_sfb=kwargs["sample_sfb"],
+                    sample_padded_offsets=kwargs["sample_padded_offsets"],
+                    sample_alpha=kwargs["sample_alpha"],
+                    sample_prob=kwargs["sample_prob"],
+                    sample_dprob=kwargs["sample_dprob"],
+                    sample_dbias=kwargs["sample_dbias"],
+                    sample_dprob_workspace=kwargs["sample_dprob_workspace"],
+                    sample_dbias_workspace=kwargs["sample_dbias_workspace"],
+                    num_experts=kwargs["num_experts"],
+                    b_shape=kwargs["b_shape"],
+                    b_dtype=kwargs["b_dtype"],
+                    sample_sfd_row=kwargs["sample_sfd_row"],
+                    sample_sfd_col=kwargs["sample_sfd_col"],
+                    sample_sfd_col_d_srelu=kwargs["sample_sfd_col_d_srelu"],
+                    sample_amax=kwargs["sample_amax"],
+                    sample_norm_const=kwargs["sample_norm_const"],
+                    acc_dtype=kwargs["acc_dtype"],
+                    mma_tiler_mn=kwargs["mma_tiler_mn"],
+                    cluster_shape_mn=kwargs["cluster_shape_mn"],
+                    sf_vec_size=kwargs["sf_vec_size"],
+                    vector_f32=kwargs["vector_f32"],
+                    m_aligned=kwargs["m_aligned"],
+                    discrete_col_sfd=kwargs["discrete_col_sfd"],
+                    b_major=kwargs["b_major"],
+                    use_dynamic_sched=kwargs["use_dynamic_sched"],
+                    use_dsrelu_reuse=kwargs["use_dsrelu_reuse"],
+                    deterministic=kwargs["deterministic"],
+                    tanh_clamp_scale=kwargs["tanh_clamp_scale"],
                 )
-        if acc_dtype is None:
-            acc_dtype = cutlass.Float32
-        super().__init__()
-        self._framework = framework
+            self._kernel = self._implementation._kernel
+            self.weight_mode = self._implementation.weight_mode
+        supported = self._implementation.check_support()
+        self._is_supported = self._implementation._is_supported
+        if supported:
+            self._pending_init_kwargs = None
+        return supported
 
-        self._warn_experimental_api()
-        self._logger.debug("Entering __init__")
+    def compile(self) -> None:
+        if self._implementation is None:
+            self.check_support()
+        if self._is_supported:
+            self._implementation._is_supported = True
+        self._implementation.compile()
+        self._is_supported = self._implementation._is_supported
+        self._compiled_kernel = self._implementation._compiled_kernel
 
-        # ---- Weight mode auto-detection ----
-        if sample_b is not None and num_experts is None:
-            self.weight_mode = MoEWeightMode.DENSE
-            if sample_sfb is None:
-                raise ValueError("sample_sfb is required when sample_b is provided (dense mode)")
-        elif num_experts is not None and sample_b is None:
-            self.weight_mode = MoEWeightMode.DISCRETE
-            if b_shape is None or b_dtype is None:
-                raise ValueError("b_shape and b_dtype are required in discrete mode")
-        else:
-            raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes of caller-owned, 128-byte-aligned scratch ``execute(workspace=)`` requires.
 
-        self._sample_a_tensor = sample_a
-        self._sample_b_tensor = sample_b
-
-        # ---- Common tensor descriptors ----
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", interpret_uint8_as_fp4x2=False, canonical=True)
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
-        self.d_row_desc = self._make_tensor_desc(sample_d_row, name="sample_d_row", canonical=True)
-        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col", canonical=True)
-        self.d_srelu_desc = self._make_tensor_desc(sample_d_srelu, name="sample_d_srelu", canonical=True)
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
-        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets", canonical=True)
-        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha", canonical=True)
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
-        self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob", canonical=True)
-        self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias", canonical=True)
-        # Determinism scratch, kept out of the output descriptors so dprob/dbias mean the same
-        # thing in both modes. The kernel writes whichever of the pair is active.
-        self.dprob_workspace_desc = self._make_tensor_desc(sample_dprob_workspace, name="sample_dprob_workspace", canonical=True)
-        self.dbias_workspace_desc = self._make_tensor_desc(sample_dbias_workspace, name="sample_dbias_workspace", canonical=True)
-
-        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row", canonical=True)
-        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col", canonical=True)
-        self.sfd_col_d_srelu_desc = self._make_tensor_desc(sample_sfd_col_d_srelu, name="sample_sfd_col_d_srelu", canonical=True)
-        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True)
-        self.norm_const_desc = self._unpad_tensor_to_ndim(
-            self._make_tensor_desc(sample_norm_const, name="sample_norm_const", canonical=True),
-            1,
-            "norm_const",
-        )
-
-        # ---- Mode-specific state ----
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False, canonical=True)
-            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
-            self.expert_cnt = self.padded_offsets_desc.shape[0]
-        else:
-            self._value_error_if(num_experts == 0, "num_experts must be > 0")
-            self.expert_cnt = num_experts
-            self.b_shape = b_shape
-            self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
-            self.b_major = b_major
-            self._value_error_if(
-                self.padded_offsets_desc.shape[0] != self.expert_cnt,
-                f"padded_offsets length ({self.padded_offsets_desc.shape[0]}) " f"must equal num_experts ({self.expert_cnt})",
-            )
-
-        # ---- Configuration ----
-        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = mma_tiler_mn
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
-        self.cta_tile_m = _cta_tile_m(mma_tiler_mn)
-        self.cluster_shape_mn = _resolve_cluster_shape_mn(mma_tiler_mn, cluster_shape_mn)
-        self.sf_vec_size = sf_vec_size
-        self.vector_f32 = vector_f32
-        self.m_aligned = m_aligned
-        self.discrete_col_sfd = discrete_col_sfd
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_major = b_major  # stored for both modes
-
-        self.use_dynamic_sched = use_dynamic_sched
-        self.use_dsrelu_reuse = use_dsrelu_reuse
-        self.deterministic = deterministic
-        if tanh_clamp_scale is not None:
-            self._value_error_if(
-                not math.isfinite(tanh_clamp_scale) or tanh_clamp_scale <= 0.0,
-                f"tanh_clamp_scale must be finite and positive, got {tanh_clamp_scale}",
-            )
-        self.tanh_clamp_scale = tanh_clamp_scale
-
-        self._interpret_uint8_as_fp4x2 = True
-        self._has_dbias = self.dbias_desc is not None
-        self._generate_d_srelu = self.d_srelu_desc is not None
-        self._kernel = BlockScaledMoEGroupedGemmQuantBwdKernel
-
-        self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
-
-        self._workspace = None
-        self._live_ptrs = None
-        self._compile_b_ptrs = None
-        self._compile_sfb_ptrs = None
-
-        self._logger.debug("__init__ completed")
-
-    @staticmethod
-    def _sf_desc_is_physical(sf_desc) -> bool:
-        """True if the SF descriptor is the physical C-contiguous (L, MN', K', 32, 4, 4)
-        allocation rather than the torch-style permuted (32, 4, MN', 4, K', L) atom view.
-
-        Frameworks that cannot express the permuted strided view (e.g. JAX, whose arrays
-        are row-major) pass the physical form. The kernel rebuilds the SF layout from the
-        GEMM shapes via ``tile_atom_to_shape_SF`` and consumes only the SF base pointer,
-        so the two forms are byte-identical.
+        BF16: the kernel's per-expert TMA-descriptor slots and dynamic-scheduler counter (never 0).
+        Block-scaled: 0 -- that kernel keeps its own descriptor workspace, so ``workspace`` stays None.
+        The deterministic dprob slots are not part of it: they stay ``dprob_workspace_tensor``.
         """
-        shape = sf_desc.shape
-        return not (len(shape) == 6 and shape[0] == 32 and shape[1] == 4 and shape[3] == 4)
-
-    def _check_sf_shape(self, sf_desc, mn128: int, rest: int, l: int, name: str) -> None:
-        """Validate an SF tensor shape and strides, accepting the permuted atom view or (in
-        discrete weight mode) the physical C-contiguous form -- see ``_sf_desc_is_physical``.
-
-        The kernel consumes only the SF base pointer and rebuilds the layout from the GEMM
-        shapes, so both forms must be exactly the C-contiguous physical allocation in memory:
-        strides are validated too (a shape-matching but differently-strided tensor would
-        silently produce wrong results).
-        """
-        if sf_desc is None:
-            return
-        self._value_error_if(len(sf_desc.shape) != 6, f"{name} tensor must be 6-D, got shape {sf_desc.shape}")
-        if not self._sf_desc_is_physical(sf_desc):
-            self._check_tensor_shape(sf_desc, (32, 4, mn128, 4, rest, l), name)
-            _ = self._check_tensor_stride(
-                sf_desc,
-                stride=[canonicalize_unit_dim_strides((32, 4, mn128, 4, rest, l), (16, 4, rest * 512, 1, 512, mn128 * rest * 512))],
-                name=name,
-                extra_error_msg=f"{name} atom view must be the (3, 4, 1, 5, 2, 0) permutation of a C-contiguous (L, MN', K', 32, 4, 4) allocation",
-            )
-            return
-        self._value_error_if(
-            self.weight_mode != MoEWeightMode.DISCRETE,
-            f"{name} physical (L, MN', K', 32, 4, 4) form is only supported in discrete weight mode; " "provide the permuted (32, 4, MN', 4, K', L) atom view",
-        )
-        self._check_tensor_shape(sf_desc, (l, mn128, rest, 32, 4, 4), name)
-        _ = self._check_tensor_stride(
-            sf_desc,
-            stride=[canonicalize_unit_dim_strides((l, mn128, rest, 32, 4, 4), (mn128 * rest * 512, rest * 512, 512, 16, 4, 1))],
-            name=name,
-            extra_error_msg=f"{name} in the physical (L, MN', K', 32, 4, 4) form must be C-contiguous",
-        )
+        if self._implementation is None:
+            self.check_support()
+        if self.backend is GroupedGemmBackend.BF16:
+            return self._implementation.scratch_workspace_bytes()
+        return 0
 
     @staticmethod
     def dprob_workspace_shape(valid_m: int, n: int, mma_tiler_mn: Tuple[int, int] = (256, 256), cluster_shape_mn: Optional[Tuple[int, int]] = None):
         """Shape of ``sample_dprob_workspace`` -- one fp32 slot per (token, N-tile)."""
-        return (valid_m, _dprob_n_slots(n, mma_tiler_mn, cluster_shape_mn, True), 1)
+        return GroupedGemmDsreluBlockScaledAPI.dprob_workspace_shape(valid_m, n, mma_tiler_mn, cluster_shape_mn)
 
     @staticmethod
     def dbias_workspace_shape(valid_m: int, n: int, mma_tiler_mn: Tuple[int, int] = (256, 256)):
         """Shape of ``sample_dbias_workspace`` -- one bf16 slot per (CTA M-block, n)."""
-        return (ceil_div(valid_m, _cta_tile_m(mma_tiler_mn)), n, 1)
+        return GroupedGemmDsreluBlockScaledAPI.dbias_workspace_shape(valid_m, n, mma_tiler_mn)
 
     @staticmethod
     def reduce_dprob_workspace(dprob_workspace, dprob_tensor=None, current_stream=None):
-        """Collapse the dprob slots into ``(valid_m, 1, 1)``; accumulates onto dprob_tensor if given."""
-        return _reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream)
+        """Collapse the dprob slots into ``(valid_m, 1, 1)``; accumulates onto dprob_tensor if given.
+
+        The deterministic class-API sequence that works on both backends is ``execute(...)``, then
+        ``reduce_dprob_workspace(slots, dprob_tensor)``, then ``slots.zero_()``. The block-scaled
+        ``execute()`` adds its partials into the slots, so this call moves them into
+        ``dprob_tensor`` and the slots must be zeroed before the next ``execute()``. The BF16
+        ``execute()`` has already folded the slots into ``dprob_tensor`` and zeroed them, so there
+        this call adds zero. The return-value form ``reduce_dprob_workspace(slots)`` is not
+        portable: after a BF16 ``execute()`` it returns zeros, not dprob.
+        """
+        return GroupedGemmDsreluBlockScaledAPI.reduce_dprob_workspace(dprob_workspace, dprob_tensor, current_stream)
 
     @staticmethod
     def reduce_dbias_workspace(dbias_workspace, padded_offsets, dbias_tensor=None, mma_tiler_mn: Tuple[int, int] = (256, 256), current_stream=None):
-        """Segment-sum the dbias slots per expert; accumulates onto dbias_tensor if given.
-
-        Public because a plain sum over dim 0 is wrong here and gets it wrong quietly: the slots
-        have to be grouped by the expert ranges ``padded_offsets`` marks off. Accumulates rather
-        than overwrites, matching both reduce_dprob_workspace and the atomic the kernel uses when
-        the flag is off.
-        """
-        return _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_offsets, _cta_tile_m(mma_tiler_mn))
-
-    @property
-    def _kernel_dprob_desc(self):
-        """The dprob descriptor the kernel writes: the per-N-tile scratch under determinism."""
-        return self.dprob_workspace_desc if self.deterministic else self.dprob_desc
-
-    @property
-    def _kernel_dbias_desc(self):
-        """The dbias descriptor the kernel writes: the M-block scratch under determinism."""
-        return self.dbias_workspace_desc if self.deterministic and self.dbias_desc is not None else self.dbias_desc
-
-    def _make_dbias_fake(self):
-        """Fake dbias tensor for compilation.
-
-        The determinism scratch is indexed by M-block, so its dim 0 scales with the token count
-        and has to stay symbolic -- baked static it would bind the compiled kernel to one valid_m
-        and silently reuse it for another, the trap _dprob_n_slots documents for dprob's slots.
-        Divisibility 2 because valid_m is a multiple of m_aligned (256) and a block is
-        cta_tile_m (128) rows. The (expert, n, 1) output has no token-dependent extent.
-        """
-        desc = self._kernel_dbias_desc
-        if desc is None or not self.deterministic:
-            return self._make_fake_cute_tensor_from_desc(desc, assumed_align=16)
-        return self._make_fake_cute_compact_tensor(
-            dtype=desc.dtype,
-            shape=desc.shape,
-            stride_order=desc.stride_order,
-            dynamic_mode=0,
-            divisibility=2,
-        )
-
-    def check_support(self) -> bool:
-        """Check if the kernel configuration is supported.
-
-        :return: True if supported, raises exception otherwise
-        """
-        self._logger.debug("Entering check_support")
-
-        # ---- SFD group validation ----
-        all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
-        all_provided = all(x is not None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
-        self._value_error_if(
-            not (all_none or all_provided),
-            "sfd_row_desc, sfd_col_desc, and norm_const_desc must be all None or all not None",
-        )
-        self._user_requested_sfd = all_provided
-
-        # ---- Shapes and strides ----
-        self._logger.debug("Checking tensor shapes and strides")
-        tensor_m, k, _one = self._tensor_shape(self.a_desc, name="sample_a")
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            n, _, l = self._tensor_shape(self.b_desc, name="sample_b")
-        else:
-            # Discrete: extract n, k from b_shape
-            if len(self.b_shape) == 2:
-                n, b_k = self.b_shape
-            else:
-                n, b_k, _ = self.b_shape
-            self._value_error_if(b_k != k, f"B K dimension ({b_k}) must match A K dimension ({k})")
-            l = self.expert_cnt  # for shape checks that use l
-
-        n_out = n
-
-        self._check_tensor_shape(self.a_desc, (tensor_m, k, 1), "A")
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_tensor_shape(self.b_desc, (n, k, l), "B")
-        self._check_tensor_shape(self.c_desc, (tensor_m, n_out, 1), "C")
-        self._check_tensor_shape(self.d_row_desc, (tensor_m, n_out, 1), "D_row")
-        self._check_tensor_shape(self.d_col_desc, (tensor_m, n_out, 1), "D_col")
-        self._check_tensor_shape(self.d_srelu_desc, (tensor_m, n_out, 1), "D_srelu")
-
-        rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-        self._check_sf_shape(self.sfa_desc, ceil_div(tensor_m, 128), rest_k, 1, "SFA")
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
-
-        rest_n_out = ceil_div(ceil_div(n_out, self.sf_vec_size), 4)
-        self._check_sf_shape(self.sfd_row_desc, ceil_div(tensor_m, 128), rest_n_out, 1, "SFD_row")
-        rest_m = ceil_div(ceil_div(tensor_m, self.sf_vec_size), 4)
-        self._check_sf_shape(self.sfd_col_desc, ceil_div(n_out, 128), rest_m, 1, "SFD_col")
-        self._check_sf_shape(self.sfd_col_d_srelu_desc, ceil_div(n_out, 128), rest_m, 1, "SFD_col_d_srelu")
-
-        self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
-        self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
-        self._check_tensor_shape(self.dprob_desc, (tensor_m, 1, 1), "dprob")
-        self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
-        # The determinism scratch. Separate tensors rather than a reshaped dprob/dbias, so the
-        # output contract does not depend on the flag; the kernel writes these instead.
-        self._check_tensor_shape(
-            self.dprob_workspace_desc, (tensor_m, _dprob_n_slots(n_out, self.mma_tiler_mn, self.cluster_shape_mn, True), 1), "dprob_workspace"
-        )
-        self._check_tensor_shape(self.dbias_workspace_desc, (ceil_div(tensor_m, self.cta_tile_m), n_out, 1), "dbias_workspace")
-        self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 1), "amax")
-        self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
-        self._check_tensor_shape(self.padded_offsets_desc, (self.expert_cnt,), "padded_offsets")
-
-        # Strides
-        _ = self._check_tensor_stride(
-            self.a_desc,
-            stride=[(k, 1, tensor_m * k)],
-            extra_error_msg="A must have k-major layout",
-        )
-        if self.weight_mode == MoEWeightMode.DENSE:
-            if self._is_fp8(self.a_desc):
-                _ = self._check_tensor_stride(
-                    self.b_desc,
-                    stride=[(k, 1, n * k), (1, n, n * k)],
-                    extra_error_msg="For fp8 ab_dtype, B must have k- or n-major layout",
-                )
-            else:
-                _ = self._check_tensor_stride(
-                    self.b_desc,
-                    stride=[(k, 1, n * k)],
-                    extra_error_msg="For fp4 ab_dtype, B must have k-major layout",
-                )
-        _ = self._check_tensor_stride(
-            self.c_desc,
-            stride=[(n_out, 1, tensor_m * n_out)],
-            extra_error_msg="C must have n-major layout",
-        )
-        _ = self._check_tensor_stride(
-            self.d_row_desc,
-            stride=[(n_out, 1, tensor_m * n_out)],
-            extra_error_msg="D_row must have n-major layout",
-        )
-        _ = self._check_tensor_stride(
-            self.d_col_desc,
-            stride=[(n_out, 1, tensor_m * n_out)],
-            extra_error_msg="D_col must have n-major layout",
-        )
-
-        # ---- Data types ----
-        self._logger.debug("Checking data types")
-        self.ab_dtype = self._check_dtype(
-            self.a_desc,
-            dtype=[
-                cutlass.Float4E2M1FN,
-                cutlass.Uint8,
-                cutlass.Float8E5M2,
-                cutlass.Float8E4M3FN,
-            ],
-            name="A/B",
-        )
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_dtype(
-                self.b_desc,
-                dtype=self.ab_dtype,
-                name="B",
-                extra_error_msg="B must have the same dtype as A",
-            )
-        else:
-            self._value_error_if(
-                self.b_dtype != self.ab_dtype,
-                f"b_dtype ({self.b_dtype}) must match A dtype ({self.ab_dtype})",
-            )
-
-        self.sf_dtype = self._check_dtype(
-            self.sfa_desc,
-            dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN],
-            name="SFA/SFB/SFD",
-        )
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_dtype(
-                self.sfb_desc,
-                dtype=self.sf_dtype,
-                name="SFB",
-                extra_error_msg="SFB must have the same dtype as SFA",
-            )
-        self._check_dtype(
-            self.sfd_row_desc,
-            dtype=self.sf_dtype,
-            name="SFD_row",
-            extra_error_msg="SFD_row must have the same dtype as SFA",
-        )
-        self._check_dtype(
-            self.sfd_col_desc,
-            dtype=self.sf_dtype,
-            name="SFD_col",
-            extra_error_msg="SFD_col must have the same dtype as SFA",
-        )
-
-        self._value_error_if(
-            self.sf_vec_size not in [16, 32],
-            f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}",
-        )
-        self._value_error_if(
-            self.sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 32,
-            f"sf_dtype {self.sf_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
-        )
-        self._value_error_if(
-            self._is_fp8(self.ab_dtype) and self.sf_vec_size == 16,
-            f"ab_dtype {self.ab_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
-        )
-
-        self._check_dtype(
-            self.acc_dtype,
-            dtype=cutlass.Float32,
-            name="Accumulator",
-            extra_error_msg="Accumulator must be float32",
-        )
-        self._check_dtype(
-            self.prob_desc,
-            dtype=cutlass.Float32,
-            name="Prob",
-            extra_error_msg="Prob must be float32",
-        )
-        self._check_dtype(
-            self.dprob_desc,
-            dtype=cutlass.Float32,
-            name="Dprob",
-            extra_error_msg="Dprob must be float32",
-        )
-        self._check_dtype(self.dbias_desc, dtype=cutlass.BFloat16, name="Dbias", extra_error_msg="dbias must be bfloat16")
-        # Scratch matches the output it stands in for: the slots only need a single writer and a
-        # fixed-order reduction to be reproducible, not a wider accumulator.
-        self._check_dtype(self.dprob_workspace_desc, dtype=cutlass.Float32, name="Dprob workspace", extra_error_msg="dprob workspace must be float32")
-        self._check_dtype(self.dbias_workspace_desc, dtype=cutlass.BFloat16, name="Dbias workspace", extra_error_msg="dbias workspace must be bfloat16")
-        self.c_dtype = self._check_dtype(
-            self.c_desc,
-            dtype=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
-            name="C",
-        )
-        if self._is_fp8(self.c_dtype) and self.vector_f32:
-            raise ValueError("Invalid configuration: fp8 c_dtype and vector_f32 is not supported. " "Please use vector_f32=False or c_dtype=bfloat16 instead")
-
-        if self._is_fp4x2(self.ab_dtype):
-            self.d_dtype = self._check_dtype(
-                self.d_row_desc,
-                dtype=[cutlass.Float16, cutlass.BFloat16, cutlass.Float32],
-                name="D_row",
-                extra_error_msg="D_row must be fp16, bf16, or float32 when ab_dtype is fp4",
-            )
-        elif self._is_fp8(self.ab_dtype):
-            self.d_dtype = self._check_dtype(
-                self.d_row_desc,
-                dtype=[
-                    cutlass.Float8E4M3FN,
-                    cutlass.Float8E5M2,
-                ],
-                name="D_row",
-                extra_error_msg="D_row must be fp8 dtype when ab_dtype is fp8",
-            )
-        else:
-            raise NotImplementedError(f"Invalid ab_dtype: {self.ab_dtype}, expected fp4 or fp8")
-        self._check_dtype(
-            self.d_col_desc,
-            dtype=self.d_dtype,
-            name="D_col",
-            extra_error_msg="D_col must have the same dtype as D_row",
-        )
-        self._check_dtype(
-            self.d_srelu_desc,
-            dtype=self.d_dtype,
-            name="D_srelu",
-            extra_error_msg="D_srelu must have the same dtype as D_row",
-        )
-
-        # ---- SFD generation logic ----
-        kernel_generate_sfd = self._is_fp8(self.ab_dtype) and self.sf_dtype is cutlass.Float8E8M0FNU and self._is_fp8(self.d_dtype)
-        self._value_error_if(
-            kernel_generate_sfd and not self._user_requested_sfd,
-            "sfd_row, sfd_col, and norm_const are required for FP8 input/FP8 output with sf_dtype=torch.float8_e8m0fnu",
-        )
-        if not kernel_generate_sfd and self._user_requested_sfd:
-            self._logger.warning(
-                "sfd_row/sfd_col/norm_const were provided, but this configuration does not generate SFD outputs; " "the tensors will be ignored by the kernel",
-            )
-        self.generate_sfd = kernel_generate_sfd
-        self._value_error_if(
-            self._generate_d_srelu and self.generate_sfd and self.sfd_col_d_srelu_desc is None,
-            "sfd_col_d_srelu is required when d_srelu is generated for FP8 output",
-        )
-        self._check_dtype(
-            self.sfd_col_d_srelu_desc,
-            dtype=self.sf_dtype,
-            name="SFD_col_d_srelu",
-            extra_error_msg="SFD_col_d_srelu must have the same dtype as SFA",
-        )
-        if self.discrete_col_sfd and not self.generate_sfd:
-            self._logger.warning("discrete_col_sfd is True but generate_sfd is False, discrete_col_sfd will be ignored")
-            self.discrete_col_sfd = False
-
-        # ---- Activation function validation ----
-        # ---- Discrete-mode-specific validation ----
-        if self.weight_mode == MoEWeightMode.DISCRETE:
-            self._value_error_if(
-                self.b_major not in ["k", "n"],
-                f"b_major must be 'k' or 'n', got {self.b_major}",
-            )
-            self._value_error_if(
-                self._is_fp4x2(self.ab_dtype) and self.b_major != "k",
-                "b_major must be 'k' when ab_dtype is fp4",
-            )
-
-        # ---- MMA tile / cluster shape ----
-        self._logger.debug("Checking MMA tile shape and cluster shape")
-        self._value_error_if(
-            not self.use_2cta_instrs and self.mma_tiler_mn[0] != 128,
-            f"MMA tiler M must be 128 when use_2cta_instrs=False, got {self.mma_tiler_mn[0]}",
-        )
-        self._value_error_if(
-            self.use_2cta_instrs and self.mma_tiler_mn[0] != 256,
-            f"MMA tiler M must be 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
-        )
-        self._value_error_if(
-            self.mma_tiler_mn[1] != 256,
-            f"MMA tiler N must be 256, got {self.mma_tiler_mn[1]}",
-        )
-        self._value_error_if(
-            self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,
-            f"cluster_shape_mn[0] must be divisible by 2 when use_2cta_instrs=True, got {self.cluster_shape_mn[0]}",
-        )
-        self._value_error_if(
-            not (
-                self.cluster_shape_mn[0] * self.cluster_shape_mn[1] <= 16
-                and self.cluster_shape_mn[0] > 0
-                and self.cluster_shape_mn[1] > 0
-                and self.cluster_shape_mn[0] <= 4
-                and self.cluster_shape_mn[1] <= 4
-                and is_power_of_2(self.cluster_shape_mn[0])
-                and is_power_of_2(self.cluster_shape_mn[1])
-            ),
-            f"Invalid cluster shape: expected values to be powers of 2 and product <= 16, got {self.cluster_shape_mn}",
-        )
-        cluster_tiler_m = (self.cluster_shape_mn[0] // (2 if self.use_2cta_instrs else 1)) * self.mma_tiler_mn[0]
-        self._value_error_if(
-            cluster_tiler_m not in [128, 256],
-            f"Invalid cluster tiler shape: expected cluster_tiler_m in {{128, 256}}, got {cluster_tiler_m}",
-        )
-        self._value_error_if(
-            self.m_aligned % self.mma_tiler_mn[0] != 0,
-            f"m_aligned must be divisible by mma_tiler_mn[0], got {self.m_aligned} % {self.mma_tiler_mn[0]} != 0",
-        )
-        self._value_error_if(
-            self.m_aligned != BlockScaledMoEGroupedGemmQuantBwdKernel.FIX_PAD_SIZE,
-            f"m_aligned must be {BlockScaledMoEGroupedGemmQuantBwdKernel.FIX_PAD_SIZE} (FIX_PAD_SIZE), got {self.m_aligned}",
-        )
-
-        # ---- Tensor alignment ----
-        self._logger.debug("Checking tensor alignment")
-
-        def check_contiguous_16B_alignment(dtype, stride_order, tensor_shape):
-            is_mode0_major = stride_order == (0, 1, 2)
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // (_convert_to_cutlass_data_type(dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2).width)
-            return num_major_elements % num_contiguous_elements == 0
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            b_stride_order_for_check = self.b_desc.stride_order
-            b_shape_for_check = (n, k, l)
-        else:
-            b_stride_order_for_check = (0, 1, 2) if self.b_major == "n" else (1, 0, 2)
-            b_shape_for_check = (n, k, 1)
-
-        self._value_error_if(
-            not (
-                check_contiguous_16B_alignment(self.ab_dtype, self.a_desc.stride_order, (tensor_m, k, l))
-                and check_contiguous_16B_alignment(self.ab_dtype, b_stride_order_for_check, b_shape_for_check)
-                and check_contiguous_16B_alignment(self.d_dtype, self.d_row_desc.stride_order, (tensor_m, n_out, 1))
-            ),
-            "Invalid tensor alignment: tensors must be 16B aligned",
-        )
-
-        # ---- Expert count limit ----
-        self._value_error_if(
-            self.expert_cnt > 1024,
-            f"expert_cnt must be <= 1024, got {self.expert_cnt}",
-        )
-
-        # ---- Determinism scratch must be present exactly when the flag is on ----
-        self._value_error_if(
-            self.deterministic and self.dprob_workspace_desc is None,
-            "deterministic=True requires sample_dprob_workspace of shape dprob_workspace_shape(valid_m, n), float32",
-        )
-        self._value_error_if(
-            self.deterministic and self.dbias_desc is not None and self.dbias_workspace_desc is None,
-            "deterministic=True with dbias requires sample_dbias_workspace of shape dbias_workspace_shape(valid_m, n), bfloat16",
-        )
-        self._value_error_if(
-            not self.deterministic and (self.dprob_workspace_desc is not None or self.dbias_workspace_desc is not None),
-            "the determinism workspaces are only used when deterministic=True",
-        )
-
-        # ---- Disabled configurations ----
-        # Deterministic dbias keys its workspace by absolute M-block,
-        # token_offset // cta_tile_m + tile_m_idx, which is single-writer only if the scheduler
-        # emits no tile past an expert's range. It emits
-        # ceil_div(tokens_e, cta_tile_m * cluster_m) * cluster_m tiles per expert, so that ceil
-        # must be exact: m_aligned, which every tokens_e is a multiple of, has to divide by the
-        # cluster's M footprint. True for every supported shape (m_aligned is pinned to 256,
-        # cta_tile_m * cluster_m is 128 or 256), but a wider cluster would alias one expert's
-        # phantom tiles onto the next expert's slots.
-        self._not_implemented_error_if(
-            self.deterministic and self.dbias_desc is not None and self.m_aligned % (self.cta_tile_m * self.cluster_shape_mn[0]) != 0,
-            f"Invalid configuration: deterministic dbias needs m_aligned ({self.m_aligned}) to be a multiple of "
-            f"cta_tile_m * cluster_m ({self.cta_tile_m} * {self.cluster_shape_mn[0]}).",
-        )
-
-        self._not_implemented_error_if(
-            self.dbias_desc is None and self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype is cutlass.Float32,
-            "Invalid configuration: fp4 ab_dtype, sf_vec_size 16, d_dtype float32 is not supported. " "Please use sf_vec_size 32 or d_dtype bf16 instead",
-        )
-
-        # ---- SM100+ check ----
-        if not cuda_is_available():
-            raise RuntimeError("CUDA is not available")
-        major, minor = get_compute_capability()
-        compute_capability = major * 10 + minor
-        if not has_tcgen05(major):
-            raise RuntimeError(f"GroupedGemmDsrelu requires SM100+ compute capability with tcgen05 (not cc 12.x), " f"but found SM{compute_capability}")
-
-        self._is_supported = True
-        self._logger.debug("check_support completed successfully")
-        return True
-
-    def compile(self) -> None:
-        """Compile the kernel."""
-        self._logger.debug("Entering compile")
-        self._ensure_support_checked()
-        if self._compiled_kernel is not None:
-            self._logger.debug("Kernel already compiled; skipping recompilation")
-            return
-        if self.a_desc.shape[0] == 0:
-            self._logger.debug("sample valid_m is zero, skipping kernel compilation")
-            return
-
-        gemm_dsrelu = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            generate_sfd=self.generate_sfd,
-            discrete_col_sfd=self.discrete_col_sfd,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            use_dynamic_sched=self.use_dynamic_sched,
-            epilogue_type=EpilogueType.DSRELU.value,
-            generate_dbias=self._has_dbias,
-            generate_d_srelu=self._generate_d_srelu,
-            use_dsrelu_reuse=self.use_dsrelu_reuse,
-            deterministic=self.deterministic,
-            tanh_clamp_scale=self.tanh_clamp_scale,
-        )
-
-        hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        max_active_clusters -= self.num_cluster_overlap_margin
-        self._value_error_if(
-            max_active_clusters <= 0,
-            "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
-        )
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-
-        self._use_full_dynamic_mnkl = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
-
-        workspace_bytes = gemm_dsrelu.get_workspace_bytes()
-        # Internal scratch in the caller's framework allocator; kernels write through its
-        # raw pointer and it is never surfaced as a framework array.
-        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._compile_dense(gemm_dsrelu, max_active_clusters, fake_stream)
-        else:
-            self._compile_discrete(gemm_dsrelu, max_active_clusters, fake_stream)
-
-        self._logger.debug("Kernel compiled successfully")
-
-    def _compile_dense(self, gemm_dsrelu, max_active_clusters, fake_stream) -> None:
-        """Compile for dense (contiguous) weight mode."""
-        self._logger.debug("Compiling grouped_gemm_dsrelu kernel")
-        use_full_dynamic = self._use_full_dynamic_mnkl
-
-        fake_workspace_ptr = cute.runtime.nullptr(
-            dtype=cutlass.Uint8,
-            assumed_align=128,
-        )
-
-        if not use_full_dynamic:
-            valid_m = cute.sym_int(divisibility=256)
-
-            a_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.a_desc.dtype,
-                shape=(valid_m, *self.a_desc.shape[1:]),
-                stride_order=self.a_desc.stride_order,
-            )
-            b_cute_fake = self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
-            c_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.c_desc.dtype,
-                shape=(valid_m, *self.c_desc.shape[1:]),
-                stride_order=self.c_desc.stride_order,
-            )
-            d_row_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_row_desc.dtype,
-                shape=(valid_m, *self.d_row_desc.shape[1:]),
-                stride_order=self.d_row_desc.stride_order,
-            )
-            d_col_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_col_desc.dtype,
-                shape=(valid_m, *self.d_col_desc.shape[1:]),
-                stride_order=self.d_col_desc.stride_order,
-            )
-            d_srelu_cute_fake = None
-            if self.d_srelu_desc is not None:
-                d_srelu_cute_fake = self._make_fake_cute_compact_tensor(
-                    dtype=self.d_srelu_desc.dtype,
-                    shape=(valid_m, *self.d_srelu_desc.shape[1:]),
-                    stride_order=self.d_srelu_desc.stride_order,
-                )
-
-            tensor_m_128 = cute.sym_int()
-            stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
-                stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
-            )
-
-            sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
-
-            prob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.prob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.prob_desc.stride_order,
-            )
-            dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self._kernel_dprob_desc.dtype,
-                shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
-                stride_order=self._kernel_dprob_desc.stride_order,
-            )
-
-            sfd_row_fake = None
-            sfd_col_fake = None
-            sfd_col_d_srelu_fake = None
-            if self.sfd_row_desc is not None:
-                stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                )
-            if self.sfd_col_desc is not None:
-                rest_m = cute.sym_int(divisibility=1)
-                stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                )
-                if self.sfd_col_d_srelu_desc is not None:
-                    sfd_col_d_srelu_fake = self._make_fake_cute_tensor(
-                        dtype=self.sfd_col_d_srelu_desc.dtype,
-                        shape=(32, 4, self.sfd_col_d_srelu_desc.shape[2], 4, rest_m, 1),
-                        stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                    )
-        else:
-            valid_m = cute.sym_int(divisibility=256)
-            n_sym = cute.sym_int()
-            n_out_sym = cute.sym_int()
-            k_sym = cute.sym_int()
-            l_sym = cute.sym_int()
-
-            a_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.a_desc.dtype,
-                shape=(valid_m, k_sym, 1),
-                stride_order=self.a_desc.stride_order,
-                dynamic_mode=self.a_desc.stride_order[0],
-                divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
-            )
-            b_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.b_desc.dtype,
-                shape=(n_sym, k_sym, l_sym),
-                stride_order=self.b_desc.stride_order,
-                dynamic_mode=self.b_desc.stride_order[0],
-                divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
-            )
-
-            c_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.c_desc.dtype,
-                shape=(valid_m, n_out_sym, 1),
-                stride_order=self.c_desc.stride_order,
-                dynamic_mode=self.c_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.c_desc.dtype) else 16,
-            )
-
-            d_row_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_row_desc.dtype,
-                shape=(valid_m, n_out_sym, 1),
-                stride_order=self.d_row_desc.stride_order,
-                dynamic_mode=self.d_row_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.d_row_desc.dtype) else 16,
-            )
-
-            d_col_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.d_col_desc.dtype,
-                shape=(valid_m, n_out_sym, 1),
-                stride_order=self.d_col_desc.stride_order,
-                dynamic_mode=self.d_col_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.d_col_desc.dtype) else 16,
-            )
-            d_srelu_cute_fake = None
-            if self.d_srelu_desc is not None:
-                d_srelu_cute_fake = self._make_fake_cute_compact_tensor(
-                    dtype=self.d_srelu_desc.dtype,
-                    shape=(valid_m, n_out_sym, 1),
-                    stride_order=self.d_srelu_desc.stride_order,
-                    dynamic_mode=self.d_srelu_desc.stride_order[0],
-                    divisibility=8 if self._is_f16(self.d_srelu_desc.dtype) else 16,
-                )
-
-            tensor_m_128 = cute.sym_int()
-            rest_k = cute.sym_int()
-            stride_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
-            stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_shape = list(self.sfa_desc.shape)
-            sfa_shape[2] = tensor_m_128
-            sfa_shape[4] = rest_k
-            sfa_stride = list(self.sfa_desc.stride)
-            sfa_stride[2] = stride_rest_k
-            sfa_stride[5] = stride_tensor_m_128
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=tuple(sfa_shape),
-                stride=tuple(sfa_stride),
-            )
-
-            tensor_n_128 = cute.sym_int()
-            stride_sfb_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
-            stride_sfb_tensor_n_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfb_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfb_desc.dtype,
-                shape=(32, 4, tensor_n_128, 4, rest_k, l_sym),
-                stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
-            )
-
-            prob_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.prob_desc.dtype,
-                shape=(valid_m, *self.prob_desc.shape[1:]),
-                stride=self.prob_desc.stride,
-            )
-            dprob_cute_fake = self._make_fake_cute_tensor(
-                dtype=self._kernel_dprob_desc.dtype,
-                shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
-                stride=self._kernel_dprob_desc.stride,
-            )
-
-            sfd_row_fake = None
-            sfd_col_fake = None
-            sfd_col_d_srelu_fake = None
-            if self.sfd_row_desc is not None:
-                rest_n_out = cute.sym_int()
-                stride_sfd_rest_n_out = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_sfd_rest_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, rest_n_out, 1),
-                    stride=(16, 4, stride_sfd_rest_n_out, 1, 512, stride_sfd_rest_tensor_m_128),
-                )
-            if self.sfd_col_desc is not None:
-                tensor_n_out_128 = cute.sym_int()
-                rest_m_dyn = cute.sym_int()
-                stride_sfd_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_sfd_n_out = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
-                    stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
-                )
-                if self.sfd_col_d_srelu_desc is not None:
-                    sfd_col_d_srelu_fake = self._make_fake_cute_tensor(
-                        dtype=self.sfd_col_d_srelu_desc.dtype,
-                        shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
-                        stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
-                    )
-
-        dbias_fake = self._make_dbias_fake()
-
-        _compiled_kernel = cute.compile(
-            gemm_dsrelu,
-            a=_reinterpret_raw_grouped_fp4_tensor(self._sample_a_tensor) if self.a_desc.dtype is cutlass.Uint8 else a_cute_fake,
-            b=_reinterpret_raw_grouped_fp4_tensor(self._sample_b_tensor) if self.b_desc.dtype is cutlass.Uint8 else b_cute_fake,
-            sfb=sfb_cute_fake,
-            n=cutlass.Int32(0),
-            k=cutlass.Int32(0),
-            b_stride_size=cutlass.Int64(0),
-            b_major_mode=OperandMajorMode.K,
-            workspace_ptr=fake_workspace_ptr,
-            c=c_cute_fake,
-            d=d_row_cute_fake,
-            d_col=d_col_cute_fake,
-            sfa=sfa_cute_fake,
-            sfd_row_tensor=sfd_row_fake,
-            sfd_col_tensor=sfd_col_fake,
-            amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
-            norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
-            padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
-            alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
-            prob=prob_cute_fake,
-            dprob=dprob_cute_fake,
-            dbias_tensor=dbias_fake,
-            d_srelu=d_srelu_cute_fake,
-            sfd_col_d_srelu_tensor=sfd_col_d_srelu_fake,
-            max_active_clusters=max_active_clusters,
-            stream=fake_stream,
-            options="--enable-tvm-ffi",
-        )
-
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
-            d_row_tensor: torch.Tensor,
-            d_col_tensor: Optional[torch.Tensor],
-            d_srelu_tensor: Optional[torch.Tensor],
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            sfd_row_tensor: Optional[torch.Tensor],
-            sfd_col_tensor: Optional[torch.Tensor],
-            sfd_col_d_srelu_tensor: Optional[torch.Tensor],
-            amax_tensor: Optional[torch.Tensor],
-            norm_const_tensor: Optional[torch.Tensor],
-            padded_offsets: torch.Tensor,
-            alpha_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            dprob_tensor: torch.Tensor,
-            dbias_tensor: Optional[torch.Tensor],
-            stream: cuda.CUstream,
-        ) -> None:
-            norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            _compiled_kernel(
-                _reinterpret_raw_grouped_fp4_tensor(a_tensor),
-                _reinterpret_raw_grouped_fp4_tensor(b_tensor),
-                sfb_tensor,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int64(0),
-                cached_workspace_ptr,
-                c_tensor,
-                d_row_tensor,
-                d_col_tensor,
-                sfa_tensor,
-                sfd_row_tensor,
-                sfd_col_tensor,
-                amax_tensor,
-                norm_const_tensor,
-                padded_offsets,
-                alpha_tensor,
-                prob_tensor,
-                dprob_tensor,
-                dbias_tensor,
-                d_srelu_tensor,
-                sfd_col_d_srelu_tensor,
-                stream,
-            )
-
-        self._compiled_kernel = tensor_api
-
-    def _compile_discrete(self, gemm_dsrelu, max_active_clusters, fake_stream) -> None:
-        """Compile for discrete (per-expert pointer) weight mode."""
-        if len(self.b_shape) == 2:
-            n, k = self.b_shape
-        else:
-            n, k, _ = self.b_shape
-
-        b_major_mode = OperandMajorMode.K if self.b_major == "k" else OperandMajorMode.MN
-        if self.b_major == "k":
-            b_stride_size = k
-        else:
-            b_stride_size = n
-
-        ab_cutlass_dtype = _convert_to_cutlass_data_type(self.a_desc.dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2)
-        align = 32 if ab_cutlass_dtype.width == 4 else 16
-
-        valid_m = cute.sym_int(divisibility=256)
-        a_tensor = self._make_fake_cute_tensor(
-            dtype=self.a_desc.dtype,
-            shape=(valid_m, *self.a_desc.shape[1:]),
-            stride=(self.a_desc.stride[0], *self.a_desc.stride[1:]),
-            assumed_align=align,
-        )
-        c_tensor = self._make_fake_cute_tensor(
-            dtype=self.c_desc.dtype,
-            shape=(valid_m, *self.c_desc.shape[1:]),
-            stride=(self.c_desc.stride[0], *self.c_desc.stride[1:]),
-        )
-        d_row_tensor = self._make_fake_cute_compact_tensor(
-            dtype=self.d_row_desc.dtype,
-            shape=(valid_m, *self.d_row_desc.shape[1:]),
-            stride_order=self.d_row_desc.stride_order,
-        )
-        d_col_tensor = self._make_fake_cute_compact_tensor(
-            dtype=self.d_col_desc.dtype,
-            shape=(valid_m, *self.d_col_desc.shape[1:]),
-            stride_order=self.d_col_desc.stride_order,
-        )
-        d_srelu_tensor = None
-        if self.d_srelu_desc is not None:
-            d_srelu_tensor = self._make_fake_cute_compact_tensor(
-                dtype=self.d_srelu_desc.dtype,
-                shape=(valid_m, *self.d_srelu_desc.shape[1:]),
-                stride_order=self.d_srelu_desc.stride_order,
-            )
-
-        tensor_m_128 = cute.sym_int()
-        stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-        if self._sf_desc_is_physical(self.sfa_desc):
-            # Physical C-contiguous (1, M', K', 32, 4, 4) form (e.g. JAX): the kernel rebuilds
-            # the SF layout from the GEMM shapes and consumes only the base pointer. The
-            # extent-1 L dim's (M-dependent) stride is symbolic; the ABI cannot observe it.
-            rest_k_sfa = self.sfa_desc.shape[2]
-            sfa_tensor = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=(1, tensor_m_128, rest_k_sfa, 32, 4, 4),
-                stride=(stride_tensor_m_128, rest_k_sfa * 512, 512, 16, 4, 1),
-                assumed_align=16,
-            )
-        else:
-            sfa_shape = list(self.sfa_desc.shape)
-            sfa_shape[2] = tensor_m_128
-            sfa_stride = list(self.sfa_desc.stride)
-            sfa_stride[5] = stride_tensor_m_128
-            sfa_tensor = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=tuple(sfa_shape),
-                stride=tuple(sfa_stride),
-                assumed_align=16,
-            )
-        sfd_row_tensor = None
-        if self.sfd_row_desc is not None:
-            stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-            if self._sf_desc_is_physical(self.sfd_row_desc):
-                rest_n_sfd = self.sfd_row_desc.shape[2]
-                sfd_row_tensor = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(1, tensor_m_128, rest_n_sfd, 32, 4, 4),
-                    stride=(stride_sfd_m, rest_n_sfd * 512, 512, 16, 4, 1),
-                    assumed_align=16,
-                )
-            else:
-                sfd_row_tensor = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                    assumed_align=16,
-                )
-        sfd_col_tensor = None
-        sfd_col_d_srelu_tensor = None
-        if self.sfd_col_desc is not None:
-            rest_m = cute.sym_int(divisibility=1)
-            stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
-            stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-            if self._sf_desc_is_physical(self.sfd_col_desc):
-                # Physical (1, N', M_rest, 32, 4, 4): both outer strides are M-dependent.
-                n_out_128 = self.sfd_col_desc.shape[1]
-                sfd_col_tensor = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(1, n_out_128, rest_m, 32, 4, 4),
-                    stride=(stride_sfd_n, stride_rest_m, 512, 16, 4, 1),
-                    assumed_align=16,
-                )
-                if self.sfd_col_d_srelu_desc is not None:
-                    sfd_col_d_srelu_tensor = self._make_fake_cute_tensor(
-                        dtype=self.sfd_col_d_srelu_desc.dtype,
-                        shape=(1, n_out_128, rest_m, 32, 4, 4),
-                        stride=(stride_sfd_n, stride_rest_m, 512, 16, 4, 1),
-                        assumed_align=16,
-                    )
-            else:
-                sfd_col_tensor = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                    assumed_align=16,
-                )
-                if self.sfd_col_d_srelu_desc is not None:
-                    sfd_col_d_srelu_tensor = self._make_fake_cute_tensor(
-                        dtype=self.sfd_col_d_srelu_desc.dtype,
-                        shape=(32, 4, self.sfd_col_d_srelu_desc.shape[2], 4, rest_m, 1),
-                        stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                        assumed_align=16,
-                    )
-        amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
-        norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
-        padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
-        alpha_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
-        prob_tensor = self._make_fake_cute_tensor(
-            dtype=self.prob_desc.dtype,
-            shape=(valid_m, *self.prob_desc.shape[1:]),
-            stride=self.prob_desc.stride,
-            assumed_align=16,
-        )
-        dprob_tensor = self._make_fake_cute_tensor(
-            dtype=self._kernel_dprob_desc.dtype,
-            shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
-            stride=self._kernel_dprob_desc.stride,
-            assumed_align=16,
-        )
-        dbias_tensor = self._make_dbias_fake()
-
-        # Compile-time placeholders for the pointer-array arguments: real device bytes
-        # (fake tensors have dummy iterators) allocated in the caller's framework,
-        # retyped to Int64 via the element_type override.
-        self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-        self._compile_sfb_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-        b_ptrs_placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
-        b_ptrs_placeholder.element_type = cutlass.Int64
-        b_ptrs_cute = b_ptrs_placeholder.iterator
-        sfb_ptrs_placeholder = from_dlpack(self._compile_sfb_ptrs, assumed_align=8)
-        sfb_ptrs_placeholder.element_type = cutlass.Int64
-        sfb_ptrs_cute = sfb_ptrs_placeholder.iterator
-
-        workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
-
-        self._logger.debug("Compiling discrete grouped GEMM dSReLU kernel")
-        _compiled_kernel = cute.compile(
-            gemm_dsrelu,
-            a_tensor,
-            b_ptrs_cute,
-            sfb_ptrs_cute,
-            cutlass.Int32(n),
-            cutlass.Int32(k),
-            cutlass.Int64(b_stride_size),
-            b_major_mode,
-            workspace_ptr_cute,
-            c_tensor,
-            d_row_tensor,
-            d_col_tensor,
-            sfa_tensor,
-            sfd_row_tensor,
-            sfd_col_tensor,
-            amax_tensor,
-            norm_const_tensor_cute,
-            padded_offsets_tensor,
-            alpha_tensor,
-            prob_tensor,
-            dprob_tensor,
-            dbias_tensor,
-            d_srelu_tensor,
-            sfd_col_d_srelu_tensor,
-            max_active_clusters,
-            fake_stream,
-            options="--enable-tvm-ffi",
-        )
-
-        self._n = n
-        self._k = k
-        self._b_stride_size = b_stride_size
-
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-        cached_n = cutlass.Int32(self._n)
-        cached_k = cutlass.Int32(self._k)
-        cached_b_stride = cutlass.Int64(self._b_stride_size)
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_ptrs_device: torch.Tensor,
-            sfb_ptrs_device: torch.Tensor,
-            c_tensor: torch.Tensor,
-            d_row_tensor: torch.Tensor,
-            d_col_tensor: Optional[torch.Tensor],
-            d_srelu_tensor: Optional[torch.Tensor],
-            sfa_tensor: torch.Tensor,
-            sfd_row_tensor: Optional[torch.Tensor],
-            sfd_col_tensor: Optional[torch.Tensor],
-            sfd_col_d_srelu_tensor: Optional[torch.Tensor],
-            amax_tensor: Optional[torch.Tensor],
-            norm_const_tensor: Optional[torch.Tensor],
-            padded_offsets: torch.Tensor,
-            alpha_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            dprob_tensor: torch.Tensor,
-            dbias_tensor: Optional[torch.Tensor],
-            stream: cuda.CUstream,
-        ) -> None:
-            norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            b_ptrs_addr = int(get_data_ptr(b_ptrs_device))
-            sfb_ptrs_addr = int(get_data_ptr(sfb_ptrs_device))
-
-            _compiled_kernel(
-                a_tensor,
-                b_ptrs_addr,
-                sfb_ptrs_addr,
-                cached_n,
-                cached_k,
-                cached_b_stride,
-                cached_workspace_ptr,
-                c_tensor,
-                d_row_tensor,
-                d_col_tensor,
-                sfa_tensor,
-                sfd_row_tensor,
-                sfd_col_tensor,
-                amax_tensor,
-                norm_const_tensor,
-                padded_offsets,
-                alpha_tensor,
-                prob_tensor,
-                dprob_tensor,
-                dbias_tensor,
-                d_srelu_tensor,
-                sfd_col_d_srelu_tensor,
-                stream,
-            )
-
-        self._compiled_kernel = tensor_api
+        """Segment-sum the dbias slots per expert; accumulates onto dbias_tensor if given."""
+        return GroupedGemmDsreluBlockScaledAPI.reduce_dbias_workspace(dbias_workspace, padded_offsets, dbias_tensor, mma_tiler_mn, current_stream)
 
     def execute(
         self,
         a_tensor: torch.Tensor,
         c_tensor: torch.Tensor,
         d_row_tensor: torch.Tensor,
-        d_col_tensor: torch.Tensor,
-        sfa_tensor: torch.Tensor,
+        d_col_tensor: Optional[torch.Tensor],
+        sfa_tensor: Optional[torch.Tensor],
         padded_offsets: torch.Tensor,
-        alpha_tensor: torch.Tensor,
+        alpha_tensor: Optional[torch.Tensor],
         prob_tensor: torch.Tensor,
         dprob_tensor: torch.Tensor,
         # Dense mode:
@@ -1521,119 +370,80 @@ class GroupedGemmDsreluSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace: Any = None,
     ) -> None:
-        """Execute the compiled kernel.
+        """Execute the compiled kernel; see the backend implementation for each argument.
 
-        For dense mode, supply ``b_tensor`` and ``sfb_tensor``.
-        For discrete mode, supply ``b_ptrs`` and ``sfb_ptrs``.
-
-        :param a_tensor: Input A tensor (gradient input)
-        :param c_tensor: Forward activations input
-        :param d_row_tensor: Output D row tensor
-        :param d_col_tensor: Output D column tensor
-        :param sfa_tensor: Scale factor A
-        :param padded_offsets: End offset per expert after padding
-        :param alpha_tensor: Per-group alpha scaling factors
-        :param prob_tensor: Per-row probability (from forward)
-        :param dprob_tensor: Gradient of probability (output, must be zero-initialized)
-        :param b_tensor: (Dense) Input B tensor (weights)
-        :param sfb_tensor: (Dense) Scale factor B
-        :param dbias_tensor: Optional dbias output tensor.
-        :param dprob_workspace_tensor: Determinism scratch, required iff deterministic=True
-        :param dbias_workspace_tensor: Determinism scratch, required iff deterministic=True and dbias
-        :param b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
-        :param sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
-        :param sfd_row_tensor: Optional row scale factor D
-        :param sfd_col_tensor: Optional column scale factor D
-        :param amax_tensor: Optional amax tensor
-        :param norm_const_tensor: Optional normalization constant
-        :param current_stream: CUDA stream
+        The BF16 backend takes ``d_col_tensor=None``, ``sfa_tensor=None`` and
+        ``alpha_tensor=None``, and requires ``workspace``: a caller-owned, 128-byte-aligned device
+        buffer of at least ``scratch_workspace_bytes()`` bytes, never allocated here; launches that
+        can overlap need distinct workspaces. The block-scaled backend takes no ``workspace``.
         """
-        self._logger.debug("Entering execute")
-        if current_stream is None:
-            # torch inputs stay ordered with the caller's current torch stream;
-            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
-            current_stream = default_stream(detect_framework(a_tensor))
-
-        if a_tensor.shape[0] == 0:
-            self._logger.debug("execute: valid_m is zero, skipping kernel execution")
-            return
-        self._runtime_error_if(
-            self._compiled_kernel is None,
-            "Kernel not compiled; call compile() first",
-        )
-
-        self._logger.debug("Executing grouped GEMM dSReLU kernel")
-        if self._has_dbias:
-            self._value_error_if(
-                dbias_tensor is None,
-                "dbias_tensor is required when GroupedGemmDsreluSm100 is configured with sample_dbias",
+        if self._implementation is None:
+            raise RuntimeError("Kernel not compiled; call compile() first")
+        if self.backend is GroupedGemmBackend.BF16:
+            controls = (
+                ("d_col_tensor", d_col_tensor),
+                ("sfa_tensor", sfa_tensor),
+                ("alpha_tensor", alpha_tensor),
+                ("sfb_tensor", sfb_tensor),
+                ("dbias_tensor", dbias_tensor),
+                ("dbias_workspace_tensor", dbias_workspace_tensor),
+                ("sfb_ptrs", sfb_ptrs),
+                ("sfd_row_tensor", sfd_row_tensor),
+                ("sfd_col_tensor", sfd_col_tensor),
+                ("sfd_col_d_srelu_tensor", sfd_col_d_srelu_tensor),
+                ("amax_tensor", amax_tensor),
+                ("norm_const_tensor", norm_const_tensor),
             )
-        # Under determinism the kernel fills the scratch and the caller reduces it into
-        # dprob/dbias afterwards; dprob_tensor/dbias_tensor are otherwise written directly.
-        if self.deterministic:
-            self._value_error_if(
-                dprob_workspace_tensor is None,
-                "dprob_workspace_tensor is required when the op was built with deterministic=True",
-            )
-            self._value_error_if(
-                self._has_dbias and dbias_workspace_tensor is None,
-                "dbias_workspace_tensor is required when the op was built with deterministic=True and sample_dbias",
-            )
-            dprob_tensor = dprob_workspace_tensor
-            dbias_tensor = dbias_workspace_tensor if self._has_dbias else dbias_tensor
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._compiled_kernel(
+            forbidden = [name for name, value in controls if value is not None]
+            if forbidden:
+                raise ValueError(f"grouped_gemm_dsrelu_sm100: BF16 forbids scale control {forbidden[0]}")
+            self._implementation.execute(
                 a_tensor=a_tensor,
-                b_tensor=b_tensor,
                 c_tensor=c_tensor,
                 d_row_tensor=d_row_tensor,
-                d_col_tensor=d_col_tensor,
-                d_srelu_tensor=d_srelu_tensor,
-                sfa_tensor=sfa_tensor,
-                sfb_tensor=sfb_tensor,
-                sfd_row_tensor=sfd_row_tensor,
-                sfd_col_tensor=sfd_col_tensor,
-                sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
-                amax_tensor=amax_tensor,
-                norm_const_tensor=norm_const_tensor,
                 padded_offsets=padded_offsets,
-                alpha_tensor=alpha_tensor,
                 prob_tensor=prob_tensor,
                 dprob_tensor=dprob_tensor,
-                dbias_tensor=dbias_tensor,
-                stream=current_stream,
+                b_tensor=b_tensor,
+                b_ptrs=b_ptrs,
+                d_srelu_tensor=d_srelu_tensor,
+                dprob_workspace_tensor=dprob_workspace_tensor,
+                current_stream=current_stream,
+                workspace=workspace,
             )
         else:
-            if not is_torch_tensor(b_ptrs):
-                # No record_stream equivalent for immutable frameworks (e.g. JAX): keep the
-                # pointer arrays referenced until the next execute so their buffers outlive
-                # the asynchronous launch.
-                self._live_ptrs = (b_ptrs, sfb_ptrs)
-            self._compiled_kernel(
+            if workspace is not None:
+                raise ValueError("workspace is supported only by the BF16 kernel; the block-scaled kernel needs no caller scratch")
+            self._implementation.execute(
                 a_tensor=a_tensor,
-                b_ptrs_device=b_ptrs,
-                sfb_ptrs_device=sfb_ptrs,
                 c_tensor=c_tensor,
                 d_row_tensor=d_row_tensor,
                 d_col_tensor=d_col_tensor,
-                d_srelu_tensor=d_srelu_tensor,
                 sfa_tensor=sfa_tensor,
-                sfd_row_tensor=sfd_row_tensor,
-                sfd_col_tensor=sfd_col_tensor,
-                sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
-                amax_tensor=amax_tensor,
-                norm_const_tensor=norm_const_tensor,
                 padded_offsets=padded_offsets,
                 alpha_tensor=alpha_tensor,
                 prob_tensor=prob_tensor,
                 dprob_tensor=dprob_tensor,
+                b_tensor=b_tensor,
+                sfb_tensor=sfb_tensor,
                 dbias_tensor=dbias_tensor,
-                stream=current_stream,
+                dprob_workspace_tensor=dprob_workspace_tensor,
+                dbias_workspace_tensor=dbias_workspace_tensor,
+                b_ptrs=b_ptrs,
+                sfb_ptrs=sfb_ptrs,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                d_srelu_tensor=d_srelu_tensor,
+                sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
+                amax_tensor=amax_tensor,
+                norm_const_tensor=norm_const_tensor,
+                current_stream=current_stream,
             )
-
-        self._logger.debug("Execute completed")
+        self._is_supported = self._implementation._is_supported
+        self._compiled_kernel = self._implementation._compiled_kernel
 
 
 _logger = logging.getLogger(__name__)
@@ -1674,6 +484,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     deterministic: Optional[bool] = None,
     tanh_clamp_scale: Optional[float] = None,
     current_stream: Optional[cuda.CUstream] = None,
+    tanh_mode: str = "approx",
+    generate_d_srelu: bool = True,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM dSReLU backward operation.
 
@@ -1684,6 +496,16 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     Discrete mode: provide ``b_ptrs``, ``sfb_ptrs``, ``n``, and ``b_dtype``.
 
     Compiled kernels are cached for reuse when called with the same configuration.
+
+    BF16 ``a_tensor`` and ``b_tensor`` (or ``b_dtype``) select the BF16 backend: ``c_tensor`` is the
+    BF16 pre-activation the forward returned as its ``c_tensor``, ``d_row_tensor`` the BF16 ``dZ``
+    and ``d_srelu_tensor`` the BF16 recomputed forward output. ``prob_tensor`` is required;
+    ``sfa_tensor``, ``sfb_tensor``, ``sfb_ptrs``, ``alpha_tensor``, ``norm_const_tensor`` and
+    ``generate_dbias`` must be omitted; ``d_col_tensor``, ``dbias_tensor``, ``amax_tensor`` and the
+    scale-factor outputs are ``None``. The BF16 kernel's descriptor and scheduler scratch
+    (``GroupedGemmDsreluSm100.scratch_workspace_bytes()``) is allocated per call on the launch
+    stream. The BF16 backend takes torch tensors only; JAX arrays are served by the block-scaled
+    backend.
 
     Args:
         a_tensor: Input A tensor (valid_m, k, 1) -- gradient input
@@ -1712,7 +534,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
-        use_dsrelu_reuse: Reuse relu(C)^2 (or, when clamped, c^2) between d_srelu and dprob
+        use_dsrelu_reuse: Reuse relu(C)^2 (or, when clamped, c^2) between d_srelu and dprob.
+            The BF16 epilogue always does, so the BF16 backend accepts either value and builds
+            the same kernel for both.
         tanh_clamp_scale: Optional soft-clamp scale ``s``, must match the forward pass that
             produced ``c_tensor``. Must be finite and > 0. ``None`` (default) is
             bit-identical to today's unclamped DSRELU.
@@ -1722,11 +546,151 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             this wrapper. ``None`` (default) follows ``torch.use_deterministic_algorithms``.
             See docs/operations/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
         current_stream: CUDA stream
+        tanh_mode: ``"approx"`` (default) or ``"accurate"``; any other value, ``None`` included,
+            raises ``ValueError``. Like ``tanh_clamp_scale`` it must match the forward pass that
+            produced ``c_tensor``: the backward recomputes ``t`` and the forward output
+            (``d_srelu_tensor``) from ``c_tensor``. With ``tanh_clamp_scale`` set it selects the
+            tanh: ``"approx"`` is MUFU ``tanh.approx.f32`` (capped at 1) on both backends;
+            ``"accurate"`` is a Cephes-style FP32 tanh on the BF16 backend and raises
+            ``ValueError`` on the block-scaled one, which has no accurate tanh. Without
+            ``tanh_clamp_scale`` no tanh is evaluated and the mode is ignored (both values share
+            one compiled kernel). NaN pre-activations propagate on the BF16 backend in every mode;
+            the block-scaled kernel maps them to +0 (clamped: the ``mul.rn.sat.f32`` in
+            ``moe_kernel_helpers.tanh_clamp_unit``; plain: its relu select).
+        generate_d_srelu: Also write ``d_srelu_tensor``, the recomputed forward output
+            ``prob * srelu(C)`` (default ``True``, as before). ``False`` skips that write and
+            returns ``d_srelu_tensor=None``.
 
     Returns:
-        TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
-            dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor
+        TupleDict with keys: d_row_tensor, d_col_tensor, d_srelu_tensor, dprob_tensor,
+            dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor, sfd_col_d_srelu_tensor
     """
+    framework = detect_framework(a_tensor)
+    if framework not in ("torch", "jax"):
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dsrelu_wrapper_sm100; pass torch tensors or JAX arrays")
+    is_dense = b_tensor is not None
+    is_discrete = b_ptrs is not None
+    if is_dense and is_discrete:
+        raise ValueError("Provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs), not both")
+    if not is_dense and not is_discrete:
+        raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
+    if is_discrete and (n is None or b_dtype is None):
+        raise ValueError("n and b_dtype are required for discrete mode")
+    backend = select_grouped_gemm_backend(
+        operation="grouped_gemm_dsrelu_sm100",
+        a_dtype=a_tensor.dtype,
+        b_dtype=b_tensor.dtype if is_dense else b_dtype,
+        scale_controls=(
+            ("sfa_tensor", sfa_tensor),
+            ("sfb_tensor", sfb_tensor),
+            ("sfb_ptrs", sfb_ptrs),
+            ("alpha_tensor", alpha_tensor),
+            ("norm_const_tensor", norm_const_tensor),
+            ("generate_dbias", generate_dbias if generate_dbias else None),
+            ("sf_vec_size", sf_vec_size if sf_vec_size != 16 else None),
+            ("vector_f32", vector_f32 if vector_f32 else None),
+            ("discrete_col_sfd", discrete_col_sfd if discrete_col_sfd else None),
+        ),
+        block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
+    )
+    if backend is GroupedGemmBackend.BF16:
+        return _grouped_gemm_dsrelu_bf16_call(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            padded_offsets=padded_offsets,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_ptrs=b_ptrs,
+            n=n,
+            b_dtype=b_dtype,
+            b_major=b_major,
+            acc_dtype=acc_dtype,
+            d_dtype=d_dtype,
+            cd_major=cd_major,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            m_aligned=m_aligned,
+            use_dynamic_sched=use_dynamic_sched,
+            deterministic=deterministic,
+            tanh_clamp_scale=tanh_clamp_scale,
+            tanh_mode=tanh_mode,
+            generate_d_srelu=generate_d_srelu,
+            current_stream=current_stream,
+        )
+    _check_block_scaled_activation_options("grouped_gemm_dsrelu_sm100", tanh_clamp_scale, tanh_mode, "acc")
+    return _grouped_gemm_dsrelu_block_scaled_call(
+        a_tensor=a_tensor,
+        b_tensor=b_tensor,
+        c_tensor=c_tensor,
+        sfa_tensor=sfa_tensor,
+        sfb_tensor=sfb_tensor,
+        padded_offsets=padded_offsets,
+        alpha_tensor=alpha_tensor,
+        prob_tensor=prob_tensor,
+        dprob_tensor=dprob_tensor,
+        generate_dbias=generate_dbias,
+        b_ptrs=b_ptrs,
+        sfb_ptrs=sfb_ptrs,
+        n=n,
+        b_dtype=b_dtype,
+        b_major=b_major,
+        norm_const_tensor=norm_const_tensor,
+        acc_dtype=acc_dtype,
+        d_dtype=d_dtype,
+        cd_major=cd_major,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        vector_f32=vector_f32,
+        m_aligned=m_aligned,
+        discrete_col_sfd=discrete_col_sfd,
+        use_dynamic_sched=use_dynamic_sched,
+        use_dsrelu_reuse=use_dsrelu_reuse,
+        deterministic=deterministic,
+        tanh_clamp_scale=tanh_clamp_scale,
+        current_stream=current_stream,
+        generate_d_srelu=generate_d_srelu,
+    )
+
+
+def _grouped_gemm_dsrelu_block_scaled_call(
+    a_tensor: torch.Tensor,
+    b_tensor: Optional[torch.Tensor] = None,
+    c_tensor: Optional[torch.Tensor] = None,
+    sfa_tensor: Optional[torch.Tensor] = None,
+    sfb_tensor: Optional[torch.Tensor] = None,
+    padded_offsets: Optional[torch.Tensor] = None,
+    alpha_tensor: Optional[torch.Tensor] = None,
+    prob_tensor: Optional[torch.Tensor] = None,
+    dprob_tensor: Optional[torch.Tensor] = None,
+    # generate_dbias is optional in both modes:
+    generate_dbias: bool = False,
+    # Discrete mode:
+    b_ptrs: Optional[torch.Tensor] = None,
+    sfb_ptrs: Optional[torch.Tensor] = None,
+    n: Optional[int] = None,
+    b_dtype: Optional[torch.dtype] = None,
+    b_major: str = "k",
+    # Common:
+    norm_const_tensor: Optional[torch.Tensor] = None,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
+    cd_major: str = "n",
+    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    sf_vec_size: int = 16,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    discrete_col_sfd: bool = False,
+    use_dynamic_sched: bool = False,
+    use_dsrelu_reuse: bool = False,
+    deterministic: Optional[bool] = None,
+    tanh_clamp_scale: Optional[float] = None,
+    current_stream: Optional[cuda.CUstream] = None,
+    generate_d_srelu: bool = True,
+) -> TupleDict:
+    """Block-scaled path of grouped_gemm_dsrelu_wrapper_sm100 (arguments as documented there)."""
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dsrelu_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -1768,6 +732,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 ("use_dsrelu_reuse", use_dsrelu_reuse),
                 ("deterministic", bool(deterministic)),
                 ("tanh_clamp_scale", tanh_clamp_scale is not None),
+                # grouped_gemm_dsrelu_jax_sm100 always writes d_srelu: refuse rather than return it.
+                ("generate_d_srelu", not generate_d_srelu),
             ):
                 if rejected:
                     raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
@@ -1837,13 +803,15 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         with _torch_stream_context(current_stream, a_tensor.device):
             d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
             d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
-            d_srelu_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
+            d_srelu_tensor = (
+                torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device) if generate_d_srelu else None
+            )
     else:
         # n-major C-contiguous; the extent-1 batch dim's stride is unobservable by the kernel.
         d_jax_dtype = framework_dtype(d_dtype, "jax")
         d_row_tensor = _jax_alloc(lambda: jnp.empty((valid_m, n_out, 1), dtype=d_jax_dtype, device=a_tensor.device))
         d_col_tensor = _jax_alloc(lambda: jnp.empty((valid_m, n_out, 1), dtype=d_jax_dtype, device=a_tensor.device))
-        d_srelu_tensor = _jax_alloc(lambda: jnp.empty((valid_m, n_out, 1), dtype=d_jax_dtype, device=a_tensor.device))
+        d_srelu_tensor = _jax_alloc(lambda: jnp.empty((valid_m, n_out, 1), dtype=d_jax_dtype, device=a_tensor.device)) if generate_d_srelu else None
 
     sfd_row_tensor = None
     sfd_col_tensor = None
@@ -1899,14 +867,16 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             with _torch_stream_context(current_stream, a_tensor.device):
                 sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
                 sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-                sfd_col_d_srelu_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+                if generate_d_srelu:
+                    sfd_col_d_srelu_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
         else:
             # Physical C-contiguous atom allocations: JAX cannot express the permuted view;
             # the kernel rebuilds the SF layout from the GEMM shapes and consumes only the
             # SF base pointer, so the physical form is byte-identical.
             sfd_row_tensor = _jax_alloc(lambda: jnp.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device))
             sfd_col_tensor = _jax_alloc(lambda: jnp.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device))
-            sfd_col_d_srelu_tensor = _jax_alloc(lambda: jnp.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device))
+            if generate_d_srelu:
+                sfd_col_d_srelu_tensor = _jax_alloc(lambda: jnp.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device))
 
     if d_dtype in (cutlass.BFloat16, cutlass.Float16):
         _logger.debug("grouped_gemm_dsrelu_wrapper_sm100: Constructing amax_tensor")
@@ -2248,3 +1218,202 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         sfd_col_tensor=sfd_col_tensor,
         sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
     )
+
+
+def _dsrelu_tensor_signature(tensor, *, dynamic_m: bool = False) -> tuple:
+    """What a compiled BF16 kernel depends on: layout, dtype and device, with M left out when dynamic."""
+    if tensor is None:
+        return (None,)
+    device = get_device(tensor)
+    shape = get_shape(tensor)
+    if dynamic_m:
+        # execute() checks the full layout; the compiled kernel only depends on the row shape.
+        return (shape[1:], tensor.dtype, device.type, device.index)
+    return (shape, canonicalize_unit_dim_strides(shape, get_strides(tensor)), tensor.dtype, device.type, device.index)
+
+
+def _grouped_gemm_dsrelu_bf16_call(
+    *,
+    a_tensor,
+    b_tensor,
+    c_tensor,
+    padded_offsets,
+    prob_tensor,
+    dprob_tensor,
+    b_ptrs,
+    n,
+    b_dtype,
+    b_major,
+    acc_dtype,
+    d_dtype,
+    cd_major,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    m_aligned,
+    use_dynamic_sched,
+    deterministic,
+    tanh_clamp_scale,
+    tanh_mode,
+    generate_d_srelu,
+    current_stream,
+) -> TupleDict:
+    """BF16 path of grouped_gemm_dsrelu_wrapper_sm100."""
+    operation = "grouped_gemm_dsrelu_wrapper_sm100"
+    if detect_framework(a_tensor) != "torch":
+        # The public wrapper admits torch and JAX only; the BF16 backend has no JAX entry point.
+        raise ValueError(_JAX_BF16_ERROR)
+    # Rule 7: decline an unusable CuTe DSL by version before anything is allocated (the facade's
+    # check_support() imports the BF16 kernel module behind the same gate).
+    requirement = bf16_kernel_requirement_error(f"{operation} (BF16)")
+    if requirement:
+        raise ImportError(requirement)
+    import torch
+
+    for name, dtype, expected in (("acc_dtype", acc_dtype, cutlass.Float32), ("d_dtype", d_dtype, cutlass.BFloat16)):
+        if dtype is not None and _convert_to_cutlass_data_type(dtype) is not expected:
+            raise ValueError(f"{operation}: BF16 {name} must be {expected}, got {dtype}")
+    if cd_major != "n":
+        raise ValueError(f"cd_major must be 'n', got {cd_major}")
+    if c_tensor is None:
+        raise ValueError(f"{operation}: c_tensor (the BF16 pre-activation the forward saved) is required")
+    if prob_tensor is None:
+        raise ValueError(f"{operation}: prob_tensor is required (shape (valid_m, 1, 1), float32)")
+    if padded_offsets is None:
+        raise ValueError(f"{operation}: padded_offsets is required")
+    # The public wrapper has checked that exactly one of b_tensor / b_ptrs is given and that
+    # discrete mode carries n and b_dtype.
+    is_dense = b_tensor is not None
+    is_discrete = b_ptrs is not None
+    a_shape = get_shape(a_tensor)
+    if len(a_shape) != 3 or a_shape[2] != 1:
+        raise ValueError(f"a_tensor must have shape (valid_m, k, 1), got {a_shape}")
+    valid_m, k, _ = a_shape
+    if is_dense:
+        weight_mode = MoEWeightMode.DENSE
+        b_full_shape = get_shape(b_tensor)
+        if len(b_full_shape) != 3:
+            raise ValueError(f"b_tensor must have shape (n, k, experts), got {b_full_shape}")
+        n_out = b_full_shape[0]
+        num_experts = b_full_shape[2]
+        b_shape = None
+        if n is not None or b_dtype is not None:
+            raise ValueError("Dense mode forbids n and b_dtype")
+    else:
+        weight_mode = MoEWeightMode.DISCRETE
+        num_experts = _validate_pointer_tensor(b_ptrs, "b_ptrs")
+        n_out = n
+        b_shape = (n_out, k)
+    tanh_clamp_scale, tanh_mode = resolve_bf16_srelu_options(tanh_clamp_scale, tanh_mode)
+    if deterministic is None:
+        deterministic = torch.are_deterministic_algorithms_enabled()
+    deterministic = bool(deterministic)
+
+    device = a_tensor.device
+    if current_stream is None:
+        # The launch stream on the operands' device, fixed before anything is allocated: the outputs, the
+        # dprob buffers, the scratch and the launch share it even when another device is current.
+        current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    resolved_cluster = cluster_shape_mn if cluster_shape_mn is not None else ((2, 1) if mma_tiler_mn[0] == 256 else (1, 1))
+    dprob_n_slots = _dprob_n_slots(n_out, mma_tiler_mn, resolved_cluster, True)
+    # Allocated on the launch stream, as on the block-scaled path: the caching allocator hands out
+    # blocks on the strength of the allocating stream's ordering.
+    with _torch_stream_context(current_stream, device):
+        d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=torch.bfloat16, device=device)
+        d_srelu_tensor = (
+            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=torch.bfloat16, device=device) if generate_d_srelu else None
+        )
+        if dprob_tensor is None:
+            dprob_tensor = torch.zeros((valid_m, 1, 1), dtype=torch.float32, device=device)
+        dprob_workspace = torch.zeros((valid_m, dprob_n_slots, 1), dtype=torch.float32, device=device) if deterministic else None
+    outputs = TupleDict(
+        d_row_tensor=d_row_tensor,
+        d_col_tensor=None,
+        d_srelu_tensor=d_srelu_tensor,
+        dprob_tensor=dprob_tensor,
+        dbias_tensor=None,
+        amax_tensor=None,
+        sfd_row_tensor=None,
+        sfd_col_tensor=None,
+        sfd_col_d_srelu_tensor=None,
+    )
+    if valid_m == 0:
+        _logger.debug("grouped_gemm_dsrelu_wrapper_sm100: valid_m is zero, skipping kernel execution")
+        return outputs
+
+    cache_key = backend_cache_key(
+        GroupedGemmBackend.BF16,
+        weight_mode,
+        _dsrelu_tensor_signature(a_tensor, dynamic_m=True),
+        _dsrelu_tensor_signature(c_tensor, dynamic_m=True),
+        _dsrelu_tensor_signature(prob_tensor, dynamic_m=True),
+        _dsrelu_tensor_signature(dprob_tensor, dynamic_m=True),
+        _dsrelu_tensor_signature(b_tensor),
+        _dsrelu_tensor_signature(padded_offsets),
+        _dsrelu_tensor_signature(b_ptrs),
+        n_out,
+        num_experts,
+        b_shape,
+        None if b_dtype is None else _convert_to_cutlass_data_type(b_dtype),
+        b_major,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        m_aligned,
+        use_dynamic_sched,
+        deterministic,
+        generate_d_srelu,
+        tanh_clamp_scale,
+        # The plain squared-ReLU evaluates no tanh: both modes share one entry and one kernel.
+        None if tanh_clamp_scale is None else tanh_mode,
+        int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+    )
+    api = _cache_of_GroupedGemmDsreluSm100Objects.get(cache_key)
+    if api is None:
+        _logger.debug("grouped_gemm_dsrelu_wrapper_sm100: creating a BF16 GroupedGemmDsreluSm100 object")
+        # check_support() and compile() pin the operands' device themselves; this context only keeps
+        # the cold path on that device.
+        with device_context(device):
+            api = GroupedGemmDsreluSm100(
+                sample_a=a_tensor,
+                sample_b=b_tensor,
+                sample_c=c_tensor,
+                sample_d_row=d_row_tensor,
+                sample_d_srelu=d_srelu_tensor,
+                sample_padded_offsets=padded_offsets,
+                sample_prob=prob_tensor,
+                sample_dprob=dprob_tensor,
+                sample_dprob_workspace=dprob_workspace,
+                num_experts=num_experts if is_discrete else None,
+                b_shape=b_shape,
+                b_dtype=b_dtype,
+                acc_dtype=acc_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                m_aligned=m_aligned,
+                b_major=b_major,
+                use_dynamic_sched=use_dynamic_sched,
+                deterministic=deterministic,
+                tanh_clamp_scale=tanh_clamp_scale,
+                tanh_mode=tanh_mode,
+            )
+            if not api.check_support():
+                raise RuntimeError("Unsupported BF16 configuration")
+            api.compile()
+        _cache_of_GroupedGemmDsreluSm100Objects[cache_key] = api
+
+    # Per-call scratch allocated on the launch stream (recipe R2): the cached API owns none.
+    with wrapper_workspace("torch", api.scratch_workspace_bytes(), device, current_stream) as workspace:
+        api._implementation.execute(
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            padded_offsets=padded_offsets,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            b_ptrs=b_ptrs,
+            d_srelu_tensor=d_srelu_tensor,
+            dprob_workspace_tensor=dprob_workspace,
+            current_stream=current_stream,
+            workspace=workspace,
+        )
+    return outputs

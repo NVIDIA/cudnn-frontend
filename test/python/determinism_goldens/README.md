@@ -110,6 +110,140 @@ nonpaged D256 frame cases while passing the six paged controls. Intermediate
 new-fixture failures exposed omitted total-Q capacity and undersized B=1 HN
 storage, both corrected in tests without another production change.
 
+### BF16 grouped GEMM srelu/dsrelu backends (2026-11-16)
+
+`gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` and
+`gemm/cutedsl/test_grouped_gemm_dsrelu_bf16_determinism.py` cover the BF16
+backends of `grouped_gemm_srelu_wrapper_sm100` and
+`grouped_gemm_dsrelu_wrapper_sm100` with discrete weights (four expert slots,
+K = 192, a 512-row target segment). The forward cells are the plain
+squared-ReLU and the tanh-clamped one (s = 16) in both `tanh_mode` values,
+each with `act_input` acc and saved, at N = 320, which has a partial last N
+tile (six cells). The backward cells are plain, clamped approx and clamped
+accurate with deterministic dprob at N = 320 and at N = 1856, plus clamped
+approx at N = 320 with the default atomic dprob, which compares dZ and
+d_srelu only: atomic dprob is not bit-reproducible by design. Every cell
+checks replay against concurrent work and batch invariance (ragged neighbours
+with an empty expert, changed neighbours, the segment moved to the last slot
+and duplicated in two slots, a batch in which every persistent cluster runs
+several tiles), with an FP32 reference check kept separate; every
+deterministic cell records one golden. Warm stress covers the shared-memory
+stages the kernels refill: the forward kernel's (K1) tile-info ring and the
+backward kernel's (K2) tile-info ring and
+Z_save stage.
+
+Deterministic dprob is one FP32 partial per row and 256-column N tile, which a
+second kernel folds in increasing tile order and adds to dprob once. At
+N = 320 a row has two partials, a and b, and the wrapper's dprob starts at +0,
+so the fold, +0 + (a + b), and atomic accumulation, (+0 + a) + b, both come
+down to one FP32 addition of the same two terms, which has the same bits in
+either order. Those goldens therefore cannot detect a change of the fold order
+or of the tile-to-slot mapping, or a switch to atomic accumulation. At
+N = 1856 a row has eight partials (the last N tile is 64 columns wide), where
+those orders generally round differently, so its goldens pin them. The unit
+test `test_dsrelu_bf16_dprob_fold_is_a_strict_left_fold` runs the fold kernel
+alone on 3, 4, 8 and 14 slots per row (eight and fourteen are N = 1856 and
+N = 3584) over 805 rows, with mixed-magnitude FP32 slots and a non-zero
+starting dprob. It requires dprob to become, byte for byte, its start plus the
+sequential FP32 left fold of its slots, start + (((s0 + s1) + s2) + ...);
+every slot to read +0.0 afterwards; and the guard rows behind both buffers to
+keep their bytes, so the partial last thread block stores nothing past either
+end. On the same inputs it checks that the reversed fold, accumulation slot by
+slot into dprob and, from four slots, a pairwise tree each give other bytes.
+It compares with torch additions, so it needs no golden.
+
+Every run used GB300 (cc 10.3, 152 SMs), driver 580.167.08, cuDNN 9.24.0,
+CuTe DSL 4.8.0 (cu13 flavor, CUDA 13.4 compiler, except the cu12 runs below),
+Torch 2.13.0a0+9186a08b2c.nv26.07 and apache-tvm-ffi 0.1.12. The goldens live
+under runtime key `da1753675488f6a3`,
+the hash of their `runtime` block: the GPU name, compute capability and SM
+count, the Torch version and its CUDA version (13.3), the driver API version
+(13030), the cuDNN version (92400) and the CuTe DSL and TVM FFI versions. In
+every run `cudnn` was imported from the tested checkout and `cutlass` from a
+CuTe DSL 4.8.0 overlay on `PYTHONPATH`: `nvidia-cutlass-dsl`, `-libs-base`,
+`-libs-core` and `-libs-cu12` 4.8.0, plus `-libs-cu13` 4.8.0 in the cu13 overlay. The cu12 runs
+used the cu12-flavor overlay and compiled with CUDA 12.9, although the image's
+`nvidia-cutlass-dsl-libs-cu13` 4.6.0 stayed installed. The twelve JSON files
+run F recorded were inspected: the nine at N = 320 are byte-identical to the
+committed ones (`cmp`), and the three at N = 1856 share one input record, hold
+three distinct hashes for each of dZ, d_srelu and dprob (none equal to an
+N = 320 output), and carry the same runtime block. Those three are the
+committed N = 1856 goldens; run G recorded all twelve again, byte-identical.
+
+Runs F and G, from `test/python`:
+
+```bash
+export PYTHONPATH=<checkout>/python:<CuTe DSL 4.8.0 overlay>:<pytest 9.1.1, pytest-mock 3.17.0 and their dependencies>
+export CUDA_VISIBLE_DEVICES=1 CUTE_DSL_CACHE_DIR=<new dir> PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=8
+suites="gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py gemm/cutedsl/test_grouped_gemm_dsrelu_bf16_determinism.py"
+python -m pytest $suites -m "L0 or L1" -p no:cacheprovider --collect-only -q
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new dir> \
+  python -m pytest $suites -m "L0 or L1" -p no:cacheprovider \
+  -o addopts="--tb=short --no-header -ra -s --durations=15" --junitxml=<report>
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest $suites -m "L0 or L1" -p no:cacheprovider \
+  -o addopts="--tb=short --no-header -ra -s --durations=15" --junitxml=<report>
+```
+
+Runs A to E, H and I used the same pytest line, under `timeout 3600`, with the
+environment and selection below, `--durations=25` in A and B, and in A to E
+one more directory on `PYTHONPATH` that these suites do not import from. Every run had 0 failed and 0 skipped.
+In every run the GPU these suites used (GPU 1; GPU 2 in run B's cu12 lane) ran
+nothing else meanwhile, as the `gpu_exclusive` warm-stress cells require; in
+runs A to E, H and I other suites ran on the node's other GPUs, and runs F
+and G ran these suites alone. The counts are srelu + dsrelu cases; start times are
+UTC-8.
+
+| Run | Started | Tested source revision | Environment and selection | Result |
+| --- | --- | --- | --- | --- |
+| A | 08:42 | `77225e06`, based on develop `1b6c3540` | `CUDNN_DETERMINISM_RECORD=<new dir>` | 13 + 8 passed; 9 goldens recorded |
+| A | 08:42 | `77225e06` | separate process, `CUDNN_DETERMINISM_GOLDENS=<A's record dir>`, `-k golden` | 6 + 3 passed, 12 deselected |
+| B | 09:26 | `e59ffb45`, based on `1b6c3540` (with the packed-word Z_save release and the device-scoped launch) | `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"` | 13 + 8 passed |
+| B | 09:26 | `e59ffb45` | the cu12-flavor overlay (CUDA 12.9 compiler), no golden variable, `-k "not golden"`, GPU 2 | 7 + 5 passed, 9 deselected |
+| D | 13:20 | `a6857d05`, based on `5304d19d` | `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"`, the dsrelu suite only | 8 passed |
+| E | 15:11 | `e28ca298`, based on `9bdf9a8a` | `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"` | 13 + 8 passed |
+| F | 18:40 | `13355420`, based on `9bdf9a8a` | `--collect-only` | 13 + 18 collected |
+| F | 18:40 | `13355420` | `CUDNN_DETERMINISM_RECORD=<new dir>` | 13 + 18 passed; 12 goldens recorded |
+| F | 18:40 | `13355420` with run F's three N = 1856 goldens added | `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"`, separate process | 13 + 18 passed |
+| G | 18:54 | `5f758bdc`, based on `9bdf9a8a` | `CUDNN_DETERMINISM_RECORD=<new dir>` | 13 + 18 passed; 12 goldens recorded; the 12 files byte-identical to the committed ones |
+| G | 18:54 | `5f758bdc` | `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"`, separate process | 13 + 18 passed |
+| H | 09:03, 11-17 | `f0a7d2b8`, based on `9bdf9a8a` | `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"` | 13 + 18 passed |
+| I | 10:03, 11-17 | `3c5c77fe`, based on `9bdf9a8a` | the cu12-flavor overlay (CUDA 12.9 compiler), no golden variable, `-k "not golden"` | 7 + 12 passed, 12 deselected |
+
+`77225e06`, `e59ffb45` and `a6857d05` are pre-rebase revisions of this
+series, and `e28ca298` (run E) and `1335542016b224d9de919ee2a34f4dd3d3bf095d`
+(run F) are earlier versions of it on `9bdf9a8a`; none of the five is in the
+committed history. `e28ca298` differs from `5f758bdc` only in
+`test_grouped_gemm_dsrelu_bf16_determinism.py` and the three N = 1856
+goldens, so runs E, F and G tested the same production code. Run G tested
+`5f758bdc1080567631bdeee5e0c0c5de24a1985e`, which adds run F's three goldens
+and the fold test's guard rows to run F's revision. Run H tested
+`f0a7d2b827f87f5ed19a612e313122194b74f054`, which differs from `5f758bdc` in
+this record and in the BF16 gate's explicit CuTe DSL 4.8.0 floor
+(`_bf16_options.DSL_FLOOR`), its gate test, an L1 shape's test ID and two
+documentation sentences; the kernels, the two determinism suites and the
+goldens are unchanged. Run I tested
+`3c5c77fe3af9a1dd97605b200fcd5eae56367d8d`, which differs from `f0a7d2b8`
+only in this record. The committed series is the series of runs H and I
+rebased onto develop `5816cb6a`: apart from this file, its changes from
+`5816cb6a` are those of `f0a7d2b8` and `3c5c77fe` from `9bdf9a8a`. The
+rebased tree was not run.
+
+The warm-stress cells read 0 wrong of 1,000 warm and 1,000 poisoned launches
+each in every run that included them (run A's golden-only check ran none, and
+run D ran K2's only), with K1's ring refilled 456 times per launch and K2's
+Z_save stage 4,560 times. The kernels run one thread
+block per SM (their shared memory), where the report states a zero bounds
+little; the cluster-2 control's unsafe ring failed 200 of 200 launches on
+this GPU. Rule 11's proof is the rendering pin
+(`test_*_bf16_rendering_orders_every_release` in the two functional suites),
+which passed on both compiler flavors.
+
+The runtime key does not record the DSL compiler flavor, so the cu12 runs
+deselect the golden cells rather than comparing their bytes with the cu13
+goldens. Run I covers the N = 1856 cells and the fold test on the cu12
+flavor. SM100 (B200) and other runtimes are unverified.
+
 ### Fixed SM107 quantized backward implementations (2026-11-15)
 
 Per-tensor FP8 engine 20605 and MXFP8 engine 20606 retain their records,
@@ -669,6 +803,8 @@ pytest core/test_determinism_utils.py
 | `sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` | `pygraph.sdpa_mxfp8(causal_exclude_own_block=32)` (SM100/SM103 MXFP8 D128 FROST kernel) | BF16 O, FP32 Stats | — (the option is forward-only) |
 | `sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py` | `sdpa_mxfp8_backward` on the `sdpa_bwd_sm100_d128_mxfp8` row (SM100 / SM103, D128) | — (backward only) | BF16 dQ, dK, dV; FP32 amax_dQ / dK / dV when requested |
 | `sdpa/frost/test_sdpa_bwd_sm90.py` | `pygraph.sdpa_backward` through the opt-in `sdpa_bwd_sm90` row (the Hopper dense D64 / D128 key-owner chain with the ordered dQ relay) | — (backward-only engine row) | dQ, dK, dV |
+| `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` | `grouped_gemm_srelu_wrapper_sm100`, BF16 backend (plain and tanh-clamped, `act_input` acc/saved; discrete weights) | BF16 C (the pre-activation) and D | — (the backward is the dSReLU suite) |
+| `gemm/cutedsl/test_grouped_gemm_dsrelu_bf16_determinism.py` | `grouped_gemm_dsrelu_wrapper_sm100`, BF16 backend (deterministic dprob; the atomic default for dZ and d_srelu only) | — (the forward is the SReLU suite) | BF16 dZ and d_srelu, FP32 dprob (deterministic mode) |
 
 ### SM90 D128 template forward (issue #378): validation, 2026-11-13 (UTC)
 
