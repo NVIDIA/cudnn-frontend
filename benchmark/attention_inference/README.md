@@ -90,7 +90,12 @@ python -m benchmark.attention_inference.runner --config llama
 python -m benchmark.attention_inference.runner --config kimi_k3 --dry-run
 python -m benchmark.attention_inference.runner --config llama --backend cudnn_oss
 python -m benchmark.attention_inference.runner --config llama --phase generation
+python -m benchmark.attention_inference.runner --config serving_prefill --replot results/serving_prefill/<gpu>/serving_prefill_<ts>.csv
 ```
+
+`--replot` redraws a config's charts from an existing results CSV without
+benchmarking (e.g. after a chart-code change); they land in `--output-dir` or
+the config's output dir.
 
 Results are organized per architecture as `results/<config>/<gpu>/`, each
 holding the CSV plus two charts: `<config>_context.webp` (subplots stacked by
