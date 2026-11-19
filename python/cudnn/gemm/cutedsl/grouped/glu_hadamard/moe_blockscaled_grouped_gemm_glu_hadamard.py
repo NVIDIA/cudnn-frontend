@@ -38,6 +38,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Float32, Int32, AddressSpace
+from cudnn.api_base import is_sm107_device
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -231,7 +232,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             num_threads=32 * self.epilogue_warp_group_size,
         )
 
-        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
+        # Size the A/B pipeline from the shared memory of the device that runs the kernel: SM107 (Rubin) has more
+        # than SM100, and the hard-coded "sm_100" budget left A/B stages unused there.
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107" if is_sm107_device() else "sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
