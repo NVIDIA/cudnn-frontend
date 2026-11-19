@@ -18,11 +18,16 @@ middle of a launch sequence.
 The callers today: the gated attention block's projection GEMM driver (``gated_attention_block/kernels/proj_gemm.py``:
 ``compile()`` refused under capture; the GRAPH route's cuDNN handle creation refused under capture) and the grouped GEMM's
 debug-only device-value validation (``gemm/cutedsl/grouped/backend_utils.py``), which keeps its own remedy text.
+
+:func:`relaxed_capture_check` is for the opposite need: a host path that must READ a CUDA event while a capture may be open
+somewhere in the process.  Its caller today: ``cudnn.frost.init_order`` (the order of a direct-call entry's launches behind the
+initialization of the buffers it allocates for itself); ``buffers.DeviceBuffer.__del__`` keeps its own teardown-tolerant form.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple
 
 #: What a refused caller is told when it names no remedy of its own.
 DEFAULT_REMEDY = (
@@ -83,4 +88,34 @@ def check_not_capturing(stream, what: str, *, remedy: Optional[str] = None) -> N
     raise RuntimeError(f"{what}: refused under CUDA-graph capture (stream {int(stream):#x} is capturing); {remedy or DEFAULT_REMEDY}")
 
 
-__all__ = ["DEFAULT_REMEDY", "capture_state", "check_not_capturing", "is_capturing"]
+@contextmanager
+def relaxed_capture_check(required: bool = True) -> Iterator[bool]:
+    """Run the block with THIS thread's stream-capture check relaxed and restore the previous mode behind it, also when the
+    block raises.  For a host path that must READ a CUDA event (``cudaEventQuery``, ``cudaEventSynchronize``) while a stream
+    capture may be open in the process: in the default (global) capture mode such a call is refused while ANY thread
+    captures, and the refusal invalidates that capture -- another thread's too.  Relaxing lifts the refusal of this thread's
+    calls and nothing else: the caller reads events recorded OUTSIDE the capture only.
+
+    Yields ``True`` when the block may read (the check is relaxed; also without a visible CUDA device, where nothing can be
+    capturing).  When the mode cannot be exchanged: ``RuntimeError`` and the block does not run (``required``), else the
+    block runs with ``False`` and must read nothing.
+    """
+    from cudnn._device import _driver
+
+    drv = _driver()
+    if drv is None:
+        yield True
+        return
+    err, previous = drv.cuThreadExchangeStreamCaptureMode(drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+    if int(err) != 0:
+        if required:
+            raise RuntimeError(f"cuThreadExchangeStreamCaptureMode failed: {err}")
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        drv.cuThreadExchangeStreamCaptureMode(previous)
+
+
+__all__ = ["DEFAULT_REMEDY", "capture_state", "check_not_capturing", "is_capturing", "relaxed_capture_check"]
