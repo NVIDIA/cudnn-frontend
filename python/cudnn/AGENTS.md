@@ -1405,7 +1405,7 @@ jitted functions on non-default devices with changed inputs and gradients (see
 
 1. Kernel package under the closest existing family (layout above).
 2. Public functions in `api.py`.
-3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family); register any new package dir in `pyproject.toml` packages list.
+3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family). A new package directory under `python/cudnn/` needs no registration: `pyproject.toml` finds packages (`include = ["cudnn*", ...]`, namespace packages on).
 4. Docs: page under `docs/operations/<family>/`, listed in `docs/fern/versions/latest.yml` and linked from `docs/operations/overview.md`.
 5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
 6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
