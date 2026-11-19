@@ -53,6 +53,8 @@ class CfgD256:
     S_SLOTS: int = 1
     BIAS_MCAST_CTAS: int = 1
     Q_IN_TMEM: int = 0
+    # Steps the QK stream runs ahead of the PV stream (1 on the single-warpgroup body, 3 on the two-warpgroup pair build).
+    KV_LOOKAHEAD: int = 1
     TILE_M: int = 128
     TILE_N: int = 128
     TILE_K: int = 128
@@ -128,10 +130,19 @@ class CfgD256:
 
 
 _D256_TOTAL_WARPS = 12
+# The two-warpgroup pair build (per-tensor FP8 at cta_mma=2): a second softmax warpgroup (warps 4-7) takes the odd kv steps, the
+# service roles shift up one warpgroup, Q is resident in TMEM and the QK stream runs four steps ahead of PV.  184 + 184 + 96 + 48 = 512.
+_D256_PAIR_TOTAL_WARPS = 16
+_D256_PAIR_SOFTMAX_REGS = 184
+_D256_PAIR_CORRECTION_REGS = 96
+_D256_PAIR_OTHER_REGS = 48
+_D256_PAIR_KV_LOOKAHEAD = 4
+_D256_PAIR_STAGES_KV = 5
+_D256_PAIR_MAX_STAGES_KV = 6
 
 
-def _d256_read_tile_arrivers(cta_mma: int) -> int:
-    return ((1 * 4) + 4 + 2) * (cta_mma * 1) + (cta_mma // cta_mma)
+def _d256_read_tile_arrivers(cta_mma: int, softmax_wgs: int = 1) -> int:
+    return ((softmax_wgs * 4) + 4 + 2) * (cta_mma * 1) + (cta_mma // cta_mma)
 
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
@@ -172,6 +183,25 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         raise ValueError("single-Q D128 requires half THD CTA1 N128, unsplit/unpacked and two S slots")
     tile_k = tile_o = 128 if single_q_d128 else 256
     tile_n = 128
+    mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
+    # The pair build: the per-tensor FP8 d256 body at cta_mma=2 on the dense, unsplit, non-THD, unpacked, ungated HALF-softmax
+    # record.  Every other record keeps the 12-warp single-softmax-warpgroup pipeline.
+    pair = (
+        not mxfp8
+        and not single_q_d128
+        and cta_mma == 2
+        and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+        and bool(params.softmax_f16)
+        and not params.thd_varlen
+        and (params.split_kv or 1) == 1
+        and not params.paged_kv
+        and not params.pack_gqa
+        and not params.epilogue_gate
+        and params.dtype_kv == -1
+    )
+    softmax_wgs = 2 if pair else 1
+    total_warps = _D256_PAIR_TOTAL_WARPS if pair else _D256_TOTAL_WARPS
+    role_shift = 4 if pair else 0
     # STAGES_KV is a TUNING KNOB again (2..4), and the note that said otherwise
     # was WRONG about why.
     #
@@ -203,9 +233,9 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     # stages_kv=0 onto the default 2, which is a knob SUBSTITUTION -- the one
     # thing the engine contract forbids (honored or ineligible). Out-of-domain
     # values must reach the 2..4 check below and raise there.
-    stages_kv = params.stages_kv if getattr(params, "stages_kv", None) is not None else 2
-    mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
-    arrivers = _d256_read_tile_arrivers(cta_mma)
+    stages_kv = params.stages_kv if getattr(params, "stages_kv", None) is not None else (_D256_PAIR_STAGES_KV if pair else 2)
+    pair_lookahead = _D256_PAIR_KV_LOOKAHEAD
+    arrivers = _d256_read_tile_arrivers(cta_mma, softmax_wgs)
     # The four single-warp roles (MMA / TMA-LDG / TMA-STG / scheduler; the HW
     # equality constraint keeps them one number) run at 40 on every d256
     # module.  MEASURED DEAD END (2026-09-15, gated MXFP8): its sm_107a SASS
@@ -218,9 +248,12 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     # applied (USETMAXREG.TRY_ALLOC / DEALLOC present in the sm_107a SASS).  Do
     # not retry the bump; see the REGISTER NOTE in
     # sm107/d256_mxfp8_single_q/kernel.py's TMA-LDG warp for the levers not yet tried.
-    other_regs = 40
+    other_regs = _D256_PAIR_OTHER_REGS if pair else 40
 
     cfg = CfgD256(
+        Q_IN_TMEM=1 if pair else 0,
+        S_SLOTS=2,
+        KV_LOOKAHEAD=pair_lookahead if pair else 1,
         DTYPE_KV=params.dtype_kv,
         TILE_M=128,
         TILE_N=tile_n,
@@ -243,12 +276,11 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         TILES_Q=1,
         SCHEDULER_STAGES=2,
         STAGES_KV=stages_kv,
-        # The body is a SINGLE-warpgroup pipeline. Two warpgroups is the
-        # Blackwell d256 split-P design and does not exist here.
-        SOFTMAX_WARPGROUPS=1,
+        # One softmax warpgroup, or the pair build's two ping-pong warpgroups (even / odd kv steps).
+        SOFTMAX_WARPGROUPS=softmax_wgs,
         CORRECTION_WARPS=4,
-        SOFTMAX_REGS=240,
-        CORRECTION_REGS=96,
+        SOFTMAX_REGS=_D256_PAIR_SOFTMAX_REGS if pair else 240,
+        CORRECTION_REGS=_D256_PAIR_CORRECTION_REGS if pair else 96,
         MMA_REGS=other_regs,
         TMALDG_REGS=other_regs,
         TMASTG_REGS=other_regs,
@@ -272,15 +304,15 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         SCHEDULER_POLICY=params.sched_policy if params.sched_policy is not None else SCHED_NATURAL,
         N_BMM2_CHUNKS=tile_n // 64,
         BMM2_CHUNK_SIZE=64,
-        TOTAL_WARPS=_D256_TOTAL_WARPS,
-        THREADS_PER_CTA=_D256_TOTAL_WARPS * 32,
+        TOTAL_WARPS=total_warps,
+        THREADS_PER_CTA=total_warps * 32,
         SOFTMAX_WG0_BASE=0,
-        SOFTMAX_WG1_BASE=0,  # unused at SOFTMAX_WARPGROUPS=1
-        CORR_WARP_BASE=4,
-        MMA_WARP_ID=8,
-        TMALDG_WARP_ID=9,
-        TMASTG_WARP_ID=10,
-        SCHED_WARP_ID=11,
+        SOFTMAX_WG1_BASE=4 if pair else 0,  # unused at SOFTMAX_WARPGROUPS=1
+        CORR_WARP_BASE=4 + role_shift,
+        MMA_WARP_ID=8 + role_shift,
+        TMALDG_WARP_ID=9 + role_shift,
+        TMASTG_WARP_ID=10 + role_shift,
+        SCHED_WARP_ID=11 + role_shift,
         READ_TILE_ARRIVERS=arrivers,
         # Fused epilogue gate (validated per flavor in _validate_params). The gate
         # is 2 B/elem on BOTH the half kernel (Q dtype) and the FP8 kernel (bf16).
@@ -289,7 +321,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     )
 
     _validate_regs(cfg, flavor)
-    _validate_warp_layout(cfg, flavor, expect_total=_D256_TOTAL_WARPS, expect_arrivers=arrivers)
+    _validate_warp_layout(cfg, flavor, expect_total=total_warps, expect_arrivers=arrivers)
     _validate_dtype_k_step(cfg, flavor)
     _validate_swizzles(cfg, flavor)
     _validate_masks(cfg, flavor)
@@ -310,10 +342,14 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _check(
         [
             (cfg.TILES_Q == 1, f"{flavor}: the d256 pipeline mandates TILES_Q == 1"),
-            (cfg.SOFTMAX_WARPGROUPS == 1, f"{flavor}: the d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
+            (cfg.SOFTMAX_WARPGROUPS == softmax_wgs, f"{flavor}: the d256 pipeline mandates SOFTMAX_WARPGROUPS == {softmax_wgs} on this record"),
             (
-                2 <= cfg.STAGES_KV <= 4,
-                f"{flavor}: STAGES_KV must be in 2..4 (got {cfg.STAGES_KV}); the upper bound is {_depth_bound}",
+                2 <= cfg.STAGES_KV <= (_D256_PAIR_MAX_STAGES_KV if pair else 4),
+                f"{flavor}: STAGES_KV must be in 2..{_D256_PAIR_MAX_STAGES_KV if pair else 4} (got {cfg.STAGES_KV}); the upper bound is {_depth_bound}",
+            ),
+            (
+                cfg.STAGES_KV >= cfg.KV_LOOKAHEAD,
+                f"{flavor}: the K ring must hold KV_LOOKAHEAD = {cfg.KV_LOOKAHEAD} tiles (STAGES_KV {cfg.STAGES_KV})",
             ),
         ]
     )
