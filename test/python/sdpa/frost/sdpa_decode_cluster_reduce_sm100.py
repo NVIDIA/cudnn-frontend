@@ -588,22 +588,23 @@ def _record(split, pack, reduce=None):
     return record
 
 
-@pytest.mark.parametrize(
-    "heads,users,declared",
-    [
-        ((H, KH), 1, 2048),
-        ((H, KH), 2, 2048),
-        ((H, KH), 4, 2048),
-        ((H, KH), 1, 1536),
-        # around the rows of a 152-SM part (15 clusters of 8, 36 of 4, 76 of 2 are one wave): at a row, and one cluster past it
-        ((H, KH), 9, 2048),
-        ((H, KH), 10, 2048),
-        ((8, 1), 15, 2048),
-        ((8, 1), 16, 2048),
-        ((8, 1), 37, 2560),
-    ],
-    ids=lambda value: "x".join(map(str, value)) if isinstance(value, tuple) else str(value),
-)
+# (heads, users, declared keys) of the default-plan cell below; ``test_sdpa_fwd_decode_cluster_reduce.py`` pins, without a
+# device, which form the rules give each step on a 148-SM and on a 152-SM part.
+DEFAULT_PLAN_STEPS = [
+    ((H, KH), 1, 2048),
+    ((H, KH), 2, 2048),
+    ((H, KH), 4, 2048),
+    ((H, KH), 1, 1536),
+    # around the rows of a 152-SM part (15 clusters of 8, 36 of 4, 76 of 2 are one wave): at a row, and one cluster past it
+    ((H, KH), 9, 2048),
+    ((H, KH), 10, 2048),
+    ((8, 1), 15, 2048),
+    ((8, 1), 16, 2048),
+    ((8, 1), 37, 2560),
+]
+
+
+@pytest.mark.parametrize("heads,users,declared", DEFAULT_PLAN_STEPS, ids=lambda value: "x".join(map(str, value)) if isinstance(value, tuple) else str(value))
 def test_default_plan_takes_the_form_inside_the_recorded_bound(heads, users, declared):
     """The heuristics' own lead plan for a two-token step, with no knob record from the caller. Its split is the one of the
     existing rules. Where the part has a recorded cluster bound that holds the plan's clusters, the plan carries the knob

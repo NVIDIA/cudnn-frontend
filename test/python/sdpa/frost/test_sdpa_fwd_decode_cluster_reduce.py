@@ -323,6 +323,42 @@ def test_rule_table_for_other_head_ratios(sm, heads, b, s_q, s_kv, split, reduce
     assert lead.pack_gqa and (lead.split_kv, bool(lead.cluster_reduce)) == (split, reduced)
 
 
+# The two-token steps of the device cell ``test_default_plan_takes_the_form_inside_the_recorded_bound`` -> the first plan's
+# (split, reduced in the launch) on a 148-SM and on a 152-SM part. Literal, not read from the table: a changed row or a
+# changed split rule moves a pin here before it moves a device cell.
+DEFAULT_PLAN_FORMS = {
+    ((24, 4), 1, 2048): ((8, True), (8, True)),
+    ((24, 4), 2, 2048): ((8, True), (8, True)),
+    ((24, 4), 4, 2048): ((4, True), (8, False)),  # 16 clusters: of 4 on 148 SMs (its row), of 8 on 152 SMs (one past its row)
+    ((24, 4), 1, 1536): ((4, True), (4, True)),
+    ((24, 4), 9, 2048): ((2, False), (4, True)),  # 36 clusters of 4, the row of 152 SMs
+    ((24, 4), 10, 2048): ((2, False), (2, True)),
+    ((8, 1), 15, 2048): ((8, False), (8, True)),  # 15 clusters of 8, the row of 152 SMs
+    ((8, 1), 16, 2048): ((4, True), (8, False)),
+    ((8, 1), 37, 2560): ((2, False), (4, False)),
+}
+
+
+def test_host_pins_name_the_default_plan_device_cells():
+    from sdpa_decode_cluster_reduce_sm100 import DEFAULT_PLAN_STEPS
+
+    assert list(DEFAULT_PLAN_FORMS) == [tuple(step) for step in DEFAULT_PLAN_STEPS]
+
+
+@pytest.mark.parametrize("step", list(DEFAULT_PLAN_FORMS), ids=lambda step: f"{step[0][0]}x{step[0][1]}-{step[1]}-{step[2]}")
+def test_default_plan_device_cells_find_their_row(step):
+    """What the default-plan device cell meets on each part with recorded rows, without a device: the graph's first plan is
+    this tile's packed plan with the split of the existing rules, and it is reduced in the launch exactly where its clusters
+    are inside the part's row for that split -- the expression the device cell asserts with the device's own SM count. On
+    a 152-SM part every step finds a row; before its rows were recorded the first four device cells had none there."""
+    heads, users, declared = step
+    for sm, (split, reduced) in zip((148, 152), DEFAULT_PLAN_FORMS[step]):
+        f = facts(users, 2, declared, sm, heads=heads)
+        name, lead = _plans(f)[0]
+        assert name == SWAP_AB and lead.pack_gqa and (lead.split_kv, bool(lead.cluster_reduce)) == (split, reduced), sm
+        assert (sm, split) in heur.FUSED_CLUSTER_BOUND and (users * heads[1] <= heur.fused_cluster_bound(sm, split)) is reduced, sm
+
+
 def test_unpacked_sets_are_not_marked():
     """24 / 4 heads at three to eight tokens do not fit one packed tile: the first plan stays the prefill kernel, and the decode
     tile's unpacked set keeps two launches unless a caller sets the knob, which the row then honours. No unpacked set of any
