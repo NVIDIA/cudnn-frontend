@@ -595,13 +595,11 @@ def test_general_grouped_release_addresses_depend_on_the_words_read(case, monkey
     assert _mailbox_store_precedes_the_reduction(ptx) == (gather and clustered)
 
 
-def _stress_case(name, *, swap=False, gather=False, config=_TILE_128):
-    """A launch whose thread blocks each take many tiles, with an integer-valued reference of every output byte.
+def _exact_case(*, swap=False, gather=False, config=_TILE_128, E=8, G=1024, rows_per_group=16, N=128, K=128):
+    """``G`` groups of ``rows_per_group`` rows over ``E`` experts with an integer-valued reference of every output byte.
 
-    1024 groups of 16 rows over 8 experts: 1024 tiles for the launch's thread blocks, so every scheduler slot is
-    rewritten several times inside one launch. Operands and scales are small integers and powers of two: every
-    product and partial sum is exact in fp32 in any order, and the bf16 output is that sum rounded once."""
-    E, G, rows_per_group, N, K = 8, 1024, 16, 128, 128
+    Operands and scales are small integers and powers of two: every product and partial sum is exact in fp32 in any
+    order, and the bf16 output is that sum rounded once. Returns the plan, its pack, the output and the reference."""
     S = G * rows_per_group
     g, t = _graph(E, S, N, K, G, gather_rows=S if gather else None)
     plan = Plan(g, config=by_name(config), swap_ab=swap)
@@ -610,8 +608,8 @@ def _stress_case(name, *, swap=False, gather=False, config=_TILE_128):
     gen = torch.Generator(device=dev).manual_seed(11)
     tok = torch.randint(-3, 4, (1, S, K), device=dev, generator=gen).float()
     w = torch.randint(-3, 4, (E, N, K), device=dev, generator=gen).float()
-    sa = torch.exp2(torch.randint(-1, 2, (1, S, 1), device=dev, generator=gen).float())
-    sb_nk = torch.exp2(torch.randint(-1, 2, (E, 1, 1), device=dev, generator=gen).float())
+    sa = torch.exp2(torch.randint(-1, 2, (1, S, K // 128), device=dev, generator=gen).float())
+    sb_nk = torch.exp2(torch.randint(-1, 2, (E, N // 128, K // 128), device=dev, generator=gen).float())
     idx = torch.randperm(S, device=dev, generator=gen).to(torch.int32).view(1, S, 1) if gather else None
     out = torch.empty(1, S, N, device=dev, dtype=torch.bfloat16)
     pack = {
@@ -624,10 +622,22 @@ def _stress_case(name, *, swap=False, gather=False, config=_TILE_128):
     }
     if gather:
         pack[t["idx"]] = idx
-    routed = (tok[0] * sa[0])[idx[0, :, 0].long()] if gather else tok[0] * sa[0]
+    tok_f = tok[0] * sa[0].repeat_interleave(128, 1)
+    routed = tok_f[idx[0, :, 0].long()] if gather else tok_f
     expert = torch.arange(G, device=dev).repeat_interleave(rows_per_group) % E
-    reference = torch.einsum("sk,snk->sn", routed.double(), (w * sb_nk).double()[expert]).float().to(torch.bfloat16).view(1, S, N)
-    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=dev)
+    w_f = w * sb_nk.repeat_interleave(128, 1).repeat_interleave(128, 2)
+    reference = torch.einsum("sk,snk->sn", routed.double(), w_f.double()[expert]).float().to(torch.bfloat16).view(1, S, N)
+    return plan, pack, out, reference
+
+
+def _stress_case(name, *, swap=False, gather=False, config=_TILE_128):
+    """A launch whose thread blocks each take many tiles, with an integer-valued reference of every output byte.
+
+    1024 groups of 16 rows over 8 experts: 1024 tiles for the launch's thread blocks, so every scheduler slot is
+    rewritten several times inside one launch."""
+    G, rows_per_group = 1024, 16
+    plan, pack, out, reference = _exact_case(swap=swap, gather=gather, config=config, G=G, rows_per_group=rows_per_group)
+    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda")
     cfg = plan._compiled.config
     blocks = C._grid_num_clusters(cfg) * cfg.cga_size_m * cfg.cga_size_n
     # The routed rows are the tile's columns once the operands are swapped, its rows otherwise.
@@ -668,3 +678,64 @@ def test_general_grouped_warm_launches_keep_writing_the_reference_bytes(case):
     stress = _stress_case(case, **_STRESS[case])
     assert stress.refills_per_launch >= 4, "the shape rewrites every scheduler slot inside one launch"
     warm_stress.assert_warm_stress(stress, validation=warm_stress.stress_validation(torch.device("cuda")))
+
+
+# A CUDA graph replays a launch with the arguments it was captured with, the scheduler's launch epoch among them.
+
+_GRAPH_REPLAYS = {
+    "fwd": dict(),
+    # every cluster's first claim but a few is already past the tiles
+    "fwd_fewer_tiles_than_clusters": dict(G=8),
+    # cluster rank 0 claims for both thread blocks of a pair
+    "fwd_2cta": dict(config=_config(128, 128, "2x1", 2)),
+    "swap_table": dict(swap=True, config=_config(128, 32)),
+    "gather": dict(gather=True),
+    "gather_2cta": dict(gather=True, config=_config(128, 128, "2x1", 2)),
+    "gather_swap": dict(gather=True, swap=True, config=_config(128, 16)),
+}
+
+
+@requires_sm100
+@pytest.mark.parametrize("case", list(_GRAPH_REPLAYS))
+def test_general_grouped_graph_replays_write_every_tile(case):
+    """Every replay of a captured launch counts its tiles from zero, though it runs with the launch epoch it was
+    captured with: back-to-back replays of one graph, a second graph of the same plan, eager launches in between and
+    a replay behind a workspace another use filled with other bytes all write the reference bytes, through the same
+    workspace and each into an output poisoned before it."""
+    plan, pack, out, reference = _exact_case(**{"G": 256, "N": 256, **_GRAPH_REPLAYS[case]})
+    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def launch():
+        plan._compiled(pack, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+
+    def run(step, what):
+        out.fill_(float("nan"))
+        step()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), reference.view(torch.int16)), what
+
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    try:
+        with torch.cuda.stream(stream):
+            run(launch, "the eager launch before the captures")
+            for graph in graphs:
+                with torch.cuda.graph(graph, stream=stream):
+                    launch()
+        for i in range(3):
+            run(graphs[0].replay, f"replay {i + 1} of a graph, back to back")
+        with torch.cuda.stream(stream):
+            run(launch, "an eager launch between the replays")
+        for i in range(2):
+            run(graphs[1].replay, f"replay {i + 1} of a second graph of the plan")
+        for i in range(2):
+            for j, graph in enumerate(graphs):
+                run(graph.replay, f"round {i + 1} of alternating replays, graph {j + 1}")
+        workspace.random_(0, 256)
+        run(graphs[0].replay, "a replay behind a workspace filled with other bytes")
+        run(graphs[0].replay, "the replay after it")
+    finally:
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()

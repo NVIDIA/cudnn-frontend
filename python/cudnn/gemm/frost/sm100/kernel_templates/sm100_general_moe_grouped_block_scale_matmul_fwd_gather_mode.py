@@ -190,6 +190,14 @@ _promo_tbl_runs = 32 * _sfb_loads
 # A workspace is scratch memory, so the word a launch finds is the last launch's, another plan's or unset: any word
 # whose epoch is not this launch's is replaced by this epoch with a count of zero, by whichever cluster gets there
 # first. No kernel has to clear the counter ahead of the launch.
+#
+# A launch also runs again with the epoch it was given: a CUDA graph replays its launches with the arguments they
+# were captured with. So the launch's last claim returns the word to zero, an epoch no launch has. Each cluster
+# claims until its first index past the launch's T tiles, so a launch's claims are the indices 0 .. T +
+# grid_num_clusters - 1, and the cluster that draws the last one is the last of the launch to use the word. It clears
+# the word once its scheduler loop is done, off the path of the claims. By then its thread block has its closing
+# slot and may have let a dependent launch start, so the clear is a compare-and-swap from the word the launch's
+# claims left (this epoch, T + grid_num_clusters claims): a launch that has opened the word since keeps it.
 
 
 @cute.jit
@@ -210,6 +218,15 @@ def _sched_claim(counter_ptr):
     """The next unclaimed tile index of this launch."""
     word = nvvm.atomicrmw("add", counter_ptr, cutlass.Int64(1), mem_order="relaxed", syncscope="gpu")
     return (word & cutlass.Int64(0x7FFFFFFF)).to(cutlass.Int32)
+
+
+@cute.jit
+def _sched_close(counter_ptr, epoch, claimed, launch_tiles):
+    """Clear the counter if ``claimed``, a claim past the launch's ``launch_tiles`` tiles, is the launch's last."""
+    claims = launch_tiles + grid_num_clusters
+    if claimed == claims - 1:
+        left = (cutlass.Int64(epoch) << 32) | cutlass.Int64(claims)
+        nvvm.atomicrmw("cas", counter_ptr, left, b=cutlass.Int64(0), mem_order="relaxed", syncscope="gpu")
 
 
 @cute.kernel
@@ -825,6 +842,12 @@ def _kernel(
                         sched_stage = cutlass.Int32(0)
                         sched_empty_phase = sched_empty_phase ^ 1
 
+        # The loop ended on a claim past the last group, whose search left each lane's run of groups as it was: lane
+        # 31's ends at the launch's tile count.
+        launch_tiles = nvvm.shfl_sync(full_warp_mask, start_linear_idx + total_tiles, 31, shfl_idx_clamp, nvvm.Shfl.IDX)
+        if cta_rank_in_cluster == 0:
+            if lane == 0:
+                _sched_close(sched_counter_ptr, sched_epoch, linear_idx, launch_tiles)
         if cutlass.const_expr(cluster_size > 1):
             if cta_rank_in_cluster == 0:
                 while _load_bcast_ack(bcast_ack_count.subview(last_bcast_stage)) != last_bcast_ack_expected:

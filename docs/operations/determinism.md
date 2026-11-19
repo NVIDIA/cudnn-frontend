@@ -147,8 +147,10 @@ scale per 1x128 activation block and per 128x128 weight block: the dense
 kernel and the four grouped ones. On SM100 (compute capability 10.0), fixed
 inputs replay to the same bytes for the dense kernel and for NONE and GATHER
 in both orientations, with BF16 output, with a gated pair and with FP8
-block-128 output. A routed row of a NONE graph keeps its bytes alone and
-among other rows of its group. Reordered, duplicated and removed groups,
+block-128 output. The grouped kernels write those bytes on every replay of a
+captured CUDA graph as well, back to back and between other launches of the
+plan through the same workspace. A routed row of a NONE graph keeps its bytes
+alone and among other rows of its group. Reordered, duplicated and removed groups,
 row isolation under GATHER, SCATTER and COMBINE, SM103 and SM107 are
 unverified. Warm launches of a shape that rewrites every scheduler slot
 inside one launch kept writing the reference bytes; these kernels run one

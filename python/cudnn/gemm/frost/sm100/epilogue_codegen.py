@@ -617,9 +617,12 @@ def _emit_wide_quant(
             tap_idx, qv, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=row_pred, converted=True, col_bound=col_bound
         )
     if quant.axis == 1:
-        # One scale per (block of lanes, tile column): warp 0's lane l stores column col_j + l's.
+        # One scale per (block of lanes, tile column): warp 0's lane l stores column col_j + l's. The block is the
+        # tile's 128 lanes, from coord_m_tile; a cluster's tile past M (the weight's output columns) stores no scale,
+        # as it stores no data. Its block index, M / 128 or more, is past the column's M / 128 scales: in a [tokens,
+        # M / 128] scale tensor, the next token's first block.
         store += [
-            f"if (warp_idx == 0) & (lane < {vsize}) & (col_j + lane < {col_bound}):",
+            f"if (warp_idx == 0) & (lane < {vsize}) & (col_j + lane < {col_bound}) & (coord_m_tile + {bs} <= M):",
             f"    (gC_tap_{scale_tap_idx}_ptr + {l_term}(row // {bs}) * quant_scale_stride_m_{quant_idx} + (col_j + lane) * quant_scale_stride_n_{quant_idx}).store(_wq_sfm, alignment=4)",
         ]
     return values, scale, store

@@ -337,6 +337,9 @@ _GATED = {
     # every group one row: most of every tile is past its group's end
     "fwd_one_row_groups": dict(E=8, S=64, offsets=[0, 1, 2, 3, 4, 5, 6, 7, 8]),
     "gather_swap_one_row_groups": dict(kind="gather", E=8, S=4, rows=64, offsets=[0, 1, 2, 3, 4, 5, 6, 7, 8], swap=True, config=_config(16)),
+    # swapped, two tiles per cluster along the weight's output columns: N = 384 puts the last cluster's second tile past N
+    "swap_cluster2x1": dict(E=6, S=3001, N=384, K=896, swap=True, config=_config(32, "2x1")),
+    "gather_swap_cluster2x1": dict(kind="gather", E=6, S=750, rows=3001, N=384, K=896, swap=True, config=_config(32, "2x1")),
 }
 # A 64-column tile holds half a quantize block.
 _GATED_BF16_ONLY = {"fwd_n64": dict(config=_config(64)), "gather_n64": dict(kind="gather", S=300, rows=512, config=_config(64))}
@@ -362,9 +365,30 @@ def test_gated_pair_fp8_block128_numerics(case):
 
 
 @requires_sm100
-@pytest.mark.parametrize("case", ["dense", "fwd", "swap_n16", "gather_cluster1x2", "gather_swap_n32"])
+@pytest.mark.parametrize("case", ["dense", "fwd", "swap_n16", "swap_cluster2x1", "gather_cluster1x2", "gather_swap_n32"])
 def test_one_gemm_fp8_block128_numerics(case):
     _run(fp8=True, gemms=1, **_GATED[case])
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "cluster,N",
+    [("2x1", 384), ("2x1", 512), ("4x1", 640), ("4x1", 512)],
+    ids=["2x1_partial", "2x1_whole", "4x1_partial", "4x1_whole"],
+)
+@pytest.mark.parametrize("kind", ["moe", "gather"])
+def test_a_cluster_along_the_lanes_writes_the_bytes_of_one_tile_clusters(kind, cluster, N):
+    """Swapped, a cluster of two (four) tiles along the weight's output columns covers 256 (512) of them. With N = 384
+    (640) the last cluster's second (second to fourth) tile lies past N: its lanes are no output column, and it stores
+    neither codes nor scales. A scale it stored would be block N / 128 or more of a token, which in the [tokens,
+    N / 128] scale tensor is the next token's block 0 onward. Codes and scales are the bytes of the plan with one tile
+    per cluster; N = 512 (whole clusters) is the control."""
+    kw = dict(kind=kind, E=6, S=750 if kind == "gather" else 3001, rows=3001 if kind == "gather" else None, N=N, K=896, swap=True, fp8=True)
+    one = _run(config=_config(32), **kw)
+    many = _run(config=_config(32, cluster), **kw)
+    assert torch.equal(many.data.view(torch.uint8), one.data.view(torch.uint8))
+    # The rows past the routed ones are NaN in both: compared as bits.
+    assert torch.equal(many.scale.view(torch.int32), one.scale.view(torch.int32))
 
 
 # Replay and batch invariance: raw bytes
@@ -550,10 +574,9 @@ def test_a_lanes_quantize_stores_what_it_read_of_the_column_maxima(kind, monkeyp
         assert stored, f"the maximum loaded at PTX line {load + 1} reaches no global store"
 
 
-def _fp8_stress_case(kind):
-    """A swapped gated FP8 launch of many tiles per thread block; the reference is the cold launches' bytes (the
-    approximate reciprocal of the scale has no independent byte model)."""
-    E, G, rows_per_group, N, K = 8, 512, 16, 128, 128
+def _fp8_case(kind, G=512):
+    """A swapped gated FP8 plan over ``G`` groups of 16 routed rows and its pack: the plan, the pack, codes, scales."""
+    E, rows_per_group, N, K = 8, 16, 128, 128
     S = G * rows_per_group
     plan, t = _gated_plan(kind=kind, E=E, S=S, N=N, K=K, rows=S if kind == "gather" else None, fp8=True, swap=True, config=_config(16))
     dev = "cuda"
@@ -572,7 +595,15 @@ def _fp8_stress_case(kind):
         pack[t["sfb"][i]] = (torch.rand(E, N // _BLOCK, K // _BLOCK, device=dev, generator=gen) + 0.5).transpose(1, 2)
     if kind == "gather":
         pack[t["idx"]] = torch.randperm(S, device=dev, generator=gen).to(torch.int32).view(1, S, 1)
-    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=dev)
+    return plan, pack, q, qs
+
+
+def _fp8_stress_case(kind):
+    """A swapped gated FP8 launch of many tiles per thread block; the reference is the cold launches' bytes (the
+    approximate reciprocal of the scale has no independent byte model)."""
+    plan, pack, q, qs = _fp8_case(kind)
+    S = q.shape[1]
+    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda")
     cfg = plan._compiled.config
     blocks = C._grid_num_clusters(cfg) * cfg.cga_size_m * cfg.cga_size_n
     # Every tile of 16 routed rows runs twice (the pair's two passes), each pass through a scheduler slot.
@@ -599,3 +630,43 @@ def test_gated_fp8_warm_launches_keep_writing_the_cold_bytes(kind):
     stress = _fp8_stress_case(kind)
     assert stress.refills_per_launch >= 4
     warm_stress.assert_warm_stress(stress, validation=warm_stress.stress_validation(torch.device("cuda")))
+
+
+@requires_sm100
+@pytest.mark.parametrize("kind", ["moe", "gather"])
+def test_gated_fp8_graph_replays_write_the_eager_bytes(kind):
+    """A swapped gated FP8 plan captured in a CUDA graph (the launch epoch is captured with it): every replay, codes
+    and scales poisoned before it, writes the bytes of the eager launch, back to back and around an eager launch."""
+    plan, pack, q, qs = _fp8_case(kind, G=64)
+    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def launch():
+        plan._compiled(pack, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+
+    def run(step):
+        q.fill_(0x7F)
+        qs.fill_(float("nan"))
+        step()
+        torch.cuda.synchronize()
+        return q.clone(), qs.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            codes, scales = run(launch)
+            with torch.cuda.graph(graph, stream=stream):
+                launch()
+        assert not bool((codes == 0x7F).any()) and bool(torch.isfinite(scales).all()), "the eager launch left an output unwritten"
+        for what in ("replay 1", "replay 2", "replay 3", "eager", "replay 4", "replay 5"):
+            if what == "eager":
+                with torch.cuda.stream(stream):
+                    got = run(launch)
+            else:
+                got = run(graph.replay)
+            assert torch.equal(got[0], codes), what
+            assert torch.equal(got[1].view(torch.int32), scales.view(torch.int32)), what
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()

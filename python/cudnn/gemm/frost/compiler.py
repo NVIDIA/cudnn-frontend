@@ -965,7 +965,8 @@ def _next_sched_epoch() -> int:
 
     A grouped kernel that takes one (``sched_epoch``) keeps its scheduler counter as ``epoch << 32 | tiles claimed``
     and starts the count over when the word it finds carries another epoch, so the counter in the (scratch)
-    workspace needs no clearing between launches."""
+    workspace needs no clearing between launches. A CUDA graph replays a launch with the epoch drawn at capture, so
+    the cluster that draws a launch's last claim also returns the word to zero, no launch's epoch (``_sched_close``)."""
     return next(_SCHED_EPOCHS) % 0x7FFFFFFF + 1
 
 

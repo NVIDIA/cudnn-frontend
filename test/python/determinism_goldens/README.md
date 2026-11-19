@@ -19,8 +19,8 @@ launches.
 | Suite (`gemm/frost/`) | Byte checks |
 |---|---|
 | `test_general_block_scale_matmul.py` | replay of the dense kernel (320 x 384 x 1024) |
-| `test_general_moe_grouped_block_scale_matmul_fwd.py` | replay: NONE token-by-weight, NONE `SWAP_AB=1`, GATHER. Row isolation, both orientations: four routed rows alone and among the other rows of their group. Warm stress, five cells (both orientations of NONE and GATHER, and a swapped tile with the promotion scale table): 1024 groups of 16 rows, N = K = 128, small-integer operands and power-of-two scales, so every byte has an exact reference |
-| `test_general_block_scale_gated_fp8.py` | replay of the gated pair, BF16 and FP8 block-128 output: dense, NONE in both orientations, GATHER. Row isolation of the pair in both orientations and both outputs. Launches on a workspace of arbitrary bytes that another plan also uses. Warm stress of the swapped gated FP8 plan, NONE and GATHER, against its cold launches (codes and scales) |
+| `test_general_moe_grouped_block_scale_matmul_fwd.py` | replay: NONE token-by-weight, NONE `SWAP_AB=1`, GATHER. Row isolation, both orientations: four routed rows alone and among the other rows of their group. Warm stress, five cells (both orientations of NONE and GATHER, and a swapped tile with the promotion scale table): 1024 groups of 16 rows, N = K = 128, small-integer operands and power-of-two scales, so every byte has an exact reference. CUDA graph replays, seven cells (NONE token-by-weight on one-tile and paired 2-CTA clusters and with fewer tiles than clusters, NONE `SWAP_AB=1` with the scale table, GATHER on one-tile and paired clusters, GATHER `SWAP_AB=1`): 256 groups of 16 rows, N = 256, K = 128, against the same exact reference after every step -- three back-to-back replays of one graph, an eager launch, two replays of a second graph of the plan, alternating replays, and two replays behind a workspace refilled with random bytes, all through one workspace and each into a poisoned output |
+| `test_general_block_scale_gated_fp8.py` | replay of the gated pair, BF16 and FP8 block-128 output: dense, NONE in both orientations, GATHER. Row isolation of the pair in both orientations and both outputs. Launches on a workspace of arbitrary bytes that another plan also uses. Warm stress of the swapped gated FP8 plan, NONE and GATHER, against its cold launches (codes and scales). CUDA graph replays of the swapped gated FP8 plan, NONE and GATHER: five replays and an eager launch, codes and scales poisoned before each, against the eager launch's bytes. Swapped clusters of two and of four tiles along the output columns, NONE and GATHER: N = 384 and N = 640 (tiles of the last cluster past N) and N = 512 (whole clusters) write the codes and scales of the plan with one-tile clusters |
 
 Not covered: a group reordered, duplicated or removed; row isolation under
 GATHER; SCATTER and COMBINE (COMBINE adds a token's routed rows with atomic
@@ -45,13 +45,26 @@ the scale table whose address is computed from the loaded registers through
 the kernel's release-zero argument; the GATHER mailbox, acknowledged by a
 reduction, is checked for the store of the index in front of it.
 
+Against source `0550cd04`, all nine graph-replay cells failed at the second
+back-to-back replay of one graph, which wrote no tile: the replay ran with the
+scheduler epoch drawn at capture and found the counter its previous replay had
+left, every claim already counted. The eager launch and the first replay
+passed: a launch that follows one with another epoch starts the count over,
+which is why repeated eager launches did not show it. The grouped kernels now
+return the counter to zero after a launch's last claim. The four
+partial-cluster cells, and the gated FP8 numerics of N = 384 on two-tile
+clusters, failed too: the tiles past N stored scales of block N / 128 and up,
+which in the [tokens, N / 128] scale tensor are the next token's (at N = 384
+the first row past the routed ones, a NaN sentinel, read 0.0). The four
+whole-cluster controls passed before and after.
+
 Run on an SM100 GPU of compute capability 10.0 with 68 SMs, driver 610.57.04,
 PyTorch 2.14.1+cu130, cuDNN backend 92400 and CuTe DSL 4.8.0 compiling with
-CUDA 13.4, on the change that follows source `26bb6426`. The frost test
+CUDA 13.4, on the change that follows source `0550cd04`. The frost test
 conftest loads `python/cudnn` of the checkout, which the run confirmed.
 Results, one process per suite: `test_general_block_scale_matmul.py` **57
-passed**; `test_general_moe_grouped_block_scale_matmul_fwd.py` **86 passed**;
-`test_general_block_scale_gated_fp8.py` **82 passed**; no failures and no
+passed**; `test_general_moe_grouped_block_scale_matmul_fwd.py` **93 passed**;
+`test_general_block_scale_gated_fp8.py` **97 passed**; no failures and no
 skips. `test_template_epilogue_parity.py` passed 44 with its two
 single-family skips. SM103 and SM107 were not available and are unverified.
 
