@@ -940,8 +940,8 @@ A session that is handed the drafter runs the whole step of speculative decoding
   and built no session with it: a session that is not handed the checkpoint draws seeded weights, and the drafter's
   with them, without a word. The loop is now run as written on the seeded pair and on a checkpoint a test
   generates and describes, and the table it runs on is held against the file.
-- What describes shared weights is read at the session that loaded them: a session that shares holds no checkpoint,
-  and its `seed=` says nothing about a checkpoint it was handed. A drafter two links of `share=` behind the loader
-  had nothing to load from, and the drafter of a model handed seed 11's checkpoint was drawn from seed 0 with every
-  token still right, since the verify step decides the tokens; the load now follows `share=` to its end
-  (`Session._weights_owner`) and draws a seeded drafter from the seed its checkpoint records.
+- What describes shared weights is read at the session that loaded them: a session that shares reads no checkpoint
+  of its own, and a `seed=` says nothing about a checkpoint a session was handed. A drafter two links of `share=`
+  behind the loader had nothing to load from, and the drafter of a model handed seed 11's checkpoint was drawn from
+  seed 0 with every token still right, since the verify step decides the tokens; the load now follows `share=` to
+  its end (`Session._weights_owner`) and draws a seeded drafter from the seed its checkpoint records.

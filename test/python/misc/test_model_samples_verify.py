@@ -3098,8 +3098,9 @@ def test_a_session_with_a_drafter_stands_alone_on_its_own_seed_and_keeps_the_ove
     """A session with a drafter needs no other session: without ``share=`` it loads the model itself, and the drafter with
     the model's table.  Its plan table is its own three tables.  The overrides of a run are the model's: the drafter's
     plan is resolved without them (its table has none of the model's blocks).  On seeded weights the drafter is drawn
-    from the SESSION's seed, so the head rows it proposes from are rows of the model's head at another seed than 0
-    too; and the loop on such a session emits the tokens of a plain session of that seed."""
+    from the seed of the checkpoint the session makes from its ``seed=``, so the head rows it proposes from are rows of
+    the model's head at another seed than 0 too; and the loop on such a session emits the tokens of a plain session of
+    that seed."""
     from model_samples import Checkpoint, Session, TextIO, loop, sampling
 
     model = _tiny_model()
