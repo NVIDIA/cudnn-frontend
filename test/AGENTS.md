@@ -285,6 +285,15 @@ current device, then unmap memory still used by another GPU. The later CuTe laun
 can report that fault. `test_empty_cache_waits_for_other_devices_default_stream`
 checks completion before the unsafe release, so its failing control stays safe.
 
+When an xdist worker dies, report its full crash-item node ID immediately:
+an outer job timeout can prevent the terminal failure summary. Use the
+capture-independent stderr helper and an optional `pytest_handlecrashitem`
+hook, preserving the failed report and worker replacement. This is xdist's
+attribution, not proof of the GPU operation that caused the crash; retain the
+per-worker trace journal too. `test_crash_reporting.py` covers hard exits and
+the C watchdog before a deliberately unfinished session, failure status plus
+a following pass, and a serial session without xdist.
+
 For a timed subprocess test, arm a child-side `faulthandler` dump before the
 parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
 The parent's watchdog shows only `subprocess.communicate()`, and pytest's
