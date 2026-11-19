@@ -2521,7 +2521,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "`tokens`, `drafter cache`, `draft proposals`, `acceptance` and `ids`; one kept below it failed `acceptance` alone.",
         "58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids). Both runs ended in `[02] PASS`, "
         "and both stopped at the end token.",
-        "the last step kept six tokens and the end token was its fourth, so two accepted drafted tokens were not written",
+        "the last step kept six tokens and the end token was its fourth, so the last two of them were not written",
         "the second in 38 of those 49, the third in 27 of 38, the fourth in 18 of 27, the fifth in 8 of 18",
         "on `native` 38 of 46 kept tokens were the decode steps' on the same tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the "
         "first kept token 30.",

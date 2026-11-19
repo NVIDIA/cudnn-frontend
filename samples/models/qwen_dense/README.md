@@ -1557,7 +1557,7 @@ steps: 3.22 kept tokens a step (1 + 140 accepted drafted tokens / 63 steps); 14,
 six tokens; the first drafted token was accepted in 49 of 63 steps, the second in 38 of those 49, the third in 27 of 38,
 the fourth in 18 of 27, the fifth in 8 of 18 -- the counts of the library loop in the section "The verify step", on the
 same prompt and list. On `fe-cublas` it wrote 249 new tokens in 74 steps: 3.38 kept tokens a step (1 + 176 / 74; the
-last step kept six tokens and the end token was its fourth, so two accepted drafted tokens were not written); 13, 14,
+last step kept six tokens and the end token was its fourth, so the last two of them were not written); 13, 14,
 14, 10, 11 and 12 steps kept one to six tokens; 61 of 74, 47 of 61, 33 of 47, 23 of 33 and 12 of 23. The stacks launch
 other kernels for the same blocks and a greedy run follows its first other token: an acceptance length is a figure of
 its stack as well as of its prompt and its list. In both runs `position`, `prompt`, `recorded`, `rejected rows`,
