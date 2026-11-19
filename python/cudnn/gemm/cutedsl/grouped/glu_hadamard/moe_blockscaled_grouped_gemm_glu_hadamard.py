@@ -29,7 +29,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import nvvm
+from cutlass._mlir.dialects import nvvm, llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cudnn._cutlass_helpers.warp_reduce import warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -79,6 +80,22 @@ from ..moe_kernel_helpers import (
     can_implement,
     amax_reduction_per_thread,
 )
+
+
+@dsl_user_op
+def _wait_sfb_ready(ptr, phase, *, loc=None, ip=None):
+    """Acquire both CTAs' scale stores before the collective SMEM->TMEM copy."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(ptr.toint()).ir_value(loc=loc, ip=ip), cutlass.Int32(phase).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred done; WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [$0], $1, 10000000; @!done bra WAIT; }",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class BlockScaledMoEGroupedGemmGluHadamardKernel:
@@ -378,11 +395,15 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.d_layout,
             self.sf_dtype,
             self.sf_vec_size,
-            self.num_smem_capacity - (8 if self.glu_layout == "gate_then_up" else 0),
+            self.num_smem_capacity - (256 if self.glu_layout == "gate_then_up" else 0),
             self.occupancy,
             self.bias_dtype if self.enable_bias else None,
             self.use_tmem_post_rht_amax,
         )
+
+        # Two 8-byte SFB barriers per stage, with room for at most 16 stages.
+        if self.glu_layout == "gate_then_up":
+            assert self.num_ab_stage <= 16
 
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -499,6 +520,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
             b_tma_op_arg = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma_arg.thr_id)
             sfb_tma_op_arg = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma_arg.thr_id)
+            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                sfb_tma_op_arg = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
 
             # Read per-expert base addresses from the pointer arrays
             b_ptr_tensor = cute.make_tensor(
@@ -730,6 +753,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
         # TMA load SFB
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma.thr_id)
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            sfb_op = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
         tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_op,
@@ -765,6 +790,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
+        self.num_sfb_load_bytes = sfb_copy_size
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            self.num_tma_load_bytes -= sfb_copy_size * atom_thr_size
 
         # TMA store C
         c_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
@@ -839,7 +867,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         class SharedStorage:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-            sfb_pair_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1 if self.glu_layout == "gate_then_up" else 0]
+            sfb_load_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage if self.glu_layout == "gate_then_up" else 0]
+            sfb_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage if self.glu_layout == "gate_then_up" else 0]
             pingpong_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_pingpong_stage * 2]
             if cutlass.const_expr(self.enable_bias):
                 bias_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_bias_stage * 2]
@@ -1428,7 +1457,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         if cutlass.const_expr(self.glu_layout == "gate_then_up"):
             if warp_idx == self.mma_warp_id:
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(storage.sfb_pair_mbar_ptr.data_ptr(), 1)
+                    for stage in cutlass.range_constexpr(self.num_ab_stage):
+                        cute.arch.mbarrier_init(storage.sfb_load_mbar_ptr.data_ptr() + stage, 1)
+                        cute.arch.mbarrier_init(storage.sfb_ready_mbar_ptr.data_ptr() + stage, 2)
             cute.arch.mbarrier_init_fence()
 
         # AB pipeline
@@ -1784,7 +1815,14 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar_ptr=tma_bar, mcast_mask=a_full_mcast_mask)
                     cute.copy(tma_atom_b, tBgB_k, tBsB_pipe, tma_bar_ptr=tma_bar, mcast_mask=b_full_mcast_mask, tma_desc_ptr=desc_ptr_b)
                     cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_pipe, tma_bar_ptr=tma_bar, mcast_mask=sfa_full_mcast_mask)
-                    cute.copy(tma_atom_sfb, tBgSFB_k, tBsSFB_pipe, tma_bar_ptr=tma_bar, mcast_mask=sfb_full_mcast_mask, tma_desc_ptr=desc_ptr_sfb)
+                    sfb_bar = tma_bar
+                    if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                        # Both half-tile multicasts contribute to this CTA's
+                        # complete SFB stage. Group-one completion stays local.
+                        sfb_bar = storage.sfb_load_mbar_ptr.data_ptr() + ab_producer_state.index
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(sfb_bar, self.num_sfb_load_bytes)
+                    cute.copy(tma_atom_sfb, tBgSFB_k, tBsSFB_pipe, tma_bar_ptr=sfb_bar, mcast_mask=sfb_full_mcast_mask, tma_desc_ptr=desc_ptr_sfb)
 
                     ab_producer_state.advance()
 
@@ -1803,8 +1841,6 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         # Specialized MMA warp
         # ---------------------------------------------------------------
         if warp_idx == self.mma_warp_id:
-            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
-                sfb_pair_phase = cutlass.Int32(0)
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
@@ -1893,25 +1929,22 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     if cutlass.const_expr(self.glu_layout == "gate_then_up"):
-                        # Collective S2T consumes both CTAs' local scales. Signal
-                        # TMA completion to the peer and await its permutation.
-                        pair_barrier = storage.sfb_pair_mbar_ptr.data_ptr()
-                        if is_leader_cta:
-                            ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(pair_barrier, cta_rank_in_cluster ^ 1, scope=nvvm.MemScopeKind.CLUSTER)
-                        else:
-                            cute.arch.mbarrier_wait(pair_barrier, sfb_pair_phase)
+                        # Each CTA observes its own TMA destination before
+                        # permuting SFB. The permutation stores and proxy fence
+                        # precede the release; both arrivals are required before
+                        # the leader's collective S2T can consume either copy.
+                        cute.arch.mbarrier_wait(storage.sfb_load_mbar_ptr.data_ptr() + ab_consumer_state.index, ab_consumer_state.phase)
                         interleave_sfb_in_place(sSFB, ab_consumer_state.index, lane_idx, self.mma_tiler[2], self.sf_vec_size, self.num_ab_stage)
-                        if is_leader_cta:
-                            cute.arch.mbarrier_wait(pair_barrier, sfb_pair_phase)
-                        else:
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(pair_barrier, cta_rank_in_cluster ^ 1, scope=nvvm.MemScopeKind.CLUSTER)
-                        sfb_pair_phase ^= 1
+                        ready_barrier = storage.sfb_ready_mbar_ptr.data_ptr() + ab_consumer_state.index
+                        with cute.arch.elect_one():
+                            if is_leader_cta:
+                                cute.arch.mbarrier_arrive(ready_barrier)
+                            else:
+                                cute.arch.mbarrier_arrive(ready_barrier, cta_rank_in_cluster ^ 1, scope=nvvm.MemScopeKind.CLUSTER)
                     if is_leader_cta:
-                        if cutlass.const_expr(self.glu_layout != "gate_then_up"):
-                            ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                            _wait_sfb_ready(storage.sfb_ready_mbar_ptr.data_ptr() + ab_consumer_state.index, ab_consumer_state.phase)
                         s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
                         tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
                         tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]

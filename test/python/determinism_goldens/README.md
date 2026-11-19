@@ -8812,3 +8812,70 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+### Canonical NVFP4 Hadamard paired-CTA SFB handoff — 2026-11-19
+
+The nonquant `grouped_gemm_glu_hadamard_wrapper_sm100` forward path now
+observes each CTA's own SFB TMA completion before in-place scale permutation.
+A per-stage, two-arrival ready barrier and cluster-scope acquire precede
+collective S2T. Stage reuse remains owned by the original AB pipeline.
+This changes synchronization, not the numerical formula or output scale
+format. The API has no backward entry point. The separate Hadamard+quant
+kernel is unchanged.
+
+Fresh validation used NVIDIA GB200 (SM100, 152 SMs), Torch
+2.13.0a0+8145d630e8.nv26.06, CUDA 13.3, cuDNN 9.25.1, and CuTe DSL 4.8.0
+(compiling with CUDA 13.4), job 9182480. The worktree was
+`glu_canonical_validation/pr_publication_20261110/worktrees/cudnn-frontend`
+at `ca3f85b6` with the local synchronization fix. Kernel source SHA256 was
+`15e2088c1539992fd0906f7daff550abc8575faa9dfc8dfec962555ac89c844f`;
+new determinism suite SHA256 was
+`3ecabd0f3b84ab54e294752704809fd5f082fd2a99160143163ce12fbab01143`.
+The launcher asserted the Python package/API paths and unchanged kernel
+hashes during each run; it reused the existing compiled cuDNN binding.
+
+Run from `test/python`, with `CUBLAS_WORKSPACE_CONFIG=:4096:8` and the
+worktree package selected explicitly (equivalent pytest arguments):
+
+```bash
+python -m pytest -v -m L0 gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py
+python -m pytest -s -v -m L0 gemm/cutedsl/test_grouped_gemm_glu_hadamard_determinism.py
+python -m pytest -v -m L0 gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py
+```
+
+- Existing Hadamard layout/reference/replay/batch-invariance suite: **13 passed**.
+  Two cases check the existing rejection of canonical discrete-weight TMEM RHT.
+- New stage reuse/synchronization suite: **19 passed**. Twelve cases cover
+  K=1792/4096, static/dynamic scheduling, dense/discrete SMEM RHT and dense
+  TMEM RHT. Four inject a 20,000 ns nanosleep before either CTA's scale
+  permutation, for dense/discrete weights. Emitted PTX confirms all four
+  instrumented kernels contain the delay and the cluster acquire. The
+  instrumented subset was rerun separately: **4 passed, 15 deselected**;
+  this overlaps the 19-case result.
+- Three warm-stress cases use grouped M=[1024,0,2048], N=2048, K=4096,
+  five input stages and persistent scheduling. Each completed 3,000 warm
+  and 3,000 poisoned launches with zero differing bytes. The helper's unsafe
+  ring control failed 200/200 launches. The target uses 152 resident CTAs
+  (one per SM), versus 456 for the control; these bounded measurements do
+  not exhaust possible schedules. Cold-launch byte references supplement
+  the independent FP64 GEMM/SwiGLU and explicit H16 numerical checks.
+- Separate unchanged Hadamard+quant suites: **33 passed**, including row/column
+  payloads/scales, changed-input graphs, batch invariance and warm stress.
+- No failures or skips in those completed runs. An initial launcher attempt
+  failed argument parsing because pytest-xdist was absent; removing `-n0`
+  allowed the serial runs above. No numerical tolerance or golden changed.
+
+The independent numerical checks retain C rtol/atol=0.01/0.005,
+D=0.015/0.005, exact stored-D amax, and post-RHT amax=1e-4/1e-4.
+All replay, input-preservation and legacy-layout comparisons use exact bytes.
+The six pre-existing modified files were verified unchanged by SHA256.
+For dense/discrete SMEM and dense TMEM, legacy interleave32 PTX is identical
+before/after after normalizing entry-symbol names and removing source comments.
+Canonical PTX confirms group-one SFB multicast completion, permutation stores
+before release, and cluster acquire before group-two S2T.
+
+No old-kernel timing failure was reproduced; the fix closes the synchronization
+contract gap. The generic unsafe-ring control is not a reproduction of that
+specific defect. SM103 and untested shapes remain unverified.
+Evidence (logs, XML, provenance, before/after sources and PTX) is under
+`glu_canonical_validation/hadamard_sync_fix_20261119/` in the validation workspace.

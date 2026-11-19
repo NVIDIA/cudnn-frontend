@@ -361,6 +361,12 @@ for replay, batch-invariance, and stress-test results.
   Atomic dbias and legacy-alias atomic dprob are separate numerical checks
   and carry no new bitwise guarantee. SM100 passed independent references,
   replay and batch invariance; SM103 is unverified.
+  The nonquant GLU+Hadamard path additionally qualifies its canonical 2CTA
+  SFB handoff on SM100: per-CTA TMA completion, per-stage reordered-scale
+  readiness, and a cluster-scope acquire before collective S2T. Tests cover
+  dense/discrete SMEM RHT and dense TMEM RHT, stage wraps, asymmetric CTA
+  arrival, and bounded warm/poisoned replay. SM103 remains unverified;
+  canonical discrete-weight TMEM RHT remains unsupported.
   The GLU+Hadamard+quant natural-rank adapter additionally checks exact
   equality with legacy tensor ranks for both GLU branch orders, dense/discrete
   NVFP4 weights, BF16/NVFP4 rowwise outputs, and standard GEMM-blocked colwise scales.
