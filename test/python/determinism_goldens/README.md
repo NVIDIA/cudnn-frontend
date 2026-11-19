@@ -4,6 +4,38 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
+
+The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
+decode suite had no goldens for GH200, so their four and six `test_golden`
+cases skipped there. This adds them; no kernel or test code changes.
+
+Runtime: NVIDIA GH200 480GB (SM90, 132 SMs, aarch64 host), PyTorch
+2.14.0+cu130, CUDA 13.0, driver API 13020, cuDNN 92700, CuTe DSL 4.8.1,
+tvm-ffi 0.1.15.post2, at commit `86b74686`. The goldens are in
+`c079e9b62638eb64/`.
+
+```
+F="block_sparse_attention/cutedsl/test_BSA_determinism.py causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py"
+CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $F   # 42 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> pytest -m L0 $F  # 42 passed
+pytest -m L0 $F                                           # twice, files copied in: 42 passed, 0 skipped
+```
+
+Run from `test/python`. The 42 cases are 30 block-sparse attention and 12
+causal convolution. Each `test_golden` case checks its problem against the
+FP32 reference and replays it bitwise before the hashes are recorded.
+
+The six causal convolution records equal the GeForce RTX 4090 records in
+`c74756f44f441362/` byte for byte, inputs and outputs. The block-sparse
+attention records do not compare that way with the H100 and B300 records in
+`f2590ab8d14a5923/` and `d6ab5c84009f8fa5/`. Their integer metadata hashes
+match, but the BF16 and FP16 q, k, v and dO drawn from the suite's CPU
+generator do not. On this aarch64 host, PyTorch 2.12.0 through 2.16.0.dev give
+the same operand bytes, so the split follows the host CPU's `randn` path, not
+the PyTorch version. Outputs from these four files are only comparable with
+records drawn on an aarch64 host.
+
 ### SM100 D256 swap-AB in-launch reduction (2026-11-18)
 
 `sdpa/frost/sdpa_decode_cluster_reduce_sm100.py` (collected through
