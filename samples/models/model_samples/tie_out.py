@@ -673,6 +673,7 @@ class Checks:
     kernels: str = ""  # the kernel check, when it was asked for: PASS | FAIL | NOT OBSERVED
     unobserved: str = ""  # why the kernels were not observed
     on_demand: Optional[OnDemand] = None  # what the reference's copies of the weights the run keeps no copy of cost
+    positions: Tuple[int, ...] = ()  # of a run with judged positions: the steps at which its blocks were held against the reference
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -821,7 +822,9 @@ def run_checks(
     the reference.  The run is then replayed up to the last of them -- past ``max_steps``, which stays the bound of the
     reference stack's own pass (``tokens``) -- with the block check and the batch-invariance check on at the judged
     positions alone and off at every other step; ``replay`` holds the ids and logits of every replayed step.  The first
-    line of the checks then names the positions.  Not for a session built with ``draft_tokens=`` (``ValueError``).
+    line of the checks then names the positions, and ``Checks.positions`` holds them: what was judged, for a caller that
+    says so.  A position the run did not record is a ``ValueError``, never left out; so is a session built with
+    ``draft_tokens=``.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
@@ -852,7 +855,9 @@ def run_checks(
     steps = last = min(main.count, main.inputs.shape[0])  # ``steps``: of the reference stack's own pass; ``last``: the steps replayed here
     if max_steps is not None:
         steps = min(steps, max_steps)
-    judged_at = None if positions is None else frozenset(position for position in positions if 0 <= position < last)
+    judged_at = None if positions is None else frozenset(positions)
+    if judged_at and not 0 <= min(judged_at) <= max(judged_at) < last:  # a position that was asked for is judged, or the run says no
+        raise ValueError(f"judged positions {positions_text(judged_at)}: the run recorded {last} steps, the positions 0 to {last - 1}")
     last = steps if judged_at is None else max(steps, max(judged_at, default=-1) + 1)
     inputs, logits, ids = main.inputs[:last].clone(), main.logits[:last].clone(), main.outputs[:last].clone()
     accepted = list(main.accepted[:last])  # per step the tokens behind the first that the run kept: 0 for a decode step
@@ -1013,7 +1018,7 @@ def run_checks(
             lines.append(f"    {DRAFTER_KERNELS}")
     session.reset(fresh=True)
     ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
-    return Checks(lines, ok, judged, status, unobserved, cost)
+    return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())))
 
 
 @dataclass

@@ -15,9 +15,10 @@
 * the screen (no line wider than 110 characters, in every form) and the report file (strict JSON, a definition beside
   every statistic, no local path);
 * the sample's flags, each refusal before the load, ``main()`` with ``--perf`` to its last line, and an ordinary run
-  that prints what it printed;
-* the public text of the mode: the words, the ``stage`` row, the rules of the guide, the flag table and the example of
-  the report, each against the code.
+  that prints what it printed and does not import the mode's module;
+* the public text of the mode: a sentence of the READMEs, of the guide or of the script that says what the mode does is
+  held beside the assertion that shows it (``_says``), and so are the definitions the report file carries
+  (``_defines``); the words, the ``stage`` row, the flag table and the example of the report against the code.
 
 No GPU, no weights on disk, no profiler."""
 
@@ -65,6 +66,42 @@ def helper_layer():
         del sys.modules[name]
 
 
+_TEXTS = {"area": MODELS / "README.md", "guide": MODELS / "AGENTS.md", "family": MODELS / "qwen_dense" / "README.md", "script": SCRIPT}
+
+
+def _flat(text):
+    return " ".join(text.split())
+
+
+def _says(where, *sentences):
+    """The public text ``where`` holds every one of ``sentences``, white space aside (of the script: its adjacent string
+    literals read as one).  Called beside the assertion that shows the code does what the sentence says."""
+    text = _TEXTS[where].read_text(encoding="utf-8")
+    text = _flat(re.sub(r'"\s*\n\s*f?"', "", text) if where == "script" else text)
+    for sentence in sentences:
+        assert _flat(sentence) in text, f"{_TEXTS[where].name} does not say: {sentence}"
+
+
+def _defines(key, *phrases):
+    """The definition the report file carries beside the statistic ``key`` holds every one of ``phrases``."""
+    from model_samples import perf
+
+    for phrase in phrases:
+        assert phrase in perf.DEFINITIONS[key][1], f"{key}: {phrase}"
+
+
+class _Nth:
+    """True the n-th time it is asked and false every other time: a defect of one step (``defect={"token": _Nth(n)}``: the
+    n-th token choice of a session returns another id)."""
+
+    def __init__(self, n):
+        self.n, self.asked = n, 0
+
+    def __bool__(self):
+        self.asked += 1
+        return self.asked == self.n
+
+
 def _request(first, tokens, launches=None, request=0.0, kind="timed", ids=None):
     """A request with constructed stamps, in seconds: ``t_request``, ``t_first``, ``t_token`` and, where given, ``t_launch``
     (default: each step is launched 1 ms behind the read before it)."""
@@ -89,6 +126,8 @@ def test_time_per_output_token_is_last_minus_first_over_tokens_minus_one():
     assert late.time_per_output_token_ms() == pytest.approx(request.time_per_output_token_ms()), "a longer prompt moves no interval"
     stats = perf._statistics([request], 0, 1, "")
     assert stats["time_per_output_token"]["value"] == pytest.approx(25.0) and stats["time_per_output_token"]["events"] == "t_token[last] - t_first"
+    _defines("time_per_output_token", "ids reach the host) / (new tokens - 1). Of a run: the median over its timed requests.")
+    _says("area", "time per output token = (the last token's ids on the host - the first new token's ids on the host) / (new tokens - 1) of a timed request")
 
 
 def test_rate_is_never_a_median_step():
@@ -106,8 +145,16 @@ def test_rate_is_never_a_median_step():
     assert wall["decode_rate"]["value"] == pytest.approx(40.0) and wall["tokens_per_second_wall"]["value"] == pytest.approx(5 / 1.1)
     # several sequences: the total beside the rate per sequence; a rate that is not printed has neither
     assert perf._statistics([request], 0, 4, "")["decode_rate"]["total"] == pytest.approx(160.0)
-    missing = perf._statistics([request], 0, 4, "not printed for a reduced model")["decode_rate"]
+    unprinted = perf._statistics([request], 0, 4, "not printed for a reduced model")
+    missing, wall = unprinted["decode_rate"], unprinted["tokens_per_second_wall"]
     assert missing["value"] is None and missing["total"] is None and missing["reason"] == "not printed for a reduced model"
+    assert wall["value"] is None and wall["reason"] == "not printed for a reduced model", "no figure of a rate where no rate is printed"
+    _defines("decode_rate", "1000 / time per output token in ms. Never a median step turned into a rate.")
+    _defines("tokens_per_second_wall", "new tokens / (time the last token's ids reach the host - time the request is handed to the text path)")
+    _says("area", "| `decode rate` | 1000 / time per output token, in tokens per second per sequence;")
+    _says(
+        "area", "Never a median step turned into a rate, and not output tokens / wall time, which holds every time to first token (that figure is in the file)."
+    )
 
 
 def test_percentiles_nearest_rank():
@@ -123,6 +170,8 @@ def test_percentiles_nearest_rank():
     pooled = perf.summary([1.0, 2.0, 3.0, 4.0, 100.0])
     assert pooled == {"n": 5, "median": 3.0, "mean": 22.0, "minimum": 1.0, "maximum": 100.0, "p90": 100.0, "p99": 100.0}
     assert perf.summary([]) == {"n": 0}
+    _defines("token_to_token_interval", "pooled over the run's timed requests; percentiles are nearest-rank.")
+    _says("area", "pooled over the timed requests: median, p90 and p99 by nearest rank.")
 
 
 def test_run_value_is_median_over_timed_requests():
@@ -136,6 +185,8 @@ def test_run_value_is_median_over_timed_requests():
     assert per_token["mean"] == pytest.approx(24.0) and per_token["spread_percent"] == pytest.approx((50.0 - 10.0) / 12.0 * 100)
     assert stats["decode_rate"]["value"] == pytest.approx(1000 / 12.0)
     assert stats["token_to_token_interval"]["n"] == 6, "the intervals are pooled over the requests"
+    _says("area", "of a timed request, and of a run the median over its timed requests.", "The line also gives how far the timed requests are apart.")
+    _says("family", "the time per output token and the time to first token of a run are the median over them, the token-to-token intervals are pooled")
 
 
 def test_time_to_first_token_starts_at_the_request():
@@ -153,6 +204,8 @@ def test_time_to_first_token_starts_at_the_request():
         first["value"] == pytest.approx(6000.0) and first["events"] == "t_first - t_request" and first["per_request"] == pytest.approx([5800.0, 6000.0, 7000.0])
     )
     assert "The load is outside it" in first["definition"] and "without the network" in first["serving_counterpart"]
+    _defines("time_to_first_token", "from the request being handed to the text path to the first new token's ids on the host", "Of a run: the median over")
+    _says("area", "and the host read; the median over the timed requests. The load is outside it.")
 
 
 def test_step_is_the_median_interval_at_the_traced_positions():
@@ -168,12 +221,17 @@ def test_step_is_the_median_interval_at_the_traced_positions():
     assert three["host"]["value"] == pytest.approx(1.0) and three["host"]["n"] == 6
     four = perf._statistics(timed, 4, 1, "")  # the long last step is among the traced positions now
     assert four["step"]["n"] == 8 and four["step"]["maximum"] == pytest.approx(60.0) and four["step"]["value"] == pytest.approx(10.0)
-    assert four["host"]["maximum"] == pytest.approx(5.0), "the fourth step of the first request was launched 5 ms behind the read before it"
+    assert four["host"]["n"] == 8 and four["host"]["maximum"] == pytest.approx(5.0), "the fourth step of the first request: 5 ms behind the read before it"
     every = perf._statistics(timed, 0, 1, "")
     assert every["step"]["n"] == 8 and every["step"]["value"] == every["token_to_token_interval"]["value"] == pytest.approx(10.0)
     assert three["step"]["events"] == "t_token[i] - t_token[i - 1] at the traced positions"
     assert "gpu_busy" not in three and "launch_overhead" not in three and "tracing_stretch" not in three, "not statistics of this version"
     assert "does not take GPU busy from the traced request" in three["step"]["definition"]
+    _defines("host", "From a token's ids on the host to the next step's first launch call", "the median over the timed steps at the traced positions")
+    _defines("step", "The median token-to-token interval over the timed steps at the positions the traced request covers, all timed requests.")
+    _says("area", "| `step` | the median token-to-token interval over the timed steps at the positions the traced request covers (the line names them).")
+    _says("area", "the loop's own host time, from a token's ids on the host to the next step's first launch call, is in the file")
+    assert three["step"]["clock"] == three["host"]["clock"] == perf.CLOCK and "clock" not in three["memory"] and "clock" not in three["launches_per_step"]
 
 
 def test_judged_positions_from_page_and_request():
@@ -197,6 +255,12 @@ def test_judged_positions_from_page_and_request():
     assert why[0] == "one of the first 16 positions of the request" and why[313] == "one of the last two timed positions"
     assert why[63] == why[64] == "on either side of the first page boundary of the attention cache inside the timed steps (64 positions a page)"
     assert all(58 <= position <= 313 for position in why if position > 15), "every judged position behind the first 16 is a timed one"
+    assert sum(position > 15 for position in why) == 4
+    _says("script", "with the reference checks on it, also at four positions of the timed steps")
+    _says("family", "one checked request with the reference checks on it (also at four positions of the timed steps)")
+    _says("area", "The judged positions are the first 16 of the request, the two on either side of the first page boundary of the attention cache inside")
+    _says("area", f"for the default prompt of 58 tokens, {listed(58, 256).replace(', 313', ' and 313')}.", f"A page is {configs.ATTENTION_PAGE} positions,")
+    _says("area", "the attention blocks of this sample read one contiguous cache today, and the two positions are judged all the same")
     assert tie_out.positions_text([5, 3, 4, 9, 10, 12]) == "3-5, 9, 10, 12" and tie_out.positions_text([]) == ""
 
 
@@ -229,6 +293,16 @@ def test_record_class_reasons_in_the_order_of_the_conditions():
     assert perf.record_class(False, False, "", True, "") == ("orientation", ["other processes not observed", "clocks not observed"])
     assert perf.record_class(False, False, "", True, "a check did not hold", "", "")[1] == ["a check did not hold"]
     assert perf.record_class(False, False, "", True, "", "", "") == ("controlled", []), "every condition handed in as met"
+    # the third reason, from the kernel facts of a run: no target declared; a declared target whose census line is not EQUAL
+    census_line = "target census plain / cc 10.0 / 148 SMs (recorded <date>): "
+    assert perf.identity_reason({"declared": False, "census": None}) == "no target kernel set declared"
+    assert perf.identity_reason({"declared": True, "census": census_line + "EQUAL (three numbers, 0 by membership alone)"}) == ""
+    for other in ("NOT CLAIMED (fallback rows present)", "NOT EQUAL (the kernel check did not hold)", "NOT OBSERVED", "not compared"):
+        assert perf.identity_reason({"declared": True, "census": census_line + other}) == "kernel identity not claimed on this GPU class", other
+    _says("area", "A run is a controlled run only when it observed every condition itself: a checkpoint, every block on a claimed target kernel,")
+    _says("area", "Otherwise it is `orientation` and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`.")
+    _says("area", "*Record class*: what a run may call its numbers, on the second line of its report: `orientation` with every reason, or a controlled run.")
+    _says("family", "Every run of the mode is `orientation` today and says why on the second line of its report")
 
 
 # ---------------------------------------------------------------------------------------------- a session on the CPU, stand-in providers
@@ -334,16 +408,18 @@ def _stand_ins(monkeypatch, events, profiler="records", defect=None):
     return dict(factories(), **stand_ins)
 
 
-def _session(monkeypatch, events, sequences=1, capacity=40, **stand_in):
+def _session(monkeypatch, events, sequences=1, capacity=40, watch=False, record_steps=None, **stand_in):
     """A loaded session of the tiny geometry on the CPU through the rows of ``fe-cublas``, on the stand-ins of
     :func:`_stand_ins`: ``(session, text)``.  Every decode step of it writes what it ran with into ``events``:
-    ``("step", rows of the record, whether a tap is set, whether a call log is open)``."""
+    ``("step", rows of the record, whether a tap is set, whether a call log is open)``.  With ``watch`` the events also
+    hold every host read (``"read"``), every reset (``("reset", fresh, recorded)``), every call of the tokenizer
+    (``"encode"``) and every device synchronisation of a stage (``"sync"``)."""
     from model_samples import Session, TextIO, blocks
 
     build = _stand_ins(monkeypatch, events, **stand_in)
     model = _tiny_model()
     text = TextIO.synthetic(model.geometry.vocab)
-    session = Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=capacity, check_kernels=True)
+    session = Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=capacity, check_kernels=True, record_steps=record_steps)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
     options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True}
     session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, 1, "fe-cublas", model=model, options=options, factories=build)
@@ -355,6 +431,12 @@ def _session(monkeypatch, events, sequences=1, capacity=40, **stand_in):
         return advance(ids, *more, **named)
 
     monkeypatch.setattr(session, "_advance", watched)
+    if watch:
+        read, reset, encode = session.read, session.reset, text.encode
+        session.stages._sync = lambda: events.append("sync")
+        monkeypatch.setattr(session, "read", lambda ids: events.append("read") or read(ids))
+        monkeypatch.setattr(session, "reset", lambda fresh=True, recorded=True: events.append(("reset", fresh, recorded)) or reset(fresh, recorded))
+        monkeypatch.setattr(text, "encode", lambda *words, **named: events.append("encode") or encode(*words, **named))
     return session, text
 
 
@@ -371,16 +453,17 @@ class _Sink:
         self.written.append(text)
 
 
-def _mode(monkeypatch, tmp_path, steps=6, requests=2, warmup=2, sequences=1, budget=160_000, real=False, on_say=None, eos=None, **stand_in):
+def _mode(monkeypatch, tmp_path, steps=6, requests=2, warmup=2, sequences=1, budget=160_000, real=False, on_say=None, eos=None, **session_options):
     """One run of the mode on the stand-ins: ``(outcome, the lines it said, events, sink)``.  ``events`` holds, in order,
-    every stamp the mode took (``"stamp"``), every decode step (``_session``), every line (``("say", line)``), every
-    decoder made for a text (``"decoder"``) and every profiler pass (``"profiler"``).  ``on_say(line)`` is called with
-    every line: a test switches a defect on at the line that says which phase comes next.  ``real`` runs the text path of
-    a checkpoint (the text written once, to the sink), with ``eos`` as the text's end tokens."""
+    every stamp the mode took (``"stamp"``), every decode step (``_session``, which takes ``session_options``), every
+    line (``("say", line)``), every decoder made for a text (``"decoder"``) and every profiler pass (``"profiler"``).
+    ``on_say(line)`` is called with every line: a test switches a defect on at the line that says which phase comes
+    next.  ``real`` runs the text path of a checkpoint (the text written once, to the sink), with ``eos`` as the text's
+    end tokens."""
     from model_samples import Environment, blocks, perf
 
     events, lines, sink = [], [], _Sink()
-    session, text = _session(monkeypatch, events, sequences, capacity=5 + steps + 2, **stand_in)
+    session, text = _session(monkeypatch, events, sequences, capacity=5 + steps + 2, **session_options)
     if real:  # the weights are loaded; the report names a checkpoint by its own summary, which seeded weights do not have
         session.checkpoint, text.eos_ids = None, tuple(eos or ())
     clock = perf.now
@@ -455,6 +538,11 @@ def test_no_profiler_before_the_last_timed_request(monkeypatch, tmp_path):
     assert (lines[at] + " " + lines[at + 1].strip()).endswith(" ms at the 3 traced positions, 5 to 7; GPU busy not measured (this version)")
     one, lines, events, _ = _mode(monkeypatch, tmp_path / "one", budget=1)  # a budget below one step: the sizing step is the traced request
     assert one.data["traced"]["steps"] == 1 and events.count("profiler") == 1 and one.passed
+    _says("area", "The first profiler pass of the process starts behind the last timed request: the traced request feeds its prompt untraced")
+    _says("area", "its first step alone -- whose launch records size the rest -- then as many further steps as `--perf-trace-records` holds")
+    _says("family", "Its first step is traced alone and sizes the rest (it is always traced, also where its records alone pass N);")
+    _says("family", "where the timed steps do not all fit, it traces the first steps that do, and the report says how many and at which positions")
+    _says("guide", "and no profiler pass runs in the process before its last timed request.")
 
 
 def test_trace_request_traces_steps_of_the_request_that_is_running(monkeypatch):
@@ -492,6 +580,8 @@ def test_timed_request_has_no_recorder_no_text(monkeypatch, tmp_path):
     """From the line that announces the warm-up request to the first profiler pass: every decode step runs on a record of 0
     steps, with no tap and no call log; no line is said, no text is decoded.  The checked request before it is recorded
     whole; the traced steps have their call log; the text is decoded once, behind the report."""
+    from model_samples import perf
+
     (tmp_path / "x").mkdir()
     outcome, lines, events, sink = _mode(monkeypatch, tmp_path / "x", steps=6, requests=2, warmup=2)
     announced = next(index for index, event in enumerate(events) if event[0] == "say" and "a warm-up request, 2 timed requests" in event[1])
@@ -516,6 +606,67 @@ def test_timed_request_has_no_recorder_no_text(monkeypatch, tmp_path):
         "text": "none",
     }
     assert all(request["end_state_sha256"] == outcome.data["raw"]["requests"][0]["end_state_sha256"] for request in outcome.data["raw"]["requests"][2:4])
+    # the count the run printed before the load: every decode step of the stack, the replay of the checks among them
+    assert sum(event[0] == "step" for event in events) == perf.Protocol(2, 6, 2).decode_steps(5)
+    inside = "no recorder, no call log, no profiler, no text"
+    _says("area", f"Inside a timed request there is nothing but the step: {inside}.", "with the recorder of the checks on")
+    _says("guide", f"Nothing but the step runs inside a timed request: {inside};")
+    _says("script", "forced decode steps (default 256, the end token ignored) with nothing but the step inside; only then the profiler")
+
+
+def test_every_stamp_stands_where_its_definition_says(monkeypatch, tmp_path):
+    """One monotonic clock, and every stamp of a timed request at its event: ``t_request`` in front of render and
+    tokenize, ``t_first`` behind the first host read, ``t_launch`` in front of a step, ``t_token`` behind its one host
+    read.  The state is zeroed in place in front of every request, and the device is synchronised between that zeroing
+    and the request's first stamp, and not again before its last."""
+    from model_samples import perf, timing
+
+    assert perf.now is timing.now and perf.CLOCK.startswith("time.perf_counter")
+    with monkeypatch.context() as patch:
+        patch.setattr(timing.time, "perf_counter", lambda: 12345.5)
+        assert perf.now() == 12345.5, "the clock of the stamps is the monotonic one"
+    outcome, lines, events, _ = _mode(monkeypatch, tmp_path, steps=6, requests=2, warmup=2, watch=True)
+    kinds = [event if isinstance(event, str) else event[0] for event in events]
+    zeroings = [index for index, event in enumerate(events) if event == ("reset", False, False)]
+    assert len(zeroings) == 4 and ("reset", True, False) not in events, "in front of the warm-up, each timed and the traced request: in place"
+    request = ["stamp", "encode", *["step"] * 5, "read", "stamp"]  # t_request, the text path, the prompt's steps, the first host read, t_first
+    step = ["stamp", "step", "read", "stamp"]  # t_launch, the step, its one host read, t_token
+    for start, stop in zip(zeroings[1:3], zeroings[2:4]):  # the two timed requests, each from its zeroing to the next one
+        inside = [kind for kind in kinds[start + 1 : stop] if kind in ("stamp", "encode", "step", "read", "sync")]
+        assert inside == ["sync", "sync", *request, *step * 6, "sync", "sync"], inside
+    assert kinds[zeroings[0] + 1 : zeroings[1]].count("sync") == 4, "the warm-up request too: its zeroing and its own stage"
+    assert outcome.passed and outcome.data["protocol"]["restart"].endswith("zeroed in place at position 0, the device synchronised behind the zeroing")
+    assert outcome.data["startup"]["zeroing the state_s"] >= 0.0
+    _defines("startup", "the zeroing of the state", "no other stage enters a rate or the time to first token")
+    _says("area", "timed requests, each from the state zeroed in place (the device is synchronised behind the zeroing, which is outside every statistic);")
+    _says("area", "*Token-to-token interval*: the time between the host reads of two consecutive tokens of a timed request.")
+    _says("area", "from the request being handed to the text path to the first new token's ids on the host: render, tokenize, the copy of the ids,")
+    # the raw stamps of the file are seconds from the request, and they give the file's statistics
+    data = json.loads(json.dumps(outcome.data))
+    timed = [made for made in data["raw"]["requests"] if made["kind"] == "timed"]
+    assert [(made["t_token_s"][-1] - made["t_first_s"]) * 1e3 / 6 for made in timed] == pytest.approx(
+        data["statistics"]["time_per_output_token"]["per_request"]
+    )
+    assert [made["t_first_s"] * 1e3 for made in timed] == pytest.approx(data["statistics"]["time_to_first_token"]["per_request"])
+    _says("area", "(every stamp of every request, relative to its start, and the hashes of its ids and of its end state)")
+
+
+def test_the_end_state_digest_reads_every_byte(monkeypatch):
+    """The digest of a state changes with one element of any one of its tensors, and comes back with it."""
+    from model_samples import perf
+
+    session, text = _session(monkeypatch, [], capacity=12)
+    session.read(session.prefill([text.encode("ab0xy")]))
+    before = perf.state_digest(session.state)
+    tensors = [tensor for layer in session.state.layers for tensor in layer.tensors()]
+    assert len(tensors) > 2
+    for tensor in tensors:
+        flat = tensor.view(-1)
+        kept = flat[-1].clone()
+        flat[-1] = kept + 1
+        assert perf.state_digest(session.state) != before, "one element of one state tensor"
+        flat[-1] = kept
+    assert perf.state_digest(session.state) == before
 
 
 def test_the_text_of_a_checkpoint_is_written_once_behind_the_report(monkeypatch, tmp_path):
@@ -530,7 +681,6 @@ def test_the_text_of_a_checkpoint_is_written_once_behind_the_report(monkeypatch,
     at = produced.index(end) + 1
     assert outcome.passed and outcome.produced[0] == produced, "the end token is ignored by the forced steps: the same ids"
     assert _line(lines, "text out ") == f"text out              sequence 0, to its first end token (token {at} of 7): goes to stdout after this report"
-    assert len("text out              sequence 0, to its first end token (token 257 of 257): goes to stdout after this report") <= 110
     assert len(sink.written) == 1 and sink.written[0].endswith("\n") and events.count("decoder") == 1
     assert outcome.data["text_path"]["tokens_written"] == at and outcome.data["text_path"]["cut_at_an_end_token"] is True
     assert lines.index(_line(lines, "text out ")) > lines.index(_line(lines, "report file ")), "behind the report"
@@ -539,6 +689,9 @@ def test_the_text_of_a_checkpoint_is_written_once_behind_the_report(monkeypatch,
     assert 271 not in produced
     assert _line(lines, "text out ") == "text out              sequence 0, all 7 new tokens (no end token): goes to stdout after this report"
     assert len(whole.written) == 1 and len(whole.written[0]) >= len(sink.written[0]) and outcome.data["text_path"]["tokens_written"] == 7
+    _says("guide", "or once, after the report, with `--no-stream` and always in the performance mode")
+    _says("script", "the text is written once, after the report.")
+    _says("family", "and the text written once, after the report (as `--no-stream`)")
 
 
 def test_checks_lines_say_what_was_judged(monkeypatch, tmp_path):
@@ -563,6 +716,13 @@ def test_checks_lines_say_what_was_judged(monkeypatch, tmp_path):
     after = lines[lines.index(_line(lines, "kernels     ")) + 1]
     assert re.fullmatch(r"            \d+ block calls on fallback rows; a step launches \d+ kernels and 1 copy", after), after
     assert screen["last_line"] == "[00] PASS" and outcome.data["record"]["performance_claim_eligible"] is False
+    _says("area", "replay over the whole request, every provider block against the reference at the judged positions, the tokens on the first 16 steps;")
+    _says("area", "The `checks` lines are three statements, each with its own verdict:", "on a stack that declares no target they say so.")
+    _says("guide", "The report says at which positions the blocks were held against the reference, that every timed request gave the checked request's")
+    _says("guide", "tokens and state, and that the kernels of the traced steps are the plan's;")
+    # what is printed as judged is what the checks judged: they hand it back, and a position the run did not record is refused
+    with pytest.raises(ValueError, match="the checked request is 67 steps and the session records 16"):
+        _mode(monkeypatch, tmp_path / "short", steps=62, requests=1, warmup=1, record_steps=16)
 
 
 def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkeypatch):
@@ -657,12 +817,24 @@ def test_orientation_stands_in_the_rate_line():
     ]
     for start in ("                      token-to-token interval: ", "time to first token   ", "step                  "):
         assert _line(reduced, start).startswith(start + "reduced model: "), start
+    _says("area", "every time then carries `reduced model:`, no rate is printed, and the text is written nowhere.")
+    _says("script", "the same protocol runs on the reduced seeded model and prints no rate.")
+    _says("guide", "The rate of a run that is not a controlled run says so in its own line, and line 2 says it of every other number.")
     controlled = perf.screen(_checkpoint_form(record={"class": "controlled", "reasons": []}))
     assert controlled[1] == "record class          controlled run in one process; a number of record is the median of 3 such runs"
     assert _line(controlled, "decode rate").startswith("decode rate           9.9  tokens/s per sequence   (")
     several = perf.screen(_checkpoint_form(model={"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False, "sequences": 4}))
     at = several.index("decode rate (orientation)   9.9  tokens/s per sequence (9.9 in all)")  # the total beside the rate: the bracket moves down
     assert several[at + 1].startswith(" " * 28 + "(") and several[at + 1].endswith(" %)") and "| 4 sequences | greedy" in _line(several, "model       ")
+    # every number of the timing lines is the field of the file's data its label names: the run's value, never the mean
+    stats = (labelled := _checkpoint_form(model={"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False, "sequences": 4}))["statistics"]
+    stats["decode_rate"].update(value=9.9, total=39.6)
+    stats["time_per_output_token"].update(value=111.111, median=111.111, mean=222.222, minimum=1.0, maximum=999.0, spread_percent=3.3)
+    stats["token_to_token_interval"].update(value=33.333, median=33.333, mean=44.444, p90=55.555, p99=66.666)
+    stats["time_to_first_token"].update(value=7777.7, median=7777.7, mean=8888.8)
+    said = " ".join(line.strip() for line in perf.screen(labelled))
+    assert "decode rate (orientation)   9.9  tokens/s per sequence (39.6 in all) (111.111 ms per token; 2 requests within 3.3 %)" in said
+    assert "token-to-token interval: median 33.333, p90 55.555, p99 66.666 ms time to first token   7777.7  ms for a 58-token prompt" in said
 
 
 def test_the_step_line_says_what_was_not_measured():
@@ -686,7 +858,9 @@ def test_the_step_line_says_what_was_not_measured():
     ), "on the CPU"
     held = perf.screen(_checkpoint_form(memory={"weights_gib": 37.3, "state_gib": 0.5, "peak_reserved_gib": 40.0}))
     assert "memory                weights 37.3 GiB | state and cache 0.50 GiB | peak reserved 40.0 GiB  (GiB = 2^30 bytes)" in held
-    assert len("memory                weights 37.3 GiB | state and cache 0.50 GiB | peak reserved 40.0 GiB  (GiB = 2^30 bytes)") == 110
+    assert len(_line(held, "memory   ")) == 110, "one line at the screen's width"
+    _defines("memory", "Peak reserved: PyTorch's peak between the emptied pool behind the checks and the end of the timed requests.")
+    _says("area", "peak reserved: PyTorch's peak between the emptied pool behind the checks and the end of the timed requests; in GiB (2^30 bytes)")
 
 
 def test_no_line_wider_than_110(monkeypatch, tmp_path):
@@ -722,12 +896,21 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
         lines = perf.screen(data)
         assert max(len(line) for line in lines) <= perf.WIDTH == 110, max(lines, key=len)
         assert lines[0] == "cuDNN Frontend model sample: decode performance report" and lines[-1].startswith(("report file           ", " " * 22))
+        assert sum(line.startswith("scope       a decode-loop rate, not a served rate: ") for line in lines) == 1, "in every form"
     assert "decode rate           not printed: the timed requests did not compute the checked request's tokens" in perf.screen(forms[1])
     assert "decode rate           not printed: the kernels of the traced steps are not the plan's" in perf.screen(forms[2])
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)  # and the lines a run printed are those of its data
     said = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
     assert max(len(line) for line in said) <= 110, "the text out line behind the screen too"
     assert said[: len(perf.screen(outcome.data))] == perf.screen(outcome.data) and 24 <= len(perf.screen(outcome.data)) <= 30
+    assert perf.screen(json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))) == perf.screen(outcome.data), "the file's data and nothing else"
+    unwritten = perf.screen(outcome.data, "--perf-report late.json: No space left on device")
+    assert (
+        unwritten[-1] == "report file           not written: --perf-report late.json: No space left on device" and unwritten[:-1] == said[: len(unwritten) - 1]
+    )
+    _says("guide", f"The screen is rendered from the data the report file holds and from nothing else, at no more than {perf.WIDTH} characters a line;")
+    _says("guide", "a line of it that would be longer breaks at a separator or between two words.")
+    _says("area", "The `scope` line behind it is always there: a decode-loop rate is not a served rate.")
 
 
 def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
@@ -762,11 +945,11 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
         "timing_role": "orientation",
         "performance_claim_eligible": False,
     }
+    assert set(data["statistics"]) == set(perf.DEFINITIONS), "one definition per statistic of the file, and no statistic without one"
     for key, (unit, definition, counterpart) in perf.DEFINITIONS.items():
         entry = data["statistics"][key]
-        assert (entry["unit"], entry["definition"], entry["serving_counterpart"]) == (unit, definition, counterpart), key
+        assert (entry["unit"], entry["definition"], entry["serving_counterpart"]) == (unit, definition, counterpart) and len(definition) > 40, key
         assert "value" in entry and (entry["value"] is not None or entry["reason"]), f"{key}: a value that does not exist is null with a reason"
-    assert sorted(set(data["statistics"]) - set(perf.DEFINITIONS)) == ["tokens_per_second_wall"]
     assert data["statistics"]["decode_rate"]["value"] is None and data["statistics"]["decode_rate"]["reason"] == "not printed for a reduced model"
     sentences = " ".join(f"{definition} {counterpart or ''}" for _, definition, counterpart in perf.DEFINITIONS.values())
     assert not re.search(
@@ -793,10 +976,16 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     )
     assert data["text_path"]["render_s"] == 0.001 and data["text_path"]["tokens_written"] == 0
     # a value that is no number is not written as one: the file is refused, and nothing is left behind a name that exists
-    assert perf.write_report(str(tmp_path / "report.json"), data) == "--perf-report report.json: File exists"
-    assert perf.write_report(str(tmp_path / "nan.json"), {"value": float("nan")}).startswith("--perf-report nan.json: ")
-    assert perf.write_report(str(tmp_path / "missing" / "r.json"), data) == "--perf-report r.json: No such file or directory"
+    refusals = [perf.write_report(str(tmp_path / name), value) for name, value in (("report.json", {}), ("nan.json", {"value": float("nan")}))]
+    assert refusals[0] == "--perf-report report.json: File exists" and refusals[1].startswith("--perf-report nan.json: ")
+    assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8")) == data, "the file that was there is the file that is there"
+    missing = perf.write_report(str(tmp_path / "missing" / "r.json"), data)
+    assert missing == "--perf-report r.json: No such file or directory"
     assert re.fullmatch(r"report-\d{8}T\d{6}Z\.json", perf.default_report_name())
+    _says("area", "is strict JSON with units in its field names and no local path:", "`statistics` (per statistic its definition,")
+    paragraph = _flat(_TEXTS["area"].read_text(encoding="utf-8")).split("**The report file**", 1)[1].split("The report, with dots", 1)[0]
+    assert re.findall(r"`([a-z_]+)`(?= \(|,| and|\.)", paragraph.split("no local path:", 1)[1]) == sections.split()[4:], "the sections, in the file's order"
+    _says("guide", "One definition per statistic, written in the report file, with a host test of its arithmetic on constructed time stamps.")
 
 
 def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
@@ -812,7 +1001,7 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
         if "a warm-up request" in line:
             defect["token"] = True
 
-    for name in ("tokens", "kernel", "unobserved", "traced", "state", "weights", "before"):
+    for name in ("tokens", "kernel", "unobserved", "whole", "traced", "last", "state", "weights", "replay", "before"):
         (tmp_path / name).mkdir()
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "tokens", defect=defect, on_say=other_tokens)
     assert not outcome.passed and outcome.data["checks"]["timed_requests"] == "FAIL (request 1, step 0)"
@@ -821,6 +1010,9 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     assert "decode rate           not printed: the timed requests did not compute the checked request's tokens" in lines
     assert "a check did not hold" in outcome.data["record"]["reasons"] and outcome.data["checks"]["last_line"] == "[00] FAIL"
     assert (tmp_path / "tokens" / "report.json").exists() and len(outcome.data["raw"]["requests"]) == 5, "the stamps are kept for the diagnosis"
+    _says("area", "A statement that does not hold prints its `FAIL`, the rate line says why no rate is printed, and the run ends in `[00] FAIL`;")
+    _says("area", "Not printed for a reduced model, nor where a statement of the `checks` lines does not hold |")
+    _says("guide", "a run in which one of the three does not hold prints no rate, and kernels that could not be observed are reported as not observed,")
     form = _checkpoint_form(checks=outcome.data["checks"])
     form["statistics"]["decode_rate"].update(outcome.data["statistics"]["decode_rate"], reason=f"not printed: {perf.NOT_COMPUTED}")
     assert not any("tokens/s" in line for line in perf.screen(form)), "on a checkpoint too: a rate needs the three statements"
@@ -850,12 +1042,30 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     assert outcome.data["checks"]["last_line"] == f"[00] RAN (kernels not observed: {NO_PROFILER})" and events.count("profiler") == 1
     assert outcome.data["traced"]["steps"] == 0 and outcome.data["kernels"]["kernels_per_step"] is None
     assert "what a step launches was not observed" in lines[lines.index(_line(lines, "kernels     ")) + 1]
+    traced = outcome.data["traced"]
+    assert outcome.data["protocol"]["profiler_first_started"] is None and traced["first_position"] is None and traced["last_position"] is None
+    # ... and on a model that is not a reduced one the rate stays, as orientation, with that reason on line 2
+    whole = _tiny_model()
+    whole.reductions = ()
+    with monkeypatch.context() as patch:
+        patch.setattr(sys.modules[__name__], "_tiny_model", lambda: whole)
+        outcome, lines, events, _ = _mode(patch, tmp_path / "whole", profiler=NO_PROFILER)
+    assert _line(lines, "decode rate (orientation)   ") and "kernels not observed" in " ".join(lines[lines.index(_line(lines, "record class ")) :][:3])
+    assert outcome.data["checks"]["last_line"] == f"[00] RAN (kernels not observed: {NO_PROFILER})" and outcome.data["statistics"]["decode_rate"]["value"] > 0
+    _says("area", "the run keeps its rate as `orientation` with the reason `kernels not observed`, and it ends in")
+    _says("guide", "the rate staying `orientation` with that reason.")
 
     # the traced request alone computes other tokens: it is held against the checked request too
     defect.clear()
     defect["at the first profiler pass"] = {"token": True}
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "traced", defect=defect)
     assert not outcome.passed and outcome.data["checks"]["timed_requests"] == "FAIL (traced request, step 1)"
+    assert outcome.data["statistics"]["decode_rate"]["reason"] == "not printed: the traced request did not compute the checked request's tokens"
+
+    # a token that differs at the last step alone, of the first timed request: one token choice of the load's own first launch, then the
+    # checked request's 5 + 6, the replay's 11, the warm-up request's 5 + 2, the request's 11
+    outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "last", defect={"token": _Nth(1 + 11 + 11 + 7 + 11)})
+    assert not outcome.passed and outcome.data["checks"]["timed_requests"] == "FAIL (request 1, step 6)"
     assert outcome.data["statistics"]["decode_rate"]["reason"] == f"not printed: {perf.NOT_COMPUTED}"
 
     # a timed request that gives the same tokens and leaves another state
@@ -870,6 +1080,7 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "state")
     monkeypatch.setattr(perf, "state_digest", digest)
     assert not outcome.passed and outcome.data["checks"]["timed_requests"] == "FAIL (request 1, end state)"
+    assert outcome.data["statistics"]["decode_rate"]["reason"] == "not printed: a timed request did not leave the checked request's state"
 
     # a stored weight that no longer holds the bytes of its load behind the timed requests (the checks before found it whole, twice)
     asked = []
@@ -881,6 +1092,13 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     monkeypatch.setattr(perf.tie_out, "changed_weights", written_to)
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "weights")
     assert not outcome.passed and outcome.data["checks"]["timed_requests"] == "FAIL (stored weights: mlp.down of layer 0)" and len(asked) == 3
+    assert outcome.data["statistics"]["decode_rate"]["reason"] == "not printed: a stored weight no longer holds the bytes of its load"
+    monkeypatch.undo()
+
+    # a replay that gives another token at its last step alone: nothing is timed behind it
+    outcome, lines, events, _ = _mode(monkeypatch, tmp_path / "replay", defect={"token": _Nth(1 + 11 + 11)})
+    assert not outcome.passed and outcome.data is None and any("  replay " in line and line.endswith("FAIL") for line in lines)
+    assert sum(event[0] == "step" for event in events) == 2 * 11 and "profiler" not in events
     monkeypatch.undo()
 
     events_before = []
@@ -912,6 +1130,7 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     assert not failed.passed and failed.data is None and not (tmp_path / "before" / "report.json").exists(), "nothing timed, no file"
     assert any("  replay " in line and line.endswith("FAIL") for line in "\n".join(said).split("\n")) and "profiler" not in events_before
     assert not any("decode performance report" in line for line in said)
+    _says("area", "a check of the checked request that fails ends the run before anything is timed, and no file is written.")
 
 
 # ---------------------------------------------------------------------------------------------- the flags and main()
@@ -993,7 +1212,8 @@ def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
 
     def error(arguments):
         capsys.readouterr()
-        assert sample.main(arguments) == 1
+        code = sample.main(arguments)
+        assert code == 1
         return capsys.readouterr().err.splitlines()[-1]
 
     (tmp_path / "there.json").write_text("{}")
@@ -1002,8 +1222,30 @@ def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
     assert (tmp_path / "there.json").read_text() == "{}"
     assert error(["--perf", "--perf-report", ""]) == "[00] ERROR --perf-report: needs a file name; it was given an empty one"
     assert error(["--perf", "--perf-report", str(tmp_path / "missing" / "r.json")]) == "[00] ERROR --perf-report r.json: cannot be written there"
-    late = error(["--perf", "--max-model-len", "40"])  # 26 prompt tokens + 257 forced new tokens do not fit 40 positions
-    assert late.startswith("[00] ERROR the seeded prompt: ") and "--max-model-len" in late
+    for flag in ("--dump-tokens", "--dump-census"):  # written behind the report: the same file would be written over
+        same = error(["--perf", "--perf-report", "same.json", flag, os.path.join(".", "same.json")])
+        assert same == f"[00] ERROR --perf-report and {flag} name one file, same.json: a report file is never written over"
+    assert not (tmp_path / "same.json").exists(), "nothing was written (--text-out is held by the same lines; the flag needs a checkpoint)"
+    # a request beyond the context, in the mode's own words: 26 prompt tokens, the first new token and 256 timed steps against 40 positions
+    late = error(["--perf", "--max-model-len", "40"])
+    words = "the seeded prompt: 26 prompt tokens, the first new token and --perf-steps 256 are 283 positions and --max-model-len is 40; "
+    assert late == f"[00] ERROR {words}take --perf-steps 13 or fewer, or raise --max-model-len"
+    assert error(["--perf", "--max-model-len", "28"]).endswith("--perf-steps 256 are 283 positions and --max-model-len is 28; raise --max-model-len")
+    body = sample.serving_options.Request([], None, {}, "--messages body.json", max_tokens=8, limit_field="max_tokens")
+    fits = sample._arguments(["--perf", "--perf-steps", "8"])
+    beside = '--messages body.json: its "max_tokens": 8 does not apply beside --perf, which decodes --perf-steps 8 forced steps behind the first new token'
+    assert sample._perf_limit(fits, body, 26) == [beside] and sample._perf_limit(fits, sample.serving_options.Request([], None, {}, "a prompt"), 26) == []
+    _says("family", "is an `ERROR` before the load that names `--perf-steps`, like every request beyond the context.")
+    _says("family", "A file that exists, a file that `--dump-tokens`, `--dump-census` or `--text-out` names too, an empty name or a folder that cannot")
+    _says("family", "be written is an `ERROR` before the load: a report file is never written over |")
+    _says("area", "a file that exists, or that another output flag of the run names, is an `ERROR` before the load: a report file is never written over)")
+    _says("script", "a file that exists, or that another flag of the run writes, is an error before the load")
+    _says("family", "Not with `--stack reference`, `--max-tokens`, `--force-tokens`, a list of sequence counts or several prompts: each is refused before")
+    _says("family", "Implies one sequence count and one prompt, the kernel check (as `--check-kernels`), forced steps with the end token ignored,")
+    _says("family", "one token more than a serving request of 256 output tokens. At least 2 |")
+    _says("area", "the decode performance report of this GPU: one process, one sequence count, one prompt.")
+    _says("script", "Implies one sequence count, the kernel check, forced steps with the end token ignored, and the text written once, after the report;")
+    _says("script", "not with --stack reference")
     # the defaults of the mode: the protocol's counts, one sequence count, the kernel check on, the forced count of a request
     args = sample._arguments(["--perf"])
     assert (args.perf_warmup, args.perf_steps, args.perf_requests, args.perf_trace_records) == (32, 256, 3, 160_000)
@@ -1012,12 +1254,13 @@ def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
     with pytest.raises(AssertionError, match="reached a load"):  # nothing above reached one; the mode itself does, behind its line
         sample.main(["--perf", "--perf-steps", "8"])
     before = capsys.readouterr().err.splitlines()
-    line = "[00] performance mode: at most 228 decode steps in all: one checked request, one warm-up request of 32 decode steps behind its first new token, "
-    line += "3 timed requests of 8 decode steps each, one traced request of up to 8; a prompt of 26 tokens is 26 decode steps in front of each; "
-    assert (line + "the checks replay the checked request once") in before, before[:8]
-    assert before.index(line + "the checks replay the checked request once") < next(
-        index for index, said in enumerate(before) if said.startswith("served by (")
-    )
+    # the count before the load: the checked request, its replay by the checks, three timed and the traced request of 26 + 8 steps, the warm-up's 26 + 32
+    line = "[00] performance mode: at most 262 decode steps of this stack in all: one checked request and its replay by the checks, one warm-up request "
+    line += "of 32 decode steps behind its first new token, 3 timed requests of 8 decode steps each, one traced request of up to 8; a prompt of 26 tokens "
+    line += "is 26 decode steps in front of each; the reference's own passes are not counted"
+    assert line in before, before[:8]
+    assert before.index(line) < next(index for index, said in enumerate(before) if said.startswith("served by ("))
+    _says("area", "Before the load the run prints how many decode steps of the stack all of this is at most, the replay of the checks among them, as a count;")
     assert not list(tmp_path.glob("report-*.json")), "a run that ended before its report wrote no file"
 
 
@@ -1077,6 +1320,7 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(perf, "write_report", write)
     late = capsys.readouterr().err.splitlines()
     assert code == 1 and late[-1] == "[00] ERROR --perf-report late.json: No space left on device (the run itself: PASS)"
+    assert "report file           not written: --perf-report late.json: No space left on device" in late, "the screen names no file that is not there"
     # kernels that cannot be observed: the mode's report with the reason, and the last line of a run that could not look
     for name in ("mine.json", "census.json"):
         (tmp_path / name).rename(tmp_path / f"kept_{name}")
@@ -1085,6 +1329,24 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
     unseen = capsys.readouterr().err.splitlines()
     assert code == 0 and unseen[-1] == f"[00] RAN fe-cublas stack (kernels not observed: {NO_PROFILER})"
     assert f"            kernels, traced steps: NOT OBSERVED ({NO_PROFILER})" in unseen
+    _says("area", "kernels that could not be observed are `NOT OBSERVED` with the reason,", "`[00] RAN <stack> stack (kernels not observed: <reason>)`.")
+    # a statement of the checks that does not hold: the script's own last line and exit code (the token choice of a timed request's first step)
+    wrong = _sample_on_the_cpu(monkeypatch, [], defect={"token": _Nth(1 + 32 + 32 + 28 + 27)})
+    code = wrong.main(["--perf", "--perf-steps", "6", "--perf-requests", "2", "--perf-warmup", "2", "--perf-report", "failed.json"])
+    failed = capsys.readouterr().err.splitlines()
+    assert (
+        code == 1 and failed[-1] == "[00] FAIL" and "            timed requests give the checked request's tokens and state: FAIL (request 1, step 1)" in failed
+    )
+    assert "decode rate           not printed: the timed requests did not compute the checked request's tokens" in failed
+    assert json.loads((tmp_path / "failed.json").read_text())["checks"]["last_line"] == "[00] FAIL", "the file's last line is the run's"
+    # the GPU cells of the area run this form on the two stacks the repository's tests run, each in a fresh interpreter
+    cells = (MODELS.parents[1] / "test" / "python" / "linear_attention" / "frost" / "test_model_sample_qwen_dense.py").read_text(encoding="utf-8")
+    cell = cells.split("def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(", 1)
+    assert cell[0].endswith('@pytest.mark.L0\n@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])\n') and "_fresh_interpreter(arguments)" in cell[1]
+    _says(
+        "area", "the performance mode of the seeded model (`--perf`) on both stacks, in a fresh interpreter: `[NN] PASS`, the report in its reduced-model form"
+    )
+    _says("area", "Without `--model` the same protocol runs on the reduced seeded model:", "The GPU test of this area runs that form.")
 
 
 def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
@@ -1100,10 +1362,16 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     assert args.perf is False and args.sequences == [1, 4] and args.force_tokens == 32 and not args.check_kernels and args.perf_steps is None
     monkeypatch.chdir(tmp_path)
     capsys.readouterr()
+    monkeypatch.delitem(sys.modules, "model_samples.perf", raising=False)  # another test of this module imported it
     code = sample.main(["--check-kernels", "--sequences", "1", "--force-tokens", "4"])
     out, err = capsys.readouterr()
     lines = err.splitlines()
     assert code == 0 and lines[-1] == "[00] PASS" and out == "" and not list(tmp_path.iterdir())
+    assert "model_samples.perf" not in sys.modules, "an ordinary run does not import the mode's module"
+    assert (sample._record_steps(True, False), sample._record_steps(False, False)) == (32, None), "what an ordinary run records, as before"
+    assert sample._record_steps(True, True) is None, "with a checkpoint the mode's checked request is recorded whole: the checks replay all of it"
+    _says("guide", "An ordinary run prints what it printed before the mode existed and does not import the mode's module:")
+    _says("guide", "the mode is a branch of its own in the script, and a pull request that touches the loop, the census, the checks or the timing shows")
     assert not any("performance" in line or line.startswith(("record class", "scope ", "decode rate")) for line in lines)
     for start in ("text path ", "first token ", "steps (", "traced pass (", "rate ", "bytes per step ", "note ", "text out "):
         assert sum(line.startswith(start) for line in lines) == 1, start
@@ -1134,7 +1402,10 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     for _ in range(3):
         ids = session.step(ids)
     session.trace(4)
+    with pytest.raises(ValueError, match="judged positions 0, 8: the run recorded 8 steps, the positions 0 to 7"):
+        tie_out.run_checks(session, prompt_tokens=5, positions=[0, 8])
     plain = tie_out.run_checks(session, prompt_tokens=5)
+    assert plain.positions == (), "no judged positions were asked for: every step was judged"
     assert plain.lines[0] == "checks (1 sequence, 8 steps: 5 prompt + 3 decode)" and plain.ok and plain.kernels == "PASS"
     assert " 8 calls " in next(line for line in plain.lines if line.startswith("    linear_attention.step "))
     with pytest.raises(ValueError, match="judged positions are steps of a decode run"):
@@ -1146,14 +1417,11 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------- the public text
-def _flat(text):
-    return " ".join(text.split())
-
-
-def test_the_public_text_of_the_mode_says_what_the_code_does():
-    """The READMEs, the guide and the script's own text against the code: the words the mode prints, the ``stage`` row
-    against the stages a load names, the rule about the text, the rule of the mode, the flag table against the parser,
-    and the README's example of the report against the rendered screen with every value replaced by dots."""
+def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_path):
+    """The READMEs, the guide and the script's own text against the code, where no other test of this module holds the
+    sentence beside the behaviour (``_says``): the words, the ``stage`` row against the stages a load names, what the
+    mode never prints, the flag table and the script's own text against the parser's defaults, and the README's example
+    of the report against the rendered screen with every value replaced by dots."""
     from model_samples import perf
 
     area, guide = (MODELS / "README.md").read_text(encoding="utf-8"), (MODELS / "AGENTS.md").read_text(encoding="utf-8")
@@ -1161,24 +1429,32 @@ def test_the_public_text_of_the_mode_says_what_the_code_does():
     # the words: each names something the mode prints or holds
     for word in ("*Timed request*", "*Judged position*", "*Token-to-token interval*", "*Record class*"):
         assert word in _flat(area), word
+    steps = perf.Protocol().steps  # a timed request: forced steps, one token more than intervals
+    _says("area", "*Timed request*: one prompt from a zero state, its first new token, then a fixed number of forced decode steps --")
+    _says("area", f"with the default of {steps} steps, {steps + 1} new tokens and {steps} intervals, one token more than a serving request of {steps} output")
+    _says("family", f"{steps + 1} new tokens and {steps} intervals at the default, one token more than a serving request of {steps} output tokens.")
+    _says("script", f"timed decode steps of a request, behind its first new token; at the default {steps + 1} new tokens and {steps} intervals")
+    _says("area", "*Judged position*: a position of a request at which every provider block is held against its reference block.")
+    written_out = f"--perf-warmup {perf.Protocol().warmup} --perf-steps {steps} --perf-requests {perf.Protocol().requests} --perf-report my_gpu.json"
+    _says("area", f"# The protocol written out (these are the defaults) and a file name of your own: python samples/models/qwen_dense/00_decode.py --model")
+    _says("area", written_out)
     # the stage row names every stage a load of the family adds to the line
     row = next(line for line in area.splitlines() if line.startswith("| `stage` |"))
     loader = (MODELS / "model_samples" / "qwen_dense" / "model.py").read_text(encoding="utf-8")
     for stage in re.findall(r'stages\.stage\("([a-z ]+)"\)', loader):
         assert stage in row, f"the stage row does not name {stage!r}"
     assert "lay out" in row and "checksum" in row and "merge" in row
-    # rule 17: where the text is written; rule 19: what the mode states
-    assert "or once, after the report, with `--no-stream` and always in the performance mode" in _flat(guide)
-    rule = _flat(guide.split("19. **The performance mode states what it observed, never what it assumes.**", 1)[1].split("\n## ", 1)[0])
-    for sentence in (
-        "One definition per statistic, written in the report file, with a host test of its arithmetic on constructed time stamps.",
-        "Nothing but the step runs inside a timed request: no recorder, no call log, no profiler, no text; and no profiler pass runs in the process before its last timed request.",
-        "a run in which one of the three does not hold prints no rate.",
-        "the word 'locked' is never printed.",
-        "A report holds no speed-up, no baseline and no figure of a second GPU class.",
-    ):
-        assert sentence in rule, sentence
-    assert "locked" not in " ".join(perf.screen(_checkpoint_form())) and "locked" not in json.dumps(_data())
+    assert "19. **The performance mode states what it observed, never what it assumes.**" in guide, "the rule of the mode: its sentences are held above"
+    # what the mode never prints: not one line of a run of it, nor its file, holds these words, and what it does not observe it says so
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path)
+    printed = "\n".join(lines) + json.dumps(outcome.data)
+    for word in ("locked", "none seen", "speed-up", "baseline", "faster", "slower"):
+        assert word not in printed, word
+    assert "            other compute processes: not observed (this version)" in lines and outcome.data["observation"]["clocks"] is None
+    _says("guide", "Another process, the clock and a limit reason are observed or printed as not observed;", "the report never prints the word 'locked'.")
+    _says("guide", "`none seen` is printed only when the run's own process is in the driver's list;")
+    _says("guide", "A report holds no speed-up, no baseline and no figure of a second GPU class.")
+    _says("area", "No version of the mode observes the GPU's other processes or its clock yet (`not observed`, never assumed)")
     # the flag table of the family README: every flag of the mode, with the parser's default
     sample_flags = dict(re.findall(r"^\| `(--perf[a-z-]*)(?: [A-Z]+)?` \| ([^|]*) \|", family, flags=re.MULTILINE))
     assert set(sample_flags) == {"--perf", "--perf-warmup", "--perf-steps", "--perf-requests", "--perf-report", "--perf-trace-records"}
@@ -1190,6 +1466,15 @@ def test_the_public_text_of_the_mode_says_what_the_code_does():
     assert (protocol.warmup, protocol.steps, protocol.requests, protocol.trace_records) == (32, 256, 3, 160000)
     for flag in sample_flags:
         assert f'"{flag}"' in script and f"``{flag}" in script.split('"""', 2)[1], f"{flag}: a flag of the parser, named in the script's docstring"
+    counts = _sample_script(monkeypatch).PERF_COUNTS  # the parser's defaults: the flag table's and the script's own text
+    assert {flag: default for flag, (default, _) in counts.items()} == {flag: int(sample_flags[flag].strip(" `")) for flag in counts}
+    _says(
+        "script",
+        f"(``--perf-warmup`` forced steps, default {counts['--perf-warmup'][0]});",
+        f"``--perf-requests`` timed requests (default {counts['--perf-requests'][0]}),",
+    )
+    _says("script", f"``--perf-steps`` forced decode steps (default {counts['--perf-steps'][0]}, the end token ignored)")
+    _says("script", f"``--perf-trace-records`` launch records hold (default {counts['--perf-trace-records'][0]}),")
     assert "--perf-show" not in family + area + script and "--perf-overwrite" not in family + area + script, "flags of a later version"
     # the section of the area README: its example is the screen, every value a run measures or counts replaced by dots
     section = area.split("## The performance mode\n", 1)[1].split("\n## ", 1)[0]

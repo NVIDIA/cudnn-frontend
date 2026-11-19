@@ -297,7 +297,17 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
     assert requests[2]["ids_sha256"] == requests[3]["ids_sha256"] == requests[0]["ids_sha256"], "every timed request: the checked request's ids"
     assert requests[2]["end_state_sha256"] == requests[3]["end_state_sha256"] == requests[0]["end_state_sha256"], "and its end state, byte for byte"
-    assert data["protocol"]["profiler_first_started"] == "behind the last timed request, in the traced request"
+    assert data["protocol"]["profiler_first_started"] == (None if unobserved else "behind the last timed request, in the traced request")
+    # the record class: every reason, in the order of the conditions; a stack that declares a target kernel set names its identity
+    identity = "no target kernel set declared" if stack == "fe-cublas" else "kernel identity not claimed on this GPU class"
+    observed = ["kernels not observed"] if unobserved else []
+    reasons = ["reduced model", "fallback rows present", identity, "launched from Python", *observed, "other processes not observed", "clocks not observed"]
+    assert data["record"]["reasons"] == reasons and data["record"]["performance_claim_eligible"] is False
+    assert all(entry["definition"] and entry["unit"] for entry in data["statistics"].values()), "a definition and a unit beside every statistic"
+    memory = data["memory"]  # the peak of the timed part is PyTorch's own, between the settle and the last timed request: inside the process's
+    assert (
+        0 < memory["peak_reserved_gib"] <= memory["process_peak_reserved_gib"] and memory["weights_gib"] + memory["state_gib"] <= memory["peak_allocated_gib"]
+    )
     kernels = data["kernels"]
     if not unobserved:
         assert 1 <= data["traced"]["steps"] <= 16 and requests[4]["ids_sha256"] == requests[0]["ids_sha256"], "the traced request too"

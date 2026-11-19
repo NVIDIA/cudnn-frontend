@@ -59,27 +59,24 @@ kernels of an entry by name, order, count, grid, block and shared memory.  Where
 ``[00] RAN <stack> stack (kernels not observed: <reason>)``, never in ``PASS``.  ``--dump-census FILE`` writes those launch
 records as JSON.
 
-``--perf`` is the performance mode: the decode performance report of this GPU from one process.  It runs one request and
-checks it against the reference, also at four positions of the timed steps; warms up (one request of ``--perf-warmup``
-forced steps, default 32); times ``--perf-requests`` requests (default 3), each the prompt, its first new token and
-``--perf-steps`` forced decode steps behind it (default 256, the end token ignored) with nothing but the step inside -- no
-recorder, no profiler, no text; only then starts the profiler, for one traced request of as many of those steps as
-``--perf-trace-records`` launch records hold (default 160000), and checks the kernels on it.  The report -- a rate, the time
-to first token, the step, memory, each with one written definition -- goes to standard error and, with every
-number, its definition, the protocol and the environment, into a report file (``--perf-report FILE``; default
-``report-<UTC time>.json`` in the current directory); the text is written once, after the report.  Its second line says
-what the numbers are: ``orientation`` with every reason, until a run observes its GPU and its step is captured.  Without
-``--model`` the same protocol runs on the reduced seeded model and prints no rate.
+``--perf`` is the performance mode: the decode performance report of this GPU from one process.  One checked request
+with the reference checks on it, also at four positions of the timed steps; a warm-up request (``--perf-warmup`` forced
+steps, default 32); ``--perf-requests`` timed requests (default 3), each the prompt, its first new token and
+``--perf-steps`` forced decode steps (default 256, the end token ignored) with nothing but the step inside; only then
+the profiler, for one traced request of as many of those steps as ``--perf-trace-records`` launch records hold (default
+160000), and the kernel check on it.  The report goes to standard error and, with every number, its definition, the
+protocol and the environment, into a report file (``--perf-report FILE``; default ``report-<UTC time>.json`` in the
+current directory); the text is written once, after the report.  Without ``--model`` the same protocol runs on the
+reduced seeded model and prints no rate.  ``samples/models/README.md`` has the protocol, the statistics and the labels.
 
     python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf
-    python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf \\
-        --perf-warmup 32 --perf-steps 256 --perf-requests 3 --perf-report my_gpu.json
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import sys
@@ -327,7 +324,8 @@ def _perf_flags(parser) -> None:
     parser.add_argument(
         "--perf-report",
         metavar="FILE",
-        help="with --perf: the report file (default report-<UTC time>.json in the current directory); a file that exists is an error before the load",
+        help="with --perf: the report file (default report-<UTC time>.json in the current directory); a file that exists, or that another flag of "
+        "the run writes, is an error before the load",
     )
 
 
@@ -359,6 +357,27 @@ def _perf_arguments(parser, args) -> None:
     args.sequences = "1" if args.sequences is None else args.sequences  # one count: the seeded default of an ordinary run is a list
     args.force_tokens = args.perf_steps + 1  # a request: the first new token and that many forced steps
     args.check_kernels = True  # the kernels of the traced steps are one of the three statements of the report's checks
+
+
+def _perf_limit(args, request, prompt_tokens: int) -> list:
+    """The count a request of the performance mode decodes -- its first new token and ``--perf-steps`` forced steps -- held
+    against ``--max-model-len`` in the mode's own words (``ValueError``).  Returns the line a run prints for a request body
+    whose own limit does not apply, in a list, or no line."""
+    room = args.max_model_len - prompt_tokens - 1
+    if room < args.perf_steps:
+        fewer = f"take --perf-steps {room:,} or fewer, or " if room >= 2 else ""
+        raise ValueError(
+            f"{request.shown}: {prompt_tokens:,} prompt tokens, the first new token and --perf-steps {args.perf_steps:,} are "
+            f"{prompt_tokens + 1 + args.perf_steps:,} positions and --max-model-len is {args.max_model_len:,}; {fewer}raise --max-model-len"
+        )
+    beside = f"does not apply beside --perf, which decodes --perf-steps {args.perf_steps:,} forced steps behind the first new token"
+    return [] if request.max_tokens is None else [f'{request.shown}: its "{request.limit_field}": {request.max_tokens} {beside}']
+
+
+def _record_steps(real: bool, perf: bool):
+    """The steps a session records for its checks: with a checkpoint the first steps an ordinary run checks and traces;
+    every step (``None``) of a seeded run and of the performance mode, whose checked request the checks replay whole."""
+    return max(CHECKED_STEPS, TRACED_STEPS) if real and not perf else None
 
 
 def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str:
@@ -455,7 +474,7 @@ def main(argv=None) -> int:
         _say(f"{TAG} SKIP needs nvidia-cudnn-frontend and PyTorch ({error}): see samples/models/README.md")
         return 0
     import model_samples
-    from model_samples import census, perf, tie_out
+    from model_samples import census, tie_out
     from model_samples.blocks import DeviceFacts, parse_overrides
     from model_samples.qwen_dense import QwenDense
 
@@ -471,10 +490,16 @@ def main(argv=None) -> int:
             if path is not None:  # a file that cannot be written, or a flag without a name, is an error before the run, not after it
                 _writable(flag, path)
         if args.perf:  # the report file's name is fixed now: one that exists is never written over, and that is known before the load
+            perf = importlib.import_module("model_samples.perf")  # the mode's module: an ordinary run does not import it
             report = perf.default_report_name() if args.perf_report is None else args.perf_report
             _writable("--perf-report", report)
             if os.path.exists(report):
                 raise ValueError(f"--perf-report {os.path.basename(os.path.normpath(report))}: the file exists, and a report file is never written over")
+            for flag, path in (("--dump-tokens", args.dump_tokens), ("--dump-census", args.dump_census), ("--text-out", args.text_out)):
+                if path is not None and os.path.realpath(path) == os.path.realpath(report):  # written behind the report, over it
+                    raise ValueError(
+                        f"--perf-report and {flag} name one file, {os.path.basename(os.path.normpath(report))}: a report file is never written over"
+                    )
         if real and args.text_out is None and sys.stdout is None:  # closed before the process started (>&-): known now, said now
             raise ValueError("standard output is closed and the generated text has nowhere to go; redirect it, or name a file with --text-out")
         if real:  # the text side and the description of the checkpoint: config and shard headers, no weights
@@ -518,6 +543,10 @@ def main(argv=None) -> int:
     def stop_rule(request, prompt_tokens):
         """The stop rule of one request: its limit of new tokens, held against ``--max-model-len`` before anything is
         planned (``ValueError``); a limit that was given and does not apply is said in a line."""
+        if args.perf:  # the mode's fixed count, held against the context and said in the mode's own words
+            for note in _perf_limit(args, request, prompt_tokens):
+                _say(f"{TAG} {note}")
+            return model_samples.StopRule(text.eos_ids, max_new_tokens=args.force_tokens, force_tokens=args.force_tokens)
         flag = args.max_new_tokens if args.limit_given else None
         limit, note = serving_options.new_tokens(request, prompt_tokens, args.max_model_len, flag, args.force_tokens, args.limit_flag)
         if note:
@@ -573,7 +602,7 @@ def main(argv=None) -> int:
             capacity=max(int(prompts[0].numel()) + rule.limit for prompts, _, rule in prompt_sets),
             checkpoint=checkpoint,
             share=runs[0][0] if runs else None,
-            record_steps=max(CHECKED_STEPS, TRACED_STEPS) if real and not args.perf else None,  # the mode's checked request is recorded whole
+            record_steps=_record_steps(real, args.perf),
             check_kernels=args.check_kernels,
         )
         runs.append((session, prompt_sets))

@@ -205,14 +205,18 @@ it: with the default of 256 steps, 257 new tokens and 256 intervals, one token m
 output tokens. A run makes, in this order: one checked request, launched as every other, with the recorder of the
 checks on, and the reference checks on it -- replay over the whole request, every provider block against the
 reference at the judged positions, the tokens on the first 16 steps; a warm-up request; `--perf-requests` timed
-requests, each from the state zeroed in place; one traced request; and the checks behind it. Inside a timed request
-there is nothing but the step: no recorder, no call log, no profiler, no text. The first profiler pass of the process
-starts behind the last timed request: the traced request feeds its prompt untraced and then traces the first timed
-positions, its first step alone -- whose launch records size the rest -- then as many further steps as
-`--perf-trace-records` holds. The judged positions are the first 16 of the request, the two on either side of the
-first page boundary of the attention cache inside the timed steps, and the last two timed positions: for the default
-prompt of 58 tokens, 0-15, 63, 64, 312 and 313. Before the load the run prints how many decode steps all of this is,
-as a count; a check of the checked request that fails ends the run before anything is timed, and no file is written.
+requests, each from the state zeroed in place (the device is synchronised behind the zeroing, which is outside every
+statistic); one traced request; and the checks behind it. Inside a timed request there is nothing but the step: no
+recorder, no call log, no profiler, no text. The first profiler pass of the process starts behind the last timed
+request: the traced request feeds its prompt untraced and then traces the first timed positions, its first step
+alone -- whose launch records size the rest -- then as many further steps as `--perf-trace-records` holds. The judged
+positions are the first 16 of the request, the two on either side of the first page boundary of the attention cache
+inside the timed steps, and the last two timed positions: for the default prompt of 58 tokens, 0-15, 63, 64, 312 and
+313. A page is 64 positions, the page of the paged attention cache that the attention core of the target kernel set
+reads; the attention blocks of this sample read one contiguous cache today, and the two positions are judged all the
+same, so that the judged positions do not move when the paged cache arrives. Before the load the run prints how many
+decode steps of the stack all of this is at most, the replay of the checks among them, as a count; a check of the
+checked request that fails ends the run before anything is timed, and no file is written.
 
 **The statistics**, each with one definition, which the report file carries beside the number:
 
@@ -229,20 +233,21 @@ observed every condition itself: a checkpoint, every block on a claimed target k
 the three statements of the `checks` lines, no other process on the GPU, the clocks. Otherwise it is `orientation`
 and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`. No version of
 the mode observes the GPU's other processes or its clock yet (`not observed`, never assumed), and no stack of this
-area is captured: every run today is `orientation`. Line 3, `scope`, is always there: a decode-loop rate is not a
-served rate. The `kernels` lines give the launches of a step that are on the target kernel set, by provider and as
+area is captured: every run today is `orientation`. The `scope` line behind it is always there: a decode-loop rate
+is not a served rate. The `kernels` lines give the launches of a step that are on the target kernel set, by provider and as
 three numbers, and what else a step launches; on a stack that declares no target they say so. The `checks` lines are
 three statements, each with its own verdict: the blocks against the reference at the judged positions; the timed
 requests and the traced request gave the checked request's token ids, step for step, every timed request left the
 state in the same bytes and the stored weights still hold the bytes of their load; the kernels of the traced steps
 are the plan's. A statement that does not hold prints its `FAIL`, the rate line says why no rate is printed, and the
-run ends in `[00] FAIL`; kernels that could not be observed are `NOT OBSERVED` with the reason and the run ends in
-`[00] RAN <stack> stack (kernels not observed: <reason>)`. A report holds no speed-up, no baseline and no figure of
-another GPU class.
+run ends in `[00] FAIL`; kernels that could not be observed are `NOT OBSERVED` with the reason, the run keeps its
+rate as `orientation` with the reason `kernels not observed`, and it ends in
+`[00] RAN <stack> stack (kernels not observed: <reason>)`. The line `with draft tokens` says `not run by this script`:
+this script decodes without a drafter. A report holds no speed-up, no baseline and no figure of another GPU class.
 
 **The report file** (`--perf-report FILE`; default `report-<UTC time>.json` in the current directory, so one command
-can be run twice; a file that exists is an `ERROR` before the load and is never written over) is strict JSON with
-units in its field names and no local path: `record` (the class and its reasons), `model`, `environment`,
+can be run twice; a file that exists, or that another output flag of the run names, is an `ERROR` before the load:
+a report file is never written over) is strict JSON with units in its field names and no local path: `record` (the class and its reasons), `model`, `environment`,
 `observation`, `kernels`, `protocol` (the counts, the prompt's hash, where the profiler first started), `checks` (every
 judged position with its reason, the lines of the checks, the three verdicts, the run's last line),
 `statistics` (per statistic its definition, what it corresponds to in a serving benchmark, its value and, where there

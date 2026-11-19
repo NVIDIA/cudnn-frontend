@@ -11,8 +11,9 @@ this order:
 1. the **checked request**, with the recorder of the checks on, and the reference checks on it (``tie_out.run_checks``):
    replay over the whole request, every provider block against the reference at the **judged positions**
    (``judged_positions``), the tokens, the stored weights.  A check that fails ends the run: nothing is timed, no file;
-2. a **warm-up request** and the **timed requests**, each from the state zeroed in place, with nothing but the step inside:
-   no recorder, no call log, no profiler, no text;
+2. a **warm-up request** and the **timed requests**, each from the state zeroed in place -- the device synchronised behind
+   the zeroing, which is outside every statistic -- with nothing but the step inside: no recorder, no call log, no
+   profiler, no text;
 3. the **traced request**: the prompt untraced, then the first timed positions under the profiler -- the first profiler
    pass of the process starts here, behind the last timed request.  Its first step is traced alone and sizes the rest:
    as many steps as the record budget holds;
@@ -65,6 +66,7 @@ GIB = 2.0**30
 #: why this version states nothing about the GPU's other processes and its clock
 UNOBSERVED = "this version does not observe the GPU"
 NOT_COMPUTED = "the timed requests did not compute the checked request's tokens"
+CLOCK = "time.perf_counter, one process"  # of every statistic that is taken from stamps
 NOT_THE_PLAN = "the kernels of the traced steps are not the plan's"
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
@@ -126,6 +128,14 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
         ),
         None,
     ),
+    "tokens_per_second_wall": (
+        "tokens/s per sequence",
+        (
+            "Per timed request: new tokens / (time the last token's ids reach the host - time the request is handed to the text path). Of a run: the median "
+            "over its timed requests. It holds the time to first token and is not the decode rate; where no decode rate is printed it is null too."
+        ),
+        "A serving benchmark's output tokens / wall time of a request, which holds its time to first token.",
+    ),
     "launches_per_step": (
         "launches",
         (
@@ -147,8 +157,9 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
     "startup": (
         "s",
         (
-            "The seconds of every stage of the load, of the checks and of the requests, the device synchronised at both ends of a stage. None of it enters a "
-            "rate or the time to first token."
+            "The seconds of every stage of a run. Import, describe and plan are host times; every later stage -- of the load, the checks, the zeroing of the "
+            "state, the requests -- has the device synchronised at both ends. The stage of the timed requests spans the requests the statistics are taken "
+            "from; no other stage enters a rate or the time to first token."
         ),
         None,
     ),
@@ -166,17 +177,18 @@ class Protocol:
     trace_records: int = 160_000
 
     def decode_steps(self, prompt_tokens: int) -> int:
-        """The most decode steps the requests of a run make: the checked request, the warm-up request, the timed requests
-        and a traced request of every timed step, each behind the prompt's own steps."""
-        return (2 + self.requests) * (prompt_tokens + self.steps) + prompt_tokens + self.warmup
+        """The most decode steps of the stack a run makes: the checked request, its replay by the checks, the timed requests
+        and a traced request of every timed step, and the warm-up request, each behind the prompt's own steps.  The
+        reference's own passes of the checks are not steps of the stack and are not counted."""
+        return (3 + self.requests) * (prompt_tokens + self.steps) + prompt_tokens + self.warmup
 
     def line(self, prompt_tokens: int) -> str:
         """What a run of the mode will do, said before the load: a rule and counts, never a time."""
         each = f"{self.requests} timed request{'s' if self.requests != 1 else ''} of {self.steps} decode steps each"
         return (
-            f"performance mode: at most {self.decode_steps(prompt_tokens):,} decode steps in all: one checked request, one warm-up request of "
-            f"{self.warmup} decode steps behind its first new token, {each}, one traced request of up to {self.steps}; a prompt of {prompt_tokens} "
-            f"tokens is {prompt_tokens} decode steps in front of each; the checks replay the checked request once"
+            f"performance mode: at most {self.decode_steps(prompt_tokens):,} decode steps of this stack in all: one checked request and its replay by "
+            f"the checks, one warm-up request of {self.warmup} decode steps behind its first new token, {each}, one traced request of up to "
+            f"{self.steps}; a prompt of {prompt_tokens} tokens is {prompt_tokens} decode steps in front of each; the reference's own passes are not counted"
         )
 
 
@@ -280,6 +292,14 @@ def record_class(
     return (ORIENTATION if reasons else CONTROLLED), reasons
 
 
+def identity_reason(kernels: dict) -> str:
+    """Why the kernels of a run are not a claimed target kernel set on its GPU class (``""``: they are), from the facts of
+    ``kernel_facts``: the stack declares no target, or the census line of the run is not ``EQUAL``."""
+    if not kernels["declared"]:
+        return "no target kernel set declared"
+    return "" if ": EQUAL (" in kernels["census"] else "kernel identity not claimed on this GPU class"
+
+
 def state_digest(state) -> str:
     """The SHA-256 over the position and the bytes of every tensor of a decode state.  Reads the device: behind a request,
     never inside one."""
@@ -353,9 +373,10 @@ def _checks_lines(checks: dict) -> List[str]:
     return lines + _wrapped("", second, 12) + _wrapped("", third, 12)
 
 
-def screen(data: dict) -> List[str]:
+def screen(data: dict, unwritten: str = "") -> List[str]:
     """The screen of a run, rendered from the data the report file holds and from nothing else: at most ``WIDTH`` characters
-    a line.  Every time of a reduced model carries ``reduced model:``, and such a run prints no rate."""
+    a line.  Every time of a reduced model carries ``reduced model:``, and such a run prints no rate.  ``unwritten``: why
+    the run could not write that file (``write_report``); the last line then says so in the place of the file's name."""
     model, gpu, kernels, protocol, traced = data["model"], data["environment"]["gpu"], data["kernels"], data["protocol"], data["traced"]
     stats, memory, record = data["statistics"], data["memory"], data["record"]
     prefix = "reduced model: " if model["reduced"] else ""
@@ -417,6 +438,8 @@ def screen(data: dict) -> List[str]:
     peak = "peak reserved not observed" if memory["peak_reserved_gib"] is None else f"peak reserved {memory['peak_reserved_gib']:.1f} GiB"
     held = [f"weights {memory['weights_gib']:.1f} GiB", f"state and cache {memory['state_gib']:.2f} GiB", f"{peak}  (GiB = 2^30 bytes)"]
     lines += _packed("memory", held)
+    if unwritten:
+        return lines + [""] + _wrapped("report file", f"not written: {unwritten}")
     lines += [""] + _packed("report file", [data["report_file"], "(every number, its definition, the protocol, the environment)"], joint=" ")
     return lines
 
@@ -461,7 +484,7 @@ def _statistics(timed: Sequence[Request], covered: int, sequences: int, rate_mis
 
     def entry(key: str, **values) -> dict:
         unit, definition, counterpart = DEFINITIONS[key]
-        return {"definition": definition, "serving_counterpart": counterpart, "unit": unit, "clock": "time.perf_counter, one process", **values}
+        return {"definition": definition, "serving_counterpart": counterpart, "unit": unit, **({"clock": CLOCK} if "events" in values else {}), **values}
 
     per_token = [request.time_per_output_token_ms() for request in timed]
     first = [request.time_to_first_token_ms() for request in timed]
@@ -472,6 +495,7 @@ def _statistics(timed: Sequence[Request], covered: int, sequences: int, rate_mis
     rate = (
         {"value": None, "reason": rate_missing, "total": None} if rate_missing else {"value": 1000 / value, "reason": None, "total": sequences * 1000 / value}
     )
+    per_wall = {"value": None, "reason": rate_missing} if rate_missing else {"value": statistics.median(wall), "reason": None, "per_request": wall}
     stats = {
         "time_per_output_token": entry("time_per_output_token", events="t_token[last] - t_first", value=value, per_request=per_token, spread_percent=spread),
         "decode_rate": entry("decode_rate", **rate),
@@ -479,7 +503,7 @@ def _statistics(timed: Sequence[Request], covered: int, sequences: int, rate_mis
         "time_to_first_token": entry("time_to_first_token", events="t_first - t_request", value=statistics.median(first), per_request=first),
         "step": entry("step", events="t_token[i] - t_token[i - 1] at the traced positions"),
         "host": entry("host", events="t_launch[i] - t_token[i - 1] at the traced positions"),
-        "tokens_per_second_wall": {"unit": "tokens/s per sequence", "value": statistics.median(wall), "per_request": wall},
+        "tokens_per_second_wall": entry("tokens_per_second_wall", events="new tokens / (t_token[last] - t_request)", **per_wall),
     }
     samples = {"time_per_output_token": per_token, "token_to_token_interval": intervals, "time_to_first_token": first}
     samples["step"] = [interval for request in timed for interval in request.intervals_ms()[:last]]
@@ -543,6 +567,12 @@ def run(
         made.state = state_digest(session.state)  # behind the last stamp
         return made
 
+    def zeroed() -> None:
+        """The state zeroed in place for the next request, nothing recorded: a stage of its own, so the device is
+        synchronised behind the zeroing and none of it runs inside the request's time to first token."""
+        with stages.stage("zeroing the state"):
+            session.reset(fresh=False, recorded=False)
+
     def peaks_now() -> Tuple[int, int]:
         return (torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)) if cuda else (0, 0)
 
@@ -552,6 +582,8 @@ def run(
     positions = judged_positions(prompt_tokens, protocol.steps, getattr(model, "attention_page", None))
     judged = [position for position, _ in positions]
     listed = tie_out.positions_text(judged)
+    if session.record.inputs.shape[0] < prompt_tokens + protocol.steps:  # the checks replay the request and judge its last positions
+        raise ValueError(f"the checked request is {prompt_tokens + protocol.steps} steps and the session records {session.record.inputs.shape[0]}")
     say(
         f"{tag} performance mode: the checked request ({prompt_tokens} prompt tokens through the decode step, the first new token, {protocol.steps} forced "
         f"steps), then the checks against the {session.reference_precision}-accumulated reference: replay, the blocks at positions {listed}, the tokens",
@@ -566,6 +598,7 @@ def run(
     if not before.ok:  # as an ordinary run: its lines, and nothing is timed; no file
         say(before.text())
         return Outcome(False, before.judged, "", produced, peaks=peaks)
+    listed = tie_out.positions_text(before.positions)  # from here on: the positions the checks judged, as the checks hand them back
 
     # phases 5 to 7: settle, the warm-up request, the timed requests -- nothing but the step inside, and no profiler pass so far
     say(
@@ -573,7 +606,7 @@ def run(
         "the checks behind it; the report follows",
         flush=True,
     )
-    session.reset(fresh=False, recorded=False)  # the record of the checks is dropped before the pool is emptied
+    zeroed()  # the record of the checks is dropped before the pool is emptied
     gc.collect()  # ... and so are the reference sessions of the checks, with their states
     if cuda:
         torch.cuda.empty_cache()
@@ -581,16 +614,16 @@ def run(
     requests = [checked]
     with stages.stage("the warm-up request"):
         requests.append(request("warm-up", protocol.warmup))
-    with stages.stage("the timed requests"):
-        for _ in range(protocol.requests):
-            session.reset(fresh=False, recorded=False)
+    for _ in range(protocol.requests):
+        zeroed()
+        with stages.stage("the timed requests"):
             requests.append(request("timed", protocol.steps))
     timed, timed_peaks = requests[2:], peaks_now()
     peaks = (max(peaks[0], timed_peaks[0]), max(peaks[1], timed_peaks[1]))
 
     # phase 9: the traced request -- the first profiler pass of the process: one step, whose records size the rest
+    zeroed()
     with stages.stage("the traced request"):
-        session.reset(fresh=False, recorded=False)
         traced, step = begin("traced")
         session.trace_request(step, 1)
         first = session.traced
@@ -605,17 +638,17 @@ def run(
 
     # phase 10: the checks after
     with stages.stage("the checks after"):
-        held = PASS
+        held, missing = PASS, ""  # statement 2, and where it does not hold why no rate is printed: the first thing that differs
         for number, made in enumerate([*timed, traced], 1):
             who = f"request {number}" if made.kind == "timed" else "traced request"
             differs = next((index for index, read in enumerate(made.ids) if read != checked.ids[index]), None)
             if differs is not None and held == PASS:
-                held = f"FAIL ({who}, step {differs})"
+                held, missing = f"FAIL ({who}, step {differs})", NOT_COMPUTED if made.kind == "timed" else NOT_COMPUTED.replace("timed requests", who)
             if made.kind == "timed" and made.state != checked.state and held == PASS:
-                held = f"FAIL ({who}, end state)"
+                held, missing = f"FAIL ({who}, end state)", "a timed request did not leave the checked request's state"
         changed = tie_out.changed_weights(session.weights)
         if changed and held == PASS:
-            held = f"FAIL (stored weights: {', '.join(changed)})"
+            held, missing = f"FAIL (stored weights: {', '.join(changed)})", "a stored weight no longer holds the bytes of its load"
         status, unobserved, kernel_lines = tie_out.kernel_check(session)
     say("\n".join([*before.lines, *kernel_lines]))
     covered = len(session.traced.steps or []) if status != NOT_OBSERVED else 0  # the traced positions: the first so many timed steps
@@ -623,17 +656,12 @@ def run(
     passed = held == PASS and status != FAIL
     kinds = f"{session.traced.differences} kind{'s' if session.traced.differences != 1 else ''} of difference"
     third = {PASS: PASS, FAIL: f"FAIL ({kinds}: the kernels lines above name them)"}.get(status, f"{NOT_OBSERVED} ({unobserved})")
-    identity = "kernel identity not claimed on this GPU class"  # of a stack that declares a target: unless its census line is EQUAL
-    if not kernels["declared"]:
-        identity = "no target kernel set declared"
-    elif ": EQUAL (" in kernels["census"]:
-        identity = ""
     failed = "a check did not hold" if not passed else ("kernels not observed" if status == NOT_OBSERVED else "")
     failed = failed or ("" if before.judged else "no provider block was judged")
     reduced = bool(getattr(model, "reductions", ()))
-    rate_missing = f"not printed: {NOT_COMPUTED}" if held != PASS else (f"not printed: {NOT_THE_PLAN}" if status == FAIL else "")
+    rate_missing = f"not printed: {missing}" if held != PASS else (f"not printed: {NOT_THE_PLAN}" if status == FAIL else "")
     rate_missing = rate_missing or ("not printed for a reduced model" if reduced else "")
-    kind, reasons = record_class(reduced, kernels["fallback_rows"], identity, False, failed)
+    kind, reasons = record_class(reduced, kernels["fallback_rows"], identity_reason(kernels), False, failed)
     weights = model.copy_bytes(session.uncopied_weights()) + model.stored_bytes(session.stored_weights())
     raw = []
     for made in requests:
@@ -682,16 +710,16 @@ def run(
             "timed_requests": protocol.requests,
             "new_tokens_per_request": protocol.steps + 1,
             "intervals_per_request": protocol.steps,
-            "profiler_first_started": "behind the last timed request, in the traced request",
+            "profiler_first_started": "behind the last timed request, in the traced request" if covered else None,  # None: no traced step was observed
             "stop_rule": "forced",
             "in_a_timed_request": {"recorder": "off (a record of 0 steps)", "call_log": "off", "profiler": "not started", "text": "none"},
-            "restart": "every request starts from the state zeroed in place at position 0",
+            "restart": "every request starts from the state zeroed in place at position 0, the device synchronised behind the zeroing",
             "prompt": {"tokens": prompt_tokens, "sha256": prompt_hash, "source": source},
             "first_timed_position": prompt_tokens,
             "last_timed_position": prompt_tokens + protocol.steps - 1,
         },
         "checks": {
-            "judged_positions": [{"position": position, "why": why} for position, why in positions],
+            "judged_positions": [{"position": position, "why": why} for position, why in positions if position in before.positions],
             "positions_text": listed,
             "before": list(before.lines),
             "after": {"kernels": [line.strip() for line in kernel_lines], "stored_weights_changed": changed},
@@ -704,8 +732,8 @@ def run(
         "raw": {"requests": raw},
         "traced": {
             "steps": covered,
-            "first_position": prompt_tokens,
-            "last_position": prompt_tokens + covered - 1,
+            "first_position": prompt_tokens if covered else None,
+            "last_position": prompt_tokens + covered - 1 if covered else None,
             "record_budget": protocol.trace_records,
             "records_of_the_sizing_step": sizing,
             "gpu_busy_ms": None,
@@ -729,7 +757,7 @@ def run(
     data["text_path"].update(tokens_written=len(kept) if real else 0, cut_at_an_end_token=ended is not None)
     unwritten = write_report(report, data)
     say("")
-    say("\n".join(screen(data)))
+    say("\n".join(screen(data, unwritten)))
     stream = text.decoder(prompts[0])
     written = "".join(stream.push(token) for token in kept) + stream.close()
     if not real:
