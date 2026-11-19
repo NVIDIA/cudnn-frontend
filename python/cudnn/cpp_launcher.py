@@ -58,7 +58,7 @@ import sys
 import threading
 import types
 import weakref
-from numbers import Integral, Real
+from numbers import Integral, Rational, Real
 from operator import itemgetter
 
 from cudnn._tupledict import TupleDict
@@ -240,8 +240,8 @@ def _key(values, env, stream):
 
 
 def _item(v):
-    if isinstance(v, float):
-        return v or repr(v)  # 0.0 == -0.0, and they are different arguments
+    if type(v) is float:
+        return v or (v, float_bits(v))  # 0.0 == -0.0, and they are different arguments
     if isinstance(v, _torch.Tensor):
         return (v.dtype, v.shape, v.stride(), v.device)
     if _stream_like(v):
@@ -251,6 +251,8 @@ def _item(v):
             raise TypeError("a tensor inside a sequence")
         return tuple((type(x), _item(x)) for x in v)
     hash(v)
+    if isinstance(v, Real) and not isinstance(v, Rational):  # a float subclass, a numpy float: equal values of other bits
+        return v, float_bits(v)
     return v
 
 

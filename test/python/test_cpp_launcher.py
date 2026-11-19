@@ -143,28 +143,41 @@ def test_float_arguments_are_replayed_bit_for_bit():
     assert type(recording).__name__ == "_Recording"
 
 
-def test_a_negative_zero_argument_is_not_the_recorded_zero():
-    """0.0 and -0.0 compare equal and are different kernel arguments: each has its own recording."""
+class OddFloat(float):
+    """A float whose truth value and repr say nothing of its value."""
+
+    def __bool__(self):
+        raise ValueError("no truth value")
+
+    def __repr__(self):
+        return "odd"
+
+
+@pytest.mark.parametrize("number", ["float", "numpy.float32", "numpy.float64", "OddFloat"])
+def test_a_negative_zero_argument_is_not_the_recorded_zero(number):
+    """0.0 and -0.0 compare equal and are different kernel arguments: each has its own recording, whatever the float's type."""
     import struct
 
+    import numpy
     import tvm_ffi
 
     from cudnn.cpp_launcher import launch, cpp_launched
 
+    number = {"float": float, "numpy.float32": numpy.float32, "numpy.float64": numpy.float64, "OddFloat": OddFloat}[number]
     seen = []
     sink = tvm_ffi.convert(lambda got: seen.append(struct.pack("d", got)))
 
     @cpp_launched
     def api(x, scale):
-        launch(sink, scale)
+        launch(sink, float(scale))
         return x
 
     x = torch.zeros(8, device="cuda")
-    scales = (0.0, 0.0, 0.0, -0.0, -0.0, -0.0)
+    scales = [number(v) for v in (0.0, 0.0, 0.0, -0.0, -0.0, -0.0, 1.0, 1.0, 2.0, 2.0)]
     for scale in scales:
         assert api(x, scale) is x
     assert seen == [struct.pack("d", scale) for scale in scales]
-    assert [type(r).__name__ for r in api.recordings.values()] == ["_Recording"] * 2
+    assert [type(r).__name__ for r in api.recordings.values()] == ["_Recording"] * 4
 
 
 def test_a_recorded_function_called_inside_a_recording_runs_its_python():
