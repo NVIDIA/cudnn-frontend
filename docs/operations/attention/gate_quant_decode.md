@@ -83,13 +83,13 @@ capture if a captured call will use it. The buffer is allocated on torch's curre
 that moment and that stream can still write it (torch fills it under deterministic algorithms; a recycled block can
 carry a write the stream still owes it): every launch that writes its bytes, by default or as a view passed back as
 `out`, by this entry or by another entry that orders its launches the same way (today `AddNormQuantDecode`,
-`AttentionPrepareDecode` and `AttentionGateQuantDecode`), is ordered behind that work on whatever stream it runs. On
-the allocating stream that is stream order; on another stream the launch stream waits for an event recorded behind the
-allocation, without a host wait and without synchronizing a stream or the device; a captured call that finds the work
-still pending waits for that one event on the host before its launch (set-up, never part of a replay; not needed for a
-buffer allocated before the capture once its stream's earlier work is done). Not ordered: a buffer allocated inside a
-stream capture (nothing is recorded: allocate before the capture), and a launch on a new stream that got the raw
-handle of a destroyed allocating stream (a stream outlives the work it has queued). An allocation on the legacy
+`AttentionPrepareDecode` and `AttentionGateQuantDecode`), is ordered behind that work on whatever stream it runs. The
+launch stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a
+stream or the device (on the allocating stream itself the event is already behind the launch and the wait is free; a
+stream that was given the raw handle of a destroyed allocating stream waits like any other); a captured call that
+finds the work still pending waits for that one event on the host before its launch (set-up, never part of a replay;
+not needed for a buffer allocated before the capture once its stream's earlier work is done). Not ordered: a buffer
+allocated inside a stream capture (nothing is recorded: allocate before the capture). An allocation on the legacy
 default stream while a blocking stream of another host thread captures raises torch's error: allocate before that
 capture or on a stream of your own. Once a call has seen it complete nothing is kept of it; while it is pending on the
 device, every call of such an entry on that device reads the device's records. The caller's: `attn`, `gate` and

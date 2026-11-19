@@ -41,15 +41,16 @@ thread.  Stream order does not serialize host calls, so two host threads that sh
 ``out`` (or build one entry each).  The buffer's allocation is stream work of torch's current stream of the entry's device at that
 moment (the buffer is not initialized by the entry, but under deterministic algorithms torch fills it, and its block can be a recycled
 one that stream still owes a write), and every launch that writes its bytes -- by default, or as a view passed back as ``out``, by
-this entry or by another entry that orders its launches the same way -- is ordered behind it on whatever stream it runs: nothing on
-the same stream, a stream-side wait on another (no host wait, no synchronization), a host wait for that ONE event when the launch
-stream is capturing (set-up, never part of a replay; a buffer allocated before the capture needs none once its stream's earlier work
-is done: ``torch.cuda.graph`` synchronizes when it is entered, a raw capture does not); nothing once a call has seen it complete, and
+this entry or by another entry that orders its launches the same way -- is ordered behind it on whatever stream it runs: a
+stream-side wait of the launch stream (no host wait, no synchronization; free on the allocating stream itself, and made also by a
+stream that was given the raw handle of a destroyed allocating stream), a host wait for that ONE event when the launch stream is
+capturing (set-up, never part of a replay; a buffer allocated before the capture needs none once its stream's earlier work is
+done: ``torch.cuda.graph`` synchronizes when it is entered, a raw capture does not); nothing once a call has seen it complete, and
 while it is pending on the device every call reads the device's records (``cudnn.frost.init_order``).  Not ordered: a buffer
-allocated INSIDE a stream capture (nothing is recorded: allocate before the capture), and a launch on a new stream that got the raw
-handle of a destroyed allocating stream (a stream outlives the work it has queued).  The caller's: ``attn``, ``gate`` and ``scale``,
-which a launch only reads, and its own reads and writes of the returned view outside a call.  Workspace: none.  The launch reads no
-device memory to the host (Rule 3) -- the one host wait of the entry is the one above; the warm path allocates nothing (Rule 1).
+allocated INSIDE a stream capture (nothing is recorded: allocate before the capture).  The caller's: ``attn``, ``gate`` and
+``scale``, which a launch only reads, and its own reads and writes of the returned view outside a call.  Workspace: none.  The
+launch reads no device memory to the host (Rule 3) -- the one host wait of the entry is the one above; the warm path allocates
+nothing (Rule 1).
 """
 
 from dataclasses import replace
