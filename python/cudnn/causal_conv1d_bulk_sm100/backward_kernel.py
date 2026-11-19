@@ -42,6 +42,8 @@ from cudnn.sdpa.utils import atomic_add_fp32
 
 WIDTH = 4
 PACKED_TILE_DESCRIPTOR_WIDTH = 4
+# Static extent for N-sized flat workspaces; the host validates their real size.
+_FLAT_WORKSPACE_EXTENT = 2**31 - 1
 
 
 @cute.kernel
@@ -444,6 +446,10 @@ class CausalConv1dBulkBackwardKernel:
         n_partials = cutlass.Int32(self.batch_size * tiles_per_sequence)
         if cutlass.const_expr(cu_seqlens is not None):
             # Packed N is runtime: one compiled plan serves every sequence count.
+            # A symbolic workspace extent costs ~10-15% in the bwd loop's index math.
+            packed_tile_map = cute.make_tensor(packed_tile_map.iterator, cute.make_layout(_FLAT_WORKSPACE_EXTENT))
+            if cutlass.const_expr(dw_partials is not None):
+                dw_partials = cute.make_tensor(dw_partials.iterator, cute.make_layout(_FLAT_WORKSPACE_EXTENT))
             total_tokens = self.batch_size * self.sequence_length
             num_sequences = cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(1)
             n_partials = num_sequences + (cutlass.Int32(total_tokens) - num_sequences) // cutlass.Int32(self.tokens_per_cta)
