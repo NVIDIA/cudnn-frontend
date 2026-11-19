@@ -206,7 +206,7 @@ def test_override_stride_off_the_alignment_is_refused_before_launch():
     o = _storage(68, fill=float("nan"))
     overrides = dict(override_uids=[t.get_uid() for t in ports], override_shapes=[[B, H, S, D]] * 4, override_strides=[_strides(68)] * 4)
     workspace = torch.empty(max(int(g.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
-    with pytest.raises(Exception, match=r"override stride 68 of dimension 1 .*16-byte alignment"):
+    with pytest.raises(Exception, match=r"native SDPA override rank and strides must match the declared storage"):
         g.execute(dict(zip(ports, (q, k, v, o))), workspace, **overrides)
     torch.cuda.synchronize()
     assert torch.isnan(o).all(), "the kernel ran on a refused variant pack"

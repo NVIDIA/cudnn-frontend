@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "serialize.h"
+#include "../node_interface.h"
 #include <algorithm>
 
 namespace cudnn_frontend::graph::plan_serialization_detail {
@@ -130,6 +131,9 @@ struct PlanMetadata {
     Workspace workspace;
     std::unordered_map<uid_t, std::pair<int64_t, int64_t>> aligned;
     Replacements replacements;
+    SDPAOverrideOperands sdpa_override_operands;
+    bool has_sdpa_override_metadata  = false;
+    int64_t sdpa_override_sm_version = 0;
     std::unordered_map<uid_t, std::shared_ptr<Tensor_attributes>> tensors;
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> dumps;
     int64_t workspace_size = 0;
@@ -206,6 +210,37 @@ parse(json const &j) {
                     "Serialized alignment or element width is invalid");
             result.aligned.emplace(uid(it.key()), std::make_pair(alignment, width));
         }
+    }
+
+    if (j.contains("sdpa_override_operands")) {
+        auto const &operands = j.at("sdpa_override_operands");
+        require(operands.is_object(), "Serialized SDPA override operands must be an object");
+        for (auto it = operands.begin(); it != operands.end(); ++it) {
+            auto const &geometry = it.value();
+            require(geometry.is_array() && geometry.size() == 3 && geometry[0].is_array() && geometry[1].is_array() &&
+                        geometry[2].is_boolean(),
+                    "Serialized SDPA override operand must contain dimensions, strides and a ragged-batch flag");
+            require(
+                !geometry[0].empty() && geometry[0].size() <= CUDNN_DIM_MAX && geometry[0].size() == geometry[1].size(),
+                "Serialized SDPA override operand has invalid ranks");
+            SDPAOverrideGeometry parsed;
+            parsed.ragged_batch = geometry[2].get<bool>();
+            for (auto const &value : geometry[0]) {
+                auto extent = integer(value);
+                require(extent >= 0, "Serialized SDPA override dimension must be nonnegative");
+                parsed.dim.push_back(extent);
+            }
+            for (auto const &value : geometry[1]) {
+                auto stride = integer(value);
+                require(stride >= 0, "Serialized SDPA override stride must be nonnegative");
+                parsed.stride.push_back(stride);
+            }
+            require(result.sdpa_override_operands.emplace(uid(it.key()), std::move(parsed)).second,
+                    "Serialized SDPA override operand has a duplicate UID");
+        }
+        result.sdpa_override_sm_version = integer(j.at("sdpa_override_sm_version"));
+        require(result.sdpa_override_sm_version >= 0, "Serialized SDPA target SM must be nonnegative");
+        result.has_sdpa_override_metadata = true;
     }
 
     auto const &replacements = j.at("variant_pack_replacements");

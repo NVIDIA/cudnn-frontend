@@ -1395,6 +1395,13 @@ class Graph : public ICudnn, public INode {
         }
         count_node_producing_workspace_modifications_();
         CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_subtree(cached_aligned_operands));
+        cached_sdpa_override_operands.clear();
+        CHECK_CUDNN_FRONTEND_ERROR(collect_sdpa_override_operands_subtree(cached_sdpa_override_operands));
+        has_sdpa_override_metadata = true;
+        if (!cached_sdpa_override_operands.empty() && handle != nullptr) {
+            CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
+        }
+        sdpa_override_sm_version = std::max<int64_t>(0, context.get_sm_version());
         refresh_host_copy_sources_();
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
@@ -1500,6 +1507,9 @@ class Graph : public ICudnn, public INode {
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             return get_workspace_size_plan_at_index(plan_index, cudnn_workspace_size);
         }
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            validate_sdpa_overrides(plan_index, override_uids, override_shapes, override_strides));
 
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Runtime workspace query with override shapes requires cuDNN v9.23.0"};
@@ -1881,6 +1891,8 @@ class Graph : public ICudnn, public INode {
         }
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            validate_sdpa_overrides(plan_index, override_uids, override_shapes, override_strides));
 
         // Every mapping/ordered/raw-pointer entry reaches here. Reject a missing
         // required workspace before patching workspace-relative addresses or
@@ -2215,6 +2227,17 @@ class Graph : public ICudnn, public INode {
         }
         j["aligned_operands"] = aligned_operands_json;
 
+        // Preserve an unknown legacy contract on re-serialization: an empty map means
+        // known non-SDPA, not missing provenance. Plan-only payloads need this too.
+        if (has_sdpa_override_metadata) {
+            json operands = json::object();
+            for (auto const &[uid, geometry] : cached_sdpa_override_operands) {
+                operands[std::to_string(uid)] = json::array({geometry.dim, geometry.stride, geometry.ragged_batch});
+            }
+            j["sdpa_override_operands"]   = std::move(operands);
+            j["sdpa_override_sm_version"] = sdpa_override_sm_version;
+        }
+
         j["variant_pack_replacements"] = variant_pack_replacements;
 
         j["fe_workspace_size"] = fe_workspace_size;
@@ -2443,7 +2466,10 @@ class Graph : public ICudnn, public INode {
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
         count_node_producing_workspace_modifications_();
-        cached_aligned_operands = deserialized_aligned_operands;
+        cached_aligned_operands       = deserialized_aligned_operands;
+        cached_sdpa_override_operands = std::move(metadata.sdpa_override_operands);
+        has_sdpa_override_metadata    = metadata.has_sdpa_override_metadata;
+        sdpa_override_sm_version      = metadata.sdpa_override_sm_version;
         refresh_host_copy_sources_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
@@ -3517,6 +3543,79 @@ class Graph : public ICudnn, public INode {
         return "print is unavailable when compiled with "
                "CUDNN_FRONTEND_SKIP_JSON_LIB";
 #endif
+    }
+
+   private:
+    // Keep cold contract metadata after the existing execution fields.
+    SDPAOverrideOperands cached_sdpa_override_operands;
+    bool has_sdpa_override_metadata  = false;
+    int64_t sdpa_override_sm_version = 0;
+
+    error_t
+    validate_sdpa_overrides(int64_t plan_index,
+                            std::vector<int64_t> const &uids,
+                            std::vector<std::vector<int64_t>> const &shapes,
+                            std::vector<std::vector<int64_t>> const &strides) const {
+        if (uids.empty() && shapes.empty() && strides.empty()) {
+            return {error_code_t::OK, ""};
+        }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(uids.size() != shapes.size() || uids.size() != strides.size(),
+                                       error_code_t::INVALID_VARIANT_PACK,
+                                       "override_uids, override_shapes and override_strides must have the same size.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !has_sdpa_override_metadata,
+            error_code_t::INVALID_VARIANT_PACK,
+            "Runtime overrides require declared SDPA geometry metadata. Rebuild this legacy execution-plan cache.");
+        for (size_t k = 0; k < uids.size(); ++k) {
+            auto const it = cached_sdpa_override_operands.find(uids[k]);
+            if (it == cached_sdpa_override_operands.end()) {
+                continue;
+            }
+            auto const &declared = it->second;
+            // The declared geometry is already accepted by this plan. Avoid
+            // repeating the changed-layout checks for an unchanged override.
+            if (shapes[k] == declared.dim && strides[k] == declared.stride) {
+                continue;
+            }
+            // Stats callers may omit the trailing singleton dimension. Its
+            // stride never contributes to an address; preserve that established
+            // contract while refusing changes to the actual storage layout.
+            auto const rank   = shapes[k].size();
+            bool same_storage = rank > 0 && rank <= declared.dim.size() && strides[k].size() == rank;
+            if (same_storage) {
+                for (size_t d = 0; d < declared.dim.size(); ++d) {
+                    if (d >= rank) {
+                        same_storage = same_storage && declared.dim[d] == 1;
+                    } else if (declared.dim[d] > 1 && !(d == 0 && declared.ragged_batch)) {
+                        same_storage = same_storage && strides[k][d] == declared.stride[d];
+                    }
+                }
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!same_storage,
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uids[k]) +
+                                               ": native SDPA override rank and strides must match the declared "
+                                               "storage. Rebuild for a new layout.");
+            // Hopper engine 9 uses the declared batch grid (#1570).
+            // Preserve working smaller-batch overrides on other plans.
+            if ((sdpa_override_sm_version == 90 || sdpa_override_sm_version == 0) && shapes[k][0] != declared.dim[0] &&
+                plan_index >= 0 && plan_index < static_cast<int64_t>(plans.execution_plans.size()) &&
+                plans.execution_plans[plan_index] != nullptr) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(plans.execution_plans[plan_index]->getTag().compare(0, 5, "eng9_") == 0,
+                                               error_code_t::INVALID_VARIANT_PACK,
+                                               "Uid " + std::to_string(uids[k]) +
+                                                   ": native Hopper SDPA engine 9 ignores batch overrides. Rebuild for "
+                                                   "the requested batch shape.");
+            }
+            for (size_t d = 0; d < rank; ++d) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(shapes[k][d] < 0 || shapes[k][d] > declared.dim[d],
+                                               error_code_t::INVALID_VARIANT_PACK,
+                                               "Uid " + std::to_string(uids[k]) +
+                                                   ": native SDPA override extent exceeds the declared shape "
+                                                   "or is negative. Rebuild for a larger extent.");
+            }
+        }
+        return {error_code_t::OK, ""};
     }
 };
 

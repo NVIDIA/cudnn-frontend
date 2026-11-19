@@ -2289,3 +2289,35 @@ TEST_CASE("Graph::serialize rejects unbuilt candidate; get_name_at_index rejects
 
     cudnnDestroy(handle);
 }
+
+TEST_CASE("Plan metadata validates native SDPA override geometry", "[serialize][plan_metadata][host]") {
+    namespace md = cudnn_frontend::graph::plan_serialization_detail;
+    json base{{"cudnn_backend_data", "opaque"},
+              {"variant_pack_uids", json::array({1})},
+              {"fe_workspace_size", 0},
+              {"variant_pack_replacements", json::array()},
+              {"behavior_notes", json::array({json::array()})}};
+    REQUIRE_FALSE(md::parse(base).has_sdpa_override_metadata);
+    base["sdpa_override_operands"]   = json::object();
+    base["sdpa_override_sm_version"] = 90;
+    REQUIRE(md::parse(base).has_sdpa_override_metadata);
+    REQUIRE(md::parse(base).sdpa_override_operands.empty());
+    base["sdpa_override_operands"]["1"] = {{2, 4, 64, 64}, {16384, 4096, 64, 1}, true};
+    auto roundtrip                      = md::parse(json::from_ubjson(json::to_ubjson(base)));
+    REQUIRE(roundtrip.sdpa_override_sm_version == 90);
+    REQUIRE(roundtrip.sdpa_override_operands.at(1).ragged_batch);
+    REQUIRE(roundtrip.sdpa_override_operands.at(1).dim == std::vector<int64_t>{2, 4, 64, 64});
+    REQUIRE(roundtrip.sdpa_override_operands.at(1).stride == std::vector<int64_t>{16384, 4096, 64, 1});
+    for (auto bad_geometry : {json::array(),
+                              json({{1}, {1, 2}, false}),
+                              json({{-1}, {1}, false}),
+                              json({{1}, {-1}, false}),
+                              json({{1.5}, {1}, false}),
+                              json({{1}, {true}, false})}) {
+        auto bad                           = base;
+        bad["sdpa_override_operands"]["1"] = bad_geometry;
+        REQUIRE_THROWS_AS(md::parse(bad), std::exception);
+    }
+    base["sdpa_override_operands"] = json::array();
+    REQUIRE_THROWS_AS(md::parse(base), std::exception);
+}
