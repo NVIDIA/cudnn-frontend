@@ -11,6 +11,7 @@ device cell makes, so the four cells cannot drift apart.
 
 A non-test module (no ``test_`` prefix): imported by name from the entry suites."""
 
+import gc
 import json
 import os
 import tempfile
@@ -39,6 +40,11 @@ def kernel_records(launch: Callable[[], object]) -> List[KernelRecord]:
     (a node without CUPTI): the caller reports that as a skip, never as a pass."""
     from torch.profiler import ProfilerActivity, profile
 
+    # Collect garbage first.  torch.profiler can record a launch under the NAME of an earlier profiled kernel whose module was unloaded
+    # just before the launched kernel's module was loaded -- beside this launch's own grid, block and shared memory.  An earlier case's
+    # compiled kernels can stay loaded until a garbage collection, and an automatic one late in the warm call's compile is that order:
+    # the name comparison has failed on such a record in some whole-module sessions.  Collected here, they are unloaded before the compile.
+    gc.collect()
     launch()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
