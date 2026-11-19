@@ -752,13 +752,13 @@ def test_a_call_orders_its_launch_behind_a_pending_record_over_any_operand_it_wr
     k.compiled[k.key()] = lambda *args: s.calls.append(("launch", int(args[-1])))
     ops, mine, owned = make_operands(3, DEFAULT_FORM), fresh_outputs(3, "cpu"), k.buffers[3]
 
-    def ordering_of_a_call(over=None, **outs):
+    def ordering_of_a_call(over=None, operands=ops, **outs):
         k._pending.clear()
         event = s.Event(False)
         if over is not None:
             k._pending[0] = (event, 7, spans_of((over,)))
         s.calls.clear()
-        k(*call_args(ops), **outs)
+        k(*call_args(operands), **outs)
         return [c for c in s.calls if c[0] in ("wait_event", "launch")], [("wait_event", 100, event), ("launch", 100)]
 
     for name in ("q_out", "gate_out"):
@@ -768,9 +768,16 @@ def test_a_call_orders_its_launch_behind_a_pending_record_over_any_operand_it_wr
         assert got == ordered, f"a record over the entry-owned {name}"
     got, ordered = ordering_of_a_call(ops["cache"])
     assert got == ordered, "a record over the pools' storage"
+    pools = {name: torch.zeros(ops["cache"].shape[0], KV_HEADS, ops["cache"].shape[2], D, dtype=BF16) for name in ("k_pool", "v_pool")}
+    for name in pools:  # each pool a tensor of its own: the other pool's bounds do not cover it
+        got, ordered = ordering_of_a_call(pools[name], dict(ops, **pools))
+        assert got == ordered, f"a record over {name} alone"
     for name in ("slab", "q_weight", "cos_sin"):
         assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
     assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+    k.buffers.clear()
+    got, ordered = ordering_of_a_call(mine["q_out"], **mine)
+    assert got == ordered, "a passed output while the entry holds no pair of the call's token count"
 
 
 def test_launch_writes_are_the_live_tokens_of_the_outputs_and_the_bounds_of_the_pools():
@@ -1923,6 +1930,58 @@ def test_entry_owned_q_out_on_a_recycled_block_waits_for_what_its_stream_still_o
     if recycled[0] not in [t.data_ptr() for t in k.outputs(tokens).values()]:
         pytest.skip("the allocator did not hand the freed block to the entry: the schedule shows nothing")
     _assert_same(_overlapping(k, ops, pending), want, "an entry-owned output on a recycled block")
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_slices_of_another_token_counts_pair_wait_for_that_pairs_pending_fill():
+    """The pair of ANOTHER token count, allocated on a parked side stream under deterministic algorithms and passed to a call
+    of fewer tokens as slices that start INSIDE it: the launch is ordered behind the allocation that holds the bytes it writes
+    -- the call's own token count has no pair and no record here."""
+    dev = _device_or_skip()
+    tokens, larger = 6, 12
+    k, ops, want = _warm_entry_and_reference(dev, tokens, 136)
+    taken = {}
+
+    def allocate():
+        with deterministic_fill():
+            taken.update(k.outputs(larger))
+
+    pending = park(pooled(dev, lambda: fresh_outputs(larger, dev)), allocate)
+    got = _overlapping(k, ops, pending, q_out=taken["q_out"][tokens:], gate_out=taken["gate_out"][tokens:])
+    assert tokens not in k.buffers and got["q_out"].data_ptr() == taken["q_out"][tokens].data_ptr()
+    _assert_same(got, want, f"slices of the pair of {larger} tokens")
+
+
+@pytest.mark.usefixtures("settled_records")
+@pytest.mark.parametrize("which", ("k_pool", "v_pool"))
+def test_pool_laid_over_a_pending_pair_waits_for_that_pairs_fill(which):
+    """A POOL is written by the launch too: one pool, a tensor of its own, laid over the ``q_out`` of a larger pair that is
+    pending on a parked side stream under deterministic algorithms; the other pool and both outputs are the caller's and
+    ready.  The pool rows the launch writes are those of a launch into a ready pool; unordered, torch's fill lands on them."""
+    dev = _device_or_skip()
+    tokens, larger = 6, 22
+    k, ops, _ = _warm_entry_and_reference(dev, tokens, 137)
+    shape = (ops["cache"].shape[0], KV_HEADS, ops["cache"].shape[2], D)
+    canary = lambda: torch.full(shape, CANARY_BITS, dtype=I16, device=dev).view(BF16)  # noqa: E731
+    ready, pools, outs = dict(k_pool=canary(), v_pool=canary()), dict(k_pool=canary(), v_pool=canary()), fresh_outputs(tokens, dev)
+    k(*call_args(dict(ops, **ready)), **fresh_outputs(tokens, dev))
+    torch.cuda.synchronize()
+    want = bits(ready[which])
+    written = want != CANARY_BITS
+    assert int(written.sum()) >= tokens * KV_HEADS * D // 2, "the launch into a ready pool wrote too little to show anything"
+    taken = {}
+
+    def allocate():
+        with deterministic_fill():
+            taken.update(k.outputs(larger))
+
+    pending = park(pooled(dev, lambda: fresh_outputs(larger, dev)), allocate)
+    pools[which] = taken["q_out"].view(-1)[: written.numel()].view(shape)
+    k(*call_args(dict(ops, **pools)), **outs)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    wrong = int((bits(pools[which])[written] != want[written]).sum())
+    assert wrong == 0, f"{which} laid over a pending pair: {wrong} of the {int(written.sum())} elements the launch writes differ"
 
 
 @pytest.mark.usefixtures("settled_records")

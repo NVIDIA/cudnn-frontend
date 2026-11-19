@@ -123,11 +123,15 @@ the test is one of addresses. On the allocating stream that is stream order; on 
 stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a stream or
 the device, so `compile(tokens)` may run on any stream. A captured call that finds the work still pending waits for
 that one event on the host before its launch (a capturing stream cannot wait for an event recorded outside its
-capture): set-up, never part of a replay, and not needed for a pair allocated before the capture on the capturing
-thread's stream. Once a call has seen the work complete nothing is kept of it; while it is pending on the device,
-every call of such an entry on that device reads the device's records. What stays the caller's: the operands a
-launch only reads, and the caller's own reads and writes of a returned tensor outside a call. `outputs(tokens)`
-returns a copy of the entry's table (the same tensors) without waiting.
+capture): set-up, never part of a replay, and not needed for a pair allocated before the capture once its stream's
+earlier work is done (`torch.cuda.graph` synchronizes when it is entered; a raw capture does not). Not ordered: a pair
+allocated inside a stream capture (nothing is recorded: allocate before the capture), and a launch on a new stream
+that got the raw handle of a destroyed allocating stream (a stream outlives the work it has queued). An allocation on
+the legacy default stream while a blocking stream of another host thread captures raises torch's error: allocate
+before that capture or on a stream of your own. Once a call has seen the work complete nothing is kept of it; while
+it is pending on the device, every call of such an entry on that device reads the device's records. What stays the
+caller's: the operands a launch only reads, and the caller's own reads and writes of a returned tensor outside a
+call. `outputs(tokens)` returns a copy of the entry's table (the same tensors) without waiting.
 
 Everything the entry does not serve is declined by name. At construction, without torch and without the DSL:
 `TypeError` for a `geometry` that is not an `AttentionPrepareGeometry` of `int` fields or a launch knob that is not a
