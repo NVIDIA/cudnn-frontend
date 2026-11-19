@@ -302,8 +302,10 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     holds GPU busy of every traced step and the per-kernel table of real launches: its rows hold every record of a
     step, an exact row the launches the plan has for it, and the rows' mean time per step sums to the mean GPU busy;
     and the step taken apart: one remainder for every timed step at a traced position, whose mean adds up with the
-    means of the step, of GPU busy and of the host time, and is labelled an estimate.  No time of it is held against
-    anything."""
+    means of the step, of GPU busy and of the host time, and is labelled an estimate.
+    What it observed of its GPU through the driver's tool -- or that it could not -- stands on the ``GPU`` lines and
+    among the reasons, whatever a host shows.
+    No time of it is held against anything."""
     import json
 
     if not torch.cuda.is_available():  # decided here, before a child is started
@@ -349,8 +351,20 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     # the record class: every reason, in the order of the conditions; a stack that declares a target kernel set names its identity
     identity = "no target kernel set declared" if stack == "fe-cublas" else "kernel identity not claimed on this GPU class"
     observed = ["kernels not observed"] if unobserved else []
-    reasons = ["reduced model", "fallback rows present", identity, "launched from Python", *observed, "other processes not observed", "clocks not observed"]
-    assert data["record"]["reasons"] == reasons and data["record"]["performance_claim_eligible"] is False
+    fixed = ["reduced model", "fallback rows present", identity, "launched from Python", *observed]
+    # what the run observed of its GPU: the reasons behind the fixed ones are those of its two verdicts, which the screen prints
+    watched = data["observation"]
+    seen, clocks = watched["other_compute_processes"], watched["clocks"]
+    others = {"none seen": [], "seen": ["shared GPU"], "not observed": ["other processes not observed"]}[seen["verdict"]]
+    assert data["record"]["reasons"] == [*fixed, *others, *clocks["reasons"]] and data["record"]["performance_claim_eligible"] is False
+    assert (clocks["verdict"] == "no") == (clocks["reasons"] == ["clocks not observed"]) and (seen["verdict"] == "seen") == bool(seen["seen"])
+    assert any("other compute processes: " in line for line in screen) and any(f"clocks observed: {clocks['verdict']} (" in line for line in screen)
+    assert "locked" not in " ".join(screen), "the report never prints the word"
+    if watched["source"] == "nvidia-smi":  # the driver's tool was found: a reading before the load, before the warm-up request and behind the timed requests
+        assert [made["when"] for made in watched["readings"]] == ["before the load", "before the warm-up request", "behind the last timed request"]
+        assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced"]
+    else:
+        assert watched["reason"] and seen["verdict"] == "not observed" and clocks["verdict"] == "no"
     assert all(entry["definition"] and entry["unit"] for entry in data["statistics"].values()), "a definition and a unit beside every statistic"
     memory = data["memory"]  # the peak of the timed part is PyTorch's own, between the settle and the last timed request: inside the process's
     assert (
