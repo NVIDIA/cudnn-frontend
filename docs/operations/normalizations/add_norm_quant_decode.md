@@ -156,10 +156,16 @@ On the allocating stream that is stream order; on another stream the launch stre
 the initialization, without a host wait and without synchronizing a stream or the device, so `compile(rows)` may run
 on any stream. A capturing stream cannot wait for an event recorded outside its capture: a captured call that finds
 the initialization still pending waits for that one event on the host before its launch. That is set-up, never part
-of a replay, and a set allocated before the capture on the capturing thread's stream needs no wait. Once a call has
+of a replay, and a set allocated before the capture needs no wait once its stream's earlier work is done
+(`torch.cuda.graph` synchronizes when it is entered; a raw capture does not). Not ordered: a set allocated inside a
+stream capture (nothing is recorded: its fill is a node of that graph and runs at each replay, so allocate before the
+capture), and a launch on a new stream that got the raw handle of a destroyed allocating stream (a stream outlives the
+work it has queued). An allocation on the legacy default stream while a blocking stream of another host thread
+captures raises torch's error: allocate before that capture or on a stream of your own. Once a call has
 seen an initialization complete nothing is kept of it and a warm call does nothing extra; while one is pending on the
-device, every call of such an entry on that device reads the device's records (address arithmetic and at most
-one event query per allocating stream). What stays the caller's: the operands a launch only reads (`x`, `weight`,
+device, every call of such an entry on that device reads the device's records (address arithmetic, one event query
+per record it drops and one per allocating stream that still holds a pending record). What stays the caller's: the
+operands a launch only reads (`x`, `weight`,
 `scale`), also when one is laid over an entry-owned tensor, and the caller's own reads and writes of a returned tensor
 outside a call. While the set's initialization may be pending those run on the stream that was current when the set
 was allocated, or the caller orders its own stream behind that one. `outputs(rows)` returns a copy of the entry's

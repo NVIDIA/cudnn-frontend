@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -638,6 +639,8 @@ def test_outputs_records_the_initialization_before_the_set_is_published(monkeypa
     again = k.outputs(3)
     assert again is not owned and again is not k.buffers[3] and all(again[name] is owned[name] for name in ("out", "codes", "scales"))
     assert not s.calls and len(k._pending) == 1, "the set of a row count is allocated and recorded once"
+    make_entry(dev, "add-bf16").outputs(3)
+    assert len(k._pending) == 2, "a set the entry fills nothing of (no scales) is recorded too"
 
 
 def test_a_call_orders_its_launch_behind_a_pending_record_over_any_operand_it_writes(monkeypatch):
@@ -670,6 +673,9 @@ def test_a_call_orders_its_launch_behind_a_pending_record_over_any_operand_it_wr
     for name in ("x", "weight", "scale"):
         assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
     assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+    k.buffers.clear(), k._buffer_views.clear()
+    got, ordered = ordering_of_a_call(ops["scales"])
+    assert got == ordered, "a passed output while the entry holds no set of the call's row count"
 
 
 def test_launch_writes_are_the_live_rows_of_every_operand_the_launch_writes():
@@ -2383,6 +2389,40 @@ def test_another_entry_that_writes_a_pending_set_waits_for_its_initialization():
     pending = park(pooled(dev, lambda: _ready_outs(a, rows, dev)), lambda: taken.update(a.outputs(rows)))
     got = _overlapping(b, ops, pending, **taken)
     _assert_same(got, want, "entry B wrote the set entry A allocated on another stream")
+
+
+@pytest.mark.usefixtures("settled_records")
+@pytest.mark.parametrize("state", ("complete and not read yet", "pending on a parked stream"))
+def test_first_cuda_call_of_a_new_host_thread_is_ordered_behind_a_recorded_set(state):
+    """A host thread whose FIRST CUDA call is the entry's warm launch -- no context is bound to it yet and its current stream
+    is the default stream -- into the set ``compile(rows)`` allocated from the main thread: the launch is ordered like any other,
+    behind a record no call has read yet and behind one still pending on a parked stream, and nothing is raised (the capture
+    status of the default stream is not read: the driver answers for it only on a thread with a current context)."""
+    dev = _device_or_skip()
+    rows = 7
+    k, ops, want = _warm_entry_and_reference(dev, rows, 146)
+    pending = None
+    if state.startswith("pending"):
+        pending = park(pooled(dev, lambda: _ready_outs(k, rows, dev)), lambda: k.compile(rows))
+    else:
+        k.compile(rows)
+        torch.cuda.synchronize()
+    box = {}
+
+    def first_call():
+        try:
+            box["got"] = _launch(k, *ops)
+        except BaseException as err:  # noqa: BLE001  (reported by the assertion below)
+            box["error"] = err
+
+    thread = threading.Thread(target=first_call, daemon=True)
+    thread.start()
+    thread.join(120)
+    assert not thread.is_alive() and "error" not in box, f"the first call of a new host thread: {box.get('error')!r}"
+    assert pending is None or not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    got = {name: t for name, t in zip(entry.OUTPUT_SLOTS, box["got"]) if t is not None}
+    _assert_same(got, want, f"the first call of a new host thread, the set {state}")
 
 
 @pytest.mark.usefixtures("settled_records")
