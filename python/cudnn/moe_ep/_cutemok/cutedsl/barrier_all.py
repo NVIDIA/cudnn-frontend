@@ -17,7 +17,10 @@ One thread per rank:
   reached, then ``fence.acquire.sys``.
 
 With one rank nothing is launched; otherwise ``multicast_ptr`` must be the multicast address of the ranks'
-barrier buffers.  The counters are unsigned 32-bit and wrap; an overflow in a long run is not handled.
+barrier buffers.  The counters are unsigned 32-bit and wrap: the wait compares in serial-number order (the sign
+of ``value - threshold`` as a 32-bit difference), exact while the counter and the threshold are at most 2^31
+apart -- they are at most one barrier's ``ep_size`` arrivals apart (``ep_size`` <= 2^31) -- so a run of any length
+waits correctly.  (An unsigned ``value < threshold`` lets every rank through once the threshold wraps to 0.)
 Callers keep the buffers and the symmetric-memory handles alive until related work finishes;
 ``record_stream`` does not replace handle lifetime.
 """
@@ -27,7 +30,7 @@ import threading
 
 from ._arch import COMPILE_OPTIONS as _COMPILE_OPTIONS, check_device
 
-_CODEGEN_EPOCH = "barrier-all-runtime-uint32-system-o2-v2"
+_CODEGEN_EPOCH = "barrier-all-runtime-uint32-system-o2-v3-wrap-safe"
 from ._version_gate import require_cutedsl
 
 require_cutedsl()  # CuTe DSL >= 4.8 (cu13), before CUTLASS is imported
@@ -90,6 +93,25 @@ def _load_local_counter(address: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def _precedes(value: Uint32, threshold: Uint32, *, loc=None, ip=None) -> Uint32:
+    """1 while ``value`` has not reached ``threshold`` in wrap-around (serial-number) order: the sign bit of the
+    32-bit difference ``value - threshold``.  Inline PTX like the counter loads around it: the u32 subtraction and
+    the logical shift are exact by construction, with no signed / unsigned conversion of the DSL scalars."""
+    return Uint32(
+        llvm.inline_asm(
+            ir.IntegerType.get_signless(32),
+            [value.ir_value(), threshold.ir_value()],
+            "{ .reg .u32 d; sub.u32 d, $1, $2; shr.u32 $0, d, 31; }",
+            "=r,r,r",
+            has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _acquire_fence(*, loc=None, ip=None):
     llvm.inline_asm(None, [], "fence.acquire.sys;", "~{memory}", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
 
@@ -107,7 +129,7 @@ class _BarrierAll:
         _alias_fence()
         local_addr = barrier_buffer.iterator.toint()
         value = _load_local_counter(local_addr)
-        while Uint32(value) < Uint32(threshold):
+        while _precedes(Uint32(value), Uint32(threshold)) != Uint32(0):  # wrap-safe (module docstring)
             value = _load_local_counter(local_addr)
         _acquire_fence()
 
@@ -139,8 +161,8 @@ def _validate_inputs(barrier_buffer, barrier_buffer_ptrs, multicast_ptr, target)
     if not isinstance(barrier_buffer_ptrs, list) or any(type(pointer) is not int or not 0 < pointer < 2**63 or pointer % 4 for pointer in barrier_buffer_ptrs):
         raise ValueError("barrier_buffer_ptrs must be a list of positive 4-byte-aligned int64 addresses")
     ep_size = len(barrier_buffer_ptrs)
-    if not 0 < ep_size < 2**32:
-        raise ValueError("barrier_buffer_ptrs length must be a positive uint32")
+    if not 0 < ep_size <= 2**31:
+        raise ValueError("barrier_buffer_ptrs length must be in [1, 2^31] (the wrap-safe wait's range)")
     if type(multicast_ptr) is not int or not 0 < multicast_ptr < 2**63 or multicast_ptr % 4:
         raise ValueError("multicast_ptr must be a positive 4-byte-aligned int64 address")
     device = barrier_buffer.device
@@ -155,7 +177,7 @@ def barrier_all(barrier_buffer, barrier_buffer_ptrs, multicast_ptr, target):
 
     ``barrier_buffer`` and ``target`` are this rank's int32 ``[1]`` counters, ``barrier_buffer_ptrs`` the
     ranks' buffer addresses (its length is the rank count) and ``multicast_ptr`` their multicast address.
-    The unsigned 32-bit arithmetic wraps; an overflow in a long run is not handled.
+    The unsigned 32-bit counters wrap; the wait is wrap-safe (module docstring).
     """
     index = _current_device_index()
     # The fast path: the workspace's own buffers, seen before on this device.  A hit keeps the

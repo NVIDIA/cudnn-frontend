@@ -423,6 +423,38 @@ def test_plan_shared_by_layers(group):
     dist.barrier()
 
 
+def test_barrier_counter_wrap(group):
+    """The cross-rank barrier's 32-bit counters wrap in a long run: with both counters set so that the first barrier
+    of a call wraps its threshold to 0, and every rank but 0 held back before the call, the call still waits for all
+    ranks and gives the results of a fresh plan, bit for bit.  (An unsigned compare lets rank 0 through on its own
+    arrival there and read its peers' previous layer.)"""
+    rank, world_size, device = group
+    if world_size == 1:
+        pytest.skip("one rank launches no barrier")
+    config = _config()
+    plan = _prepare(config, device)
+    fresh = _prepare(config, device)  # kept until the end: a plan is dropped only after its work finished
+    layers = [_inputs(rank, world_size, device, seed) for seed in (90, 90 + 2 * world_size)]
+    expected = _call(fresh, config, layers[1])
+    _call(plan, config, layers[0])  # the peers' buffers now hold layer 0
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    start = -world_size  # 2^32 - ep_size: the next barrier's threshold wraps to 0
+    plan.workspace.barrier_target.fill_(start)
+    plan.workspace.barrier_buffer.fill_(start)
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    if rank != 0:
+        torch.cuda._sleep(200_000_000)  # hold the other ranks back: rank 0 reaches the barrier first
+    actual = _call(plan, config, layers[1])
+    for name, a, b in zip(("output", *GRADIENT_NAMES), expected, actual, strict=True):
+        assert torch.equal(a, b), f"{name} differs after the barrier counter wrapped"
+    torch.cuda.synchronize(device)
+    # the call's barriers did cross the wrap: the target went from 2^32 - ep_size past 0
+    assert 0 < int(plan.workspace.barrier_target.item()) < 2**31
+    dist.barrier()
+
+
 def test_plan_owns_workspace(group):
     """prepare does not fill the process-wide workspace cache of the layer functions; dropping the plan, after the
     calls on it finished on every rank, frees its symmetric buffers."""
