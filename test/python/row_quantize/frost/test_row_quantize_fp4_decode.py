@@ -412,7 +412,9 @@ def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_mos
     No branch synchronizes a stream or the device; every read of the event runs with the thread's capture check relaxed, and the
     check is restored also when the read raises.  A pair of another row count is never touched, and an entry on a device without
     streams records nothing.  A record that is gone when the pair is looked up -- another host thread's launch saw the
-    initialization complete and dropped it -- is nothing to order behind: no event and no capture check is read."""
+    initialization complete and dropped it -- is nothing to order behind: no event and no capture check is read; a record that
+    the other thread drops WHILE this call reads its event is dropped without an error.  The initialization's stream is the
+    same stream also when it arrives as another object (``torch.cuda.current_stream`` returns a new one on every call)."""
     calls, capturing, Event, Stream, Driver = _ordering_stand_ins(monkeypatch)
     k = make_entry("cpu")
     k.outputs(3), k.outputs(4)
@@ -434,6 +436,17 @@ def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_mos
     assert decide(pending, other, captured=True) == (["synchronize"], False)
     assert decide(Event(False), init, captured=True) == (["synchronize"], False)
     assert decide(Event(True), other) == (["query"], False)
+
+    class SameStream(Stream):  # the same stream as another object
+        def __eq__(self, o):
+            return isinstance(o, Stream) and o.name == self.name
+
+        def __ne__(self, o):
+            return not self == o
+
+        __hash__ = None
+
+    assert decide(Event(False), SameStream("init")) == (["query"], True), "the initialization's stream as another object: nothing is enqueued"
     k._init = {3: (Event(False, fails=True), init, ())}
     with pytest.raises(RuntimeError, match="the event's query failed"):
         k._order_behind_init(3, other, Driver)
@@ -442,6 +455,15 @@ def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_mos
     k._init = {4: untouched}
     k._order_behind_init(3, other, Driver)
     assert not calls and k._init == {4: untouched} and Driver.mode == "global", "a record that is gone: nothing is read, nothing raises"
+
+    class DroppedMeanwhile(Event):  # another thread's launch drops the record between this call's lookup and its own drop
+        def query(self):
+            k._init.pop(3)
+            return super().query()
+
+    k._init = {3: (DroppedMeanwhile(True), init, ()), 4: untouched}
+    k._order_behind_init(3, other, Driver)
+    assert k._init == {4: untouched} and Driver.mode == "global", "a record dropped while this call read its event: its own drop does not raise"
     k._init = {3: (Event(False), init, ())}
     Driver.fails = True
     calls.clear()
