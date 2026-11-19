@@ -199,7 +199,8 @@ def test_rule_is_pure_and_every_marked_set_is_honoured(monkeypatch):
                 seen.add((f.device_sm_count, _clusters(f, knobs), knobs.split_kv))
     # the recorded bounds are reached, and nothing past them is marked
     assert {(148, 16, 4), (148, 8, 8)} <= seen and all(split in (4, 8) for sm, _, split in seen if sm == 148)
-    # 152 SMs: the rows of 4 and 8 chunks are reached exactly; the existing rules split 2 ways only below that row
+    # 152 SMs: the rows of 4 and 8 chunks are reached exactly; this grid's user counts reach 72 clusters of 2 (the rules
+    # reach the row of 76 with more users and a longer cache: the rule tables below)
     assert {(152, 36, 4), (152, 15, 8)} <= seen and {split for sm, _, split in seen if sm == 152} == {2, 4, 8}
     assert max(n for sm, n, split in seen if (sm, split) == (152, 2)) == 72
 
@@ -264,11 +265,14 @@ def test_rule_table_on_148_sms(b, s_q, s_kv, replay, split, reduced):
         (9, 1, 2048, False, 4, True),
         (9, 2, 2048, False, 4, True),
         (10, 1, 8192, False, 4, False),
-        # 2 chunks: one wave holds 76 clusters, and the existing rules split 2 ways up to 72
+        # 2 chunks: one wave holds 76 clusters; the rules reach that row with a long declared cache, and one user more keeps two launches
         (9, 1, 1792, False, 2, True),
         (10, 1, 2048, False, 2, True),
         (16, 1, 8192, False, 2, True),
         (18, 1, 8192, False, 2, True),
+        (19, 1, 12288, False, 2, True),  # 76 clusters of 2, the row
+        (19, 2, 12288, False, 2, True),
+        (20, 1, 32768, False, 2, False),  # 80 clusters of 2, past the row
         # unsplit plans have nothing to reduce
         (12, 1, 2048, False, 1, False),
         (64, 1, 2048, False, 1, False),
@@ -310,6 +314,8 @@ def test_rule_table_on_152_sms(b, s_q, s_kv, replay, split, reduced):
         (152, (8, 1), 36, 1, 2048, 4, True),  # 36 clusters of 4, the row
         (152, (8, 1), 37, 1, 2560, 4, False),  # one cluster more
         (152, (8, 1), 64, 1, 4096, 2, True),  # 64 clusters of 2
+        (152, (8, 1), 76, 1, 12288, 2, True),  # 76 clusters of 2, the row
+        (152, (8, 1), 77, 1, 12288, 2, False),  # one cluster more
     ],
 )
 def test_rule_table_for_other_head_ratios(sm, heads, b, s_q, s_kv, split, reduced):
