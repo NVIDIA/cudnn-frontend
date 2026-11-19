@@ -168,12 +168,18 @@ for backward. Broadcast output gradients are materialized at the allocating
 autograd boundary. Dense initial/final history is not supported by this route;
 use an equivalent packed call when history is needed.
 
-For contiguous BF16, width-four SiLU packed backward on SM103, the persistent
+For contiguous BF16, width-four SiLU packed backward on SM100/SM103, the persistent
 schedule is selected at 8192 or more tokens and 768 or 2048 channels, with no
 state gradients. Other cases retain the tiled schedules. Dense backward uses
 the persistent schedule at 2048 channels and at least 100 million activation
 elements, with more than one token per sequence. The kernel retains its input
 and pending-gradient windows in registers across eight-token TMA stages.
+
+The BF16 K4 SiLU parameter reduction on SM100/SM103 assigns each filter tap
+and bias gradient to separate thread blocks. Each output retains its fixed
+split-sum order. Small tiled calls cap the split count at the number of
+64-token tiles; packs with 256 channels and 4096–8191 tokens use one split
+per tile. FP32 parameter outputs retain FP64 final accumulation.
 
 Packed parameter gradients and the persistent dense path use fixed-order
 reductions. They are repeatable for a fixed configuration. Parameter gradients

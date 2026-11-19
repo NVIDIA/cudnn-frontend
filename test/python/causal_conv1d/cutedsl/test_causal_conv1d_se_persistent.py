@@ -12,12 +12,18 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 
 
 @pytest.fixture(autouse=True)
-def sm103():
+def persistent_arch():
     from cudnn.causal_conv1d_se.packed import _require_dsl
 
     _require_dsl()
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("persistent SE backward requires SM100 or SM103")
+
+
+@pytest.fixture
+def dense_arch():
     if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("persistent SE backward is qualified on SM103")
+        pytest.skip("the public dense SE adapter is qualified on SM103")
 
 
 def _inputs(lengths, channels, bias=True):
@@ -125,6 +131,7 @@ def test_public_persistent_nondefault_graph_changed_offsets():
 
 
 @pytest.mark.parametrize("dense_shape", [(2, 32, 256), (8, 8192, 2048)])
+@pytest.mark.usefixtures("dense_arch")
 def test_public_dense_gradients_and_dispatch(dense_shape):
     from cudnn.causal_conv1d_se.dense import _persistent_shape
 
@@ -145,6 +152,7 @@ def test_public_dense_gradients_and_dispatch(dense_shape):
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
+@pytest.mark.usefixtures("dense_arch")
 def test_dense_tiled_deterministic_mode_declines():
     args = _inputs([32, 32], 256)
     enabled = torch.are_deterministic_algorithms_enabled()
@@ -158,7 +166,9 @@ def test_dense_tiled_deterministic_mode_declines():
 
 
 @pytest.mark.parametrize("mode", ["packed", "dense"])
-def test_persistent_warm_stress(mode):
+def test_persistent_warm_stress(mode, request):
+    if mode == "dense":
+        request.getfixturevalue("dense_arch")
     from cudnn.causal_conv1d_se.packed import _compiled, _backward_schedule
     from cuda.bindings import driver as cuda
     from warm_stress import StressCase, assert_warm_stress
@@ -214,6 +224,7 @@ def test_persistent_sequence_batch_invariance():
             start += length
 
 
+@pytest.mark.usefixtures("dense_arch")
 def test_dense_fullgraph_autograd():
     from cudnn.ops import causal_conv1d
 
@@ -236,6 +247,7 @@ def test_dense_fullgraph_autograd():
 
 
 @pytest.mark.parametrize("shape", [(65536, 1, 8), (1, 524281, 8), (1, 1, 2**31)])
+@pytest.mark.usefixtures("dense_arch")
 def test_dense_launch_limits_reject_before_compilation(shape):
     from torch._subclasses.fake_tensor import FakeTensorMode
     from cudnn.ops import causal_conv1d
@@ -281,6 +293,7 @@ def test_tiled_staging_warm_stress(width, channels, dtype, silu):
     assert_warm_stress(case, warm=3000, poisoned=3000)
 
 
+@pytest.mark.usefixtures("dense_arch")
 def test_dense_signed_zero_tail_matches_parent(monkeypatch):
     """Preserve the parent's zero sign after padded-tail arithmetic."""
     from cudnn.causal_conv1d_se import dense
@@ -301,3 +314,40 @@ def test_dense_signed_zero_tail_matches_parent(monkeypatch):
     parent = _public(args, shape)
     assert_bitwise({"dx": actual["dx"]}, {"dx": parent["dx"]}, "dense signed-zero tail")
     assert (actual["dx"] == 0).all()
+
+
+@pytest.mark.parametrize(
+    "name,lengths,channels",
+    [
+        ("tiny", [1] * 64, 256),
+        ("tail", [0, 1031, 0, 1031, 0], 1032),
+        ("ragged", [0, 1, 3, 29, 1025, 4097, 0], 256),
+        ("split_boundary", [4095, 1], 256),
+        ("before_persistent", [8191], 768),
+        ("after_persistent", [1, 8192], 768),
+    ],
+)
+@pytest.mark.parametrize("bias", [False, True])
+def test_public_tuned_schedule_boundaries(name, lengths, channels, bias):
+    args = _inputs(lengths, channels, bias)
+    actual = assert_replays(lambda: _public(args), repeats=3)
+    _reference_check(actual, args, lengths)
+
+
+@pytest.mark.parametrize("name,lengths,channels", [("tiny", [1] * 64, 256), ("tail", [1031, 1031], 1032), ("ragged", [1, 3, 29, 1025, 4097], 256)])
+def test_public_tuned_tiled_golden(name, lengths, channels):
+    from cutlass.base_dsl.version_info import CUDA_VERSION
+
+    args = _inputs(lengths, channels)
+    inputs = dict(zip(("x", "w", "b", "cu", "dy"), args))
+    before = snapshot(inputs)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        actual = assert_replays(lambda: _public(args), repeats=3)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+    _reference_check(actual, args, lengths)
+    assert_bitwise(inputs, before, "tuned tiled inputs")
+    assert_golden(f"causal_conv1d_se_tuned_{name}_bf16_cuda{CUDA_VERSION.major}_{CUDA_VERSION.minor}", inputs, actual)

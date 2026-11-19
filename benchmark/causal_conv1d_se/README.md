@@ -122,14 +122,15 @@ The focused tests check independent numerical references, causal boundaries, out
 
 From the repository root, `summarize_bitwise.py --input <bitwise-directory> --output <summary-directory>` exports per-output comparisons, missing cases, backend exclusions, and nondeterministic parameter reductions. Repeat `--input` for other GPUs. Its exit status is nonzero unless every expected case passes; inspect the exported statuses to distinguish backend exclusions from mismatches.
 
-The current FP32 NWH rounding profiles target the verified cuDNN 9.29 backend with NVRTC 13.4–13.6 and need revalidation when the backend or compiler changes. The full seven-architecture performance matrix has not been rerun after the modern-compiler correction; six historical backend performance losses remain open. Public autograd/FakeTensor routing, validation, and cache/workspace ownership also remain integration work.
+The current FP32 NWH rounding profiles target the verified cuDNN 9.29 backend with NVRTC 13.4–13.6 and need revalidation when the backend or compiler changes. The full seven-architecture performance matrix has not been rerun after the modern-compiler correction; six historical backend performance losses remain open. The public SE route below covers packed calls and a narrow dense BF16 contract. Other dense and fused variants still require public integration.
 
 ## Packed SE and persistent backward versus Cake
 
 `compare_backward.py` compares the integrated private SE launch with Cake on
 the same BF16 width-four SiLU backward workload. `backward_workloads.json`
 defines the eight packed cases; five have equal sequence lengths and also
-support dense mode. Use an idle SM103 GPU with Cake's CUDA 13.4 dependencies.
+support dense mode. Use an idle SM100/SM103 GPU for packed mode or SM103 for
+dense mode, with Cake's CUDA 13.4 dependencies.
 For each case, run three fresh processes:
 
 ```bash
@@ -142,7 +143,11 @@ done
 
 Change `--mode` to `dense` for a uniform batch. The output retains all 21
 randomized timing rounds, source hashes, compiler/GPU identity, selected
-schedule, and full-output errors against Cake. Compilation, allocations,
+schedule, an identical-Cake A/A timing control, and full-output errors against
+Cake. Eight fixed channels across all tokens are checked against an independent
+FP64 reference before timing. Repeat zero also poisons and overwrites all
+gradient outputs 100 times; atomic dense parameter sums use numerical checks,
+while the other outputs require identical bytes. Compilation, allocations,
 metadata construction and filter preparation precede timing. Dense returned
 gradient conversion is included. Each CUDA Graph replay contains 20 calls.
 The ratio is Cake time divided by SE time; values above one favor SE.

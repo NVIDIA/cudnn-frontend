@@ -8580,3 +8580,59 @@ The focused signed-zero regression command was:
 python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
   -m L0 -q -rs -x -k dense_signed_zero_tail_matches_parent
 ```
+
+## SM100 packed backward and parallel parameter reduction qualification
+
+The packed BF16 K4 SiLU persistent schedule now runs on SM100 and SM103. The tap-parallel final reducer retains each output's split-sum order; BF16 uses FP32 accumulation, and FP32 outputs retain FP64 accumulation. Small BF16 tiled calls avoid empty splits. The 256-channel, 4096–8191-token range uses one split per 64-token tile. Public dense SE remains SM103-only.
+
+Agent-run qualification on 2026-11-19 used exclusive B200 and B300 SXM6 AC GPUs, each with 148 SMs, driver 615.71.10, cuDNN 9.29.0.2, Torch 2.14.1+cu130, CuTe DSL 4.8.0, and the existing FE 1.32.0 binding build overlaid with this checkout. Both actual compiler flavors, CUDA 12.9 and 13.4, ran against the same CUDA 13 Torch/driver environment. This does not qualify a complete CUDA 12 deployment.
+
+| GPU | Selection | Compiler | Passed | Skipped | Runtime (s) |
+|---|---|---|---:|---:|---:|
+| B200 | broad | 12.9 | 405 | 23 | 989.25 |
+| B200 | golden-stress-record | 12.9 | 23 | 1 | 84.07 |
+| B200 | strict-goldens | 12.9 | 19 | 0 | 5.06 |
+| B200 | broad | 13.4 | 338 | 15 | 916.41 |
+| B200 | focused | 13.4 | 67 | 8 | 94.32 |
+| B200 | golden-stress-record | 13.4 | 23 | 1 | 82.47 |
+| B200 | strict-goldens | 13.4 | 19 | 0 | 5.10 |
+| B300 | broad | 12.9 | 413 | 15 | 438.85 |
+| B300 | device-repro | 12.9 | 1 | 0 | 33.65 |
+| B300 | golden-stress-record | 12.9 | 24 | 0 | 93.59 |
+| B300 | strict-goldens | 12.9 | 19 | 0 | 4.53 |
+| B300 | broad | 13.4 | 338 | 15 | 916.40 |
+| B300 | focused | 13.4 | 75 | 0 | 166.60 |
+| B300 | golden-stress-record | 13.4 | 24 | 0 | 93.42 |
+| B300 | strict-goldens | 13.4 | 19 | 0 | 5.06 |
+
+Broad runs cover the packed private and public interfaces, FP16/BF16/FP32, widths 2–8, identity/SiLU, strided tensors, empty sequences, initial/final history, autograd, full-graph AOT tracing, changed-offset CUDA Graph replay, numerical edge cases, and invalid-offset traps. The focused selection adds public persistent dispatch boundaries and 12 cancellation/strided-output checks that compare all BF16 parameter bytes with the original reducer. CUDA 12.9 broad runs also include the focused selection.
+
+The first B300 allocation became unavailable late in the CUDA 12.9 suite: 299 cases passed before a launch error, fresh processes then failed CUDA initialization, and NVML reported GPU Recovery Action: Reboot. The exact failing case and complete CUDA 12.9 suite passed on a replacement B300 with unchanged kernel sources. The failed attempt remains in the task artifacts; it is excluded from the accepted-run table.
+
+The 15 skipped broad cases per GPU/compiler require two devices and exercise the existing backend binding device-scope tests. B200 also skips eight dense-only focused cases and one dense staging-stress case because public dense SE remains SM103-only. These skips do not represent correctness failures. Actual multi-device SE execution and other admitted GPU families remain unverified.
+
+Golden review checked 76 records: 32 existing records were unchanged and 44 records were added for B200 runtime coverage and the tiny, tail, and ragged tuned paths. Independent references and input-mutation checks precede recording. Each of the four GPU/compiler combinations then passed 19 strict golden comparisons in a separate process with recording disabled. No existing golden was replaced.
+
+Each compiler lane ran four staging-stress cases on B200 and five on B300: 3,000 warm and 3,000 poisoned launches per case, 108,000 launches total. All output and partial-scratch bytes matched the cold reference. The unsafe control must reproduce before these tests pass. The persistent cases exercise roughly two CTAs per SM and stage reuse; the tiled cases cover BF16 K4, BF16 K8 double buffering, and FP32 K8. Zero observed mismatches are bounded evidence, not proof for every rendering.
+
+Generated PTX control-flow and SASS checks covered 18 persistent variants across the four GPU/compiler combinations. The async-proxy fence remains on every loop path before stage reuse, followed by a warp barrier. Correctness and synchronization qualification are separate from the warm backward performance measurements.
+
+The separate native-architecture benchmark compares 13 shared workloads in three fresh processes per source version on B200, B300, and a 208-SM Rubin device. B200 dense and all Rubin calls remain experimental raw-kernel comparisons; they do not expand public API admission or determinism support. Repository CI remains unrun for this unpublished branch.
+
+Run from `test/python`, with the intended compiler environment and an exclusive supported GPU:
+
+```bash
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_packed*.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_schedule_unit.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_reduction.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_semantic_api_unit.py \
+  causal_conv1d/torch/test_causal_conv1d_device_scope.py \
+  -n 0 -m L0 -q -rs -x -k 'not golden and not warm_stress'
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_packed_goldens.py \
+  -n 0 -m L0 -q -rs -x -k golden
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  -n 0 -m L0 -q -rs -x -k warm_stress
+```

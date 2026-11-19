@@ -346,22 +346,39 @@ packed_parameter_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.kernel
-def packed_parameter_reduce_fp32(partials: cute.Tensor, dw: cute.Tensor, db: cute.Tensor, width: cutlass.Constexpr):
-    """Accumulate FP32 gradient partials in FP64, parallel across filter taps."""
+def packed_parameter_reduce_parallel(partials: cute.Tensor, dw: cute.Tensor, db: cute.Tensor, width: cutlass.Constexpr):
+    """Reduce independent filter taps in parallel, preserving each sum order."""
     blocks_h = cute.ceil_div(dw.shape[0], 128)
     h = cutlass.Int64(cute.arch.block_idx()[0] % blocks_h) * 128 + cute.arch.thread_idx()[0]
     tap = cute.arch.block_idx()[0] // blocks_h
     if h < dw.shape[0]:
-        acc = cutlass.Float64(0)
+        accumulator = cutlass.Float64 if cutlass.const_expr(dw.element_type == cutlass.Float32) else cutlass.Float32
+        acc = accumulator(0)
         for split in cutlass.range(partials.shape[0]):
-            acc = acc + partials[cutlass.Int64(split), tap, h].to(cutlass.Float64)
+            acc = acc + partials[cutlass.Int64(split), tap, h].to(accumulator)
         if tap < width:
             dw[h, tap] = acc.to(dw.element_type)
         elif cutlass.const_expr(db is not None):
             db[h] = acc.to(db.element_type)
 
 
-packed_parameter_reduce_fp32.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+packed_parameter_reduce_parallel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def launch_packed_parameter_reduce(partials, dw, db, width: cutlass.Constexpr, silu: cutlass.Constexpr, fast: cutlass.Constexpr, stream: cuda.CUstream):
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    arch = CuTeDSL._get_dsl().get_arch_enum()
+    parallel = cutlass.const_expr(
+        dw.element_type == cutlass.Float32
+        or (fast and width == 4 and silu and dw.element_type == cutlass.BFloat16 and arch.major == 10 and arch.minor in (0, 3))
+    )
+    if cutlass.const_expr(parallel):
+        taps = width + (1 if cutlass.const_expr(db is not None) else 0)
+        packed_parameter_reduce_parallel(partials, dw, db, width).launch(grid=(cute.ceil_div(dw.shape[0], 128) * taps, 1, 1), block=(128, 1, 1), stream=stream)
+    else:
+        packed_parameter_reduce(partials, dw, db, width).launch(grid=(cute.ceil_div(dw.shape[0], 128), 1, 1), block=(128, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -1220,7 +1237,7 @@ def _packed_backward_rows(
     from cutlass.cutlass_dsl import CuTeDSL
 
     paired = cutlass.const_expr(
-        all((x.element_type.width == 16, width == 4, silu, CuTeDSL._get_dsl().get_arch_enum().major == 10, CuTeDSL._get_dsl().get_arch_enum().minor == 3))
+        all((x.element_type.width == 16, width == 4, silu, CuTeDSL._get_dsl().get_arch_enum().major == 10, CuTeDSL._get_dsl().get_arch_enum().minor in (0, 3)))
     )
     vector = 128 // x.element_type.width
     window = cute.make_rmem_tensor(cute.make_layout((width, vector), stride=(vector, 1)), cutlass.Float32)
@@ -1767,11 +1784,7 @@ def launch_packed_backward(
         packed_parameter_partials(x, cu, initial, dz, partials, width).launch(
             grid=(cute.ceil_div(x.shape[1], 128) * partials.shape[0], 1, 1), block=(128, 1, 1), stream=stream
         )
-    if cutlass.const_expr(dw.element_type == cutlass.Float32):
-        taps = width + (1 if cutlass.const_expr(db is not None) else 0)
-        packed_parameter_reduce_fp32(partials, dw, db, width).launch(grid=(cute.ceil_div(x.shape[1], 128) * taps, 1, 1), block=(128, 1, 1), stream=stream)
-    else:
-        packed_parameter_reduce(partials, dw, db, width).launch(grid=(cute.ceil_div(x.shape[1], 128), 1, 1), block=(128, 1, 1), stream=stream)
+    launch_packed_parameter_reduce(partials, dw, db, width, silu, fast, stream)
 
 
 @cute.kernel

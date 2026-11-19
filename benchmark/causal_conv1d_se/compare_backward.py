@@ -22,12 +22,19 @@ from cutlass.base_dsl.version_info import CUDA_VERSION
 from cudnn.causal_conv1d_cake.api import CausalConv1dPlan
 from cudnn.causal_conv1d_se import packed, dense
 from timing import measure
+from reference_checks import reference_check, replay_check
 
 
 def _hashes():
     package = Path(packed.__file__).parent
     files = list(package.glob("*.py")) + list((package.parent / "causal_conv1d_cake").glob("*.py"))
-    files += [package.parent / "_cake/_vendor/VENDORED_CAUSAL_CONV1D.json", Path(__file__), Path(__file__).with_name("backward_workloads.json")]
+    files += [
+        package.parent / "_cake/_vendor/VENDORED_CAUSAL_CONV1D.json",
+        Path(__file__),
+        Path(__file__).with_name("backward_workloads.json"),
+        Path(__file__).with_name("timing.py"),
+        Path(__file__).with_name("reference_checks.py"),
+    ]
     return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
 
 
@@ -47,8 +54,9 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     case = next(c for c in json.loads(Path(__file__).with_name("backward_workloads.json").read_text()) if c["id"] == args.case)
-    if torch.cuda.get_device_capability() != (10, 3):
-        raise RuntimeError("the persistent comparison is qualified on SM103")
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)) or (args.mode == "dense" and capability != (10, 3)):
+        raise RuntimeError("the comparison requires SM100/103 for packed mode or SM103 for dense mode")
     before = _hashes()
     _idle()
     lengths, channels = case["lengths"], case["channels"]
@@ -114,7 +122,10 @@ def main():
         error = ((a - ref).norm() / ref.norm().clamp_min(1e-30)).item()
         assert error <= 0.002, (name, error)
         errors[name] = error
+    reference_errors = reference_check(out, x, w, b, dy, lengths)
+    replay = replay_check(se, out, route) if args.repeat == 0 else None
     _idle()
+    aa = measure({"cake_a": cake, "cake_b": cake}, repeats=20, rounds=21)
     timing = measure({"cake": cake, "se": se}, repeats=20, rounds=21)
     _idle()
     assert before == _hashes(), "sources changed during benchmark"
@@ -128,9 +139,14 @@ def main():
         timing=timing,
         speedup=timing["cake"]["median_us"] / timing["se"]["median_us"],
         relative_l2=errors,
+        reference_errors=reference_errors,
+        replay=replay,
+        aa_control=aa,
         hashes=before,
         environment=dict(
             gpu=props.name,
+            capability=capability,
+            compiled_target=os.environ.get("CUTE_DSL_ARCH"),
             uuid=str(props.uuid),
             sms=props.multi_processor_count,
             torch=torch.__version__,

@@ -20,19 +20,25 @@ def _schedule(*args):
 @pytest.mark.parametrize(
     "tokens,channels,expected",
     [
-        (0, 2048, ("tiled", 64)),
-        (1, 2048, ("tiled", 64)),
+        (0, 2048, ("tiled", 1)),
+        (1, 2048, ("tiled", 1)),
         (8191, 2048, ("tiled", 64)),
         (8192, 2048, ("persistent", 37)),
         (8192, 768, ("persistent", 98)),
         (8192, 1032, ("tiled", 64)),
         (4095, 256, ("tiled", 64)),
-        (4096, 256, ("tiled", 37)),
+        (4096, 256, ("tiled", 64)),
+        (5155, 256, ("tiled", 81)),
+        (8191, 256, ("tiled", 128)),
+        (8192, 256, ("tiled", 64)),
+        (64, 256, ("tiled", 1)),
+        (2062, 1032, ("tiled", 33)),
         (2**31, 2048, ("tiled", 64)),
     ],
 )
-def test_measured_dispatch_boundaries(tokens, channels, expected):
-    assert _schedule(tokens, channels, 4, "torch.bfloat16", True, True, (10, 3), 148) == expected
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_measured_dispatch_boundaries(tokens, channels, expected, capability):
+    assert _schedule(tokens, channels, 4, "torch.bfloat16", True, True, capability, 148) == expected
 
 
 @pytest.mark.parametrize(
@@ -43,7 +49,7 @@ def test_measured_dispatch_boundaries(tokens, channels, expected):
         (4, "torch.float16", True, True, (10, 3)),
         (4, "torch.bfloat16", False, True, (10, 3)),
         (4, "torch.bfloat16", True, False, (10, 3)),
-        (4, "torch.bfloat16", True, True, (10, 0)),
+        (4, "torch.bfloat16", True, True, (10, 7)),
         (4, "torch.bfloat16", True, True, (9, 0)),
     ],
 )

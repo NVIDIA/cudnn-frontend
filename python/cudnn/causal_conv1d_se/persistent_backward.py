@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""SM103 K4 SiLU backward with persistent register windows and warp-local TMA.
+"""SM100/103 K4 SiLU backward with persistent register windows and warp-local TMA.
 
 Each warp owns one contiguous token range and 256 channels. Two eight-row
 stages feed four input rows and four pending dX rows per channel. Three halo
@@ -23,7 +23,7 @@ from cutlass.cute.nvgpu import cpasync
 from cudnn._cutlass_compat import SmemAllocator
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from .kernel import _nwh_load_vector
-from .packed_kernel import _sequence, _validate_offsets, packed_parameter_reduce, packed_parameter_reduce_fp32
+from .packed_kernel import _sequence, _validate_offsets, launch_packed_parameter_reduce
 
 
 @cute.jit
@@ -300,7 +300,7 @@ def launch_supported_backward(
     from cutlass.cutlass_dsl import CuTeDSL
 
     arch = CuTeDSL._get_dsl().get_arch_enum()
-    assert arch.major == 10 and arch.minor == 3, "persistent SE backward requires SM103"
+    assert arch.major == 10 and arch.minor in (0, 3), "persistent SE backward requires SM100 or SM103"
     assert fast and index32 and x.element_type.width == 16
     assert width == 4 and silu and initial is None and dfinal is None and dinitial is None
     # TMA requires a nonzero row pitch even when a static unit axis has stride zero.
@@ -312,10 +312,7 @@ def launch_supported_backward(
     persistent(ax, tx, ay, ty, x, w, b, cu, dy, dx, partials, dense).launch(
         grid=(cute.ceil_div(x.shape[1], 256) * partials.shape[0], 1, 1), block=(128, 1, 1), stream=stream
     )
-    if cutlass.const_expr(dw.element_type == cutlass.Float32):
-        packed_parameter_reduce_fp32(partials, dw, db, width).launch(grid=(cute.ceil_div(x.shape[1], 128) * 5, 1, 1), block=(128, 1, 1), stream=stream)
-    else:
-        packed_parameter_reduce(partials, dw, db, width).launch(grid=(cute.ceil_div(x.shape[1], 128), 1, 1), block=(128, 1, 1), stream=stream)
+    launch_packed_parameter_reduce(partials, dw, db, width, silu, fast, stream)
     if cutlass.const_expr(dense):
         # Retain the dense parent's padded-tail arithmetic, including signed zero.
         dense_tail_fixup(x, w, b, cu, dy, dx).launch(grid=(3 * (cu.shape[0] - 1) * cute.ceil_div(x.shape[1], 256), 1, 1), block=(32, 1, 1), stream=stream)
