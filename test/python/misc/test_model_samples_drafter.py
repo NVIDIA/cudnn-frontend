@@ -25,8 +25,10 @@
 
 No real checkpoint, tokenizer or template file is committed.  No GPU, no weights."""
 
+import contextlib
 import dataclasses
 import importlib.util
+import io
 import json
 import math
 import os
@@ -343,6 +345,30 @@ def _readme_blocks() -> tuple:
     return tuple(blocks)
 
 
+def _scripts(monkeypatch) -> tuple:
+    """The two scripts of the family as modules, ``(00_decode, 02_speculative_decode)``, for their own functions; what loading
+    them changes in the process leaves with the test."""
+    monkeypatch.setattr(sys, "path", list(sys.path))  # a script puts samples/models and its own folder on the path
+    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
+    loaded = []
+    for script in ("00_decode.py", "02_speculative_decode.py"):
+        spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_for_the_recipe", MODELS / "qwen_dense" / script)
+        loaded.append(importlib.util.module_from_spec(spec))
+        spec.loader.exec_module(loaded[-1])
+    return tuple(loaded)
+
+
+def _takes(script, flag: str) -> bool:
+    """Whether a script takes ``flag`` on a run with a checkpoint: it parses the flag with a value and does not end in its
+    usage error.  A flag that is declared to be refused by a sentence is not taken; neither is one the script does not have."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            script._arguments(["--model", "d", flag, "value"])
+        except SystemExit:
+            return False
+    return True
+
+
 def test_the_readmes_recipe_makes_a_draft_vocabulary_the_loader_reads(tmp_path, monkeypatch):
     """The recipe is run as it is written in the family README, on files the sample's own ``--dump-tokens`` writer wrote:
     every id the model read or wrote is listed, the rest of the list is the lowest ids not among them, and the loader
@@ -350,16 +376,16 @@ def test_the_readmes_recipe_makes_a_draft_vocabulary_the_loader_reads(tmp_path, 
     from model_samples.qwen_dense.drafter import RECIPE, DraftVocab
 
     assert RECIPE == 'samples/models/qwen_dense/README.md, "The checkpoint\'s drafter"' and "--dump-tokens FILE" in README.read_text()
-    # a flag the section names is a flag a script of this folder has: the list is the loader's argument until a script takes it
+    sample, speculative = _scripts(monkeypatch)
+    # a flag the section names is a flag a script of this folder TAKES.  A script that declares a flag to refuse it holds the flag's
+    # string as well: each script is asked, with the flag and a value, whether it ends in its usage error
     flags = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*[a-z]", _readme_section()))
-    scripts = "".join(path.read_text() for path in sorted((MODELS / "qwen_dense").glob("[0-9][0-9]_*.py")))
-    assert {"--model", "--dump-tokens"} <= flags and [flag for flag in sorted(flags) if f'"{flag}"' not in scripts] == []
-    assert "`draft_vocab=`" in _readme_section()
-    monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
-    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_for_the_recipe", MODELS / "qwen_dense" / "00_decode.py")
-    sample = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(sample)
+    assert {"--model", "--dump-tokens", "--draft-vocab", "--speculative-config"} <= flags
+    assert [flag for flag in sorted(flags) if not (_takes(sample, flag) or _takes(speculative, flag))] == []
+    assert (_takes(sample, "--draft-vocab"), _takes(speculative, "--draft-vocab")) == (False, True), "declared by both, taken by one"
+    assert (_takes(sample, "--speculative-config"), _takes(speculative, "--speculative-config")) == (False, True)
+    assert (_takes(sample, "--dump-census"), _takes(speculative, "--dump-census")) == (True, False) and not _takes(sample, "--no-such-flag")
+    assert "`draft_vocab=`" in _readme_section() and "`02_speculative_decode.py` takes the list as `--draft-vocab FILE`" in _readme_section()
     monkeypatch.chdir(tmp_path)
     one = [{"sequences": 1, "prompt": 0, "prompt_ids": [[248045, 846, 198, 70000]], "ids": [[70000, 70000, 12, 90000, 248046]]}]
     two = [
@@ -384,6 +410,26 @@ def test_the_readmes_recipe_makes_a_draft_vocabulary_the_loader_reads(tmp_path, 
 
     exec(compile(recipe.replace("rows = 65536", "rows = 3"), "the README's recipe with 3 rows", "exec"), {})
     assert json.loads((tmp_path / "draft_vocab.json").read_text()) == [846, 70000, 248045], "the three ids the dumps hold most often: 3, 5 and 4 times"
+
+
+def test_the_readmes_recipe_reads_the_ids_of_both_scripts(tmp_path, monkeypatch):
+    """The recipe as it is written, on one file the plain script's ``--dump-tokens`` writer wrote and one the speculative
+    script's wrote: the second holds the kept count of every step beside the same ``prompt_ids`` and ``ids``, and the
+    recipe lists what both runs read and wrote."""
+    sample, speculative = _scripts(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    plain = [{"sequences": 1, "prompt": 0, "prompt_ids": [[248045, 846, 198]], "ids": [[70000, 12, 248046]]}]
+    drafted = [{"sequences": 1, "prompt": 0, "prompt_ids": [[248045, 9, 198]], "ids": [[70000, 3, 90000, 5, 248046]], "kept": [2, 0]}]
+    assert (sample._dump("ids_1.json", "native", plain), speculative._dump("ids_2.json", "native", drafted, draft_tokens=5)) == ("", "")
+    written = json.loads((tmp_path / "ids_2.json").read_text())
+    assert (written["sample"], written["draft_tokens"], written["greedy"]) == ("qwen_dense/02_speculative_decode", 5, True)
+    assert written["runs"] == drafted and json.loads((tmp_path / "ids_1.json").read_text())["sample"] == "qwen_dense/00_decode"
+    recipe = _readme_blocks()[1]
+    exec(compile(recipe.replace("rows = 65536", "rows = 12"), "the README's recipe on the files of both scripts", "exec"), {})
+    listed = json.loads((tmp_path / "draft_vocab.json").read_text())
+    seen = {248045, 846, 198, 70000, 12, 248046, 9, 3, 90000, 5}
+    assert set(listed) == seen | {0, 1} and listed == sorted(listed), "the ids both runs read and wrote, then the lowest ids not among them"
+    assert "The files of both scripts of this folder are read alike" in " ".join(_readme_section().split())
 
 
 # --------------------------------------------------------------------------- a checkpoint on local disk, with a drafter
@@ -1712,8 +1758,9 @@ def test_the_readmes_speculative_loop_runs_on_the_checkpoint_the_loaders_call_de
     """The speculative loop of the family README, as it is written, with the names of the loader's call above it --
     ``checkpoint``, ``model``, ``drafter`` -- for a checkpoint on disk that is generated here.  The session that loads
     is handed the checkpoint, so the table the loop runs on and the drafter's weights are the file's, and the loop's
-    tokens are a plain session's on that checkpoint.  With ``checkpoint`` ``None`` -- what the sentence under the loop
-    says of the seeded pair -- a session draws seeded weights, and its drafter's with them."""
+    tokens are a plain session's on that checkpoint.  With ``checkpoint`` ``None`` a session draws seeded weights: handed
+    the drafter of the checkpoint it is refused by name where it is built, and the seeded pair -- what the sentence
+    under the loop says ``None`` is for -- runs the same lines."""
     pytest.importorskip("safetensors")
     from model_samples import Checkpoint, TextIO
     from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
@@ -1746,7 +1793,12 @@ def test_the_readmes_speculative_loop_runs_on_the_checkpoint_the_loaders_call_de
         ids = plain.step(ids)
         stream += plain.read(ids)
     assert len(new) >= 24 and new == stream, "the tokens of the loop are a plain session's on that checkpoint"
-    # handed no checkpoint, the same lines run on seeded weights: another table, and another drafter
+    # handed no checkpoint, the session that loads would draw seeded weights: the drafter of the checkpoint is refused there, by name
+    refusal = "the drafter was described from a checkpoint and the weights of this session are seeded: hand the session that loads that checkpoint "
+    with pytest.raises(ValueError, match=f"^{re.escape(refusal)}" + r"\(checkpoint=\), or build the drafter of the seeded model$"):
+        run(None)
+    # ... and the seeded pair runs the same lines with ``None``: another table, and another drafter
+    names.update(model=tiny, drafter=QwenDenseDrafter.seeded(tiny))
     seeded_plain, seeded, _ = run(None)
     assert seeded_plain.checkpoint.synthetic_weights and not torch.equal(seeded.weights.embedding, table)
     assert seeded.draft_weights.embedding is seeded.weights.embedding and not torch.equal(seeded.draft_weights.fc.codes, own.fc.codes)
@@ -1805,12 +1857,14 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     # what there is, and what does not run it
     said = (
         "**What is here today is its loader and its draft pass on reference blocks, both reached from the library**",
-        'A session that is handed the drafter runs its passes in front of every verify step (`Session.speculate`, in the section "The verify step").',
-        "No script of this folder drafts yet, and `00_decode.py` neither reads the drafter nor has a flag for it.",
+        'A session that is handed the drafter runs its passes in front of every verify step (`Session.speculate`, in the section "The verify step"), '
+        'and `02_speculative_decode.py` is the script that drafts with it (the section "Speculative decoding").',
+        "`00_decode.py` neither reads the drafter nor drafts: it declares `--speculative-config` and `--draft-vocab` to refuse them with the name of "
+        "that script.",
         "The drafter has a draft pass on reference blocks, reached from the library (`QwenDenseDrafter.body`, `propose`, `draft`): "
         "every block of it is a reference chain in every stack, and its embedding lookup is PyTorch's gather.",
-        "A session that is handed the drafter runs its passes (`Session.speculate`, in the next section); no script takes the list yet: "
-        "the loader takes it as `draft_vocab=`.",
+        "A session that is handed the drafter runs its passes (`Session.speculate`, in the next section); `02_speculative_decode.py` takes the list "
+        "as `--draft-vocab FILE`, the loader as `draft_vocab=`.",
         "The drafter's blocks are held to their definitions and to each other at one row and at several, and their proposals are reported against "
         "the model's own tokens on a checkpoint; they are not compared with another implementation of the drafter in this repository "
         "(one second evaluation of its network was made by hand, outside this repository: it is among the runs below).",
@@ -1844,10 +1898,11 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     # ... and no sentence of another section says that nothing drafts: a session with a drafter does, and no SCRIPT does
     whole = " ".join(README.read_text().split())
     elsewhere = (
-        "the step a session makes of it and the drafter's passes (**The speculative step**, below). No script runs either yet:",
+        "the step a session makes of it and the drafter's passes (**The speculative step**, below). `02_speculative_decode.py` runs the second "
+        '(the section "Speculative decoding"); both are reached from the helper layer as well,',
         "how many were kept; handed the drafter, the session drafts them itself (**The speculative step**, below).",
-        "**What is not here.** A script that drafts: the speculative step is reached from the library.",
-        "Kernels for the drafter: every block of its passes but the embedding lookup is a reference chain, so no rate is printed for such a run "
+        "**What is not here.** Kernels for the drafter: every block of its passes but the embedding lookup is a reference chain, so no rate is "
+        "printed for such a run "
         "and the kernel census holds no draft pass.",
         "Without a drafter nothing decides how many tokens to keep: the caller says it.",
     )

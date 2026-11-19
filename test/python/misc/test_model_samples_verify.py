@@ -3506,7 +3506,8 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     text = " ".join(part.split())
     assert text.startswith(
         "`Session.speculate` runs one step of speculative decoding: the drafter's passes on reference blocks, one verify step, one host read. "
-        "It is reached from the library; no script drafts yet. The drafter's cache is filled by one pass of the drafter per prompt position, "
+        "It is the step of `02_speculative_decode.py`, and is reached from the library too. The drafter's cache is filled by one pass of the "
+        "drafter per prompt position, "
         "at one row. The census records a step, not a prompt: these passes are in no section."
     )
     # the loop, as written: one load for two sessions, the drafter loaded by its session, one host read a step
@@ -3551,8 +3552,10 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         # what the lines beside the loop say of it (held above, by the test of a session alone and by the drafter module's run on a checkpoint)
         "the plain session reads the model's weights, once, and is what the checks hold the loop against (`tie_out.speculative_checks`);",
         "`checkpoint`, `model` and `drafter` are those of the loader's call in the section \"The checkpoint's drafter\".",
-        "The session that loads is handed the checkpoint (`checkpoint=`): a session that is handed none draws seeded weights, and its drafter's with "
-        "them -- `checkpoint` is `None` for the seeded pair (`QwenDenseDrafter.seeded(model)`).",
+        "The session that loads is handed the checkpoint (`checkpoint=`): a session that is handed none draws seeded weights, and the drafter of a "
+        "checkpoint is refused there, by name, where the session is built -- `checkpoint` is `None` for the seeded pair "
+        "(`QwenDenseDrafter.seeded(model)`).",
+        "A drafter of another model's widths is refused there as well, by the first width that differs.",
         "The first `plan_table` resolves every plan of the run and prints the plain session's table and one memory sentence for the whole run, "
         "the drafter in it; `session.plan_table()` prints the session's own three tables.",
         "A session with a drafter stands alone as well, without `share=`: it then loads the model itself.",
@@ -3635,12 +3638,13 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     assert (
         "handed the drafter (`drafter=`, one sequence) it runs the whole step of speculative decoding: `Session.speculate` is the drafter's passes on "
         "reference blocks, one verify step and one host read, and the caller says after that read how many drafted tokens it keeps. "
-        "It is reached from the library; no script drafts yet."
+        "The second sample, `02_speculative_decode.py`, runs that step for one request:"
     ) in area
     assert "for a session with a drafter also `drafter cache` and `draft proposals`" in area and "`test/python/misc/test_model_samples_verify.py`" in area
     guide_text = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     guide = " ".join(guide_text.split())
-    assert guide_text.rstrip().split("\n## ")[-1].startswith("What the speculative step taught\n"), "the last section of the guide"
+    sections = [section.split("\n", 1)[0] for section in guide_text.split("\n## ")]
+    assert sections[-2:] == ["What the speculative step taught", "What building the speculative script taught"], "the section, and the script's behind it"
     lessons = (
         "- The cut of a step follows the one host read.",
         "a cache kept beside the state would have carried the first prompt set into the second,",
@@ -3662,7 +3666,8 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "- A refusal stands in front of everything the refused call would leave.",
         "on a session with a drafter that is `speculate`, also where the session refuses a decode step or a count.",
         "- The names beside a snippet are run as the text says they may be.",
-        "a session that is not handed the checkpoint draws seeded weights, and the drafter's with them, without a word.",
+        "a session that was not handed the checkpoint drew seeded weights, and the drafter's with them, without a word "
+        "(it now refuses the drafter of a checkpoint by name).",
     )
     assert [sentence for sentence in lessons if sentence not in guide] == []
     assert len(WRONG_PASSES) == 8 and sampling.accepted([1, 2, 3], [2, 9, 9]) == 1
@@ -3727,3 +3732,96 @@ def test_the_traced_pass_of_a_session_with_a_drafter_runs_whole_steps(monkeypatc
     assert session.state is state and session.record is record and torch.equal(state.draft.k, cache) and record.accepted_all == scheduled
     own = tie_out.run_checks(session, prompt_tokens=5)
     assert own.ok and f"    {tie_out.DRAFTER_KERNELS}" in own.lines, "what a run says of the kernels of the passes, beside its kernel verdict"
+
+
+# ---------------------------------------------------------------- what a session refuses of a drafter that is not its own; a snapshot behind a keep
+def test_a_drafter_of_another_checkpoint_or_of_other_widths_is_refused_by_name():
+    """Two refusals of ``drafter=``, each by its own sentence where the session is built -- before a plan, a load or a pass.
+    A drafter that was described from a checkpoint drafts on that checkpoint's weights: on a session whose weights are
+    seeded -- the session that loads was handed no checkpoint, or a seeded one -- it would propose from rows of another
+    head than the model's.  And a drafter of another model's widths, which ended in a tensor-size error inside the
+    warm-up step of the load: the sentence names the first width that differs and both values."""
+    import dataclasses
+
+    from model_samples import Checkpoint, Session, TextIO
+    from model_samples.qwen_dense import Geometry, QwenDense
+
+    model = _tiny_model()
+    text, seeded = TextIO.synthetic(model.geometry.vocab), _seeded_drafter(model)
+    common = dict(stack="reference", device="cpu", draft_tokens=5)
+    # what "described from a checkpoint" is to a session: the drafter names the checkpoint's own tensors (a seeded one names none)
+    described = dataclasses.replace(seeded, label="checkpoint tiny (local)", prefix="mtp.", keys={"drafter.fc.weight": "mtp.fc.weight"})
+    assert seeded.keys == {} and described.keys
+    sentence = (
+        "the drafter was described from a checkpoint and the weights of this session are seeded: hand the session that loads that checkpoint "
+        "(checkpoint=), or build the drafter of the seeded model"
+    )
+    plain = Session(model, text, stack="reference", device="cpu")
+    drawn = Session(model, text, stack="reference", device="cpu", checkpoint=Checkpoint.synthetic(model, 3))
+    for more in ({}, {"share": plain}, {"share": drawn}, {"checkpoint": Checkpoint.synthetic(model, 3)}):
+        with pytest.raises(ValueError, match=f"^{re.escape(sentence)}$"):
+            Session(model, text, drafter=described, **common, **more)
+    # ... judged on the session that loads: one that was handed a checkpoint which is not seeded takes the drafter, and so does a sharer of it
+    on_disk = SimpleNamespace(synthetic_weights=False, label="checkpoint tiny (local)")
+    loads = Session(model, text, stack="reference", device="cpu", checkpoint=on_disk)
+    assert Session(model, text, drafter=described, checkpoint=on_disk, **common).drafter is described
+    assert Session(model, text, drafter=described, share=loads, **common).drafter is described
+    assert all(Session(model, text, drafter=seeded, **common, **more).drafter is seeded for more in ({}, {"share": plain})), "the seeded pair"
+    # a drafter of other widths: the first width that differs, by name, with both values
+    for field, value, said in (
+        ("hidden", 96, "its hidden is 96, the model's 64"),
+        ("mlp", 128, "its mlp is 128, the model's 96"),
+        ("vocab", 300, "its vocab is 300, the model's 272"),
+    ):
+        other = QwenDense(dataclasses.replace(model.geometry, **{field: value}), reductions=("tiny geometry",))
+        with pytest.raises(
+            ValueError, match=f"^{re.escape('the drafter was described for a model of other widths than this session' + chr(39) + 's: ' + said)}$"
+        ):
+            Session(model, text, drafter=_seeded_drafter(other), **common)
+    deeper = QwenDense(dataclasses.replace(model.geometry, layer_kinds=("linear_attention",) * 3 + ("full_attention",)), reductions=("tiny geometry",))
+    assert Session(deeper, text, drafter=seeded, **common).drafter is seeded, "the depth of a model is no width of its drafter: its one layer is its own"
+    assert isinstance(model.geometry, Geometry) and "layer_kinds" in vars(model.geometry)
+    # the refusals come before the two a session with a drafter had, in no plan: nothing was resolved for a refused session
+    with pytest.raises(ValueError, match=r"; got sequences=2$"):
+        Session(model, text, sequences=2, drafter=described, **common)
+
+
+def test_a_snapshot_behind_a_step_that_kept_drafted_tokens_gives_the_steps_behind_it():
+    """``snapshot`` / ``restore`` on a loop that KEEPS drafted tokens: the scheduled loop (``force=``) keeps 0, 1, 2, .. of
+    them in turn, so the state a snapshot is taken behind stands on a kept drafted token -- its kept count is 2, where the
+    loop on the seeded drafter's own proposals keeps 0 in every step.  The steps behind the restored state are the steps
+    that were behind it the first time: the pairs and the drafter's proposals.  A restore that lost the kept count would
+    go on from another row: the next window starts with another token."""
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
+    _, scheduled, pairs = _engine_loop(session, prompts, stream)
+    counts, steps = list(session.record.accepted_all), session.record.count
+    assert counts == scheduled and counts[:5] == [0, 1, 2, 3, 4] and steps >= 5
+    forces = session.record.inputs[:steps].view(steps, 1, 6)[:, :, 1:].clone()  # the drafted tokens every step verified
+    proposals = session.record.proposals[:steps].clone()
+    session.reset(fresh=False)
+    session.read(session.prefill(prompts))
+    for step in range(3):
+        session.speculate(forces[step])
+        session.accept(counts[step])
+    state = session.state
+    snap = state.snapshot()
+    assert snap["accepted"] == state.accepted == 2 and state.position == 5 + 1 + 2 + 3, "the state stands on the second drafted token of its last step"
+
+    def two_steps():
+        made = []
+        for step in (3, 4):
+            made.append(session.speculate(forces[step]))
+            session.accept(counts[step])
+        return torch.stack(made), session.record.proposals[session.record.count - 2 : session.record.count].clone()
+
+    behind, drafted = two_steps()
+    assert torch.equal(behind, torch.stack(pairs[3:5])) and torch.equal(drafted, proposals[3:5]), "the steps of the first run"
+    assert state.accepted == 4 and not torch.equal(state.draft.k, snap["draft"][0]), "two steps moved the count and the drafter's cache"
+    state.restore(snap)
+    assert state.accepted == 2 and state.position == 11 and torch.equal(state.draft.k, snap["draft"][0])
+    again, redrafted = two_steps()
+    assert torch.equal(again, behind) and torch.equal(redrafted, drafted), "behind the restored state: the same pairs, the same proposals"
+    # the control: the same snapshot without its kept count -- the step goes on from row 0 of the step before, another token and other proposals
+    state.restore(dict(snap, accepted=0))
+    wrong, misdrafted = two_steps()
+    assert wrong[0, 0, 0, 0] != behind[0, 0, 0, 0] and not torch.equal(misdrafted[0], drafted[0]), "what the kept count of a restore decides"

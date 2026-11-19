@@ -101,6 +101,9 @@ STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_STEPS = 16  # with a checkpoint the checks cover the first steps of every prompt
 TRACED_STEPS = 32
+SPECULATIVE = "02_speculative_decode.py"  # the script of this folder that drafts
+#: its two flags, each with what it takes: declared here so that each is refused by a sentence that names that script
+SPECULATIVE_FLAGS = (("--speculative-config", "JSON"), ("--draft-vocab", "list"))
 
 
 def _say(*lines, flush: bool = False) -> None:
@@ -259,7 +262,12 @@ def _arguments(argv):
         "made elsewhere; implies --check-kernels",
     )
     _perf_flags(parser)
+    for flag, takes in SPECULATIVE_FLAGS:
+        parser.add_argument(flag, metavar=takes.upper(), help=f"not this script: speculative decoding is {SPECULATIVE}, which takes the same {takes}")
     args = parser.parse_args(argv)
+    for flag, takes in SPECULATIVE_FLAGS:
+        if getattr(args, flag[2:].replace("-", "_")) is not None:
+            parser.error(f"{flag}: speculative decoding is the script {SPECULATIVE} of this folder, which takes the same {takes}")
     args.check_kernels = args.check_kernels or args.dump_census is not None
     # the limit of new tokens has two spellings; a sentence about it names the one that was typed
     args.limit_flag = "--max-new-tokens" if any(word.split("=")[0] == "--max-new-tokens" for word in argv) else "--max-tokens"
@@ -405,11 +413,12 @@ def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str
     reference stack, or one whose ``--provider`` flags put every judged block on its reference row, compared the reference
     with itself: it reports ``RAN``.  So does a run that was asked to check its kernels and could not observe them
     (``unobserved``: why): its other checks held, the one it was asked for did not run.  A failed check is ``FAIL`` whatever
-    else is true."""
-    if stack == "reference":
-        return "RAN reference stack (no provider checked)"
+    else is true, on the reference stack too (no run of this script checks anything there; a script of this folder that
+    does shares this answer)."""
     if not passed:
         return "FAIL"
+    if stack == "reference":
+        return "RAN reference stack (no provider checked)"
     if unobserved:
         return f"RAN {stack} stack (kernels not observed: {unobserved})"
     return "PASS" if judged else "RAN (no provider block was judged)"

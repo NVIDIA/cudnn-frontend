@@ -203,6 +203,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
     before the load to somebody who comes from a serving engine -- the decoding rule beside the checkpoint's own
     generation settings, the decode steps a prompt takes before the first new token -- states what is exact at that
     point, a rule and a count, never a time: the report measures the time.
+    A configuration object of a serving engine that selects what is launched is answered key by key in the same
+    module; a key it does not hold is an `ERROR` that names it. A key is read, accepted at the value that changes
+    nothing, or refused with its reason, and each key of its tables has its case in the same test module.
 19. **The performance mode states what it observed, never what it assumes.** One definition per statistic, written in
     the report file, with a host test of its arithmetic on constructed time stamps. Nothing but the step runs inside a
     timed request: no recorder, no call log, no profiler, no text; and no profiler pass runs in the process before its
@@ -954,11 +957,42 @@ A session that is handed the drafter runs the whole step of speculative decoding
   taken for a step's and the first-token line read 0.0 ms. And a refusal names the step of the session that was
   asked: on a session with a drafter that is `speculate`, also where the session refuses a decode step or a count.
 - The names beside a snippet are run as the text says they may be. The README's loop said "a described checkpoint"
-  and built no session with it: a session that is not handed the checkpoint draws seeded weights, and the drafter's
-  with them, without a word. The loop is now run as written on the seeded pair and on a checkpoint a test
+  and built no session with it: a session that was not handed the checkpoint drew seeded weights, and the drafter's
+  with them, without a word (it now refuses the drafter of a checkpoint by name). The loop is now run as written on the seeded pair and on a checkpoint a test
   generates and describes, and the table it runs on is held against the file.
 - What describes shared weights is read at the session that loaded them: a session that shares reads no checkpoint
   of its own, and a `seed=` says nothing about a checkpoint a session was handed. A drafter two links of `share=`
   behind the loader had nothing to load from, and the drafter of a model handed seed 11's checkpoint was drawn from
   seed 0 with every token still right, since the verify step decides the tokens; the load now follows `share=` to
   its end (`Session._weights_owner`) and draws a seeded drafter from the seed its checkpoint records.
+
+## What building the speculative script taught
+
+`02_speculative_decode.py` runs the speculative step for one request: its own loop, the speculative configuration of a
+serving engine key by key, the comparison with decode steps and the checks of every run. What building it showed:
+
+- A configuration that selects what is launched has no class "printed and ignored". A request body's unknown field is
+  named and ignored; an unknown key of a speculative configuration would change which kernels run. So its tables are
+  read, neutral and refused, a key outside them is an `ERROR`, and the keys that are read must be named: an engine's
+  default for a missing one selects another launch set. What a refused key holds is not printed back.
+- A script that compares where another checks nothing needs the verdict's order. `_verdict` answered the reference
+  stack before it looked at the checks; the speculative script compares its run with decode steps on that stack
+  too. A failed line is `FAIL` on every stack, in both scripts, and one host test holds the two functions to each
+  other and to the README's table over every input.
+- What the library's comparison cannot see, the script holds itself. The window of a step is the session's, so a
+  drafted token a loop emits reaches no line of `speculative_checks`; the ids of both arms do, and the script
+  compares them. Three wrong loops run through `main()`, on a host and on the device. A count kept beyond the
+  compared one also fails the drafter's two lines: the first pass of the next step takes the greedy token of a kept
+  row for the token that follows it, which is true of an accepted draft alone.
+- A default follows what it is the default of. A scheduled run needs enough new tokens to keep every count once: 17
+  at five drafted tokens, 38 at eight. A fixed default of 32 answered eight drafted tokens with an error about the
+  token count; now the default follows the schedule, the plan declines by its row, and a typed count is still held.
+- A flag that is declared in order to be refused is still a string of the script. A test that took a flag for a
+  script's own when its string stood in a script of the folder passed for `--draft-vocab` whatever the speculative
+  script did; it now asks each script whether it takes the flag.
+- A refusal belongs where the object is built. A checkpoint's drafter on a session that was handed no checkpoint
+  proposed from rows of a seeded head without a word; a drafter of another model's widths ended in a tensor size
+  inside the warm-up step. Both are sentences of `Session` now, before a plan.
+- A stand-in that rounds otherwise is not given the product's band. On the tiny geometry of the host tests the fp32
+  chains of the stand-in providers leave the seeded model's logits band at six tokens per sequence: the test of the
+  last line holds `PASS` at three drafted tokens and says, for the default, which line fails.

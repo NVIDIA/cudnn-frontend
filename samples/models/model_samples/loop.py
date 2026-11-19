@@ -173,7 +173,9 @@ class Session:
         feeds ``draft_tokens + 1`` tokens per sequence (``tokens`` is then that number and is left out here).  The
         drafted tokens are the caller's -- or, with ``drafter`` (the checkpoint's drafter, or the seeded model's:
         ``QwenDenseDrafter``), the drafter's: the session then runs its passes (``speculate``).  A drafter needs
-        ``draft_tokens`` and serves one sequence."""
+        ``draft_tokens`` and serves one sequence.  It drafts for this session's weights and widths: a checkpoint's
+        drafter is refused where the session that loads was handed none (its weights are seeded), one of another
+        model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if on_demand is not None and (share is None or stack != REFERENCE):
@@ -203,6 +205,20 @@ class Session:
             raise ValueError("a drafter drafts the tokens a session's verify steps check: drafter= needs draft_tokens=, the number it drafts a step")
         if drafter is not None and sequences != 1:
             raise ValueError(f"{ONE_SEQUENCE}; got sequences={sequences}")
+        if drafter is not None:  # ... and it drafts for the weights and the widths this session's steps run on: said here, before any plan
+            loaded = checkpoint if share is None else share.checkpoint  # of the session that loads: None draws seeded weights
+            if getattr(drafter, "keys", None) and (loaded is None or getattr(loaded, "synthetic_weights", False)):
+                raise ValueError(
+                    "the drafter was described from a checkpoint and the weights of this session are seeded: hand the session that loads "
+                    "that checkpoint (checkpoint=), or build the drafter of the seeded model"
+                )
+            ours, theirs = vars(model.geometry), vars(drafter.geometry)
+            width = next((name for name in ours if name != "layer_kinds" and theirs.get(name) != ours[name]), None)
+            if width is not None:
+                raise ValueError(
+                    f"the drafter was described for a model of other widths than this session's: its {width} is {theirs.get(width)!r}, "
+                    f"the model's {ours[width]!r}"
+                )
         self.model, self.text, self.sequences, self.stack, self.prefill_route = model, text, int(sequences), stack, prefill
         self.tokens = tokens  # per sequence, of a step of this session's plan
         self.draft_tokens = draft_tokens  # of a session that feeds its prompt through decode steps and verifies behind it; else None

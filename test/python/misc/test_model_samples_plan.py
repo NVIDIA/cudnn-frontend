@@ -382,8 +382,8 @@ def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
         run(1, 4)
 
 
-def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, environment=None):
-    """``main()`` of the sample script on stated device facts, up to its first load: no GPU is touched and nothing is loaded.
+def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, environment=None, script="00_decode.py"):
+    """``main()`` of a sample script on stated device facts, up to its first load: no GPU is touched and nothing is loaded.
     Returns ``(exit code, printed text)``; raises ``AssertionError("reached a load")`` when the run gets that far."""
     import importlib.util
 
@@ -402,7 +402,7 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     monkeypatch.setattr(model_samples, "check_environment", environment or matching)
     monkeypatch.setattr(model_samples.Session, "load", no_load)
     paths = list(sys.path)
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_on_stated_facts", MODELS / "qwen_dense" / "00_decode.py")
+    spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_on_stated_facts", MODELS / "qwen_dense" / script)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
@@ -868,14 +868,14 @@ def _line(checks, start):
     return next(line for line in checks.lines if line.strip().startswith(start))
 
 
-def _sample_script(monkeypatch):
-    """The sample script as a module, for its own functions; what loading it changes in the process leaves with the test."""
+def _sample_script(monkeypatch, script="00_decode.py"):
+    """A sample script as a module, for its own functions; what loading it changes in the process leaves with the test."""
     import importlib.util
     import os
 
     monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
     monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_functions", MODELS / "qwen_dense" / "00_decode.py")
+    spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_functions", MODELS / "qwen_dense" / script)
     sample = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sample)
     return sample
@@ -1289,3 +1289,141 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     behind = Session(model, text, share=plain, draft_tokens=5, **common)
     with_prompt, two_sessions = plain.plan_table([behind]), decode.plan_table([verify])
     assert asked(with_prompt) == asked(two_sessions), "one reserve and one more state in both runs"
+
+
+# --------------------------------------------------------------------------- the speculative script: its plan, its verdict, its help
+
+SPECULATIVE_SCRIPT = "02_speculative_decode.py"
+
+
+def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(monkeypatch, capsys):
+    """``main()`` of ``02_speculative_decode.py`` on stated device facts, up to its first load.  The plain plan, the verify
+    plan, the prompt's decode plan and the drafter's are printed with ONE memory sentence, the drafter in it, behind the
+    line that says what a prompt and a step are; a count of drafted tokens no verify row of the stack holds is declined
+    by that row's sentence -- a ``SKIP``, before any load; so is a GPU with less free memory than the sentence asks for."""
+    from model_samples import loop
+
+    def run(*arguments, **facts):
+        return _sample_main(monkeypatch, capsys, list(arguments), script=SPECULATIVE_SCRIPT, **facts)
+
+    with pytest.raises(AssertionError, match="reached a load"):
+        run()
+    said = capsys.readouterr().err
+    lines = said.splitlines()
+    before = "[02] prompt of 26 tokens = 26 decode steps and 25 passes of the drafter before the first token; then every step is 5 draft passes and "
+    before += "one verify step of 6 tokens, and keeps 1 to 6 of them"
+    first = next(index for index, line in enumerate(lines) if line.startswith("served by (decided before the load"))
+    assert lines.index(before) < first, "the rule and the counts, before the tables and so before the load"
+    assert said.count("\nserved by (decided before the load") == 4, "the plain plan, the verify plan, the prompt's decode plan, the drafter's"
+    assert loop.PROMPT_ROWS in lines and loop.DRAFTER_ROWS.format(calls=18) in lines
+    kinds = "a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt with its drafter, one after the other"
+    assert said.count("this stack needs about ") == 1 and f" GiB on this GPU for {kinds}; 80.0 GiB are free" in said, "one memory sentence for the run"
+    assert "[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method" in said
+    assert "[02] draft vocabulary seeded list (seed 0): 3,880 ids of the model's 15,520, in ascending order" in said
+    reductions = "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 "
+    assert reductions + "positions in turn and by another token behind them | the drafter runs on reference blocks" in lines[0]
+    # eight drafted tokens are nine tokens per sequence: no verify row of a provider stack holds them
+    eight = '{"method": "mtp", "num_speculative_tokens": 8, "use_local_argmax_reduction": true}'
+    code, out = run("--speculative-config", eight)  # the seeded default of new tokens follows the schedule: 38 here, said in the stop rule
+    last = out.splitlines()[-1]
+    assert code == 0 and last.startswith("[02] SKIP cudnn.GdnVerifyFused serves ") and last.endswith("this run has 1 sequences x 9 tokens per sequence"), last
+    with pytest.raises(AssertionError, match="reached a load"):  # seven are a row of the stack; and the reference stack holds any count
+        run("--speculative-config", eight.replace("8", "7"))
+    assert "then every step is 7 draft passes and one verify step of 8 tokens, and keeps 1 to 8 of them" in capsys.readouterr().err
+    with pytest.raises(AssertionError, match="reached a load"):
+        run("--speculative-config", eight, "--stack", "reference")
+    capsys.readouterr()
+    code, out = run("--speculative-config", eight, "--stack", "reference", "--force-tokens", "37")  # a count that was typed is held, before the plan
+    short = "[02] ERROR --force-tokens 37: the seeded run schedules its steps to keep 0 to 8 drafted tokens in turn and needs 38 new tokens to keep every count once"
+    assert code == 1 and out.splitlines() == [short]
+    code, out = run(free=5 * GIB)
+    skip = rf"^\[02\] SKIP stack fe-cublas needs about \d\.\d GiB on this GPU for {kinds}; 5\.0 GiB are free: free memory on this GPU"
+    assert code == 0 and re.match(skip, out.splitlines()[-1]), out.splitlines()[-1]
+    code, out = run(cc=(9, 0))
+    assert code == 0 and out.splitlines()[-1] == "[02] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is 9.0", out
+    code, out = run("--provider", "mlp.down=nothing")
+    assert code == 1 and out.splitlines()[-1].startswith("[02] ERROR --provider mlp.down=nothing: not a declared row"), out
+    # --provider selects its row in both kinds of step: an entry's key of one kind is declined by that row's sentence, a fallback key serves both
+    code, out = run("--provider", "linear_attention.step=fe.gdn_decode_fused")
+    assert code == 0 and out.splitlines()[-1] == "[02] SKIP cudnn.GdnDecodeFused serves rows 1-65,535; this run has 1 sequences x 6 tokens per sequence"
+    code, out = run("--provider", "linear_attention.step=fe.gdn_verify_fused")
+    assert code == 0 and out.splitlines()[-1].endswith("this run has 1 sequences x 1 tokens per sequence") and "[02] SKIP cudnn.GdnVerifyFused serves " in out
+    with pytest.raises(AssertionError, match="reached a load"):
+        run("--provider", "mlp.down=torch_ref.linear")
+    capsys.readouterr()
+
+
+def test_both_scripts_end_in_the_verdict_the_readme_states(monkeypatch):
+    """The last line of a run is one function per script, and the two answer alike over every input: a failed check is
+    ``FAIL`` on every stack -- the speculative script compares on the reference stack too --, then the reference stack's
+    ``RAN``, kernels that could not be observed, and ``PASS`` only where provider blocks were judged.  The area README's
+    table of last lines is those answers, with ``[NN]`` for a script's tag."""
+    plain, speculative = _sample_script(monkeypatch), _sample_script(monkeypatch, SPECULATIVE_SCRIPT)
+    assert (plain.TAG, speculative.TAG) == ("[00]", "[02]")
+    reason = "the profiler failed (no tracing library)"
+    said = {}
+    for stack in plain.STACKS:
+        for passed in (True, False):
+            for judged in (0, 6):
+                for unobserved in ("", reason):
+                    answer = plain._verdict(stack, passed, judged, unobserved)
+                    assert speculative._verdict(stack, passed, judged, unobserved) == answer, (stack, passed, judged, unobserved)
+                    said[(stack, passed, judged, bool(unobserved))] = answer
+    assert all(answer == "FAIL" for (_, passed, _, _), answer in said.items() if not passed), "a failed check, whatever else is true"
+    assert {answer for (stack, passed, _, _), answer in said.items() if passed and stack == "reference"} == {"RAN reference stack (no provider checked)"}
+    assert said[("native", True, 6, True)] == f"RAN native stack (kernels not observed: {reason})" == said[("native", True, 0, True)]
+    assert (said[("fe-cublas", True, 6, False)], said[("fe-cublas", True, 0, False)]) == ("PASS", "RAN (no provider block was judged)")
+    readme = (MODELS / "README.md").read_text()
+    table = readme.split("| last line | exit code | meaning |\n|---|---|---|\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    rows = [(row.split(" | ")[0].strip("| `"), row.split(" | ")[1]) for row in table]
+    assert rows == [
+        ("[NN] PASS", "0"),
+        ("[NN] SKIP <requirement>", "0"),
+        ("[NN] RAN reference stack (no provider checked)", "0"),
+        ("[NN] RAN (no provider block was judged)", "0"),
+        ("[NN] RAN <stack> stack (kernels not observed: <reason>)", "0"),
+        ("[NN] ERROR <reason>", "1"),
+        ("[NN] FAIL", "1"),
+    ]
+    stated = {row.replace("<reason>", reason)[5:] for row, _ in rows}
+    answers = {answer.replace(f"RAN {stack} stack (kernels", "RAN <stack> stack (kernels") for (stack, _, _, _), answer in said.items()}
+    assert answers <= stated and len(answers) == 5, "every answer of the two functions is a row of the table: all but SKIP and ERROR, which main() prints"
+    assert "`[NN]` is the script's tag: `[00]` for `00_decode.py`, `[02]` for `02_speculative_decode.py`." in " ".join(readme.split())
+
+
+def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkeypatch):
+    """The memory figures of the help text of ``02_speculative_decode.py``, per stack and GPU class, are the one memory
+    sentence of its run at the published widths on stated facts: a plain session and a session with the drafter (65,536
+    listed ids) at the default context length."""
+    from model_samples import Session, TextIO, blocks
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+
+    sample = _sample_script(monkeypatch, SPECULATIVE_SCRIPT)
+    model = QwenDense()
+    text, drafter = TextIO.synthetic(model.geometry.vocab), QwenDenseDrafter.seeded(model, rows=65536)
+
+    def asked(stack, cc):
+        monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls(cc, "stated device", 148, 0, 200 * GIB)))
+        common = dict(sequences=1, stack=stack, device="cuda:0", capacity=sample.serving_options.MAX_MODEL_LEN)
+        plain = Session(model, text, **common)
+        sentence = plain.plan_table([Session(model, text, draft_tokens=5, share=plain, drafter=drafter, **common)]).splitlines()[-1]
+        return round(float(sentence.split("needs about ", 1)[1].split(" GiB", 1)[0]))
+
+    figures = {(stack, cc): asked(stack, cc) for stack in ("fe-cublas", "native", "fe-entries") for cc in ((10, 0), (10, 3), (10, 7), (12, 0))}
+    assert [figures[("fe-cublas", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] == [61, 61, 61, 64]
+    assert [figures[("native", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] == [44, 48, 48, 64]
+    assert all(figures[("fe-entries", cc)] == figures[("native", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0)))
+    said = (
+        f"about {figures[('fe-cublas', (10, 0))]} GiB of free GPU memory on the stack fe-cublas (about {figures[('fe-cublas', (12, 0))]} GiB on compute "
+        f"capability 12.x), and on the stacks native and fe-entries for about {figures[('native', (10, 0))]} GiB on compute capability 10.0, about "
+        f"{figures[('native', (10, 3))]} GiB on the other 10.x classes, about {figures[('native', (12, 0))]} GiB elsewhere"
+    )
+    assert said in " ".join(sample.EPILOG.split()) and "a list of 65,536 ids and the default context length" in " ".join(sample.EPILOG.split())
+    # ... and the family README's section on the script states these figures, not others
+    readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split("\n## Speculative decoding\n", 1)[1].split("\n## ", 1)[0].split())
+    assert (
+        f"with a list of 65,536 ids and the default context length a run asks for about {figures[('fe-cublas', (10, 0))]} GiB free on the stack "
+        f"`fe-cublas` (about {figures[('fe-cublas', (12, 0))]} GiB on compute capability 12.x); on the stacks `native` and `fe-entries` for about "
+        f"{figures[('native', (10, 0))]} GiB on compute capability 10.0, about {figures[('native', (10, 3))]} GiB on the other 10.x classes, about "
+        f"{figures[('native', (12, 0))]} GiB elsewhere."
+    ) in readme
