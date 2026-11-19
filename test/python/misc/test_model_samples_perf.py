@@ -529,17 +529,15 @@ def test_the_text_of_a_checkpoint_is_written_once_behind_the_report(monkeypatch,
     outcome, lines, events, sink = _mode(monkeypatch, tmp_path / "ended", real=True, eos=[end])
     at = produced.index(end) + 1
     assert outcome.passed and outcome.produced[0] == produced, "the end token is ignored by the forced steps: the same ids"
-    assert (
-        _line(lines, "text out ") == f"text out              sequence 0: the text up to the first end token (token {at} of 7), goes to stdout after this report"
-    )
+    assert _line(lines, "text out ") == f"text out              sequence 0, to its first end token (token {at} of 7): goes to stdout after this report"
+    assert len("text out              sequence 0, to its first end token (token 257 of 257): goes to stdout after this report") <= 110
     assert len(sink.written) == 1 and sink.written[0].endswith("\n") and events.count("decoder") == 1
     assert outcome.data["text_path"]["tokens_written"] == at and outcome.data["text_path"]["cut_at_an_end_token"] is True
     assert lines.index(_line(lines, "text out ")) > lines.index(_line(lines, "report file ")), "behind the report"
     assert events.index("decoder") > max(index for index, event in enumerate(events) if event == "profiler"), "and behind every request"
     outcome, lines, events, whole = _mode(monkeypatch, tmp_path / "whole", real=True, eos=[271])  # an id the run does not produce
-    assert 271 not in produced and _line(lines, "text out ").startswith(
-        "text out              sequence 0: the text up to the first end token (no end token among the 7), "
-    )
+    assert 271 not in produced
+    assert _line(lines, "text out ") == "text out              sequence 0, all 7 new tokens (no end token): goes to stdout after this report"
     assert len(whole.written) == 1 and len(whole.written[0]) >= len(sink.written[0]) and outcome.data["text_path"]["tokens_written"] == 7
 
 
@@ -728,6 +726,7 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     assert "decode rate           not printed: the kernels of the traced steps are not the plan's" in perf.screen(forms[2])
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)  # and the lines a run printed are those of its data
     said = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
+    assert max(len(line) for line in said) <= 110, "the text out line behind the screen too"
     assert said[: len(perf.screen(outcome.data))] == perf.screen(outcome.data) and 24 <= len(perf.screen(outcome.data)) <= 30
 
 

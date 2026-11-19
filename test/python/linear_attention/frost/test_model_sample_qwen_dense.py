@@ -275,8 +275,9 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
     lines = out.splitlines()
     screen = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
-    screen = screen[: next(index for index, line in enumerate(screen) if line.startswith("report file ")) + 2]
+    screen = screen[: next(index for index, line in enumerate(screen) if line.startswith("[00] "))]  # the report and its text out line
     assert max(len(line) for line in screen) <= 110, max(screen, key=len)
+    assert any(line.startswith("report file           report.json") for line in screen) and any(line.startswith("text out  ") for line in screen)
     assert screen[1].startswith("record class          orientation, not a number of record: reduced model; ")
     assert "decode rate           not printed for a reduced model" in screen and not any("tokens/s" in line for line in screen)
     assert any(line.startswith("checks      blocks against the reference at positions 0-15, ") and line.endswith(": PASS") for line in screen)

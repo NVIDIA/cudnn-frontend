@@ -733,9 +733,9 @@ def run(
     stream = text.decoder(prompts[0])
     written = "".join(stream.push(token) for token in kept) + stream.close()
     if not real:
-        say(f"text out              sequence 0, {len(produced[0])} tokens (seeded weights: not language): {written[:48]!r}")
+        say("\n".join(_wrapped("text out", f"sequence 0, {len(produced[0])} tokens (seeded weights: not language): {written[:48]!r}")))
     else:
-        where = f"token {ended + 1} of {len(produced[0])}" if ended is not None else f"no end token among the {len(produced[0])}"
-        say(f"text out              sequence 0: the text up to the first end token ({where}), {sink.reported(written)}", flush=True)
+        upto = f"all {len(produced[0])} new tokens (no end token)" if ended is None else f"to its first end token (token {ended + 1} of {len(produced[0])})"
+        say("\n".join(_wrapped("text out", f"sequence 0, {upto}: {sink.reported(written)}")), flush=True)
         sink.write(written + "\n")
     return Outcome(passed, before.judged, unobserved, produced, unwritten, peaks, data)
