@@ -2864,8 +2864,8 @@ def _scenario(folder, **changes):
 def _tool(monkeypatch, tmp_path, **scenario):
     """The stand-in for the driver's tool in a folder of the test, found as ``nvidia-smi``, and a GPU id for it: the
     folder.  It is a real program, so the readings and the sampler's child process run as they do on a GPU.  The host's
-    load and its cores are stated too (5.5 on 50 cores): what a line of the screen has room for does not depend on the
-    host a test runs on."""
+    load and its cores are stated too -- 4.5 at the first reading behind this call and 5.5 at every later one, on 50
+    cores: what a line of the screen has room for does not depend on the host a test runs on."""
     from model_samples import observe
 
     folder = tmp_path / "driver tool"
@@ -2877,7 +2877,8 @@ def _tool(monkeypatch, tmp_path, **scenario):
     found = shutil.which
     monkeypatch.setattr(shutil, "which", lambda name, *more, **named: str(tool) if name == "nvidia-smi" else found(name, *more, **named))
     monkeypatch.setattr(observe, "target_of", lambda device: "GPU-00000000-stand-in")
-    monkeypatch.setattr(observe, "host_load", lambda: [5.5, 5.0, 4.5])
+    loads = iter([[4.5, 4.0, 3.5]])
+    monkeypatch.setattr(observe, "host_load", lambda: next(loads, [5.5, 5.0, 4.5]))
     monkeypatch.setattr(observe, "host_cores", lambda: 50)
     return folder
 
@@ -3111,7 +3112,7 @@ def test_own_process_is_not_another(monkeypatch, tmp_path):
     folder = _tool(monkeypatch, tmp_path, processes=[[os.getpid(), 400], [777, 900]], device=["000.00", "2000", "1310", "55"])
     read = observe.reading(str(folder / "nvidia-smi"), "GPU-00000000-stand-in", os.getpid(), "before the load")
     assert (read.reason, read.listed, read.own, read.others, read.used, read.clock, read.utilization) == ("", True, 400.0, {777: 900.0}, 1310.0, 2000.0, 55.0)
-    assert read.driver == "000.00" and read.load == [5.5, 5.0, 4.5] and read.seconds > 0.0
+    assert read.driver == "000.00" and read.load == [4.5, 4.0, 3.5] and read.seconds > 0.0
     data = read.data()
     assert (data["this_process_mib"], data["other_compute_processes"], data["other_memory_mib"], data["memory_agrees"]) == (400.0, 1, [900.0], False)
     assert [call["argv"] for call in _calls(folder)] == [
@@ -3204,8 +3205,9 @@ def test_clock_value_forms():
     for made in (watched(steady, lock=2000), watched(steady[:3], lock=2000), watched([], lock=2000), watched(steady, lock=2600, events=0b10)):
         assert "locked" not in observe.clocks_text(made) + " ".join(observe.clock_reasons(made)) + json.dumps(made)
     _says("area", f"`thin` where a timed request has fewer than {observe.LEAST_SAMPLES} clock samples; `no` with the reason.")
-    _says("area", f"`SM clock fell to <n> MHz`, a sample below {observe.FLOOR * 100:.0f} % of the median;")
+    _says("area", f"`SM clock fell to <n> MHz`, a sample below {observe.FLOOR * 100:.0f} % of the median where no lock was declared;")
     _says("area", f"a sample below {observe.FLOOR * 100:.0f} % or above {observe.CEILING * 100:.0f} % of a lock that was declared;")
+    assert round((1 - observe.FLOOR) * 100) == round((observe.CEILING - 1) * 100) == 3, "the family README: more than 3 % below or above it"
     _says("area", "That the driver saw the GPU idle in a sample is counted in the file and is no limit.", "the report never prints the word 'locked'.")
     _says("area", "`host load`: the host's load average over the last minute, read behind the last timed request, and the cores this process may use:")
     _says("guide", "A lock is the operator's declaration: it is printed as declared, held against the observed clock in both directions, and never set.")
@@ -3290,11 +3292,12 @@ def test_the_observer_is_called_outside_every_request(monkeypatch, tmp_path):
         assert abs(made["clock"]["samples"] - request["t_token_s"][-1] * 1e4) <= 2 and made["process_samples"] == made["clock_lines"], made["kind"]
     assert set(watched["requests"][0]["clock"]) == {"samples", "minimum_mhz", "median_mhz", "mean_mhz", "maximum_mhz", "share_below_declared_lock"}
     assert {"readings", "requests", "other_compute_processes", "clocks", "rules"} <= set(watched), "counts and extremes: no sample itself is in the file"
-    _says("area", "`observation` (every reading, the samples of every request as counts and extremes, the two verdicts of the `GPU`")
+    _says("area", "`observation` (every reading, the samples of every request behind the checked one as counts and extremes, the two verdicts of the `GPU`")
     _says("area", "it reads the GPU's list of compute processes, its memory in use, its utilisation and its SM clock, and the host's load.")
     gpu = lines.index("GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen")
     assert lines[gpu + 1] == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 50 cores"
-    assert watched["host"] == {"load": 5.5, "cores": 50} and watched["readings"][-1]["host_load"] == [5.5, 5.0, 4.5], "the load behind the last timed request"
+    assert [made["host_load"] for made in watched["readings"]] == [[4.5, 4.0, 3.5], [5.5, 5.0, 4.5]]
+    assert watched["host"] == {"load": 5.5, "cores": 50}, "the load over the last minute, of the reading behind the last timed request"
     environment = outcome.data["environment"]
     assert environment["driver"] == {"value": "000.00", "reason": None}
     assert list(environment["host"]["load"]) == ["before the warm-up request", "behind the last timed request"]
@@ -3355,15 +3358,9 @@ def test_the_sampler_is_a_child_process_whose_loops_end_with_its_pipe(monkeypatc
     files = [Path(sampler.folder.name) / name for name in ("clocks.csv", "processes.csv")]
     _wait(lambda: all(file.exists() and file.read_text(encoding="utf-8").count("\n") >= 8 for file in files))  # the test looks; the sampler does not
     assert sampler.clocks == [] and sampler.processes == [] and len(loops()) == 2
-    assert [call["argv"] for call in loops()] == [
-        [
-            "--id=GPU-00000000-stand-in",
-            "--query-gpu=timestamp,clocks.sm,power.draw,clocks_event_reasons.active",
-            "--format=csv,noheader,nounits",
-            "--loop-ms=5",
-        ],
-        ["--id=GPU-00000000-stand-in", "--query-compute-apps=timestamp,pid,used_memory", "--format=csv,noheader,nounits", "--loop-ms=5"],
-    ]
+    queries = ["--query-compute-apps=timestamp,pid,used_memory", "--query-gpu=timestamp,clocks.sm,power.draw,clocks_event_reasons.active"]
+    expected = [["--id=GPU-00000000-stand-in", query, "--format=csv,noheader,nounits", "--loop-ms=5"] for query in queries]
+    assert sorted(call["argv"] for call in loops()) == expected, "the two loops start side by side: either may write its line first"
     running = [call["pid"] for call in loops()]
     assert all(_running(pid) for pid in running)
     sampler.stop()
@@ -3447,7 +3444,9 @@ def test_not_observed_names_no_path(monkeypatch, tmp_path):
     assert outcome.passed and outcome.data["record"]["reasons"][-2:] == ["other processes not observed", "clocks not observed"]
     watched = outcome.data["observation"]
     assert outcome.data["environment"]["driver"] == {"value": None, "reason": "not observed (nvidia-smi ended with an error)"}
-    assert {made["reason"] for made in watched["readings"]} == {"nvidia-smi ended with an error"} and len(_calls(run)) == 2 + 2
+    assert {made["reason"] for made in watched["readings"]} == {"nvidia-smi ended with an error"}
+    asked = [call for call in _calls(run) if not call["argv"][-1].startswith("--loop-ms=")]
+    assert len(asked) == 2, "one call a reading: a tool that failed is not asked for its list too (the two loops of the sampler start beside the run)"
     printed = "\n".join(lines) + json.dumps(outcome.data)
     assert str(tmp_path) not in printed and "libnvidia" not in printed and "NVIDIA-SMI" not in printed and "Traceback" not in printed
     assert watched["other_compute_processes"]["reason"] in observe.REASONS and watched["clocks"]["reason"] in observe.REASONS
@@ -3534,7 +3533,7 @@ def test_clock_lock_is_a_declaration(monkeypatch, capsys, tmp_path):
         assert call["argv"][0] == "--id=GPU-00000000-stand-in" and call["argv"][1].startswith("--query-") and call["argv"][2] == "--format=csv,noheader,nounits"
         assert all(word.startswith("--loop-ms=") for word in call["argv"][3:])
     _says("family", "| `--perf-clock-lock MHZ` | none | the SM clock in MHz that an operator fixed outside the sample: a declaration.")
-    _says("family", "The report prints it beside the clock it observed and names it as a reason where a sample lies below or above it;")
+    _says("family", "The report prints it beside the clock it observed and names it as a reason where a sample lies more than 3 % below or above it;")
     _says("family", "the sample never sets a clock |")
     _says("area", "`--perf-clock-lock MHZ` declares a clock that an operator fixed outside the sample: the declaration is written into the report and held")
     _says("area", "against the clock the run observed, and nothing is set.")

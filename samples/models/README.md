@@ -294,18 +294,18 @@ this script decodes without a drafter. A report holds no speed-up, no baseline a
 **The `GPU` lines and the record class.** Another process on the GPU is the reason `shared GPU`. A process list the
 run could not read, or in which it did not find itself, or beside a device memory in use that its own does not
 explain, is `other processes not observed`: a list is never assumed to be empty. The clocks give
-`clocks not observed`; `too few clock samples`; `SM clock fell to <n> MHz`, a sample below 97 % of the median;
-`below the declared lock` and `above the declared lock`, a sample below 97 % or above 103 % of a lock that was
-declared; and `limit reported: <names>`, the driver's own names. That the driver saw the GPU idle in a sample is
-counted in the file and is no limit. A `not observed` names its reason, one of a closed list, and never a path; the
-report never prints the word 'locked'. None of this makes a run a controlled run while its launch sequence is not
-captured.
+`clocks not observed`; `too few clock samples`; `SM clock fell to <n> MHz`, a sample below 97 % of the median where
+no lock was declared; `below the declared lock` and `above the declared lock`, a sample below 97 % or above 103 % of
+a lock that was declared; and `limit reported: <names>`, the driver's own names. That the driver saw the GPU idle in
+a sample is counted in the file and is no limit. A `not observed` names its reason, one of a closed list, and never
+a path; the report never prints the word 'locked'. None of this makes a run a controlled run while its launch
+sequence is not captured.
 
 **The report file** (`--perf-report FILE`; default `report-<UTC time>.json` in the current directory, so one command
 can be run twice; a file that exists, or that another output flag of the run names, is an `ERROR` before the load:
 a report file is never written over) is strict JSON with units in its field names and no local path: `record` (the class and its reasons), `model`, `environment`,
-`observation` (every reading, the samples of every request as counts and extremes, the two verdicts of the `GPU`
-lines and the rules behind them), `kernels`, `protocol` (the counts, the prompt's hash, where the profiler first started), `checks` (every
+`observation` (every reading, the samples of every request behind the checked one as counts and extremes, the two
+verdicts of the `GPU` lines and the rules behind them), `kernels`, `protocol` (the counts, the prompt's hash, where the profiler first started), `checks` (every
 judged position with its reason, the lines of the checks, the three verdicts, the run's last line),
 `statistics` (per statistic its definition, what it corresponds to in a serving benchmark, its value and, where there
 are samples, their count, median, mean, extremes and percentiles), `raw` (every stamp of every request, relative to
