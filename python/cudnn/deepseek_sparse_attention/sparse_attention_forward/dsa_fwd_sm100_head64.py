@@ -11,13 +11,12 @@ This module uses public CuTe DSL APIs except for the small gather4
 bridge in ``_tma_gather4.py``.  The bridge is compile-time optional so the
 audited predicated cp.async path remains available with older DSL wheels.
 
-A CTA runs one query at a time and its twelve warps split the work by role.
+A CTA runs one query at a time; its twelve warps split the work by role.
 With gather4 the kernel is persistent: CTAs claim queries through cluster
-launch control and carry every pipeline across query boundaries, so a query's
-Q load, first gathers and first QK overlap the previous query's epilogue.  Q
-is staged by a regular public 1-CTA TMA copy and each 64-token sparse tile is
-gathered with 2-D TMA gather4 (or, one query per CTA, with safe, predicated
-128-bit cp.async copies as a compatibility fallback).
+launch control, and the next query's Q load, first gathers and first QK
+overlap the current query's epilogue.  Q is staged by a regular public 1-CTA
+TMA copy and each 64-token sparse tile is gathered with 2-D TMA gather4 (or,
+one query per CTA, with predicated 128-bit cp.async copies as a fallback).
 QK and the two 256-column PV halves are real 1-SM tcgen05
 MMAs; online-softmax statistics stay in registers while O persists in TMEM
 across sparse tiles.  Keeping validity separate from the zero-filled KV tile
@@ -159,8 +158,6 @@ class SparseAttentionForwardSm100Head64:
     NUM_WARPS = 12
     WARP_SIZE = 32
     THREADS_PER_CTA = NUM_WARPS * WARP_SIZE
-    # Issues the cluster-launch-control queries of the persistent schedule: the
-    # first KV producer warp, once it has issued a query's last gather.
     CLC_WARP = 4
     RESCALE_THRESHOLD_LOG2 = 6.0
     COPY_BITS = 128
@@ -201,10 +198,9 @@ class SparseAttentionForwardSm100Head64:
         # compatibility cp.async path keeps its proven two-stage allocation
         # and schedule.
         self.num_kv_stages = 3 if self.use_tma_gather4 else 2
-        # The persistent gather4 schedule stages the next query's Q in the KV
-        # stage of its tile 1 while the current query's O occupies the stage
-        # of its last tile; with fewer than three stages they are the same.
-        assert not self.use_tma_gather4 or self.num_kv_stages == 3, "the persistent gather4 schedule needs three KV stages"
+        # The next query's Q and the current query's O borrow two different KV
+        # stages.
+        assert not self.use_tma_gather4 or self.num_kv_stages >= 3, "the persistent gather4 schedule needs at least three KV stages"
         self.num_tail_stages = 1 if self.use_tma_gather4 else self.num_kv_stages
         self.num_kv_parts = 2
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.THREADS_PER_CTA)
@@ -232,7 +228,7 @@ class SparseAttentionForwardSm100Head64:
         softmax_scale: Float32 | float,
         stream: cuda.CUstream,
     ):
-        """Build and launch the head64 kernel on a grid of one CTA per query token."""
+        """Build and launch one regular-head64 CTA per query token."""
 
         self.element_dtype = q.element_type
         if const_expr(self.element_dtype not in (Float16, BFloat16)):
@@ -374,11 +370,9 @@ class SparseAttentionForwardSm100Head64:
         )
         q_tma_bytes = cute.size_in_bytes(self.element_dtype, q_nope_tma_layout)
 
-        # O is staged as eight SW128 tiles in a drained KV surface: the arena
-        # on the compatibility path, the KV stage of the query's last tile on
-        # the gather4 path.  Keep the tensor map rank three, (D, H, Tq), so
-        # every 64x64 store lowers to the rank-3 bulk TMA store form rather
-        # than a tiled-dimension 4-D map.
+        # Reuse a drained KV surface as an eight-tile SW128 output stage.  Keep
+        # the tensor map rank three, (D, H, Tq), so every 64x64 store lowers to
+        # the rank-3 bulk TMA store form rather than a tiled-dimension 4-D map.
         o_chunk_smem_layout = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3),
             0,
@@ -414,8 +408,8 @@ class SparseAttentionForwardSm100Head64:
         q_nope_elements = cute.cosize(q_nope_layout)
         tail_elements = cute.cosize(q_tail_layout) if self.head_dim == 576 else 0
         kv_nope_elements = cute.cosize(kv_nope_layout)
-        # Fast arena: [tail?][K0/K1/K2][independent FP32 P exchange]; each
-        # query stages Q and O in KV stages (see the query loop).
+        # Fast arena: [tail?][K0/K1/K2][independent FP32 P exchange]; Q and O
+        # borrow KV stages.
         # Fallback arena: [Q][K0/K1], including each D=576 tail.  A constexpr
         # expression keeps the nested SharedStorage extent code-read-time
         # constant; staged ``if`` assignments are not visible to that type.
@@ -462,10 +456,8 @@ class SparseAttentionForwardSm100Head64:
         assert SharedStorage.size_in_bytes() <= 227 * 1024, f"H64 shared storage is {SharedStorage.size_in_bytes()} bytes"
         self.shared_storage = SharedStorage
 
-        # The gather4 kernel is persistent through cluster launch control: the
-        # grid has one CTA per query and resident CTAs claim the queries of
-        # CTAs that have not started.  The compatibility kernel runs one query
-        # per CTA on the same grid.
+        # One CTA per query; with gather4, resident CTAs also claim the queries
+        # of unstarted CTAs (cluster launch control).
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((cute.size(q.shape[0]), 1, 1), (1, 1, 1))
         grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
         self.kernel(
@@ -683,8 +675,7 @@ class SparseAttentionForwardSm100Head64:
             self.num_kv_stages,
             self.num_kv_parts,
             self.num_tail_stages,
-            # Gather4 loads the D=576 Q tail with warps 10-11; the fallback
-            # waits its own cp.async group instead of this barrier.
+            # q_tail_ready arrivals: gather4 copies the D=576 Q tail with warps 10-11.
             2 * self.WARP_SIZE if self.use_tma_gather4 else 4 * self.WARP_SIZE,
         )
         if const_expr(self.use_tma_gather4):
@@ -706,8 +697,7 @@ class SparseAttentionForwardSm100Head64:
                 clc_response_ptr,
             )
             work_tile = tile_sched.initial_work_tile_info()
-        # TMEM allocation ends with a CTA-wide named barrier, which also
-        # publishes the barrier initialization above.
+        # The TMEM allocation barrier also publishes the barrier inits above.
         tmem.allocate(self.TMEM_COLUMNS)
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(Float32)
@@ -721,12 +711,9 @@ class SparseAttentionForwardSm100Head64:
             q_tmem_tail_layout,
         )
 
-        # With gather4 the kernel is persistent: a CTA runs every query it
-        # claims through cluster launch control, one iteration of this loop per
-        # query, and every pipeline continues across queries.  ``tile_base``
-        # counts the CTA's tiles before the current query; each barrier ring
-        # takes its stage and phase from that per-CTA tile count.  The
-        # compatibility kernel runs one iteration, for its CTA's own query.
+        # One iteration per claimed query.  Barrier rings take stage and phase
+        # from the per-CTA tile count, tile_base + the query's tile.  The
+        # cp.async fallback runs one iteration.
         has_query = Int32(1)
         tile_base = Int32(0)
         query_count = Int32(0)
@@ -744,16 +731,10 @@ class SparseAttentionForwardSm100Head64:
             # Stage the regular Q tile with an ordinary 1-CTA TMA.  Sparse KV
             # remains on the audited predicated gather path below.
             #
-            # Gather4 stages a query's Q-NoPE in a KV stage that its first two
-            # tiles do not use: the stage of its tile 2 for the CTA's first
-            # query, otherwise the stage of its tile 1, because the stage of
-            # tile 2 then holds the previous query's O until its write-back.
-            # The producer waits for the S2T (q_s2t_done) before it writes the
-            # Q stage.  For a later query the stage was last read by
-            # PV(tile_base - 2), which completed before WG0 published
-            # so_ready(tile_base - 1); warp 8 issues the Q TMA after waiting
-            # that so_ready.  q_s2t_done is a two-deep ring indexed by query
-            # parity.
+            # Gather4 stages Q in tile 2's KV stage for a CTA's first query,
+            # else in tile 1's (tile 2's holds the previous O).  That stage's
+            # last reader, PV(tile_base - 2), is done once warp 8 has seen
+            # so_ready(tile_base - 1).
             q_slot = query_count % Int32(2)
             q_slot_phase = (query_count // Int32(2)) % Int32(2)
             if const_expr(self.use_tma_gather4):
@@ -776,8 +757,7 @@ class SparseAttentionForwardSm100Head64:
                 cute.group_modes(sQ_nope_mma, 0, cute.rank(sQ_nope_mma)),
                 cute.group_modes(tAgQ, 0, cute.rank(tAgQ)),
             )
-            # Gather4 issues the Q load from warp 8, at the start of its
-            # iteration, i.e. after issuing the previous query's last PV.
+            # Gather4: warp 8 loads Q right after the previous query's last PV.
             if warp_idx == Int32(8 if self.use_tma_gather4 else 0):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(q_ready_mbar_ptr, q_tma_bytes)
@@ -789,8 +769,8 @@ class SparseAttentionForwardSm100Head64:
                 # destination steps, which violate the bulk TMA load alignment contract.
                 # Copy the small 8-KiB tail with aligned cp.async chunks;
                 # the following S2T path and QK descriptor remain source-exact.
-                # Gather4 copies it with the two tail warps; it lives in the P
-                # surface, which the previous query's last PV must have read.
+                # Gather4: warps 10-11 copy it into the P surface after the
+                # previous query's last PV.
                 q_tail_threads = (2 if self.use_tma_gather4 else 4) * self.WARP_SIZE
                 q_tail_tidx = tidx - Int32(10 * self.WARP_SIZE) if self.use_tma_gather4 else tidx
                 if q_tail_tidx >= Int32(0) and q_tail_tidx < Int32(q_tail_threads):
@@ -827,8 +807,7 @@ class SparseAttentionForwardSm100Head64:
                     if const_expr(self.head_dim == 576):
                         cute.arch.mbarrier_wait(q_tail_ready_mbar_ptr, query_count % Int32(2))
                     cute.arch.fence_view_async_shared()
-                # TMEM Q is rewritten after the previous query's last QK:
-                # tcgen05.mma and tcgen05.cp from one thread run in issue order.
+                # Earlier QKs read TMEM Q first: tcgen05 runs in issue order.
                 tcgen05_fence_after_thread_sync()
                 copy_q_128xk_f16_s2t_cta1(sQ_dual_nope, tQ_nope)
                 if const_expr(self.head_dim == 576):
@@ -868,14 +847,10 @@ class SparseAttentionForwardSm100Head64:
                 kv_stage_elements = kv_stage_elements + Int32(cute.cosize(kv_tail_layout) if self.head_dim == 576 else 0)
             if const_expr(self.use_tma_gather4):
                 if warp_idx >= Int32(4) and warp_idx < Int32(8):
-                    # Before its first write to the Q stage, the producer waits
-                    # for the Q copy to TMEM; before its first write to the
-                    # stage holding the previous query's O, for that O's
-                    # write-back.  A query too short to reach either stage
-                    # waits after its last tile.  Both barriers are two-deep
-                    # rings indexed by query parity: a producer that falls
-                    # behind cannot be lapped, because a slot's next
-                    # completion needs the next query's gathers.
+                    # Wait for the Q copy and the previous O write-back before
+                    # first writing their stages (after the last tile if never
+                    # reached).  Both are two-deep rings by query parity, so a
+                    # lagging producer cannot be lapped.
                     o_stage = (tile_base + Int32(self.num_kv_stages - 1)) % Int32(self.num_kv_stages)
                     o_slot = (query_count + Int32(1)) % Int32(2)
                     o_slot_phase = ((query_count - Int32(1)) // Int32(2)) % Int32(2)
@@ -919,10 +894,8 @@ class SparseAttentionForwardSm100Head64:
                             warp_idx,
                         )
                         producer_tile = producer_tile + Int32(1)
-                    # Claim the next query only now, close to when this CTA can
-                    # start it: claiming at the start of a query assigns queries
-                    # in start order and unbalances ragged lengths.  The
-                    # response still arrives before warp 8 issues the last PV.
+                    # Claim here, not at query start: early claims unbalance
+                    # ragged lengths.
                     if warp_idx == Int32(self.CLC_WARP):
                         clc_pipeline.producer_acquire(clc_producer_state)
                         tile_sched.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer_state))
@@ -1417,8 +1390,7 @@ class SparseAttentionForwardSm100Head64:
             if warp_idx < Int32(4):
                 sO_query = sO
                 if const_expr(self.use_tma_gather4):
-                    # Stage O in the KV stage of the query's last tile.  The
-                    # producer waits for its write-back before reusing it.
+                    # Stage O in the last tile's KV stage.
                     o_query_ptr = sKV_base_ptr + cute.assume(final_stage * Int32(kv_nope_elements), divby=kv_nope_elements)
                     sO_query = cute.make_tensor(cute.recast_ptr(o_query_ptr, o_full_smem_layout.inner), o_full_smem_layout.outer)
                 self._epilogue_o_tma(
@@ -1571,8 +1543,7 @@ class SparseAttentionForwardSm100Head64:
     ):
         """Copy the D=576 SW64 tail with two dedicated warps.
 
-        ``tile_idx`` selects the query's index slots; ``global_tile`` counts the
-        CTA's tiles across queries and selects the stage phase.
+        ``tile_idx`` is the query's tile; ``global_tile``, the CTA's tile count, selects the phase.
         """
 
         if warp_idx >= Int32(10) and warp_idx < Int32(12):
@@ -1721,20 +1692,19 @@ class SparseAttentionForwardSm100Head64:
     ):
         """Issue one QK tile after the prior score readers release TMEM P.
 
-        ``tile_idx`` counts the query's tiles; ``global_tile`` counts every tile
-        this CTA has issued, across queries, and selects the barrier phases.
+        ``tile_idx`` is the query's tile; ``global_tile``, the CTA's tile count, selects the phases.
         """
 
         if warp_idx == Int32(8):
             # The score accumulator has one physical TMEM stage.  Tile k may
             # overwrite it only after all 128 WG0 threads have completed their
-            # synchronous Ld32x32 reads for the CTA's previous tile.
+            # synchronous Ld32x32 reads for tile k-1.
             if global_tile > Int32(0):
                 cute.arch.mbarrier_wait(p_free_mbar, (global_tile - Int32(1)) % Int32(2))
 
-            # On gather4, S2T completion both orders Q before the query's first
-            # QK and publishes the aliased Q-NoPE stage to its producer.  The
-            # fallback keeps its CTA-synchronized same-warp instruction order.
+            # On gather4, S2T completion both orders Q before QK0 and publishes
+            # the aliased Q-NoPE stage to the producer.  The fallback keeps
+            # its original CTA-synchronized same-warp instruction ordering.
             if const_expr(self.use_tma_gather4):
                 if tile_idx == Int32(0):
                     cute.arch.mbarrier_wait(q_s2t_done_mbar, q_phase)
@@ -1822,9 +1792,7 @@ class SparseAttentionForwardSm100Head64:
     ):
         """Consume one QK result and materialize its online-softmax P tile.
 
-        ``global_tile`` counts the CTA's tiles across queries; the P store waits
-        for the PV of the CTA's previous tile, which may belong to the previous
-        query.
+        ``global_tile`` is the CTA's tile count; the P store waits for the PV of the previous one.
         """
 
         new_mi = old_mi
@@ -1986,11 +1954,9 @@ class SparseAttentionForwardSm100Head64:
         global_tile: Int32,
         warp_idx: Int32,
     ):
-        """Accumulate both 64x256 P@V halves into TMEM O.
+        """Accumulate both 64x256 P@V halves into persistent TMEM O.
 
-        ``tile_idx`` counts the query's tiles (tile zero clears O);
-        ``global_tile`` counts the CTA's tiles across queries and selects the
-        handoff phase.
+        ``tile_idx`` 0 clears O; ``global_tile``, the CTA's tile count, selects the phase.
         """
 
         if warp_idx == Int32(8):
@@ -2134,7 +2100,7 @@ class SparseAttentionForwardSm100Head64:
         tidx: Int32,
         warp_idx: Int32,
     ):
-        """Stage O from TMEM in the given shared-memory surface and emit eight TMA stores."""
+        """Stage O in ``sO`` and emit eight TMA stores."""
 
         tcgen05_fence_after_thread_sync()
         head_idx = tidx % Int32(self.NUM_HEADS)

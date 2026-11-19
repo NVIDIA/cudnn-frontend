@@ -396,13 +396,7 @@ def test_DSA_sparse_attention_forward_executes_all_frozen_instances(num_heads, h
     ids=["D512", "D576", "D512-indexer512"],
 )
 def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_launches(head_dim, indexer_topk):
-    """Carry the H64 rings, Q stage, O staging and per-query statistics across the queries one CTA claims.
-
-    Several queries per SM, with lengths from empty to past the indexer prefix,
-    reach both the in-query and the end-of-query Q/O stage handoffs.  The
-    batched launch must equal, byte for byte, launches small enough that every
-    CTA runs a single query, and must match the reference.
-    """
+    """A persistent H64 launch (several queries per CTA) equals, byte for byte, launches of one query per CTA."""
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100-family GPU required")
@@ -472,8 +466,7 @@ def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_l
     torch.testing.assert_close(batched["max_logits"], ref_max, atol=1e-6, rtol=2.01 / 65536)
     torch.testing.assert_close(batched["lse"], ref_lse, atol=1e-6, rtol=2.01 / 65536)
     if indexer_topk:
-        # The reference's +inf sentinel for rows shorter than the prefix is
-        # outside the forward contract; compare the rows that reach it.
+        # Rows shorter than the prefix are outside the forward contract.
         full_prefix = topk_length >= indexer_topk
         torch.testing.assert_close(batched["lse_indexer"][full_prefix], ref_lse_indexer[full_prefix], atol=1e-6, rtol=2.01 / 65536)
 
