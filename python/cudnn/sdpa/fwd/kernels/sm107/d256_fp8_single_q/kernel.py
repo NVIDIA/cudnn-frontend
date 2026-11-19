@@ -202,6 +202,7 @@ from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts, mma_ts_step, desc_opaque
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 from cudnn.frost.tile_dsl.mask import (
     apply_mask_chunk,
     MASK_NONE,
@@ -364,7 +365,7 @@ if PAIR and not (
     and SPLIT_KV == 1
     and SOFTMAX_F16
     and Q_TS
-    and KV_LOOKAHEAD in (3, 4)
+    and KV_LOOKAHEAD == 4
     and CFG.STAGES_KV >= KV_LOOKAHEAD
     and not CFG.EPILOGUE_GATE
     and not CFG.PACK_GQA
@@ -372,7 +373,7 @@ if PAIR and not (
     and CFG.TILE_N == 128
 ):
     raise ValueError(
-        f"{__name__}: the two-warpgroup pipeline serves the dense unsplit cta_mma=2 HALF-softmax build with Q in TMEM, lookahead 4 and STAGES_KV >= 5"
+        f"{__name__}: the two-warpgroup pipeline serves the dense unsplit cta_mma=2 HALF-softmax build with Q in TMEM, lookahead 4 and STAGES_KV >= 4"
     )
 if Q_TS and not PAIR:
     raise ValueError(f"{__name__}: Q_IN_TMEM is wired on the two-warpgroup pipeline only")
@@ -502,7 +503,7 @@ def _kernel(
     # rather than passing None, so the GridConstant never has to be Optional;
     # CFG.EPILOGUE_GATE (and the None-specialized gate_tensor below) fold the
     # feature in or out.  _host calls _kernel POSITIONALLY, so inserting here is
-    # safe; seq_q_lens_addr stays the last parameter.
+    # safe; the defaulted tail (seq_q_lens_addr ...) stays last.
     tma_gate_desc: cutlass.GridConstant[tmap.TensorMap],
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
@@ -529,6 +530,7 @@ def _kernel(
     # atomicMax fold out under const_expr(amax_o_tensor is not None), the same
     # way a None lse_tensor folds the Stats store out.
     amax_o_tensor: Optional[cute.Tensor],
+    rz_arg: cutlass.Int32,  # release-zero of tile_dsl.consume; _host passes the literal 0
     seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
     thd_origins: Optional[cute.Tensor] = None,
@@ -540,6 +542,7 @@ def _kernel(
         exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
+    rz = release_zero(rz_arg)
 
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
@@ -841,6 +844,7 @@ def _kernel(
                     mb_p_tail=mb_p_tail,
                     alpha_smem=alpha_smem,
                     stats_smem=stats_smem,
+                    rz=rz,
                 )
             else:
                 _softmax_warp_group_pair(
@@ -868,6 +872,7 @@ def _kernel(
                     mb_p_tail=mb_p_tail,
                     alpha_smem=alpha_smem,
                     stats_smem=stats_smem,
+                    rz=rz,
                 )
         else:
             _softmax_warp_group(
@@ -921,6 +926,7 @@ def _kernel(
             stats_smem=stats_smem,
             mb_o_ready=mb_o_ready,
             mb_pv_done=mb_pv_done,
+            rz=rz,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -1347,14 +1353,14 @@ def _tmaldg_warp_group(
     # cga2 drain — trailing empty mbar arrives from leader's multicast commits
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         if cutlass.const_expr(PAIR):
-            for _ks in cutlass.range_constexpr(CFG.STAGES_KV):
+            for _ in cutlass.range_constexpr(CFG.STAGES_KV):
                 bars.mb_k_empty[kv_state_K.idx].wait(kv_state_K.phase)
                 kv_state_K = advance(kv_state_K, CFG.STAGES_KV)
-            for _ks in cutlass.range_constexpr(CFG.STAGES_KV):
+            for _ in cutlass.range_constexpr(CFG.STAGES_KV):
                 bars.mb_v_empty[kv_state_V.idx].wait(kv_state_V.phase)
                 kv_state_V = advance(kv_state_V, CFG.STAGES_KV)
         else:
-            for _ks in cutlass.range_constexpr(CFG.STAGES_KV):
+            for _ in cutlass.range_constexpr(CFG.STAGES_KV):
                 bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
                 kv_state = advance(kv_state, CFG.STAGES_KV)
@@ -1615,6 +1621,7 @@ def _mma_warp_group(
             elect_p = nvvm.elect_sync()
             if cutlass.const_expr(PAIR):
                 mb_pv_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                bmm2_done_mma_phase_pair = bmm2_done_mma_phase_pair ^ cutlass.Int32(1)
             else:
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
         else:
@@ -2341,6 +2348,7 @@ def _softmax_warp_group_pair(
     mb_p_tail,
     alpha_smem,
     stats_smem,
+    rz,
 ):
     """PAIR softmax warpgroup ``softmax_half``: the kv steps of its parity, dense loop only.  Per step k:
     wait S(k) -> load it (two LDTM.red x64) -> release the slot (mb_s_free) -> store P(k-2) into the slot's front (mb_p_ready)
@@ -2363,7 +2371,6 @@ def _softmax_warp_group_pair(
     OTHER_SLOT_PP = cutlass.Int32((1 - softmax_half) * CFG.TILE_M)
     softmax_wg_base = CFG.SOFTMAX_WG0_BASE if softmax_half == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base * 32)
-    ZERO_CHUNK = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CHUNK)), cutlass.Float32)
     ZERO_RED = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(CHUNK + 1)), cutlass.Int32)
 
     q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
@@ -2477,7 +2484,7 @@ def _softmax_warp_group_pair(
             # Publish the running max first: the other warpgroup's step k+1 waits for it.
             if ~is_last:
                 softmax_exchange.subview(MY_SLOT_PP + tid_in_wg).store(total_max)
-                mb_softmax_max[softmax_half].arrive()
+                consume_then_arrive(mb_softmax_max[softmax_half], prev_max, rz)
             exp_input = cutlass.Float32(arith.select(first_live.ir_value(), NEG_INF.ir_value(), (prev_max - total_max).ir_value()))
             alpha = cute.math.exp2(exp_input, fastmath=True)
             exp_shift = cutlass.Float32(arith.select(tile_dead.ir_value(), cutlass.Float32(0.0).ir_value(), total_max.ir_value()))
@@ -2525,8 +2532,8 @@ def _softmax_warp_group_pair(
         my_sum_pp = total_sum[0] + total_sum[1]
         stats_smem.subview(cutlass.Int32((2 + softmax_half) * CFG.TILE_M) + tid_in_wg).store(my_sum_pp)
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=32 * 2 * CFG.SOFTMAX_WG_WARPS)
-        other_sum_pp = stats_smem.subview(cutlass.Int32((2 + (1 - softmax_half)) * CFG.TILE_M) + tid_in_wg).load()
         if ((bounds.right - cutlass.Int32(1)) & cutlass.Int32(1)) == cutlass.Int32(softmax_half):
+            other_sum_pp = stats_smem.subview(cutlass.Int32((2 + (1 - softmax_half)) * CFG.TILE_M) + tid_in_wg).load()
             final_sum_pp = my_sum_pp + alpha_own_last * other_sum_pp
             stats_smem.subview(tid_in_wg).store(total_max)
             stats_smem.subview(cutlass.Int32(CFG.TILE_M) + tid_in_wg).store(final_sum_pp)
@@ -2589,6 +2596,7 @@ def _correction_warp_group(
     stats_smem=None,
     mb_o_ready=None,
     mb_pv_done=None,
+    rz=None,
 ):
     """Qwen correction warp: bootstrap-only-lo-parity bmm2_ready arrive,
     per-parity bmm2_done_phase_pair, LSE+sink fold lives here (not softmax),
@@ -2639,7 +2647,8 @@ def _correction_warp_group(
         if cutlass.const_expr(PAIR):
             # Step l: alpha(l) is 1 by construction -- consume it and hand O to PV(l).  Per step k > l: alpha(k) from SMEM, rescale O
             # (after PV(k-1) completed) only when some row of the warp needs it, then hand O to PV(k) through mb_o_ready.
-            # mb_pv_done[(k-1) & 3] is consumed per step whether or not it was waited on.
+            # Every PV completion phase is observed exactly once: before the rescale when a row needs it, otherwise behind the
+            # O-ready arrive (off the MMA's issue path), so the stage's next commit always follows a waited phase.
             if bounds.right > bounds.left:
                 lo_parity_rt = bounds.left & cutlass.Int32(1)
                 alpha_phase_lo = (alpha_full_phase_pair >> lo_parity_rt) & cutlass.Int32(1)
@@ -2651,19 +2660,19 @@ def _correction_warp_group(
             else:
                 bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
-                parity_prev_rt = (kv_loop - cutlass.Int32(1)) & cutlass.Int32(1)
                 parity_cur_rt = kv_loop & cutlass.Int32(1)
                 tmem_base_iter = tmem_ptr_i32.load()
                 alpha_phase_cur = (alpha_full_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
                 mb_alpha_full[parity_cur_rt].wait(alpha_phase_cur, spin=SPIN_RING_WAITS)
                 alpha_full_phase_pair = alpha_full_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
                 alpha = alpha_smem.subview(parity_cur_rt * cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
-                mb_alpha_empty[parity_cur_rt].arrive()
+                consume_then_arrive(mb_alpha_empty[parity_cur_rt], alpha, rz)
                 alpha_is_one = alpha == cutlass.Float32(1.0)
                 all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
                 pv_stage_prev = (kv_loop - cutlass.Int32(1)) & cutlass.Int32(_O_READY_STAGES - 1)
+                pv_phase_prev = (pv_done_phase_pair >> pv_stage_prev) & cutlass.Int32(1)
                 if ~all_alpha_one:
-                    mb_pv_done[pv_stage_prev].wait((pv_done_phase_pair >> pv_stage_prev) & cutlass.Int32(1), spin=SPIN_RING_WAITS)
+                    mb_pv_done[pv_stage_prev].wait(pv_phase_prev, spin=SPIN_RING_WAITS)
                     nvvm.tcgen05_fence(kind=nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
@@ -2679,6 +2688,8 @@ def _correction_warp_group(
                 pv_done_phase_pair = pv_done_phase_pair ^ (cutlass.Int32(1) << pv_stage_prev)
                 nvvm.tcgen05_fence(kind=nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 mb_o_ready[kv_loop & cutlass.Int32(_O_READY_STAGES - 1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                if all_alpha_one:
+                    mb_pv_done[pv_stage_prev].wait(pv_phase_prev, spin=SPIN_RING_WAITS)
         else:
             if bounds.right > bounds.left:
                 # Bootstrap arrive on ONE parity (qwen-specific — NOT both)
@@ -2750,6 +2761,7 @@ def _correction_warp_group(
             # The final (max, sum) came through SMEM (the TMEM stats columns are Q's on this build).
             total_max_scaled = stats_smem.subview(tid_in_wg).load()
             total_sum = stats_smem.subview(cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
+            consume_then_arrive(bars.mb_stat_empty, (total_max_scaled, total_sum), rz)
         else:
             stats_addr_epi = tmem_base_epi + cutlass.Int32(LAYOUT.STATS_OFF)
             stats_vec_epi = nvvm.tcgen05_ld(
@@ -2760,7 +2772,7 @@ def _correction_warp_group(
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             total_max_scaled = stats_vec_epi[0]
             total_sum = stats_vec_epi[1]
-        bars.mb_stat_empty.arrive()
+            bars.mb_stat_empty.arrive()
         stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
         row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + tid_in_wg % cutlass.Int32(HEADS_PER_TILE)
@@ -3301,6 +3313,7 @@ def _host(
         descale_v_t,
         scale_o_t,
         amax_o_tensor,
+        cutlass.Int32(0),
         seq_q_lens_addr,
         o_partial_f32,
         thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,

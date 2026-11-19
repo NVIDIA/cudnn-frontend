@@ -190,3 +190,202 @@ def test_d192_cga1_causal_public_record(dtype):
             bufs[name].fill_(float("nan"))
         capture.replay()
         check()
+
+
+def _d256_pair_problem(*, b, hq, hkv, sq, skv, dtype=torch.float8_e4m3fn, seed=0, zero_qk=False):
+    """BHSD per-tensor FP8 operands for the standalone adapter, with unit scales (the operating point of the e2e half test).
+    ``zero_qk``: Q = K = 0, so every running max stays put and no step rescales O (the PV-completion ring wraps unobserved by a rescale)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    draw = lambda h, s: (torch.randn(b, h, s, 256, device="cuda", generator=gen) * 0.5).to(dtype)  # noqa: E731
+    q8, k8, v8 = draw(hq, sq), draw(hkv, skv), draw(hkv, skv)
+    if zero_qk:
+        q8.zero_()
+        k8.zero_()
+    return q8, k8, v8
+
+
+def _d256_pair_reference(q8, k8, v8, *, causal=False, bottom_right=False):
+    """fp64 softmax(scale Q K^T) V and the natural-log LSE; a keyless row (bottom-right causal, S_q > S_kv) is O = 0 / LSE = -inf."""
+    rep = q8.shape[1] // k8.shape[1]
+    scores = (q8.double() @ k8.double().repeat_interleave(rep, 1).transpose(-1, -2)) * 256**-0.5
+    if causal:
+        sq, skv = scores.shape[-2:]
+        scores = scores.masked_fill(torch.ones(sq, skv, device=scores.device, dtype=torch.bool).triu(1 + (skv - sq if bottom_right else 0)), float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    out = torch.softmax(scores, dim=-1) @ v8.double().repeat_interleave(rep, 1)
+    out = torch.where(torch.isinf(lse).unsqueeze(-1), torch.zeros_like(out), out)
+    return out.float(), lse.float()
+
+
+def _d256_pair_adapter(q8, k8, v8, out, lse, **kwargs):
+    """The two-warpgroup body: per-tensor FP8 D256 at cga 2 with HALF softmax through the standalone adapter."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    api = SdpaFwdDslSm100(
+        sample_q=q8,
+        sample_k=k8,
+        sample_v=v8,
+        sample_o=out,
+        sample_lse=lse,
+        scale_softmax=256**-0.5,
+        pertensor_fp8=True,
+        has_amax_o=False,
+        cga=2,
+        softmax_precision=cudnn.data_type.HALF,
+        **kwargs,
+    )
+    assert api.check_support()
+    api.compile()
+    cfg = api._k_mod.CFG
+    assert api._k_mod.__file__.endswith("sm107/d256_fp8_single_q/kernel.py")
+    assert (cfg.SOFTMAX_WARPGROUPS, cfg.Q_IN_TMEM, cfg.CTA_MMA, cfg.KV_LOOKAHEAD) == (2, 1, 2, 4)
+    workspace = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+
+    def launch():
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, lse_tensor=lse, workspace=workspace)
+
+    return api, launch
+
+
+def _d256_pair_check(out, lse, q8, k8, v8, *, causal=False, bottom_right=False):
+    ref, ref_lse = _d256_pair_reference(q8, k8, v8, causal=causal, bottom_right=bottom_right)
+    err = (out.float() - ref).abs().max().item()
+    assert err <= 0.1 * ref.abs().max().item(), f"max err {err} vs the fp64 reference"
+    torch.testing.assert_close(lse, ref_lse, atol=0.02, rtol=0.02, equal_nan=False)
+
+
+def test_d256_pair_admission():
+    """Explicit cga=2 reaches the pair on the HALF-softmax dense leg only; the default width and the public record stay at cga 1."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, supported_cgas_for
+
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=True) == (1,)
+    q8, k8, v8 = _d256_pair_problem(b=1, hq=2, hkv=2, sq=64, skv=256)
+    out = torch.empty_like(q8, dtype=torch.bfloat16)
+    lse = torch.empty(1, 2, 64, device="cuda", dtype=torch.float32)
+    common = dict(sample_q=q8, sample_k=k8, sample_v=v8, sample_o=out, sample_lse=lse, scale_softmax=256**-0.5, pertensor_fp8=True, has_amax_o=False)
+    for declined in (
+        dict(cga=2),
+        dict(cga=2, softmax_precision=cudnn.data_type.HALF, split_kv=2),
+        dict(cga=2, softmax_precision=cudnn.data_type.HALF, pack_gqa=True),
+    ):
+        with pytest.raises(NotImplementedError, match="per-tensor FP8 2-CTA pair"):
+            SdpaFwdDslSm100(**common, **declined).check_support()
+    default = SdpaFwdDslSm100(**common, softmax_precision=cudnn.data_type.HALF)
+    assert default.check_support()
+    default.compile()
+    assert (default._k_mod.CFG.CTA_MMA, default._k_mod.CFG.SOFTMAX_WARPGROUPS) == (1, 1)
+
+
+_PAIR_CASES = {
+    "odd-steps": dict(sq=200, skv=896),
+    "even-steps": dict(sq=200, skv=1024),
+    "no-rescale-ring-wrap": dict(sq=200, skv=1024, zero_qk=True),
+    "causal": dict(sq=1024, skv=1024, is_causal=True),
+    # 256 cluster tiles, three of every four Q tiles keyless: the first wave's CTAs finish their empty tiles early and take live
+    # ones through the cluster launch control, so one CTA pair runs empty-to-live and live-to-empty handoffs.
+    "bottom-right-empty-tiles": dict(sq=1024, skv=256, is_causal=True, causal_bottom_right=True, b=8, hq=8, hkv=4),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("case", list(_PAIR_CASES))
+def test_d256_pair_body_reference_and_replay(dtype, case):
+    """The two-warpgroup body against an fp64 reference, then byte-identical replay under concurrent GPU work.  The zero-Q/K case
+    never rescales O (the PV-completion ring wraps without a rescale wait); the bottom-right case runs the first three Q tiles of
+    every head keyless ahead of the live one, with more cluster tiles than the device holds at once."""
+    from determinism_utils import assert_replays
+
+    spec = dict(_PAIR_CASES[case])
+    sq, skv = spec.pop("sq"), spec.pop("skv")
+    zero_qk = spec.pop("zero_qk", False)
+    causal, bottom_right = spec.get("is_causal", False), spec.get("causal_bottom_right", False)
+    b, hq, hkv = spec.pop("b", 2), spec.pop("hq", 4), spec.pop("hkv", 2)
+    q8, k8, v8 = _d256_pair_problem(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dtype=dtype, zero_qk=zero_qk)
+    out = torch.empty(b, hq, sq, 256, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(b, hq, sq, device="cuda", dtype=torch.float32)
+    _, launch = _d256_pair_adapter(q8, k8, v8, out, lse, **spec)
+    launch()
+    torch.cuda.synchronize()
+    _d256_pair_check(out, lse, q8, k8, v8, causal=causal, bottom_right=bottom_right)
+
+    def run():
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        launch()
+        return {"o": out, "lse": lse}
+
+    assert_replays(run)
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group("gpu_exclusive")
+def test_d256_pair_refilled_stage_warm_stress():
+    """The alpha, running-max and final-stat slots of the two-warpgroup body are refilled inside one launch."""
+    from warm_stress import StressCase, assert_warm_stress
+
+    b, hq, sq, skv = 64, 16, 200, 1024
+    q8, k8, v8 = _d256_pair_problem(b=b, hq=hq, hkv=hq, sq=sq, skv=skv)
+    out = torch.empty(b, hq, sq, 256, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(b, hq, sq, device="cuda", dtype=torch.float32)
+    _, launch = _d256_pair_adapter(q8, k8, v8, out, lse)
+    launch()
+    torch.cuda.synchronize()
+    _d256_pair_check(out, lse, q8, k8, v8)
+    # 2048 CTAs (two per 256-row cluster tile); eight KV steps refill each parity's alpha and running-max slot three times per tile.
+    assert_warm_stress(
+        StressCase("SM107 D256 per-tensor FP8 two-warpgroup body", launch, {"o": out, "lse": lse}, thread_blocks=b * hq * 2, refills_per_launch=3),
+        warm=256,
+        poisoned=256,
+    )
+
+
+def test_d256_pair_release_dependence(tmp_path):
+    """Every shared-memory slot credit of the two-warpgroup body (alpha, running max, final stats) is an arrive whose address
+    depends on the loaded words through the release-zero argument (Rule 11), pinned on the PTX of a fresh compile."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    import warm_stress
+
+    source = textwrap.dedent("""
+        import faulthandler, sys
+        from pathlib import Path
+        faulthandler.dump_traceback_later(280, exit=True)
+        sys.meta_path[:] = [f for f in sys.meta_path if "editable" not in str(f).lower()]
+        sys.path[:0] = sys.argv[1:3]
+        import cudnn, torch
+        assert Path(cudnn.__file__).resolve().parent.parent == Path(sys.argv[1]).resolve()
+        from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+        q8 = torch.zeros(1, 1, 256, 256, device="cuda", dtype=torch.float8_e4m3fn)
+        k8 = torch.zeros(1, 1, 256, 256, device="cuda", dtype=torch.float8_e4m3fn)
+        out = torch.empty(1, 1, 256, 256, device="cuda", dtype=torch.bfloat16)
+        lse = torch.empty(1, 1, 256, device="cuda", dtype=torch.float32)
+        api = SdpaFwdDslSm100(
+            sample_q=q8, sample_k=k8, sample_v=k8, sample_o=out, sample_lse=lse, scale_softmax=256**-0.5,
+            pertensor_fp8=True, has_amax_o=False, cga=2, softmax_precision=cudnn.data_type.HALF,
+        )
+        assert api.check_support()
+        api.compile()
+        assert api._k_mod.CFG.SOFTMAX_WARPGROUPS == 2
+        """)
+    test_root = Path(__file__).resolve().parents[2]
+    source_root = Path(cudnn.__file__).resolve().parent.parent
+    env = dict(
+        os.environ,
+        CUTE_DSL_DUMP_DIR=str(tmp_path),
+        CUTE_DSL_KEEP="ptx,cubin",
+        CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1",
+        CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0",
+    )
+    result = subprocess.run([sys.executable, "-c", source, str(source_root), str(test_root)], env=env, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    bodies = [p.read_text() for p in tmp_path.glob("*.ptx") if "tcgen05.mma" in p.read_text()]
+    assert len(bodies) == 1, f"expected one attention PTX, found {len(bodies)}"
+    # Four dependent credits: the running-max exchange of each softmax warpgroup (one word), the alpha slot (one word) and the
+    # final-stat slot (two words).
+    sites = warm_stress.assert_release_dependence(bodies[0], sites=4, words=1)
+    assert sorted(site.loaded_registers for site in sites if site.dependent) == [1, 1, 1, 2]

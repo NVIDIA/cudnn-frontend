@@ -53,7 +53,7 @@ class CfgD256:
     S_SLOTS: int = 1
     BIAS_MCAST_CTAS: int = 1
     Q_IN_TMEM: int = 0
-    # Steps the QK stream runs ahead of the PV stream (1 on the single-warpgroup body, 3 on the two-warpgroup pair build).
+    # Steps the QK stream runs ahead of the PV stream (1 on the single-warpgroup body, 4 on the two-warpgroup pair build).
     KV_LOOKAHEAD: int = 1
     TILE_M: int = 128
     TILE_N: int = 128

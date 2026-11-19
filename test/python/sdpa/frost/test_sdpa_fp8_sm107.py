@@ -1324,7 +1324,7 @@ _AMAX_ZERO = 1e-3
 def _load_d256(**params):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
-    # cta_mma=1 is what the adapter pins for FP8 d256 (supported_cgas_for((256, 256), fp8=True) == (1,)); dtype_o overridable.
+    # cta_mma=1 is the adapter's default width for FP8 d256 (the two-warpgroup pair runs on an explicit cga=2); dtype_o overridable.
     tp = dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
     tp.update(params)
     return _load_sm100_kernel_module(_D256, TemplateParams(**tp), fp8=True, pertensor=True, rubin=True)
@@ -2042,7 +2042,8 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     """d256 MXFP8 on cc 10.7 serves both CTA widths and runs the 2-CTA pair on the dense unsplit legs, where it measured
     8-13 % faster (dense) / 6-7 % (causal) than one CTA with a bitwise-identical O; THD (the pair's untested arm),
     split-KV and paged graphs stay at cga1.  ONE predicate (config_sm100.d256_mxfp8_pair_leg) drives the row domain,
-    the ranking and the standalone adapter -- pin all three, plus the per-tensor FP8 row, which keeps cga1."""
+    the ranking and the standalone adapter -- pin all three.  The per-tensor FP8 row keeps cga1 by default; the adapter admits an
+    explicit cga=2 for its dense unsplit HALF-softmax leg (the two-warpgroup body)."""
     from dataclasses import replace
 
     from test_sdpa_fwd_dsl_sm107 import _caps, _mxfp8_facts
@@ -2056,9 +2057,10 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     assert d256_mxfp8_pair_leg(**base)
     for off in (dict(pertensor=True), dict(thd=True), dict(paged=True), dict(split_kv=2), dict(device_cc=(10, 0))):
         assert not d256_mxfp8_pair_leg(**{**base, **off}), off
-    # the standalone adapter admits both widths for MXFP8 on cc 10.7 only
+    # the standalone adapter admits both widths on cc 10.7 only (per-tensor: explicit cga=2 on the HALF-softmax pair leg)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
-    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1,)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=True) == (1,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=False) == (1,)
     # the per-tensor d192x128 kernel lists the single CTA on the 107 line with an fp8 O only
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True, fp8_o=True) == (1, 2)
@@ -2289,6 +2291,10 @@ class TestMidFp8Implementation:
         test_public_record_rebuild_rebind_and_retained_capture as _record,
         test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
         test_mid_fp8_refilled_stage_warm_stress as _warm,
+        test_d256_pair_admission as _pair_admission,
+        test_d256_pair_body_reference_and_replay as _pair_replay,
+        test_d256_pair_refilled_stage_warm_stress as _pair_warm,
+        test_d256_pair_release_dependence as _pair_release,
         test_d192_cga1_causal_public_record as _cga1,
         test_wide_envelopes_keep_the_adapter_block_output_decline as _block_output,
     )
@@ -2296,6 +2302,10 @@ class TestMidFp8Implementation:
     test_public_record = staticmethod(_record)
     test_retired_record = staticmethod(_retired)
     test_warm_stress = staticmethod(_warm)
+    test_d256_pair_admission = staticmethod(_pair_admission)
+    test_d256_pair_replay = staticmethod(_pair_replay)
+    test_d256_pair_warm_stress = staticmethod(_pair_warm)
+    test_d256_pair_release_dependence = staticmethod(_pair_release)
     test_cga1 = staticmethod(_cga1)
     test_block_output_decline = staticmethod(_block_output)
 

@@ -137,6 +137,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D128 dense `SWAP_AB=1` (at most eight live query rows per packed unit; fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | Supported (tested configurations) | Supported (tested configurations) |
 | `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); full SM103 suite unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D192/V128 and D256 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
+| Standalone `SdpaFwdDslSm100`, FROST SM107 D256 per-tensor FP8 two-warpgroup body (explicit `cga=2`, `softmax_precision=HALF`; dense or causal, unsplit, unpacked, ungated) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O; FP32 Stats | Unsupported for this body | Unsupported for this body | Supported (tested configurations: fixed-input replay under concurrent work, fp64 reference, warm stress of the refilled shared-memory slots); batch invariance not separately exercised |
 | `pygraph.sdpa_mxfp8`, explicit SM100 D64/D128, D192/V128 and D256 implementation records | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 or FP8 O | Unsupported for these engines | Unverified for general batch invariance; fixed-plan replay verified on SM100 and SM103 in the tested configurations | Unsupported for these engines |
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
@@ -283,6 +284,16 @@ causal case and D256 sigmoid gate. Reference checks and replay/batch-byte
 checks pass on the qualified runtime; strict historical THD goldens are
 unavailable for that runtime. These identities preserve the existing math
 and do not promise equal bytes across split counts or softmax precisions.
+
+The SM107 D256 per-tensor FP8 two-warpgroup body (standalone adapter, explicit
+`cga=2`, `softmax_precision=HALF`) preserves O/Stats bytes across repeat
+execution under concurrent GPU work for the tested dense, causal and
+bottom-right causal shapes, including a run that never rescales O and keyless
+Q tiles handed over under the cluster launch control. Its refilled
+shared-memory slots (alpha, running max, final statistics) are released
+through `tile_dsl.consume`; the PTX pin and the warm stress pass on cc 10.7.
+The public record keeps the single-CTA body. Batch invariance of the pair
+body is not separately exercised, and SM100/SM103 do not run it.
 
 Exact SM107 D64/D128 per-tensor FP8 uses native multi-Q engine 20563;
 explicit dense D128 swap-AB uses 20564 with the existing shared device body.
