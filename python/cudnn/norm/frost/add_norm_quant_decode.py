@@ -58,19 +58,20 @@ adds to ``out`` / ``codes`` under deterministic algorithms, and whatever that st
 EVERY launch that writes bytes of the set is ordered behind it on WHATEVER stream it runs, HOWEVER the tensor reached the call: the
 entry's own output of the row count, a tensor taken with ``outputs`` and passed back as an explicit output or as ``residual``, whole
 or as a view, at this row count or another, by this entry or by another entry that orders its launches the same way
-(``cudnn.frost.init_order``; the test is one of addresses: the bytes a launch writes against the set's allocations).  The same
-stream: by stream order.  Another stream: by a stream-side wait for the event recorded behind the initialization -- no host wait,
-never a synchronization of a stream or of the device -- so ``compile(rows)`` may run on any stream.  A captured launch cannot carry
-that dependency: a call that finds the initialization still pending under a capture waits for that ONE event on the host before its
-captured launch (set-up, never part of a replay; a set allocated before the capture needs no wait once its stream's earlier work is
-done: ``torch.cuda.graph`` synchronizes when it is entered, a raw capture does not).  NOT ordered: a set allocated INSIDE a stream
-capture (nothing is recorded: its fill is a node of that graph and runs at each replay -- allocate before the capture), and a launch
-on a new stream that got the raw handle of a destroyed allocating stream (a stream outlives the work it has queued).  Once a call
-has seen an initialization complete nothing is kept of it, and a warm call does nothing for it; while one is pending on the device,
-every call reads the device's records.  WHAT STAYS THE CALLER'S: the operands a launch only READS (``x``, ``weight``, ``scale``),
-also when one is laid over an entry-owned tensor, and the caller's own reads and writes of a returned tensor outside a call of an
-entry -- while the set's initialization may be pending those run on the stream that was current when the set was allocated, or the
-caller orders its own stream behind that one.  Entry-owned outputs are valid until the entry's next call at that row
+(``cudnn.frost.init_order``; the test is one of addresses: the bytes a launch writes against the set's allocations).  The launch
+stream waits for the event recorded behind the initialization -- a stream-side wait: no host wait, never a synchronization of a
+stream or of the device; on the allocating stream itself the event is already behind the launch and the wait is free, and a
+stream that was given the raw handle of a destroyed allocating stream waits like any other -- so ``compile(rows)`` may run on any
+stream.  A captured launch cannot carry that dependency: a call that finds the initialization still pending under a capture waits
+for that ONE event on the host before its captured launch (set-up, never part of a replay; a set allocated before the capture
+needs no wait once its stream's earlier work is done: ``torch.cuda.graph`` synchronizes when it is entered, a raw capture does
+not).  NOT ordered: a set allocated INSIDE a stream capture (nothing is recorded: its fill is a node of that graph and runs at
+each replay -- allocate before the capture).  Once a call has seen an initialization complete nothing is kept of it, and a warm
+call does nothing for it; while one is pending on the device, every call reads the device's records.  WHAT STAYS THE CALLER'S:
+the operands a launch only READS (``x``, ``weight``, ``scale``), also when one is laid over an entry-owned tensor, and the
+caller's own reads and writes of a returned tensor outside a call of an entry -- while the set's initialization may be pending
+those run on the stream that was current when the set was allocated, or the caller orders its own stream behind that one.
+Entry-owned outputs are valid until the entry's next call at that row
 count from ANY host thread (stream order does not serialize host calls): two host threads that share one entry pass their own
 outputs or build one entry each; a caller that sweeps many row counts passes its own outputs (the per-row-count sets are never
 freed).  A returned entry-owned output cannot come back as an operand of a call that would write it: a call at that row count

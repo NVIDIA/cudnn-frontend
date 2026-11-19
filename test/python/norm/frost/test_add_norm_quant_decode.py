@@ -70,6 +70,7 @@ from add_norm_quant_utils import (  # noqa: E402  (the form tables, the operand 
 )
 
 from cudnn.frost import init_order  # noqa: E402
+from cudnn.frost.capture import relaxed_capture_check  # noqa: E402
 from cudnn.norm.frost import add_norm_quant_decode as entry  # noqa: E402
 from cudnn.norm.frost.kernel import add_norm_quant_decode_config as kcfg  # noqa: E402
 from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fixture)
@@ -79,6 +80,8 @@ from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fi
     park,
     pooled,
     previous_owner,
+    raw_capture,
+    recycled_handle,
     settled_records,
     side_stream,
     spans_of,
@@ -2423,6 +2426,60 @@ def test_first_cuda_call_of_a_new_host_thread_is_ordered_behind_a_recorded_set(s
     torch.cuda.synchronize()
     got = {name: t for name, t in zip(entry.OUTPUT_SLOTS, box["got"]) if t is not None}
     _assert_same(got, want, f"the first call of a new host thread, the set {state}")
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_new_stream_given_the_raw_handle_of_a_destroyed_allocating_stream_waits_for_the_pending_initialization():
+    """A raw handle does not name a stream for good.  ``compile(rows)`` on a stream of the caller's own behind a delay; that
+    stream is destroyed while the work is queued (the work still runs) and the caller's NEXT stream gets its handle from the
+    driver: the call on that one is ordered behind the set's zero-fill like a call on any other stream."""
+    dev = _device_or_skip()
+    rows = 7
+    k, ops, want = _warm_entry_and_reference(dev, rows, 147)
+    with recycled_handle(dev) as (first, successor):
+        pending = park(pooled(dev, lambda: _ready_outs(k, rows, dev), first), lambda: k.compile(rows))
+        with torch.cuda.stream(successor()):
+            got = _overlapping(k, ops, pending)
+    _assert_same(got, want, "entry-owned outputs initialized on a destroyed stream, written on the stream that got its handle")
+
+
+@pytest.mark.usefixtures("settled_records")
+@pytest.mark.parametrize("capture", ("no capture", "a capture open on another stream", "captured on that stream"))
+def test_call_on_the_allocating_stream_itself_is_ordered_behind_its_own_pending_initialization(capture):
+    """``compile(rows)`` on a side stream behind a delay and the call ON THAT STREAM while the work is queued.  Eager, the
+    stream waits for the event it recorded itself: the event is behind the launch in stream order already, so the wait holds
+    up neither the stream nor the host -- also while another stream of the thread is capturing (the wait is enqueued with the
+    capture check relaxed, and that capture stays valid).  Captured on that stream, the launch cannot wait for an event
+    recorded outside the capture: the host waits for that ONE event, as it does for any other allocating stream."""
+    dev = _device_or_skip()
+    rows = 6
+    k, ops, want = _warm_entry_and_reference(dev, rows, 148, (True, None))
+    side = pooled(dev, lambda: _ready_outs(k, rows, dev))
+    capturing = {"no capture": None, "a capture open on another stream": side_stream(dev, side), "captured on that stream": side}[capture]
+    probe = torch.zeros(16, dtype=U8, device=dev)
+    graph = torch.cuda.CUDAGraph()
+    pending = park(side, lambda: k.compile(rows))
+    try:
+        with raw_capture(graph, capturing):
+            if capturing is not None:
+                with torch.cuda.stream(capturing):
+                    probe.fill_(7)
+            with torch.cuda.stream(side):
+                got = dict(zip(entry.OUTPUT_SLOTS, _launch(k, *ops)))
+            with relaxed_capture_check():  # a capture may be open: an event is read with this thread's check relaxed
+                kept, overlapped = len(init_order.pending_of(dev)), not pending.query()
+        complete = pending.query()
+        if capturing is not None:
+            graph.replay()
+        torch.cuda.synchronize()
+        if capturing is side:  # the host wait drops the record; the initialization is complete when the capture ends
+            assert kept == 0 and complete, "the captured call did not wait on the host for the pending initialization"
+        else:  # the stream wait keeps the record for the next stream, and the host does not wait
+            assert kept == 1 and overlapped, f"the eager call kept {kept} record(s) and {'did not wait' if overlapped else 'WAITED'} on the host"
+        _assert_same(got, want, f"the call on the allocating stream itself, {capture}")
+        assert capturing is None or bool((probe == 7).all()), "the capture did not replay"
+    finally:
+        graph.reset()
 
 
 @pytest.mark.usefixtures("settled_records")

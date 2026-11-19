@@ -152,15 +152,15 @@ launch that writes bytes of the set waits for it on whatever stream it runs and 
 the entry's own output, a tensor taken with `outputs(rows)` and passed back as an output or as `residual`, whole or as
 a view, at this row count or another, by this entry or by another entry that orders its launches the same way
 (today `AddNormQuantDecode`, `AttentionPrepareDecode` and `AttentionGateQuantDecode`); the test is one of addresses.
-On the allocating stream that is stream order; on another stream the launch stream waits for an event recorded behind
-the initialization, without a host wait and without synchronizing a stream or the device, so `compile(rows)` may run
-on any stream. A capturing stream cannot wait for an event recorded outside its capture: a captured call that finds
-the initialization still pending waits for that one event on the host before its launch. That is set-up, never part
-of a replay, and a set allocated before the capture needs no wait once its stream's earlier work is done
+The launch stream waits for an event recorded behind the initialization, without a host wait and without synchronizing
+a stream or the device, so `compile(rows)` may run on any stream; on the allocating stream itself the event is already
+behind the launch and the wait is free, and a stream that was given the raw handle of a destroyed allocating stream
+waits like any other. A capturing stream cannot wait for an event recorded outside its capture: a captured call that
+finds the initialization still pending waits for that one event on the host before its launch. That is set-up, never
+part of a replay, and a set allocated before the capture needs no wait once its stream's earlier work is done
 (`torch.cuda.graph` synchronizes when it is entered; a raw capture does not). Not ordered: a set allocated inside a
 stream capture (nothing is recorded: its fill is a node of that graph and runs at each replay, so allocate before the
-capture), and a launch on a new stream that got the raw handle of a destroyed allocating stream (a stream outlives the
-work it has queued). An allocation on the legacy default stream while a blocking stream of another host thread
+capture). An allocation on the legacy default stream while a blocking stream of another host thread
 captures raises torch's error: allocate before that capture or on a stream of your own. Once a call has
 seen an initialization complete nothing is kept of it and a warm call does nothing extra; while one is pending on the
 device, every call of such an entry on that device reads the device's records (address arithmetic, one event query
