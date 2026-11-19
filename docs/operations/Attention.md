@@ -138,7 +138,7 @@ FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_
       ```
 
   - Dimensions: $[B=2, H=1, S=8, D=64]$ (S is still max sequence length)
-  - Strides: $[512, 64, 64, 1]$ (strides unchanged, but ignored for ragged)
+  - Strides: $[512, 64, 64, 1]$ (the batch stride is ignored for ragged; head, sequence and feature strides still address storage)
   - **Ragged offset:** $[0, 2 \times H \times D, 5 \times H \times D] = [0, 128, 320]$
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br />
@@ -529,7 +529,7 @@ pair alone, these engines serve any combination of the three. See
 #### Limitations
 
 - Head dimension must be a multiple of 8.
-- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If a non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
+- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If an addressed non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. For an operand with a ragged-offset tensor, offsets replace the batch stride, so that unused stride is exempt at build time and in runtime shape overrides; its head and sequence strides remain checked. The caller must still provide aligned sequence starts through the ragged offsets. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
 - Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward. On SM89 (Ada), the FROST `sdpa_bwd_sm89` engine serves FP16/BF16 backward up to head dimension 256 when the backend declines the graph.
