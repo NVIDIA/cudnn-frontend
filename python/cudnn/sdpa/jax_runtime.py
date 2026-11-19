@@ -41,7 +41,8 @@ def _library():
     cudnn_root = (
         Path(os.environ["CUDNN_PATH"]) if "CUDNN_PATH" in os.environ else (Path("/usr") if spec is None else Path(next(iter(spec.submodule_search_locations))))
     )
-    cudnn_lib = next((p for p in (cudnn_root / "lib", cudnn_root / "lib64", cudnn_root / "lib/x86_64-linux-gnu") if (p / "libcudnn.so.9").exists()), None)
+    library_dirs = ("lib", "lib64", "lib/x86_64-linux-gnu", "lib/aarch64-linux-gnu")
+    cudnn_lib = next((cudnn_root / d for d in library_dirs if (cudnn_root / d / "libcudnn.so.9").exists()), None)
     if cudnn_lib is None:
         raise ImportError("Set CUDNN_PATH to the cuDNN headers and libraries")
     signature = source.read_bytes() + f"{jax.__version__}:{cudnn.__version__}:{cuda.full}:{headers}".encode()

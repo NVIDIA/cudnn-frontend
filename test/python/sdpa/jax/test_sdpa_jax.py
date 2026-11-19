@@ -33,6 +33,30 @@ def test_missing_ffi_header(monkeypatch, tmp_path):
     assert "Install compatible JAX and jaxlib" in str(error.value)
 
 
+@pytest.mark.parametrize("library_dir", ["lib", "lib64", "lib/x86_64-linux-gnu", "lib/aarch64-linux-gnu"])
+def test_bridge_links_cudnn_from_library_dir(monkeypatch, tmp_path, library_dir):
+    from cudnn._cake import loader
+    from cudnn.sdpa import jax_runtime
+
+    library = tmp_path / library_dir / "libcudnn.so.9"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    ffi_header = tmp_path / "jax_include" / "xla/ffi/api/ffi.h"
+    ffi_header.parent.mkdir(parents=True)
+    ffi_header.touch()
+    monkeypatch.setenv("CUDNN_PATH", str(tmp_path))
+    monkeypatch.setattr(loader, "_toolkit", lambda: ("/cuda/bin/nvcc", SimpleNamespace(full="test")))
+    monkeypatch.setattr(loader, "cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(jax.ffi, "include_dir", lambda: str(tmp_path / "jax_include"))
+    failed = SimpleNamespace(returncode=1, stderr="stopped by test")
+    with mock.patch.object(jax_runtime.subprocess, "run", return_value=failed) as compile_bridge:
+        with pytest.raises(RuntimeError, match="stopped by test"):
+            jax_runtime._library.__wrapped__()
+    command = compile_bridge.call_args.args[0]
+    assert str(library) in command
+    assert "-Wl,-rpath," + str(library.parent) in command
+
+
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
 @pytest.mark.parametrize("feature", ["plain", "causal", "gqa", "mqa", "cross", "bias", "bias_mask", "mask", "padding", "window", "unbatched"])
 def test_routes(monkeypatch, dtype, feature):
