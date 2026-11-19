@@ -41,6 +41,7 @@ from cudnn.gemm.frost.tile_helpers import (
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, consume_then_arrive_on_peer, release_zero
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.runtime import make_fake_stream
@@ -227,8 +228,12 @@ def _kernel(
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    release_zero_arg: cutlass.Int32,
 ) -> None:
     """Run the persistent grouped GEMM with promoted linear scales and the selected output epilogue."""
+    # The mask of every release of a shared-memory stage this kernel reads (python/cudnn/AGENTS.md Rule 11): the host passes
+    # 0 and nothing else in the kernel may look at it.
+    rz = release_zero(release_zero_arg)
     # @@INJECT_AB_DESC_LISTS@@
 
     # @@INJECT_MOE_MA_LIST@@
@@ -366,6 +371,8 @@ def _kernel(
     sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     bcast_ack_count = cutlass.Array(cutlass.Uint32, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     # Retain token descriptor storage to preserve the compiler-modeled SMEM layout.
+    # Its first word takes the claimed index a scheduler lane read from the broadcast mailbox: the store in front of
+    # the acknowledgement. Nothing reads it.
     tma_b_desc_smem_list = [
         cutlass.Array(
             cutlass.Int64,
@@ -419,7 +426,9 @@ def _kernel(
         # A quantize block across the tile's lanes: each epilogue warp's maximum of every tile column, in two buffers
         # that consecutive drains alternate. A warp writes a drain's maxima while another may still read the previous
         # drain's; it reaches the buffer of the drain before that only behind the barrier every warp arrives at after
-        # its own reads and stores of that drain.
+        # its own reads and stores of that drain. That barrier is the buffer's release and has no address to compute
+        # from what was read (python/cudnn/AGENTS.md Rule 11): the order is that every maximum a lane loads reaches a
+        # global store of its drain -- the block's scale, or the data it scales -- in front of the barrier.
         wq_colmax = cutlass.Array(cutlass.Float32, 2 * num_epilogue_warps * epi_cols_per_mma_m, space=cutlass.AddressSpace.smem, alignment=16)
 
     if cutlass.const_expr(cta_group == 2):
@@ -590,9 +599,11 @@ def _kernel(
                 if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
                     nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
                 linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
-                # Finish every lane's slot reads before the elected release.
                 nvvm.bar_warp_sync(0xFFFFFFFF)
-                # Release orders the mailbox reads before the producer may reuse it.
+                # The acknowledgement is a reduction on rank 0's count, which tile_dsl.consume has no form for: every
+                # lane stores the index it read in front of it (python/cudnn/AGENTS.md Rule 11), so no lane's read is
+                # pending when rank 0 may write the mailbox again.
+                tma_b_desc_smem_list[0].subview(0).store(cutlass.Int64(linear_idx))
                 if lane == 0:
                     _publish_bcast_ack(nvvm.mapa(bcast_ack_count.subview(bcast_stage), 0))
                 if cutlass.const_expr(cluster_size > 1):
@@ -841,12 +852,13 @@ def _kernel(
             is_valid = (slot.subview(3)).load()
             group_begin = (slot.subview(4)).load()
             group_end = (slot.subview(5)).load()
+            slot_words = [coord_expert, tile_m, tile_n, is_valid, group_begin, group_end]
             if cutlass.const_expr(glu_pair):
                 glu_gemm = (slot.subview(8)).load()
-            # Finish every lane's slot reads before the elected release.
+                slot_words.append(glu_gemm)
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if elect_one:
-                nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
+            # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+            consume_then_arrive(sched_empty_mbar_ptr.subview(sched_stage), slot_words, rz, pred=elect_one)
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
                 sched_stage = cutlass.Int32(0)
@@ -1020,10 +1032,9 @@ def _kernel(
                 ):
                     pass
                 is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
-                # Finish every lane's slot reads before the elected release.
                 nvvm.bar_warp_sync(0xFFFFFFFF)
-                if elect_one:
-                    nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
+                # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+                consume_then_arrive(sched_empty_mbar_ptr.subview(sched_stage), is_valid, rz, pred=elect_one)
                 sched_stage += 1
                 if sched_stage == SCHED_STAGES:
                     sched_stage = cutlass.Int32(0)
@@ -1196,10 +1207,9 @@ def _kernel(
                     ):
                         pass
                     is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
-                    # Finish every lane's slot reads before the elected release.
                     nvvm.bar_warp_sync(0xFFFFFFFF)
-                    if elect_one:
-                        nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
+                    # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+                    consume_then_arrive(sched_empty_mbar_ptr.subview(sched_stage), is_valid, rz, pred=elect_one)
                     sched_stage += 1
                     if sched_stage == SCHED_STAGES:
                         sched_stage = cutlass.Int32(0)
@@ -1334,10 +1344,9 @@ def _kernel(
                     ):
                         pass
                     is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
-                    # Finish every lane's slot reads before the elected release.
                     nvvm.bar_warp_sync(0xFFFFFFFF)
-                    if elect_one:
-                        nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
+                    # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+                    consume_then_arrive(sched_empty_mbar_ptr.subview(sched_stage), is_valid, rz, pred=elect_one)
                     sched_stage += 1
                     if sched_stage == SCHED_STAGES:
                         sched_stage = cutlass.Int32(0)
@@ -1430,12 +1439,14 @@ def _kernel(
                 group_end = (slot.subview(5)).load()
                 start_sf_block_n = (slot.subview(6)).load()
                 group_idx = (slot.subview(7)).load()
+            slot_words = [tile_m, tile_n, is_valid, group_begin, group_end, start_sf_block_n, group_idx]
             if cutlass.const_expr(glu_pair):
                 glu_gemm = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS + 8)).load()
+                slot_words.append(glu_gemm)
             nvvm.bar_warp_sync(0xFFFFFFFF)
             sched_stage = cute.arch.make_warp_uniform(sched_stage)
-            if elect_one:
-                nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
+            # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+            consume_then_arrive(sched_empty_mbar_ptr.subview(sched_stage), slot_words, rz, pred=elect_one)
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
                 sched_stage = cutlass.Int32(0)
@@ -1779,12 +1790,13 @@ def _kernel(
             is_valid = (slot.subview(3)).load()
             group_begin = (slot.subview(4)).load()
             group_end = (slot.subview(5)).load()
+            slot_words = [coord_expert, tile_m, tile_n, is_valid, group_begin, group_end]
             if cutlass.const_expr(glu_pair):
                 glu_gemm = (slot.subview(8)).load()
-            # Finish every lane's slot reads before the elected release.
+                slot_words.append(glu_gemm)
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if elect_one:
-                nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
+            # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+            consume_then_arrive(sched_empty_mbar_ptr.subview(sched_stage), slot_words, rz, pred=elect_one)
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
                 sched_stage = cutlass.Int32(0)
@@ -1964,6 +1976,8 @@ def _kernel(
                             ):
                                 pass
 
+                    # What this lane reads of the stage's scale table during the window, for the release of the partial.
+                    tbl_words = []
                     partial_col = base_col_id_root + partial_col_base + partial_slot * acc_region_cols + promo_col0
                     for mi in cutlass.range_constexpr(promo_mi_count):
                         for ch in cutlass.range_constexpr(promo_chunks):
@@ -1981,6 +1995,7 @@ def _kernel(
                                             if cutlass.const_expr(run not in scales[mi]):
                                                 if cutlass.const_expr(promo_scale_table):
                                                     scales[mi][run] = (promo_tbl.subview(partial_slot * _promo_tbl_runs + run)).load()
+                                                    tbl_words.append(scales[mi][run])
                                                 else:
                                                     scales[mi][run] = nvvm.shfl_sync(0xFFFFFFFF, sfb_grid[run // 32], grid_base + run % 32, 0x1F, nvvm.Shfl.IDX)
                                                 if cutlass.const_expr(not _sfa_folded):
@@ -2004,6 +2019,7 @@ def _kernel(
                                         if cutlass.const_expr(run not in scales[mi]):
                                             if cutlass.const_expr(promo_scale_table):
                                                 scales[mi][run] = (promo_tbl.subview(partial_slot * _promo_tbl_runs + run)).load()
+                                                tbl_words.append(scales[mi][run])
                                             else:
                                                 scales[mi][run] = nvvm.shfl_sync(0xFFFFFFFF, sfb_grid[run // 32], grid_base + run % 32, 0x1F, nvvm.Shfl.IDX)
                                             if cutlass.const_expr(not _sfa_folded):
@@ -2025,15 +2041,26 @@ def _kernel(
                     else:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    if elect_one:
+                    if cutlass.const_expr(promo_scale_table):
+                        # Once every promotion warp has released the partial, its next window may fill and the writer
+                        # put that window's scales into this stage's table: every table word the lane read reaches
+                        # the address of the release (python/cudnn/AGENTS.md Rule 11).
                         if cutlass.const_expr(cta_group == 2):
-                            nvvm.mbarrier_arrive(
-                                nvvm.mapa(partial_empty_mbar_ptr.subview(partial_slot), pair_leader_rank),
-                                scope=nvvm.MemScope.CLUSTER,
-                                relaxed=True,
+                            consume_then_arrive_on_peer(
+                                partial_empty_mbar_ptr.subview(partial_slot), pair_leader_rank, tbl_words, rz, pred=elect_one, release_cta=False
                             )
                         else:
-                            nvvm.mbarrier_arrive(partial_empty_mbar_ptr.subview(partial_slot))
+                            consume_then_arrive(partial_empty_mbar_ptr.subview(partial_slot), tbl_words, rz, pred=elect_one)
+                    else:
+                        if elect_one:
+                            if cutlass.const_expr(cta_group == 2):
+                                nvvm.mbarrier_arrive(
+                                    nvvm.mapa(partial_empty_mbar_ptr.subview(partial_slot), pair_leader_rank),
+                                    scope=nvvm.MemScope.CLUSTER,
+                                    relaxed=True,
+                                )
+                            else:
+                                nvvm.mbarrier_arrive(partial_empty_mbar_ptr.subview(partial_slot))
                     partial_iter += 1
 
                 if cutlass.const_expr(promo_in_registers):
@@ -2066,8 +2093,8 @@ def _kernel(
                     pass
                 relay_valid = sched_storage.subview(relay_sched_stage * SCHED_SLOT_WORDS + 3).load()
                 nvvm.bar_warp_sync(0xFFFFFFFF)
-                if elect_one:
-                    nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(relay_sched_stage))
+                # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+                consume_then_arrive(sched_empty_mbar_ptr.subview(relay_sched_stage), relay_valid, rz, pred=elect_one)
                 relay_sched_stage += 1
                 if relay_sched_stage == SCHED_STAGES:
                     relay_sched_stage = cutlass.Int32(0)
@@ -2116,8 +2143,8 @@ def _kernel(
             b_group_begin = b_slot.subview(4).load()
             b_group_end = b_slot.subview(5).load()
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if elect_one:
-                nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(b_sched_stage))
+            # Every word read from the slot reaches the address of its release (python/cudnn/AGENTS.md Rule 11).
+            consume_then_arrive(sched_empty_mbar_ptr.subview(b_sched_stage), [b_tile_n, b_is_valid, b_group_begin, b_group_end], rz, pred=elect_one)
             b_sched_stage += 1
             if b_sched_stage == SCHED_STAGES:
                 b_sched_stage = cutlass.Int32(0)
@@ -2302,6 +2329,8 @@ def _host(
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
+        # The release-zero of tile_dsl.consume: the literal 0, the only value ever passed.
+        cutlass.Int32(0),
     ).launch(
         grid=grid_shape,
         block=(threads_per_cta, 1, 1),

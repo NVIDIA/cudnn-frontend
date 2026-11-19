@@ -15,13 +15,15 @@ and batch-invariance byte comparisons."""
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs recorder)
 import pytest
 import torch
 
-from gemm_test_utils import Plan, requires_sm100
+import warm_stress
+from gemm_test_utils import Plan, keep_kernel_ptx, kernel_ptx, requires_sm100
 from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.fusion_ir import BlockQuantizeSpec, wide_quant
 from cudnn.gemm.frost.graph_analyzer import analyze
@@ -437,3 +439,163 @@ def test_grouped_launches_need_no_cleared_workspace(swap):
                 # The same operands as `first` (same seeds): the same bytes, on every round.
                 assert torch.equal(q, first.data), f"round {round_}"
                 assert torch.equal(qs[0, : first.used].view(torch.int32), first.scale[0, : first.used].view(torch.int32))
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap", [False, True], ids=["fwd", "swap"])
+def test_a_gated_pair_refuses_one_scale_matrix_for_either_weight(swap):
+    """Both weights of a pair are read at the tile's expert, and so are their scales: a single scale matrix bound for
+    either weight is refused before the launch (the kernel is compiled for the count the graph declared).
+
+    The single matrix is a view of a tensor that holds one per expert, in the kernel's axis order."""
+    E, S, N, K = 2, 256, 128, 512
+    g, t = _graph("moe", E, S, N, K)
+    plan = Plan(g, config=by_name(_config(32) if swap else _TILE_128), swap_ab=swap)
+    dev = "cuda"
+    per_expert = [torch.ones(E, N // _BLOCK, K // _BLOCK, device=dev) for _ in range(2)]
+    out = torch.full((1, S, N), float("nan"), device=dev, dtype=torch.bfloat16)
+    pack = {
+        t["tok"]: torch.ones(1, S, K, device=dev).to(torch.float8_e4m3fn),
+        t["sfa"]: torch.ones(1, S, K // _BLOCK, device=dev),
+        t["fto"]: torch.tensor([0, 128, 256], dtype=torch.int32, device=dev).view(-1, 1, 1),
+        t["out"]: out,
+    }
+    for i in range(2):
+        pack[t["w"][i]] = torch.ones(E, N, K, device=dev).to(torch.float8_e4m3fn).transpose(1, 2)
+    for short in range(2):
+        for i in range(2):
+            pack[t["sfb"][i]] = per_expert[i][:1] if i == short else per_expert[i].transpose(1, 2)
+        with pytest.raises(ValueError, match=rf"[AB] scale\[{short}\] must have shape \[2, 1, 4\].*compiled for one scale matrix per matrix"):
+            plan(pack)
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+    # The declared count for both: the pair runs.
+    for i in range(2):
+        pack[t["sfb"][i]] = per_expert[i].transpose(1, 2)
+    plan(pack)
+    torch.cuda.synchronize()
+    silu_512 = 512.0 / (1.0 + torch.exp(torch.tensor(-512.0)))
+    assert torch.allclose(out[0].float(), torch.full((S, N), float(silu_512 * 512.0), device=dev), rtol=5e-3)
+
+
+# Releasing what was read (python/cudnn/AGENTS.md Rule 11): the pair's slot word and the lanes' column maxima
+#
+# A pair's scheduler slot carries one more word (which of the two GEMMs the pass computes), read by the loader, the
+# promotion warps and the epilogue: it reaches the address of the slot's release like the other words. A quantize
+# block across the lanes (the weight-by-token templates) keeps each epilogue warp's column maxima in shared memory;
+# the warps read each other's behind a thread-block barrier, and the buffer is rewritten two drains later, behind the
+# next drain's barrier. That release has no address to compute, so the order is the one Rule 11 names for it: every
+# maximum a lane reads reaches a global store of its drain (the scale, or the data it scales) in front of that barrier.
+
+_GATED_RELEASES = {
+    # the loader and the promotion warps read 7 words, the epilogue 8; "table" is the partial's release behind the
+    # promotion scale table (at least one register)
+    "fwd": (dict(kind="moe"), [1, 1, 7, 7, 8]),
+    "swap_fp8": (dict(kind="moe", fp8=True, swap=True, config=_config(32)), [1, 1, 7, 7, 8, "table"]),
+    "gather_fp8": (dict(kind="gather", S=300, rows=512, fp8=True), [1, 4, 7, 7, 8]),
+}
+
+
+def _gated_plan(kind="moe", E=6, S=512, N=256, K=512, *, rows=None, fp8=False, swap=False, config=_TILE_128):
+    g, t = _graph(kind, E, S, N, K, rows=rows, fp8=fp8)
+    plan = Plan(g, config=by_name(config), swap_ab=swap)
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[(kind, swap)]
+    return plan, t
+
+
+@requires_sm100
+@pytest.mark.parametrize("case", list(_GATED_RELEASES))
+def test_a_gated_pair_releases_its_slot_behind_every_word_it_read(case, monkeypatch, tmp_path):
+    """In the generated PTX of a pair: every slot release is computed from the words read, the pass word included."""
+    kw, expected = _GATED_RELEASES[case]
+    keep_kernel_ptx(monkeypatch, C, tmp_path)
+    plan, _ = _gated_plan(**kw)
+    sites = warm_stress.assert_release_dependence(kernel_ptx(plan), sites=len(expected), words=1)
+    found = sorted(site.loaded_registers for site in sites if site.dependent)
+    for words in (w for w in expected if w != "table"):
+        found.remove(words)
+    assert found == [] if "table" not in expected else (len(found) == 1 and found[0] >= 1)
+
+
+@requires_sm100
+@pytest.mark.parametrize("kind", ["moe", "gather"])
+def test_a_lanes_quantize_stores_what_it_read_of_the_column_maxima(kind, monkeypatch, tmp_path):
+    """In the generated PTX of a quantize block across the lanes: the maxima a lane loads behind the epilogue's
+    barrier reach a global store further down, before the loop comes back to that barrier and the buffer may be
+    rewritten. The barrier appears once, so everything behind it up to the end of the function is that drain."""
+    keep_kernel_ptx(monkeypatch, C, tmp_path)
+    plan, _ = _gated_plan(kind=kind, S=300 if kind == "gather" else 512, rows=512 if kind == "gather" else None, fp8=True, swap=True, config=_config(32))
+    assert "wide_quant_lanes = True" in open(plan.generated_path).read()
+    lines = [line.strip() for line in kernel_ptx(plan).splitlines()]
+    barriers = [i for i, line in enumerate(lines) if re.match(r"barrier\.sync\s+1, 128;", line)]
+    assert len(barriers) == 1, "the epilogue's barrier of a lanes quantize is one instruction"
+    register = re.compile(r"%[a-z]+\d+")
+    # The loads of the four warps' maxima: the shared-memory loads between the barrier and the first shuffle of the scale.
+    first_shuffle = next(i for i in range(barriers[0], len(lines)) if lines[i].startswith("shfl.sync"))
+    loads = [i for i in range(barriers[0], first_shuffle) if lines[i].startswith("ld.shared")]
+    assert len(loads) == 4, "one maximum per epilogue warp"
+    for load in loads:
+        reached = set(register.findall(lines[load].split(",")[0]))
+        stored = False
+        for line in lines[load + 1 :]:
+            if line.startswith(("//", "$")) or line.endswith(":"):
+                continue
+            opcode, _, operands = line.lstrip("@!%p0123456789 ").partition(" ")
+            if opcode.startswith("st.global"):
+                stored = stored or bool(reached & set(register.findall(operands)))
+                continue
+            results, _, sources = operands.partition("}" if operands.startswith("{") else ",")
+            if reached & set(register.findall(sources)):
+                reached |= set(register.findall(results))
+        assert stored, f"the maximum loaded at PTX line {load + 1} reaches no global store"
+
+
+def _fp8_stress_case(kind):
+    """A swapped gated FP8 launch of many tiles per thread block; the reference is the cold launches' bytes (the
+    approximate reciprocal of the scale has no independent byte model)."""
+    E, G, rows_per_group, N, K = 8, 512, 16, 128, 128
+    S = G * rows_per_group
+    plan, t = _gated_plan(kind=kind, E=E, S=S, N=N, K=K, rows=S if kind == "gather" else None, fp8=True, swap=True, config=_config(16))
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(5)
+    q = torch.empty(1, S, N, device=dev, dtype=torch.uint8)
+    qs = torch.empty(1, S, N // _BLOCK, device=dev)
+    pack = {
+        t["tok"]: (torch.randn(1, S, K, device=dev, generator=gen) * 0.5).to(torch.float8_e4m3fn),
+        t["sfa"]: torch.rand(1, S, K // _BLOCK, device=dev, generator=gen) + 0.5,
+        t["fto"]: (torch.arange(E + 1, dtype=torch.int32, device=dev) * (S // E)).view(-1, 1, 1),
+        t["q"]: q.view(torch.float8_e4m3fn),
+        t["qs"]: qs,
+    }
+    for i in range(2):
+        pack[t["w"][i]] = (torch.randn(E, N, K, device=dev, generator=gen) * 0.5).to(torch.float8_e4m3fn).transpose(1, 2)
+        pack[t["sfb"][i]] = (torch.rand(E, N // _BLOCK, K // _BLOCK, device=dev, generator=gen) + 0.5).transpose(1, 2)
+    if kind == "gather":
+        pack[t["idx"]] = torch.randperm(S, device=dev, generator=gen).to(torch.int32).view(1, S, 1)
+    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=dev)
+    cfg = plan._compiled.config
+    blocks = C._grid_num_clusters(cfg) * cfg.cga_size_m * cfg.cga_size_n
+    # Every tile of 16 routed rows runs twice (the pair's two passes), each pass through a scheduler slot.
+    passes = 2 * (S // cfg.cta_tile_n)
+    return warm_stress.StressCase(
+        name=f"general grouped gated fp8 {kind} swap",
+        launch=lambda: plan(pack, workspace=workspace),
+        outputs={"codes": q, "scales": qs},
+        thread_blocks=blocks,
+        refills_per_launch=max(passes // blocks - 2, 0),
+    )
+
+
+@requires_sm100
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("kind", ["moe", "gather"])
+def test_gated_fp8_warm_launches_keep_writing_the_cold_bytes(kind):
+    """Warm launches of a swapped gated FP8 plan, back to back and behind a launch that overwrites every SM's shared
+    memory, write the bytes of its cold launches: codes and scales. The shape rewrites every scheduler slot and both
+    buffers of column maxima many times inside one launch. A rate bound at one thread block per SM (see the grouped
+    cells in test_general_moe_grouped_block_scale_matmul_fwd.py); the generated-code tests above pin the order."""
+    warm_stress.build_launchers(torch.device("cuda"))
+    stress = _fp8_stress_case(kind)
+    assert stress.refills_per_launch >= 4
+    warm_stress.assert_warm_stress(stress, validation=warm_stress.stress_validation(torch.device("cuda")))

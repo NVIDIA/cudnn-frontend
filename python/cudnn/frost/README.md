@@ -1042,14 +1042,25 @@ The epilogue parity test holds the drain to the block-scale group.
   `gcd(block_n, columns per thread)` columns, since a thread's columns start at
   a multiple of their count.
 - **Scale reads.** The promotion warps index each scale tensor through its own
-  strides, so any layout of shape `[1 or L, ceil(rows / block), ceil(cols /
-  block)]` works.
+  strides, so any layout of shape `[B, ceil(rows / block), ceil(cols /
+  block)]` works. `B` is the count the graph declares, 1 (one matrix for every
+  batch entry) or L, and the kernel is compiled for it (`sfa_batch_broadcast`
+  / `sfb_batch_broadcast`): a call binds that count.
 - **Partial last block.** Rows, columns and whole windows past M, N or K read
   no scale and are scaled by zero.
 - **Gates.** `kernel_registry.general_block_scale_reject` holds the data pairs
   and scale dtypes. uint8 scales are excluded because the DSL widens a loaded
   `Uint8` scalar as signed. `sm100/compiler.py::_general_block_scale_plan`
-  rejects swapAB, a 64-byte MMA K, multi-GEMM and `cta_tile_k_bytes != 128`.
+  rejects swapAB, a 64-byte MMA K and `cta_tile_k_bytes != 128`. A multi-GEMM
+  graph is served when it is a gated pair (`kernel_registry.general_glu_pair`:
+  two GEMMs over the same tokens, run as two passes of every tile); any other
+  is rejected.
+- **Extents.** M and K bind at launch. N binds at launch too, as a multiple of
+  the element count of the vector the epilogue stores (the compiled N carries
+  that divisibility, as in the native template): a plan compiled from N = 256
+  with bf16 output stores 16 elements at a time, so N = 208 runs and N = 200
+  is refused at the launch; a graph that declares N = 200 compiles the
+  narrower vector.
   Coverage lives in `gemm/frost/test_general_block_scale_matmul.py`.
 
 ### Grouped (MoE) general block scale
@@ -1074,8 +1085,14 @@ takes a general one.
   `(rows, k, l)`, the weight side as `(n, k, l)` with one batch entry per
   expert, read at the tile's expert. GATHER reads the token scale of a row
   through `token_index`, as it reads the row. The launcher checks each bound
-  scale buffer against `[1 or L, ceil(rows / block), ceil(K / block)]` of its
-  operand (`compiler.py::_general_moe_scale_reject`).
+  scale buffer against `[B, ceil(rows / block), ceil(K / block)]` of its
+  operand (`compiler.py::_general_moe_scale_reject`). `B` is the count the
+  graph declared, which the kernel is compiled for: one matrix per expert
+  (read at the tile's expert), or one that every expert shares (read at
+  matrix 0; not declarable under GATHER). The other count is refused: a kernel
+  compiled per expert would read past a single matrix, and one compiled for a
+  shared matrix would ignore the others. Both weights of a gated pair bind
+  the declared count.
 - **Promotion warps.** The plain templates add warps 8..15, as the dense one.
   The async GATHER templates keep their 20 warps: the SF-copy and SF-pack
   warps (8..11, 16..19) have no scale factors to move and become the two
@@ -1125,11 +1142,34 @@ takes a general one.
   rows per expert to pay for its second CTA.
 - **Modes and fusions.** NONE and GATHER select the templates above; SCATTER
   and COMBINE, a ReLU epilogue, fp32 output and N-major weights run through
-  the plain and swapped templates unchanged from their sources.
-- **Not served.** Multi-GEMM chains (the dual gate / up SwiGLU GEMM among
-  them), token tiles of 8 columns (an M=128 MMA needs N % 16 == 0), and what
-  the dense plan rejects (a 64-byte MMA K, `cta_tile_k_bytes != 128`,
-  `mma_tile_m != 128`).
+  the plain and swapped templates unchanged from their sources. A gated pair
+  (the dual gate / up SwiGLU GEMM, under NONE or GATHER) and an FP8 output
+  with one fp32 scale per 128 columns run in all four:
+  `docs/operations/MoeGroupedMatmul.md` has the recipe,
+  `gemm/frost/test_general_block_scale_gated_fp8.py` the coverage.
+- **Releasing what was read (`python/cudnn/AGENTS.md` Rule 11).** The shared
+  memory a warp reads with ordinary loads and then hands back to its writer:
+
+  | Buffer | Written by | Read by | Released by |
+  |---|---|---|---|
+  | `sched_storage` (a slot of the two-slot scheduler ring) | the scheduler warp, once every consumer credited the slot | the loader, the MMA warp, the epilogue and promotion warps; under GATHER also the relay and token-copy warps | `consume_then_arrive` on `sched_empty`, elected lane, over every word the warp read |
+  | `sched_bcast_slot` (the claimed tile index, one mailbox per thread block) | the scheduler warp of cluster rank 0, through `mapa` | every thread block's scheduler warp | plain and swapped: `consume_then_arrive_on_peer` on rank 0's `sched_bcast_empty` (`release.cta`, the read-then-credit form of `barrier.mbar_arrive_on_peer`; a default `mbarrier_arrive` on the `mapa` address is a cluster-scope release, which cost a COMBINE kernel with a short K up to a fifth of its time). GATHER (a cluster of several thread blocks): a reduction on rank 0's `bcast_ack_count`, which the helper has no form for, behind a store of the index every lane read (into the first word of the retained token-descriptor storage, which nothing reads) |
+  | `promo_scale_tbl` (`promo_scale_table`) | one warp of the promotion warpgroup, once the stage's next window is full | the warpgroup's four warps, as they fold | `consume_then_arrive` (2-CTA: `..._on_peer`) on `partial_empty` over the window's table words: every promotion warp's release is what lets the next window fill. Measured on gated FP8 FC1 kernels with 32-column swapped tiles: under 0.5% of the kernel for most shapes, up to 4% for two of them |
+  | `wq_colmax` (a quantize block across the lanes, swapped templates) | each epilogue warp, its own columns | all four epilogue warps, behind the epilogue's thread-block barrier | the next drain's barrier, which has no address to compute: every maximum a lane loads reaches a global store of its drain (the scale, or the data it scales) in front of that barrier, and the two buffers alternate so a warp's next write goes to the other one |
+
+  The kernel takes the release-zero of `tile_dsl.consume` as its last
+  argument and the host passes the literal 0. The dense template reads its
+  scheduler through the launch-control response and keeps the source's
+  `fence.proxy.async.shared::cta` between that read and its release. Tensor
+  memory (the partial a promotion thread folds, the accumulator the epilogue
+  drains) is released behind `tcgen05.wait::ld`, as in the source templates.
+  `test_general_grouped_templates_release_every_word_they_read` holds the
+  source to this table, `..._release_addresses_depend_on_the_words_read` the
+  generated PTX, and the warm-stress cells run a shape that rewrites every
+  slot inside one launch.
+- **Not served.** Multi-GEMM chains other than a gated pair, token tiles of 8
+  columns (an M=128 MMA needs N % 16 == 0), and what the dense plan rejects
+  (a 64-byte MMA K, `cta_tile_k_bytes != 128`, `mma_tile_m != 128`).
   Coverage lives in
   `gemm/frost/test_general_moe_grouped_block_scale_matmul_fwd.py`; the
   epilogue parity test holds the drain of each to its source's group.

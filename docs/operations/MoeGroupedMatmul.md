@@ -129,6 +129,13 @@ block-scale kernels: for example DeepSeek FP8, E4M3 data with one FP32 scale
 per 128 K values of a token row (`block_size=[1,128]`) and one per 128x128
 weight block (`block_size=[128,128]`). They serve NONE, GATHER, SCATTER and
 COMBINE in both orientations, and the dense `matmul` of the same operands.
+
+A weight scale tensor holds one matrix per expert, `[E, K/128, N/128]` for
+the blocks above, or one that every expert shares, `[1, K/128, N/128]` (GATHER
+takes one per expert). The plan is built for the count the graph declares, and
+a call binds a scale tensor of that count: the other count is refused at the
+call, before anything is written.
+
 Two fusions let FC1 produce FC2's input in one kernel, under NONE and GATHER
 (and for the dense `matmul`):
 

@@ -299,32 +299,81 @@ def test_general_block_scale_fused_epilogue(force_stg):
     _run(256, 256, 512, relu=True, force_stg=force_stg)
 
 
+def _out_vec_elems(plan) -> int:
+    """Output elements the plan's epilogue stores at a time: the divisibility its compiled N carries (bf16 output)."""
+    return C._epi_vec_bytes(plan.chain, plan._compiled.config) // 2
+
+
+def _bind_extents(plan, binding, M, N, K):
+    """Bind fresh operands of the extents (M, N, K) to a plan of the 1x128 / 128x128 graph; returns (pack, out, ref)."""
+    torch.manual_seed(M)
+    a, b = _data("fp8_e4m3", (1, M, K)), _data("fp8_e4m3", (1, N, K))
+    sa, sb_nk = _scales("fp32", (1, M, ceil_div(K, 128))), _scales("fp32", (1, ceil_div(N, 128), ceil_div(K, 128)))
+    out = torch.full((1, M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    pack = {
+        binding.a_operands[0]: a,
+        binding.b_operands[0]: b,
+        binding.sfa_operands[0]: sa,
+        binding.sfb_operands[0]: sb_nk.transpose(1, 2),
+        binding.outputs[0]: out,
+    }
+    ref = (a.double() * _expand(sa, (1, 128), (M, K))) @ (b.double() * _expand(sb_nk, (128, 128), (N, K))).transpose(1, 2)
+    return pack, out, ref
+
+
 @requires_sm100
 def test_general_block_scale_runs_other_extents_without_recompiling(monkeypatch):
-    """M, N and K bind at launch: one plan serves other extents, and the scale rule follows them."""
+    """M, N and K bind at launch: one plan serves other extents, and the scale rule follows them.
+
+    M and K are free. N keeps the divisibility the plan was compiled with: the epilogue stores whole vectors, so the
+    compiled N is a multiple of the vector's element count (16 bf16 elements for the 256 columns of this graph), as in
+    the native block-scale template. Extents that end inside a tile and inside a scale block are covered: 208 = 128 + 80
+    columns, 136 = 128 + 8 rows, and 64 columns are less than one tile."""
     import cutlass.cute as cute
 
     g = _graph(256, 256, 512)
     _, binding = analyze_with_binding(g)
     plan = Plan(g, config=by_name(_TILE_128))
+    vec_elems = _out_vec_elems(plan)
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("a runtime extent must not recompile the plan"))
-    for M, N, K in ((136, 200, 640), (384, 64, 128)):
-        torch.manual_seed(M)
-        a, b = _data("fp8_e4m3", (1, M, K)), _data("fp8_e4m3", (1, N, K))
-        sa, sb_nk = _scales("fp32", (1, M, ceil_div(K, 128))), _scales("fp32", (1, ceil_div(N, 128), ceil_div(K, 128)))
-        out = torch.full((1, M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
-        plan(
-            {
-                binding.a_operands[0]: a,
-                binding.b_operands[0]: b,
-                binding.sfa_operands[0]: sa,
-                binding.sfb_operands[0]: sb_nk.transpose(1, 2),
-                binding.outputs[0]: out,
-            }
-        )
+    for M, N, K in ((136, 208, 640), (384, 64, 128)):
+        assert N % vec_elems == 0
+        pack, out, ref = _bind_extents(plan, binding, M, N, K)
+        plan(pack)
         torch.cuda.synchronize()
-        ref = (a.double() * _expand(sa, (1, 128), (M, K))) @ (b.double() * _expand(sb_nk, (128, 128), (N, K))).transpose(1, 2)
         torch.testing.assert_close(out.double(), ref.to(torch.bfloat16).double(), rtol=1e-2, atol=1e-2 * ref.abs().mean().item())
+
+
+@requires_sm100
+def test_general_block_scale_refuses_an_extent_off_the_compiled_vector_width(monkeypatch):
+    """An N that is not a multiple of the plan's output vector is refused at the launch, and nothing is written.
+
+    The boundary of test_general_block_scale_runs_other_extents_without_recompiling: N = 200 is a multiple of 8, not of
+    the 16 elements the plan compiled from N = 256 stores at a time. A graph that declares N = 200 compiles its own plan
+    with the narrower vector and runs."""
+    import cutlass.cute as cute
+
+    g = _graph(256, 256, 512)
+    _, binding = analyze_with_binding(g)
+    plan = Plan(g, config=by_name(_TILE_128))
+    vec_elems = _out_vec_elems(plan)
+    assert vec_elems == 16 and 200 % vec_elems
+    pack, out, _ = _bind_extents(plan, binding, 136, 200, 640)
+    with monkeypatch.context() as patched:
+        patched.setattr(cute, "compile", lambda *a, **k: pytest.fail("a refused extent must not recompile the plan"))
+        with pytest.raises(ValueError, match=r"problem_size\[1\]"):
+            plan(pack)
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+    # The same extents as the graph's own: a plan of their own, with the vector they divide by.
+    own = _graph(136, 200, 640)
+    _, own_binding = analyze_with_binding(own)
+    own_plan = Plan(own, config=by_name(_TILE_128))
+    assert 200 % _out_vec_elems(own_plan) == 0
+    pack, out, ref = _bind_extents(own_plan, own_binding, 136, 200, 640)
+    own_plan(pack)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.double(), ref.to(torch.bfloat16).double(), rtol=1e-2, atol=1e-2 * ref.abs().mean().item())
 
 
 @requires_sm100

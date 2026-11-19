@@ -136,6 +136,25 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
+| `pygraph.matmul` over `block_scale_dequantize` operands with linear scale tensors (FROST general block-scale kernel; plain, gated pair, FP8 block-128 output) | fprop | FP8 E4M3 operands, FP32 scales in 1x128 / 128x128 blocks; BF16 output, or FP8 E4M3 output with one FP32 scale per 128 columns | Unsupported for this kernel | Unverified (SM100 repeatability tested; batch invariance and SM103 unverified) | Unverified |
+| `pygraph.moe_grouped_matmul`, NONE, over linear-scale operands (FROST general grouped kernels, token-by-weight and `SWAP_AB=1`; plain, gated pair, FP8 block-128 output) | fprop | FP8 E4M3 operands, FP32 scales in 1x128 / 128x128 blocks; BF16 output, or FP8 E4M3 output with one FP32 scale per 128 columns | Unsupported for these kernels | Unverified (SM100 repeatability and isolated-row cases tested; general batch invariance and SM103 unverified) | Unverified |
+| `pygraph.moe_grouped_matmul`, GATHER, over linear-scale operands (FROST general grouped kernels, both orientations; plain, gated pair, FP8 block-128 output) | fprop | FP8 E4M3 operands, FP32 scales in 1x128 / 128x128 blocks; BF16 output, or FP8 E4M3 output with one FP32 scale per 128 columns | Unsupported for these kernels | Unverified (SM100 repeatability tested; batch invariance and SM103 unverified) | Unverified |
+| `pygraph.moe_grouped_matmul`, SCATTER and COMBINE, over linear-scale operands (FROST general grouped kernels) | fprop | FP8 E4M3 operands, FP32 scales; BF16 (SCATTER) or FP32 (COMBINE) output | Unsupported for these kernels | Unverified; COMBINE adds a token's routed rows with atomic adds, in no fixed order | Unverified |
+
+The general block-scale GEMM rows cover the FROST kernels that apply linear
+scale tensors to the accumulator, for example FP8 E4M3 data with one FP32
+scale per 1x128 activation block and per 128x128 weight block: the dense
+kernel and the four grouped ones. On SM100 (compute capability 10.0), fixed
+inputs replay to the same bytes for the dense kernel and for NONE and GATHER
+in both orientations, with BF16 output, with a gated pair and with FP8
+block-128 output. A routed row of a NONE graph keeps its bytes alone and
+among other rows of its group. Reordered, duplicated and removed groups,
+row isolation under GATHER, SCATTER and COMBINE, SM103 and SM107 are
+unverified. Warm launches of a shape that rewrites every scheduler slot
+inside one launch kept writing the reference bytes; these kernels run one
+thread block per SM, so that result bounds a failure rate for the tested
+shape and is not a qualification. See the
+[coverage record](../../test/python/determinism_goldens/README.md#general-linear-scale-gemm-kernels--sm100-2026-11-19).
 
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;

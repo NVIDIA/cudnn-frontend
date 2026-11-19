@@ -11,17 +11,19 @@ Registry gates (no GPU), then end-to-end numerics against an fp32 dequantize-the
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs recorder)
 import pytest
 import torch
 
-from gemm_test_utils import Plan, ceil_div, requires_sm100
+import warm_stress
+from gemm_test_utils import Plan, ceil_div, keep_kernel_ptx, kernel_ptx, requires_sm100
 from moe_block_scale_test_utils import _build_graph as _native_graph
 from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.graph_analyzer import analyze
-from cudnn.gemm.frost.kernel_registry import GraphType, classify_graph_type, select_template, swap_ab_graph
+from cudnn.gemm.frost.kernel_registry import GraphType, classify_graph_type, select_template, swap_ab_graph, template_path
 from cudnn.gemm.frost.tile_config import by_name
 
 pytestmark = pytest.mark.L0
@@ -46,12 +48,28 @@ _TILE_128 = _config(128, 128)
 
 
 def _graph(
-    E, S, N, K, G, *, gather_rows=None, scatter=None, combine=None, relu=False, block_a=(1, 128), block_b=(128, 128), sfa="fp32", sfb="fp32", out="bf16"
+    E,
+    S,
+    N,
+    K,
+    G,
+    *,
+    gather_rows=None,
+    scatter=None,
+    combine=None,
+    relu=False,
+    block_a=(1, 128),
+    block_b=(128, 128),
+    sfa="fp32",
+    sfb="fp32",
+    out="bf16",
+    shared_weight_scale=False,
 ):
     """``out[rows of group g] = dequant(token rows) @ dequant(weight[g % E]).T`` with linear scales.
 
     ``S`` is the token tensor's row count; under GATHER ``gather_rows`` routed rows index into it. ``scatter`` /
-    ``combine`` are the top-k of a SCATTER / COMBINE graph (the output is fp32 under COMBINE)."""
+    ``combine`` are the top-k of a SCATTER / COMBINE graph (the output is fp32 under COMBINE). The weight scale is
+    one matrix per expert, or one that every expert shares (``shared_weight_scale``)."""
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     t = {}
     t["tok"] = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.FP8_E4M3)
@@ -59,7 +77,7 @@ def _graph(
     am, ak = ceil_div(S, block_a[0]), ceil_div(K, block_a[1])
     bk, bn = ceil_div(K, block_b[0]), ceil_div(N, block_b[1])
     t["sfa"] = g.tensor(name="SFA", dim=[1, am, ak], stride=[am * ak, ak, 1], data_type=_CUDNN[sfa])
-    t["sfb"] = g.tensor(name="SFB", dim=[E, bk, bn], stride=[bk * bn, 1, bk], data_type=_CUDNN[sfb])
+    t["sfb"] = g.tensor(name="SFB", dim=[1 if shared_weight_scale else E, bk, bn], stride=[bk * bn, 1, bk], data_type=_CUDNN[sfb])
     t["fto"] = g.tensor(name="first_token_offset", dim=[G + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     tok_d = g.block_scale_dequantize(input=t["tok"], descale=t["sfa"], block_size=list(block_a))
     w_d = g.block_scale_dequantize(input=t["w"], descale=t["sfb"], block_size=list(block_b))
@@ -383,3 +401,270 @@ def test_general_grouped_block_scale_rejects_a_mismatched_scale_buffer():
     }
     with pytest.raises(ValueError, match=r"A scale\[0\] must have shape"):
         plan(pack)
+
+
+# The count of weight scale matrices is part of the compiled kernel (one per expert, read at the tile's expert, or one
+# that every expert shares, read at matrix 0): a call binds the count the graph declared.
+
+_COUNT_CASES = {
+    "fwd": dict(),
+    "swap": dict(swap=True, config=_config(128, 32)),
+    "gather": dict(gather=True),
+    "gather_swap": dict(gather=True, swap=True, config=_config(128, 32)),
+}
+
+
+def _count_case(shared, *, swap=False, gather=False, config=_TILE_128):
+    """Two experts over unit operands: a routed row's 128 outputs are K times the weight scale its kernel read.
+
+    The weight scale matrices hold 1 (expert 0) and 2 (expert 1); the token scale is 1. Returns the plan, the pack
+    without the weight scale, the output and the two matrices' backing tensor, [E, n blocks, k blocks]."""
+    E, S, N, K = 2, 256, 128, 512
+    g, t = _graph(E, S, N, K, E, gather_rows=S if gather else None, shared_weight_scale=shared)
+    plan = Plan(g, config=by_name(config), swap_ab=swap)
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[(gather, swap)]
+    dev = "cuda"
+    backing = torch.empty(E, 1, 4, device=dev)
+    backing[0], backing[1] = 1.0, 2.0
+    out = torch.full((1, S, N), float("nan"), device=dev, dtype=torch.bfloat16)
+    pack = {
+        t["tok"]: torch.ones(1, S, K, device=dev).to(torch.float8_e4m3fn),
+        t["w"]: torch.ones(E, N, K, device=dev).to(torch.float8_e4m3fn).transpose(1, 2),
+        t["sfa"]: torch.ones(1, S, 4, device=dev),
+        t["fto"]: torch.tensor([0, 128, 256], dtype=torch.int32, device=dev).view(-1, 1, 1),
+        t["out"]: out,
+    }
+    if gather:
+        pack[t["idx"]] = torch.arange(S, dtype=torch.int32, device=dev).view(1, S, 1)
+    return plan, t, pack, out, backing
+
+
+# A GATHER graph declares one weight scale matrix per expert: the analyzer has no shared spelling for it.
+_COUNT_PARAMS = [(case, shared) for case in _COUNT_CASES for shared in (False, True) if not (shared and _COUNT_CASES[case].get("gather"))]
+_COUNT_IDS = [f"{case}-{'shared' if shared else 'per_expert'}" for case, shared in _COUNT_PARAMS]
+
+
+@requires_sm100
+@pytest.mark.parametrize("case,shared", _COUNT_PARAMS, ids=_COUNT_IDS)
+def test_general_grouped_block_scale_reads_the_declared_scale_matrix_count(case, shared):
+    """The control of the refusals below: the declared count, bound, scales each group by its own (or the one) matrix."""
+    plan, t, pack, out, backing = _count_case(shared, **_COUNT_CASES[case])
+    # A view of the two matrices' storage either way, so the bound tensor is what selects the matrix.
+    pack[t["sfb"]] = (backing[:1] if shared else backing).transpose(1, 2)
+    plan(pack)
+    torch.cuda.synchronize()
+    expected = torch.tensor([512.0, 512.0 if shared else 1024.0], device="cuda").repeat_interleave(128)[:, None].expand(256, 128)
+    assert torch.equal(out[0].float(), expected)
+
+
+@requires_sm100
+@pytest.mark.parametrize("case,shared", _COUNT_PARAMS, ids=_COUNT_IDS)
+def test_general_grouped_block_scale_refuses_the_other_scale_matrix_count(case, shared):
+    """A kernel compiled for one scale matrix per expert reads matrix ``expert`` of what is bound, past the end of a
+    single matrix; one compiled for a shared matrix reads matrix 0 and would ignore the others. Either binding is
+    refused before the launch, in the kernel's axis order and in the graph's, and nothing is written.
+
+    The single matrix is a view of the two matrices' storage: were the binding accepted, the kernel would read
+    initialized memory of this test, not past an allocation."""
+    plan, t, pack, out, backing = _count_case(shared, **_COUNT_CASES[case])
+    other = backing if shared else backing[:1]
+    wanted, compiled = (1, "shared by every matrix") if shared else (2, "per matrix")
+    for bound in (other, other.transpose(1, 2)):
+        pack[t["sfb"]] = bound
+        with pytest.raises(ValueError, match=rf"[AB] scale\[0\] must have shape \[{wanted}, 1, 4\].*compiled for one scale matrix {compiled}"):
+            plan(pack)
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+
+
+# Releasing what was read (python/cudnn/AGENTS.md Rule 11)
+#
+# A grouped template hands three shared-memory stages back to their writers: a slot of the scheduler ring (every
+# consumer warp reads the tile's words and credits the slot's empty barrier), the broadcast mailbox (a scheduler warp
+# reads the claimed index and acknowledges to cluster rank 0) and, where a thread has many column runs, a stage of the
+# promotion scale table (released with the partial). Each release goes through cudnn.frost.tile_dsl.consume, which
+# computes the address of the arrive from every word read, so no word is still unread when the stage may be rewritten.
+# The GATHER templates acknowledge the mailbox with a reduction, which the helper has no form for: they store the
+# index they read in front of it.
+
+
+def _consumed_names(expr, body):
+    """The names a release passes as ``consumed``: a name, a list, or ``slot_words`` and what the code put into it."""
+    expr = expr.strip()
+    if expr != "slot_words":
+        return [n.strip() for n in expr.strip("[]").split(",")]
+    made = re.findall(r"slot_words = \[([^\]]*)\]", body)[-1]
+    return [n.strip() for n in made.split(",")] + re.findall(r"slot_words\.append\((\w+)\)", body)
+
+
+@pytest.mark.parametrize("gather,swap", list(_TEMPLATES))
+def test_general_grouped_templates_release_every_word_they_read(gather, swap):
+    """At the source: every release of a stage a warp read goes through the consume helper with each word it loaded."""
+    source = template_path(_TEMPLATES[(gather, swap)]).read_text()
+    # The scheduler ring: no bare arrive on a slot's empty barrier, and a release names every word loaded since the
+    # warp acquired the slot (its wait on the full barrier).
+    assert "mbarrier_arrive(sched_empty_mbar_ptr" not in source
+    releases = list(re.finditer(r"consume_then_arrive\(sched_empty_mbar_ptr\.subview\(\w+\), (.+), rz, pred=elect_one\)", source))
+    # The loader, the MMA warp's three arms, the epilogue and the promotion warps; GATHER adds its relay and copy warps.
+    assert len(releases) == (8 if gather else 6)
+    for release in releases:
+        body = source[source.rindex("sched_full_mbar_ptr.subview(", 0, release.start()) : release.start()]
+        loaded = list(dict.fromkeys(re.findall(r"^\s*(\w+) = .*\.load\(\)\s*$", body, flags=re.M)))
+        assert loaded, "a slot release without a slot read"
+        assert sorted(_consumed_names(release.group(1), body)) == sorted(loaded), f"line {source.count(chr(10), 0, release.start()) + 1}"
+    # The broadcast mailbox.
+    assert "mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr" not in source
+    read = source.index("linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()")
+    if gather:
+        store = source.index(".subview(0).store(cutlass.Int64(linear_idx))", read)
+        assert store < source.index("_publish_bcast_ack(nvvm.mapa(bcast_ack_count.subview(bcast_stage), 0))", read)
+    else:
+        assert "consume_then_arrive_on_peer(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0, linear_idx, rz, pred=lane == 0)" in source[read:]
+    # The promotion scale table: both reads are collected, and the partial's release passes them.
+    assert len(re.findall(r"\(promo_tbl\.subview\([^)]*\)\)\.load\(\)\n\s+tbl_words\.append\(scales\[mi\]\[run\]\)", source)) == 2
+    assert source.count("partial_empty_mbar_ptr.subview(partial_slot), tbl_words, rz, pred=elect_one") == 1
+    assert source.count("partial_empty_mbar_ptr.subview(partial_slot), pair_leader_rank, tbl_words, rz, pred=elect_one, release_cta=False") == 1
+    # The mask has the one use the helper allows, and the host passes the literal zero.
+    assert source.count("release_zero_arg") == 2 and "rz = release_zero(release_zero_arg)" in source
+    assert re.search(r"# @@TMA_STORE_ONLY:END@@\n\s+# [^\n]*\n\s+cutlass\.Int32\(0\),\n\s+\)\.launch\(", source)
+
+
+# Per rendering: the run, and the loaded registers each release's address is computed from, sorted. A slot word is one
+# 32-bit register: the MMA warp reads the validity word (once per arm it renders), the loader and the promotion warps
+# six words, the epilogue seven; the relay warp of a paired GATHER plan one and the token-copy warps four. The
+# mailbox is one word where an mbarrier acknowledges it. A scale table adds the partial's release (TABLE: at least one
+# register; the count depends on how the loads are packed).
+TABLE = "table"
+_RELEASE_RENDERINGS = {
+    "fwd": (dict(), [1, 1, 6, 6, 7]),
+    "fwd_2cta": (dict(config=_config(128, 128, "2x1", 2)), [1, 1, 1, 6, 6, 7]),
+    "swap_n32": (dict(swap=True, config=_config(128, 32)), [1, 1, 6, 6, 7, TABLE]),
+    # a paired plan releases the partial (and with it the table) on its pair leader's barrier
+    "swap_2cta": (dict(swap=True, config=_config(128, 128, "2x1", 2)), [1, 1, 1, 6, 6, 7, TABLE]),
+    "gather": (dict(S=300, gather_rows=512), [1, 4, 6, 6, 7]),
+    "gather_2cta": (dict(S=300, gather_rows=512, config=_config(128, 128, "2x1", 2)), [1, 1, 1, 4, 6, 6, 7]),
+    "gather_swap_n32": (dict(S=300, gather_rows=512, swap=True, config=_config(128, 32)), [1, 4, 6, 6, 7, TABLE]),
+}
+
+
+def _mailbox_store_precedes_the_reduction(ptx):
+    """GATHER, a cluster of several thread blocks: the index a lane read from the mailbox is stored in front of the
+    reduction that acknowledges it. Returns False when the PTX has no such reduction (a cluster of one)."""
+    lines = ptx.splitlines()
+    reductions = [i for i, line in enumerate(lines) if "red.release.cluster.shared::cluster.add.u32" in line]
+    if not reductions:
+        return False
+    assert len(reductions) == 1
+    stores = [i for i in range(reductions[0]) if lines[i].strip().startswith("st.shared.b64")]
+    assert stores, "no shared-memory store in front of the acknowledgement"
+    stored = re.search(r"(%rd\d+);", lines[stores[-1]]).group(1)
+    widened = [i for i in range(stores[-1]) if re.match(rf"\s*cvt\.s64\.s32\s+{stored},", lines[i])]
+    assert widened, f"the stored register {stored} is not the widened index"
+    index = re.search(r"(%r\d+);", lines[widened[-1]]).group(1)
+    loads = [i for i in range(widened[-1]) if re.match(rf"\s*ld\.shared\.b32\s+{index},", lines[i])]
+    assert loads, f"the stored value {index} is not what was read from shared memory"
+    # Straight-line code from the read to the store: no label between them.
+    assert not any(lines[i].rstrip().endswith(":") for i in range(loads[-1], stores[-1]))
+    return True
+
+
+@requires_sm100
+@pytest.mark.parametrize("case", list(_RELEASE_RENDERINGS))
+def test_general_grouped_release_addresses_depend_on_the_words_read(case, monkeypatch, tmp_path):
+    """In the generated PTX: the address of every such arrive is computed, through the kernel's release-zero argument,
+    from the registers the warp loaded. The rest of a rendering's arrives release no stage read with shared-memory loads."""
+    kw, expected = _RELEASE_RENDERINGS[case]
+    keep_kernel_ptx(monkeypatch, C, tmp_path)
+    plan, *_ = _run(**kw)
+    ptx = kernel_ptx(plan)
+    sites = warm_stress.assert_release_dependence(ptx, sites=len(expected), words=1)
+    found = sorted(site.loaded_registers for site in sites if site.dependent)
+    words = sorted(w for w in expected if w != TABLE)
+    if TABLE in expected:
+        assert plan._compiled is not None and C._general_block_scale_plan(plan.chain, plan._compiled.config)["promo_scale_table"]
+        # The table's release is the one the slot words do not account for.
+        for w in words:
+            found.remove(w)
+        assert len(found) == 1 and found[0] >= 1
+    else:
+        assert found == words
+    # Every dependent arrive is predicated (the elected lane, or the one lane that credits rank 0) ...
+    assert all(site.text.startswith("@") for site in sites if site.dependent)
+    # ... and the mailbox of a GATHER cluster is acknowledged behind the store of what was read.
+    gather, clustered = "gather_rows" in kw, "cluster2x1" in kw.get("config", "")
+    assert _mailbox_store_precedes_the_reduction(ptx) == (gather and clustered)
+
+
+def _stress_case(name, *, swap=False, gather=False, config=_TILE_128):
+    """A launch whose thread blocks each take many tiles, with an integer-valued reference of every output byte.
+
+    1024 groups of 16 rows over 8 experts: 1024 tiles for the launch's thread blocks, so every scheduler slot is
+    rewritten several times inside one launch. Operands and scales are small integers and powers of two: every
+    product and partial sum is exact in fp32 in any order, and the bf16 output is that sum rounded once."""
+    E, G, rows_per_group, N, K = 8, 1024, 16, 128, 128
+    S = G * rows_per_group
+    g, t = _graph(E, S, N, K, G, gather_rows=S if gather else None)
+    plan = Plan(g, config=by_name(config), swap_ab=swap)
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[(gather, swap)]
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(11)
+    tok = torch.randint(-3, 4, (1, S, K), device=dev, generator=gen).float()
+    w = torch.randint(-3, 4, (E, N, K), device=dev, generator=gen).float()
+    sa = torch.exp2(torch.randint(-1, 2, (1, S, 1), device=dev, generator=gen).float())
+    sb_nk = torch.exp2(torch.randint(-1, 2, (E, 1, 1), device=dev, generator=gen).float())
+    idx = torch.randperm(S, device=dev, generator=gen).to(torch.int32).view(1, S, 1) if gather else None
+    out = torch.empty(1, S, N, device=dev, dtype=torch.bfloat16)
+    pack = {
+        t["tok"]: tok.to(torch.float8_e4m3fn),
+        t["w"]: w.to(torch.float8_e4m3fn).transpose(1, 2),
+        t["sfa"]: sa,
+        t["sfb"]: sb_nk.transpose(1, 2),
+        t["fto"]: (torch.arange(G + 1, dtype=torch.int32, device=dev) * rows_per_group).view(-1, 1, 1),
+        t["out"]: out,
+    }
+    if gather:
+        pack[t["idx"]] = idx
+    routed = (tok[0] * sa[0])[idx[0, :, 0].long()] if gather else tok[0] * sa[0]
+    expert = torch.arange(G, device=dev).repeat_interleave(rows_per_group) % E
+    reference = torch.einsum("sk,snk->sn", routed.double(), (w * sb_nk).double()[expert]).float().to(torch.bfloat16).view(1, S, N)
+    workspace = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=dev)
+    cfg = plan._compiled.config
+    blocks = C._grid_num_clusters(cfg) * cfg.cga_size_m * cfg.cga_size_n
+    # The routed rows are the tile's columns once the operands are swapped, its rows otherwise.
+    tiles = G * -(-rows_per_group // (cfg.cta_tile_n if swap else cfg.cta_tile_m))
+    return warm_stress.StressCase(
+        name=f"general grouped block scale {name}",
+        launch=lambda: plan(pack, workspace=workspace),
+        outputs={"out": out},
+        thread_blocks=blocks,
+        # A thread block's share of the tiles through its two-slot ring.
+        refills_per_launch=max(tiles // blocks - 2, 0),
+        reference={"out": reference},
+    )
+
+
+_STRESS = {
+    "fwd": dict(),
+    "swap": dict(swap=True, config=_config(128, 16)),
+    "swap_table": dict(swap=True, config=_config(128, 32)),
+    "gather": dict(gather=True),
+    "gather_swap": dict(gather=True, swap=True, config=_config(128, 16)),
+}
+
+
+@requires_sm100
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("case", list(_STRESS))
+def test_general_grouped_warm_launches_keep_writing_the_reference_bytes(case):
+    """Warm launches, back to back and behind a launch that overwrites every SM's shared memory, write the bytes of an
+    independent reference: the run-time detector of a slot, mailbox or table word that is read after its stage was
+    rewritten. A rate bound for this shape on this GPU, and a pass only where the helper's control (the unsafe twin of
+    its test ring) is seen to fail; the order itself is pinned in the generated code by the test above.
+
+    The launch runs one thread block per SM (the kernel fixes its register count at entry that way), which the report
+    flags: the control's ring does not fail in that geometry, so the bound is weaker than at two blocks per SM."""
+    warm_stress.build_launchers(torch.device("cuda"))
+    stress = _stress_case(case, **_STRESS[case])
+    assert stress.refills_per_launch >= 4, "the shape rewrites every scheduler slot inside one launch"
+    warm_stress.assert_warm_stress(stress, validation=warm_stress.stress_validation(torch.device("cuda")))

@@ -4,6 +4,64 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### General linear-scale GEMM kernels — SM100, 2026-11-19
+
+The FROST general block-scale kernels apply linear scale tensors to the
+accumulator: `sm100_general_block_scale_matmul.py` (dense) and the four
+`sm100_general_moe_grouped_block_scale_matmul_fwd*.py` templates (NONE and
+GATHER, token-by-weight and `SWAP_AB=1`). They serve FP8 E4M3 operands with
+FP32 scales in 1x128 and 128x128 blocks, a gated pair (two GEMMs over the same
+tokens) and an FP8 output with one FP32 scale per 128 columns. Forward only;
+no backward path exists. No golden was recorded: the byte checks below compare
+launches with each other, with an exact integer reference, or with cold
+launches.
+
+| Suite (`gemm/frost/`) | Byte checks |
+|---|---|
+| `test_general_block_scale_matmul.py` | replay of the dense kernel (320 x 384 x 1024) |
+| `test_general_moe_grouped_block_scale_matmul_fwd.py` | replay: NONE token-by-weight, NONE `SWAP_AB=1`, GATHER. Row isolation, both orientations: four routed rows alone and among the other rows of their group. Warm stress, five cells (both orientations of NONE and GATHER, and a swapped tile with the promotion scale table): 1024 groups of 16 rows, N = K = 128, small-integer operands and power-of-two scales, so every byte has an exact reference |
+| `test_general_block_scale_gated_fp8.py` | replay of the gated pair, BF16 and FP8 block-128 output: dense, NONE in both orientations, GATHER. Row isolation of the pair in both orientations and both outputs. Launches on a workspace of arbitrary bytes that another plan also uses. Warm stress of the swapped gated FP8 plan, NONE and GATHER, against its cold launches (codes and scales) |
+
+Not covered: a group reordered, duplicated or removed; row isolation under
+GATHER; SCATTER and COMBINE (COMBINE adds a token's routed rows with atomic
+adds); fresh allocations with concurrent GPU work in the replay cases; the
+dense kernel with a batch of several matrices.
+
+The warm-stress shapes give a thread block about 15 tiles (30 passes for the
+pair) through its two-slot scheduler ring, so every slot is rewritten about 13
+times inside one launch; the swapped FP8 pair also alternates its two buffers
+of column maxima. The helper's control (the unsafe twin of its test ring)
+failed 200 of 200 launches on this GPU. Each of the seven cells read **0
+mismatches in 3000 warm and 3000 poisoned launches**, a per-launch rate below
+0.1% at 95% confidence for that shape. The kernels run one thread block per
+SM, below the control's three: the bound is weak, and the five grouped cells
+read zero as well against the templates as they were before their releases
+went through `tile_dsl.consume`. What separates the two is the generated code: against
+the earlier templates, `test_general_grouped_templates_release_every_word_they_read`
+(source) and `test_general_grouped_release_addresses_depend_on_the_words_read`
+(PTX, seven renderings) fail, and they pass now. The PTX test finds, per
+rendering, one arrive per release of a slot, of the broadcast mailbox and of
+the scale table whose address is computed from the loaded registers through
+the kernel's release-zero argument; the GATHER mailbox, acknowledged by a
+reduction, is checked for the store of the index in front of it.
+
+Run on an SM100 GPU of compute capability 10.0 with 68 SMs, driver 610.57.04,
+PyTorch 2.14.1+cu130, cuDNN backend 92400 and CuTe DSL 4.8.0 compiling with
+CUDA 13.4, on the change that follows source `26bb6426`. The frost test
+conftest loads `python/cudnn` of the checkout, which the run confirmed.
+Results, one process per suite: `test_general_block_scale_matmul.py` **57
+passed**; `test_general_moe_grouped_block_scale_matmul_fwd.py` **86 passed**;
+`test_general_block_scale_gated_fp8.py` **82 passed**; no failures and no
+skips. `test_template_epilogue_parity.py` passed 44 with its two
+single-family skips. SM103 and SM107 were not available and are unverified.
+
+```bash
+cd test/python
+for suite in test_general_block_scale_matmul test_general_moe_grouped_block_scale_matmul_fwd test_general_block_scale_gated_fp8; do
+    python -m pytest "gemm/frost/$suite.py" -m L0 -q -rs
+done
+```
+
 ### D256 nonpaged split physical origins (2026-11-16)
 
 `sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed

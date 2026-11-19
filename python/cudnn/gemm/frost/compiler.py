@@ -546,20 +546,28 @@ def _general_moe_scale_reject(chain, a_bufs, b_bufs, sfa, sfb, K: int) -> str | 
     """Why a grouped call's linear scale tensors do not cover its operands, or ``None``.
 
     The call binds A as ``[L, M, K]`` and B as ``[L, N, K]``; each scale is its operand's shape in blocks,
-    ``[1 or L, ceil(rows / block), ceil(K / block)]``, which is what the promotion warps index."""
+    ``[B, ceil(rows / block), ceil(K / block)]``, which is what the promotion warps index. ``B`` is the count the
+    graph declared, which the kernel is compiled for (``sfa_batch_broadcast`` / ``sfb_batch_broadcast``): 1 when one
+    scale matrix serves every matrix of the operand (the kernel reads matrix 0), else L, one per matrix (the kernel
+    reads the tile's). The other count is refused: the kernel would read past a single matrix, or ignore all but the
+    first of L."""
     bs = chain.block_scale
     sides = (
-        ("A", a_bufs, sfa if bs.a_scaled else [], bs.a_scale_block and (bs.a_scale_block[1], bs.a_scale_block[2])),
-        ("B", b_bufs, sfb if bs.b_scaled else [], bs.b_scale_block and (bs.b_scale_block[2], bs.b_scale_block[1])),
+        ("A", a_bufs, sfa if bs.a_scaled else [], bs.a_scale_block and (bs.a_scale_block[1], bs.a_scale_block[2]), bs.sfa_dim),
+        ("B", b_bufs, sfb if bs.b_scaled else [], bs.b_scale_block and (bs.b_scale_block[2], bs.b_scale_block[1]), bs.sfb_dim),
     )
-    for side, operands, scales, block in sides:
+    for side, operands, scales, block, declared in sides:
+        # The same test as the constant the kernel is rendered with (sm100/compiler.py).
+        broadcast = declared is not None and int(declared[0]) == 1
         for i, (operand, scale) in enumerate(zip(operands, scales)):
-            expected = (-(-int(operand.shape[1]) // block[0]), -(-K // block[1]))
+            expected = (1 if broadcast else int(operand.shape[0]), -(-int(operand.shape[1]) // block[0]), -(-K // block[1]))
             shape = tuple(int(d) for d in scale.shape)
-            if len(shape) != 3 or shape[0] not in (1, int(operand.shape[0])) or shape[1:] != expected:
+            if shape != expected:
+                compiled = "one scale matrix shared by every matrix of the operand" if broadcast else "one scale matrix per matrix of the operand"
                 return (
-                    f"{side} scale[{i}] must have shape [1 or {int(operand.shape[0])}, {expected[0]}, {expected[1]}] "
-                    f"for a {tuple(int(d) for d in operand.shape)} operand with {block[0]} x {block[1]} blocks; got {shape}"
+                    f"{side} scale[{i}] must have shape [{expected[0]}, {expected[1]}, {expected[2]}] "
+                    f"for a {tuple(int(d) for d in operand.shape)} operand with {block[0]} x {block[1]} blocks; got {shape}. "
+                    f"The plan is compiled for {compiled}, as the graph declared the scale tensor"
                 )
     return None
 
