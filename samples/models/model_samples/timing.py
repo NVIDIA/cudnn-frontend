@@ -257,15 +257,24 @@ class Report:
     """What a run prints after its loop: the text path, the first-token line with its route, the step timings, the traced
     pass and the bytes of a step."""
 
-    def __init__(self, tag: str, reduced: bool, tokens: int = 1, draft_tokens: Optional[int] = None):
+    def __init__(self, tag: str, reduced: bool, tokens: int = 1, draft_tokens: Optional[int] = None, drafter: bool = False):
         """``tokens``: the tokens per sequence a step of the session feeds.  At more than one its steps are verify steps:
         the first-token line, the rate and the bytes of a step are a decode step's and are not stated.
 
         ``draft_tokens``: the drafted tokens of a step of a session that feeds its prompt through decode steps and verifies
         behind it (``Session(draft_tokens=)``).  Its prompt is prefilled, so the first-token line is a decode session's;
         its rate is not printed, because the drafted tokens of its steps are its caller's; the bytes of a step stay not
-        stated; and the traced-pass line says that the prompt was replayed in front of the traced steps."""
+        stated; and the traced-pass line says that the prompt was replayed in front of the traced steps.
+
+        ``drafter``: such a session has a drafter, so its steps are whole steps of speculative decoding.  Its report then
+        has the acceptance lines (from ``accepted``: the count every step kept; ``scheduled``: some step verified drafted
+        tokens of its caller's, so nothing was measured), the bytes of such a step (``bytes`` at the step's tokens and
+        ``pass_bytes``, a draft pass's), and says why no rate is printed while the drafter runs on reference blocks."""
         self.tag, self.reduced, self.tokens, self.draft_tokens = tag, reduced, tokens, draft_tokens
+        self.drafter = drafter
+        self.accepted: List[int] = []  # of every step: the drafted tokens it kept
+        self.scheduled = False
+        self.pass_bytes: Dict[str, int] = {}  # the drafter's bytes_per_pass
         self.text_path: Dict[str, float] = {}
         self.prompt_tokens = 0
         self.prefill_route = "decode step"
@@ -302,8 +311,9 @@ class Report:
             lines.append(f"first token           not stated: a session of {self.tokens} tokens per sequence prefills nothing (its steps are verify steps)")
         else:
             lines.append(
-                f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one step; "
-                f"not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
+                f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one step"
+                + (", each but the first behind one pass of the drafter over the position in front of it" if self.drafter else "")
+                + f"; not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
             )
         s = self.clock.summary()
         if s is not None:
@@ -328,7 +338,10 @@ class Report:
             )
         elif self.trace_missing:
             lines.append(f"traced pass           not available: {self.trace_missing}")
-        if behind_prompt:  # no drafter runs: what a step keeps follows the tokens its caller drafted
+        if self.drafter:
+            lines += self.acceptance()
+            lines.append("rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)")
+        elif behind_prompt:  # no drafter runs: what a step keeps follows the tokens its caller drafted
             lines.append(f"rate                  not printed: the drafted tokens of these steps are their caller's ({self.tokens} tokens per sequence a step)")
         elif several:  # how many tokens a verify step keeps is its caller's: steps per second would not be tokens per second
             lines.append(
@@ -342,7 +355,16 @@ class Report:
             wall = self.clock.ids[-1] - self.clock.launch[0]
             produced = len(self.clock.ids)
             lines.append(f"rate                  {produced / wall:.1f} tokens per second per sequence = {produced} tokens / {wall:.3f} s of the decode loop")
-        if several:  # the family's arithmetic is a decode step's: one embedding row, one state slot, three history columns per sequence
+        if self.drafter and self.bytes and self.pass_bytes:  # a step of speculative decoding: one verify step and the drafter's passes
+            gb, k = 1e9, self.draft_tokens
+            model, moved = self.bytes["weights"] + self.bytes["state"], self.bytes["copies"] + self.bytes["state"]
+            lines.append(
+                f"bytes per step        {prefix}model {model / gb:.2f} GB (weights once, {self.tokens} embedding rows, one recurrent state read and "
+                f"{self.tokens} written, 3 history columns read and {self.tokens + 2} written, the caches up to the step's last position) + drafter "
+                f"{k} x {self.pass_bytes['weights'] / gb:.2f} GB; this stack moves {(moved + k * self.pass_bytes['copies']) / gb:.2f} GB "
+                "(arithmetic, not a measurement)"
+            )
+        elif several:  # the family's arithmetic is a decode step's: one embedding row, one state slot, three history columns per sequence
             lines.append("bytes per step        not stated for a verify step (the arithmetic of a step is the decode step's)")
         elif self.bytes:
             gb = 1e9
@@ -367,3 +389,20 @@ class Report:
         lines.append(f"note                  {bound}; no floor and no speed-of-light figure is printed")
         lines.extend(self.notes)
         return "\n".join(lines)
+
+    def acceptance(self) -> List[str]:
+        """The acceptance lines of a session with a drafter.  A step keeps the greedy token of its first row and the drafted
+        tokens the comparison accepted, 1 to ``tokens`` tokens: the mean over the steps, how many steps kept each number,
+        and per drafted token how many of the steps that kept the one before it kept it too.  For a run whose steps
+        verified drafted tokens of the caller's (a schedule) nothing was measured, and the line says that."""
+        steps, total = len(self.accepted), self.tokens
+        if not steps:
+            return ["acceptance            no step ran"]
+        counts = [sum(1 for kept in self.accepted if kept == count) for count in range(total)]
+        by_kept = ", ".join(f"{count + 1}: {steps_at}" for count, steps_at in enumerate(counts))
+        if self.scheduled:
+            return [f"acceptance            scheduled, not measured (reduction): {steps} steps; kept {by_kept}"]
+        reached = [sum(1 for kept in self.accepted if kept >= draft) for draft in range(total)]  # reached[j]: the steps that kept at least j drafted tokens
+        per_draft = ", ".join(f"{draft}: {reached[draft]} of {reached[draft - 1]}" for draft in range(1, total))
+        mean = f"kept tokens per step {1 + sum(self.accepted) / steps:.2f} of {total} (1 + accepted drafted tokens / steps), {steps} steps"
+        return [f"acceptance            {mean}; kept {by_kept}", f"                      accepted per draft: {per_draft}"]

@@ -6,8 +6,9 @@ model's output head it proposes tokens from, and its draft pass on reference blo
 
 A checkpoint of this family can carry a drafter beside the model: a small network that reads the model's last hidden row
 and the embedding of the last token and proposes the next tokens, which the model then verifies in one step (speculative
-decoding).  This module is its loader and its draft pass; no session runs a pass yet.  The loader answers three
-questions, each from the checkpoint itself:
+decoding).  This module is its loader and its draft pass; a session that is handed a drafter runs the passes of its
+steps (``Session(drafter=)``, ``Session.speculate``).  The loader answers three questions, each from the checkpoint
+itself:
 
 * **Which tensors.**  The drafter's own tensors sit under one prefix of the checkpoint, found in its shard headers: two
   norms in front of a ``[hidden, 2 x hidden]`` multiply, one attention layer with its MLP at the model's widths, a final
@@ -133,6 +134,8 @@ BODY = (
     ("draft.final_norm", ""),
 )
 HEAD = (("draft.head.quantize", ""), ("draft.head", ""), ("draft.token_choice", ""))
+#: the weight rows a reference multiply converts to fp64 at a time (``torch_ref.linear``): what a pass's working memory follows
+REFERENCE_CHUNK = 8192
 READS = "it reads a drafter stored in bf16, whose multiplies it quantises to 8 bits when it loads"
 RECIPE = 'samples/models/qwen_dense/README.md, "The checkpoint\'s drafter"'
 _JSON_KINDS = {dict: "an object", str: "a string", bool: "true or false", int: "a number", float: "a number", type(None): "null"}
@@ -494,6 +497,29 @@ class QwenDenseDrafter:
         g = self.geometry
         cache = 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
         return sum(self.load_bytes().values()) + (sum(self.copy_bytes().values()) if copies else 0) + cache
+
+    def working_bytes(self) -> int:
+        """What a pass on reference blocks needs on the device beyond what is held, in bytes: an allowance, not a bound.  A
+        reference multiply converts a chunk of ``REFERENCE_CHUNK`` weight rows to fp64, 8 bytes per element, and
+        multiplies on it; the allowance is the largest such chunk among the five weights and the listed head rows,
+        twice.  The factor two is the allowance: it stands for what the allocator keeps beside the chunk, and it is
+        held against a measured run, not derived."""
+        specs = {spec.name: spec for spec in self.tensor_specs()}
+        chunks = [min(REFERENCE_CHUNK, len(self.vocabulary.ids)) * self.geometry.hidden]
+        for _, parts in MULTIPLIES:
+            shapes = [specs[OWN + part + ".weight"].shape for part in parts]
+            chunks.append(min(REFERENCE_CHUNK, sum(shape[0] for shape in shapes)) * shapes[0][1])
+        return 2 * 8 * max(chunks)
+
+    def bytes_per_pass(self, positions: int = 0) -> Dict[str, int]:
+        """What one pass at one row reads, in bytes: arithmetic on the tensor list, not a measurement.  ``weights``: the five
+        weights, the norm weights and the listed head rows in the formats a load holds them (``load_bytes``), one row of
+        the model's embedding table, and the cache up to ``positions`` positions (keys and values); ``copies``: the same
+        with the five weights and the head rows as the bf16 copies the reference blocks multiply on (``copy_bytes``) --
+        what a pass moves while its blocks are reference chains."""
+        g, held = self.geometry, self.load_bytes()
+        row = 2 * g.hidden + 2 * g.attn_kv_heads * positions * g.attn_head_dim * 2
+        return {"weights": sum(held.values()) + row, "copies": sum(self.copy_bytes().values()) + held["norms"] + row}
 
     def manifest_text(self) -> str:
         """The manifest as a run prints it: no path, a file by its own name."""

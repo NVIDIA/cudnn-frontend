@@ -27,6 +27,7 @@
 
 No GPU, no weights on disk, no profiler."""
 
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -502,9 +503,10 @@ def test_what_a_verify_session_refuses_and_what_a_stream_needs():
         verify.verify(ids, kept)
     with pytest.raises(ValueError, match="was built for 26 positions per sequence"):
         verify.verify(ids, 0)
-    assert verify.record.accepted == [5, 5, 5, 2] and verify.state.accepted == 2
+    assert verify.record.accepted == verify.record.accepted_all == [5, 5, 5, 2] and verify.state.accepted == 2
     verify.reset(fresh=False)  # back to the start in the same allocations: the record and where the state stands go with it
     assert (verify.record.count, verify.record.accepted, verify.state.position, verify.state.accepted) == (0, [], 0, 0)
+    assert verify.record.accepted_all == [], "the counts of every step go with the record"
 
 
 def test_two_sessions_on_one_load_keep_two_states_and_a_verify_session_reports_no_decode_step_arithmetic():
@@ -1211,8 +1213,8 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert (
         "**One session for a prompt and its verify steps.** A session built with `draft_tokens=k` does both: it feeds its prompt through decode steps "
         "and then runs verify steps of `k + 1` tokens on the same state. Its plan table shows both plans, and one memory sentence counts one state. "
-        "The caller supplies the drafted tokens and says after the host read how many were kept; no session drafts yet. Two sessions on one load still "
-        "share weights, never a state." in section
+        "The caller supplies the drafted tokens and says after the host read how many were kept; handed the drafter, the session drafts them itself "
+        "(**The speculative step**, below). Two sessions on one load still share weights, never a state." in section
     )
     assert "One state for both kinds of step is not built" not in section and "no run here prefills a prompt" not in section
     assert all(f"`{name}`" in section for name in ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "acceptance"))
@@ -1336,8 +1338,8 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         "then 10 verify steps fed a plain run's 32 new tokens with scheduled counts): `position`, `prompt`, `recorded` and `rejected rows` passed;" in section
     )
     assert (
-        "A session can now feed a prompt through decode steps and verify behind it (`Session(draft_tokens=k)`), the caller supplying the drafted tokens; "
-        "no script drafts yet." in " ".join(area.split())
+        "A session can feed a prompt through decode steps and verify behind it (`Session(draft_tokens=k)`), the caller supplying the drafted tokens; "
+        "handed the drafter (`drafter=`, one sequence) it runs the whole step of speculative decoding:" in " ".join(area.split())
     )
     assert (
         "## What one session for a prompt and its verify steps taught" in guide and "A kernel on a view is another compiled form, under the same name." in guide
@@ -1943,13 +1945,16 @@ def test_a_row_that_hands_a_call_site_on_and_the_parts_of_its_block():
 
 
 # ---------------------------------------------------------------- one session for the prompt's decode steps and the verify steps
-def _speculative(sequences, drafted, new=24, prompt=5, **more):
+def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, **more):
     """A plain session and a session built with ``draft_tokens=drafted`` on its weights -- the reference stack on the CPU,
     the tiny geometry -- both loaded; the prompts; and the plain run's new tokens of every sequence (``new`` and the
-    ``drafted - 1`` more the last window reads): ``(plain, session, prompts, stream)``."""
+    ``drafted - 1`` more the last window reads): ``(plain, session, prompts, stream)``.  ``drafter``: what makes the
+    session's drafter from the model (``QwenDenseDrafter.seeded``, or a wrong one's); left out, the session has none."""
     from model_samples import Session, TextIO
 
     model = _tiny_model()
+    if drafter is not None:
+        more["drafter"] = drafter(model)
     text = TextIO.synthetic(model.geometry.vocab)
     common = dict(sequences=sequences, stack="reference", device="cpu", capacity=prompt + new + drafted)
     plain = Session(model, text, **common)
@@ -2161,6 +2166,7 @@ def test_a_run_longer_than_its_record_is_compared_on_what_it_recorded(monkeypatc
     plain, session, prompts, stream = _speculative(1, 5, record_steps=3)
     _, scheduled = _scheduled_loop(session, prompts, stream)
     assert (session.record.count, session.record.accepted, session.prompt_record.count) == (len(scheduled), scheduled[:3], 5) and len(scheduled) == 8
+    assert session.record.accepted_all == scheduled, "the count of every step, recorded or not, beside the counts of the recorded ones"
     checks = tie_out.speculative_checks(session, plain)
     assert checks.ok, checks.text()
     assert _line(checks, "position").endswith(
@@ -2673,3 +2679,954 @@ def test_the_decode_adapter_builds_the_layout_the_prompt_launches(monkeypatch):
     assert state.prompt_layers()[1].k is state.layers[1].k and state.prompt_layers()[1].tokens == 1, "an attention layer: the same cache, one position a step"
     plain_state = DecodeState(g.layer_kinds, 2, 16, model.state_shapes(), "cpu")
     assert plain_state.decode_layers is plain_state.layers and plain_state.prompt_layers() is plain_state.layers
+
+
+# ---------------------------------------------------------------- the speculative step: draft passes, one verify step, one host read
+def _engine_loop(session, prompts, stream, new=24, scheduled=True, emit=None):
+    """The loop a caller writes around a session with a drafter: ``prefill``, then per step ``speculate``, the ONE host read
+    of the pair, ``sampling.accepted``, ``accept``.  ``scheduled``: the drafted tokens of every step are those of
+    :func:`tie_out.forced_drafts` (``force=``), which a correct step keeps 0, 1, .., ``draft_tokens`` of in turn; else
+    the drafter's own.  ``emit(window, greedy, kept)`` replaces what the loop emits of a step, for a test of a wrong
+    loop.  Returns ``(the new tokens, the scheduled counts, the pair every step returned)``."""
+    from model_samples import sampling, tie_out
+
+    drafted, vocab = session.draft_tokens, session.model.geometry.vocab
+    out = session.read(session.prefill(prompts))
+    schedule, pairs, done = [], [], 1
+    while done < new:
+        length = len(schedule) % (drafted + 1)
+        force = torch.tensor([tie_out.forced_drafts(stream[0][done:], length, drafted, vocab)], dtype=torch.int32) if scheduled else None
+        pairs.append(session.speculate(force))
+        ((window, greedy),) = session.read(pairs[-1])
+        kept = sampling.accepted(window, greedy)
+        session.accept(kept)
+        out += greedy[: kept + 1] if emit is None else emit(window, greedy, kept)
+        schedule.append(length)
+        done += kept + 1
+    return out, schedule, pairs
+
+
+def _seeded_drafter(model):
+    from model_samples.qwen_dense import QwenDenseDrafter
+
+    return QwenDenseDrafter.seeded(model)
+
+
+def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says():
+    """A session with a drafter runs the whole step: the drafter's passes, one verify step, the pair for the one host read.
+    The seeded model and its seeded drafter on the CPU: with the drafted tokens of every step scheduled (``force=``) the
+    ids are the plain session's, every count is kept, the drafter still proposes and its proposals are in the record;
+    every line of the comparison holds, the two lines of the drafter among them; the replay regenerates the proposals.
+    The loop on the drafter's own proposals keeps whatever the comparison says and emits the same ids."""
+    from model_samples import loop, tie_out
+
+    drafted, new = 5, 24
+    tokens = drafted + 1
+    plain, session, prompts, stream = _speculative(1, drafted, new, drafter=_seeded_drafter)
+    drafter, calls = session.drafter, session.drafter.calls_per_pass()
+    assert (calls, session.draft_plan.sequences, session.draft_plan.tokens, session.draft_plan.stack) == (18, 1, 1, "reference")
+    # the tables: the verify steps', the prompt's, and under one line the drafter's -- one plan of it, at one row per sequence
+    line = "the drafter: 18 block calls a pass; the first pass of a step behind a verify step runs at S x T rows, every other pass "
+    line += "and every pass over the prompt at S rows; every row of this table serves any row count"
+    assert loop.DRAFTER_ROWS.format(calls=calls) == line
+    above, said, below = session._tables().partition(f"\n{line}\n")
+    assert said and below == session.draft_plan.table() and above == f"{session.plan.table()}\n{loop.PROMPT_ROWS}\n{session.prefill_plan.table()}"
+    assert session.draft_plan not in session._plans() and session._first_used()[-1] is session.draft_plan and session.draft_plan.first_used
+    # the load: the drafter with the model's table, no second copy; a warm-up step that is a whole step
+    assert session.draft_weights.embedding is session.weights.embedding and session.draft_weights.copies is not None
+    assert session.report().calls_per_step == 27 + drafted * calls, "the block calls of a step: the model's and the drafter's passes"
+    assert (session.state.hidden, session.state.greedy, session.state.position) == (None, None, 0), "the warm-up left nothing"
+    assert tuple(session.state.draft.k.shape) == (1, 1, session.capacity, 8) and not session.state.draft.k.any()
+    # the prompt: N decode steps, and N - 1 passes of the drafter (15 block calls each) in front of every step but the first
+    first = session.read(session.prefill(prompts))
+    assert session._calls == 5 * 27 + 4 * 15 and first == [stream[0][0]]
+    cache = session.state.draft
+    assert cache.k[:, :, :4].abs().sum() > 0 and not cache.k[:, :, 4:].any(), "positions 0 to 3 are written; the last prompt position waits for its token"
+    assert tuple(session.state.hidden.shape) == (1, 64) and session.state.hidden.dtype == torch.bfloat16 and session.state.greedy.tolist() == first
+    # one step: the pair, on the device, nothing read; the window starts with the token kept last and goes on with the forced tokens
+    force = torch.tensor([tie_out.forced_drafts(stream[0][1:], 2, drafted, 272)], dtype=torch.int32)
+    pair = session.speculate(force)
+    assert tuple(pair.shape) == (1, 2, tokens) and pair.dtype == torch.int32
+    assert pair[0, 0].tolist() == [first[0], *force[0].tolist()] and torch.equal(pair[0, 1], session.state.greedy)
+    assert tuple(session.state.hidden.shape) == (tokens, 64) and session.state.position == 5, "the count stays open: the position has not moved"
+    assert session._calls == 5 * 27 + 4 * 15 + drafted * calls + 27
+    proposals = session.record.proposals[0]
+    assert tuple(session.record.proposals.shape[1:]) == (1, drafted) and not torch.equal(proposals, force), "the drafter's own, not the forced ones"
+    assert set(proposals[0].tolist()) <= set(drafter.vocabulary.ids), "it proposes from its listed ids"
+    assert cache.k[:, :, 4 : 4 + drafted].abs().sum(dim=(0, 1, 3)).gt(0).all() and not cache.k[:, :, 4 + drafted :].any(), "pass 1 at 4, the others behind it"
+    session.accept(2)
+    assert (session.state.position, session.state.accepted, session.record.accepted_all, session.record.forced) == (8, 2, [2], 1)
+    # the scheduled loop
+    session.reset(fresh=True)
+    out, scheduled, pairs = _engine_loop(session, prompts, stream, new)
+    assert out[:new] == stream[0][:new], "the ids are the plain session's"
+    assert session.record.accepted == scheduled == session.record.accepted_all and set(scheduled) == set(range(tokens)), "every count was kept"
+    assert session.record.forced == len(scheduled) and all(tuple(pair.shape) == (1, 2, tokens) for pair in pairs)
+    recorded = session.record.proposals[: len(scheduled)].clone()
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    assert checks.ok, checks.text()
+    steps = len(scheduled)
+    assert _line(checks, "drafter cache") == (
+        f"  drafter cache     after the passes of {steps} of {steps} steps the drafter's cache up to the last kept position is the "
+        "bytes of the passes written out at one row per position    PASS"
+    )
+    assert _line(checks, "draft proposals") == (
+        f"  draft proposals   the 5 proposals the run recorded are those of the passes written out at one row, in {steps} of {steps} steps    PASS"
+    )
+    assert [line.split()[0] for line in checks.lines[1:]].count("drafter") == 1 and all("FAIL" not in line for line in checks.lines)
+    assert session.record.count == steps and torch.equal(session.record.proposals[:steps], recorded), "the comparison leaves the run's record"
+    own = tie_out.run_checks(session, prompt_tokens=5)
+    assert own.ok, own.text()
+    assert "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    PASS" in own.lines
+    # ... and the replay holds the proposals: a record that says the drafter proposed another token is not the run's
+    _engine_loop(session, prompts, stream, new)
+    session.record.proposals[2, 0, 4] += 1
+    other = tie_out.run_checks(session, prompt_tokens=5)
+    assert (
+        not other.ok and "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    FAIL" in other.lines
+    )
+    # the drafter's own proposals: the step keeps what the comparison says, and the ids are still the plain session's
+    out, _, pairs = _engine_loop(session, prompts, stream, new, scheduled=False)
+    assert out[:new] == stream[0][:new] and session.record.forced == 0 and all(0 <= kept <= drafted for kept in session.record.accepted_all)
+    windows = session.record.inputs[: session.record.count].view(-1, tokens)
+    assert torch.equal(windows[:, 1:], session.record.proposals[: session.record.count, 0]), "the windows are the drafter's proposals"
+    unscheduled = tie_out.speculative_checks(session, plain)
+    assert unscheduled.ok, unscheduled.text()
+    # the line of the proposals is about what the RUN recorded, not what the comparison's replay drafts: a record of another token fails it
+    session.reset(fresh=False)  # the comparison left the session with the record of its run: a new prompt set starts with a reset
+    _engine_loop(session, prompts, stream, new, scheduled=False)
+    ran = session.record.count
+    session.record.proposals[1, 0, 2] += 1
+    tampered = tie_out.speculative_checks(session, plain)
+    assert not tampered.ok and _line(tampered, "drafter cache").endswith("    PASS")
+    assert _line(tampered, "draft proposals").endswith(f"in {ran - 1} of {ran} steps    FAIL")
+
+
+def test_a_step_leaves_the_rows_its_output_head_read_and_the_ids_it_chose_by_reference():
+    """What a drafter reads of a step is what that step's output head read.  ``state.hidden`` IS the tensor the final
+    norm's call returned -- the call whose quantised rows the head multiplied -- and ``state.greedy`` IS what the token
+    choice returned: the same objects, not a copy, and not another tensor of the step with the same shape (the rows in
+    front of the norm, a layer's normed rows, the residual stream).  The session and the second run of the comparison
+    read the same attribute, so no line of a comparison holds this; the session's tap does: behind a prompt step (one
+    row), behind a verify step (six rows), and on a plain session, whose step leaves them as well."""
+    plain, session, prompts, _ = _speculative(1, 5, drafter=_seeded_drafter)
+    seen = {}
+
+    def tap(name, layer, block, operands):
+        out = block(*operands)
+        if name == "add_norm_quantize" and operands[-1] == "output_head":
+            seen["quantised"], seen["normed"] = out[0], out[1]
+        elif name == "output_head":
+            seen["head read"] = operands[0]
+        elif name == "token_choice":
+            seen["chosen"] = out
+        return out
+
+    def held(state, rows):
+        assert state.hidden is seen["normed"] and state.greedy is seen["chosen"], "by reference: the tensors the two calls returned"
+        assert seen["head read"] is seen["quantised"], "the head read the quantised rows of that same norm call"
+        assert tuple(state.hidden.shape) == (rows, 64) and state.hidden.dtype == torch.bfloat16 and tuple(state.greedy.shape) == (rows,)
+
+    session.tap = plain.tap = tap
+    session.read(session.prefill(prompts))
+    held(session.state, 1)
+    session.speculate()
+    held(session.state, 6)
+    rows, ids = session.state.hidden, session.state.greedy
+    session.accept(3)
+    assert session.state.hidden is rows and session.state.greedy is ids, "keeping tokens leaves both where they are: nothing is copied"
+    seen.clear()
+    plain.read(plain.prefill(prompts))
+    held(plain.state, 1)
+
+
+def test_what_a_rejected_draft_left_in_the_drafters_cache_is_not_read():
+    """A step that keeps fewer tokens than were drafted leaves the drafter's own rows in its cache behind the last kept
+    position.  The first pass of the next step writes those positions again, from the model's rows, before a row reads
+    them -- it writes every position of the step before, from that step's first row on.  So with every cache position
+    from there on overwritten after every ``accept``, the rows of the rejected drafts among them, the loop proposes
+    and emits what it did, and the cache in front of its last step is the same bytes.  The control: the position in
+    front of that first row is read and never written again, and the same overwrite from there on moves the proposals."""
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
+    out, scheduled, _ = _engine_loop(session, prompts, stream)
+    steps, began = session.record.count, session.state.position - (session.state.accepted + 1)
+    assert scheduled == [0, 1, 2, 3, 4, 5, 0, 1], "all but one step left rejected drafts behind"
+    first = (session.record.proposals[:steps].clone(), session.state.draft.k[:, :, :began].clone(), session.state.draft.v[:, :, :began].clone())
+    accept = session.accept
+
+    def overwriting(in_front):
+        def told(count):
+            accept(count)
+            state = session.state
+            at = state.position - (state.accepted + 1) - in_front  # the first row of the step that has just been told its count
+            state.draft.k[:, :, at:] = 1.5
+            state.draft.v[:, :, at:] = -2.5
+
+        return told
+
+    session.reset(fresh=False)
+    session.accept = overwriting(0)
+    again, kept, _ = _engine_loop(session, prompts, stream)
+    cache = session.state.draft
+    assert again == out and kept == scheduled and torch.equal(session.record.proposals[:steps], first[0]), "nothing of it was read"
+    assert torch.equal(cache.k[:, :, :began], first[1]) and torch.equal(cache.v[:, :, :began], first[2]) and bool((cache.k[:, :, began:] == 1.5).all())
+    session.reset(fresh=False)
+    session.accept = overwriting(1)
+    again, kept, _ = _engine_loop(session, prompts, stream)
+    assert again == out and kept == scheduled, "the drafted tokens were scheduled: the ids are the plain session's all the same"
+    assert not torch.equal(session.record.proposals[:steps], first[0]), "the position in front of a step is read by every pass behind it"
+
+
+def _wrong_drafter(wrong):
+    """What makes a seeded drafter whose ``draft`` is wrong in one named way; every pass of it is the right one."""
+    from model_samples.qwen_dense import QwenDenseDrafter
+
+    class Wrong(QwenDenseDrafter):
+        def draft(self, call, weights, cache, hidden, ids, position, kept, passes):
+            sequences = cache.k.shape[0]
+            rows = self.body(call, weights, cache, hidden, ids, position).unflatten(0, (sequences, hidden.shape[0] // sequences))
+            row = rows[:, 0 if wrong == "the row select at row 0" else kept]
+            drafts = [self.propose(call, weights, row)]
+            for index in range(1, passes):
+                if wrong == "a later pass fed the model's row again":
+                    row = hidden.unflatten(0, (sequences, hidden.shape[0] // sequences))[:, kept]
+                token = drafts[-2] if wrong == "a later pass fed the draft of two passes before" and index > 1 else drafts[-1]
+                at = position + kept + index + (1 if wrong == "a later pass one position off" else 0)
+                row = self.body(call, weights, cache, row, token, at, index)
+                drafts.append(self.propose(call, weights, row, index))
+            return torch.stack(drafts, dim=1)
+
+    return Wrong.seeded
+
+
+#: a wrong pass -> the line of the comparison that must fail: the first four are the session's (what it hands the passes), the
+#: last four the drafter's own (which row a step goes on from, what a later pass is handed)
+WRONG_PASSES = {
+    "a first pass one position off": "drafter cache",
+    "a fill pass left out": "drafter cache",
+    "a forced token used where the kept one belongs": "drafter cache",
+    "the hidden rows of an older step": "drafter cache",
+    "the row select at row 0": "draft proposals",
+    "a later pass fed the model's row again": "draft proposals",
+    "a later pass fed the draft of two passes before": "draft proposals",
+    "a later pass one position off": "draft proposals",
+}
+
+
+@pytest.mark.parametrize("wrong", list(WRONG_PASSES))
+def test_a_wrong_draft_pass_fails_the_line_that_sees_it(monkeypatch, wrong):
+    """Each wrong pass, in a loop that still emits the plain session's ids (the drafted tokens are scheduled, the verify
+    step is right): the line that sees it FAILS.  ``drafter cache`` sees what the first pass of a step and the passes over
+    the prompt are handed; ``draft proposals`` sees the row a step goes on from and the later passes, which leave the
+    cache up to the last kept position as it must be."""
+    from model_samples import loop, tie_out
+
+    failing, of_the_drafter = WRONG_PASSES[wrong], WRONG_PASSES[wrong] == "draft proposals"
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_wrong_drafter(wrong) if of_the_drafter else _seeded_drafter)
+    fed, rows = [], []  # the window and the final-norm rows of every verify step, as the step itself was handed and left them
+    run = loop.Session._run
+
+    def remembering(self, plan, tokens, ids):
+        out = run(self, plan, tokens, ids)
+        if tokens > 1:
+            fed.append(ids)
+            rows.append(self.state.hidden)
+        return out
+
+    def wrong_draft(self):
+        state, kept = self.state, self.state.accepted
+        hidden, ids, position = state.hidden, state.greedy, state.position - (kept + 1)
+        if wrong == "a first pass one position off":
+            position += 1
+        if wrong == "a forced token used where the kept one belongs" and state.verify_steps and kept + 1 < self.tokens:
+            ids = ids.clone()
+            ids[kept] = fed[-1][kept + 1]  # the drafted token the window had behind the kept ones, not the token the step chose
+        if wrong == "the hidden rows of an older step" and state.verify_steps > 1:
+            hidden = rows[-2]
+        return self.drafter.draft(self._draft_call, self.draft_weights, state.draft, hidden, ids, position, kept, self.draft_tokens)
+
+    fill = loop.Session._fill
+    monkeypatch.setattr(loop.Session, "_run", remembering)
+    if wrong == "a fill pass left out":
+        monkeypatch.setattr(loop.Session, "_fill", lambda self, ids: None if self.state.position == 2 else fill(self, ids))
+    elif not of_the_drafter:
+        monkeypatch.setattr(loop.Session, "_draft", wrong_draft)
+    out, scheduled, _ = _engine_loop(session, prompts, stream)
+    assert out[:24] == stream[0][:24] and session.record.accepted == scheduled, "the verify step and the comparison are right: the ids are the plain session's"
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    assert not checks.ok and _line(checks, failing).endswith("    FAIL"), checks.text()
+    if of_the_drafter:  # the first pass and the prompt's passes were right: the cache up to the last kept position holds
+        assert _line(checks, "drafter cache").endswith("    PASS"), checks.text()
+    if wrong == "a forced token used where the kept one belongs":
+        # the first step drafts behind the prompt and is right; the second hands the pass of its LAST kept position the rejected
+        # draft, and the line fails in that step already -- it compares up to the last kept position -- and in every step behind it
+        assert "after the passes of 1 of 8 steps" in _line(checks, failing) and scheduled[0] == 0
+    failed = [line.split("  ")[1].strip() for line in checks.lines[1:] if line.endswith("    FAIL")]
+    assert set(failed) <= {"drafter cache", "draft proposals"}, "no line of the model's step fails: the passes write the drafter's cache alone"
+
+
+def test_a_drafted_token_the_caller_emits_reaches_no_line_of_the_comparison():
+    """The window of a step is the session's: it starts with the greedy token the session kept last, whatever its caller
+    emitted.  A loop that emits a drafted token where the verify step chose another -- the loop that fails the token
+    line of a session whose caller builds the windows -- leaves every line of this comparison as it was; what shows it
+    is the run's ids against the plain session's."""
+    from model_samples import tie_out
+
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
+    out, scheduled, _ = _engine_loop(session, prompts, stream, emit=_emit_the_drafted_token)
+    assert out[:24] != stream[0][:24], "the emitted ids are not the plain session's"
+    assert session.record.accepted == scheduled and set(scheduled) == set(range(6)), "the session's steps are what they were"
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    assert checks.ok and all(_line(checks, name).endswith("    PASS") for name in ("tokens", "drafter cache", "draft proposals", "acceptance")), checks.text()
+
+
+def test_a_second_prompt_set_starts_from_nothing_of_the_first():
+    """What a drafter reads of the step before it -- the final-norm rows, the greedy ids, the kept count -- and the
+    drafter's cache go with the state: ``reset(fresh=False)`` clears them in the existing allocations and a second prompt
+    set gives the proposals of a fresh session; ``snapshot`` / ``restore`` carry them, so the steps behind a restored
+    state are the steps that were behind it the first time."""
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
+    out, _, pairs = _engine_loop(session, prompts, stream, scheduled=False)
+    steps = session.record.count
+    first = (out, session.record.proposals[:steps].clone(), list(session.record.accepted_all), torch.stack(pairs))
+    state, cache = session.state, session.state.draft
+    assert state.hidden is not None and state.greedy is not None and cache.k.any() and state.accepted == session.record.accepted_all[-1]
+    session.reset(fresh=False)
+    assert session.state is state and state.draft is cache, "the same allocations"
+    assert (state.hidden, state.greedy, state.accepted, state.position, state.verify_steps) == (None, None, 0, 0, 0)
+    assert not cache.k.any() and not cache.v.any() and (session.record.accepted_all, session.record.forced, session.record.count) == ([], 0, 0)
+    out, _, pairs = _engine_loop(session, prompts, stream, scheduled=False)
+    again = (out, session.record.proposals[:steps].clone(), list(session.record.accepted_all), torch.stack(pairs))
+    assert again[0] == first[0] and again[2] == first[2] and torch.equal(again[1], first[1]) and torch.equal(again[3], first[3])
+    # a snapshot behind the third step, two more steps, the snapshot back, the two steps again
+    session.reset(fresh=False)
+    session.read(session.prefill(prompts))
+    for count in first[2][:3]:
+        session.speculate()
+        session.accept(count)
+    snap = state.snapshot()
+    assert snap["hidden"] is not state.hidden and torch.equal(snap["hidden"], state.hidden) and torch.equal(snap["greedy"], state.greedy)
+    assert snap["accepted"] == first[2][2] and all(torch.equal(saved, held) for saved, held in zip(snap["draft"], cache.tensors()))
+
+    def two_steps():
+        made = []
+        for count in first[2][3:5]:
+            made.append(session.speculate())
+            session.accept(count)
+        return torch.stack(made)
+
+    behind = two_steps()
+    assert torch.equal(behind, first[3][3:5]), "the steps of the first run"
+    assert not torch.equal(cache.k, snap["draft"][0]) and not torch.equal(state.hidden, snap["hidden"]), "two steps moved the cache and the rows"
+    state.restore(snap)
+    assert state.hidden is snap["hidden"] and state.greedy is snap["greedy"] and state.accepted == snap["accepted"]
+    assert torch.equal(cache.k, snap["draft"][0]) and torch.equal(cache.v, snap["draft"][1]) and state.draft is cache
+    again = two_steps()
+    assert torch.equal(again, behind), "behind the restored state: the same pairs"
+    # a state without a drafter has no cache and snapshots none
+    assert plain.state.draft is None and plain.state.snapshot()["draft"] is None
+
+
+def test_a_drafter_serves_one_sequence():
+    """The two refusals of ``drafter=`` by name -- a drafter without ``draft_tokens=``, a drafter at more than one sequence
+    -- before any plan; and what the step of such a session refuses."""
+    from model_samples import Session, TextIO, loop, tie_out
+
+    model = _tiny_model()
+    text, drafter = TextIO.synthetic(model.geometry.vocab), _seeded_drafter(model)
+    common = dict(stack="reference", device="cpu")
+    assert loop.ONE_SEQUENCE == "a session with a drafter serves one sequence: one request, as the drafter rows are for"
+    with pytest.raises(ValueError, match=rf"^{re.escape(loop.ONE_SEQUENCE)}; got sequences=2$"):
+        Session(model, text, sequences=2, draft_tokens=5, drafter=drafter, **common)
+    with pytest.raises(
+        ValueError, match=r"^a drafter drafts the tokens a session's verify steps check: drafter= needs draft_tokens=, the number it drafts a step$"
+    ):
+        Session(model, text, drafter=drafter, **common)
+    with pytest.raises(ValueError, match=r"not with both$"):
+        Session(model, text, tokens=6, draft_tokens=5, drafter=drafter, **common)
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
+    window = torch.zeros((1, 6), dtype=torch.int32)
+    with pytest.raises(ValueError, match=r"^the step of a session with a drafter is Session\.speculate \(force= verifies the caller's drafted tokens\)"):
+        session.verify(window)
+    with pytest.raises(ValueError, match=r"^the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first"):
+        session.speculate()
+    clock = session.report().clock
+    assert (len(clock.launch), len(clock.ids), session._calls) == (0, 0, 0), "refused in front of the passes and of the report's clock"
+    with pytest.raises(ValueError, match=r"^Session\.speculate drafts the tokens of its step: it needs a drafter \(drafter=\)"):
+        plain.speculate()
+    session.read(session.prefill(prompts))
+    assert session.report().prefill_seconds > 0 and not clock.ids, "the read that ends the prompt is the prompt's, behind a refused step too"
+    for force in (torch.zeros((1, 4), dtype=torch.int32), torch.zeros((2, 5), dtype=torch.int32), torch.zeros((1, 5), dtype=torch.int64)):
+        with pytest.raises(ValueError, match=r"^force is the drafted tokens of the step, int32 \[1, 5\] \(sequences, draft tokens\); got "):
+            session.speculate(force)
+    assert session.record.count == 0 and not session.state.verify_steps, "a refused step ran nothing"
+    session.speculate()
+    with pytest.raises(ValueError, match=r"^the step before this one has not been told how many of its tokens are kept \(Session\.accept\)$"):
+        session.speculate()
+    with pytest.raises(ValueError, match=r"^a traced pass replays every step with its kept count"):
+        session.trace(1)
+    session.accept(0)
+    # a refusal names the step such a session was asked for: speculate, not the verify step it refuses
+    asked = r"^behind its prompt a session with a drafter runs steps of speculative decoding \(Session\.speculate\); a decode step behind a keep is not built$"
+    with pytest.raises(ValueError, match=asked):
+        session.step(torch.zeros(1, dtype=torch.int32))
+    with pytest.raises(
+        ValueError, match=r"^no step of this session waits for its kept count: Session\.accept follows a Session\.speculate \(a session with a drafter\)$"
+    ):
+        session.accept(0)
+    # a replay that has no prompt to feed is refused by the sentence of a step in front of the prompt: such a session has no other first step
+    session.prompt_record.prompt = None
+    with pytest.raises(ValueError, match=r"^the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first"):
+        tie_out.run_checks(session, prompt_tokens=5)
+    # a step past the capacity is refused before its passes: nothing was drafted, written or recorded for it
+    plain, short, prompts, stream = _speculative(1, 5, new=6, drafter=_seeded_drafter)
+    short.read(short.prefill(prompts))
+    short.speculate(torch.tensor([tie_out.forced_drafts(stream[0][1:], 5, 5, 272)], dtype=torch.int32))
+    short.accept(5)
+    held, calls = short.state.draft.k.clone(), short._calls
+    assert short.state.position == 11 and short.capacity == 16
+    with pytest.raises(ValueError, match=r"^the session was built for 16 positions per sequence; build it with a larger capacity$"):
+        short.speculate()
+    assert torch.equal(short.state.draft.k, held) and (short._calls, short.record.count, len(short.report().clock.launch)) == (calls, 1, 1)
+    # a session without a drafter is the session it was: its step is verify, and it has no plan, table or cache of a drafter
+    _, without, _, _ = _speculative(1, 5)
+    assert (without.drafter, without.draft_plan, without.state.draft, without.record.proposals) == (None, None, None, None)
+    assert "the drafter" not in without._tables() and without._drafter_bytes() == 0
+
+
+def test_a_session_with_a_drafter_stands_alone_on_its_own_seed_and_keeps_the_overrides_to_the_model():
+    """A session with a drafter needs no other session: without ``share=`` it loads the model itself, and the drafter with
+    the model's table.  Its plan table is its own three tables.  The overrides of a run are the model's: the drafter's
+    plan is resolved without them (its table has none of the model's blocks).  On seeded weights the drafter is drawn
+    from the SESSION's seed, so the head rows it proposes from are rows of the model's head at another seed than 0
+    too; and the loop on such a session emits the tokens of a plain session of that seed."""
+    from model_samples import Checkpoint, Session, TextIO, loop, sampling
+
+    model = _tiny_model()
+    text, seed, new = TextIO.synthetic(model.geometry.vocab), 3, 12
+    common = dict(sequences=1, stack="reference", device="cpu", capacity=5 + new + 5, seed=seed)
+    session = Session(model, text, draft_tokens=5, drafter=_seeded_drafter(model), overrides={"mlp.down": "torch_ref.linear"}, **common)
+    printed = session.plan_table()
+    assert printed == session._tables() and printed.count("\nserved by (") == 2 and printed.startswith("served by ("), "the session's own three tables"
+    assert loop.PROMPT_ROWS in printed and loop.DRAFTER_ROWS.format(calls=18) in printed
+    bare = Session(model, text, draft_tokens=5, drafter=_seeded_drafter(model), **common)
+    bare.resolve()
+    assert (session.plan.rows["mlp.down"].key, session.prefill_plan.rows["mlp.down"].key) == ("torch_ref.linear", "torch_ref.linear")
+    assert session.draft_plan.table() == bare.draft_plan.table() and "mlp.down" not in session.draft_plan.rows, "no override reaches the drafter's plan"
+    session.load()
+    assert session.checkpoint.synthetic_weights and session.checkpoint.seed == seed and session.draft_weights.embedding is session.weights.embedding
+    head = Checkpoint.synthetic(model, seed).load("lm_head.weight", "cpu")  # the model's own head at the session's seed
+    index, drawn = session.draft_weights.head_ids.long(), session.draft_weights.head
+    assert torch.equal(drawn.codes, head.codes[index]) and torch.equal(drawn.block_scales, head.block_scales[index]) and drawn.scale == head.scale
+    other = Checkpoint.synthetic(model, 0).load("lm_head.weight", "cpu")
+    assert not torch.equal(drawn.codes, other.codes[index]), "seed 0 draws another head"
+    # the loop of the README on this one session, against a plain session of the same seed on a load of its own
+    plain = Session(model, text, **common)
+    plain.load()
+    prompts = [torch.randint(0, model.geometry.vocab, (5,), generator=torch.Generator().manual_seed(1))]
+    ids = plain.prefill(prompts)
+    stream = plain.read(ids)
+    for _ in range(new + 4):
+        ids = plain.step(ids)
+        stream += plain.read(ids)
+    out = session.read(session.prefill(prompts))
+    while len(out) < new:
+        ((window, greedy),) = session.read(session.speculate())
+        kept = sampling.accepted(window, greedy)
+        session.accept(kept)
+        out += greedy[: kept + 1]
+    assert out == stream[: len(out)] and session.record.forced == 0 and session.record.count >= 2
+
+
+def test_the_report_of_a_speculative_session():
+    """The report of a session with a drafter: the first-token line names the drafter's passes over the prompt; the
+    acceptance lines are the measured ones for a run on the drafter's own proposals and say "scheduled, not measured" for
+    a run whose steps were handed drafted tokens; no rate while the drafter runs on reference blocks; the bytes of a step
+    are the verify step's arithmetic at its tokens per sequence and a draft pass's, once per drafted token."""
+    from model_samples import tie_out
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+    from model_samples.timing import Report
+
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
+    _, scheduled, _ = _engine_loop(session, prompts, stream)
+    report = session.report()
+    assert scheduled == [0, 1, 2, 3, 4, 5, 0, 1]
+    assert (report.drafter, report.tokens, report.draft_tokens, report.scheduled, report.accepted) == (True, 6, 5, True, scheduled)
+    assert report.bytes == session.model.bytes_per_step(1, session.state.position, tokens=6) and report.pass_bytes == session.drafter.bytes_per_pass(
+        session.state.position
+    )
+    lines = report.text().splitlines()
+    first = "first token           reduced model: prefill route: decode step, 5 tokens x one step, each but the first behind one pass of the drafter "
+    assert any(line.startswith(first + "over the position in front of it; not a time to first token of record (") for line in lines)
+    assert "acceptance            scheduled, not measured (reduction): 8 steps; kept 1: 2, 2: 2, 3: 1, 4: 1, 5: 1, 6: 1" in lines
+    assert "rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)" in lines
+    assert [line for line in lines if line.startswith("steps (8) ")][0].endswith("| 117 block calls per step"), "the model's 27 and five passes of 18"
+    assert not any("their caller's" in line or "not stated for a verify step" in line for line in lines), "the sentences of a session without a drafter"
+    # behind the comparison, which leaves the session reset with the record of its run, the acceptance lines are still the run's; the bytes
+    # of a step follow where the session stands -- position 0 then -- so a run prints its report first
+    state_bytes = report.bytes["state"]
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    behind = session.report()
+    assert checks.ok and session.state.position == 0 and (behind.accepted, behind.scheduled) == (scheduled, True) and behind.bytes["state"] < state_bytes
+    # the run on the drafter's own proposals is a measurement: the report of the run says how many tokens a step kept
+    session.reset(fresh=False)
+    session.new_report()
+    _engine_loop(session, prompts, stream, scheduled=False)
+    measured = session.report()
+    kept = list(session.record.accepted_all)
+    assert not measured.scheduled and measured.accepted == kept and measured.drafter
+    assert measured.acceptance()[0].startswith(
+        f"acceptance            kept tokens per step {1 + sum(kept) / len(kept):.2f} of 6 (1 + accepted drafted tokens / steps), {len(kept)} steps; kept 1: "
+    )
+    # the measured lines on stated counts: the mean, the steps per kept number, and per drafted token the steps that kept it among those that kept the one before
+    stated = Report("qwen_dense", reduced=False, tokens=6, draft_tokens=5, drafter=True)
+    assert stated.acceptance() == ["acceptance            no step ran"]
+    stated.accepted = [5, 3, 0, 5, 1, 5, 2, 5]
+    assert stated.acceptance() == [
+        "acceptance            kept tokens per step 4.25 of 6 (1 + accepted drafted tokens / steps), 8 steps; kept 1: 1, 2: 1, 3: 1, 4: 1, 5: 0, 6: 4",
+        "                      accepted per draft: 1: 7 of 8, 2: 6 of 7, 3: 5 of 6, 4: 4 of 5, 5: 4 of 4",
+    ]
+    stated.scheduled = True
+    assert stated.acceptance() == ["acceptance            scheduled, not measured (reduction): 8 steps; kept 1: 1, 2: 1, 3: 1, 4: 1, 5: 0, 6: 4"]
+    # the bytes line on stated bytes: the model's weights and state once, the drafter's pass five times; what the stack moves reads the copies
+    stated.bytes, stated.pass_bytes = {"weights": 20e9, "copies": 50e9, "stored": 0, "state": 1e9}, {"weights": 0.6e9, "copies": 1.5e9}
+    assert (
+        "bytes per step        model 21.00 GB (weights once, 6 embedding rows, one recurrent state read and 6 written, 3 history columns read and 8 written, "
+        "the caches up to the step's last position) + drafter 5 x 0.60 GB; this stack moves 58.50 GB (arithmetic, not a measurement)"
+    ) in stated.text().splitlines()
+    # the arithmetic of a verify step at the published widths: what a decode step reads and writes, at six tokens
+    model = QwenDense()
+    g = model.geometry
+    one, six = model.bytes_per_step(1, 100), model.bytes_per_step(1, 100, tokens=6)
+    assert model.bytes_per_step(1, 100, tokens=1) == one and model.bytes_per_step(2, 100, tokens=6)["state"] == 2 * six["state"]
+    linear = sum(kind == "linear_attention" for kind in g.layer_kinds)
+    state, column, position = g.la_value_heads * g.la_head_dim**2 * 4, g.qkv_channels * 2, 2 * g.attn_kv_heads * g.attn_head_dim * 2
+    assert (linear, len(g.layer_kinds) - linear, g.la_conv_width - 1) == (48, 16, 3)
+    assert one["state"] == 48 * (2 * state + 6 * column) + 16 * 100 * position, "one state read and one written, three columns read and three written"
+    assert six["state"] == 48 * (7 * state + 11 * column) + 16 * 105 * position, "one state read and six written, three columns read and eight written"
+    assert six["weights"] - one["weights"] == six["copies"] - one["copies"] == 5 * 2 * g.hidden, "five more embedding rows; every weight once"
+    # ... and of a draft pass at one row: the codes a load holds, or the copies its reference blocks multiply on; the cache up to the position
+    drafter = QwenDenseDrafter.seeded(model, rows=65536)
+    alone, behind = drafter.bytes_per_pass(), drafter.bytes_per_pass(2051)
+    assert alone == {"weights": 613999616, "copies": 1520497664}
+    assert (
+        alone["weights"] == sum(drafter.load_bytes().values()) + 2 * g.hidden
+        and alone["copies"] - alone["weights"] == 849346560 + 671088640 - 424931328 - 189005824
+    )
+    assert behind["weights"] - alone["weights"] == behind["copies"] - alone["copies"] == 2051 * position
+    # the steps of the acceptance lines are the run's, not the record's: a session that records three steps and runs eight reports eight
+    _, short, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter, record_steps=3)
+    _, scheduled, _ = _engine_loop(short, prompts, stream)
+    assert (short.record.count, short.record.accepted, short.report().accepted) == (8, scheduled[:3], scheduled) and len(scheduled) == 8
+    assert "acceptance            scheduled, not measured (reduction): 8 steps; kept 1: 2, 2: 2, 3: 1, 4: 1, 5: 1, 6: 1" in short.report().text().splitlines()
+
+
+def test_the_memory_sentence_with_the_drafter(monkeypatch):
+    """The one memory sentence of a run counts the drafter of a session that has one, at the published widths on stated
+    facts: what its load holds besides the model's table, the bf16 copies its reference blocks multiply on, its cache,
+    and the working memory of a pass -- on ``native`` and on ``fe-cublas``; the sentence names the drafter."""
+    import inspect
+
+    from model_samples import Session, TextIO, blocks
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter, drafter as family
+
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * 2**30)))
+    model = QwenDense()
+    text, drafter = TextIO.synthetic(model.geometry.vocab), QwenDenseDrafter.seeded(model, rows=65536)
+    gib = 2.0**30
+    # the terms: 0.57 GiB loaded, 0.79 + 0.63 GiB of copies, 8.4 MB of cache at 2,051 positions, and twice the largest fp64 chunk of a multiply
+    held, copies = drafter.load_bytes(), drafter.copy_bytes()
+    assert [round(count / gib, 2) for count in (sum(held.values()), copies["weights"], copies["head"])] == [0.57, 0.79, 0.62]
+    cache = drafter.memory_bytes(1, 2051) - sum(held.values()) - sum(copies.values())
+    assert cache == 2 * 8 * 2051 * 128 * 2 and round(cache / 1e6, 1) == 8.4, "keys and values of 8 heads of 128 at 2,051 positions, bf16"
+    assert family.REFERENCE_CHUNK == inspect.signature(torch_ref.linear).parameters["columns_per_chunk"].default
+    widest = 5120 * 17408  # the down weight: every one of its 5,120 rows in one chunk, 17,408 wide -- the largest chunk a multiply converts to fp64
+    assert drafter.working_bytes() == 2 * 8 * widest and round(drafter.working_bytes() / gib, 2) == 1.33
+    assert QwenDenseDrafter.seeded(model, rows=4096).working_bytes() == drafter.working_bytes(), "the listed head rows are not the widest product"
+    for stack, with_drafter, without, alone, alone_without in (("native", "43.6", "40.2", "43.1", "39.8"), ("fe-cublas", "61.2", "57.9", "60.8", "57.5")):
+        common = dict(sequences=1, stack=stack, device="cuda:0", capacity=2051)
+
+        def sentence(**more):
+            plain = Session(model, text, **common)
+            session = Session(model, text, draft_tokens=5, share=plain, **common, **more)
+            return session, plain.plan_table([session]).splitlines()[-1].strip()
+
+        session, said = sentence(drafter=drafter)
+        assert session._drafter_bytes() == drafter.memory_bytes(1, 2051) + drafter.working_bytes() == 3568888832
+        kinds = "a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt"
+        assert said.startswith(f"this stack needs about {with_drafter} GiB on this GPU for {kinds} with its drafter, one after the other")
+        _, bare = sentence()
+        assert bare.startswith(f"this stack needs about {without} GiB on this GPU for {kinds}, one after the other"), "the same run without a drafter"
+        # a session with a drafter that is planned alone counts its drafter as well: the same 3.3 GiB over the session without one
+        kind = "a session of 1 sequence x 6 tokens behind its prompt"
+        lone = Session(model, text, draft_tokens=5, drafter=drafter, **common).plan_table().splitlines()[-1].strip()
+        none = Session(model, text, draft_tokens=5, **common).plan_table().splitlines()[-1].strip()
+        assert lone.startswith(f"this stack needs about {alone} GiB on this GPU for {kind} with its drafter"), lone
+        assert none.startswith(f"this stack needs about {alone_without} GiB on this GPU for {kind}") and "drafter" not in none, none
+        # the drafter's table stands under the session's two, and its blocks made their first use with the others
+        assert session.draft_plan.first_used and session._tables().endswith(session.draft_plan.table()) and "draft.token_choice" in session._tables()
+
+
+def _engine_step(passes=3, pass_more=(), between=(), fused=(VERIFY_SYMBOL, VERIFY_SHAPE), reads=1):
+    """The launch records of one step of speculative decoding as a traced pass has them: per draft pass the gather, the
+    chain's kernels and a host-to-device copy of a row quantiser's constant; the concatenation of the window; the model's
+    gather, a chain kernel, the fused verify step, the token choice; the stack of the pair; the host read.  ``pass_more``:
+    records behind the last pass's own; ``between``: records between the model's gather and its fused step."""
+    from model_samples.census import Launch
+
+    plain = ((1, 1, 1), (128, 1, 1), 0)
+    one_pass = [(GATHER, ((1, 1, 1), (128, 1, 1), 0)), (ELEMENTWISE, plain), ("Memcpy HtoD (Pageable -> Device)", None), ("ampere_dgemm_128x16_nn", plain)]
+    names = [record for _ in range(passes) for record in one_pass]
+    names += [*pass_more, (ELEMENTWISE, plain), (GATHER, ((40, 1, 1), (128, 1, 1), 0)), *between]
+    names += [*([fused] if fused else []), (ELEMENTWISE, plain), (ELEMENTWISE, plain)]
+    records = []
+    for at, (name, shape) in enumerate(names):
+        records.append(Launch(name, "copy", float(at), at + 0.5, bytes=4) if shape is None else Launch(name, "kernel", float(at), at + 0.5, *shape, 32))
+    return records + [Launch(HOST_READ, "copy", float(len(names) + n), len(names) + n + 0.5, bytes=48) for n in range(reads)]
+
+
+def test_the_kernel_check_of_an_engine_step_on_constructed_records():
+    """The sites of a step of speculative decoding are, for every pass, the drafter's wiring with the pass's number in the
+    place of the layer, then the model's: the check holds the embedding lookups of the passes and the model's in that
+    order, attributes the passes' chains and their copies to the drafter's fallback rows, and holds the model's verify
+    step to the census at the model's own site.  A lookup more than the wiring has, an undeclared copy between two exact
+    rows, two host reads in a step and a verify-entry launch in another shape than the recorded one each fail with
+    their own sentence."""
+    from model_samples import blocks, census
+    from model_samples.census import Call, Launch
+
+    drafter = _seeded_drafter(_tiny_model())
+    plan = blocks.plan(drafter.provider_table, drafter.regimes, blocks.DeviceFacts((10, 0), "stated device", 148), 1, 1, "native", model=drafter)
+    passes, model_sites = census.passes(plan, drafter, 3), _verify_sites()
+    assert len(passes) == 3 * drafter.calls_per_pass() and [site.layer for site in passes] == [index for index in range(3) for _ in range(18)]
+    assert [(site.block, site.site) for site in passes[:18]] == list(zip((block for block, _ in drafter.wiring()), drafter.sites()))
+    assert passes[36].name == "draft.embedding (layer 2)" and [kernel.id for kernel in passes[36].kernels] == ["embedding_gather"]
+    assert all(kernel.relation != "exact" for site in passes if site.block != "draft.embedding" for kernel in site.kernels), "every other block is a chain"
+    sites = passes + model_sites
+    log = [[Call(site.block, site.layer, 6, "cudnn.GdnVerifyFused #1" if site.form else "", tuple(site.form)) for site in sites]]
+    name = "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)"
+    claim = SimpleNamespace(recorded={2: VERIFY_SHAPE}, name=name)  # the model's third site: where its census has the fused verify step
+
+    def judged(step, at=sites, calls=log, first=len(passes), count=1):
+        traced = census.Traced.of(at, calls, step, count, "", 6, claim, first)
+        status, lines = traced.judge()
+        return traced, status, lines
+
+    traced, status, lines = judged(_engine_step())
+    assert (status, lines, traced.first, traced._recorded()) == (census.PASS, [], 54, {56: VERIFY_SHAPE})
+    result = traced.result
+    assert (result.exact, result.launches, result.copies) == (5, [14], [4]), "the exact rows of three passes and of the model; the copies of the chains"
+    assert result.families["pytorch"] == [6] and result.families["cublas"] == [3], "the chains, the window, the model's chain and token choice, the pair"
+    assert "5 on exact rows, in the wiring order" in traced.summary() and "4 copies per step" in traced.summary()
+
+    def fails(expected, **more):
+        _, status, lines = judged(**more)
+        assert status == census.FAIL and lines == expected, lines
+
+    # an embedding lookup more than the wiring has, and one less
+    extra = "the step has 5 launch(es) of embedding_gather, the plan 4 = 4 call(s) x 1 per call"
+    gather = f"('{GATHER[:93]}...')"
+    # (the lookups of a step are one kernel id: the comparison counts them and names the surplus one in front of the matching run)
+    fails(
+        [f"step 0: launched embedding_gather {gather} at the start of the step, where the plan has no such launch: {extra}"],
+        step=_engine_step(pass_more=[(GATHER, ((1, 1, 1), (128, 1, 1), 0))]),
+    )
+    fails(
+        [
+            "step 0: draft.embedding (layer 0) did not launch embedding_gather: the step has 3 launch(es) of embedding_gather, the plan 4 = 4 call(s) x 1 per call"
+        ],
+        step=_engine_step(passes=2),
+    )
+    # a copy inside a pass is a chain's (the passes above have one each); between two exact rows of the model it is undeclared
+    bare = passes + [model_sites[0], *model_sites[2:]]
+    bare_log = [[Call(site.block, site.layer, 6, "cudnn.GdnVerifyFused #1" if site.form else "", tuple(site.form)) for site in bare]]
+    copy = [("Memcpy HtoD (Pageable -> Device)", None)]
+    held = SimpleNamespace(recorded={1: VERIFY_SHAPE}, name=name)
+    clean = census.Traced.of(bare, bare_log, _engine_step(), 1, "", 6, held, 54).judge()
+    copied = census.Traced.of(bare, bare_log, _engine_step(between=copy), 1, "", 6, held, 54).judge()
+    assert clean == (census.PASS, [])
+    assert copied == (
+        census.FAIL,
+        [
+            (
+                "step 0: an undeclared copy 'Memcpy HtoD (Pageable -> Device)' between embedding and linear_attention.step (layer 0): "
+                "declared are the one host read of a step and the copies of a fallback row"
+            )
+        ],
+    )
+    # the pair read as two host reads: the records cannot be cut into the traced steps
+    fails(
+        ["copies: the records show 2 host reads for 1 traced steps: a block reads the device inside a step, and only the one host read of a step is declared"],
+        step=_engine_step(reads=2),
+    )
+    # the fused verify step in another shape than the recorded one, at the MODEL's site: against the census, and against the entry
+    launched = "linear_attention.step (layer 0) launched gdn_verify_fused with grid (96, 1, 1), block (256, 1, 1), shared memory 112,368 B; "
+    shape = "grid (96, 1, 1), block (256, 1, 1), shared memory 126,512 B"
+    fails(
+        [f"step 0: {launched}the {name} has {shape}", f"step 0: {launched}cudnn.GdnVerifyFused states {shape}"],
+        step=_engine_step(fused=(VERIFY_SYMBOL, TWO_TOKENS)),
+    )
+    _, status, lines = judged(_engine_step(fused=(VERIFY_SYMBOL, TWO_TOKENS)), first=0)
+    assert lines == [f"step 0: {launched}cudnn.GdnVerifyFused states {shape}"], "counted from the drafter's first site, the census would be held to no launch"
+    # a step that made the model's calls without the passes in front of them
+    fails(
+        ["step 0: the step made 4 block calls, the wiring has 58; call 1 is embedding, the wiring has draft.embedding (layer 0) there"],
+        step=_engine_step(),
+        calls=[log[0][54:]],
+    )
+    # the details name a recorded shape at the model's site (its lookup), not at the pass's site of the same index
+    counted = SimpleNamespace(
+        recorded={0: ((40, 1, 1), (128, 1, 1), 0), 2: VERIFY_SHAPE}, name=name, coverage=lambda: [], line=lambda status: f"census {status}"
+    )
+    named = census.Traced.of(sites, log, _engine_step(), 1, "", 6, counted, 54)
+    status, lines = named.judge()
+    recorded = [line for line in named.details() if "in the launch shape the census records" in line]
+    assert (status, lines, len(recorded)) == (census.PASS, [], 1) and recorded[0].startswith("embedding: torch.index_select, 1 launch per step")
+    # what a dump says of a site: the claim's identities are the model's sites', a pass has none
+    stated = SimpleNamespace(
+        recorded={}, name=name, known=True, identities=[SimpleNamespace(text=lambda index=index: f"model site {index}") for index in range(4)]
+    )
+    stated.dump = lambda: {}
+    dumped = census.Traced.of(sites, log, _engine_step(), 1, "", 6, stated, 54).dump()["sites"]
+    assert [site["identity"] for site in dumped[:54]] == [""] * 54 and [site["identity"] for site in dumped[54:]] == [
+        f"model site {index}" for index in range(4)
+    ]
+    assert isinstance(_engine_step()[2], Launch) and _engine_step()[2].kind == "copy"
+
+
+def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_written():
+    """The family README on the speculative step: its loop, run as it is written, on the seeded pair on the CPU; the
+    sentences that state a behaviour, a count or a figure, each against the code or against the arithmetic it states;
+    the runs as they were printed; no count of the launches of a pass.  And the sentences of the area README and of
+    the guide."""
+    from model_samples import Session, TextIO, loop, sampling, tie_out
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+    from model_samples.timing import Report
+
+    family = (MODELS / "qwen_dense" / "README.md").read_text(encoding="utf-8")
+    part = family.split("**The speculative step.**", 1)[1].split("**Memory.** The memory sentence of a verify plan", 1)[0]
+    text = " ".join(part.split())
+    assert text.startswith(
+        "`Session.speculate` runs one step of speculative decoding: the drafter's passes on reference blocks, one verify step, one host read. "
+        "It is reached from the library; no script drafts yet. The drafter's cache is filled by one pass of the drafter per prompt position, "
+        "at one row. The census records a step, not a prompt: these passes are in no section."
+    )
+    # the loop, as written: one load for two sessions, the drafter loaded by its session, one host read a step
+    (code,) = re.findall(r"```python\n(.*?)```", part, flags=re.S)
+    model = _tiny_model()
+    scope = dict(model=model, text=TextIO.synthetic(model.geometry.vocab), drafter=_seeded_drafter(model), stack="reference", device="cpu", sys=sys)
+    scope.update(prompt=torch.randint(0, 272, (5,), generator=torch.Generator().manual_seed(1)), positions=5 + 24 + 4, limit=24)
+    scope.update(checkpoint=None)  # the seeded pair; the loop on a described checkpoint is run by the drafter module, on a checkpoint it generates
+    exec(compile(code, "the README's speculative loop", "exec"), scope)
+    plain, session, new = scope["plain"], scope["session"], scope["new"]
+    assert isinstance(session, Session) and session.drafter is scope["drafter"] and session.weights is plain.weights and plain.state.position == 0
+    assert (
+        "capacity=positions, checkpoint=checkpoint)\nsession = Session(" in code and plain.checkpoint.synthetic_weights
+    ), "the session that loads is handed the checkpoint"
+    clock = session.report().clock
+    assert len(clock.launch) == len(clock.ids) == session.record.count, "one host read per step, behind the read that ends the prompt"
+    assert (plain._tables().count("served by ("), session._tables().count("served by (")) == (1, 3), "what the first plan_table prints, and the session's own"
+    ids = plain.prefill([scope["prompt"]])
+    stream = plain.read(ids)
+    while len(stream) < len(new):
+        ids = plain.step(ids)
+        stream += plain.read(ids)
+    assert len(new) >= 24 and new == stream, "the tokens of the loop are the plain session's"
+    assert session.record.forced == 0 and len(session.record.accepted_all) == session.record.count and session.state.position <= 5 + 24 + 4
+    assert "`positions` at least the prompt, the new tokens and four more: the last window reaches that far." in text
+    # what the section quotes of the code
+    quoted = (
+        f'"{loop.DRAFTER_ROWS.format(calls=18)}"',
+        f"`drafter=` needs `draft_tokens=`, and {loop.ONE_SEQUENCE}.",
+        f'"{tie_out.DRAFTER_KERNELS}"',
+        'The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)"',
+        "prints `scheduled, not measured (reduction)` in their place.",
+        "`kept tokens per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .. 6: ..` and `accepted per draft: 1: x of n, 2: y of x, ..`",
+        "On a session with a drafter `verify` is refused:",
+        "With `force=` (`[sequences, draft tokens]` int32 on the GPU) the step verifies drafted tokens of the caller's in the place of the drafter's: "
+        "the drafter runs all the same, and its own proposals are in the record (`session.record.proposals`).",
+        "The first step of a run has no verify step in front of it, so its first pass runs at one row per sequence, over the last prompt position; "
+        "from the second step on it runs at `S x T` rows.",
+        "Both runs call the same blocks: the two lines hold what the passes of a step are handed, not the arithmetic of a block,",
+        "every weight once, six embedding rows, one recurrent state read and six written, three history columns read and eight written, "
+        "the caches up to the step's last position -- and a draft pass's, five times.",
+        # what the lines beside the loop say of it (held above, by the test of a session alone and by the drafter module's run on a checkpoint)
+        "the plain session reads the model's weights, once, and is what the checks hold the loop against (`tie_out.speculative_checks`);",
+        "`checkpoint`, `model` and `drafter` are those of the loader's call in the section \"The checkpoint's drafter\".",
+        "The session that loads is handed the checkpoint (`checkpoint=`): a session that is handed none draws seeded weights, and its drafter's with "
+        "them -- `checkpoint` is `None` for the seeded pair (`QwenDenseDrafter.seeded(model)`).",
+        "The first `plan_table` resolves every plan of the run and prints the plain session's table and one memory sentence for the whole run, "
+        "the drafter in it; `session.plan_table()` prints the session's own three tables.",
+        "A session with a drafter stands alone as well, without `share=`: it then loads the model itself.",
+        "The loop reads the device once per step.",
+        "The plan table of such a session (`session.plan_table()`) has a third table under one line",
+        # the working memory (its arithmetic: the test of the memory sentence) and what a rejected draft leaves (the test of the overwritten cache)
+        "an allowance of twice the largest chunk of a weight a reference multiply converts to fp64 at a time (`working_bytes`: 1.33 GiB",
+        "A step that keeps fewer tokens than were drafted leaves the drafter's own rows in its cache behind the last kept position; "
+        "the first pass of the next step writes those positions again, from the model's rows, before a row reads them.",
+        "Every block of the drafter but its embedding lookup is a reference chain, so the block check judges none of them.",
+    )
+    assert [sentence for sentence in quoted if sentence not in text] == []
+    stated = Report("qwen_dense", reduced=False, tokens=6, draft_tokens=5, drafter=True)
+    stated.accepted = [0]
+    lines = stated.text().splitlines()
+    assert "rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)" in lines
+    assert any(
+        line.startswith("acceptance            kept tokens per step 1.00 of 6 (1 + accepted drafted tokens / steps), 1 steps; kept 1: 1, ") for line in lines
+    )
+    # the memory of the drafter at the published widths (the terms are held by the test of the memory sentence)
+    drafter = QwenDenseDrafter.seeded(QwenDense(), rows=65536)
+    gib = 2.0**30
+    assert f"(`working_bytes`: {drafter.working_bytes() / gib:.2f} GiB at the published widths)" in text
+    added = (drafter.memory_bytes(1, 2051) + drafter.working_bytes()) / gib
+    assert f"with 65,536 ids and 2,051 positions the drafter adds {added:.1f} GiB:" in text and f"{added:.1f}" == "3.3"
+    assert (
+        "asks for about 43.6 GiB on `native` and about 61.2 GiB on `fe-cublas`, where the same run without a drafter asks for about 40.2 and 57.9 GiB."
+    ) in text
+    # the runs, as they were printed
+    printed = (
+        "What ran (2026-11-18; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only).",
+        "a prompt of 8 tokens and 32 new tokens through 10 steps of `speculate(force=)` whose drafted tokens were scheduled to be kept 0 to 5 in turn:",
+        "`drafter cache` and `draft proposals` in 10 of 10 steps;",
+        "the kernel check passed over 10 traced steps --",
+        "the default prompt, 58 tokens through `prefill`; then the loop above on the drafter's own proposals until the end token or 256 new tokens;",
+        "On the first 16 steps `drafter cache`, `draft proposals`, `position`, `prompt`, `recorded` and `rejected rows` passed;",
+        "`tokens` was reported -- 38 of 46 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs kept token 13 -- "
+        "and the loop's text is another text than a plain run's from its 14th new token on:",
+        "Replay with the proposals, the blocks of both kinds of step and the kernel check over 6 traced steps passed,",
+        "13 of 20 launches of the verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results);",
+        "One, three and seven drafted tokens and the four-layer model passed on `native` as well.",
+        "In one process on `native`, twenty-one runs with one thing wrong each, between two runs of the tree as it is.",
+        "So did three ways of feeding the prompt to something the verify steps do not stand on -- a state of its own for the model's layers, "
+        "another attention cache, another view of the history columns: each failed `prompt` and passed `drafter cache` and `draft proposals`.",
+        "With the whole state apart, the rows a drafter reads among it, the session was refused at its load, by name:",
+        "A drafted token emitted by the caller failed no line of the comparison",
+        "the loop ended at the end token after 204 new tokens in 63 steps and kept 3.22 tokens a step (1 + 140 accepted drafted tokens / 63 steps, "
+        "every step counted in full); 14, 11, 11, 9, 10 and 8 steps kept one to six tokens; the first drafted token was accepted in 49 of 63 steps, "
+        "the second in 38 of those 49, the third in 27 of 38, the fourth in 18 of 27, the fifth in 8 of 18.",
+        "It is a figure of this list and this prompt, reported; no line of it is a gate of this sample.",
+        "zeros in the place of the hidden row kept 1.04 tokens a step, the hidden rows of another text 1.05, "
+        "the two halves in front of the first multiply exchanged 1.00",
+        "a later pass fed the model's row again kept 2.48; a later pass one position off kept 3.25,",
+        "370 of 484 launches of the verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)",
+        "The sentence asked for about 43.3 GiB, PyTorch reserved 40.0 GiB and the device grew by 40.2 GiB, the GPU otherwise empty.",
+        "The drafter's blocks are not compared with another implementation of the drafter in this repository.",
+    )
+    assert [sentence for sentence in printed if sentence not in text] == []
+    # ... the figures that are arithmetic, held as arithmetic: the steps by kept count, the steps that accepted each draft, the mean
+    by_kept = (14, 11, 11, 9, 10, 8)
+    reached = [sum(by_kept[draft:]) for draft in range(6)]
+    drafted = sum(count * steps for count, steps in enumerate(by_kept))
+    assert (sum(by_kept), reached, drafted) == (63, [63, 49, 38, 27, 18, 8], 140)
+    turns = [step % 6 for step in range(10)]  # the seeded run: ten steps scheduled to keep 0 to 5 drafted tokens in turn, behind the prompt's first token
+    assert 1 + sum(count + 1 for count in turns) == 32
+    assert f"{1 + drafted / sum(by_kept):.2f}" == "3.22"
+    assert [f"{1 + accepted / steps:.2f}" for accepted, steps in ((7, 196), (10, 195), (0, 203), (121, 82), (142, 63))] == [
+        "1.04",
+        "1.05",
+        "1.00",
+        "2.48",
+        "3.25",
+    ]
+    # no count of the launches of a pass: the kernel census holds none, and the text states none
+    counted = r"(?:[\d,]+|one|two|three|four|five|six|no|none) (?:kernel |gather |copy )?(?:launch(?:es)?|gathers?|lookups?|kernels?|cop(?:y|ies))"
+    assert re.findall(rf"\b{counted} (?:per|a|of a|of one|in a) (?:draft )?(?:pass|call)\b", text) == []
+    assert re.findall(r"\blaunch(?:es)? (?:of|per) (?:a|one|the) (?:draft )?pass\b", text) == []
+    # the area README and the guide
+    area = " ".join((MODELS / "README.md").read_text(encoding="utf-8").split())
+    assert (
+        "handed the drafter (`drafter=`, one sequence) it runs the whole step of speculative decoding: `Session.speculate` is the drafter's passes on "
+        "reference blocks, one verify step and one host read, and the caller says after that read how many drafted tokens it keeps. "
+        "It is reached from the library; no script drafts yet."
+    ) in area
+    assert "for a session with a drafter also `drafter cache` and `draft proposals`" in area and "`test/python/misc/test_model_samples_verify.py`" in area
+    guide_text = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
+    guide = " ".join(guide_text.split())
+    assert guide_text.rstrip().split("\n## ")[-1].startswith("What the speculative step taught\n"), "the last section of the guide"
+    lessons = (
+        "- The cut of a step follows the one host read.",
+        "a cache kept beside the state would have carried the first prompt set into the second,",
+        "- A check that calls the function it checks holds nothing. The second run of the passes never calls `draft`:",
+        "Eight wrong passes, each in a loop that still emits the plain session's ids, hold that split in a host test.",
+        "- The window of a step is the session's.",
+        "- A traced step is the step the loop runs.",
+        "`Traced.first` shifts it, and the host test holds a launch in another shape at the model's site with both of its sentences.",
+        "On the checkpoint the loop kept 3.22 tokens a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, "
+        "with the two halves in front of the first multiply exchanged 1.00; with a later pass one position off, 3.25.",
+        "the allowance of a pass is twice the largest such chunk, 1.33 GiB at the published widths",
+        "On the checkpoint the run asked for about 43.3 GiB, reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.",
+        "and a count of block calls -- 18 a pass -- is the wiring's.",
+        "so the acceptance lines of a report printed behind the comparison are still the run's. Its bytes of a step are not:",
+        "- What a step hands on by reference is held by identity, where it is handed on.",
+        "`state.hidden` is the tensor the final norm's call returned, the one whose quantised rows the head read, and `state.greedy` the one the "
+        "token choice returned.",
+        "- A traced step is held to the recorded step, not to its shape alone.",
+        "- A refusal stands in front of everything the refused call would leave.",
+        "on a session with a drafter that is `speculate`, also where the session refuses a decode step or a count.",
+        "- The names beside a snippet are run as the text says they may be.",
+        "a session that is not handed the checkpoint draws seeded weights, and the drafter's with them, without a word.",
+    )
+    assert [sentence for sentence in lessons if sentence not in guide] == []
+    assert len(WRONG_PASSES) == 8 and sampling.accepted([1, 2, 3], [2, 9, 9]) == 1
+
+
+def test_the_traced_pass_of_a_session_with_a_drafter_runs_whole_steps(monkeypatch):
+    """The traced pass of a session with a drafter replays its prompt with the drafter's passes and then runs, per traced
+    step, the step ``speculate`` runs -- the passes, the window, the verify step, the pair -- on the recorded drafted
+    tokens, with one call log per step: the calls of every pass under the pass's number, then the model's.  The sites
+    are the passes' and the model's, the claim's first site is the model's first, and the run's own state and record
+    are put back.  (A stand-in for the profiler runs the steps: the CPU has no kernel activity records.)"""
+    from model_samples import loop, tie_out
+
+    plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter, check_kernels=True)
+    _, scheduled, _ = _engine_loop(session, prompts, stream)
+    state, record, cache = session.state, session.record, session.state.draft.k.clone()
+    engine, steps, read = loop.Session._engine, [], []
+    monkeypatch.setattr(loop.Session, "_engine", lambda self, force, accept: steps.append((force.clone(), accept)) or engine(self, force, accept))
+
+    def stand_in(step, count, device=None, records=None):
+        for index in range(count):
+            step(index)
+            read.append(session.state.position)
+        return None, "a stand-in ran the steps"
+
+    monkeypatch.setattr(loop, "trace_steps", stand_in)
+    run, draft, fed, proposed = loop.Session._run, loop.Session._draft, [], []
+
+    def remembering(self, plan, tokens, ids):
+        if tokens > 1:
+            fed.append(ids.clone())
+        return run(self, plan, tokens, ids)
+
+    def drafting(self):
+        proposed.append(draft(self).clone())
+        return proposed[-1]
+
+    monkeypatch.setattr(loop.Session, "_run", remembering)
+    monkeypatch.setattr(loop.Session, "_draft", drafting)
+    session.trace(4)
+    monkeypatch.setattr(loop.Session, "_run", run)
+    monkeypatch.setattr(loop.Session, "_draft", draft)
+    traced = session.traced
+    assert len(steps) == 4 and [accept for _, accept in steps] == scheduled[:4], "one step of speculate's own per traced step, with its kept count"
+    # a traced step is the RECORDED step: its verify step is fed the recorded window -- the token the run kept last, not a row of the
+    # traced step's own --, and its passes, which draft on the cache the passes of the replayed prompt filled, propose what the run recorded
+    assert len(fed) == len(proposed) == 4 and all(torch.equal(ids, record.inputs[index]) for index, ids in enumerate(fed))
+    assert all(torch.equal(ids, record.proposals[index]) for index, ids in enumerate(proposed))
+    assert all(torch.equal(force, record.inputs[index].view(1, 6)[:, 1:]) for index, (force, _) in enumerate(steps)), "fed the recorded drafted tokens"
+    assert read == [
+        5 + sum(count + 1 for count in scheduled[: index + 1]) for index in range(4)
+    ], "behind the replayed prompt, each step from where the last stood"
+    assert (traced.first, len(traced.sites), traced.missing) == (5 * 18, 5 * 18 + 27, "a stand-in ran the steps")
+    assert [(site.block, site.layer) for site in traced.sites[:90]] == [(block, index) for index in range(5) for block, _ in session.drafter.wiring()]
+    assert [len(calls) for calls in traced.call_log] == [117] * 4 and all(
+        [(call.block, call.layer) for call in calls] == [(site.block, site.layer) for site in traced.sites] for calls in traced.call_log
+    )
+    # the rows of a call: the first pass of the first step behind the prompt at one row, behind a verify step at six; every other pass at one
+    rows = [[call.rows for call in calls] for calls in traced.call_log]
+    assert rows[0][:90] == [1] * 90 and rows[1][:15] == [6] * 15 and rows[1][15:90] == [1] * 75 and set(rows[1][90:]) == {6}
+    # the run is as it was: its state, its record, its drafter cache
+    assert session.state is state and session.record is record and torch.equal(state.draft.k, cache) and record.accepted_all == scheduled
+    own = tie_out.run_checks(session, prompt_tokens=5)
+    assert own.ok and f"    {tie_out.DRAFTER_KERNELS}" in own.lines, "what a run says of the kernels of the passes, beside its kernel verdict"
