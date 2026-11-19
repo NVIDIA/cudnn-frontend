@@ -156,7 +156,7 @@ class BwdGeometry:
                 raise ValueError(f"{name} must be a positive CUDA int32 value")
         for name in ("num_local_tokens", "minibatch_size", "macrobatch_size", "schedule_capacity"):
             if getattr(self, name) % ROW_ALIGNMENT:
-                raise ValueError(f"{name} must be 256-aligned for the CUDA tile ABI; got {getattr(self, name)}")
+                raise ValueError(f"{name} must be 256-aligned for the kernel's tile ABI; got {getattr(self, name)}")
         # The hidden extent may have a 128-wide tail, like the intermediate one below: its last tile is
         # counted (ceil) and its out-of-range half zero-filled / clipped by the TMA.  A routed hidden
         # that differs from the shared one (latent layers) stays 256-aligned.
