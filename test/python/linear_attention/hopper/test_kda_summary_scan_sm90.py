@@ -17,11 +17,6 @@ ENGINE = "kda_summary_hopper_scan"
 pytestmark = fp32.pytestmark
 
 
-@pytest.fixture(autouse=True)
-def enable_scan_engine(monkeypatch):
-    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-
-
 def run(case):
     return kimi_delta_attention_summary_bwd(
         case["q"],
@@ -37,6 +32,50 @@ def run(case):
 
 def expected(case):
     return fp32.reference(case, backward=True, seeded=False)[0]
+
+
+def test_public_g_only_prefers_compact_scan(monkeypatch):
+    """The semantic G-only request selects the compact provider without a plan name."""
+    from cudnn.linear_attention.hopper.summary_engine import KdaSummaryHopperScanPlan
+
+    launches = []
+    original = KdaSummaryHopperScanPlan._launch
+
+    def counted(self, *args, **kwargs):
+        launches.append(self.plan_name)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(KdaSummaryHopperScanPlan, "_launch", counted)
+    case = fp32.make_case((73,), heads=5)
+    actual = kimi_delta_attention_summary_bwd(
+        case["q"],
+        case["k"],
+        case["g"],
+        case["beta"],
+        case["dO"],
+        case["cu"],
+        batch_invariant=True,
+    )
+
+    assert launches == [ENGINE]
+    assert_bitwise({"state": actual}, {"state": ordinary_backward_state(case)}, "default compact G")
+
+
+def test_public_g_only_falls_back_when_compact_scan_declines():
+    """A provider restriction changes performance, not the public G-only contract."""
+    case = fp32.make_case((19,), heads=1)
+    case["cu"] = case["cu"].to(torch.int64)
+    actual = kimi_delta_attention_summary_bwd(
+        case["q"],
+        case["k"],
+        case["g"],
+        case["beta"],
+        case["dO"],
+        case["cu"],
+        batch_invariant=True,
+    )
+
+    torch.testing.assert_close(actual.double(), expected(case), atol=2e-6, rtol=3e-5)
 
 
 def ordinary_backward_state(case):

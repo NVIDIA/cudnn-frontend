@@ -2469,18 +2469,19 @@ def kimi_delta_attention_summary_bwd(
     only the state-gradient summary, not dQ/dK/dV/dG/dBeta, and is not an
     autograd implementation for the summary operation itself.
 
-    Explicit ``plan_name="kda_summary_hopper_scan"`` selects an SM90-only,
-    state-only reverse summary for packed context-parallel callers that already
-    own the forward span transition. It accepts only BF16 K=V=128 inputs with
-    equal head counts, int32 ``cu_seqlens``, ``batch_invariant=True``, no
-    ``d_final_state``, and ``output_transition=False``. The plan runs the same
+    With ``output_transition=False``, an eligible SM90 graph automatically
+    prefers a state-only reverse summary for packed context-parallel callers
+    that already own the forward span transition. It accepts only BF16 K=V=128
+    inputs with equal head counts, int32 ``cu_seqlens``,
+    ``batch_invariant=True``, and no ``d_final_state``. The plan runs the same
     chunk-parallel reverse scan as the ordinary Hopper KDA backward, so its G
     output is bitwise equal to that backward's ``d_initial_state``; it does not
-    have the direct-FP32 summary's arithmetic. It stops before dQ/dK/dV/dG/dBeta
-    and omits the unused forward scan CTAs. The caller-owned workspace is sized
-    by ``graph.get_workspace_size()`` and may be large; the plan allocates no
-    hidden storage. Enable ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`` and provide
-    a complete CUDA toolkit selected by ``CUDA_HOME`` when necessary.
+    have the direct-FP32 summary's arithmetic. It stops before
+    dQ/dK/dV/dG/dBeta and omits the unused forward scan CTAs. Unsupported graphs
+    fall through to another G-only summary provider. The caller-owned workspace
+    is sized by ``graph.get_workspace_size()`` and may be large; the plan
+    allocates no hidden storage. A complete CUDA toolkit selected by
+    ``CUDA_HOME`` may be required.
     Args:
         scale: attention scale applied to ``q``; defaults to ``1 / sqrt(K)``.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
@@ -2489,8 +2490,8 @@ def kimi_delta_attention_summary_bwd(
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
-        plan_name: pin one execution plan by name (for example ``kda_summary_frost``, ``kda_summary_hopper_cuda``, or the
-            restricted state-only ``kda_summary_hopper_scan`` plan described above).
+        plan_name: optionally pin one execution plan for testing or tuning; normal calls should leave this unset so
+            unsupported state-only graphs can fall through to another summary provider.
         output_context: with ``output_transition``, also return the backward's context as a third value, for
             ``torch.ops.cudnn.kimi_delta_attention_bwd(..., context=context)``; prepared at ``checkpoint_every_n_tokens``, which must
             equal the backward's.

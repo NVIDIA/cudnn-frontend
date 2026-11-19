@@ -8495,14 +8495,16 @@ review and integration CI remain separate from this bounded packet.
 
 ### SM90 KDA state-only reverse scan — 2026-11-18
 
-`linear_attention/hopper/test_kda_summary_scan_sm90.py` adds 14 L0 cases for
-the explicit `kda_summary_hopper_scan` plan. The served contract is reverse
-G only: packed BF16 K=V=128 inputs, equal heads, FP32 log gate/beta/output,
-int32 offsets, `batch_invariant=True`, no seed, transition, context, or token
-gradients. The suite rejects each incompatible form explicitly, including
-cu64 offsets. The numerical oracle is independent FP64 with an ordinary-
-backward accuracy bound; the stronger implementation contract compares every
-G byte with the complete Hopper KDA backward's `d_initial_state` before its
+`linear_attention/hopper/test_kda_summary_scan_sm90.py` qualifies the public
+G-only request (`output_transition=False`) and its internal
+`kda_summary_hopper_scan` lowering. The served SM90 envelope is packed BF16
+K=V=128 inputs, equal heads, FP32 log gate/beta/output, int32 offsets,
+`batch_invariant=True`, and no seed, transition, context, or token gradients.
+The public request automatically prefers this lowering and falls through to a
+different summary provider when an SM90 restriction, such as cu64 offsets, is
+not met. The numerical oracle is independent FP64 with an ordinary-backward
+accuracy bound; the stronger implementation contract compares every G byte
+with the complete Hopper KDA backward's `d_initial_state` before its
 token-gradient kernel runs.
 
 Determinism covers four fixed-input executions under concurrent GPU work,
