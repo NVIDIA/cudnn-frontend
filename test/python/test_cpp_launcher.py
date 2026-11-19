@@ -180,6 +180,33 @@ def test_a_negative_zero_argument_is_not_the_recorded_zero(number):
     assert [type(r).__name__ for r in api.recordings.values()] == ["_Recording"] * 4
 
 
+def test_a_number_that_gives_no_double_is_keyed_by_its_value():
+    import struct
+
+    import numpy
+    import tvm_ffi
+
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    class NoDouble(numpy.float32):
+        def __float__(self):
+            raise TypeError("no double")
+
+    seen = []
+    sink = tvm_ffi.convert(lambda got: seen.append(struct.pack("d", got)))
+
+    @cpp_launched
+    def api(x, scale):
+        launch(sink, scale.item())
+        return x
+
+    x = torch.zeros(8, device="cuda")
+    for value in (0.5, 0.5, 0.5, 0.25, 0.25):
+        assert api(x, NoDouble(value)) is x
+    assert seen == [struct.pack("d", value) for value in (0.5, 0.5, 0.5, 0.25, 0.25)]
+    assert [type(r).__name__ for r in api.recordings.values()] == ["_Recording"] * 2
+
+
 def test_a_recorded_function_called_inside_a_recording_runs_its_python():
     """A function with a recording of its own, called while another call is recorded, runs its Python: a replay's launches
     are made in C++, where the outer recording would not see them."""
@@ -531,6 +558,30 @@ def test_verify_mode_checks_every_call(monkeypatch):
     graph.replay()
     torch.testing.assert_close(out, 1 + 0.5 * x, rtol=0, atol=0)
     assert cpp_launcher.VERIFIED["matched"] == matched + 2
+
+
+def test_verify_mode_compares_a_float_argument_by_its_bits(monkeypatch):
+    """A NaN is not equal to itself, and it is the same argument in the call and in its replay."""
+    import math
+
+    import tvm_ffi
+
+    from cudnn import cpp_launcher
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    monkeypatch.setattr(cpp_launcher, "VERIFY", True)
+    monkeypatch.setattr(cpp_launcher, "VERIFIED", cpp_launcher.VERIFIED.copy())
+    sink = tvm_ffi.convert(lambda got: None)
+
+    @cpp_launched
+    def api(x, scale):
+        launch(sink, scale)
+        return x
+
+    matched = cpp_launcher.VERIFIED["matched"]
+    x = torch.zeros(8, device="cuda")
+    assert api(x, math.nan) is x
+    assert cpp_launcher.VERIFIED["matched"] == matched + 1
 
 
 def test_a_call_keys_the_same_however_its_arguments_are_passed():
