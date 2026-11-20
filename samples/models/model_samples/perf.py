@@ -93,7 +93,9 @@ FROM_PYTHON = "launched from Python: not the time of a kernel inside a captured 
 OWN_ORIGINS = ("cuDNN FE", "PyTorch")
 #: the kinds of a row of the per-kernel table whose launches are one record of one kind each: the kernel of an entry
 #: of cuDNN Frontend or of an operator of PyTorch (``exact``), a library's kernel (``library``), the host read
-#: (``read``: a copy to the host, not a kernel).  A time per launch is printed for them
+#: (``read``: a copy to the host, not a kernel).  A time per launch is printed for them.  The edge of ``exact``
+#: (``_row_kind``): a block that two library entries serve, and a block call that launches a library's kernel
+#: together with one of cuDNN Frontend, are ``exact`` too -- every launch of such a row is still one kernel
 ONE_KERNEL = ("exact", "library", "read")
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
@@ -723,9 +725,10 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
 def _kernel_lines(table: dict, prefix: str) -> List[str]:
     """The per-kernel table of the screen, from the file's ``per_kernel`` section: per row its launches of a step, the time
     a launch adds to the GPU's timeline, the row's time per step and its share of GPU busy; or the one line that says
-    why there is no table.  ``us/launch`` is printed for a row whose launches are one kernel each (``ONE_KERNEL``), not
-    for a row of fallback or host blocks or of launches beside a kernel (chains of many kernels), nor at all where
-    the profiler's stamps are whole microseconds."""
+    why there is no table.  ``us/launch`` is printed for a row whose launches are one record of one kind each
+    (``ONE_KERNEL``: the kernel of an exact row, a library's kernel, the host read -- a copy to the host, not a
+    kernel), not for a row of fallback or host blocks or of launches beside a kernel (chains of many kernels), nor
+    at all where the profiler's stamps are whole microseconds."""
     if table["rows"] is None:
         return _wrapped("per kernel, per step", f"not printed: {table['reason']}")
     fine = table["us_per_launch_printed"]

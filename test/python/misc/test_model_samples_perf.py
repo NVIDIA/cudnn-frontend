@@ -1837,6 +1837,18 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         row = perf.kernel_table(*_walked(served, [_records(served)]))["rows"][0]
         named.append((row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]))
     assert named == [("a.library.call: p", "library", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 4, 4)]
+    # a name longer than its column -- a block's own, or a library's entry in front of its block -- is cut at the column: the columns behind it
+    # stay where they are and no line is wider than the screen; the file's row still names the block and its entry in full
+    long_block = "a_block_whose_name_alone_is_longer_than_the_column_of_the_names"
+    long_entry = "a.library.call.as.the.plan.names.it + another.call.of.the.library"
+    wide = [_site(long_block, 0, "gate_quant"), census.Site("p", 0, library, entry=long_entry)]
+    cut = perf.kernel_table(*_walked(wide, [_records(wide)]))
+    assert len(long_block) > perf.LABEL < len(f"{long_entry}: p") and perf.LABEL == 58
+    assert [(row["label"], row["relation"]) for row in cut["rows"][:2]] == [(long_block[:58], "exact"), (f"{long_entry}: p"[:58], "library")]
+    assert [(row["blocks"][0]["block"], row["blocks"][0]["entry"]) for row in cut["rows"][:2]] == [(long_block, f"entry of {long_block}"), ("p", long_entry)]
+    shown = perf._kernel_lines(cut, "")
+    assert shown[3] == f"  {long_block[:58]}{1:>9}{'4.30':>11}{0.004:>9.3f}{'33.3 %':>9}", "the columns behind a name that fills its column"
+    assert len({len(line) for line in shown[3:]}) == 1 and max(len(line) for line in shown) <= perf.WIDTH, "every row in its columns, no line too wide"
     # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches; the row of a block
     # a library serves carries the library's entry as the plan names it, and holds the launches of the library's kernel
     sites, claim = _planned(monkeypatch)
