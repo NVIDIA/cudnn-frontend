@@ -4304,8 +4304,34 @@ The set excludes cuTile/CAKE, other Hopper paths, QSA indexed/two-pass APIs,
 checkpoint/summary/decode paths, shared gate parameters, fused/separate Top-K,
 paged/MXFP4 indexer forward, THD dense indexer backward, score recompute,
 pooled DSA, and distributed recipes. Existing tests cover some paths separately.
-Recipe CI and an automatic source-to-test gate remain integration work;
-the checklist is a review safeguard.
+Recipe CI remains integration work.
+
+### Pull request coverage gate
+
+The `kernel-determinism-coverage` GitHub Actions job checks the
+[source-to-test registry](../../../tools/kernel_determinism_manifest.json)
+on PRs, including changes from forks. Register each new frontend-owned kernel
+source with its replay suite under `test/` or `aot/<arch>/test/`. A PR changing a registered source
+must also change at least one test listed for that source. Updating only a
+golden or this report does not satisfy the check. When a numerical path lacks
+replay coverage, register the exact source with an `exempt_reason` identifying
+the gap. A maintainer can apply `determinism-exempt` for a non-numerical change
+to waive the test update. Registration and path validation still run.
+
+The checker discovers CuTeDSL, cuTile, Triton and native CUDA kernels, kernel
+directories, frontend Python API modules (`api.py`, `jax_api.py`, and `ops/`),
+and the recorded pins for packaged CAKE kernels. Imported vendor snapshots are
+excluded from source discovery. Register dispatch or shared
+numerical code outside these conventions explicitly. Registry entries map files
+to the test suites that need review. GPU support and measured results are
+recorded in the coverage tables above.
+
+From the repository root, validate the registry and check your committed changes:
+
+```sh
+python3 tools/check_kernel_determinism_coverage.py --all
+python3 tools/check_kernel_determinism_coverage.py --base origin/develop
+```
 
 ## Temporary skips
 

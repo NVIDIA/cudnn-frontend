@@ -1,0 +1,1850 @@
+[
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/gdn_decode_fused.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_decode_fused_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_decode_fused_f16.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_gdn_decode_fused.py"
+    ],
+    "notes": "Inference-step output and mutable state byte replay; no backward API. Verification/batch-invariance limits remain in docs/operations/determinism.md."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/gdn_verify_fused.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_verify_fused_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_verify_fused_f16.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_gdn_verify_fused.py"
+    ],
+    "notes": "Inference-step output and mutable state byte replay; no backward API. Verification/batch-invariance limits remain in docs/operations/determinism.md."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/common/gdn2_operands.py",
+      "python/cudnn/linear_attention/frost/common/gdn2_state_grad.py",
+      "python/cudnn/linear_attention/frost/gdn2_engine.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_bprop_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_bprop_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_prefill_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_prefill_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_prep_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_prep_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_prep_prefill_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_recompute_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_recompute_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_uncut_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_uncut_forward_f16.py",
+      "python/cudnn/linear_attention/ops/gdn2.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_gdn2_determinism.py",
+      "test/python/linear_attention/determinism.py"
+    ],
+    "notes": "FROST FP16/BF16 prefill and autograd replay with batch_invariant=True. Other providers, summary/checkpoint-specific entry points and untested dispatch configurations are not qualified by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/kda_engine.py",
+      "python/cudnn/linear_attention/frost/kda_jax.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_bprop_config.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_bprop_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_prefill_config.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_prep_config.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_prep_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_prep_prefill_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_recompute_config.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_recompute_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_uncut_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_uncut_forward_f16.py",
+      "python/cudnn/linear_attention/ops/kda.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_kda_determinism.py",
+      "test/python/linear_attention/determinism.py"
+    ],
+    "notes": "FROST FP16/BF16 prefill and autograd replay with batch_invariant=True. Other providers, summary/checkpoint-specific entry points and untested dispatch configurations are not qualified by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/gdp_engine.py",
+      "python/cudnn/linear_attention/frost/kernel/gdp_bprop_v64_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdp_bprop_v64_f16.py",
+      "python/cudnn/linear_attention/ops/gdp.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_gdp_determinism.py",
+      "test/python/linear_attention/determinism.py"
+    ],
+    "notes": "FROST FP16/BF16 prefill and autograd replay with batch_invariant=True. Other providers, summary/checkpoint-specific entry points and untested dispatch configurations are not qualified by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/gdn_engine.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_bprop_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_bprop_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_geometry.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_prefill_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_recompute_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_recompute_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_tinv_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_tinv_f16.py",
+      "python/cudnn/linear_attention/ops/gdn.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_gdn_determinism.py",
+      "test/python/linear_attention/frost/test_gdp_determinism.py",
+      "test/python/linear_attention/determinism.py"
+    ],
+    "notes": "FROST FP16/BF16 prefill and autograd replay with batch_invariant=True. Other providers, summary/checkpoint-specific entry points and untested dispatch configurations are not qualified by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/common/beta_guard.py",
+      "python/cudnn/linear_attention/frost/common/blockwise_inverse.py",
+      "python/cudnn/linear_attention/frost/common/context.py",
+      "python/cudnn/linear_attention/frost/common/expand.py",
+      "python/cudnn/linear_attention/frost/common/gate_bwd.py",
+      "python/cudnn/linear_attention/frost/common/head_reduce.py",
+      "python/cudnn/linear_attention/frost/common/head_wave.py",
+      "python/cudnn/linear_attention/frost/common/host.py",
+      "python/cudnn/linear_attention/frost/common/l2norm.py",
+      "python/cudnn/linear_attention/frost/common/piece_chain.py",
+      "python/cudnn/linear_attention/frost/common/residual.py",
+      "python/cudnn/linear_attention/frost/common/split_k.py",
+      "python/cudnn/linear_attention/frost/common/state_snapshot.py",
+      "python/cudnn/linear_attention/frost/common/steep_decay.py",
+      "python/cudnn/linear_attention/frost/common/tail.py",
+      "python/cudnn/linear_attention/frost/common/thd.py",
+      "python/cudnn/linear_attention/frost/engine.py",
+      "python/cudnn/linear_attention/graph_analyzer.py",
+      "python/cudnn/linear_attention/ops/common.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_gdn_determinism.py",
+      "test/python/linear_attention/frost/test_gdp_determinism.py",
+      "test/python/linear_attention/frost/test_gdn2_determinism.py",
+      "test/python/linear_attention/frost/test_kda_determinism.py",
+      "test/python/linear_attention/determinism.py"
+    ],
+    "notes": "Shared numerical/dispatch helpers of the four FROST delta-rule replay suites; the tests do not qualify every optional state/summary mode."
+  },
+  {
+    "sources": [
+      "python/cudnn/QSA/_backward.py",
+      "python/cudnn/QSA/_contract.py",
+      "python/cudnn/QSA/_forward.py",
+      "python/cudnn/QSA/_metadata.py",
+      "python/cudnn/QSA/_metadata_fast.py",
+      "python/cudnn/QSA/api.py",
+      "python/cudnn/QSA/indexed/_metadata.py",
+      "python/cudnn/QSA/indexed/api.py",
+      "python/cudnn/QSA/kernels/_fprop_n64_ops.py",
+      "python/cudnn/QSA/kernels/bprop_sm100.py",
+      "python/cudnn/QSA/kernels/bprop_sm107.py",
+      "python/cudnn/QSA/kernels/fprop_dense.py",
+      "python/cudnn/QSA/kernels/fprop_n64_sm107.py",
+      "python/cudnn/QSA/kernels/fprop_prepare.py",
+      "python/cudnn/QSA/kernels/fprop_sm100.py",
+      "python/cudnn/QSA/kernels/fprop_sm107.py"
+    ],
+    "tests": [
+      "test/python/QSA/cutedsl/test_qsa_determinism.py"
+    ],
+    "notes": "BF16 public QSA training forward/backward and indexed backward replay. Preserve the suite's documented known batch-invariance failures and scoped skips; indexed forward/selection APIs are not established by this suite."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/cake/deterministic.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cake/test_deterministic.py"
+    ],
+    "notes": "Cake deterministic BF16 DSA forward/backward; bounded repeatability and isolated-row checks, not a general batch-invariance guarantee."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/_interface_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/_nvvm_compat.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/_tcgen05_mma_ws.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/_tcgen05_sync.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/_tma_gather4.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/api.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head128_small_topk.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head64.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_determinism.py"
+    ],
+    "notes": "Sparse attention FP16/BF16 forward output/statistic replay through the public wrapper on SM100/103/107; only the suite's head dimensions and Top-K configurations are qualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm100_common.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm100_d576.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_qcluster_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_qpair_topk_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_rank_common_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_2cta_deterministic.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_2cta_rank_shard.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_deterministic.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h128_2cta.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h128_d576_2cta.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h128_d576_2cta_deterministic.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h128_d576_2cta_rank_shard.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_rank_chain_m64.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_rank_shard_m64.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_determinism.py"
+    ],
+    "notes": "Public sparse backward with deterministic=True, including supported deterministic dKV modes. Default atomic paths, uncovered head shapes and known batch-invariance failures are not promoted to guarantees."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/_interface.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/_interface_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/_support.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/api.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/indexer_fwd_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/indexer_fwd_sm100_mxfp8.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/indexer_fwd_sm90.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py",
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py"
+    ],
+    "notes": "BF16 and quantized score replay: SM90 FP8; SM100/103/107 MXFP8/NVFP4. Public dispatch is shared with additional unqualified paged/Top-K configurations."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/_compressed_top_k_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/prepared.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/compress_top_k_sm100.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_compressed_sm90_determinism.py"
+    ],
+    "notes": "Deterministic compressed IndexerForward + Top-K and prepared-plan replay; coverage is limited to the GPU and dtype cases selected in this suite."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/indexer_backward/api.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_backward/dense_indexer_backward_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_backward/deterministic_dk_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_backward/indexer_backward_sm100.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py"
+    ],
+    "notes": "Sparse BF16-input backward with deterministic=True and BF16/FP32 dK; dense and large-TopK failure/skip cases remain explicit coverage debt in the suite."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/utils/compiler.py",
+      "python/cudnn/deepseek_sparse_attention/utils/copy.py",
+      "python/cudnn/deepseek_sparse_attention/utils/runtime.py",
+      "python/cudnn/deepseek_sparse_attention/utils/seqlen.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm100/gemm.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm100/mma_desc.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm100/mxfp8_scale_pack.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm100/mxfp8_scale_utils.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm90/bwd_barriers.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm90/bwd_tile_scheduler.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm90/mma.py",
+      "python/cudnn/deepseek_sparse_attention/utils/sm90/primitives.py",
+      "python/cudnn/deepseek_sparse_attention/utils/tensor_conversion.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_determinism.py",
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py",
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py"
+    ],
+    "notes": "Shared DSA numerical helpers and quantized-scale packing used by the named suites; no blanket qualification of every DSA route."
+  },
+  {
+    "sources": [
+      "python/cudnn/csa/compressor/api.py",
+      "python/cudnn/csa/compressor/compressor_sm100.py",
+      "python/cudnn/csa/compressor/compressor_sm100_r128.py"
+    ],
+    "tests": [
+      "test/python/compressed_sparse_attention/cutedsl/test_CSA_compressor.py"
+    ],
+    "notes": "Compressor forward replay and deterministic=True backward/state gradients with independent references and goldens. Default atomic dAPE and unmeasured GPUs remain unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/block_sparse_attention/_bwd_metadata.py",
+      "python/cudnn/block_sparse_attention/_interface.py",
+      "python/cudnn/block_sparse_attention/api.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/bsa_bwd_postprocess.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/bsa_bwd_prepost.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/bsa_bwd_preprocess.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/bucketed_k2q_csr.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/local_pair.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/local_pair_refine_batch_wide.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm100_blk64/bsa_bwd_sm100.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm100_blk64/bsa_bwd_sm100_paired.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm90_blk64/bsa_bwd_sm90.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm90_blk64/bsa_bwd_sm90_paired.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_combine.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_helpers.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm90_blk64/bsa_fwd_sm90.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/batched_static_scheduler.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/block_info.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/block_sparse_tile_scheduler.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/copy_utils.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/cute_dsl_utils.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/kernel_utils.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/layout_utils.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/mma_sm100_desc.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/named_barrier.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/pack_gqa.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/pipeline.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/seqlen_info.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/sm90_barriers.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/sm90_utils.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/softmax.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/subset_barrier.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/tcgen05_mma_helpers.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/tile_scheduler.py"
+    ],
+    "tests": [
+      "test/python/block_sparse_attention/cutedsl/test_BSA_determinism.py"
+    ],
+    "notes": "SM90/SM100/SM103 blk64 public forward and backward maintenance. Backward repeatability is not guaranteed; known failing/unsupported cases remain visible. FP8, blk128, SM120 and paged variants are not covered here."
+  },
+  {
+    "sources": [
+      "python/cudnn/causal_conv1d_update_sm100/api.py",
+      "python/cudnn/causal_conv1d_update_sm100/kernel.py",
+      "python/cudnn/ops/_causal_conv1d_update.py"
+    ],
+    "tests": [
+      "test/python/causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py"
+    ],
+    "notes": "Public width-four FP16 inference decode output/state byte replay and batch isolation. Other precisions and convolution APIs need separate qualification."
+  },
+  {
+    "sources": [
+      "python/cudnn/simplified_sparse_attention/api.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/backend.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/jax_kernels.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/_cuda_preload.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/_stream_lock.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/attention_teacher_forward_hq16.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/attention_teacher_forward_hq32.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/attention_teacher_forward_hq96.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/cute_dsl_filter_topk/_cutlass_block_compat.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/cute_dsl_filter_topk/block_scan.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/cute_dsl_filter_topk/filtered_top_k_prefill_varlen.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/cute_dsl_filter_topk/filtered_top_k_varlen_util.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/dense_gemm_sm100.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/gvr_topk/gvr_topk_decode_self_sampling.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/gvr_topk/gvr_topk_decode_self_sampling_host.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/gvr_topk/postproc.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/gvr_topk/wrapper.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/indexer_aux_grad_precompute_tcgen05.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/indexer_forward_topk_fused_tcgen05.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/indexer_forward_topk_tcgen05.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/phase1_dense_indexer_kl.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_backward_hq16.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_backward_hq32.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_backward_tcgen05.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_h96_big.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_large.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_large_h32_lookahead.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/kernels/sparse_attention_workspace.py",
+      "python/cudnn/simplified_sparse_attention/cutedsl/phase1.py",
+      "python/cudnn/simplified_sparse_attention/jax_api.py"
+    ],
+    "tests": [
+      "test/python/simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py",
+      "test/python/simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism_jax.py",
+      "test/python/simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py"
+    ],
+    "notes": "Torch/JAX simplified sparse attention and dense-indexer KL byte detectors. These APIs expose no deterministic mode; known backward and batch-invariance failures are documented rather than waived."
+  },
+  {
+    "sources": [
+      "python/cudnn/attention_gate/frost/gate_quant_decode.py",
+      "python/cudnn/attention_gate/frost/kernel/gate_quant_decode_config.py",
+      "python/cudnn/attention_gate/frost/kernel/gate_quant_decode_f16.py"
+    ],
+    "tests": [
+      "test/python/attention_gate/frost/test_gate_quant_decode_determinism.py"
+    ],
+    "notes": "Inference-only decode fusion: fixed-payload output byte replay, fresh buffers and batch-isolation checks. No backward API; GPU/geometry coverage remains limited to the suite and support page."
+  },
+  {
+    "sources": [
+      "python/cudnn/moe/frost/kernel/shared_expert_decode_config.py",
+      "python/cudnn/moe/frost/kernel/shared_expert_decode_f16.py",
+      "python/cudnn/moe/frost/shared_expert_decode.py"
+    ],
+    "tests": [
+      "test/python/moe/frost/test_shared_expert_decode_determinism.py"
+    ],
+    "notes": "Inference-only decode fusion: fixed-payload output byte replay, fresh buffers and batch-isolation checks. No backward API; GPU/geometry coverage remains limited to the suite and support page."
+  },
+  {
+    "sources": [
+      "python/cudnn/norm/frost/add_norm_quant_decode.py",
+      "python/cudnn/norm/frost/kernel/add_norm_quant_decode_config.py",
+      "python/cudnn/norm/frost/kernel/add_norm_quant_decode_f16.py"
+    ],
+    "tests": [
+      "test/python/norm/frost/test_add_norm_quant_decode_determinism.py"
+    ],
+    "notes": "Inference-only decode fusion: fixed-payload output byte replay, fresh buffers and batch-isolation checks. No backward API; GPU/geometry coverage remains limited to the suite and support page."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/frost/projection_decode/fp8_projection_decode.py",
+      "python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_config.py",
+      "python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py"
+    ],
+    "tests": [
+      "test/python/gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py"
+    ],
+    "notes": "Inference-only decode fusion: fixed-payload output byte replay, fresh buffers and batch-isolation checks. No backward API; GPU/geometry coverage remains limited to the suite and support page."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_config.py",
+      "python/cudnn/gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_nvfp4.py",
+      "python/cudnn/gemm/frost/swiglu_decode/swiglu_fp4_decode.py"
+    ],
+    "tests": [
+      "test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode_determinism.py"
+    ],
+    "notes": "Inference-only decode fusion: fixed-payload output byte replay, fresh buffers and batch-isolation checks. No backward API; GPU/geometry coverage remains limited to the suite and support page."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/moe_blockscaled_grouped_gemm_glu_hadamard_quant.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/moe_kernel_helpers.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/quant_utils.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/rht_utils.py"
+    ],
+    "tests": [
+      "test/python/gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py"
+    ],
+    "notes": "SM100 NVFP4 GLU/RHT quantized forward payload/scales replay and reference checks. JAX uses the shared wrapper, but separate JAX batch-invariance/GPU qualification remains limited."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard/hadamard_utils.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard/moe_blockscaled_grouped_gemm_glu_hadamard.py"
+    ],
+    "tests": [
+      "test/python/gemm/cutedsl/test_grouped_gemm_glu_hadamard.py"
+    ],
+    "notes": "The SReLU FP4/E8M0 tanh-clamp and RHT-sign-mask cases assert raw-byte replay; other activations and scale formats are not thereby qualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/grouped/canonical_jax.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/_blockscaled_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/moe_blockscaled_grouped_gemm_dglu_dbias.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/_blockscaled_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/moe_blockscaled_grouped_gemm_glu_bias.py"
+    ],
+    "tests": [
+      "test/python/gemm/jax/test_grouped_gemm_situ_determinism.py"
+    ],
+    "notes": "SiTU JAX forward/backward byte detectors and expert isolation for MXFP8. Atomic dprob has no determinism guarantee; unrelated GLU activations/dtypes remain unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cutlass_helpers/static_persistent_tile_scheduler.py",
+      "python/cudnn/_cutlass_helpers/warp_reduce.py"
+    ],
+    "exempt_reason": "Shared CUTLASS helper kernels require an explicit consumer replay association; no direct determinism test is registered yet."
+  },
+  {
+    "sources": [
+      "python/cudnn/_jax/call.py"
+    ],
+    "exempt_reason": "The _jax frontend-owned kernels have no precise byte replay association in this initial registry; qualify their numerical API and scheduling behavior before replacing this explicit coverage debt."
+  },
+  {
+    "sources": [
+      "python/cudnn/api_base.py"
+    ],
+    "exempt_reason": "The api_base.py frontend-owned kernels have no precise byte replay association in this initial registry; qualify their numerical API and scheduling behavior before replacing this explicit coverage debt."
+  },
+  {
+    "sources": [
+      "python/cudnn/block_sparse_attention/_fp8_quant.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm100_blk128/bsa_bwd_sm100.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm100_blk128/bsa_bwd_sm100_kpage.py",
+      "python/cudnn/block_sparse_attention/csrc/bwd/sm90_blk128/bsa_bwd_sm90.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8_fused_pv.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_kpage.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_kpage_q64.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120_fa4.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/bsa_fwd_sm120_fp8.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk128/sage_v_quant.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk64/bsa_fwd_sm120.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm120_blk64/bsa_fwd_sm120_fp8.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm90_blk128/bsa_fwd_sm90.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm90_blk128/bsa_fwd_sm90_fp8.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm90_blk64/bsa_fwd_sm90_fp8.py",
+      "python/cudnn/block_sparse_attention/csrc/fwd/sm90_blk64/bsa_fwd_sm90_kpage.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/kpage_tile_scheduler.py",
+      "python/cudnn/block_sparse_attention/csrc/utils/kpage_utils.py",
+      "python/cudnn/block_sparse_attention/jax_kernels.py",
+      "python/cudnn/block_sparse_attention/kpage/_build_kernels.py",
+      "python/cudnn/block_sparse_attention/kpage/_interface.py"
+    ],
+    "exempt_reason": "These BSA kernels are outside the registered SM90/SM100 blk64 FP16/BF16 contract (paged, FP8, blk128 or other architecture paths); no byte replay association is established here."
+  },
+  {
+    "sources": [
+      "python/cudnn/causal_conv1d_bulk_sm100/api.py",
+      "python/cudnn/causal_conv1d_bulk_sm100/backward.py",
+      "python/cudnn/causal_conv1d_bulk_sm100/backward_kernel.py",
+      "python/cudnn/causal_conv1d_bulk_sm100/backward_kernel_vec2_cpasync.py",
+      "python/cudnn/causal_conv1d_bulk_sm100/backward_kernel_vec4.py",
+      "python/cudnn/causal_conv1d_bulk_sm100/kernel.py"
+    ],
+    "exempt_reason": "Bulk causal convolution has no mapped byte replay suite; the registered update test exercises inference decode only."
+  },
+  {
+    "sources": [
+      "python/cudnn/causal_conv1d_se/b2b_kernel.py",
+      "python/cudnn/causal_conv1d_se/backward_kernel.py",
+      "python/cudnn/causal_conv1d_se/kernel.py"
+    ],
+    "exempt_reason": "SE/fused causal-convolution forward/backward kernels have no mapped byte replay suite; decode-update replay does not cover them."
+  },
+  {
+    "sources": [
+      "python/cudnn/conv/cutedsl/conv3d_postops/api.py",
+      "python/cudnn/conv/cutedsl/conv3d_postops/causal.py",
+      "python/cudnn/conv/cutedsl/conv3d_postops/kernel.py",
+      "python/cudnn/conv/cutedsl/conv3d_postops/rmsnorm_silu_pad.py",
+      "python/cudnn/conv/frost/templates/sm100_block_scale_conv.py",
+      "python/cudnn/conv/frost/templates/sm100_conv.py"
+    ],
+    "exempt_reason": "Convolution frontend-owned CuTeDSL kernels have no associated bit-exact replay suite in this initial registry. Numerical/reference tests do not establish scheduling determinism; add a replay association when qualifying each path."
+  },
+  {
+    "sources": [
+      "python/cudnn/csa/compressor/jax_api.py"
+    ],
+    "exempt_reason": "The csa frontend-owned kernels have no precise byte replay association in this initial registry; qualify their numerical API and scheduling behavior before replacing this explicit coverage debt."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/aligned_hca_backward/_kernels.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_backward/dense_indexer_backward_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/block_scan.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/compactify.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/local_to_global_dsl.py",
+      "python/cudnn/deepseek_sparse_attention/jax_api.py",
+      "python/cudnn/deepseek_sparse_attention/pooled/_expand_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/pooled/_pool_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/pooled/backward.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/_interface_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/dense_score_recompute_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/dense_score_recompute_sm100_mxfp8.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/dense_score_recompute_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100_mxfp8.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/pack_gqa.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/score_kernel_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/sparse_score_recompute_sm100.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h16.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h32.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm100_h96.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/_interface_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm90.py"
+    ],
+    "exempt_reason": "These DSA kernels are outside the registered sparse-attention/indexer replay configurations (including separate Top-K, score recompute, pooled/aligned paths or uncovered SM90/head variants). Add an explicit replay association for the actual API rather than assuming coverage from another DSA suite."
+  },
+  {
+    "sources": [
+      "python/cudnn/engram/_backward.py",
+      "python/cudnn/engram/_forward.py",
+      "python/cudnn/engram/_math.py",
+      "python/cudnn/engram/_reductions.py",
+      "python/cudnn/engram/api.py"
+    ],
+    "exempt_reason": "Engram kernels have no associated raw-byte replay/batch-invariance suite yet; scheduling and precision qualification remains explicit coverage debt."
+  },
+  {
+    "sources": [
+      "python/cudnn/flex_attention/_compat/copy_utils.py",
+      "python/cudnn/flex_attention/_compat/layout_utils.py",
+      "python/cudnn/flex_attention/_compat/sm90_utils.py",
+      "python/cudnn/flex_attention/dispatch.py",
+      "python/cudnn/flex_attention/kernels/common/backward_postprocess.py",
+      "python/cudnn/flex_attention/kernels/common/backward_preprocess.py",
+      "python/cudnn/flex_attention/kernels/common/barrier.py",
+      "python/cudnn/flex_attention/kernels/common/block_info.py",
+      "python/cudnn/flex_attention/kernels/common/copy_utils.py",
+      "python/cudnn/flex_attention/kernels/common/device_utils.py",
+      "python/cudnn/flex_attention/kernels/common/fast_math.py",
+      "python/cudnn/flex_attention/kernels/common/max_logit.py",
+      "python/cudnn/flex_attention/kernels/common/pack_gqa.py",
+      "python/cudnn/flex_attention/kernels/common/pipeline.py",
+      "python/cudnn/flex_attention/kernels/common/seqlen_info.py",
+      "python/cudnn/flex_attention/kernels/common/softmax.py",
+      "python/cudnn/flex_attention/kernels/common/tile_scheduler.py",
+      "python/cudnn/flex_attention/kernels/sm100/blackwell_helpers.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/backward.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/backward_config.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/backward_config_hd256.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/backward_dkdv_hd256.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/backward_dq_hd256.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/backward_hd256.py",
+      "python/cudnn/flex_attention/kernels/sm100/bwd/named_barrier.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/forward.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/forward_config.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/forward_config_hd256.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/forward_hd256.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/forward_qstage1.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/forward_qstage2.py",
+      "python/cudnn/flex_attention/kernels/sm100/fwd/named_barrier.py",
+      "python/cudnn/flex_attention/kernels/sm100/mma_desc.py",
+      "python/cudnn/flex_attention/kernels/sm90/bwd/atomic.py",
+      "python/cudnn/flex_attention/kernels/sm90/bwd/backward.py",
+      "python/cudnn/flex_attention/kernels/sm90/bwd/backward_config.py",
+      "python/cudnn/flex_attention/kernels/sm90/bwd/gemm_slice.py",
+      "python/cudnn/flex_attention/kernels/sm90/bwd/named_barrier.py",
+      "python/cudnn/flex_attention/kernels/sm90/fwd/forward.py",
+      "python/cudnn/flex_attention/kernels/sm90/fwd/forward_base.py",
+      "python/cudnn/flex_attention/kernels/sm90/fwd/forward_config.py",
+      "python/cudnn/flex_attention/kernels/sm90/fwd/named_barrier.py",
+      "python/cudnn/flex_attention/plan/builder.py",
+      "python/cudnn/flex_attention/plan/kernels/common.py",
+      "python/cudnn/flex_attention/plan/kernels/compact.py",
+      "python/cudnn/flex_attention/plan/kernels/k2q_count.py",
+      "python/cudnn/flex_attention/plan/kernels/materialize_sm100.py",
+      "python/cudnn/flex_attention/plan/kernels/materialize_sm90.py",
+      "python/cudnn/flex_attention/plan/kernels/packed_mask.py",
+      "python/cudnn/flex_attention/plan/kernels/q2k_classify.py",
+      "python/cudnn/flex_attention/plan/kernels/scan_header.py",
+      "python/cudnn/flex_attention/plan/kernels/schedule.py",
+      "python/cudnn/flex_attention/plan/kernels/workspace.py"
+    ],
+    "exempt_reason": "Flex-attention kernels and compatibility helpers require their own fixed-input byte replay coverage; ordinary correctness and benchmark coverage are not determinism evidence."
+  },
+  {
+    "sources": [
+      "python/cudnn/frost/compiled_cache.py",
+      "python/cudnn/frost/tile_dsl/barrier.py",
+      "python/cudnn/frost/tile_dsl/bias.py",
+      "python/cudnn/frost/tile_dsl/consume.py",
+      "python/cudnn/frost/tile_dsl/mask.py",
+      "python/cudnn/frost/tile_dsl/mma.py",
+      "python/cudnn/frost/tile_dsl/pointwise.py",
+      "python/cudnn/frost/tile_dsl/rope.py",
+      "python/cudnn/frost/tile_dsl/rowwise.py",
+      "python/cudnn/frost/tile_dsl/scheduler.py",
+      "python/cudnn/frost/tile_dsl/softmax_f16.py",
+      "python/cudnn/frost/tile_dsl/swizzle.py",
+      "python/cudnn/frost/tile_dsl/thd.py",
+      "python/cudnn/frost/tile_dsl/tma.py",
+      "python/cudnn/frost/tile_dsl/tmem.py",
+      "python/cudnn/frost/tile_dsl/wgmma.py"
+    ],
+    "exempt_reason": "Shared FROST utility kernels do not yet have a precise operation-to-replay mapping; allocator/cache helpers alone are not numerical determinism evidence."
+  },
+  {
+    "sources": [
+      "python/cudnn/gated_attention_block/kernels/cache_write.py",
+      "python/cudnn/gated_attention_block/kernels/elementwise.py",
+      "python/cudnn/gated_attention_block/kernels/fp8_bwd_fused.py",
+      "python/cudnn/gated_attention_block/kernels/mxfp8_bwd_fused.py",
+      "python/cudnn/gated_attention_block/kernels/proj_gemm.py",
+      "python/cudnn/gated_attention_block/kernels/proj_gemm_norm_rope.py",
+      "python/cudnn/gated_attention_block/kernels/proj_gemm_norm_rope_fp8.py",
+      "python/cudnn/gated_attention_block/kernels/proj_gemm_norm_rope_mxfp8.py",
+      "python/cudnn/gated_attention_block/kernels/qk_norm_rope.py",
+      "python/cudnn/gated_attention_block/kernels/qk_norm_rope_bwd.py",
+      "python/cudnn/gated_attention_block/kernels/qk_norm_rope_tma.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_canonical_list.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_compress.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_kbar_gather.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_kv_upcast.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_prepare.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_score_paged.py",
+      "python/cudnn/gated_attention_block/kernels/qsa_topk_decode.py",
+      "python/cudnn/gated_attention_block/kernels/quantize.py",
+      "python/cudnn/gated_attention_block/kernels/quantize_fp4.py",
+      "python/cudnn/gated_attention_block/kernels/quantize_mxfp8.py",
+      "python/cudnn/gated_attention_block/kernels/sigmoid_gate_bwd.py"
+    ],
+    "exempt_reason": "Gated-attention-block kernels are not covered by the separate AttentionGateQuantDecode inference suite; their forward/backward byte qualification remains outstanding."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/dense/amax/api.py",
+      "python/cudnn/gemm/cutedsl/dense/amax/dense_blockscaled_gemm_persistent_amax.py",
+      "python/cudnn/gemm/cutedsl/dense/amax/jax_api.py",
+      "python/cudnn/gemm/cutedsl/dense/dsrelu/api.py",
+      "python/cudnn/gemm/cutedsl/dense/dsrelu/dense_blockscaled_gemm_persistent_dsrelu_quant.py",
+      "python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/api.py",
+      "python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/gemm_proj_rope_mxfp8.py",
+      "python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/gemm_proj_rope_mxfp8_bf16in.py",
+      "python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/gemm_proj_rope_mxfp8_mxfp8in.py",
+      "python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/jax_api.py",
+      "python/cudnn/gemm/cutedsl/dense/srelu/api.py",
+      "python/cudnn/gemm/cutedsl/dense/srelu/dense_blockscaled_gemm_persistent_srelu_quant.py",
+      "python/cudnn/gemm/cutedsl/dense/srelu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/dense/swiglu/api.py",
+      "python/cudnn/gemm/cutedsl/dense/swiglu/dense_blockscaled_gemm_persistent_swiglu_interleaved_quant.py",
+      "python/cudnn/gemm/cutedsl/dense/swiglu/dense_gemm_persistent_swiglu.py",
+      "python/cudnn/gemm/cutedsl/dense/swiglu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/discrete_kernel_utils.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/dswiglu/api.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/dswiglu/discrete_B_blockscaled_grouped_gemm_dglu_dbias.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/dswiglu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/moe_persistent_scheduler.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/moe_sched_extension.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/moe_utils.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/swiglu/api.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/swiglu/discrete_B_blockscaled_grouped_gemm_glu_bias.py",
+      "python/cudnn/gemm/cutedsl/discrete_grouped/swiglu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/_bf16_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/moe_blockscaled_grouped_gemm_dglu_rubin.py",
+      "python/cudnn/gemm/cutedsl/grouped/dglu/moe_grouped_gemm_dglu_dbias.py",
+      "python/cudnn/gemm/cutedsl/grouped/dsrelu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dswiglu/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dswiglu/grouped_gemm_dswiglu_quant.py",
+      "python/cudnn/gemm/cutedsl/grouped/dswiglu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/_bf16_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/moe_blockscaled_grouped_gemm_glu_rubin.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu/moe_grouped_gemm_glu_bias.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/moe_blockscaled_grouped_gemm_glu_hadamard_quant_rubin.py",
+      "python/cudnn/gemm/cutedsl/grouped/moe_kernel_helpers.py",
+      "python/cudnn/gemm/cutedsl/grouped/moe_persistent_scheduler.py",
+      "python/cudnn/gemm/cutedsl/grouped/moe_sched_extension.py",
+      "python/cudnn/gemm/cutedsl/grouped/moe_utils.py",
+      "python/cudnn/gemm/cutedsl/grouped/quant/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/quant/grouped_gemm_quant.py",
+      "python/cudnn/gemm/cutedsl/grouped/quant/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/quant/moe_blockscaled_grouped_gemm_quant_rubin.py",
+      "python/cudnn/gemm/cutedsl/grouped/srelu/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/srelu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/srelu/moe_blockscaled_grouped_gemm_srelu_quant.py",
+      "python/cudnn/gemm/cutedsl/grouped/swiglu/grouped_gemm_swiglu_quant.py",
+      "python/cudnn/gemm/cutedsl/grouped/unfused/_bf16_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/unfused/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/unfused/moe_grouped_gemm.py",
+      "python/cudnn/gemm/cutedsl/grouped/utils.py",
+      "python/cudnn/gemm/cutedsl/grouped/wgrad/_bf16_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/wgrad/_blockscaled_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/wgrad/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/wgrad/moe_blockscaled_grouped_gemm_wgrad.py",
+      "python/cudnn/gemm/cutedsl/grouped/wgrad/moe_grouped_gemm_wgrad.py",
+      "python/cudnn/gemm/frost/kernel_templates/dynamic_scheduler_counter_initialization.py",
+      "python/cudnn/gemm/frost/ln_prologue/sm100_dual_gemm.py",
+      "python/cudnn/gemm/frost/ln_prologue/sm107_dual_gemm.py",
+      "python/cudnn/gemm/frost/sm100/compiler.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_block_scale_matmul.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_matmul.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_matmul_mainloop.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_block_scale_matmul_fwd.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_matmul_fwd.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_matmul_fwd_gather_mode.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_moe_grouped_matmul_fwd_swap_ab.py",
+      "python/cudnn/gemm/frost/sm100/kernel_templates/sm103_block_scale_matmul.py",
+      "python/cudnn/gemm/frost/sm120/compiler.py",
+      "python/cudnn/gemm/frost/sm120/kernel_templates/sm120_block_scale_matmul.py",
+      "python/cudnn/gemm/frost/sm120/kernel_templates/sm120_matmul.py",
+      "python/cudnn/gemm/frost/sm120/kernel_templates/sm120_moe_grouped_block_scale_matmul_fwd.py",
+      "python/cudnn/gemm/frost/sm120/kernel_templates/sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+      "python/cudnn/gemm/frost/sm120/kernel_templates/sm120_moe_grouped_matmul_fwd.py",
+      "python/cudnn/gemm/frost/sm120/kernel_templates/sm120_moe_grouped_matmul_fwd_swap_ab.py",
+      "python/cudnn/gemm/frost/tile_helpers.py",
+      "python/cudnn/gemm/mhc_projection_bwd/_kernels.py"
+    ],
+    "exempt_reason": "These GEMM/grouped-GEMM kernels or generated templates are outside the precise SiTU/GLU-RHT/decode replay associations above. Add datatype/epilogue/architecture-specific replay before removing this coverage debt."
+  },
+  {
+    "sources": [
+      "python/cudnn/hstu/hstu_attention/_interface.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/blackwell_helpers.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/block_info.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/block_sparse_builder.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/block_sparsity.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/fast_math.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_bwd.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_bwd_256_cute.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_bwd_256_cute_dkdv.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_bwd_256_cute_dq.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_bwd_256_cute_utils.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_bwd_q1.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/hstu_fwd.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/mask.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/tile_scheduler.py",
+      "python/cudnn/hstu/hstu_attention/_kernels/utils.py",
+      "python/cudnn/hstu/hstu_attention/jax_api.py",
+      "python/cudnn/hstu/hstu_lmsd/_kernels/hstu_lmsd_bwd.py",
+      "python/cudnn/hstu/hstu_lmsd/_kernels/hstu_lmsd_fwd.py",
+      "python/cudnn/hstu/hstu_lmsd/api.py",
+      "python/cudnn/hstu/hstu_lmsd/jax_api.py"
+    ],
+    "exempt_reason": "HSTU attention/LMSD kernels have no mapped raw-byte replay and batch-invariance suite; existing numerical tests do not qualify determinism."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/cake/kernels/fe_cake_kda_helpers.cu",
+      "python/cudnn/linear_attention/cutile/kernels/common.py",
+      "python/cudnn/linear_attention/cutile/kernels/gdn.py",
+      "python/cudnn/linear_attention/cutile/kernels/kda.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_bprop_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_chain_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_chain_forward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_chain_prologue_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_summary_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn2_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_bprop_summary_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_bprop_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_chain_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_chain_forward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_chain_prologue_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_summary_config.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_warmup_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_bprop_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_chain_prologue_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_prep_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_summary_config.py",
+      "python/cudnn/linear_attention/frost/kernel/kda_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_bprop_config.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_bprop_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_bprop_summary_config.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_bprop_summary_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_chain_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_chain_forward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_chain_prologue_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_prefill_config.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_prefill_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_recompute_config.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_recompute_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_warmup_backward_f16.py",
+      "python/cudnn/linear_attention/frost/kernel/mamba2_warmup_forward_f16.py",
+      "python/cudnn/linear_attention/hopper/cuda_kernels/kda_bwd_sm90.cu",
+      "python/cudnn/linear_attention/hopper/cuda_kernels/kda_fused_sm90.cu",
+      "python/cudnn/linear_attention/hopper/kernel/kda_prefill_sm90.py"
+    ],
+    "exempt_reason": "These linear-attention kernels belong to alternate providers or summary/chain/Mamba2 paths not established by the four FROST prefill/autograd suites. Add explicit replay coverage for the actual provider and outputs/state gradients."
+  },
+  {
+    "sources": [
+      "python/cudnn/moe_ep/_megamoe_backend/mxfp8/_compile_common.py",
+      "python/cudnn/moe_ep/_megamoe_backend/mxfp8/_training_stage.py",
+      "python/cudnn/moe_ep/_megamoe_backend/mxfp8/_training_stage_kernel.py"
+    ],
+    "exempt_reason": "Distributed expert-parallel kernels need a multi-GPU replay contract covering communication ordering and reductions; no such test is associated here."
+  },
+  {
+    "sources": [
+      "include/cudnn_frontend/generated/rms_norm_silu/sm100/ln_fwd_silu_kernel.h"
+    ],
+    "exempt_reason": "Frontend-owned native/generated CUDA source has no associated fixed-input byte replay suite; graph API correctness tests do not qualify its kernel scheduling."
+  },
+  {
+    "sources": [
+      "python/cudnn/native_sparse_attention/compression/api.py",
+      "python/cudnn/native_sparse_attention/compression/fmha.py",
+      "python/cudnn/native_sparse_attention/compression/fmha_helpers.py",
+      "python/cudnn/native_sparse_attention/jax_api.py",
+      "python/cudnn/native_sparse_attention/selection/NSA_select_attn_fwd_hmma.py",
+      "python/cudnn/native_sparse_attention/selection/api.py",
+      "python/cudnn/native_sparse_attention/top_k/api.py",
+      "python/cudnn/native_sparse_attention/top_k/nsa_top_k_reduction_fwd.py"
+    ],
+    "exempt_reason": "NSA compression/selection/sliding-window kernels are not the DSA or QSA APIs exercised by the registered suites; their own replay coverage is outstanding."
+  },
+  {
+    "sources": [
+      "python/cudnn/norm/_common_sm100.py",
+      "python/cudnn/norm/affine_kernels.py",
+      "python/cudnn/norm/bprop/kernels/batchnorm_nchw_sm100.py",
+      "python/cudnn/norm/bprop/kernels/batchnorm_nhwc_sm100.py",
+      "python/cudnn/norm/bprop/kernels/batchnorm_sm100.py",
+      "python/cudnn/norm/bprop/kernels/groupnorm_cga_sm100.py",
+      "python/cudnn/norm/bprop/kernels/groupnorm_fast_sm100.py",
+      "python/cudnn/norm/bprop/kernels/groupnorm_nhwc_sm100.py",
+      "python/cudnn/norm/bprop/kernels/groupnorm_sm100.py",
+      "python/cudnn/norm/bprop/kernels/instancenorm_nhwc_sm100.py",
+      "python/cudnn/norm/bprop/kernels/instancenorm_sm100.py",
+      "python/cudnn/norm/bprop/kernels/instancenorm_warp_sm100.py",
+      "python/cudnn/norm/bprop/kernels/layernorm_cga_sm100.py",
+      "python/cudnn/norm/bprop/kernels/layernorm_sm100.py",
+      "python/cudnn/norm/bprop/kernels/rmsnorm_sm100.py",
+      "python/cudnn/norm/fprop/kernels/batchnorm_nchw_flat_sm100.py",
+      "python/cudnn/norm/fprop/kernels/batchnorm_nchw_sm100.py",
+      "python/cudnn/norm/fprop/kernels/batchnorm_nhwc_sm100.py",
+      "python/cudnn/norm/fprop/kernels/batchnorm_sm100.py",
+      "python/cudnn/norm/fprop/kernels/groupnorm_cga_sm100.py",
+      "python/cudnn/norm/fprop/kernels/groupnorm_nhwc_sm100.py",
+      "python/cudnn/norm/fprop/kernels/groupnorm_sm100.py",
+      "python/cudnn/norm/fprop/kernels/instancenorm_nhwc_sm100.py",
+      "python/cudnn/norm/fprop/kernels/instancenorm_sm100.py",
+      "python/cudnn/norm/fprop/kernels/layernorm_cga_sm100.py",
+      "python/cudnn/norm/fprop/kernels/layernorm_sm100.py",
+      "python/cudnn/norm/fprop/kernels/layernorm_warp_sm100.py",
+      "python/cudnn/norm/fprop/kernels/rmsnorm_sm100.py",
+      "python/cudnn/norm/jax_kernels.py"
+    ],
+    "exempt_reason": "These normalization kernels are outside the AddNormQuantDecode inference entry. Forward/backward reduction and quantization replay remain unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/ops/_nvfp4_block_scale_kernels.py"
+    ],
+    "exempt_reason": "These standalone operation kernels are outside the registered attention/decode suites; a specific byte replay association is still required."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/compact_gqa/api.py",
+      "python/cudnn/sdpa/bwd/compact_gqa/dq.py",
+      "python/cudnn/sdpa/bwd/compact_gqa/launcher.py",
+      "python/cudnn/sdpa/bwd/compact_gqa/packed.py",
+      "python/cudnn/sdpa/bwd/compact_gqa/producer.py",
+      "python/cudnn/sdpa/bwd/compact_gqa/reduce.py",
+      "python/cudnn/sdpa/bwd/kernels/bprop_chain_common.py",
+      "python/cudnn/sdpa/bwd/kernels/bprop_matmul_blackwell.py",
+      "python/cudnn/sdpa/bwd/kernels/bprop_thd_reduce.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/_d128_chain.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/_d128_device_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/_d128_thd_chain.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/_fp8_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/_prepared_d128_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/chain.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/dq576/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/fa4/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/geometry.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/rubin_b2/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_pair/config_dq.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_pair/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_pair/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_pair/kernel_dkv.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_pair/kernel_dq.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_pair/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_recompute/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_recompute/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_recompute/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_recompute/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_recompute/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_fp8_accumulation/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_fp8_accumulation/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_fp8_accumulation/grouped_helpers.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_fp8_accumulation/helpers.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_fp8_accumulation/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_fp8_accumulation/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/helpers.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/helpers_thd.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/kernel_thd.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/prepared_dense.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/prepared_dense_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/prepared_thd.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/prepared_thd_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d192_f16_accum/thd_contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/dkdv.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/dq.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/masks.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_mxfp8/sf_repack.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_f16_2x2/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_f16_2x2/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_f16_2x2/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_f16_role_split/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_f16_role_split/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_f16_role_split/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_fp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_fp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_fp8/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_half_contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_mxfp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_mxfp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d512_mxfp8/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/config_dkdv.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/config_dq.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/dkdv.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/dq.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/helpers.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/fp8_pair/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/prepared_d128_accum_fp8_grouped_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/prepared_d128_accum_fp8_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/prepared_d192_fp8_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/prepared_mxfp8_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/quantized_contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_half_contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/_fp8_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/bprop_chain_f16.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/f16_fused/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/f16_fused/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/f16_fused/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/f16_two_subgroup/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/f16_two_subgroup/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/fp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/fp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/fp8/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/half_contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/mxfp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/mxfp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/mxfp8/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm120/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/_common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/f16_d64/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/f16_d64/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/f16_d64/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/f16_two_subgroup/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/f16_two_subgroup/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/f16_two_subgroup/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/half_contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm80/prepared_host.py",
+      "python/cudnn/sdpa/bwd/kernels/thd_helpers.py",
+      "python/cudnn/sdpa/bwd/qat/_frost_dq_kernel.py",
+      "python/cudnn/sdpa/bwd/qat/_frost_kernel.py",
+      "python/cudnn/sdpa/bwd/qat/_kernels.py",
+      "python/cudnn/sdpa/bwd/qat/_nvfp4.py"
+    ],
+    "exempt_reason": "This concrete SDPA source is outside the implementation-specific byte replay associations in this initial registry. Fixed-plan replay must be qualified per owner, precision and GPU; general SDPA correctness/capture tests do not establish it."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fmha_utils.py"
+    ],
+    "exempt_reason": "This concrete SDPA source is outside the implementation-specific byte replay associations in this initial registry. Fixed-plan replay must be qualified per owner, precision and GPU; general SDPA correctness/capture tests do not establish it."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/_common_blackwell.py",
+      "python/cudnn/sdpa/fwd/kernels/_fp8_host.py",
+      "python/cudnn/sdpa/fwd/kernels/_mixed_kv.py",
+      "python/cudnn/sdpa/fwd/kernels/_mxfp8_host.py",
+      "python/cudnn/sdpa/fwd/kernels/_quantized.py",
+      "python/cudnn/sdpa/fwd/kernels/_thd_split_host.py",
+      "python/cudnn/sdpa/fwd/kernels/forward_metadata.py",
+      "python/cudnn/sdpa/fwd/kernels/packed_lse.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_single_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_single_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_single_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_f16_single_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_dual_kv/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_dual_kv/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_dual_kv/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_dual_kv/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_swap_ab/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_swap_ab/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_swap_ab/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_fp8_swap_ab/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_f16_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_f16_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_f16_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_f16_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_fp8_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_fp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_fp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_fp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_half_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_mxfp8_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_mxfp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_mxfp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d192_mxfp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_swap_ab/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_swap_ab/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_swap_ab/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_swap_ab/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_fp8_single_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_fp8_single_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_fp8_single_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_fp8_single_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_mxfp8_single_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_mxfp8_single_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_mxfp8_single_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_mxfp8_single_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_2x2/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_2x2/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_2x2/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_2x2/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_role_split/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_role_split/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_role_split/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_f16_role_split/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_fp8_role_split/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_fp8_role_split/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_fp8_role_split/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_fp8_role_split/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_retained_p/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_retained_p/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_retained_p/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_slice_recompute/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_slice_recompute/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d512_mxfp8_slice_recompute/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d64_f16_quadrant/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d64_f16_quadrant/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d64_f16_quadrant/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d64_f16_quadrant/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/fp8_flavor_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/half_flavor_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/small_fp8_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/small_half_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/split_combine.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/_sparse_item_common.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_f16_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_f16_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_f16_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_f16_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_fp8_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_fp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_fp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_fp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_fp8_swap_ab/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_fp8_swap_ab/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_mxfp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_mxfp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d128_mxfp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_f16_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_f16_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_f16_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_f16_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_fp8_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_fp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_fp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_fp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_mxfp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_mxfp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d192_mxfp8_multi_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_lookahead/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_lookahead/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_lookahead/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_lookahead/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_swap_ab/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_swap_ab/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_swap_ab/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_f16_swap_ab/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_fp8_single_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_fp8_single_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_fp8_single_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_fp8_single_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_mxfp8_single_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_mxfp8_single_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d256_mxfp8_single_q/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_2x2/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_2x2/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_2x2/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_2x2/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_role_split/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_role_split/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_role_split/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_f16_role_split/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_fp8_role_split/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_fp8_role_split/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_fp8_role_split/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_fp8_role_split/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_half_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_mxfp8_role_split/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_mxfp8_role_split/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/d512_mxfp8_role_split/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/fp8_flavor_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/half_flavor_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/mid_half_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/mxfp8_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/shared_d256_f16_lookahead/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/shared_d256_f16_lookahead/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/shared_f16_single_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/shared_f16_single_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/shared_half_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/small_f16_batch_pair/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/small_f16_batch_pair/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/small_f16_batch_pair/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/small_f16_batch_pair/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/small_fp8_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/small_half_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/sparse_d256_f16.py",
+      "python/cudnn/sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/_common.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/aot_host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d256_f16_all_compute/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d256_f16_all_compute/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d256_f16_all_compute/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_f16_paired/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_f16_paired/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_f16_paired/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_fp8_paired/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_fp8_paired/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_fp8_paired/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_mxfp8_paired/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_mxfp8_paired/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/d512_mxfp8_paired/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/decode_f16_key_group/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/decode_f16_key_group/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/decode_f16_key_group/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/f16_general/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/f16_general/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/f16_general/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/fp8_general/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/fp8_general/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/fp8_general/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/half_exact_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/mxfp8_general/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/mxfp8_general/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/mxfp8_general/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/prepared_host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/prepared_mxfp8_host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm120/quantized_general_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/gqa.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/half_flavor_contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/packed_init.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/paged_load.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/prepared_host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/ragged_origin.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/_common_hopper.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/prepared_host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/thd_origins.py",
+      "python/cudnn/sdpa/fwd/kernels/thd_helpers.py",
+      "python/cudnn/sdpa/fwd/kernels/thd_origins.py",
+      "python/cudnn/sdpa/fwd/kernels/varlen_metadata.py"
+    ],
+    "exempt_reason": "This concrete SDPA source is outside the implementation-specific byte replay associations in this initial registry. Fixed-plan replay must be qualified per owner, precision and GPU; general SDPA correctness/capture tests do not establish it."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/kernels/_mxfp8_sf.py"
+    ],
+    "exempt_reason": "This concrete SDPA source is outside the implementation-specific byte replay associations in this initial registry. Fixed-plan replay must be qualified per owner, precision and GPU; general SDPA correctness/capture tests do not establish it."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/utils.py"
+    ],
+    "exempt_reason": "This concrete SDPA source is outside the implementation-specific byte replay associations in this initial registry. Fixed-plan replay must be qualified per owner, precision and GPU; general SDPA correctness/capture tests do not establish it."
+  },
+  {
+    "sources": [
+      "python/cudnn/rmsnorm_rht_amax/api.py",
+      "python/cudnn/rmsnorm_rht_amax/kernel.py"
+    ],
+    "exempt_reason": "Standalone RMSNorm/RHT/Amax has no mapped byte replay suite; the grouped-GEMM RHT tests do not cover this kernel."
+  },
+  {
+    "sources": [
+      "python/cudnn/rope/api.py",
+      "python/cudnn/rope/frost/compressed_kv.py",
+      "python/cudnn/rope/frost/kernels.py",
+      "python/cudnn/rope/frost/tail.py",
+      "python/cudnn/rope/kernel.py",
+      "python/cudnn/rope/tail.py"
+    ],
+    "exempt_reason": "Standalone/fused RoPE kernels have no mapped byte replay suite; add forward/backward coverage for the served precision and architecture."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/sm90/d64_f16_one_wg/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/d64_f16_one_wg/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/d64_f16_one_wg/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/d64_f16_one_wg/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_fwd_sm90_implementation_determinism.py"
+    ],
+    "notes": "SM90 fixed D64 implementation 20539: unpadded nonpaged FP16/BF16 forward O/Stats, fixed scheduler replay/batch checks and golden. No backward or cross-plan identity claim."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/sm90/d128_f16_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/d128_f16_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/d128_f16_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/d128_f16_multi_q/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py",
+      "test/python/sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py"
+    ],
+    "notes": "SM90 exact dense D128, 128x128 tile; forward O/Stats byte replay, batch checks and refill stress. The owned-path test pins the implementation; runtime-golden verification gaps remain visible."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/sm90/f16_three_wg/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/f16_three_wg/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/f16_three_wg/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm90/f16_three_wg/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py",
+      "test/python/sdpa/frost/test_sdpa_fwd_split_sm90_determinism.py"
+    ],
+    "notes": "SM90 D512 forward with fixed split counts 3/17 and packed/unpacked GQA: byte replay, batch checks and refill stress. No identity claim across different plans."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/sm80/d256_kv_prefetch/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/d256_kv_prefetch/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/d256_kv_prefetch/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/f16_k_prefetch/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/f16_k_prefetch/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/f16_k_prefetch/kernel.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/wide_cooperative/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/wide_cooperative/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm80/wide_cooperative/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py",
+      "test/python/sdpa/frost/test_sdpa_fwd_small_tiles_sm80.py",
+      "test/python/sdpa/frost/test_sdpa_fwd_pack_gqa_sm80.py"
+    ],
+    "notes": "SM80 half forward split replay with fixed split/geometry; companion small-tile and GQA tests exercise the D64/D256 helper cases. No different-plan byte guarantee."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_mxfp8_multi_q/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_mxfp8_multi_q/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_mxfp8_multi_q/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d128_mxfp8_multi_q/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py"
+    ],
+    "notes": "Pinned SM100 D128 MXFP8 forward with causal_exclude_own_block=32, E4M3/E5M2 payloads and E8M0 scales; BF16 O/FP32 Stats replay at fixed split count. Other modes remain unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/api_dsl_mxfp8_sm100_d128.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/chain.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/common.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/dkdv.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/dq.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/geometry.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d128_mxfp8/prep.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py"
+    ],
+    "notes": "Opt-in SM100 D128 MXFP8 backward prep/dKdV/dQ chain; BF16 output/upstream gradient/gradients and optional FP32 amax. Deterministic mode and ordinary replay have distinct support limits."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/api_dsl_sm107_d512.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d512_f16_2x2/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d512_f16_2x2/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d512_f16_2x2/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d512_f16_2x2/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_bwd_sm107_d512_determinism.py"
+    ],
+    "notes": "Fixed SM107 implementation 20608 at causal S257, D384 GQA/D512 MHA, FP16/BF16. Bounded repeatability and batch isolation, not general batch invariance or an advertised deterministic-mode guarantee."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/api_dsl_sm90.py",
+      "python/cudnn/sdpa/bwd/kernels/sm90/bprop_f16.py",
+      "python/cudnn/sdpa/bwd/kernels/sm90/prepared_host.py",
+      "python/cudnn/sdpa/bwd/prepared_sm90.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_bwd_sm90.py"
+    ],
+    "notes": "Pinned Hopper D64/D128 ordered dQ relay: FP16/BF16 dQ/dK/dV byte replay, with supported bottom-right Sq<=Skv cases. THD/SWA are outside this suite."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/api_dsl_sm100_d256.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_f16_2x2/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_f16_2x2/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_f16_2x2/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_f16_2x2/host_sm100.py",
+      "python/cudnn/sdpa/bwd/kernels/sm100/d256_f16_2x2/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_f16_4x1/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_f16_4x1/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_f16_4x1/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_f16_4x1/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_bwd_d256_implementation_determinism.py",
+      "test/python/sdpa/frost/test_sdpa_bwd_half_deterministic_sm100.py"
+    ],
+    "notes": "Fixed D256 and D192/V128 half backward implementations on SM100/SM107. Replay/batch isolation is bounded to the explicit records, precisions and shapes in these suites; general batch invariance remains unverified."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_fp8/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_fp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_fp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_fp8/kernel.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_mxfp8/config.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_mxfp8/contract.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_mxfp8/host.py",
+      "python/cudnn/sdpa/bwd/kernels/sm107/d256_mxfp8/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_bwd_sm107_quant_implementations.py"
+    ],
+    "notes": "Fixed SM107 FP8/MXFP8 backward records with BF16 gradients: raw-byte record rebuild, rebind and changed-input CUDA-graph checks; no general batch-invariance qualification."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/api_dsl.py",
+      "python/cudnn/sdpa/fwd/config_sm80.py",
+      "python/cudnn/sdpa/fwd/engines.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py",
+      "test/python/sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py",
+      "test/python/sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py"
+    ],
+    "notes": "Shared forward dispatch/configuration affecting the named fixed-owner replay suites. These representative associations do not certify every SDPA backend or geometry."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/glu_hadamard_quant/jax_api.py"
+    ],
+    "exempt_reason": "These concrete JAX-only GLU/RHT adapter paths are not executed by the registered Torch replay suites. Add an API-specific byte replay association; shared kernel coverage alone does not qualify these adapters."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/VENDORED_DSA_DET.json"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cake/test_deterministic.py"
+    ],
+    "notes": "Vendored deterministic Cake DSA source pin; changing packaged code requires revisiting its BF16 forward/backward replay tests. Does not qualify other Cake providers."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/VENDORED_DSA_SPARSE.json",
+      "python/cudnn/_cake/VENDORED_GQA.json"
+    ],
+    "exempt_reason": "Packaged third-party kernel pins outside the deterministic DSA association have no precise raw-byte replay mapping yet. Vendor code remains excluded from scanning; these exact pin records preserve visible qualification debt when packaged implementations change."
+  },
+  {
+    "sources": [
+      "python/cudnn/block_sparse_attention/jax_api.py"
+    ],
+    "exempt_reason": "These block_sparse_attention compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/aligned_hca_backward/api.py"
+    ],
+    "exempt_reason": "These deepseek_sparse_attention compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/experimental/ops/__init__.py"
+    ],
+    "exempt_reason": "These experimental compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/flex_attention/api.py"
+    ],
+    "exempt_reason": "These flex_attention compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/gated_attention_block/api.py"
+    ],
+    "exempt_reason": "These gated_attention_block compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/grouped/swiglu/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/swiglu/jax_api.py",
+      "python/cudnn/gemm/cutedsl/grouped/unfused/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/wgrad/api.py",
+      "python/cudnn/gemm/mhc_projection_bwd/api.py",
+      "python/cudnn/gemm/ops/__init__.py",
+      "python/cudnn/gemm/ops/moe_grouped_matmul.py",
+      "python/cudnn/gemm/ops/swiglu_mlp.py",
+      "python/cudnn/gemm/ops/swiglu_moe.py"
+    ],
+    "exempt_reason": "These gemm compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/hstu/hstu_attention/api.py"
+    ],
+    "exempt_reason": "These hstu compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/cake/kernels/SHA256SUMS",
+      "python/cudnn/linear_attention/jax_api.py",
+      "python/cudnn/linear_attention/ops/__init__.py",
+      "python/cudnn/linear_attention/ops/mamba2.py"
+    ],
+    "exempt_reason": "This vendored linear-attention kernel checksum pin covers an alternate provider outside the FROST determinism suites; provider-specific byte qualification remains outstanding."
+  },
+  {
+    "sources": [
+      "python/cudnn/lm_head/jax_api.py"
+    ],
+    "exempt_reason": "These lm_head compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/mhc/jax_api.py"
+    ],
+    "exempt_reason": "These mhc compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/moe_ep/api.py"
+    ],
+    "exempt_reason": "These moe_ep compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/native_sparse_attention/sliding_window_attention/api.py"
+    ],
+    "exempt_reason": "These native_sparse_attention compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/norm/affine.py",
+      "python/cudnn/norm/bprop/api.py",
+      "python/cudnn/norm/fprop/api.py",
+      "python/cudnn/norm/jax_api.py"
+    ],
+    "exempt_reason": "These norm compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/ops/__init__.py",
+      "python/cudnn/ops/causal_conv1d.py",
+      "python/cudnn/ops/dsa/__init__.py",
+      "python/cudnn/ops/fft_causal_conv1d.py",
+      "python/cudnn/ops/mhc/__init__.py",
+      "python/cudnn/ops/norm/__init__.py",
+      "python/cudnn/ops/norm/_common.py",
+      "python/cudnn/ops/norm/layernorm.py",
+      "python/cudnn/ops/norm/rmsnorm.py",
+      "python/cudnn/ops/nsa/__init__.py",
+      "python/cudnn/ops/nvfp4.py"
+    ],
+    "exempt_reason": "Public standalone operation exports/wrappers outside the registered numerical replay suites require their own API-specific byte qualification. Pure re-export/cache plumbing may use the non-numerical PR override; no future path inherits this exemption."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/qat/api.py",
+      "python/cudnn/sdpa/cake/api.py"
+    ],
+    "exempt_reason": "These sdpa compilation/dispatch sources have no precise byte replay association yet; existing correctness tests alone do not establish deterministic numerics."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_lookahead/config.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_lookahead/contract.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_lookahead/host.py",
+      "python/cudnn/sdpa/fwd/kernels/sm100/d256_f16_lookahead/kernel.py"
+    ],
+    "tests": [
+      "test/python/sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py"
+    ],
+    "notes": "Pinned shared SM100 D256 lookahead body (including its SM107 record), nonpaged THD independent origins, CGA2 and fixed splits 2/5: FP16/BF16 O/Stats fresh-buffer replay, batch changes, independent FP64 reference and golden. The separate native SM107 body is not covered by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/sdpa/bwd/api_dsl_sm100_d192.py"
+    ],
+    "exempt_reason": "This compatibility adapter selects the SM100 D192 accumulation body. The D192-geometry deterministic suites select the separate D256 2x2 body, so they do not establish raw-byte replay coverage for this adapter."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_DENSE_GEMM.json",
+      "python/cudnn/gemm/cake/dense.py"
+    ],
+    "tests": [
+      "test/python/gemm/cake/test_dense.py"
+    ],
+    "notes": "Cake dense GEMM tested operations/dtypes: repeated native output and CUDA-graph bytes compare via uint8 views, with an independent numerical reference. Batch invariance is not established."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_MOE_GROUPED_GEMM.json",
+      "python/cudnn/gemm/cake/grouped.py"
+    ],
+    "tests": [
+      "test/python/gemm/cake/test_grouped.py"
+    ],
+    "notes": "Cake grouped GEMM tested operations/dtypes: repeatability and CUDA-graph output bytes compare via uint8 views, alongside a numerical reference. This is not general expert/batch-invariance qualification."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_GATED_ACT_MXFP8.json",
+      "python/cudnn/gemm/cake/gated_act_mxfp8.py"
+    ],
+    "tests": [
+      "test/python/gemm/test_cake_gated_act_mxfp8.py"
+    ],
+    "notes": "Cake gated activation MXFP8 output/scales compare through uint8 views over repeated and captured execution. Only the exercised contract is qualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_MOK.json",
+      "python/cudnn/moe_ep/cake.py"
+    ],
+    "tests": [
+      "test/python/moe_ep/cake/test_mok.py"
+    ],
+    "notes": "Single-rank Cake MoK training outputs/gradients compare by raw uint8 views over repeat/capture with BF16/MXFP8 and weight-gradient options. Multi-rank distributed repeatability remains unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_GDN.json",
+      "python/cudnn/linear_attention/cake/gdn_engine.py",
+      "python/cudnn/linear_attention/cake/gdn_plan.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/cake/test_gdn_cake_det.py"
+    ],
+    "notes": "Existing deterministic Cake GDN training replay compares output and gradients with torch.equal. This protects replay maintenance but does not yet distinguish signed-zero bit patterns or establish batch invariance."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_KDA.json",
+      "python/cudnn/linear_attention/cake/kda_det_engine.py",
+      "python/cudnn/linear_attention/cake/kda_det_plan.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/cake/test_kda_cake_det.py"
+    ],
+    "notes": "Existing deterministic Cake KDA training replay compares output and gradients with torch.equal. Raw-byte signed-zero coverage and general batch invariance remain gaps; this is distinct from the legacy kda_cake provider."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_GATED_RMSNORM.json",
+      "python/cudnn/norm/cake/gated_rmsnorm.py"
+    ],
+    "tests": [
+      "test/python/norm/test_cake_gated_rmsnorm.py"
+    ],
+    "notes": "Cake gated RMSNorm forward/backward repeat and capture checks compare output/input/gate/weight gradients with torch.equal. Signed-zero raw-byte coverage and general batch invariance are not established."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_ZERO_RMSNORM.json",
+      "python/cudnn/norm/cake/zero_centered_rmsnorm.py"
+    ],
+    "tests": [
+      "test/python/norm/test_cake_zero_centered_rmsnorm.py"
+    ],
+    "notes": "Cake zero-centered RMSNorm training repeat/capture checks compare output and gradients with torch.equal; signed-zero bit patterns and general batch invariance remain unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_CAUSAL_CONV1D.json",
+      "python/cudnn/causal_conv1d_cake/api.py",
+      "python/cudnn/causal_conv1d_cake/autograd.py",
+      "python/cudnn/causal_conv1d_cake/validate.cu"
+    ],
+    "tests": [
+      "test/python/fe_api/test_cake_causal_conv1d.py"
+    ],
+    "notes": "Cake causal-convolution training and capture compare output/gradients with torch.equal and independent reference checks. Raw-byte signed-zero and general batch-invariance coverage remain gaps."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/_vendor/VENDORED_LM_HEAD.json",
+      "python/cudnn/lm_head/cake.py"
+    ],
+    "tests": [
+      "test/python/fe_api/test_cake_lm_head.py"
+    ],
+    "notes": "Cake LM-head logprob/LSE/input and weight gradient repeat/capture checks use torch.equal alongside a reference. Signed-zero raw-byte coverage and general batch invariance remain unqualified."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/VENDORED_MHC.json",
+      "python/cudnn/mhc/api.py"
+    ],
+    "tests": [
+      "test/python/fe_api/test_mhc_cake.py"
+    ],
+    "notes": "Cake mHC connection/head reference and capture checks include repeated gradient torch.equal comparisons. This is bounded repeatability maintenance, not full raw-byte or general batch-invariance qualification."
+  },
+  {
+    "sources": [
+      "python/cudnn/_cake/VENDORED_DSA_INDEXER.json",
+      "python/cudnn/deepseek_sparse_attention/cake/api.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cake/test_indexer_topk.py"
+    ],
+    "notes": "Cake deterministic BF16 indexer Top-K checks exact selected indices and FP32 score bits via int32 views, including ties, native repeat and graph reuse. Other DSA providers are separate."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/cake/common.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/cake/test_gdn_cake_det.py",
+      "test/python/linear_attention/cake/test_kda_cake_det.py"
+    ],
+    "notes": "Shared deterministic Cake linear-attention host contract; existing output/gradient repeats use torch.equal and do not yet provide signed-zero raw-byte or general batch-invariance coverage."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/kernel/kda_chain_forward_f16.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_kda_forward_waves.py"
+    ],
+    "notes": "KDA forward-wave byte comparisons cover eager, poisoned capture replay, changed metadata, runtime heads and checkpoint autograd at the suite geometries."
+  },
+  {
+    "sources": [
+      "python/cudnn/linear_attention/frost/kernel/kda_chain_backward_f16.py"
+    ],
+    "tests": [
+      "test/python/linear_attention/frost/test_kda_checkpoint_waves.py"
+    ],
+    "notes": "KDA checkpoint/state-wave byte comparisons cover eager, poisoned replay, changed inputs, runtime heads and independent streams; only the suite geometries are qualified."
+  },
+  {
+    "sources": [
+      "aot/sm120/src/decode_q8_q4.cu",
+      "aot/sm120/src/decode_q8_q4.h",
+      "aot/sm120/src/sdpa_sm120.cpp"
+    ],
+    "tests": [
+      "aot/sm120/test/test_sdpa_sm120.cu"
+    ],
+    "notes": "AOT exported SDPA plan Q8/Q4 decode: capture plus three bit-identical replays, and separate concurrent-stream comparisons, through the real compiled execution path. Qualification is bounded to the native suite cases."
+  },
+  {
+    "sources": [
+      "include/cudnn_frontend/node/custom_reduction.h",
+      "python/pygraph/custom_reduction.cpp"
+    ],
+    "tests": [
+      "test/python/test_custom_reduction_determinism.py"
+    ],
+    "notes": "Real backend custom-reduction repeatability/batch-isolation for tested finite-value argmax/argmin index outputs and FLOAT ADD sum on qualified SM100 configurations; arbitrary reducer callbacks and backward are not covered."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/score_recompute/_interface_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/api.py",
+      "python/cudnn/deepseek_sparse_attention/score_recompute/sparse_score_recompute_sm90.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_sparse_score_recompute.py"
+    ],
+    "notes": "L1 prepared SM90 sparse score-recompute indexer/attention replay checks ten captured executions with poisoned outputs and raw uint8 equality against an independent reference. Dense/SM100 paths and default-L0 execution are not covered by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/indexer_backward/indexer_backward_sm90.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py"
+    ],
+    "notes": "SM90 deterministic H32/TopK512 and supported reproducibility cases replay all three gradients with restored mutable scores, poisoned workspaces and owned snapshots. Other head/geometries retain their documented limitations."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/indexer_top_k_decode_varlen.py",
+      "python/cudnn/deepseek_sparse_attention/indexer_top_k/indexer_top_k_varlen_util.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_top_k.py"
+    ],
+    "notes": "L0 SM120/121 deterministic Top-K specialization: FP32/FP16/BF16, K129/2048, three native executions with poisoned workspaces/outputs and raw-byte comparison of indices and values. Other architectures and ordinary float-equality repeat tests are not a byte guarantee."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py",
+      "python/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py"
+    ],
+    "tests": [
+      "test/python/deepseek_sparse_attention/cutedsl/test_DSA_sparse_attention_backward.py"
+    ],
+    "notes": "L0 SM90 deterministic H96/D576 relay widths 4/8/16/32/64: four fixed-input launches with poisoned gradients/workspace, owned snapshots, byte comparison and independent reference. Other routes are not qualified by this association."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/cutedsl/grouped/dsrelu/api.py",
+      "python/cudnn/gemm/cutedsl/grouped/dsrelu/moe_blockscaled_grouped_gemm_dsrelu_quant.py"
+    ],
+    "tests": [
+      "test/python/gemm/cutedsl/test_grouped_gemm_dsrelu.py"
+    ],
+    "notes": "The deterministic=True dprob reduction is compared across repeated fresh-output launches with raw-byte equality and independent reference checks. This does not establish all-output or batch-invariance qualification."
+  },
+  {
+    "sources": [
+      "python/cudnn/gemm/frost/kernel_templates/split_k_reduction_epilogue_fusion.py"
+    ],
+    "tests": [
+      "test/python/gemm/frost/test_matmul.py"
+    ],
+    "notes": "The real split-K deterministic test compares repeated outputs with torch.equal at its fixed geometry and split count. This enforces maintenance of the existing repeat test; signed-zero raw-byte coverage and general batch invariance remain gaps."
+  },
+  {
+    "sources": [
+      "python/cudnn/deepseek_sparse_attention/indexer_forward/_compressed_top_k_sm100.py"
+    ],
+    "exempt_reason": "Existing SM100 compressed-indexer repetition checks in test_DSA_indexer_forward_compressed.py compare sorted indices and logits with torch.equal. Sorting discards output ordering and floating-value equality does not preserve signed-zero evidence; no exact replay of the original kernel output bytes currently protects this adapter. Add an uncanonicalized byte replay before claiming this path is covered."
+  }
+]

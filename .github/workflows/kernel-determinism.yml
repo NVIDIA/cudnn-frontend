@@ -1,0 +1,45 @@
+name: Kernel determinism coverage
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - labeled
+      - unlabeled
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-determinism-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the coverage checker
+        run: python3 -m unittest discover -s tools -p test_kernel_determinism_coverage.py -v
+
+      - name: Validate the kernel registry
+        run: python3 tools/check_kernel_determinism_coverage.py --all
+
+      - name: Require determinism tests for changed kernels
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ALLOW_TEST_EXEMPTION: ${{ contains(github.event.pull_request.labels.*.name, 'determinism-exempt') }}
+        run: |
+          args=(--base "$BASE_SHA")
+          if [[ "$ALLOW_TEST_EXEMPTION" == "true" ]]; then
+            args+=(--allow-test-exemption)
+          fi
+          python3 tools/check_kernel_determinism_coverage.py "${args[@]}"
