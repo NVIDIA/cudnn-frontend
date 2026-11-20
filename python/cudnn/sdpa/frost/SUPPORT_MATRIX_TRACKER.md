@@ -37,7 +37,8 @@ policy threshold or selected-plan Stats-stride behavior note is added.
 **Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
 graph/config for admitted override-enabled half THD plans with packed HN Stats
 when the implementation opts in and the selected plan uses the matching prepared
-binder. The implementation declaration applies across its admitted devices.
+binder, including mixed FP8 K/V graphs admitted by a half Q/O template.
+The implementation declaration applies across its admitted devices.
 The native lifecycle suite on SM100/SM103, SM107 and SM120/SM121 covers changing packed
 head strides, fresh bindings, retained captures and both FP16/BF16. This includes
 eligible explicit small, mid and wide half owners and the admitted packed/split

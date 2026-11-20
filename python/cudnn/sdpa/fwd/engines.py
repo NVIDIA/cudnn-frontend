@@ -3122,7 +3122,9 @@ class EngineSpec:
         domain, not changing Stats packing, dtype, or storage capacity. Quantized,
         padded-Stats and ragged-Q dense-decode binders have separate contracts.
         """
-        if not (self.packed_hn_stats_override and facts.shape_overrides and facts.thd and facts.wants_stats and facts.uniform_dtype):
+        # Admitted mixed FP8 K/V graphs also use the half Q/O template and
+        # its FP32 Stats binding. K/V storage does not set the Stats stride.
+        if not (self.packed_hn_stats_override and facts.shape_overrides and facts.thd and facts.wants_stats):
             return False
         if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
             return False

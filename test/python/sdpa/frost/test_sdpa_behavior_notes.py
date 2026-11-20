@@ -124,6 +124,19 @@ def test_admitted_sm107_half_owners_declare_qualified_notes(name, dq, dv, tile, 
     assert _notes(name, f, knobs.to_public()) == (cudnn.behavior_note.RUNTIME_COMPILATION, NOTE)
 
 
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("kv_dtype", [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+def test_mixed_kv_half_template_keeps_its_stats_contract(cc, kv_dtype, monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    name = "sdpa_fwd_sm107_d128_multi_q" if cc == (10, 7) else "sdpa_fwd_sm100_d128_multi_q"
+    knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=2, split_kv=1, pack_gqa=False)
+    facts = _facts(device_cc=cc, dtype_o=cudnn.data_type.BFLOAT16, kv_dtype=kv_dtype, uniform_dtype=False, max_total_seq_len_q=32)
+    assert engines.mismatch(SPECS[name].capabilities, facts, knobs) is None
+    assert NOTE in _notes(name, facts, knobs)
+
+
 def test_new_swap_ab_does_not_inherit_lookahead_notes():
     f = _facts(d_qk=256, d_v=256)
     assert NOTE not in _notes("sdpa_fwd_sm100_d256_swap_ab", f)

@@ -16,7 +16,7 @@ pytestmark = pytest.mark.L0
 NOTE = cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
 
 
-def _graph(case, dtype, layout, *, overrides=True):
+def _graph(case, dtype, layout, *, overrides=True, kv_dtype=None):
     _, owner, dq, dv, m, n, cga, split, pack, warp, paged = case
     b, h, hk, qmax, kv, page = 2, 8, 2, 16, 128, 16
     g = cudnn.pygraph(
@@ -32,16 +32,16 @@ def _graph(case, dtype, layout, *, overrides=True):
         tensor(name, [b + 1, 1, 1, 1], [1, 1, 1, 1], cudnn.data_type.INT32)
     q = tensor("q", [b, h, qmax, dq], [qmax * h * dq, dq, h * dq, 1]).set_ragged_offset(refs["off_q"])
     if paged:
-        k = tensor("k", [b * kv // page, hk, page, dq], [hk * page * dq, page * dq, dq, 1])
-        v = tensor("v", [b * kv // page, hk, page, dv], [hk * page * dv, page * dv, dv, 1])
+        k = tensor("k", [b * kv // page, hk, page, dq], [hk * page * dq, page * dq, dq, 1], kv_dtype or dtype)
+        v = tensor("v", [b * kv // page, hk, page, dv], [hk * page * dv, page * dv, dv, 1], kv_dtype or dtype)
         table = tensor("table", [b, 1, kv // page, 1], [kv // page, kv // page, 1, 1], cudnn.data_type.INT32)
         seq = tensor("kv_lengths", [b, 1, 1, 1], [1, 1, 1, 1], cudnn.data_type.INT32)
         extra = dict(seq_len_kv=seq, paged_attention_k_table=table, paged_attention_v_table=table, paged_attention_max_seq_len_kv=kv)
     else:
         for name in ("cu_kv", "off_k", "off_v"):
             tensor(name, [b + 1, 1, 1, 1], [1, 1, 1, 1], cudnn.data_type.INT32)
-        k = tensor("k", [b, hk, kv, dq], [kv * hk * dq, dq, hk * dq, 1]).set_ragged_offset(refs["off_k"])
-        v = tensor("v", [b, hk, kv, dv], [kv * hk * dv, dv, hk * dv, 1]).set_ragged_offset(refs["off_v"])
+        k = tensor("k", [b, hk, kv, dq], [kv * hk * dq, dq, hk * dq, 1], kv_dtype or dtype).set_ragged_offset(refs["off_k"])
+        v = tensor("v", [b, hk, kv, dv], [kv * hk * dv, dv, hk * dv, 1], kv_dtype or dtype).set_ragged_offset(refs["off_v"])
         extra = dict(cu_seq_len_kv=refs["cu_kv"], max_total_seq_len_kv=b * kv)
     o, stats = g.sdpa(
         q=q,
@@ -70,12 +70,12 @@ def _graph(case, dtype, layout, *, overrides=True):
     return g, refs
 
 
-def _buffers(case, dtype, lengths, layout, generator):
+def _buffers(case, dtype, lengths, layout, generator, kv_dtype=None):
     dq, dv, paged = case[2], case[3], case[-1]
     total, h, hk, kv, page = sum(lengths), 8, 2, 128, 16
     q = torch.randn(total, h, dq, device="cuda", dtype=dtype, generator=generator)
-    k = torch.randn(2 * kv, hk, dq, device="cuda", dtype=dtype, generator=generator)
-    v = torch.randn(2 * kv, hk, dv, device="cuda", dtype=dtype, generator=generator)
+    k = torch.randn(2 * kv, hk, dq, device="cuda", dtype=dtype, generator=generator).to(kv_dtype or dtype)
+    v = torch.randn(2 * kv, hk, dv, device="cuda", dtype=dtype, generator=generator).to(kv_dtype or dtype)
     o_storage = torch.full((total * h * dv + 32,), -1234.0, device="cuda", dtype=dtype)
     stats_storage = torch.full((total * h + 32,), -12345.0, device="cuda")
     cp = torch.tensor([0, lengths[0], total], device="cuda", dtype=torch.int32)
@@ -127,11 +127,25 @@ def _check(case, bufs, references, storage, lengths, layout):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("layout", ["HN", "NH"])
 def test_note_owner_stride_rebind_and_retained_capture(case, dtype, layout, monkeypatch):
+    _check_stride_lifecycle(case, dtype, layout, monkeypatch)
+
+
+@pytest.mark.parametrize("arch", [100, 103, 107])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_mixed_kv_stride_rebind_and_retained_capture(arch, dtype, kv_dtype, monkeypatch):
+    owner = "sm107_d128_multi_q" if arch == 107 else "sm100_d128_multi_q"
+    case = (arch, owner, 128, 128, 128, 128, 2, 1, 0, 0, False)
+    _check_stride_lifecycle(case, dtype, "HN", monkeypatch, kv_dtype=kv_dtype)
+
+
+def _check_stride_lifecycle(case, dtype, layout, monkeypatch, kv_dtype=None):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (case[0] // 10, case[0] % 10):
         pytest.skip("requires this implementation's target architecture")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    graph, refs = _graph(case, dt, layout)
+    kv_dt = {torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3, torch.float8_e5m2: cudnn.data_type.FP8_E5M2}.get(kv_dtype)
+    graph, refs = _graph(case, dt, layout, kv_dtype=kv_dt)
     expected_notes = layout == "HN"
     assert (NOTE in graph.get_behavior_notes()) == expected_notes
     assert graph.get_behavior_notes() == graph.get_behavior_notes_for_plan_at_index(graph._plan_index)
@@ -142,7 +156,7 @@ def test_note_owner_stride_rebind_and_retained_capture(case, dtype, layout, monk
     retained = []
     try:
         for lengths in ([16, 9], [9, 13], [15, 16]):
-            bufs, reference, storage = _buffers(case, dtype, lengths, layout, generator)
+            bufs, reference, storage = _buffers(case, dtype, lengths, layout, generator, kv_dtype=kv_dtype)
             total, qmax = sum(lengths), max(lengths)
             kwargs = dict(
                 override_uids=[refs["stats"].get_uid()],
@@ -163,7 +177,7 @@ def test_note_owner_stride_rebind_and_retained_capture(case, dtype, layout, monk
             torch.cuda.synchronize()
             _check(case, bufs, reference, storage, lengths, layout)
             assert graph._compiled_plans[graph._plan_index]._prepared is prepared
-        other, _ = _graph(case, dt, layout, overrides=False)
+        other, _ = _graph(case, dt, layout, overrides=False, kv_dtype=kv_dt)
         assert NOTE not in other.get_behavior_notes()
         assert (NOTE in graph.get_behavior_notes()) == expected_notes
         for capture, bufs, reference, storage, lengths, _, _ in reversed(retained):

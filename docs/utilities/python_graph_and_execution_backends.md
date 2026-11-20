@@ -964,7 +964,8 @@ Each forward implementation declares whether it can bind a runtime head stride.
 The declaration applies on every device that admits the selected implementation.
 For the half-precision prepared THD binder, the graph must enable shape overrides
 and declare packed head-major FP32 Stats. The selected configuration must use
-that binder, and the installed extension must support the override. Both note
+that binder, and the installed extension must support the override. Half Q/O plans that
+admit FP8 K/V use the same FP32 Stats binder. Both note
 queries and graph-plan lowering use the same implementation declaration.
 
 For example, the SM120 general half, D256 all-compute and D512 paired
