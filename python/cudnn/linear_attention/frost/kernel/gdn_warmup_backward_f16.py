@@ -406,6 +406,7 @@ def warmup_backward_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     gate_blocks: cutlass.Int32 = 0,
     gate_bwd_dgate: Optional[cute.Tensor] = None,
     gate_bwd_gate: Optional[cute.Tensor] = None,
@@ -604,6 +605,7 @@ def warmup_backward_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     gate_sms = num_sms if cutlass.const_expr(item_limit_word is not None) else 0
     if cutlass.const_expr(tinv_pass):
@@ -1138,9 +1140,11 @@ def build_warmup_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
     """Compile (cached per static config) the warmup or uncut backward launch over the buffers of one plan.  The
-    placeholders repeat the marks of the standalone builds so every kernel compiles as it does there."""
+    placeholders repeat the marks of the standalone builds so every kernel compiles as it does there.  ``l2norm_eps`` (the
+    q/k normalize's additive epsilon) is a launch argument, absent from the key."""
     DK = q.shape[2]
     DV = v.shape[-1]
     if not safe_gate:
@@ -1645,6 +1649,7 @@ def build_warmup_backward(
             l2norm_k_slots,
             l2norm_k_expand_num,
             *l2norm_placeholders,
+            float(l2norm_eps),
             cutlass.Int32(int(gate_blocks)),
             *post_placeholders,
             *tail_constexprs,
@@ -1720,6 +1725,7 @@ def run_warmup_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the warmup or uncut backward: one crossing into the DSL.  The plan validated the contract at
     build, so nothing here raises."""
@@ -1788,6 +1794,7 @@ def run_warmup_backward(
         cuda.CUstream(int(stream)),
         item_limit_word,
         *lead_buffers,
+        float(l2norm_eps),
         int(gate_blocks),
         *post_buffers,
         *tail_scalars,
@@ -1886,6 +1893,7 @@ def warmup_summary_backward_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     tail_unit_chunks: cutlass.Constexpr[int] = 0,
     tail_chain_rows: cutlass.Constexpr[int] = 0,
     tail_transition_cfg: cutlass.Constexpr = None,
@@ -1938,6 +1946,7 @@ def warmup_summary_backward_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     gdn_tinv_f16.host(tinv_cfg, True, k, tinv_words, gate, a_log, dt_bias, beta, cu_seqlens, tinv, tinv_rows, tinv_row_count, stream)
     if cutlass.const_expr(split):
@@ -2193,8 +2202,10 @@ def build_warmup_summary_backward(
     tail_chain_rows=0,
     tail_scalars=(),
     tail_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
-    """Compile (cached per static config) the backward summary launch over the buffers of one plan."""
+    """Compile (cached per static config) the backward summary launch over the buffers of one plan; ``l2norm_eps`` (the
+    q/k normalize's additive epsilon) is a launch argument, absent from the key."""
     DK = q.shape[2]
     DV = do.shape[2]
     HO = gate.shape[1]
@@ -2440,6 +2451,7 @@ def build_warmup_summary_backward(
                 from_dlpack(buffer, assumed_align=16).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
                 for buffer in l2norm_buffers
             ),
+            float(l2norm_eps),
             *tail_constexprs,
             *tail_placeholders,
             cache_key=repr((__name__, "summary", key)),
@@ -2484,6 +2496,7 @@ def run_warmup_summary_backward(
     l2norm_buffers=(None,) * 4,
     tail_scalars=(),
     tail_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the backward summary launch: one crossing into the DSL."""
     cpp_launcher.launch(
@@ -2532,6 +2545,7 @@ def run_warmup_summary_backward(
         cuda.CUstream(int(stream)),
         item_limit_word,
         *l2norm_buffers,
+        float(l2norm_eps),
         *tail_scalars,
         *tail_buffers,
     )

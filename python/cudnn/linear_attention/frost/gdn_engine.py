@@ -17,7 +17,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
-from ..graph_analyzer import analyze
+from ..graph_analyzer import analyze, qk_l2norm_eps
 from .common.context import backward_context, forward_apply_context, forward_context
 from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
@@ -166,6 +166,7 @@ class CompiledGdn:
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.expand_num = self.num_householder
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -564,7 +565,13 @@ class CompiledGdn:
             context_views = context.carve(self.context.carve) if self.has_context else ()
             merged = (*views, *carved, *context_views, None)
             cpp_launcher.launch(
-                self.chain_launch, *self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *self.chain_lead(merged)
+                self.chain_launch,
+                *self.chain_scalars,
+                *self.chain_buffers(merged),
+                self.stream_type(int(stream or 0)),
+                None,
+                *self.chain_lead(merged),
+                self.qk_l2norm_eps,
             )
             return
         k = views[self.index_k]
@@ -636,6 +643,7 @@ class CompiledGdn:
                 else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
             ),
             lead_buffers=lead_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
             ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
             ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
             ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
@@ -715,6 +723,7 @@ class CompiledGdn:
             final_indices=state_indices,
             checkpoints=state_checkpoints,
             lead_buffers=lead_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_forward(
@@ -787,6 +796,7 @@ class CompiledGdnBwd:
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.log_gate = (node.params.get("gate_domain") or "log") == "log"
         self.wants_d_a_log = "d_a_log" in node.outputs
@@ -1439,6 +1449,7 @@ class CompiledGdnBwd:
                 ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
                 ragged_buffers=self.ragged_buffers((*views, *region.values(), *context_region.values(), None)) if self.ragged_pieces else (),
                 lead_buffers=lead_buffers,
+                l2norm_eps=self.qk_l2norm_eps,
                 gate_blocks=self.gate_bwd_blocks,
                 post_buffers=post_buffers,
             )
@@ -1591,6 +1602,7 @@ class CompiledGdnBwd:
             inv_q=inv_q,
             inv_k=inv_k,
             lead_buffers=lead_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
             gate_blocks=self.gate_bwd_blocks,
             post_buffers=post_buffers,
             m_count=region.get("m_count"),
@@ -1702,6 +1714,7 @@ class CompiledGdnSummary:
         self.device = current_device()
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.log_gate = (node.params.get("gate_domain") or "log") == "log"
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
@@ -1954,6 +1967,7 @@ class CompiledGdnSummary:
             tinv_row_count=region["tinv_row_count"],
             item_limit_word=region.get("gate"),
             l2norm_k=l2norm_k,
+            l2norm_eps=self.qk_l2norm_eps,
             tail_scalars=self.tail_scalars if tail is not None else (),
             tail_buffers=self.tail_buffers((*views, *region.values(), None)) if tail is not None else (),
         )
@@ -2009,6 +2023,7 @@ class CompiledGdnSummary:
             final_state=final_state,
             transition=transition,
             l2norm_k=l2norm_k,
+            l2norm_eps=self.qk_l2norm_eps,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_summary(
@@ -2066,6 +2081,7 @@ class CompiledGdnSummaryBwd:
         self.device = current_device()
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -2357,6 +2373,7 @@ class CompiledGdnSummaryBwd:
             transition_words=region.get("recompute_tensormaps"),
             item_limit_word=region.get("gate"),
             l2norm_buffers=l2norm_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
             tail_scalars=self.tail_scalars if tail is not None else (),
             tail_buffers=self.tail_buffers((*views, *region.values(), None)) if tail is not None else (),
         )
@@ -2417,6 +2434,7 @@ class CompiledGdnSummaryBwd:
             dstate0=dstate0,
             transition=transition,
             l2norm_buffers=l2norm_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_summary_backward(

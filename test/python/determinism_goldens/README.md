@@ -3355,7 +3355,7 @@ saved baseline. The new head-layout, GDP step-count, isolated-loss, and QSA
 mask-replay cases also check an independent reference. A reference pass alone
 does not establish bitwise determinism.
 
-### Linear attention: 28 cases per family, plus four GDP cases
+### Linear attention: 28 cases per family, plus eight GDP cases
 
 The shared implementation is `linear_attention/determinism.py`. Each FROST
 wrapper pins one operation. Except where listed, inputs use BF16, two Q/K/V
@@ -3373,6 +3373,7 @@ heads, K=V=64, and a nonzero FP32 initial state.
 | `test_neighbor_isolation` | L0 | fprop/bprop; fixed 17-token target, changed 65- and 3-token neighbors | 2 |
 | `test_gradient_source` | L0 | bprop with output loss only or final-state loss only | 2 |
 | GDP `test_householder_steps` | L0 | fprop/bprop × 1/2 steps; the other GDP tests use 3 steps | +4 for GDP |
+| GDP `test_qk_l2norm` | L0 | fprop/bprop × the fused q/k normalization at the default epsilon and at `qk_l2norm_eps=1e-10`; lengths 65, 17, 3; rows scaled around both epsilons; reference, four executions, partitions | +4 for GDP |
 
 The three head layouts are `(Q/K heads, V heads, K dimension, V dimension)`:
 `(1, 4, 64, 128)`, `(4, 1, 128, 64)`, and `(2, 2, 128, 128)`.
