@@ -1503,6 +1503,10 @@ def gated_delta_net(
     and ``final_state`` and the state gradients (``d_final_state``,
     ``d_initial_state``) follow it.
 
+    FROST BF16 paths form the state-update residual ``V - K_decay @ S`` in
+    FP32 and round it once; the backward's residual regeneration follows the
+    same rule.  FP16 keeps its packed residual arithmetic.
+
     Args:
         g: scalar decay per token: log-space by default (``alpha = exp(g) in
             (0, 1]``), the linear decay ``alpha`` itself when

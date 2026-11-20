@@ -110,6 +110,7 @@ from ..common.thd import (
 )
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 from ..common.tail import gate_body
+from ..common.residual import residual_operand
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
     blockwise_diagonal_16x16_to_32x32,
@@ -137,7 +138,6 @@ from cudnn.frost.tile_dsl.pointwise import (
     opaque_f32_zero,
     sigmoid,
     softplus2,
-    sub_f16x2,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor, swizzle_xor_128b
 from cudnn.frost.tile_dsl.tma import (
@@ -2264,8 +2264,7 @@ def compute1_warp_group(
                             )
                             for j in cutlass.range_constexpr(16):
                                 s0, s1 = fmul2(k_state_vec[2 * j], k_state_vec[2 * j + 1], cumprod_vals[2 * j], cumprod_vals[2 * j + 1])
-                                k_state_word = fp32_to_fp16(s0, s1, dtype=cfg.io_dtype)
-                                v_frag[half][j] = sub_f16x2(v_frag[half][j], k_state_word, cfg.io_dtype)
+                                v_frag[half][j] = residual_operand(v_frag[half][j], s0, s1, dtype=cfg.io_dtype)
                     for half in cutlass.range_constexpr(dv_halves):
                         nvvm.tcgen05_st(
                             "16x128b",

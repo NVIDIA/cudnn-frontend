@@ -130,6 +130,7 @@ from ..common.thd import (
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
 from ..common.tail import gate_body
 from ..common.host import get_dtype, family_slots
+from ..common.residual import residual_operand
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
     blockwise_diagonal_16x16_to_32x32,
@@ -147,7 +148,7 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fmul2, fp32_to_fp16, opaque_f32_zero, sigmoid, softplus2, sub_f16x2
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fmul2, fp32_to_fp16, opaque_f32_zero, sigmoid, softplus2
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
@@ -2378,7 +2379,7 @@ def compute1_warp_group(
                         g0, g1 = fmul2(k_state_vec[2 * j], k_state_vec[2 * j + 1], cumprod_vals[2 * j], cumprod_vals[2 * j + 1])
                         g_k_state_word = fp32_to_fp16(g0, g1, dtype=cfg.io_dtype)
                         g_k_state_pack.append(g_k_state_word)
-                        y_pack.append(sub_f16x2(v_frag[half][j], g_k_state_word, cfg.io_dtype))
+                        y_pack.append(residual_operand(v_frag[half][j], g0, g1, dtype=cfg.io_dtype))
                     nvvm.tcgen05_st(
                         "16x128b",
                         nvvm.make_tmem_ptr(((tmem_row + half * 16) << 16) + tmem_y_col, cutlass.Int32),
