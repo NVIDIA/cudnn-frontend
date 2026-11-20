@@ -742,7 +742,9 @@ def _tmaldg_warp_group(
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
         # Setup records whether the load ports hold one map each (every live
         # origin equals its compact prefix) or a map per sequence.
-        origins_word = thd_origins_compact_word(thd_origins, n_batch)
+        # Split setup always emits sequence-local maps. Fold that mode into the
+        # compiled loader instead of reloading a known zero on every CTA.
+        origins_word = cutlass.Int64(0) if cutlass.const_expr(SPLIT_KV > 1) else thd_origins_compact_word(thd_origins, n_batch)
         origins_single_map = origins_word != cutlass.Int64(0)
         origins_per_sequence = origins_word == cutlass.Int64(0)
         if origins_single_map:

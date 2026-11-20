@@ -8843,3 +8843,12 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+### D256 nonpaged THD split load maps on SM100
+
+The split loader uses sequence-local Q/K/V maps on every invocation. On DRIVE P2021
+(SM100), cuDNN 9.24.0.43, Torch 2.11.0+cu130 and CuTe DSL 4.8, the loader with
+a compile-time map mode passed the eight existing split 2/5 FP16/BF16 O/Stats
+golden comparisons against archived parent records for the same runtime, plus
+three extension checks. Run `sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py`
+with `CUDNN_DETERMINISM_GOLDENS` pointing to the matching records.
