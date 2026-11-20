@@ -150,7 +150,7 @@ def test_the_drafters_plan_its_table_and_its_keys():
     new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
     classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
     assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
-    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 22 and set(providers.KEYS) == set(providers.factories())
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 25 and set(providers.KEYS) == set(providers.factories())
     used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
     assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
     assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
@@ -1209,18 +1209,20 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     table = session.plan_table()
     assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
     numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
-    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 49, 321)
-    stored = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
-    alone = ("projection.fp8.in", "mlp.gate_up")
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 130, 321)
+    # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
+    stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     assert session.stored_weights() == stored and session.uncopied_weights() == alone
     # the same forms as a decode session and a verify session on one load: the linear-attention out-projections in both forms
     decode, verify = new(), new(tokens=6)
     verify._share = decode
     two = decode.plan_table([verify])
     assert set(decode.stored_weights()) == set(stored) and set(decode.uncopied_weights()) == set(alone)
-    assert (
-        new(tokens=6).uncopied_weights() == stored
-    ), "a verify plan alone keeps no copy of that weight; with a prompt in front of it the decode plan reads one"
+    assert new(tokens=6).uncopied_weights() == stored, "a verify plan alone keeps the same forms: every multiplied weight on its stored codes, no copy"
+    entries = Session(model, text, **{**common, "stack": "fe-entries"}, draft_tokens=5)  # the cuDNN Frontend rows alone: the two plans differ there
+    entries.resolve()
+    assert entries.stored_weights() == ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
+    assert entries.uncopied_weights() == ("projection.fp8.in", "mlp.gate_up"), "the decode plan of its prompt reads a copy of the out-projections"
     # the tables: the verify steps' rows, one line, the prompt's rows, then ONE memory sentence
     head, line, rest = table.partition(f"\n{loop.PROMPT_ROWS}\n")
     assert line and head == session.plan.table() and rest.startswith(session.prefill_plan.table() + "\n  this stack needs about ")
@@ -1421,20 +1423,21 @@ def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkey
         return round(float(sentence.split("needs about ", 1)[1].split(" GiB", 1)[0]))
 
     figures = {(stack, cc): asked(stack, cc) for stack in ("fe-cublas", "native", "fe-entries") for cc in ((10, 0), (10, 3), (10, 7), (12, 0))}
-    assert [figures[("fe-cublas", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] == [61, 61, 61, 64]
-    assert [figures[("native", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] == [44, 48, 48, 64]
-    assert all(figures[("fe-entries", cc)] == figures[("native", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0)))
+    cublas, entries, native = ([figures[(stack, cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] for stack in ("fe-cublas", "fe-entries", "native"))
+    # native keeps the weights of its three library rows on their stored codes on compute capability 10.x; elsewhere it plans as fe-entries
+    assert (cublas, entries, native) == ([61, 61, 61, 64], [44, 48, 48, 64], [32, 37, 37, 64])
     said = (
-        f"about {figures[('fe-cublas', (10, 0))]} GiB of free GPU memory on the stack fe-cublas (about {figures[('fe-cublas', (12, 0))]} GiB on compute "
-        f"capability 12.x), and on the stacks native and fe-entries for about {figures[('native', (10, 0))]} GiB on compute capability 10.0, about "
-        f"{figures[('native', (10, 3))]} GiB on the other 10.x classes, about {figures[('native', (12, 0))]} GiB elsewhere"
+        f"about {cublas[0]} GiB of free GPU memory on the stack fe-cublas (about {cublas[3]} GiB on compute capability 12.x), on the stack fe-entries for "
+        f"about {entries[0]} GiB on compute capability 10.0, about {entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere, and on "
+        f"the stack native, whose three library rows need FlashInfer (00_decode.py --help has the command), for about {native[0]} GiB and about "
+        f"{native[1]} GiB there"
     )
     assert said in " ".join(sample.EPILOG.split()) and "a list of 65,536 ids and the default context length" in " ".join(sample.EPILOG.split())
     # ... and the family README's section on the script states these figures, not others
     readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split("\n## Speculative decoding\n", 1)[1].split("\n## ", 1)[0].split())
     assert (
-        f"with a list of 65,536 ids and the default context length a run asks for about {figures[('fe-cublas', (10, 0))]} GiB free on the stack "
-        f"`fe-cublas` (about {figures[('fe-cublas', (12, 0))]} GiB on compute capability 12.x); on the stacks `native` and `fe-entries` for about "
-        f"{figures[('native', (10, 0))]} GiB on compute capability 10.0, about {figures[('native', (10, 3))]} GiB on the other 10.x classes, about "
-        f"{figures[('native', (12, 0))]} GiB elsewhere."
+        f"with a list of 65,536 ids and the default context length a run asks for about {cublas[0]} GiB free on the stack `fe-cublas` (about "
+        f"{cublas[3]} GiB on compute capability 12.x); on the stack `fe-entries` for about {entries[0]} GiB on compute capability 10.0, about "
+        f"{entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere; on the stack `native`, whose three library rows need "
+        f'FlashInfer (the section "The rows a library serves"), for about {native[0]} GiB and about {native[1]} GiB there.'
     ) in readme

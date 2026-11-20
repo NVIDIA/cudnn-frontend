@@ -35,3 +35,14 @@ updates:
     labels:
       - cat-routine-update
       - area:packaging
+    # The exact pins of samples/models/constraints-native.txt: the versions the kernel census of a model sample was
+    # recorded with. A pin changes only together with a recorded run, never with an update of the pin alone.
+    ignore:
+      - dependency-name: torch
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: nvidia-cutlass-dsl
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: flashinfer-python
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: apache-tvm-ffi
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]

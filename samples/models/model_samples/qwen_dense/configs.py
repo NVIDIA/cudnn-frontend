@@ -20,10 +20,12 @@ The stacks:
   a bf16 copy, the rest in PyTorch;
 * ``native`` -- the target kernel set of this model's decode step (``kernel_census.json`` beside this file): per block the
   kernel the target launches, in the target's form.  A block whose kernel is not served here yet stays on its fallback row,
-  and a run prints it as ``not yet``; how a row stands to the target is decided against the census file, not written here;
+  and a run prints it as ``not yet``; how a row stands to the target is decided against the census file, not written here.
+  Where the target's kernel is a library's, the row calls that library (``LIBRARY_ROWS``: FlashInfer's multiplies on the
+  stored weights), so on the classes of those rows the stack needs the library's package;
 * ``fe-entries`` -- every cuDNN Frontend row of ``native``, with every block a library or a temporary kernel serves there
   on its fallback row: no package beyond cuDNN Frontend and PyTorch, so the rows of the entries stay verified wherever the
-  area's GPU test runs.  Until ``native`` has such a row the two stacks are the same rows;
+  area's GPU test runs;
 * ``reference`` -- every block in plain PyTorch.
 
 A plan is resolved for a number of tokens per sequence.  One is the decode step.  More is the verify step of speculative
@@ -122,6 +124,38 @@ GATE_UP_TILES = ((1, 8, 8), (9, 16, 16), (17, 32, 32), (33, 64, 64))
 #: count).  The target runs it up to 16 sequences, and up to 4 from six tokens per sequence; eight tokens is what every
 #: form of the entry holds on the classes it serves.  A step shape beyond these has no row: the plan declines it by name
 VERIFY_STEPS = tuple((tokens, 16 if tokens < 6 else 4) for tokens in range(2, 9))
+
+
+#: the blocks of ``native`` a library serves: block -> (provider key, what the row serves, the layer widths the operand
+#: layout of the call was run with -- the published model's; another width keeps the block on its fallback row).  The target
+#: launches these library kernels on every 10.x class, at every row count.  Nothing here is gated on batch invariance: the
+#: library states none for these calls, and the kernel of the 4-bit multiply follows the row count
+LIBRARY_ROWS = {
+    "mlp.down": ("flashinfer.mm_fp4", "any row count, hidden 5120, intermediate 17408", (("hidden", 5120), ("mlp", 17408))),
+    "output_head": ("torch_ref.quantize+flashinfer.mm_fp4", "any row count, hidden 5120", (("hidden", 5120),)),
+    "projection.fp8.out": (
+        "flashinfer.bmm_fp8",
+        "any row count, weight 5120 x 6144",
+        (("hidden", 5120), ("la_value_heads", 48), ("la_head_dim", 128), ("attn_heads", 24), ("attn_head_dim", 256)),
+    ),
+}
+#: the form of a row of the library's 4-bit multiply: its CuTe DSL backend, called outside any tuning context -- the
+#: kernel class and the launch shape are then the library's untuned pick for the call, which the census records -- and
+#: of its 8-bit multiply: the backend the library chooses itself (its tuner's pick where one has run: never a row)
+MM_FP4_FORM = (("BACKEND", "cute-dsl"), ("TUNED", False))
+BMM_FP8_FORM = (("BACKEND", "auto"),)
+
+
+def _library_row(block: str, form) -> ProviderRow:
+    """The row of ``native`` that serves ``block`` with a library call on the stored weight (:data:`LIBRARY_ROWS`).  Its launch
+    order: the library launches its own kernels as dependents of the launch before them (the adapters pass nothing that changes
+    it), so behind a launch that releases early -- the fused step or the gate in front of the out-projection, the gate / up
+    kernel in front of the down multiply -- the kernel starts early and must wait before it reads that launch's codes.  The
+    kernels of the validated version wait in front of their first load.  A launch behind one that carries the attribute must
+    wait before it reads the product (the norm: its row).  In front of the head stand PyTorch's launches: no early release."""
+    key, serves, widths = LIBRARY_ROWS[block]
+    # no test of this repository's own lanes runs a row that needs the library's package: printed as unverified in CI
+    return ProviderRow(("cc10.x",), (1, None), (1, None), key, "native", serves=serves, band="bf16_rounding", ci=False, form=form, widths=widths)
 
 
 def _verify_out_rows(stack):
@@ -310,6 +344,10 @@ PROVIDERS = {
         # row's.  A step of one token per sequence, a step of more rows than the ranges hold, another class and another
         # width are the multiply over a copy below, at both call sites
         *_verify_out_rows(TARGET_STACKS),
+        # the library's 8-bit multiply on the stored codes, where the target runs it: both call sites of a step of one token
+        # per sequence, and in a step of several the attention layers' site and every call beyond the rows above.
+        # Launch order: a dependent of the fused step or of the gate, which release early; it waits before its first load
+        _library_row("projection.fp8.out", BMM_FP8_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 8-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
@@ -331,7 +369,7 @@ PROVIDERS = {
                 # scalars; only weight tiles are read ahead of the wait.  The launch before it must not write the weight or
                 # its block scales: both are constants of the layer.  It signals the launch after it before its last output
                 # tile is written: a launch behind it that carries the attribute must wait before it reads the codes; the
-                # multiply over a copy behind it in this stack carries none and starts when this kernel has completed
+                # multiply behind it carries it where it is the library's (``native``: its row), a multiply over a copy none
                 form=(("TOKEN_TILE", tile), ("PREWAIT_STAGES", 2), ("L2_EVICT_FIRST", True), ("MAX_CLUSTERS", 148), ("PDL", True)),
                 rows=(first, last),
                 # the widths the entry serves (its page: hidden 5120, intermediate 17408, the published model's).  A checkpoint of
@@ -352,6 +390,10 @@ PROVIDERS = {
         ProviderRow(*ANY, "torch_ref.linear+torch_ref.silu_mul_quantize", "reference", serves="any", fallback="reference"),
     ],
     "mlp.down": [
+        # the library's 4-bit multiply on the stored codes.  The operand is the fused gate / up kernel's output, in the layout
+        # this kernel reads: nothing is launched between the two.  Launch order: a dependent of that kernel, which releases
+        # early; it waits before its first load
+        _library_row("mlp.down", MM_FP4_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
@@ -368,13 +410,17 @@ PROVIDERS = {
             band="gate_fp8",
             batch_invariant=("cc10.0",),
             # the target's form: 256 threads per thread block, an ordinary launch that releases its successor at entry.  The
-            # launch after it in this stack carries no dependent-launch attribute, so the release changes nothing here
+            # launch after it carries the attribute where it is the library's out-projection (``native``: its row), else none
             form=(("THREADS", 256), ("PDL_RELEASE", True)),
             rows=(1, 160),
         ),
         ProviderRow(*ANY, "torch_ref.gate_quantize", EVERY, serves="any", fallback="reference chain"),
     ],
     "output_head": [
+        # the same multiply.  Its operand is the final norm's bf16 rows: the target quantises them with a launch of its own,
+        # which no row serves yet (the census's ``output_head.quantize``), so this block quantises them when it reads them.
+        # Launch order: behind PyTorch's launches of that quantiser, none of which releases early
+        _library_row("output_head", MM_FP4_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
