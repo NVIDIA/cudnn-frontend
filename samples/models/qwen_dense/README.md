@@ -449,6 +449,51 @@ the entry's own contract against a twin at the kernel's rounding points ("The ch
 are not the chain's: on the seeded model the ids hash is the default stack's, and a greedy run on a checkpoint follows
 its first other token.
 
+What ran with this row (2026-11-20; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `fe-entries` in
+PyTorch 2.13.0, `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1). The default run of both scripts on the four
+stacks, beside the same runs of the tree before the row. On `fe-cublas` and `reference` every line was the line it had
+been but the environment line, whose source hash now covers the entry's files. On `fe-entries` and `native` every ids
+hash was the one it had been (`1509c0dd53ac`, and `11bfb9f9bcf5` for the speculative script), the logits were 1.00 bf16
+unit from the reference's, inside the band of 4, and the kernel check passed, with 18 of 20 launches of a step target
+kernels on `native` (7 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results) and 13 of
+20 on `fe-entries` (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results), and of a
+verify step 18 of 20 (6 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results) and 14 of
+20 (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results). A traced step of the
+two-layer model was 130 kernel launches on `fe-entries`, where it had been 179, and 69 on `native`, where it had been
+118. The entry's line on `fe-entries` read 408,576 query and key elements at one sequence, none of them another byte
+than the twin's, and 1,634,304 at four, 7 of them another byte and none outside its band. Verify sessions of 1 x 6, 16 x
+2 and 4 x 8 rows, 80 plain steps at two sequences across the first page boundary, and seeded runs at 85 and at 1,024
+sequences passed too: at 1,024 sequences one launch prepared the 1,024 rows of a step, 1,023 of 418,381,824 elements
+were another byte than the twin's, none was outside its band, and one sequence alone wrote the bytes it wrote among the
+1,024.
+
+On the published checkpoint the performance mode passed on both stacks, its blocks judged at positions 0-15, 63, 64, 312
+and 313 -- the two on either side of the first page boundary, on the pool -- and the kernel check of its traced steps
+with 467 of 484 launches of a step target kernels on `native` (178 the target's own compiled kernels + 289 cuDNN
+Frontend entries with byte-equal results; 403 of them in the recorded launch shape, 64 by membership) and 338 of 484 on
+`fe-entries` (49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results). The greedy
+text is not the text of the run before the row. On either stack the plain run of the default prompt takes another token
+at its 12th new token, where the two highest logits are the same two tokens in the other order: on `fe-entries` they
+were 2.0 apart before the row and are 0.25 apart with it, while the two row sets differ by 1.6 on average over the
+twenty highest logits of that step and by 3.6 at most; on `native` 0.375 and 0.125, against 0.9 and 1.8. The reference
+blocks, fed the same tokens, have them 0.625 apart. The speculative recipe of the section "Speculative decoding" ended
+in `[02] PASS` at the end token, twice with the same figures on each stack: on `native` 230 new tokens in 70 steps (3.30
+kept tokens a step; 12, 18, 12, 4, 13 and 11 steps kept one to six tokens), on `fe-entries` 254 in 76 (3.36; 16, 15, 13,
+7, 8 and 17), where the runs before the row wrote 231 in 71 and 204 in 63. Its kernel check passed over 16 traced steps,
+with 467 of 484 launches of the verify step target kernels on `native` (130 the target's own compiled kernels + 337
+cuDNN Frontend entries with byte-equal results; 451 of them in the launch shape the census records, 16 by membership)
+and 386 of 484 on `fe-entries` (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal
+results).
+
+Six runs with one thing wrong each, every one in a fresh interpreter (`fe-entries`, one sequence). A row that names one
+position row passed its checks and read `not the target` in the kernel table, with 12 of 20 launches of a step target
+kernels (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results). A row that names
+pages of 16 positions ended in `[00] ERROR`: the entry declined the pool at its first use. A slot table one row late, a
+position table one row late and a twin with its rotary halves exchanged each ended in `[00] FAIL` on the entry's line.
+An accessor that exchanges two pages in what the attention core reads ended in `[00] PASS`: no check of a run compares
+what that chain reads with anything, and the layer moves the seeded logits by less than the band. The GPU test reads the
+pool by index arithmetic of its own and fails on such an accessor.
+
 What a consumer needs beyond a kernel's bytes is launched by the consumer, never inside the producer's call. The MLP's
 down multiply reads the codes of the gate / up kernel with their block scales in the layout the kernel writes
 (128 x 4): the library's multiply reads that layout and is handed them as they are (on its fallback row, in

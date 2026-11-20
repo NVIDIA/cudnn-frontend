@@ -9551,6 +9551,17 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
         ), where
     # 467 = the 451 of the stack before this row and the 16 launches of the entry; the same 16 on the stack of the entries alone
     assert (178 + 289, 49 + 289, 130 + 337, 49 + 337) == (467, 338, 467, 386) and 467 - 451 == 338 - 322 == 16
+    # the family README's record of the runs with this row states the counts of these plans, each with its split
+    said = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split())
+    for count in (
+        f"467 of 484 launches of a step target kernels on `native` ({split.format(178, 289)}; 403 of them in the recorded launch shape, 64 by membership)",
+        f"338 of 484 on `fe-entries` ({split.format(49, 289)})",
+        f"467 of 484 launches of the verify step target kernels on `native` ({split.format(130, 337)}; 451 of them in the launch shape the census records, 16",
+        f"386 of 484 on `fe-entries` ({split.format(49, 337)})",
+        f"18 of 20 launches of a step target kernels on `native` ({split.format(7, 11)}) and 13 of 20 on `fe-entries` ({split.format(2, 11)})",
+        f"of a verify step 18 of 20 ({split.format(6, 12)}) and 14 of 20 ({split.format(2, 12)})",
+    ):
+        assert count in said, count
     # a row that names one position row: the same entry in another form -- not the target's, by its form, and nothing recorded is held against it
     table = dict(configs.PROVIDERS)
     from dataclasses import replace
