@@ -63,7 +63,12 @@ The paged-cache cell runs no script: no provider row asks for the paged attentio
 (``state.PagedKvCache``), so no run builds one.  A small program in a fresh interpreter runs the two reference chains of an
 attention layer on a plain cache and on a paged one at the published widths, across the first page boundary, and holds
 the bytes of the two against each other, the pool against index arithmetic of its own, the state's cos / sin table against
-the chain's function on the device, and the kernels the chains launch on the pool to their families."""
+the chain's function on the device, and the kernels the chains launch on the pool to their families.
+
+Every line of a run is read from standard error, which is not the sample's alone: a library may print there first, and
+behind the run's last line.  A cell that reads the header of a run finds it by the script's tag (``_header``), and
+one that reads the line in front of the verdict counts from the verdict (``_in_front_of_the_verdict``); host cases
+hold both, and the cells of the speculative script read every run between two lines that are not the sample's."""
 
 import importlib.util
 import os
@@ -568,6 +573,63 @@ def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_token
     assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"
 
 
+def _header(lines, tag):
+    """The header of a run among the lines of its standard error: the first line that begins with the script's tag.  Standard
+    error is not the sample's alone -- a library may print a warning there before the sample's first line -- so the header
+    is found, never taken to be line 0."""
+    tagged = [line for line in lines if line.startswith(tag)]
+    assert tagged, f"no line of the run begins with {tag}: the run printed no header"
+    return tagged[0]
+
+
+def _in_front_of_the_verdict(lines, tag):
+    """The line of a run that stands directly in front of its verdict, the last line that begins with the script's tag.  As
+    for the header, the place is counted from a line of the run and never from the end of standard error: a library
+    may print there behind the sample's last line (at interpreter exit)."""
+    verdict = max((index for index, line in enumerate(lines) if line.startswith(tag)), default=0)
+    assert verdict, f"no line of the run stands in front of a line that begins with {tag}"
+    return lines[verdict - 1]
+
+
+#: what the cells of the speculative script read a run's lines between: a line in front of the run and one behind it, as a
+#: library prints them on standard error at import and at interpreter exit
+NOT_THE_SAMPLES = ("a line on standard error in front of the run: a library's, at import", "a line on standard error behind the run: a library's, at exit")
+
+
+@pytest.mark.L0
+def test_the_header_of_a_run_is_found_behind_a_line_a_library_printed_first():
+    """A run's lines are read from standard error, and standard error is not the sample's alone: a library may print a
+    warning there before the sample's first line (seen in a fresh interpreter on one host: the sample ended in ``PASS``
+    and the cell that took line 0 for its header failed).  The header is the first line with the script's tag."""
+    header = "[02] qwen_dense speculative decode | reduced model: 2 of 64 layers (1 linear-attention + 1 attention) | the drafter runs on reference blocks"
+    run = [header, "[02] planning: an entry of this stack builds its kernel now", "served by (decided before the load)", "[02] PASS"]
+    warning = ["/site-packages/a_library/__init__.py:12: UserWarning: a library says something at import", "  warnings.warn(text)"]
+    assert _header(run, "[02] ") == header
+    assert _header(warning + run, "[02] ") == header, "two lines of a library in front of the run"
+    assert _header(run[:1] + warning + run[1:], "[02] ") == header and _header(["[00] a line of the other script", *run], "[02] ") == header
+    assert _header(["a library's line that quotes [02] PASS in passing", *run], "[02] ") == header, "a line of the run BEGINS with the tag"
+    with pytest.raises(AssertionError, match=r"no line of the run begins with \[02\] : the run printed no header"):
+        _header(warning, "[02] ")
+
+
+@pytest.mark.L0
+def test_the_line_in_front_of_the_verdict_is_found_where_a_library_printed_last():
+    """The other end of a run's lines.  A cell that holds the line in front of the verdict counts from the verdict -- the
+    last line with the script's tag -- and not from the end of standard error, where a library may print behind the
+    sample's last line (seen with an interpreter made to print its import times: the sample ended in ``PASS`` and the
+    cell that took the second line from the end failed).  Directly in front: no line of the run is skipped."""
+    last = "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    run = ["[02] qwen_dense speculative decode | reduced model", "  ids  ids hash 11bfb9f9bcf5, plain 11bfb9f9bcf5    PASS", last, "[02] PASS"]
+    behind = ["a line a library prints when the interpreter exits", "  and its second line"]
+    assert _in_front_of_the_verdict(run, "[02] ") == last
+    assert _in_front_of_the_verdict(run + behind, "[02] ") == last, "two lines of a library behind the verdict"
+    assert _in_front_of_the_verdict(behind + run + behind[:1], "[02] ") == last
+    assert _in_front_of_the_verdict([*run[:-1], "a line between the two", run[-1]], "[02] ") == "a line between the two", "nothing is skipped"
+    for nothing_in_front in (behind, run[-1:], []):
+        with pytest.raises(AssertionError, match=r"no line of the run stands in front of a line that begins with \[02\] "):
+            _in_front_of_the_verdict(nothing_in_front, "[02] ")
+
+
 PAGED_PROGRAM = """
 import faulthandler, sys
 faulthandler.dump_traceback_later({deadline}, exit=True)
@@ -751,7 +813,10 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
         out, written = captured.err, captured.out
     seconds = time.perf_counter() - start
     assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
-    lines = out.splitlines()
+    # Standard error is not the sample's alone: a library may print there in front of the run and behind it.  Every cell
+    # that comes through here reads the run's lines with such a line at either end, so that nothing below can take a
+    # line of the run by its place from the start or from the end of standard error.
+    lines = [NOT_THE_SAMPLES[0], *out.splitlines(), NOT_THE_SAMPLES[1]]
     tagged = [line for line in lines if line.startswith("[02] ")]
     versions = next((line[5:] for line in tagged if line.startswith("[02] cuDNN Frontend ")), "no environment line")
     device = next((line[5:].split(" | ")[0] for line in tagged if " SMs)" in line), "no device line")
@@ -764,10 +829,9 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert code == 0 and (verdict == "[02] PASS" or verdict.startswith(f"[02] RAN {stack} stack (kernels not observed: ")), out[-6000:]
     assert " FAIL" not in out and "distribution" in versions and "source hash" in versions
     # before the load: the reductions, the configuration key by key, the seeded list, what a prompt and a step are
-    assert "2 of 64 layers (1 linear-attention + 1 attention)" in lines[0] and lines[0].endswith(" | the drafter runs on reference blocks")
-    assert (
-        "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in lines[0]
-    )
+    header = _header(lines, "[02] ")
+    assert "2 of 64 layers (1 linear-attention + 1 attention)" in header and header.endswith(" | the drafter runs on reference blocks")
+    assert "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in header
     load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
     before = (
         '[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
@@ -820,7 +884,8 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert len(judged) == 2 and all(line.endswith("    PASS") for line in judged), "the prompt's decode steps and the verify steps, each against the reference"
     steps = [line for line in lines if line.split()[:1] == ["linear_attention.step"] and "[band: gdn_step]" in line]
     assert len(steps) == 2 and all(line.endswith("[band: gdn_step]  PASS") and "conv history equal; null slot untouched" in line for line in steps)
-    assert lines[-2] == "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    last = "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    assert _in_front_of_the_verdict(lines, "[02] ") == last
     return out
 
 
