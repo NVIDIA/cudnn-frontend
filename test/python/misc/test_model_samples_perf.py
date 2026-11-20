@@ -851,12 +851,13 @@ def _checkpoint_form(**changes):
     return _gpu_side(data)
 
 
-def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=410.0):
+def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=410.0, middle=None):
     """The GPU side of a report's data, set: the median GPU busy in ms (``None``: not measured, and ``why``), whether
     launch overhead is a term of the step, the loop's median host time, tracing's stretch in percent and the mean
     step.  The means of GPU busy and of host are set 2 ms and 1 ms above their medians, and the remainder is what they
-    leave of the mean step: the terms add up, as a run's do.  The defaults are made up for the form -- the parts of a
-    mean step of 410 ms beside a median of 400, the time per block call that of 700 calls -- and are no run's."""
+    leave of the mean step: the terms add up, as a run's do.  ``middle``: the median of the per-step remainders, 2 ms
+    below their mean where it is not given.  The defaults are made up for the form -- the parts of a mean step of
+    410 ms beside a median of 400, the time per block call that of 700 calls -- and are no run's."""
     from model_samples import perf
 
     stats, measured = data["statistics"], busy is not None
@@ -865,6 +866,7 @@ def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=4
     stats["gpu_busy"].update(value=busy, mean=busy + 2.0 if measured else None, reason=None if measured else f"GPU busy not measured ({why})")
     stats["host"].update(value=host, mean=host + 1.0)
     stats["launch_overhead"].update(value=remainder if term and measured else None, remainder_ms=remainder, label=perf.ESTIMATE if measured else None)
+    stats["launch_overhead"]["median"] = (remainder - 2.0 if middle is None else middle) if measured else None
     stats["launch_overhead"]["host_time_per_block_call_us"] = remainder * 1e3 / 700 if measured else None
     stats["tracing_stretch"]["value"] = None if busy is None else stretch
     data["traced"].update(gpu_busy_ms=busy, gpu_busy_reason=why or None)
@@ -1591,8 +1593,9 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     # form A: the step, its mean taken apart, the line that calls launch overhead an estimate, the traced steps and the note
     lines = perf.screen(_checkpoint_form())
     at = lines.index("step                  400.000  ms; mean 410.000 = GPU busy 82.000 + launch overhead 287.000 + host 41.000")
-    assert lines[at + 1 : at + 4] == [
+    assert lines[at + 1 : at + 5] == [
         "                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)",
+        "                      median of the per-step remainders: 285.000 ms (launch overhead is their mean)",
         "                      (GPU busy from 51 traced steps, positions 58 to 108; median 80.000 ms;",
         "                      tracing lengthens a step by 5.0 %)",
     ]
@@ -1607,17 +1610,18 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     # form B: GPU busy is not the smaller part -- the step and its mean, the mean GPU busy as the upper bound it is, no term for the rest; no note
     bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, term=False))
     at = bound.index("step                  400.000  ms (not traced), mean 410.000")
-    assert bound[at + 1 : at + 5] == [
+    assert bound[at + 1 : at + 6] == [
         "                      mean GPU busy 242.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
         "                      launch overhead and host together: not resolved by this method",
+        "                      median of the per-step remainders: 125.000 ms (a timed step less GPU busy and host)",
         "                      (GPU busy from 51 traced steps, positions 58 to 108; median 240.000 ms;",
         "                      tracing lengthens a step by 5.0 %)",
     ]
     assert not any(
-        line.startswith("note ") or "launch overhead 127" in line or "estimate" in line for line in bound
+        line.startswith("note ") or "launch overhead 127" in line or "127.000" in line or "estimate" in line for line in bound
     ), "the remainder is in the file, not on the screen"
     assert (
-        bound[at + 5].startswith("with draft tokens ")
+        bound[at + 6].startswith("with draft tokens ")
         and _gpu_side(_checkpoint_form(), busy=240.0, term=False)["statistics"]["launch_overhead"]["remainder_ms"] == 127.0
     )
     unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
@@ -1686,6 +1690,7 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
         "step                  101.000  ms (not traced), mean 68.000",
         "                      mean GPU busy 34.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
         "                      launch overhead and host together: not resolved by this method",
+        "                      median of the per-step remainders: 0.000 ms (a timed step less GPU busy and host)",
         "                      (GPU busy from 3 traced steps, positions 0 to 2; median 1.000 ms;",
         "                      tracing lengthens a step by 0.0 %)",
     ], "the form without the term, and the two means side by side: half of the mean step is GPU busy, not a hundredth of the median one"
@@ -1731,6 +1736,7 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
     assert (overhead["n"], overhead["value"]) == (1, pytest.approx(7.0)) and terms(stats) == pytest.approx((10.0, 2.0, 7.0, 1.0))
     assert lines[0] == "step                  10.000  ms; mean 10.000 = GPU busy 2.000 + launch overhead 7.000 + host 1.000"
     assert lines[2:] == [
+        "                      median of the per-step remainders: 7.000 ms (launch overhead is their mean)",
         "                      (GPU busy from the traced step, position 0; median 2.000 ms;",
         "                      tracing lengthens a step by 0.0 %)",
     ]
@@ -1766,6 +1772,81 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
     _says("guide", "and their difference can be a time no step has.")
     _says("guide", "Where its terms are printed as a sum they are the means over the same steps, so that a reader can add them up,")
     _says("guide", "and it is called an estimate: the two sides are two requests.")
+
+
+def test_one_stalled_step_moves_the_mean_and_not_the_median():
+    """The launch overhead of a run is the MEAN of the per-step remainders, so that the terms of the ``step`` line add
+    up -- and a mean moves with one stalled step.  The line therefore prints their median beside it, in both forms in
+    which a remainder was formed: under the line that calls launch overhead an estimate, where it says that launch
+    overhead is their mean, and under the sentence that says launch overhead and host are not resolved.  One timed
+    step of twenty that stalls makes the term large and leaves the median where it was; one stalled step of the traced
+    request takes the term away and leaves the median where it was.  The figure is the one the report file already
+    holds (``launch_overhead.median``): the screen is rendered from the file, and the file does not change.  Every
+    number of this test is constructed, none is a run's."""
+    from model_samples import perf
+
+    def run(insides, busy):
+        steps = len(busy)
+        timed = [_stepped([1.0] * steps, of) for of in insides]  # per step 1 ms of the loop's host time, then the time from its launch to its read
+        stats = perf._statistics(timed, steps, 1, "", busy=busy, traced=_stepped([1.0] * steps, [1.0] * steps, "traced"), calls=10)
+        overhead = stats["launch_overhead"]
+        assert stats["step"]["mean"] == pytest.approx(stats["gpu_busy"]["mean"] + overhead["remainder_ms"] + stats["host"]["mean"]), "the terms add up"
+        return stats, overhead, perf._step_lines(stats, {"steps": steps, "first_position": 0, "last_position": steps - 1}, "")
+
+    def printed(lines):
+        (line,) = [line for line in lines if "per-step remainders" in line]
+        return float(re.fullmatch(r" {22}median of the per-step remainders: (-?\d+\.\d{3}) ms \(.*\)", line).group(1))
+
+    # no step stalls: two timed requests of ten steps, each step 2 ms of GPU busy and 1 ms beside it and the host time
+    stats, overhead, lines = run([[3.0] * 10, [3.0] * 10], [2.0] * 10)
+    assert (overhead["n"], overhead["median"], overhead["remainder_ms"]) == (20, pytest.approx(1.0), pytest.approx(1.0)) and overhead["value"] is None
+    unresolved = [
+        "                      launch overhead and host together: not resolved by this method",
+        "                      median of the per-step remainders: 1.000 ms (a timed step less GPU busy and host)",
+        "                      (GPU busy from 10 traced steps, positions 0 to 9; median 2.000 ms;",
+    ]
+    assert lines[0] == "step                  4.000  ms (not traced), mean 4.000" and lines[2:5] == unresolved
+    # ONE timed step of the twenty stalls for 400 ms between its launch and its read
+    stats, overhead, lines = run([[3.0] * 10, [3.0] * 4 + [403.0] + [3.0] * 5], [2.0] * 10)
+    assert (overhead["n"], overhead["maximum"], overhead["p90"]) == (20, pytest.approx(401.0), pytest.approx(1.0)), "nineteen steps leave 1 ms, one 401"
+    assert overhead["value"] == overhead["remainder_ms"] == overhead["mean"] == pytest.approx(21.0), "(19 x 1 + 401) / 20: a term, larger than GPU busy"
+    assert overhead["median"] == pytest.approx(1.0) and stats["step"]["value"] == pytest.approx(4.0), "the medians do not move: of the remainders, of the step"
+    assert lines[:4] == [
+        "step                  4.000  ms; mean 24.000 = GPU busy 2.000 + launch overhead 21.000 + host 1.000",
+        "                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)",
+        "                      median of the per-step remainders: 1.000 ms (launch overhead is their mean)",
+        "                      (GPU busy from 10 traced steps, positions 0 to 9; median 2.000 ms;",
+    ], "the mean-based term, large, and under the line that calls it an estimate the median, small: both printed, each named"
+    assert printed(lines) == round(overhead["median"], 3) == 1.0 and "launch overhead 21.000" in lines[0], "the file's own figures"
+    # ONE step of the traced request stalls instead (400 ms more GPU busy at one position): no term, and the median as before
+    stats, overhead, lines = run([[3.0] * 10, [3.0] * 10], [2.0] * 9 + [402.0])
+    assert overhead["remainder_ms"] == pytest.approx(-39.0) and overhead["value"] is None, "(18 x 1 - 2 x 399) / 20, beside a mean GPU busy of 42"
+    assert lines[1] == "                      mean GPU busy 42.000 ms in a traced request (an upper bound: tracing lengthens kernels)"
+    assert lines[2:5] == unresolved and printed(lines) == round(overhead["median"], 3) == 1.0
+    assert not any("39" in line or "estimate" in line or "their mean" in line for line in lines), "the mean of the remainders is in the file, not on the screen"
+    # a median below zero is printed as it is; one that rounds to zero carries no sign
+    assert printed(run([[2.0] * 3], [8.0] * 3)[2]) == -6.0 and run([[2.0] * 3], [8.0] * 3)[1]["median"] == pytest.approx(-6.0)
+    below = run([[2.0] * 3], [2.0004] * 3)
+    assert below[1]["median"] < 0 and "                      median of the per-step remainders: 0.000 ms (a timed step less GPU busy and host)" in below[2]
+    # GPU busy not measured: no remainder was formed, and no line gives a median of none
+    unseen = perf._statistics([_stepped([1.0] * 3, [3.0] * 3)], 0, 1, "", unmeasured="this PyTorch build records no kernel activity")
+    assert "median" not in unseen["launch_overhead"] and unseen["launch_overhead"]["n"] == 0
+    bare = perf._step_lines({**unseen}, {"steps": 0, "first_position": None, "last_position": None, "gpu_busy_reason": "not observed"}, "")
+    assert len(bare) == 1 and "remainders" not in bare[0] and "GPU busy not measured (not observed)" in bare[0]
+    # on the whole screen: the line stands between the estimate and the traced steps, and where the term is not printed behind that sentence
+    lines = perf.screen(_gpu_side(_checkpoint_form(), middle=3.5))
+    at = lines.index("                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)")
+    assert lines[at + 1] == "                      median of the per-step remainders: 3.500 ms (launch overhead is their mean)"
+    assert lines[at - 1].endswith("+ launch overhead 287.000 + host 41.000") and lines[at + 2].startswith(" " * 22 + "(GPU busy from 51 traced steps")
+    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, term=False, middle=-3.5))
+    at = bound.index("                      launch overhead and host together: not resolved by this method")
+    assert bound[at + 1] == "                      median of the per-step remainders: -3.500 ms (a timed step less GPU busy and host)"
+    wide = _gpu_side(_data(), busy=123456.789, host=1234.567, mean=987654.321)  # a reduced model, six-digit values: no line wider than the screen
+    assert max(len(line) for line in perf.screen(wide)) <= perf.WIDTH and sum("per-step remainders" in line for line in perf.screen(wide)) == 1
+    _says("area", "Under the line that calls launch overhead an estimate, and under the sentence that says it is not resolved,")
+    _says("area", "a line gives the median of the per-step remainders: one stalled step moves their mean")
+    _says("area", "one stalled step moves their mean -- the launch overhead of the equation -- and not their median.")
+    _says("guide", "The median of the per-step values is printed beside it: one stalled step moves a mean and not a median.")
 
 
 def test_rows_by_wiring_position_not_by_name(monkeypatch):
@@ -2193,10 +2274,11 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     assert [(row["launches_per_step"], row["planned_launches_per_step"]) for row in exact] == [(1, 1), (1, 1)], "as the kernel check counted them"
     assert all(row["us_per_launch_added"] == pytest.approx(0.4375) and row["us_per_launch_recorded"] == 0.4375 for row in data["per_kernel"]["rows"])
     step, stats = lines.index(_line(lines, "step  ")), data["statistics"]
-    said = " ".join(line.strip() for line in lines[step : step + 5])
+    said = " ".join(line.strip() for line in lines[step : step + 6])
     assert " ms; mean " in said and " = GPU busy 0.017 + launch overhead " in said, "the mean of the step taken apart"
-    assert f" launch overhead: {perf.ESTIMATE} (GPU busy from 6 traced steps, positions 5 to 10; median 0.017 ms; tracing lengthens a step by " in said
     overhead, calls = stats["launch_overhead"], len(_tiny_model().wiring())
+    middle = f"median of the per-step remainders: {overhead['median']:.3f} ms (launch overhead is their mean)"
+    assert f" launch overhead: {perf.ESTIMATE} {middle} (GPU busy from 6 traced steps, positions 5 to 10; median 0.017 ms; tracing lengthens a step by " in said
     assert overhead["value"] == overhead["remainder_ms"] == overhead["mean"] > 0.017 and overhead["label"] == perf.ESTIMATE
     assert overhead["n"] == stats["step"]["n"] == stats["host"]["n"] == 2 * 6, "every timed step at a traced position: two requests of six"
     assert stats["step"]["mean"] == pytest.approx(

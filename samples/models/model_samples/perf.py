@@ -37,7 +37,8 @@ busy of the traced step at the same position and beside its own host time is for
 aggregated; the mean of it is the run's launch overhead (``step_split``), which adds up with the means of the same
 steps: step = GPU busy + launch overhead + host.  It is an estimate -- a timed step has no GPU-side record, and GPU busy
 is the traced request's, taken under the profiler, and is an upper bound -- printed as a term of the ``step`` line, and
-called an estimate there, only where it is larger than the mean GPU busy.  The per-kernel table (``kernel_table``)
+called an estimate there, only where it is larger than the mean GPU busy; the median of the per-step remainders is
+printed under it in either case, because one stalled step moves their mean.  The per-kernel table (``kernel_table``)
 gives every row the time its launches add to the GPU's timeline (``added_ms``): a row is a block, found by its place in
 the wiring by the kernel check's own walk (``census.Row``), and the blocks on fallback rows that no exact kernel
 separates are one row.  A row says what serves it (``_row_kind``): the row of a block a library serves carries the
@@ -701,21 +702,25 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
     Measured: the step -- the median -- and its mean taken apart, ``mean = GPU busy + launch overhead + host``, every
     term the mean over the same steps, only where launch overhead is larger than the mean GPU busy, and under it the
     line that calls launch overhead an estimate; otherwise the step, its mean beside the mean GPU busy as the upper
-    bound it is, and that the rest is not resolved.  Under both a line with the traced steps, their positions, their
-    median GPU busy -- what the shares of the per-kernel table are taken of -- and by how much tracing lengthened a
-    step."""
+    bound it is, and that the rest is not resolved.  Under either a line with the median of the per-step remainders,
+    which the file holds beside their mean: one stalled step moves the mean -- the launch overhead of the equation --
+    and not the median.  Under both a line with the traced steps, their positions, their median GPU busy -- what the
+    shares of the per-kernel table are taken of -- and by how much tracing lengthened a step."""
     value, busy, overhead = f"{prefix}{stats['step']['value']:.3f}  ms", stats["gpu_busy"]["value"], stats["launch_overhead"]
     one, first, last = traced["steps"] == 1, traced["first_position"], traced["last_position"]
     if busy is None:
         at = f"at the traced position, {first}" if one else f"at the {traced['steps']} traced positions, {first} to {last}"
         return _wrapped("step", f"{value} {at if traced['steps'] else 'over every timed step'}; GPU busy not measured ({traced['gpu_busy_reason']})")
     mean, of_gpu = stats["step"]["mean"], stats["gpu_busy"]["mean"]  # with the remainder and the mean host time: the means of the same steps
+    middle = f"median of the per-step remainders: {round(overhead['median'], 3) + 0.0:.3f} ms"  # + 0.0: a median that rounds to zero carries no sign
     if overhead["value"] is not None:
         equation = f"mean {mean:.3f} = GPU busy {of_gpu:.3f} + launch overhead {overhead['value']:.3f} + host {stats['host']['mean']:.3f}"
         lines = _packed("step", [value, equation], joint="; ", hang=";") + _wrapped("", f"launch overhead: {overhead['label']}")
+        lines += _wrapped("", f"{middle} (launch overhead is their mean)")
     else:
         bound = f"mean GPU busy {of_gpu:.3f} ms in a traced request (an upper bound: tracing lengthens kernels)"
         lines = _packed("step", [f"{value} (not traced), mean {mean:.3f}", bound, "launch overhead and host together: not resolved by this method"])
+        lines += _wrapped("", f"{middle} (a timed step less GPU busy and host)")
     stretch = stats["tracing_stretch"]["value"]
     lengthens = "the stretch of tracing was not formed" if stretch is None else f"tracing lengthens a step by {stretch:.1f} %"
     steps = f"the traced step, position {first}" if one else f"{traced['steps']} traced steps, positions {first} to {last}"

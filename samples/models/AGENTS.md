@@ -127,7 +127,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
     sets one against the other -- launch overhead, a step less its GPU busy and its host time -- is formed step by
     step, at the same position, before anything is aggregated: the medians of three lists need not be one step's, and
     their difference can be a time no step has. Where its terms are printed as a sum they are the means over the same
-    steps, so that a reader can add them up, and it is called an estimate: the two sides are two requests. A row of the
+    steps, so that a reader can add them up, and it is called an estimate: the two sides are two requests. The median
+    of the per-step values is printed beside it: one stalled step moves a mean and not a median. A row of the
     per-kernel table is found by its place in the wiring, never by a kernel's name, and a traced pass whose kernel
     check does not hold prints no table. The row of a block a library serves names the library's entry, as the plan
     does, never the block alone and never a fallback; what a block launches beside a kernel of its own is the row of
