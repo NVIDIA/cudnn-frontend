@@ -46,9 +46,9 @@ and never exceed the query's absolute token ID. A tail begins at the document's
 own block origin; packed document starts need not be divisible by four. Groups
 may appear in any order and padding groups may occur between selected groups.
 Groups must not overlap or repeat within a row. These device-value relationships
-are caller contracts; execution does not read indices back to the host. A row's
-blocks accumulate in the order of its groups, so the result bytes follow that
-order.
+are caller contracts; execution does not read indices back to the host. Off the
+forward's dense tiles (below), a row's blocks accumulate in the order of its
+groups, so the result bytes follow that order.
 
 The Relax layout with 512 complete four-token groups plus a four-slot causal
 tail fits directly, including invalid tail slots. A 2051-wide carrier must be
@@ -56,7 +56,11 @@ padded explicitly by the caller; this API does not silently convert it. Empty
 rows produce zero output/gradients and negative-infinity LSE. Selection is not
 differentiated. Pass the same selection and scale to forward and backward.
 
-A GPU hash table compacts the selected starts. Backward runs the engine
+A GPU hash table compacts the selected starts. Past a short call, forward runs
+a query tile whose selected keys lie in a short span on the bitmap entry's dense
+kernel, behind key masks built from the starts, and gathers the selected blocks
+of the other tiles. A short call, or a nonfinite K/V value anywhere in the call,
+keeps every tile gathered. Backward runs the engine
 described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md))
 over them. A nonfinite K/V value of a masked token adds exact zeros, and one of
 a selected token poisons its queries. Every call rebuilds metadata, including
@@ -69,6 +73,7 @@ The public wrappers allocate outputs and one workspace. The internal APIBase
 plan validates current storage and uses only caller-owned buffers in execute;
 its cache retains immutable geometry and compiled kernels. Indexed metadata
 storage is proportional to `T * W`, independent of the full key-block count.
+The forward adds one fixed-width key mask row per query for its dense tiles.
 At 128K with W=2052, compact IDs occupy 256.5 MiB in either direction, compared
 with 16 GiB for the bitmap entry's `[T, NB]` IDs. The 4 GiB bitmap is also
 unnecessary. These are metadata sizes, not total process

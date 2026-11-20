@@ -25,6 +25,29 @@ _N64_SOURCE_DIGESTS = tuple(
 
 
 @cute.jit
+def _launch_tiles(
+    q, k, v, bits, ranges, modes, order, out, out32, lse, ids, counts, lo, hi, first, last, scale: Float32, stream: cuda.CUstream, arch: cutlass.Constexpr
+):
+    total, hq, dim = q.shape
+    hkv = k.shape[1]
+    q_view = cute.make_tensor(q.iterator, cute.make_layout((total, dim, hq), stride=(hq * dim, 1, dim)))
+    k_view = cute.make_tensor(k.iterator, cute.make_layout((total, dim, hkv), stride=(hkv * dim, 1, dim)))
+    v_view = cute.make_tensor(v.iterator, cute.make_layout((dim, total, hkv), stride=(1, hkv * dim, dim)))
+    flat_bits = cute.make_tensor(bits.iterator, cute.make_layout((cute.size(bits),)))
+    flat_out = cute.make_tensor(out.iterator, cute.make_layout((cute.size(out),)))
+    flat_out32 = cute.make_tensor(out32.iterator, cute.make_layout((cute.size(out32),)))
+    flat_lse = cute.make_tensor(lse.iterator, cute.make_layout((cute.size(lse),)))
+    fprop_dense._attn_launch(
+        q_view, k_view, v_view, flat_bits, ranges, modes, order, flat_out, flat_out32, flat_lse, scale, Int32(bits.shape[1]), stream, hq // hkv, hq
+    )
+    # Past 16384 tokens a gathered query keeps its own CTA, which spreads a long sequence evenly over the SMs.
+    if total <= 16384:
+        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+    else:
+        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch, False)
+
+
+@cute.jit
 def _launch(
     q,
     k,
@@ -68,23 +91,7 @@ def _launch(
         flat_k = cute.make_tensor(k.iterator, cute.make_layout((cute.size(k),)))
         flat_v = cute.make_tensor(v.iterator, cute.make_layout((cute.size(v),)))
         fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream)
-        total, hq, dim = q.shape
-        hkv = k.shape[1]
-        q_view = cute.make_tensor(q.iterator, cute.make_layout((total, dim, hq), stride=(hq * dim, 1, dim)))
-        k_view = cute.make_tensor(k.iterator, cute.make_layout((total, dim, hkv), stride=(hkv * dim, 1, dim)))
-        v_view = cute.make_tensor(v.iterator, cute.make_layout((dim, total, hkv), stride=(1, hkv * dim, dim)))
-        flat_bits = cute.make_tensor(bits.iterator, cute.make_layout((cute.size(bits),)))
-        flat_out = cute.make_tensor(out.iterator, cute.make_layout((cute.size(out),)))
-        flat_out32 = cute.make_tensor(out32.iterator, cute.make_layout((cute.size(out32),)))
-        flat_lse = cute.make_tensor(lse.iterator, cute.make_layout((cute.size(lse),)))
-        fprop_dense._attn_launch(
-            q_view, k_view, v_view, flat_bits, ranges, modes, order, flat_out, flat_out32, flat_lse, scale, Int32(bits.shape[1]), stream, hq // hkv, hq
-        )
-        # Past 16384 tokens a gathered query keeps its own CTA, which spreads a long sequence evenly over the SMs.
-        if total <= 16384:
-            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
-        else:
-            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch, False)
+        _launch_tiles(q, k, v, bits, ranges, modes, order, out, out32, lse, ids, counts, lo, hi, first, last, scale, stream, arch)
     else:
         ids = cute.make_tensor(scratch.iterator, cute.make_layout((total, blocks), stride=(blocks, 1)))
         counts_offset = cute.ceil_div(total * blocks, 4) * 4

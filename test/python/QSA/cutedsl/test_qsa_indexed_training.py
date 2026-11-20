@@ -10,7 +10,7 @@ import inspect
 import pytest
 import torch
 
-from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
+from cudnn.ops import qsa_forward, qsa_indexed_forward, qsa_indexed_backward
 from cudnn.QSA.indexed.api import _plan
 from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, skip_without_cuda13_for_12q1kv, supported_gpu
 
@@ -60,6 +60,26 @@ def test_indexed_six_query_heads(supported_gpu, lengths):
     """6Q/1KV runs the same forward kernels and backward engine as 12Q/1KV, with six head rows per query."""
     inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
     check_case(inputs, indices_for(inputs))
+
+
+def test_indexed_dense_tiles_match_the_bitmap_entry(supported_gpu):
+    """Past a short call a query tile of short key span runs the bitmap entry's dense kernel behind the same key masks."""
+    inputs = make_inputs((129, 1671, 133), 12, 1, empty=True, all_selected=True)
+    out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], indices_for(inputs), inputs["scale"])
+    for actual, expected in zip(out, qsa_forward(**inputs)):
+        assert torch.equal(actual, expected)
+
+
+def test_indexed_masked_nonfinite_kv_with_dense_tiles(supported_gpu):
+    """A nonfinite K/V row no query selects leaves the outputs of a call with dense tiles unchanged."""
+    inputs = make_inputs((129, 1671, 133), 12, 1, all_selected=True)
+    q, k, v = (inputs[name] for name in ("q", "k", "v"))
+    indices = indices_for(inputs)
+    indices[-1] = -1
+    clean = qsa_indexed_forward(q, k, v, indices)
+    k[-1], v[-1] = torch.nan, torch.inf
+    for actual, expected in zip(qsa_indexed_forward(q, k, v, indices), clean):
+        assert_close(actual, expected)
 
 
 def test_indexed_changed_values_replay(supported_gpu):

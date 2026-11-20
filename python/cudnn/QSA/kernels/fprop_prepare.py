@@ -167,6 +167,13 @@ frost_qsa_pack_bits.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
+def tile_routes(k, v, lo, hi, partials, modes, ranges, order, stream: cuda.CUstream):
+    frost_qsa_scan_kv(k, v, partials).launch(grid=(cute.ceil_div(k.shape[0], 1024), 1, 1), block=(128, 1, 1), stream=stream)
+    frost_qsa_tile_bounds(lo, hi, partials, modes, ranges).launch(grid=(cute.ceil_div(lo.shape[0], TILE_M), 1, 1), block=(128, 1, 1), stream=stream)
+    frost_qsa_schedule(modes, ranges, order).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+
+
+@cute.jit
 def prepare(
     k,
     v,
@@ -186,9 +193,7 @@ def prepare(
     counts,
     stream: cuda.CUstream,
 ):
-    frost_qsa_scan_kv(k, v, partials).launch(grid=(cute.ceil_div(k.shape[0], 1024), 1, 1), block=(128, 1, 1), stream=stream)
-    frost_qsa_tile_bounds(lo, hi, partials, modes, ranges).launch(grid=(cute.ceil_div(lo.shape[0], TILE_M), 1, 1), block=(128, 1, 1), stream=stream)
-    frost_qsa_schedule(modes, ranges, order).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+    tile_routes(k, v, lo, hi, partials, modes, ranges, order, stream)
     frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts).launch(
         grid=(cute.ceil_div(bits.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
     )

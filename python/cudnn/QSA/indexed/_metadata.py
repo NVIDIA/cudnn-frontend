@@ -16,13 +16,14 @@ FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 @cute.kernel
-def frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE: cutlass.Constexpr[int]):
+def frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE: cutlass.Constexpr[int], TIGHT_LO: cutlass.Constexpr[bool]):
     # one CTA per query: its distinct causal group starts, deduplicated through a shared-memory hash table, written
     # in column order as the query's block ids, which the insertion race must not reorder
     tid = Int32(cute.arch.thread_idx()[0])
     row = Int32(cute.arch.block_idx()[0])
     total = Int32(indices.shape[0])
     capacity = Int32(indices.shape[1] // 4)
+    low = row
     smem = SmemAllocator()
     keys = smem.allocate_tensor(Int32, cute.make_layout(TABLE), byte_alignment=128)
     cols = smem.allocate_tensor(Int32, cute.make_layout(TABLE), byte_alignment=128)
@@ -46,6 +47,7 @@ def frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE:
         if block < capacity:
             start = indices[Int64(row), Int64(block) * 4]
             if start >= 0 and start <= row:
+                low = cute.math.min(low, start)
                 # Mix higher bits too: starts in one packed sequence share their low two bits.
                 hashed = Uint32(start) * Uint32(2654435761)
                 slot = Int32((hashed ^ (hashed >> 16)) & Uint32(TABLE - 1))
@@ -76,8 +78,18 @@ def frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE:
             for other in cutlass.range_constexpr(8):
                 prefix[0] += prefix[other + 1]
         cute.arch.sync_threads()
+    if cutlass.const_expr(TIGHT_LO):
+        # The tile routes take a query tile's key span from lo, so it is the row's lowest group start.
+        low = cute.arch.warp_reduction(low, lambda x, y: cute.math.min(x, y))
+        if lane == 0:
+            prefix[warp + 1] = low
+        cute.arch.sync_threads()
     if tid == 0:
         counts[row] = prefix[0]
+        if cutlass.const_expr(TIGHT_LO):
+            for other in cutlass.range_constexpr(8):
+                low = cute.math.min(low, prefix[other + 1])
+            lo[row] = low
 
 
 frost_qsa_indexed_metadata.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -85,7 +97,11 @@ frost_qsa_indexed_metadata.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _host(indices, ids, counts, lo, hi, first, last, stream: cuda.CUstream, TABLE: cutlass.Constexpr[int]):
-    frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE).launch(grid=(ids.shape[0], 1, 1), block=(256, 1, 1), stream=stream)
+    frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE, False).launch(grid=(ids.shape[0], 1, 1), block=(256, 1, 1), stream=stream)
+
+
+def table_size(capacity):
+    return max(256, 1 << (2 * capacity - 1).bit_length())
 
 
 def compile_metadata(arch, capacity):
@@ -94,7 +110,6 @@ def compile_metadata(arch, capacity):
     def fake(shape):
         return make_fake_compact_tensor(Int32, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=4)
 
-    table = max(256, 1 << (2 * capacity - 1).bit_length())
     return compile_cached(
         _host,
         fake((total, width)),
@@ -105,7 +120,7 @@ def compile_metadata(arch, capacity):
         fake((total,)),
         fake((total,)),
         make_fake_stream(use_tvm_ffi_env_stream=False),
-        table,
+        table_size(capacity),
         options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
         cache_key=template_key(globals(), {"arch": arch, "capacity": capacity}, "compile_metadata"),
         symbol="qsa_indexed_metadata",

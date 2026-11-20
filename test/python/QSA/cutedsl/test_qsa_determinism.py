@@ -6,9 +6,10 @@
 import pytest
 import torch
 
-from cudnn.ops import qsa_backward, qsa_forward
+from cudnn.ops import qsa_backward, qsa_forward, qsa_indexed_forward
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 from QSA.cutedsl.test_qsa import assert_close, make_inputs, reference, supported_gpu  # noqa: F401
+from QSA.cutedsl.qsa_index_list_reference import make_topk_idxs
 from QSA.cutedsl.test_qsa_backward_sm100 import _check, _entry_backward, _inputs, _skip_cu12
 
 
@@ -139,6 +140,24 @@ class TestQSA:
         expected = split(assert_replays(lambda: run(pack(samples), False), repeats=4), samples)
         for index, sample in enumerate(samples):
             assert_bitwise(run(pack([sample]), False), expected[index], f"sequence {index} of {lengths}")
+
+    @pytest.mark.L0
+    def test_indexed_packed_batch_invariance(self):
+        """A document past the first 8192 packed tokens still runs its dense tiles under the indexed entry, so a
+        128-aligned one long enough to run them alone keeps the forward bytes of its standalone call."""
+        bounds = [0, 8192, 10240]
+        generator = torch.Generator(device="cuda").manual_seed(20261118)
+        q, k, v = (torch.randn((bounds[-1], heads, 256), device="cuda", generator=generator).to(torch.bfloat16) for heads in (12, 1, 1))
+        indices = make_topk_idxs(bounds[-1], generator, bounds, 2052)
+
+        def forward(begin):
+            outputs = qsa_indexed_forward(q[begin:], k[begin:], v[begin:], torch.where(indices[begin:] >= 0, indices[begin:] - begin, -1))
+            return dict(zip(outputs.keys(), outputs))
+
+        packed = assert_replays(lambda: forward(0), repeats=4)
+        begin = bounds[1]
+        expected = {name: value[:, begin:] if name == "lse" else value[begin:] for name, value in packed.items()}
+        assert_bitwise(snapshot(forward(begin)), expected, "second document")
 
     @pytest.mark.L0
     @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])

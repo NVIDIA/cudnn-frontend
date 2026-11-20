@@ -15,6 +15,8 @@ from cudnn._torch_stream import stream_context
 from cudnn.QSA._contract import check_tensor
 
 QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
+# Up to this many tokens a forward call gathers every query faster than the dense kernel's fixed cost.
+DENSE_ROUTE_TOKENS = 1792
 
 
 def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqlens=None):
@@ -65,6 +67,7 @@ class _QsaIndexedPlan(APIBase):
             *((name, (total,), torch.int32) for name in ("lo", "hi", "first", "last")),
         ]
         self.engine_plan = None
+        self.gated = False
         self.workspace_bytes = sum(ws_align(math.prod(shape) * dtype.itemsize) for _, shape, dtype in self.layouts)
 
     def check_support(self):
@@ -94,6 +97,17 @@ class _QsaIndexedPlan(APIBase):
             mode = engine.SEQ_CU if self.num_seqs else engine.SEQ_SINGLE
             self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq, self.max_seq_len, self.deterministic)
             self.workspace_bytes += self.engine_plan.workspace_bytes()
+        else:
+            # The 64-key Rubin forward is specialised for 12 heads per KV head and reads no tile modes.
+            self.n64 = self.arch == 107 and self.total >= 32768 and self.hq == 12
+            # Each query tile takes the dense or the gathered kernel on the device.
+            self.gated = self.total > DENSE_ROUTE_TOKENS and not self.n64
+            if self.gated:
+                from . import _forward
+
+                routes = [(name, shape, torch.int32) for name, shape in _forward.route_layouts(self.total)]
+                self.layouts += routes
+                self.workspace_bytes += sum(ws_align(math.prod(shape) * dtype.itemsize) for _, shape, dtype in routes)
         self._is_supported = True
         return True
 
@@ -105,11 +119,15 @@ class _QsaIndexedPlan(APIBase):
         from . import _metadata
 
         with torch.cuda.device(self.device):
+            if self.gated:
+                from . import _forward
+
+                self.impl = _forward
+                self._compiled_kernel = _forward.compile_kernel(self.hq, self.arch, self.width // 4)
+                return
             self._metadata = _metadata.compile_metadata(self.arch, self.width // 4)
             if self.direction == "fprop":
-                module = "fprop_sm100"
-                if self.arch == 107 and self.total >= 32768 and self.hq == 12:
-                    module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
+                module = "fprop_n64_sm107" if self.n64 else "fprop_sm100"
                 self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
                 self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
             else:
@@ -159,6 +177,9 @@ class _QsaIndexedPlan(APIBase):
         metadata = tuple(scratch[name] for name in ("ids", "counts", "lo", "hi", "first", "last"))
         with torch.cuda.device(q.device), stream_context(current_stream, q.device):
             stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+            if self.gated:
+                self.impl.launch(self._compiled_kernel, q, k, v, indices, *outputs, *scratch.values(), scale=float(scale), stream=stream)
+                return outputs
             self._metadata(indices, *metadata, stream)
             if self.direction == "fprop":
                 self.impl.launch(self._compiled_kernel, q, k, v, *outputs, *metadata, float(scale), stream)
