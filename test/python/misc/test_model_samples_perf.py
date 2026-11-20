@@ -1610,20 +1610,18 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     # form B: GPU busy is not the smaller part -- the step and its mean, the mean GPU busy as the upper bound it is, no term for the rest; no note
     bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, term=False))
     at = bound.index("step                  400.000  ms (not traced), mean 410.000")
-    assert bound[at + 1 : at + 6] == [
+    assert bound[at + 1 : at + 5] == [
         "                      mean GPU busy 242.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
         "                      launch overhead and host together: not resolved by this method",
-        "                      median of the per-step remainders: 125.000 ms (a timed step less GPU busy and host)",
         "                      (GPU busy from 51 traced steps, positions 58 to 108; median 240.000 ms;",
         "                      tracing lengthens a step by 5.0 %)",
     ]
     assert not any(
         line.startswith("note ") or "launch overhead 127" in line or "127.000" in line or "estimate" in line for line in bound
     ), "the remainder is in the file, not on the screen"
-    assert (
-        bound[at + 6].startswith("with draft tokens ")
-        and _gpu_side(_checkpoint_form(), busy=240.0, term=False)["statistics"]["launch_overhead"]["remainder_ms"] == 127.0
-    )
+    assert not any("remainders" in line or "125.000" in line for line in bound), "nor its median: no figure of it under a sentence that says not resolved"
+    unresolved = _gpu_side(_checkpoint_form(), busy=240.0, term=False)["statistics"]["launch_overhead"]
+    assert bound[at + 5].startswith("with draft tokens ") and (unresolved["remainder_ms"], unresolved["median"]) == (127.0, 125.0), "both are in the file"
     unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
     at = unformed.index(
         "                      (GPU busy from 51 traced steps, positions 58 to 108; median 80.000 ms;"
@@ -1690,7 +1688,6 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
         "step                  101.000  ms (not traced), mean 68.000",
         "                      mean GPU busy 34.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
         "                      launch overhead and host together: not resolved by this method",
-        "                      median of the per-step remainders: 0.000 ms (a timed step less GPU busy and host)",
         "                      (GPU busy from 3 traced steps, positions 0 to 2; median 1.000 ms;",
         "                      tracing lengthens a step by 0.0 %)",
     ], "the form without the term, and the two means side by side: half of the mean step is GPU busy, not a hundredth of the median one"
@@ -1776,13 +1773,14 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
 
 def test_one_stalled_step_moves_the_mean_and_not_the_median():
     """The launch overhead of a run is the MEAN of the per-step remainders, so that the terms of the ``step`` line add
-    up -- and a mean moves with one stalled step.  The line therefore prints their median beside it, in both forms in
-    which a remainder was formed: under the line that calls launch overhead an estimate, where it says that launch
-    overhead is their mean, and under the sentence that says launch overhead and host are not resolved.  One timed
-    step of twenty that stalls makes the term large and leaves the median where it was; one stalled step of the traced
-    request takes the term away and leaves the median where it was.  The figure is the one the report file already
-    holds (``launch_overhead.median``): the screen is rendered from the file, and the file does not change.  Every
-    number of this test is constructed, none is a run's."""
+    up -- and a mean moves with one stalled step.  The line therefore prints their median beside it: under the line
+    that calls launch overhead an estimate, where it says that launch overhead is their mean, and nowhere else.  One
+    timed step of twenty that stalls makes the term large and leaves the median where it was, and both are printed.
+    One stalled step of the traced request takes the term away and leaves the median where it was -- in the file: the
+    line then says that launch overhead and host are not resolved, and no figure of the remainder stands under that
+    sentence, its median neither, which would read there as the resolved figure the sentence denies.  The figure is
+    the one the report file already holds (``launch_overhead.median``), in either form: the screen is rendered from
+    the file, and the file does not change.  Every number of this test is constructed, none is a run's."""
     from model_samples import perf
 
     def run(insides, busy):
@@ -1795,17 +1793,20 @@ def test_one_stalled_step_moves_the_mean_and_not_the_median():
 
     def printed(lines):
         (line,) = [line for line in lines if "per-step remainders" in line]
-        return float(re.fullmatch(r" {22}median of the per-step remainders: (-?\d+\.\d{3}) ms \(.*\)", line).group(1))
+        return float(re.fullmatch(r" {22}median of the per-step remainders: (-?\d+\.\d{3}) ms \(launch overhead is their mean\)", line).group(1))
+
+    def unprinted(lines):  # the form that says not resolved: its lines as they are without the line, and no figure of a remainder on any
+        return len(lines) == 5 and not any("remainders" in line or "median of" in line or "their mean" in line or "estimate" in line for line in lines)
 
     # no step stalls: two timed requests of ten steps, each step 2 ms of GPU busy and 1 ms beside it and the host time
     stats, overhead, lines = run([[3.0] * 10, [3.0] * 10], [2.0] * 10)
     assert (overhead["n"], overhead["median"], overhead["remainder_ms"]) == (20, pytest.approx(1.0), pytest.approx(1.0)) and overhead["value"] is None
     unresolved = [
         "                      launch overhead and host together: not resolved by this method",
-        "                      median of the per-step remainders: 1.000 ms (a timed step less GPU busy and host)",
         "                      (GPU busy from 10 traced steps, positions 0 to 9; median 2.000 ms;",
     ]
-    assert lines[0] == "step                  4.000  ms (not traced), mean 4.000" and lines[2:5] == unresolved
+    assert lines[0] == "step                  4.000  ms (not traced), mean 4.000" and lines[2:4] == unresolved
+    assert unprinted(lines) and not any("1.000" in line for line in lines), "not resolved: the median of the remainders, 1 ms, is in the file and on no line"
     # ONE timed step of the twenty stalls for 400 ms between its launch and its read
     stats, overhead, lines = run([[3.0] * 10, [3.0] * 4 + [403.0] + [3.0] * 5], [2.0] * 10)
     assert (overhead["n"], overhead["maximum"], overhead["p90"]) == (20, pytest.approx(401.0), pytest.approx(1.0)), "nineteen steps leave 1 ms, one 401"
@@ -1822,30 +1823,42 @@ def test_one_stalled_step_moves_the_mean_and_not_the_median():
     stats, overhead, lines = run([[3.0] * 10, [3.0] * 10], [2.0] * 9 + [402.0])
     assert overhead["remainder_ms"] == pytest.approx(-39.0) and overhead["value"] is None, "(18 x 1 - 2 x 399) / 20, beside a mean GPU busy of 42"
     assert lines[1] == "                      mean GPU busy 42.000 ms in a traced request (an upper bound: tracing lengthens kernels)"
-    assert lines[2:5] == unresolved and printed(lines) == round(overhead["median"], 3) == 1.0
-    assert not any("39" in line or "estimate" in line or "their mean" in line for line in lines), "the mean of the remainders is in the file, not on the screen"
-    # a median below zero is printed as it is; one that rounds to zero carries no sign
-    assert printed(run([[2.0] * 3], [8.0] * 3)[2]) == -6.0 and run([[2.0] * 3], [8.0] * 3)[1]["median"] == pytest.approx(-6.0)
-    below = run([[2.0] * 3], [2.0004] * 3)
-    assert below[1]["median"] < 0 and "                      median of the per-step remainders: 0.000 ms (a timed step less GPU busy and host)" in below[2]
+    assert lines[2:4] == unresolved and unprinted(lines), "the sentence, and under it the traced steps: no line between them"
+    assert (overhead["n"], overhead["median"], overhead["minimum"]) == (20, pytest.approx(1.0), pytest.approx(-399.0)), "the file holds the median as before"
+    assert not any("39" in line or "1.000" in line for line in lines), "the mean of the remainders and their median are in the file, not on the screen"
+    # a median below zero is printed as it is, beside the estimate; one that rounds to zero carries no sign
+    stats, overhead, lines = run([[2.0, 2.0, 108.0]], [8.0] * 3)  # the remainders: -6, -6 and 100 ms
+    assert overhead["value"] == pytest.approx(88 / 3) and overhead["median"] == pytest.approx(-6.0) and printed(lines) == -6.0
+    stats, overhead, lines = run([[2.0, 2.0, 102.0004]], [2.0004] * 3)  # the remainders: twice just below zero, and 100 ms
+    assert overhead["value"] is not None and -0.001 < overhead["median"] < 0
+    assert lines[2] == "                      median of the per-step remainders: 0.000 ms (launch overhead is their mean)"
+    # every remainder below zero: not resolved, and the median, -6 ms in the file, is on no line
+    stats, overhead, lines = run([[2.0] * 3], [8.0] * 3)
+    assert overhead["value"] is None and overhead["median"] == pytest.approx(-6.0) and unprinted(lines) and not any("6.000" in line for line in lines)
     # GPU busy not measured: no remainder was formed, and no line gives a median of none
     unseen = perf._statistics([_stepped([1.0] * 3, [3.0] * 3)], 0, 1, "", unmeasured="this PyTorch build records no kernel activity")
     assert "median" not in unseen["launch_overhead"] and unseen["launch_overhead"]["n"] == 0
     bare = perf._step_lines({**unseen}, {"steps": 0, "first_position": None, "last_position": None, "gpu_busy_reason": "not observed"}, "")
     assert len(bare) == 1 and "remainders" not in bare[0] and "GPU busy not measured (not observed)" in bare[0]
-    # on the whole screen: the line stands between the estimate and the traced steps, and where the term is not printed behind that sentence
+    # on the whole screen: the line stands between the estimate and the traced steps; where the term is not printed the screen has no such line
     lines = perf.screen(_gpu_side(_checkpoint_form(), middle=3.5))
     at = lines.index("                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)")
     assert lines[at + 1] == "                      median of the per-step remainders: 3.500 ms (launch overhead is their mean)"
     assert lines[at - 1].endswith("+ launch overhead 287.000 + host 41.000") and lines[at + 2].startswith(" " * 22 + "(GPU busy from 51 traced steps")
-    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, term=False, middle=-3.5))
-    at = bound.index("                      launch overhead and host together: not resolved by this method")
-    assert bound[at + 1] == "                      median of the per-step remainders: -3.500 ms (a timed step less GPU busy and host)"
+    for middle in (-3.5, 3.5, 125.0):  # whatever the file's median is, below zero or above: it is not printed under that sentence
+        held = _gpu_side(_checkpoint_form(), busy=240.0, term=False, middle=middle)
+        bound = perf.screen(held)
+        at = bound.index("                      launch overhead and host together: not resolved by this method")
+        assert bound[at + 1] == "                      (GPU busy from 51 traced steps, positions 58 to 108; median 240.000 ms;"
+        assert not any("remainders" in line or f"{abs(middle):.3f}" in line for line in bound) and held["statistics"]["launch_overhead"]["median"] == middle
     wide = _gpu_side(_data(), busy=123456.789, host=1234.567, mean=987654.321)  # a reduced model, six-digit values: no line wider than the screen
     assert max(len(line) for line in perf.screen(wide)) <= perf.WIDTH and sum("per-step remainders" in line for line in perf.screen(wide)) == 1
-    _says("area", "Under the line that calls launch overhead an estimate, and under the sentence that says it is not resolved,")
-    _says("area", "a line gives the median of the per-step remainders: one stalled step moves their mean")
+    wide = _gpu_side(_data(), busy=654321.789, term=False, host=1234.567, mean=987654.321)  # the same where the rest is not resolved: no such line
+    assert max(len(line) for line in perf.screen(wide)) <= perf.WIDTH and not any("remainders" in line for line in perf.screen(wide))
+    _says("area", "Under the line that calls launch overhead an estimate, and only there, a line gives the median of the per-step remainders:")
     _says("area", "one stalled step moves their mean -- the launch overhead of the equation -- and not their median.")
+    _says("area", "Where the line says that launch overhead and host are not resolved it prints no figure of the remainder, its median neither:")
+    _says("area", "its median neither: the file holds both.")
     _says("guide", "The median of the per-step values is printed beside it: one stalled step moves a mean and not a median.")
 
 
