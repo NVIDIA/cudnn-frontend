@@ -2906,7 +2906,7 @@ def _scenario(folder, **changes):
 def _tool(monkeypatch, tmp_path, **scenario):
     """The stand-in for the driver's tool in a folder of the test, found as ``nvidia-smi``, and a GPU id for it: the
     folder.  It is a real program, so the readings and the sampler's child process run as they do on a GPU.  The host's
-    load and its cores are stated too -- 4.5 at the first reading behind this call and 5.5 at every later one, on 50
+    load and its cores are stated too -- 4.5 at the first reading behind this call and 5.5 at every later one, on 70
     cores: what a line of the screen has room for does not depend on the host a test runs on."""
     from model_samples import observe
 
@@ -2921,7 +2921,7 @@ def _tool(monkeypatch, tmp_path, **scenario):
     monkeypatch.setattr(observe, "target_of", lambda device: "GPU-00000000-stand-in")
     loads = iter([[4.5, 4.0, 3.5]])
     monkeypatch.setattr(observe, "host_load", lambda: next(loads, [5.5, 5.0, 4.5]))
-    monkeypatch.setattr(observe, "host_cores", lambda: 50)
+    monkeypatch.setattr(observe, "host_cores", lambda: 70)
     return folder
 
 
@@ -3035,12 +3035,12 @@ def _observed(monkeypatch, tmp_path, lock=None, dense=True, scenario=None, clock
 
 def _alone():
     """The observation of a run that had its GPU to itself: one reading at rest, twelve steady clock samples and this
-    process alone in the list during its one timed request, on a host of 50 cores."""
+    process alone in the list during its one timed request, on a host of 70 cores."""
     from model_samples import observe
 
     reading = observe.Reading("behind the last timed request", listed=True, own=400.0, used=410.0, load=[5.5, 5.0, 4.5])
     samples = [observe.Clock(1.0 + index / 100, 2000.0, 250.0, 0) for index in range(12)]
-    return {**observe.summary([reading], samples, [observe.Seen(1.5, 4242, 400.0)], [("timed", 1.0, 2.0)], 4242), "host": {"load": 5.5, "cores": 50}}
+    return {**observe.summary([reading], samples, [observe.Seen(1.5, 4242, 400.0)], [("timed", 1.0, 2.0)], 4242), "host": {"load": 5.5, "cores": 70}}
 
 
 def test_samples_cut_by_request_bounds(monkeypatch, tmp_path):
@@ -3383,7 +3383,7 @@ def test_clock_value_forms(monkeypatch):
         patch.setattr(os, "cpu_count", lambda: 64)
         cores = observe.host_cores()
     assert cores == 3
-    assert observe.host_text({"host": {"load": 7.345, "cores": 50}}) == "host load 7.3 on 50 cores"
+    assert observe.host_text({"host": {"load": 7.345, "cores": 70}}) == "host load 7.3 on 70 cores"
     assert (
         observe.host_text({"host": {"load": 0.0, "cores": 1}}) == "host load 0.0 on 1 core"
         and observe.host_text({"host": {"load": None, "cores": 8}}) == "host load not observed"
@@ -3495,9 +3495,9 @@ def test_the_observer_is_called_outside_every_request(monkeypatch, tmp_path):
     _says("area", "`observation` (every reading, the samples of every request behind the checked one as counts and extremes, the two verdicts of the `GPU`")
     _says("area", "it reads the GPU's list of compute processes, its memory in use, its utilisation and its SM clock, and the host's load.")
     gpu = lines.index("GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen")
-    assert lines[gpu + 1] == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 50 cores"
+    assert lines[gpu + 1] == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 70 cores"
     assert [made["host_load"] for made in watched["readings"]] == [[4.5, 4.0, 3.5], [5.5, 5.0, 4.5]]
-    assert watched["host"] == {"load": 5.5, "cores": 50}, "the load over the last minute, of the reading behind the last timed request"
+    assert watched["host"] == {"load": 5.5, "cores": 70}, "the load over the last minute, of the reading behind the last timed request"
     environment = outcome.data["environment"]
     assert environment["driver"] == {"value": "000.00", "reason": None}
     assert list(environment["host"]["load"]) == ["before the warm-up request", "behind the last timed request"]
@@ -3848,7 +3848,7 @@ def test_every_form_of_the_gpu_lines_within_110():
     alone = _alone()
     assert screen() == [
         "GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen",
-        "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 50 cores",
+        "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 70 cores",
     ]
     assert len(screen()[1]) == 110, "one line at the screen's width"
     _says("area", "(a checkpoint on the stack `native`, on a GPU the run had to itself;")
