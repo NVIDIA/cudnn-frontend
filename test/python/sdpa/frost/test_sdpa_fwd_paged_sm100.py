@@ -1628,14 +1628,19 @@ def _run_graph_fp8(
         compute_data_type=cudnn.data_type.FLOAT,
         is_override_shape_enabled=override,
     )
-    q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
     bt_v = bt
-    if v_table_layout == "strided":
+    if v_table_layout == "reverse_pool":
+        # Reverse the physical V page IDs while preserving each logical token.
+        # The FP64 reference still gathers the original unreversed pool.
+        v_c = v_c.view(torch.uint8).flip((0,)).view(v_c.dtype)
+        bt_v = v_c.shape[0] - 1 - bt
+    elif v_table_layout == "strided":
         raw = torch.full((B, 1, max_pages * 2 + 1, 1), -1, device=dev, dtype=torch.int32)
         bt_v = raw[:, :, 1::2, :]
         bt_v.copy_(bt)
     elif v_table_layout == "batch_inner":
         bt_v = bt.transpose(0, 2).contiguous().transpose(0, 2)
+    q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
     tk, tv = g.tensor_like(bt), g.tensor_like(bt_v)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
 
@@ -2060,10 +2065,7 @@ def test_paged_graph_fp8_declines_off_contract():
 # dtype code its family takes (0 = E4M3 for the quantized files, 2 = BF16 for f16/bf16)
 # and the CTA-MMA topology its config accepts before the module body runs (the quantized
 # d192x128 / d256 kernels are probed at cga1); the guard under test is the module's own.
-# The SM100 d192x128 quantized files are listed because config_sm100._PAGED_KV_FLAVORS
-# names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
-    ("sm100/d192_fp8_multi_q/kernel.py", 0, 1),
     ("sm100/d512_f16_2x2/kernel.py", 2, 2),
     ("sm107/d128_fp8_multi_q/kernel.py", 0, 2),
     ("sm107/d192_mxfp8_multi_q/kernel.py", 0, 2),
@@ -3203,6 +3205,38 @@ def test_paged_graph_fp8_sink_rebind_replay(d, cga, split=1):
     finally:
         captured.reset()
         cudnn.destroy_handle(handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "page_size,hnd,q_tokens,pack,split,cga",
+    [(16, False, 1, True, 1, 1), (8, True, 2, False, 1, 2), (128, False, 8, True, 2, 2)],
+)
+def test_paged_graph_fp8_d192_mimo(page_size, hnd, q_tokens, pack, split, cga):
+    """Exercise both unequal-width pools with scattered pages, dead slots and a partial final page."""
+    sink = torch.linspace(-3, 3, 64, device="cuda").view(1, 64, 1, 1) if q_tokens == 8 else None
+    plan = _run_graph_fp8(
+        3,
+        64,
+        4,
+        192,
+        page_size,
+        -(-273 // page_size),
+        [273, 129, 0],
+        hnd,
+        v_table_layout="reverse_pool",
+        sinks=sink,
+        window_left=129 if sink is not None else None,
+        d_v=128,
+        v_hnd=not hnd,
+        s_q=q_tokens,
+        out_dt=torch.float8_e4m3fn,
+        causal="bottom_right",
+        explicit_pack=pack,
+        explicit_split=split,
+        explicit_cga=cga,
+    )
+    assert plan.engine_id == 20525
 
 
 @pytest.mark.L0

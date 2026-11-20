@@ -3597,8 +3597,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256), (512, 512)),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (192, 128), (256, 256), (512, 512)),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d192 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),
