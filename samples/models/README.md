@@ -13,9 +13,10 @@ first sample is the plain decode: by default on the reduced seeded model, self-c
 out on a checkpoint from local disk, with the checkpoint's own tokenizer and chat template; the request can be the body a
 chat client sends, and the generated text goes to standard output while every line of the run goes to standard error.
 A prompt is not prefilled by a kernel of its own: it goes through the decode step, one step per prompt token, so a
-prompt of N tokens takes as long as N new tokens before the first new token appears (in the last runs with a
+prompt of N tokens takes as long as N new tokens before the first new token appears (in the runs of 2026-11-17 with a
 checkpoint, on compute capability 10.0: 4.3 s for a prompt of 29 tokens on the stack `fe-cublas`, 7.8 s for the 58
-tokens of the default prompt on the stack `native`; orientation values of single runs). Both run by default on the
+tokens of the default prompt on the cuDNN Frontend rows of the stack `native`, the rows `fe-entries` selects today;
+orientation values of single runs). Both run by default on the
 stack `fe-cublas`, which is a reference path: it holds every quantised weight as a bf16 copy and issues every launch from
 Python. The second stack, `native`, is defined by a kernel set instead: the target kernel set of the model's decode step,
 checked in as a recorded kernel census, per block the kernel and the form it is called in. It is built block by block;

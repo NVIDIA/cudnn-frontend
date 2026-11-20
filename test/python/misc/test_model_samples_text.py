@@ -2511,16 +2511,21 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "correctness only; `native` on the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today).",
         "With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class) the default run on `native` "
         "ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of its process.",
+        "Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count, "
+        "and the kernel check passed over 10 traced steps, "
         "with 17 of 20 launches of the verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal "
         "results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens",
+        'Three drafted tokens passed in 13 steps, with "kernel identity: not stated for this run".',
         "The memory sentence of the default run asked for about 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP "
         "flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.",
         "**The last run with a checkpoint on the cuDNN Frontend rows** (2026-11-19;",
         "correctness only; `native` selected those rows then, as `fe-entries` does today; the third command of this section as it is written,",
         "**The last run with a checkpoint on `native` with its library rows** (2026-11-20; PyTorch 2.14.0, FlashInfer 0.7.2.post1; the same checkpoint, "
         "command, prompt, list and GPU class), made twice with the same figures. Both runs ended in `[02] PASS` at the end token.",
+        "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
         'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
         "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' on the same tokens, the first that differs kept token 17.",
+        "The kernel check passed over 16 traced steps, with "
         "451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal "
         "results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN Frontend entries with "
         "byte-equal results), the 16 out-projections of the attention layers by membership, on the library's own CUTLASS multiply; nothing is stated "
