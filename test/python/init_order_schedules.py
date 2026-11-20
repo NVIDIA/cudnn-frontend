@@ -107,6 +107,7 @@ def own_process(schedule, *args, timeout=300):
 
     code = (
         "import faulthandler, json, sys\n"
+        "faulthandler.enable()\n"  # a process the driver ends on a signal leaves its stack in what the case fails with
         f"faulthandler.dump_traceback_later({0.9 * timeout!r}, exit=True)\n"
         "path, package, module, function, args = json.loads(sys.argv[1])\n"
         "sys.path[:] = path\n"
@@ -124,6 +125,7 @@ def own_process(schedule, *args, timeout=300):
         ran = subprocess.run([sys.executable, "-u", "-c", code, spec], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as late:
         failed(f"did not end within {timeout} s", late.stdout, late.stderr)
+        raise  # not reached: ``failed`` raises the case's failure
     last = ran.stdout.rstrip().rsplit("\n", 1)[-1]
     if ran.returncode == 0 and last == f"{OUTCOME} passed":
         return
