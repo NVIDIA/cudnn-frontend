@@ -451,10 +451,8 @@ class Capabilities:
     # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
     # thd=True alone does not promise support for padding between sequences.
     thd: bool = False
-    # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
-    # rows consume the form on THD host-side (lens = adjacent differences of
-    # the inherent tolist); dense cu graphs stay declined until the kernels
-    # grow a CU read mode (len = cu[b+1] - cu[b]) — see mismatch().
+    # INT32 (B+1,) prefixes, read on device. THD and dense storage have
+    # independent lowerings; a THD claim alone does not enable dense readers.
     cu_seq_len: bool = False
     # Dense padded + stats: the per-batch seq_len_q LSE trim (padded q-rows
     # write LSE=-inf / O=0, cuDNN >= 9.14). Every kernel carries the dense
@@ -768,6 +766,8 @@ class Capabilities:
     # the launch. WHICH plans it does so for is the implementation's own check in mismatch(). APPENDED after sm_extra
     # (append-only contract above).
     cluster_reduces: frozenset[bool] = frozenset({False})
+    # Dense device-prefix lengths are independent of THD; preserve all older positional fields.
+    dense_cu_parts: frozenset = frozenset()
 
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V
@@ -3026,14 +3026,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"negative diagonal_band_right_bound ({band_facts.right_bound}) is not supported"
 
     if facts.has_cu_seq_len:
-        # cu_seq_len_* ((B+1,) prefix sums, cuDNN 9.24+). The THD lowering
-        # consumes either length form host-side; the dense kernels' CU read
-        # mode (len = cu[b+1] - cu[b]) is not plumbed yet, so dense cu graphs
-        # stay declined even on serving rows.
         if not capabilities.cu_seq_len:
             return "graph uses cu_seq_len_q / cu_seq_len_kv, which this engine does not support"
-        if not facts.thd:
+        if not facts.thd and facts.device_cc not in capabilities.dense_cu_parts:
             return "cu_seq_len_* on dense graphs is not supported yet (kernel CU read mode not plumbed)"
+        if not facts.thd and not facts.padded:
+            return "dense cu_seq_len_* requires a padding mask"
+        if not facts.thd and facts.has_paged_kv:
+            return "dense cu_seq_len_* with paged KV is not supported yet"
         if (facts.seq_q_t is not None and facts.cu_seq_q_t is not None) or (facts.seq_kv_t is not None and facts.cu_seq_kv_t is not None):
             return "seq_len_* and cu_seq_len_* on the same side is ambiguous (backend precedence is not replicated here)"
 
@@ -4745,7 +4745,7 @@ def _sm80_spec() -> EngineSpec:
     declared data strides, and per-shape kernel caching. Dense and packed THD
     graphs share the eight-aligned head-dim envelope. Dense graphs expose
     scheduler tuning; THD requires the natural 3-D grid."""
-    from cudnn.sdpa.native_sm80 import graph_mismatch
+    from cudnn.sdpa.native_sm80 import DENSE_CU_PARTS, graph_mismatch
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
@@ -4770,6 +4770,7 @@ def _sm80_spec() -> EngineSpec:
             paged_kv=True,
             independent_paged_pool_counts=True,
             cu_seq_len=True,
+            dense_cu_parts=DENSE_CU_PARTS,
             sink=True,
             stats=True,
             stats_log2=True,
@@ -5095,7 +5096,7 @@ def lower_dsl_prefill(
     # graph carrying per-batch Q lengths compiles the kernel's trim
     # specialization (every kernel has one), and execute forwards the buffer
     # (THD sources cu_seqlens from it instead).
-    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None
+    seq_q_lens_present = facts.padded and not facts.thd and (facts.seq_q_t is not None or facts.cu_seq_q_t is not None)
     api_cls = _adapter(api_type)
     _ctor_params = _parameter_names(api_cls.__init__)
     _exec_params = _parameter_names(api_cls.execute)
@@ -5118,8 +5119,8 @@ def lower_dsl_prefill(
         # THD carries Q lengths via cu_seqlens; support is selected per native
         # flavor above because only kernels with a quantized Q-length ABI consume it.
         seq_q_lens_present=seq_q_lens_present,
-        # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
-        # adapter's seq-lens execute arguments carry (B+1,) prefix sums.
+        # The selected length form is static; execute binds the original
+        # (B,) lengths or (B+1,) prefixes without host reads or conversion.
         cu_seq_q_lens=facts.cu_seq_q_t is not None,
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,

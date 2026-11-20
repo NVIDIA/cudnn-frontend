@@ -4,6 +4,7 @@
 
 # The parts the SM80 rows serve: the A100 the kernels were written for, and the GA10x / AD10x parts that run the same
 # sm_80 binaries under a smaller per-CTA shared-memory budget (the opt-in limits, bytes).
+DENSE_CU_PARTS = frozenset({(8, 0)})
 SM80_ROW_PARTS = ((8, 0), (8, 6), (8, 9))
 # The parts the SM80 backward row serves itself; cc 8.9 backward has its own rows (``sdpa_bwd_sm89``).
 SM80_BACKWARD_PARTS = ((8, 0), (8, 6))

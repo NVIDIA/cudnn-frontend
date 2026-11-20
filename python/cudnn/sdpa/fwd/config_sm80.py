@@ -156,6 +156,10 @@ class TemplateParams:
     split_kv: int = 1
     # Q heads sharing one KV head occupy consecutive MMA rows.
     pack_g: int = 1
+    # Dense length operands contain B+1 prefixes instead of B lengths.
+    # These flags only change device reads, never Q/K/V/O storage origins.
+    cu_seq_q_lens: bool = False
+    cu_seq_kv_lens: bool = False
 
 
 def score_sign(scale: float) -> int:
@@ -176,6 +180,10 @@ def validate_params(p: TemplateParams) -> None:
         raise ValueError("sm80: split_kv must be in [1, 65535]")
     if p.split_kv > 1 and p.thd_varlen:
         raise ValueError("sm80: split-KV currently requires dense Q")
+    if p.cu_seq_q_lens and (p.thd_varlen or not p.has_seq_q_lens):
+        raise ValueError("sm80: dense cumulative Q lengths require the dense Q-length operand")
+    if p.cu_seq_kv_lens and (p.thd_varlen or not p.has_seq_kv_lens):
+        raise ValueError("sm80: dense cumulative KV lengths require the dense KV-length operand")
     wide = p.d_qk > 256 or p.d_v > 256
     tile_ns = (16,) if wide else (16, 32, *_SM80_SEQ_TILES_N)
     if p.tile_n not in tile_ns:

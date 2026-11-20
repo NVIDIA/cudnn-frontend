@@ -8843,3 +8843,34 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+## 2026-11-17: SM80 dense cumulative lengths
+
+`sdpa/frost/test_sdpa_dense_cu_lengths_determinism.py` covers forward FP16/BF16
+D64, D256 and D576/V512, plus D128 with split3, PackGQA and sinks. The fixed
+SM80 owner is required. Every case checks an independent float64 reference,
+fresh output allocations, four replays with concurrent work, and 129-sequence
+isolated/reordered/duplicated batches including empty and changed neighbors.
+Separate numerical tests change Q/KV prefixes under CUDA Graph replay and
+compare O/Stats bytes with ordinary-length plans. The backward graph API has
+no cumulative-length attributes; no backward support is claimed here.
+
+A100 PCIe 40GB, Torch 2.14.1+cu130, cuDNN 9.28 preview, DSL 4.8.0 with CUDA
+13.4: the combined dense-CU contract/numerical/determinism suite passed 132
+cases while recording eight new goldens. The preceding admission/native sweep
+passed 223 cases. Independent old-source qualification retained one CU
+admission failure and 12 passing ordinary-length capture controls. These are
+new forward goldens, not replacements for an existing numerical contract.
+Independent A100 qualification with the same frozen source passes 132 cases
+under CUDA 12.9 and another 132 under CUDA 13.4. The eight committed golden
+records come from the CUDA 12 run. Both compiler flavors pass all eight strict
+rechecks; their
+complete records equal the separately recorded CUDA 13 results. The initial
+local recording is retained in private diagnostics and is not a replacement
+baseline. Ordinary-path host/device ABBA qualification is tracked separately.
+
+Run from `test/python` with `-o addopts= -m L0` and the two files
+`sdpa/frost/test_sdpa_dense_cu_lengths.py` and
+`sdpa/frost/test_sdpa_dense_cu_lengths_determinism.py`; for strict comparison
+set `CUDNN_DETERMINISM_GOLDENS` to this directory and leave the record variable
+unset. Keep the recorded runtime boundary when comparing results.

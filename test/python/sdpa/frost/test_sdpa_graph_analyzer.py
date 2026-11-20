@@ -1328,6 +1328,8 @@ def test_capabilities_positional_prefix_is_append_only():
     assert names[: len(legacy_order)] == list(legacy_order), names
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
+    assert caps.dense_cu_parts == frozenset()
+    assert names.index("dense_cu_parts") > names.index("cluster_reduces")
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()

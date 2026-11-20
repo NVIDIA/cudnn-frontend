@@ -55,6 +55,11 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+For an explicitly isolated CPU metadata probe, verify that
+`graph_analyzer._device_props()` returns `None` and use that same value in the
+fixture: repeatedly retrying unavailable CUDA discovery for every engine and
+every envelope pair can dominate the run. Keep device-dependent C++ validation
+failures separate; this fixture establishes no native qualification.
 For Torch varlen providers, test each op's schema independently: forward and
 backward can select a backend while the out op is still Flash-only. The host
 `test_torch_provider_dispatch.py` matrix checks legacy, mixed and selected
@@ -1839,3 +1844,12 @@ its dense calls must supply the complete signature even when paging is compiled
 out, and its softmax namespace must declare absent optional inputs such as bias.
 Pin the actual kernel route, retain full/tail wave coverage, and replay
 changed KV data and selection metadata (`test_sm120_blk128_fixed_topk`).
+
+### Dense cumulative-length readers
+
+A dense CU feature must reach every length consumer, including split/sink
+reduction Q trimming. Keep its B+1 metadata declaration separate from B-length
+carriers and from packed storage origins. Compare ordinary versus cumulative
+forms byte for byte, change device prefixes under capture, and retain
+same-side ambiguity and missing-padding declines. The SM80 detectors are
+`test_sdpa_dense_cu_lengths.py` and its batch-invariance companion.

@@ -7809,9 +7809,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
 
         self._not_implemented_error_if(
-            not self.thd and (self.cu_seq_q_lens or self.cu_seq_kv_lens),
-            "SdpaFwdDslSm80 does not serve dense cu_seq_len graphs",
+            not self.thd and self.paged and (self.cu_seq_q_lens or self.cu_seq_kv_lens),
+            "SdpaFwdDslSm80 does not serve dense cu_seq_len graphs with paged KV",
         )
+        if not self.thd:
+            self.seq_q_lens_present = self.seq_q_lens_present or self.cu_seq_q_lens
+            self.seq_kv_lens_present = self.seq_kv_lens_present or self.cu_seq_kv_lens
         if self.thd:
             self._not_implemented_error_if(
                 self.cu_seq_q_lens and self.seq_q_lens_present,
@@ -7869,10 +7872,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
         self._device_cc = (major, minor)
-        from cudnn.sdpa.native_sm80 import part_mismatch, smem_budget_bytes
+        from cudnn.sdpa.native_sm80 import DENSE_CU_PARTS, part_mismatch, smem_budget_bytes
 
         part_reason = part_mismatch(self._device_cc, "SdpaFwdDslSm80")
         self._value_error_if(part_reason is not None, f"{part_reason} on {device}")
+
+        self._not_implemented_error_if(
+            not self.thd and (self.cu_seq_q_lens or self.cu_seq_kv_lens) and self._device_cc not in DENSE_CU_PARTS,
+            "Dense cumulative lengths on the SM80 forward row require SM80",
+        )
 
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
@@ -8011,6 +8019,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             causal_bottom_right=self.causal_bottom_right,
             has_seq_kv_lens=self.seq_kv_lens_present and not self.thd,
             has_seq_q_lens=self.seq_q_lens_present and not self.thd,
+            cu_seq_q_lens=self.cu_seq_q_lens and not self.thd,
+            cu_seq_kv_lens=self.cu_seq_kv_lens and not self.thd,
             has_sink=self.has_sink,
             stats_log2=self.stats_log2,
             has_bias=self._bias_present,

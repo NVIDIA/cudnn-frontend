@@ -750,6 +750,15 @@ retain bytewise identity under replay, reordered/duplicated batches and changed
 neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
 this forward result does not establish a backward or cross-runtime guarantee.
 
+SM80 dense cumulative-length forward is repeatable and batch invariant for
+FP16/BF16 D64, D256 and D576/V512, plus D128 with fixed split3, PackGQA and
+sinks. This qualification covers O and FP32 Stats on the tested A100 runtime,
+including empty sequences, reordered and duplicated batches, changed neighbors,
+and device-length changes under replay. Ordinary and cumulative length forms
+produce identical bytes for the same plan settings. Other architectures and
+dense paged cumulative lengths are unsupported by this addition; the backward
+graph API does not expose these cumulative-length attributes.
+
 ## SM120 D128 additive-bias forward
 
 FP16/BF16 dense D128 forward with FP32 or matching-input bias is repeatable

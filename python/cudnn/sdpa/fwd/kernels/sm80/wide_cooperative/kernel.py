@@ -475,6 +475,8 @@ def _sdpa_kernel(
     elif cutlass.const_expr(has_seq_kv_lens):
         _seqk_ptr = cutlass.make_array_view(seq_kv_lens).data_ptr()
         eff_skv = Pointer(_seqk_ptr, dtype=cutlass.Int32)[batch_idx]
+        if cutlass.const_expr(PARAMS.cu_seq_kv_lens):
+            eff_skv = Pointer(_seqk_ptr, dtype=cutlass.Int32)[batch_idx + 1] - eff_skv
     else:
         eff_skv = cutlass.Int32(skv_runtime)
     if cutlass.const_expr(THD_VARLEN):
@@ -482,6 +484,8 @@ def _sdpa_kernel(
     elif cutlass.const_expr(has_seq_len_q):
         _seqq_ptr = cutlass.make_array_view(seq_len_q).data_ptr()
         eff_sq = Pointer(_seqq_ptr, dtype=cutlass.Int32)[batch_idx]
+        if cutlass.const_expr(PARAMS.cu_seq_q_lens):
+            eff_sq = Pointer(_seqq_ptr, dtype=cutlass.Int32)[batch_idx + 1] - eff_sq
     else:
         eff_sq = cutlass.Int32(sq_runtime)
     # Over-provisioned THD grid: a CTA whose q-tile starts past this sequence's
