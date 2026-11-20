@@ -3156,7 +3156,7 @@ def test_samples_cut_by_request_bounds(monkeypatch, tmp_path):
         observe.Clock(20.0, 2000.0, 250.0, 0),
         observe.Clock(22.5, 1880.0, 260.0, 0b100),  # the software power cap
         observe.Clock(25.0, 2000.0, None, 0b1),  # no power in this line; the GPU idled
-        observe.Clock(30.0, 1820.0, 230.0, 0b1000100),  # the power cap and the hardware thermal slow-down
+        observe.Clock(30.0, 1820.0, 230.0, 0b1000000),  # the hardware thermal slow-down alone: the request's two limit reasons are two samples'
         observe.Clock(30.001, 100.0, 1.0, 0),  # behind the request
         observe.Clock(41.0, 2000.0, 255.0, 0),
         observe.Clock(45.0, None, 251.0, None),  # neither a clock nor event bits in this line
@@ -3184,6 +3184,7 @@ def test_samples_cut_by_request_bounds(monkeypatch, tmp_path):
         "share_below_declared_lock": 0.5,
     }
     assert (first["power_median_w"], first["limit_reasons"], first["idle_samples"]) == (250.0, ["hw_thermal_slowdown", "sw_power_cap"], 1)
+    assert [observe.limits_of(sample.events) for sample in clocks[4:8]] == [[], ["sw_power_cap"], [], ["hw_thermal_slowdown"]], "no sample holds both"
     assert (first["process_samples"], first["this_process_listed"], first["other_compute_processes"]) == (2, True, 1)
     assert second["clock"] == {
         "samples": 2,
