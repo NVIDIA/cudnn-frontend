@@ -626,6 +626,7 @@ def build_warmup_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    compile_host=None,
 ):
     """Compile (cached per static config) the warmup or uncut backward launch over the buffers of one plan."""
     _HQ, DK = q.shape[1], q.shape[2]
@@ -687,7 +688,8 @@ def build_warmup_backward(
             else None
         ),
     )
-    if key not in warmup_backward_cache:
+    compiled = warmup_backward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         bprop_cfg = mamba2_bprop_f16.build_cfg(
             io_dtype,
             state_dtype,
@@ -864,7 +866,7 @@ def build_warmup_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        warmup_backward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             warmup_backward_host,
             facts.split,
             facts.b_t,
@@ -932,7 +934,8 @@ def build_warmup_backward(
             symbol="frost_la_mamba2_warmup_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    compiled = warmup_backward_cache[key]
+        if compile_host is None:
+            warmup_backward_cache[key] = compiled
     return compiled, facts
 
 
@@ -979,9 +982,10 @@ def run_warmup_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    launch_host=None,
 ) -> None:
     """Replay the warmup or uncut backward: one crossing into the DSL for the table, prologue and bprop launches."""
-    cpp_launcher.launch(
+    (launch_host or cpp_launcher.launch)(
         compiled,
         facts.n_heads_out,
         facts.n_tiles,
@@ -1769,6 +1773,7 @@ def build_regenerate_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    compile_host=None,
 ):
     """Compile (cached per static config) the regenerate backward launch (table, one prologue, recompute, bprop) over
     the buffers of one plan; ``seed_checkpoints`` (io or fp32 rows ``seed_every_n_tokens`` apart) makes the recompute run
@@ -1838,7 +1843,8 @@ def build_regenerate_backward(
             else None
         ),
     )
-    if key not in regenerate_backward_cache:
+    compiled = regenerate_backward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         recompute_cfg = mamba2_recompute_f16.build_cfg(
             io_dtype,
             state_dtype,
@@ -2040,7 +2046,7 @@ def build_regenerate_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        regenerate_backward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             regenerate_backward_host,
             facts.split,
             facts.b_t,
@@ -2119,7 +2125,9 @@ def build_regenerate_backward(
             symbol="frost_la_mamba2_regenerate_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return regenerate_backward_cache[key], facts
+        if compile_host is None:
+            regenerate_backward_cache[key] = compiled
+    return compiled, facts
 
 
 def run_regenerate_backward(
@@ -2174,9 +2182,10 @@ def run_regenerate_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    launch_host=None,
 ) -> None:
     """Replay the regenerate backward: one crossing into the DSL for the table, prologue, recompute and bprop launches."""
-    cpp_launcher.launch(
+    (launch_host or cpp_launcher.launch)(
         compiled,
         facts.n_heads_out,
         facts.n_tiles,

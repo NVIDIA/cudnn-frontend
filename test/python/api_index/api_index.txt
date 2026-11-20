@@ -1605,6 +1605,12 @@ cudnn.ops.dsa_sparse_backward
 cudnn.ops.dsa_sparse_forward
 cudnn.ops.dsa_sparse_workspace_size
 cudnn.ops.fft_causal_conv1d
+cudnn.ops.gated_delta_net_backward_jax
+cudnn.ops.gated_delta_net_forward_jax
+cudnn.ops.gated_delta_net_v2_backward_jax
+cudnn.ops.gated_delta_net_v2_forward_jax
+cudnn.ops.gated_delta_product_backward_jax
+cudnn.ops.gated_delta_product_forward_jax
 cudnn.ops.gated_rmsnorm_backward
 cudnn.ops.gated_rmsnorm_forward
 cudnn.ops.gqa_attention_backward
@@ -1625,6 +1631,8 @@ cudnn.ops.layer_norm_forward_jax
 cudnn.ops.lm_head_logprob_backward_jax
 cudnn.ops.lm_head_logprob_forward_jax
 cudnn.ops.lm_head_logprob_jax
+cudnn.ops.mamba2_backward_jax
+cudnn.ops.mamba2_forward_jax
 cudnn.ops.mhc
 cudnn.ops.mhc.block_forward_jax
 cudnn.ops.mhc.head_backward

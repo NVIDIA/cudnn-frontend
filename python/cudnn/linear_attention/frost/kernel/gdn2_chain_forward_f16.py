@@ -396,6 +396,7 @@ def build_chain_forward(
     lead_buffers=(None,) * 4,
     state_head_divisor=1,
     state_wave_counts=None,
+    compile_host=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, beta guard, checkpoint and final-state
     presence, seed dtype, chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``,
@@ -456,7 +457,7 @@ def build_chain_forward(
         fold_rows,
         int(state_head_divisor),
     )
-    if key not in chain_forward_cache:
+    if compile_host is not None or key not in chain_forward_cache:
         summary_cfg = gdn2_summary_f16.build_cfg(
             io_dtype,
             gate_dtype,
@@ -510,7 +511,7 @@ def build_chain_forward(
                 ),
                 from_dlpack(DeviceView(256, (1, HO, DV, DK), dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_forward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -579,6 +580,9 @@ def build_chain_forward(
             symbol="frost_la_gdn2_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
+        if compile_host is not None:
+            return compiled
+        chain_forward_cache[key] = compiled
     return chain_forward_cache[key]
 
 

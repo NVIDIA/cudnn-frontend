@@ -594,6 +594,7 @@ def build_warmup_forward(
     ragged_scalars=(),
     ragged_buffers=(),
     l2norm_eps=l2norm.L2_NORM_EPS,
+    compile_host=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
     presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
@@ -681,7 +682,8 @@ def build_warmup_forward(
             else None
         ),
     )
-    if key not in warmup_forward_cache:
+    compiled = warmup_forward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         prefill_cfg = gdn_prefill_f16.build_cfg(
             io_dtype,
             state_dtype,
@@ -907,7 +909,8 @@ def build_warmup_forward(
                     leading_dim=3
                 ),
             ]
-        warmup_forward_cache[key] = compile_cached(
+        compiler = compile_cached if compile_host is None else compile_host
+        compiled = compiler(
             warmup_forward_host,
             facts.split,
             facts.b_t,
@@ -983,7 +986,8 @@ def build_warmup_forward(
             symbol="frost_la_gdn_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    compiled = warmup_forward_cache[key]
+        if compile_host is None:
+            warmup_forward_cache[key] = compiled
     return compiled, facts
 
 

@@ -1141,6 +1141,7 @@ def build_warmup_backward(
     ragged_scalars=(),
     ragged_buffers=(),
     l2norm_eps=l2norm.L2_NORM_EPS,
+    compile_host=None,
 ):
     """Compile (cached per static config) the warmup or uncut backward launch over the buffers of one plan.  The
     placeholders repeat the marks of the standalone builds so every kernel compiles as it does there.  ``l2norm_eps`` (the
@@ -1243,7 +1244,8 @@ def build_warmup_backward(
             else None
         ),
     )
-    if key not in warmup_backward_cache:
+    compiled = warmup_backward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         tinv_cfg = None
         if tinv_pass:
             tinv_cfg = gdn_tinv_f16.build_cfg(
@@ -1556,7 +1558,8 @@ def build_warmup_backward(
             from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
             for buffer in post_buffers
         ]
-        warmup_backward_cache[key] = compile_cached(
+        compiler = compile_cached if compile_host is None else compile_host
+        compiled = compiler(
             warmup_backward_host,
             facts.split,
             facts.b_t,
@@ -1660,7 +1663,9 @@ def build_warmup_backward(
             symbol="frost_la_gdn_warmup_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return warmup_backward_cache[key], facts
+        if compile_host is None:
+            warmup_backward_cache[key] = compiled
+    return compiled, facts
 
 
 def run_warmup_backward(

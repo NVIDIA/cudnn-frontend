@@ -452,6 +452,7 @@ def build_warmup_forward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    compile_host=None,
 ):
     """Compile (cached per static config) the warmup or uncut forward launch over the buffers of one plan."""
     _HQ, DK = q.shape[1], q.shape[2]
@@ -513,7 +514,8 @@ def build_warmup_forward(
             else None
         ),
     )
-    if key not in warmup_forward_cache:
+    compiled = warmup_forward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         prefill_cfg = mamba2_prefill_f16.build_cfg(
             io_dtype,
             state_dtype,
@@ -673,7 +675,7 @@ def build_warmup_forward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        warmup_forward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             warmup_forward_host,
             facts.split,
             facts.b_t,
@@ -736,7 +738,8 @@ def build_warmup_forward(
             symbol="frost_la_mamba2_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    compiled = warmup_forward_cache[key]
+        if compile_host is None:
+            warmup_forward_cache[key] = compiled
     return compiled, facts
 
 
@@ -779,9 +782,10 @@ def run_warmup_forward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    launch_host=None,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches."""
-    cpp_launcher.launch(
+    (launch_host or cpp_launcher.launch)(
         compiled,
         facts.n_heads_out,
         facts.n_tiles,

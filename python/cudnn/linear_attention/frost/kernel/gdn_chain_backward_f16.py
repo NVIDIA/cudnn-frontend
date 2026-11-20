@@ -901,6 +901,7 @@ def build_chain_backward(
     post_buffers=(None,) * 16,
     m_count=None,
     l2norm_eps=l2norm.L2_NORM_EPS,
+    compile_host=None,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan;
     ``pieces``, ``heads_out``, ``num_seqs`` and ``l2norm_eps`` (the q/k normalize's additive epsilon) are launch arguments.
@@ -984,7 +985,8 @@ def build_chain_backward(
         l2norm_k_expand_num,
         m_count is not None,
     )
-    if key not in chain_backward_cache:
+    compiled = chain_backward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         tinv_cfg, summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = build_configs(
             bprop_module,
             io_dtype,
@@ -1052,7 +1054,8 @@ def build_chain_backward(
             from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
             for buffer in post_buffers
         ]
-        chain_backward_cache[key] = compile_cached(
+        compiler = compile_cached if compile_host is None else compile_host
+        compiled = compiler(
             chain_backward_head_host,
             int(unit_chunks),
             int(b_t),
@@ -1173,7 +1176,9 @@ def build_chain_backward(
             symbol="frost_la_gdn_chain_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return chain_backward_cache[key]
+        if compile_host is None:
+            chain_backward_cache[key] = compiled
+    return compiled
 
 
 def run_chain_backward(

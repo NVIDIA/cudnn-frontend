@@ -82,6 +82,10 @@ arbitrary user callbacks.
 | `gated_delta_product` (GDP) with `use_qk_l2norm_in_kernel`, at the default `qk_l2norm_eps` and at a custom one | fprop, bprop | BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `gated_delta_net_forward_jax`, `gated_delta_net_backward_jax` | fprop, bprop | FP16, BF16 | Unsupported | Replay only | Unsupported |
+| `gated_delta_net_v2_forward_jax`, `gated_delta_net_v2_backward_jax` | fprop, bprop | FP16, BF16 | Unsupported | Replay only | Unsupported |
+| `gated_delta_product_forward_jax`, `gated_delta_product_backward_jax` | fprop, bprop | FP16, BF16 | Unsupported | Replay only | Unsupported |
+| `mamba2_forward_jax`, `mamba2_backward_jax` | fprop, bprop | FP16, BF16 | Unsupported | Replay only | Unsupported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Supported (GH200, tested configurations) | Unverified | Unsupported |
@@ -436,6 +440,12 @@ for replay, batch-invariance, and stress-test results.
   launches the first candidate and records nothing. The cuTile engine is not on this page's table: per-candidate replay and
   the hooks are verified on cc 10.3 by `test_la.py`'s determinism tests, batch
   invariance is not claimed.
+- JAX linear attention uses native FROST plans. Byte replay and per-sequence
+  batch invariance with `batch_invariant=True` are verified on SM100 and SM103.
+  Shared parameter gradients reduce across the batch, so their bytes may
+  change with batch shape or order. The
+  [JAX linear-attention guide](/operations/LinearAttention/linear_attention_jax)
+  documents the API and qualification.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

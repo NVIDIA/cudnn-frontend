@@ -624,6 +624,7 @@ def build_chain_backward(
     checkpoint_head_divisor=1,
     state_head_divisor=1,
     state_wave_counts=None,
+    compile_host=None,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
@@ -692,7 +693,7 @@ def build_chain_backward(
         int(checkpoint_head_divisor),
         int(state_head_divisor),
     )
-    if key not in chain_backward_cache:
+    if compile_host is not None or key not in chain_backward_cache:
         flags = dict(
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
@@ -787,7 +788,7 @@ def build_chain_backward(
             from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
             for buffer in post_buffers[2:]
         ]
-        chain_backward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             chain_backward_host,
             int(unit_chunks),
             int(b_t),
@@ -899,6 +900,9 @@ def build_chain_backward(
             symbol="frost_la_gdn2_chain_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
+        if compile_host is not None:
+            return compiled
+        chain_backward_cache[key] = compiled
     return chain_backward_cache[key]
 
 

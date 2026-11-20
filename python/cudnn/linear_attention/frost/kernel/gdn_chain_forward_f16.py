@@ -483,6 +483,7 @@ def build_chain_forward(
     lead_buffers=(None,) * 8,
     l2norm_skip_k=False,
     l2norm_eps=l2norm.L2_NORM_EPS,
+    compile_host=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, checkpoint and final-state presence, seed dtype,
     chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are
@@ -551,7 +552,8 @@ def build_chain_forward(
         l2norm_k_expand_num,
         bool(l2norm_skip_k),
     )
-    if key not in chain_forward_cache:
+    compiled = chain_forward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         tinv_cfg, summary_cfg, prefill_cfg = build_configs(
             io_dtype,
             get_dtype(state_h.dtype),
@@ -599,7 +601,8 @@ def build_chain_forward(
                 ),
                 from_dlpack(DeviceView(256, (1, HO, DV, DK), dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_forward_cache[key] = compile_cached(
+        compiler = compile_cached if compile_host is None else compile_host
+        compiled = compiler(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -679,7 +682,9 @@ def build_chain_forward(
             symbol="frost_la_gdn_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return chain_forward_cache[key]
+        if compile_host is None:
+            chain_forward_cache[key] = compiled
+    return compiled
 
 
 def run_chain_forward(

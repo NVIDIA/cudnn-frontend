@@ -946,6 +946,7 @@ def build_uncut_backward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    compile_host=None,
 ):
     """Compile (cached per static config) the uncut backward launch over the buffers of one plan.  The placeholders
     repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute or the bprop
@@ -1015,7 +1016,7 @@ def build_uncut_backward(
             else None
         ),
     )
-    if key not in uncut_backward_cache:
+    if compile_host is not None or key not in uncut_backward_cache:
         flags = dict(
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
@@ -1308,7 +1309,7 @@ def build_uncut_backward(
             from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
             for buffer in post_buffers[2:]
         ]
-        uncut_backward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             uncut_backward_host,
             int(b_t),
             io_dtype,
@@ -1375,6 +1376,9 @@ def build_uncut_backward(
             symbol="frost_la_gdn2_uncut_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
+        if compile_host is not None:
+            return compiled
+        uncut_backward_cache[key] = compiled
     return uncut_backward_cache[key]
 
 

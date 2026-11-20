@@ -576,6 +576,7 @@ def build_chain_backward(
     tail_enable=None,
     post_buffers=(None,) * 18,
     fold_buffers=(None,) * 4,
+    compile_host=None,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``,
     ``heads_out`` and ``num_seqs`` are launch arguments; ``prefill_words`` is None when the graph passes the series back
@@ -621,7 +622,8 @@ def build_chain_backward(
         tuple((str(buffer.dtype), len(buffer.shape)) if buffer is not None else None for buffer in post_buffers),
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers),
     )
-    if key not in chain_backward_cache:
+    compiled = chain_backward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         recompute_summary_cfg, recompute_series_cfg, bprop_summary_cfg, bprop_cfg = build_configs(
             io_dtype,
             regenerate=regenerate,
@@ -665,7 +667,7 @@ def build_chain_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_backward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             chain_backward_host,
             int(unit_chunks),
             int(b_t),
@@ -745,7 +747,9 @@ def build_chain_backward(
             symbol="frost_la_mamba2_chain_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return chain_backward_cache[key]
+        if compile_host is None:
+            chain_backward_cache[key] = compiled
+    return compiled
 
 
 def run_chain_backward(
@@ -808,9 +812,10 @@ def run_chain_backward(
     tail_enable=None,
     post_buffers=(None,) * 18,
     fold_buffers=(None,) * 4,
+    launch_host=None,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its launches."""
-    cpp_launcher.launch(
+    (launch_host or cpp_launcher.launch)(
         compiled,
         int(pieces),
         int(heads_out),

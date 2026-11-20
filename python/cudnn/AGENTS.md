@@ -1413,6 +1413,16 @@ reject without changing the selected reduction mode.
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/operations/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
+In `@cute.jit` JAX launchers, annotate static configuration arguments with
+`cutlass.Constexpr` and guard plan-dependent branches with `cutlass.const_expr`.
+Copying that configuration into a dictionary of tensor arguments does not make
+the new dictionary constexpr; its metadata must not cross a runtime branch.
+Detector: Mamba2 cases in `test/python/linear_attention/jax/test_linear_attention_jax.py::test_forward_and_jitted_gradients`.
+The JAX linear-attention adapter captures constexprs from the native builder
+and binds the runtime frame through the same FROST plan. A test that names a
+chain route must assert plan selection; the token threshold can change and
+silently turn a nominal chain case into an uncut case.
+
 JAX tracers do not reveal eventual buffer placement. A default device can supply
 tuning properties only when the resulting launch and scratch sizes remain valid
 on every supported execution device. Pin the compiler architecture explicitly and

@@ -317,6 +317,7 @@ class CompiledMamba2:
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
@@ -386,7 +387,7 @@ class CompiledMamba2:
             self.ragged_buffers = itemgetter(*indices)
             self.ragged_scalars = (int(self.ragged_pieces), int(self.num_seqs), 0, 0)
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, *, launch_host=None) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
         fold = self.index_preceding_state_update is not None
         fold_buffers = (
@@ -398,7 +399,7 @@ class CompiledMamba2:
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
-            cpp_launcher.launch(
+            (launch_host or cpp_launcher.launch)(
                 self.chain_launch, *self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)), None, *fold_buffers
             )
             return
@@ -842,6 +843,7 @@ class CompiledMamba2Bwd:
                 ragged_recompute_words = tensormap_workspace_bytes(prefill_module, slots) // 8
                 regions.append(("ragged_recompute_tensormaps", layout.add(ragged_recompute_words * 8, align=128), "int64", (ragged_recompute_words,)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 

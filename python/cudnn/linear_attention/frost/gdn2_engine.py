@@ -443,6 +443,7 @@ class CompiledGdn2:
             ragged_bytes = tensormap_workspace_bytes(kernel_module, slots)
             regions.append(("ragged_tensormaps", layout.add(ragged_bytes, align=128), "int64", (ragged_bytes // 8,)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
@@ -1209,6 +1210,7 @@ class CompiledGdn2Bwd:
             regions.append(("dstate_snapshot", layout.add(B * HO * V * K * d_bytes, align=128), d_name, (B, HO, V, K)))
         self.order_in_recompute = not self.has_state_checkpoints
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 

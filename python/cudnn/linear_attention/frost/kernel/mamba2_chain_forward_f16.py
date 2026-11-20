@@ -393,6 +393,7 @@ def build_chain_forward(
     tail=False,
     tail_enable=None,
     fold_buffers=(None,) * 4,
+    compile_host=None,
 ):
     """Compile (cached per static config) the chain forward launch over the buffers of one plan; ``pieces``,
     ``heads_out`` and ``num_seqs`` are launch arguments."""
@@ -434,7 +435,8 @@ def build_chain_forward(
         tail_enable is not None,
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers),
     )
-    if key not in chain_forward_cache:
+    compiled = chain_forward_cache.get(key) if compile_host is None else None
+    if compiled is None:
         summary_cfg, prefill_cfg = build_configs(
             io_dtype,
             store_final_state=final_state is not None,
@@ -472,7 +474,7 @@ def build_chain_forward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_forward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -531,7 +533,9 @@ def build_chain_forward(
             symbol="frost_la_mamba2_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return chain_forward_cache[key]
+        if compile_host is None:
+            chain_forward_cache[key] = compiled
+    return compiled
 
 
 def run_chain_forward(
@@ -579,11 +583,12 @@ def run_chain_forward(
     first_head_lo=0,
     tail_enable=None,
     fold_buffers=(None,) * 4,
+    launch_host=None,
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the four launches."""
     buffers = dict(locals())
     buffers["checkpoints"] = checkpoints if int(checkpoint_every_n_tokens) > 0 else None
-    cpp_launcher.launch(
+    (launch_host or cpp_launcher.launch)(
         compiled,
         int(pieces),
         int(heads_out),

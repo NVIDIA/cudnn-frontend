@@ -565,6 +565,7 @@ def build_uncut_forward(
     ragged_chain_rows=0,
     ragged_enable=None,
     ragged_buffers=(),
+    compile_host=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the d_v split, state and checkpoint
     presence, device) the uncut forward launch over the buffers of one plan.  The placeholders repeat the marks of the
@@ -621,7 +622,7 @@ def build_uncut_forward(
         fold_rows,
         (int(ragged_pieces), int(ragged_unit_chunks), int(ragged_chain_rows)),
     )
-    if key not in uncut_forward_cache:
+    if compile_host is not None or key not in uncut_forward_cache:
         prefill_module = gdn2_prep_prefill_f16 if prep else gdn2_prefill_f16
         prefill_cfg = prefill_module.build_cfg(
             io_dtype,
@@ -848,7 +849,7 @@ def build_uncut_forward(
                     leading_dim=3
                 ),
             ]
-        uncut_forward_cache[key] = compile_cached(
+        compiled = (compile_host or compile_cached)(
             uncut_forward_host,
             int(b_t),
             int(num_sm),
@@ -897,6 +898,9 @@ def build_uncut_forward(
             symbol="frost_la_gdn2_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
+        if compile_host is not None:
+            return compiled
+        uncut_forward_cache[key] = compiled
     return uncut_forward_cache[key]
 
 
