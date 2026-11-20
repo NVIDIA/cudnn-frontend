@@ -2591,19 +2591,20 @@ def test_stage3_block_scale_dq_single_launch_is_bitwise_the_per_member_launches(
 
 
 @requires_rubin
-def test_graph_routes_to_the_row_when_opted_in_and_declines_typed_otherwise(monkeypatch):
-    """The d256 ``sdpa_mxfp8_backward`` graph on cc 10.7 lists THIS row (bracket-form name) and no other; with FROST opted out the
-    graph is admitted at validate / build and ``create_execution_plans`` raises the typed ``cudnnGraphNotSupportedError`` -- cuDNN
-    9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified 2026-09-29), so the row is the sole provider."""
-    g, _t, _outs = _mxfp8_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), names
-    assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), names
-    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    g2, _t, _outs = _mxfp8_graph()
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g2.create_execution_plans([cudnn.heur_mode.A])
+def test_graph_routes_to_the_row_with_or_without_the_flag(monkeypatch):
+    """The d256 ``sdpa_mxfp8_backward`` graph on cc 10.7 lists THIS row (bracket-form name) and no other, with or without the opt-in
+    flag: cuDNN 9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified 2026-09-29), so the row is the sole provider and is
+    offered by default, behind the backend (#2637)."""
+    for flag in ("1", None):
+        if flag is None:
+            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        else:
+            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", flag)
+        g, _t, _outs = _mxfp8_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), (flag, names)
+        assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), (flag, names)
 
 
 @requires_rubin
