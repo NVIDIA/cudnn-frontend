@@ -68,8 +68,8 @@ NIGHTLY-only -- a cell leaves FULL only with a named twin that keeps its arm (`n
 
 Counts at the time of writing: SMOKE cc 10.7 = 358 cells (266 hand-picked + 92 rule-added), cc 10.0 = 274 (142 + 132),
 cc 10.3 = 282 (the cc 10.0 cells that run on cc 10.3; the list's header names the 15 left out);
-NIGHTLY-only = 120 (96 codegen pins + 24 B / H / seed twins); SMOKE cc 12.0 = 12 cells (the fused GDN decode / verify steps only -- the
-FROST SDPA sm120 modules have no list yet). Lists for other capabilities are added as they are reviewed.
+NIGHTLY-only = 120 (96 codegen pins + 24 B / H / seed twins); SMOKE cc 12.0 = 204 cells (181 FROST SDPA sm120 hand-picked +
+11 rule-added + 12 fused GDN decode / verify). Lists for other capabilities are added as they are reviewed.
 
 ## Running
 
@@ -81,9 +81,9 @@ pytest -m smoke -n 4 --dist loadgroup sdpa/frost gated_attention_block/cutedsl s
 pytest -m "L0 and not nightly_only" sdpa/frost gated_attention_block/cutedsl sdpa/graph/test_mhas_v2.py linear_attention/frost      # FULL
 ```
 
-On a cc 12.0 part (`cc120`) the SMOKE list holds the fused GDN decode / verify cells of `linear_attention/frost` only (12 cells;
-the FROST SDPA sm120 modules have no list yet), so `pytest -m smoke linear_attention/frost` is the whole tier there; the other
-paths collect and deselect.
+On a cc 12.0 part (`cc120`) the SMOKE list holds the FROST SDPA sm120 cells of `sdpa/frost` (one section per engine row of
+`python/cudnn/sdpa/frost/support/sm120.md`) and the fused GDN decode / verify cells of `linear_attention/frost`, so
+`pytest -m smoke sdpa/frost linear_attention/frost` is the whole tier there; the other paths collect and deselect.
 
 Several pytest processes on one GPU: set `CUDNN_TEST_SHARED_GPU=1` in each so the GPU memory gate of `conftest.py` is armed
 for them (see `test/AGENTS.md`).
