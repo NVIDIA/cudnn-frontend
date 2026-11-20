@@ -1056,3 +1056,7 @@ the stored weights (`providers/flashinfer_calls.py`). What building these rows s
   token: with the three library rows the plain run of the default prompt was another text, and the speculative loop
   kept 3.27 tokens a step where it had kept 3.22 on the cuDNN Frontend rows. Such a figure is stated per row set
   that ran, each with its versions; it is never carried over.
+- A row a stack gains is a row of every script that plans the stack. The speculative script arrived while `native`
+  had no library row. With the rows it made the library's first use without the line rule 5 asks for, its help text
+  stated the memory of the other row set, and the runs its README dated on `native` were that row set's. When the rows
+  of a stack change, every script of the family is run on that stack again, and what it says of the stack is read.

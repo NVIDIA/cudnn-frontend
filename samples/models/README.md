@@ -292,7 +292,8 @@ model       <checkpoint>, ... layers | ... sequence | greedy
 GPU         <name>, compute capability ..., ... SMs
             other compute processes: not observed (this version)
             clocks observed: no (this version does not observe the GPU)
-kernels     ... of ... launches per step are on the target kernel set: cuDNN Frontend ..., PyTorch ...
+kernels     ... of ... launches per step are on the target kernel set: cuDNN Frontend ..., FlashInfer ...,
+            PyTorch ...
             = ... the target's own compiled kernels + ... cuDNN Frontend entries with byte-equal results
               + ... declared stand-ins
             not yet: ... block calls on fallback rows + ... launch of the target that has no block yet

@@ -110,9 +110,10 @@ The default run needs no checkpoint and no extra package; it needs a GPU of comp
 With --model: pip install -r samples/models/requirements.txt first, and a draft vocabulary (--draft-vocab FILE).  The
 checkpoint is your own download (nothing is fetched).  With the 27B checkpoint, a list of 65,536 ids and the default
 context length a run asks for about 61 GiB of free GPU memory on the stack fe-cublas (about 64 GiB on compute capability
-12.x), and on the stacks native and fe-entries for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x
-classes, about 64 GiB elsewhere: the model as 00_decode.py holds it, a state of six tokens per sequence, and the drafter
-with the bf16 copies its reference blocks multiply on.  Only compute capability 10.0 has run.
+12.x), on the stack fe-entries for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and
+about 64 GiB elsewhere, and on the stack native, whose three library rows need FlashInfer (00_decode.py --help has the
+command), for about 32 GiB and about 37 GiB there: the model as 00_decode.py holds it, a state of six tokens per sequence,
+and the drafter with the bf16 copies its reference blocks multiply on.  Only compute capability 10.0 has run.
 The generated text goes to standard output; every other line of a run goes to standard error.
 What a run proves per stack, the speculative configuration key by key and every flag: samples/models/qwen_dense/README.md
 """
@@ -498,6 +499,9 @@ def main(argv=None) -> int:
         )
     planning = time.perf_counter()
     try:  # every plan of the run before the first load, and ONE memory sentence, the drafter in it: nothing skips after this
+        # what a library row of the stack does at its first use beyond an entry's build, said before it is made (as 00_decode.py says it)
+        for note in dict.fromkeys(note for each in (plain, session) for note in each.resolve().announcements()):
+            _say(f"{TAG} planning: {note}", flush=True)
         tables = [plain.plan_table([session]), session.plan.table(), loop.PROMPT_ROWS, session.prefill_plan.table()]
         tables += [loop.DRAFTER_ROWS.format(calls=drafter.calls_per_pass()), session.draft_plan.table()]
         claim = session.claim()  # of a stack that declares a target: how the verify plan stands to it

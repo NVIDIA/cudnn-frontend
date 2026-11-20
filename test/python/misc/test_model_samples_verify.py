@@ -3849,6 +3849,8 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "- A figure of a greedy run on a checkpoint is a figure of a row set as well.",
         "with the three library rows the plain run of the default prompt was another text, and the speculative loop kept 3.27 tokens a step where it "
         "had kept 3.22 on the cuDNN Frontend rows. Such a figure is stated per row set that ran, each with its versions; it is never carried over.",
+        "- A row a stack gains is a row of every script that plans the stack. The speculative script arrived while `native` had no library row.",
+        "When the rows of a stack change, every script of the family is run on that stack again, and what it says of the stack is read.",
         "and a count of block calls -- 18 a pass -- is the wiring's.",
         "so the acceptance lines of a report printed behind the comparison are still the run's. Its bytes of a step are not:",
         "- What a step hands on by reference is held by identity, where it is handed on.",

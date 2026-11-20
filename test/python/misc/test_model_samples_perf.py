@@ -742,18 +742,32 @@ def test_checks_lines_say_what_was_judged(monkeypatch, tmp_path):
 
 
 def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkeypatch):
-    """Statistic 16 on the family's own tables: the 64-layer model on the stack ``native``, compute capability 10.0 with
-    148 SMs, planned on stated facts -- how many launches of a step are on the target kernel set, by provider and as
-    three numbers, and the block calls on fallback rows."""
+    """Statistic 16 on the family's own tables: the 64-layer model on compute capability 10.0 with 148 SMs, planned on
+    stated facts -- how many launches of a step are on the target kernel set, by provider and as three numbers, and the
+    block calls on fallback rows: on the cuDNN Frontend rows alone (``fe-entries``) and on ``native``, which has the
+    rows a library serves beside them."""
     from model_samples import Session, TextIO, blocks, census, perf
     from model_samples.qwen_dense import QwenDense
 
     monkeypatch.setattr(census, "installed_versions", lambda packages: {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"})
     model = QwenDense()
-    session = Session(model, TextIO.synthetic(272), stack="native", device="cpu", capacity=8)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
-    session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, "native", model=model, options={"device": "cpu"})
-    kernels = perf.kernel_facts(session, "PASS")
+
+    def planned(stack):
+        session = Session(model, TextIO.synthetic(272), stack=stack, device="cpu", capacity=8)
+        session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, stack, model=model, options={"device": "cpu"})
+        return perf.kernel_facts(session, "PASS")
+
+    kernels, native = planned("fe-entries"), planned("native")
+    assert (native["on_target"], native["launches"]) == (451, 484) and (native["code"], native["port"], native["stand_ins"]) == (178, 273, 0)
+    assert native["by_provider"] == {"cuDNN Frontend": 321, "FlashInfer": 129, "PyTorch": 1}
+    assert (native["fallback_calls"], native["absent"]) == (32, 1) and native["fallback_rows"], "451 + 32 + 1 = 484: the attention blocks are left"
+    wide = perf.screen(_data(kernels=native))  # a third provider: the line breaks between two of them
+    at = wide.index("kernels     451 of 484 launches per step are on the target kernel set: cuDNN Frontend 321, FlashInfer 129,")
+    assert wide[at + 1 : at + 3] == [
+        " " * 12 + "PyTorch 1",
+        " " * 12 + "= 178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results",
+    ]
     assert kernels["declared"] and kernels["stated"] and kernels["fallback_rows"]
     assert (kernels["on_target"], kernels["launches"]) == (322, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 273, 0)
     assert kernels["by_provider"] == {"cuDNN Frontend": 321, "PyTorch": 1}
@@ -1669,8 +1683,9 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     # the section of the area README: its example is the screen, every value a run measures or counts replaced by dots
     section = area.split("## The performance mode\n", 1)[1].split("\n## ", 1)[0]
     example = section.split("```text\n", 1)[1].split("```", 1)[0].splitlines()
-    target = {"stated": True, "declared": True, "on_target": 322, "launches": 484, "code": 49, "port": 273, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 321, "PyTorch": 1}, fallback_calls=162, kernels_per_step=2908, copies_per_step=200)
+    # the stack the example names, native: its three numbers and its providers with the rows a library serves (the test of the kernels lines)
+    target = {"stated": True, "declared": True, "on_target": 451, "launches": 484, "code": 178, "port": 273, "stand_ins": 0}
+    target.update(by_provider={"cuDNN Frontend": 321, "FlashInfer": 129, "PyTorch": 1}, fallback_calls=32, kernels_per_step=2908, copies_per_step=200)
     today = [
         "fallback rows present",
         "kernel identity not claimed on this GPU class",

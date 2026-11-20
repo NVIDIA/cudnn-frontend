@@ -1423,20 +1423,21 @@ def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkey
         return round(float(sentence.split("needs about ", 1)[1].split(" GiB", 1)[0]))
 
     figures = {(stack, cc): asked(stack, cc) for stack in ("fe-cublas", "native", "fe-entries") for cc in ((10, 0), (10, 3), (10, 7), (12, 0))}
-    assert [figures[("fe-cublas", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] == [61, 61, 61, 64]
-    assert [figures[("native", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] == [44, 48, 48, 64]
-    assert all(figures[("fe-entries", cc)] == figures[("native", cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0)))
+    cublas, entries, native = ([figures[(stack, cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] for stack in ("fe-cublas", "fe-entries", "native"))
+    # native keeps the weights of its three library rows on their stored codes on compute capability 10.x; elsewhere it plans as fe-entries
+    assert (cublas, entries, native) == ([61, 61, 61, 64], [44, 48, 48, 64], [32, 37, 37, 64])
     said = (
-        f"about {figures[('fe-cublas', (10, 0))]} GiB of free GPU memory on the stack fe-cublas (about {figures[('fe-cublas', (12, 0))]} GiB on compute "
-        f"capability 12.x), and on the stacks native and fe-entries for about {figures[('native', (10, 0))]} GiB on compute capability 10.0, about "
-        f"{figures[('native', (10, 3))]} GiB on the other 10.x classes, about {figures[('native', (12, 0))]} GiB elsewhere"
+        f"about {cublas[0]} GiB of free GPU memory on the stack fe-cublas (about {cublas[3]} GiB on compute capability 12.x), on the stack fe-entries for "
+        f"about {entries[0]} GiB on compute capability 10.0, about {entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere, and on "
+        f"the stack native, whose three library rows need FlashInfer (00_decode.py --help has the command), for about {native[0]} GiB and about "
+        f"{native[1]} GiB there"
     )
     assert said in " ".join(sample.EPILOG.split()) and "a list of 65,536 ids and the default context length" in " ".join(sample.EPILOG.split())
     # ... and the family README's section on the script states these figures, not others
     readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split("\n## Speculative decoding\n", 1)[1].split("\n## ", 1)[0].split())
     assert (
-        f"with a list of 65,536 ids and the default context length a run asks for about {figures[('fe-cublas', (10, 0))]} GiB free on the stack "
-        f"`fe-cublas` (about {figures[('fe-cublas', (12, 0))]} GiB on compute capability 12.x); on the stacks `native` and `fe-entries` for about "
-        f"{figures[('native', (10, 0))]} GiB on compute capability 10.0, about {figures[('native', (10, 3))]} GiB on the other 10.x classes, about "
-        f"{figures[('native', (12, 0))]} GiB elsewhere."
+        f"with a list of 65,536 ids and the default context length a run asks for about {cublas[0]} GiB free on the stack `fe-cublas` (about "
+        f"{cublas[3]} GiB on compute capability 12.x); on the stack `fe-entries` for about {entries[0]} GiB on compute capability 10.0, about "
+        f"{entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere; on the stack `native`, whose three library rows need "
+        f'FlashInfer (the section "The rows a library serves"), for about {native[0]} GiB and about {native[1]} GiB there.'
     ) in readme

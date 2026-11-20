@@ -1544,8 +1544,9 @@ python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-
 | you need | |
 |---|---|
 | for the default run | this checkout and a GPU of compute capability 10.x or 12.x: no checkpoint, no extra package |
+| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |
 | with `--model` | the packages of `samples/models/requirements.txt`, the checkpoint on local disk (22 GB), and a draft vocabulary: a JSON list of token ids, `--draft-vocab FILE`. The recipe of the section "The checkpoint's drafter" makes one from the files `--dump-tokens` writes, of this script or of `00_decode.py`. Without a list the run ends in one `ERROR` line that names that recipe |
-| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stacks `native` and `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes, about 64 GiB elsewhere. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
+| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stack `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and about 64 GiB elsewhere; on the stack `native`, whose three library rows need FlashInfer (the section "The rows a library serves"), for about 32 GiB and about 37 GiB there. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
 
 **What a run is.** A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then
 every step is five draft passes and one verify step of six tokens, and keeps one to six of them. A run says so before it
@@ -1636,8 +1637,8 @@ per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .
 of n, 2: y of x, ..` -- per drafted token the steps that kept it among those that kept the one before. Every step counts
 in full, the last one included, whose tokens behind an end token are not written. The acceptance length is a figure of
 this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list. Nor
-with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (the last run of this
-section has two). The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
+with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last
+runs have three). The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
 acceptance line)": a draft pass multiplies in fp64 on copies, and a rate of such a loop would be read as a speed. The
 `bytes per step` line is the verify step's arithmetic at six tokens per sequence and a draft pass's, five times. The
 `text out` line says how many tokens came out in how many steps. The report is printed before the checks.
@@ -1654,9 +1655,12 @@ script's own, and the checks of every run.
 | `native` and `fe-entries`, and any stack with `--check-kernels` | also the kernel check of whole steps: the lookups of the drafter's passes and the verify plan's rows one by one, everything else a pass launches attributed to the drafter's fallback rows |
 
 On `native`, at one sequence of six tokens on compute capability 10.0 with 148 SMs, a run proves what the verify step
-proves -- on the 64-layer model 370 of the 484 launches of a verify step are target kernels (49 the target's own
-compiled kernels + 321 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 13
-of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results) -- now behind a real
+proves -- on the 64-layer model 451 of the 484 launches of a verify step are target kernels (130 the target's own
+compiled kernels + 321 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 17
+of 20 (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results); on `fe-entries`,
+without the library rows, 370 of the 484 (49 the target's own compiled kernels + 321 cuDNN Frontend entries with
+byte-equal results) and 13 of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal
+results) -- now behind a real
 prefill, in one session, with kept counts the comparison decides. No block of the drafter is on a kernel yet: under the
 kernel check a run prints "kernel identity of the drafter's passes: not stated (the kernel census holds the verify
 step and the output head behind it; no section holds a draft pass)", and its last line before the verdict is "the
@@ -1669,7 +1673,8 @@ line of that run: the loop that writes them is the one the default run proves. T
 behind the prompt, the block check the first 16 prompt steps and the first 8 steps, the traced pass 16 steps. The last
 line of a run is the verdict of `00_decode.py` with the tag `[02]` ([../README.md](../README.md) has the table).
 
-**What ran** (2026-11-19; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only). The
+**What ran** (2026-11-19; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` on
+the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today). The
 default run -- the seeded two-layer model with its seeded drafter, a prompt of 26 tokens, then 32 new tokens in 10
 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on `fe-cublas`,
 `native` and `fe-entries` and in `[02] RAN reference stack (no provider checked)` on `reference`. In each of the four
@@ -1690,8 +1695,19 @@ tree as it is, which passed; each of the three ended in `[02] FAIL`. A drafted t
 chose another failed `ids` alone; one drafted token kept beyond the compared count failed `tokens`, `drafter cache`,
 `draft proposals`, `acceptance` and `ids`; one kept below it failed `acceptance` alone.
 
-**The last run with a checkpoint** (2026-11-19; the published checkpoint; cuDNN Frontend 1.34.0, CuTe DSL 4.8.0, PyTorch
-2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; the third command of this section as it is
+With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class) the
+default run on `native` ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of
+its process. Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count,
+and the kernel check passed over 10 traced steps, with 17 of 20 launches of the verify step target kernels (6 the
+target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results; the attention layer's
+out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens passed in
+13 steps, with "kernel identity: not stated for this run". The memory sentence of the default run asked for about
+5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP flashinfer.gemm.bmm_fp8 needs
+flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.
+
+**The last run with a checkpoint on the cuDNN Frontend rows** (2026-11-19; the published checkpoint; cuDNN Frontend
+1.34.0, CuTe DSL 4.8.0, PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native`
+selected those rows then, as `fe-entries` does today; the third command of this section as it is
 written, and once more on the default stack `fe-cublas`: the default prompt as a chat request body with `max_tokens`
 256, 58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids).
 Both runs ended in `[02] PASS`, and both stopped at the end token. On `native` the loop wrote 204 new tokens in 63
@@ -1711,6 +1727,21 @@ compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothi
 passes. The memory sentence asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by
 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the
 GPU was otherwise empty at the start of each.
+
+**The last run with a checkpoint on `native` with its library rows** (2026-11-20; PyTorch 2.14.0, FlashInfer
+0.7.2.post1; the same checkpoint, command, prompt, list and GPU class), made twice with the same figures. Both runs
+ended in `[02] PASS` at the end token. The loop wrote 231 new tokens in 71 steps: 3.27 kept tokens a step (1 + 161
+accepted drafted tokens / 71 steps); 9, 16, 20, 9, 7 and 10 steps kept one to six tokens; the first drafted token was
+accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, the fifth in
+10 of 17 -- the counts of the library loop on `native` in the section "The verify step". `position`, `prompt`,
+`recorded`, `rejected rows`, `drafter cache` and `draft proposals` passed on the first 16 steps, and replay with the
+proposals and the blocks of both kinds of step passed; `tokens` was reported -- 39 of 45 kept tokens were the decode
+steps' on the same tokens, the first that differs kept token 17. The kernel check passed over 16 traced steps, with
+451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend
+entries with byte-equal results): 435 of them in the launch shape the census records (114 the target's own compiled
+kernels + 321 cuDNN Frontend entries with byte-equal results), the 16 out-projections of the attention layers by
+membership, on the library's own CUTLASS multiply; nothing is stated about the kernels of the passes. The memory
+sentence asked for about 32.2 GiB.
 
 **What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference
 chain, and a run says "kernel identity of the drafter's passes: not stated". More than one request: `--sequences` is

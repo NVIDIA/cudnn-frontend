@@ -2150,8 +2150,8 @@ def test_the_samples_flags_for_the_kernel_check(monkeypatch, capsys):
         sample._writable("--dump-census", "/nowhere/at/all/census.json")
 
 
-def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB):
-    """``main()`` of the sample script on stated device facts (compute capability 10.0), up to its first load.  ``total``:
+def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script="00_decode.py"):
+    """``main()`` of a sample script on stated device facts (compute capability 10.0), up to its first load.  ``total``:
     the device's memory as a real device reports it; 0 states the facts only, and nothing is asked of an entry."""
     import importlib.util
 
@@ -2168,7 +2168,7 @@ def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB):
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples.Session, "load", no_load)
     paths = list(sys.path)
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_census_main", MODELS / "qwen_dense" / "00_decode.py")
+    spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_census_main", MODELS / "qwen_dense" / script)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
@@ -4474,15 +4474,17 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         _, table = run("native", 1, 4)
         assert table.count("none; unverified in CI") == 3, table
         gpu.update(total=180 * GIB, free=80 * GIB)
-    # ... and with the validated version the sample announces the library's first use while it plans, in one line
+    # ... and with the validated version a sample announces the library's first use while it plans, in one line: the plain
+    # script, and the speculative script, whose plans hold the library's rows three times (one sentence, said once)
     monkeypatch.setattr(flashinfer_calls, "installed", lambda: VALIDATED_LIBRARY)
     monkeypatch.setattr(Step, "decline", target)
     monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: False)
-    for stack, said in (("native", 1), ("fe-entries", 0)):
-        with monkeypatch.context() as scoped:
-            code, out = _sample_main(scoped, capsys, ["--stack", stack], total=180 * GIB, free=80 * GIB)
-        announced = [line for line in out.splitlines() if line.startswith("[00] planning: first use of FlashInfer 0.7.2.post1: it builds the kernels")]
-        assert code == 0 and len(announced) == said, out
+    for script in ("00_decode.py", "02_speculative_decode.py"):
+        for stack, said in (("native", 1), ("fe-entries", 0)):
+            with monkeypatch.context() as scoped:
+                code, out = _sample_main(scoped, capsys, ["--stack", stack], total=180 * GIB, free=80 * GIB, script=script)
+            line = f"[{script[:2]}] planning: first use of FlashInfer 0.7.2.post1: it builds the kernels"
+            assert code == 0 and sum(each.startswith(line) for each in out.splitlines()) == said, (script, stack, out)
 
 
 # ----------------------------------------------------------------------------------------------- an entry that a step calls in several forms
@@ -7887,7 +7889,8 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
     code, lines, out = _speculative_run(monkeypatch, capsys, three)
     assert (code, lines[-1], out) == (0, "[02] PASS", ""), lines[-6:]
     (kernels,) = _kernel_lines(lines)
-    assert kernels.endswith("    PASS") and "16 on exact rows, in the wiring order" in kernels, "three lookups of the passes and the verify plan's 13"
+    # ... 13 of them the cuDNN Frontend rows' and the lookup's, four the library rows': two down multiplies, the attention layer's out-projection, the head
+    assert kernels.endswith("    PASS") and "20 on exact rows, in the wiring order" in kernels, "three lookups of the passes and the verify plan's 17"
     assert lines.count(drafter) == 1 and lines.count(unseen) == 1 and lines.index(kernels.join(("  ", ""))) < lines.index(unseen) < lines.index(drafter)
     unstated = "kernel identity: not stated for this run (no recorded section for 4 tokens per sequence on cc 10.0 / 148 SMs: "
     assert any(line.strip().startswith(unstated) for line in lines), "three drafted tokens: a step shape the census holds no section for"
@@ -7922,14 +7925,14 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
     # and under the check, and every launch in its recorded shape
     code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "native"])
     planned = (
-        "kernel identity, as planned: 13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
-        "with byte-equal results); not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1"
+        "kernel identity, as planned: 17 of 20 launches of a step are target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries "
+        "with byte-equal results); not yet: attention.prepare 1, attention.core 1; 1 declared stand-in (not yet: output_head.quantize)"
     )
     load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
     stated = [index for index, line in enumerate(lines) if line.strip().startswith(planned)]
     assert len(stated) == 2 and stated[0] < load < stated[1], "with the plan, and again under the kernel check"
     (kernels,) = _kernel_lines(lines)
-    assert kernels.endswith("    PASS") and "18 on exact rows, in the wiring order" in kernels, "five lookups of the passes and the verify plan's 13"
+    assert kernels.endswith("    PASS") and "22 on exact rows, in the wiring order" in kernels, "five lookups of the passes and the verify plan's 17"
     assert any(line.strip().startswith("target census verify / cc 10.0 / 148 SMs") and ": NOT CLAIMED (fallback rows present" in line for line in lines)
     assert lines.count(drafter) == 1 and out == ""
     # On this tiny geometry the fp32 chains of the stand-ins leave the seeded model's declared logits band on a row of a rejected draft
@@ -7944,6 +7947,12 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
         and tokens[1].endswith("    FAIL")
     )
     assert (code, lines[-1]) == (1, "[02] FAIL")
+    # ... and on fe-entries, the cuDNN Frontend rows alone: the numbers of a verify plan without the rows a library serves
+    code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-entries"])
+    alone = "kernel identity, as planned: 13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
+    alone += "with byte-equal results); not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1"
+    assert sum(line.strip().startswith(alone) for line in lines) == 2 and "18 on exact rows, in the wiring order" in _kernel_lines(lines)[0]
+    assert (code, lines[-1]) == (1, "[02] FAIL"), "the token line of the stand-ins, as on native"
 
 
 # ----------------------------------------------------------------------------------------------- the rows a library serves
