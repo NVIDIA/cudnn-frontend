@@ -476,18 +476,30 @@ class QwenDense:
         whose weights the load keeps on their stored format alone."""
         return sum(2 * s.numel for s in self.tensor_specs() if s.fmt != "scalar") - 2 * self._elements(uncopied)
 
-    def state_bytes(self, sequences: int, capacity: int, tokens: int = 1) -> int:
+    def state_bytes(self, sequences: int, capacity: int, tokens: int = 1, page: Optional[int] = None, pages: Optional[int] = None) -> int:
         """Bytes of the decode state of ``sequences`` sequences: the slot pools of the linear-attention layers (one null slot
         each) and the key/value caches of the attention layers.  At ``tokens`` tokens per sequence a pool holds a
-        recurrent state per (sequence, token) and ``tokens + 2`` history columns per sequence."""
+        recurrent state per (sequence, token) and ``tokens + 2`` history columns per sequence.
+
+        ``page``: the attention caches are pools of pages of that many positions (``state.PagedKvCache``): per layer the
+        ``pages`` pages of every sequence (left out: as many as hold the capacity) -- the capacity rounded up to whole
+        pages -- and, once for the state, its tables (``state.PageTable``): two bytes per position and rotary element of
+        the cos / sin table, and 32 bytes per row for every position a step of ``tokens`` tokens can start at (three
+        position rows and one slot row of 64-bit integers), and again at one token per sequence for a state of several."""
         g = self.geometry
+        attention = sum(kind != "linear_attention" for kind in g.layer_kinds)
         state = 0
         for kind in g.layer_kinds:
             if kind == "linear_attention":
                 state += (sequences * tokens + 1) * g.la_value_heads * g.la_head_dim**2 * 4
                 state += (sequences + 1) * (g.la_conv_width - 2 + tokens) * g.qkv_channels * 2
-            else:
+            elif page is None:
                 state += 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
+            else:
+                state += sequences * (-(-capacity // page) if pages is None else pages) * g.attn_kv_heads * page * 2 * g.attn_head_dim * 2
+        if page is not None and attention:
+            state += capacity * g.rotary_dim * 2
+            state += sum(max(capacity - each + 1, 0) * sequences * each * 32 for each in sorted({tokens, 1}))
         return state
 
     def stored_bytes(self, stored: Sequence[str] = ()) -> int:
@@ -507,11 +519,21 @@ class QwenDense:
         weight has its copy."""
         return max((2 * out * inner for block in uncopied for out, inner in self.weight_shapes(block)[1]), default=0)
 
-    def memory_bytes(self, sequences: int, capacity: int, stored: Sequence[str] = (), uncopied: Sequence[str] = (), tokens: int = 1) -> int:
+    def memory_bytes(
+        self,
+        sequences: int,
+        capacity: int,
+        stored: Sequence[str] = (),
+        uncopied: Sequence[str] = (),
+        tokens: int = 1,
+        page: Optional[int] = None,
+        pages: Optional[int] = None,
+    ) -> int:
         """What a run needs on the GPU besides a kernel's own reservation: the weights held -- the bf16 copies (not those
         of the blocks ``uncopied``) and the stored tensors of the blocks ``stored`` (``stored_bytes``) -- the state (at
-        ``tokens`` tokens per sequence: ``state_bytes``), working memory, and the one copy the checks make on demand at
-        a time (``check_bytes``).
+        ``tokens`` tokens per sequence, and with attention caches in pages of ``page`` positions where a block of the
+        run asks for them: ``state_bytes``), working memory, and the one copy the checks make on demand at a time
+        (``check_bytes``).
 
         Working memory is load-time temporaries, activations, the reference's fp64 temporaries during the checks and the
         allocator's slack: 2 GiB, or an eighth of the weights held where that is more, and a quarter of the stored
@@ -535,7 +557,7 @@ class QwenDense:
         kept = self.stored_bytes(stored)
         held = self.copy_bytes(uncopied) + kept
         working = max(2 * GIB, held // 8) + kept // 4
-        return held + self.state_bytes(sequences, capacity, tokens) + working + self.check_bytes(uncopied)
+        return held + self.state_bytes(sequences, capacity, tokens, page, pages) + working + self.check_bytes(uncopied)
 
     def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = (), tokens: int = 1) -> Dict[str, int]:
         """What one step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
@@ -573,11 +595,15 @@ class QwenDense:
         return {"weights": on_disk + embedding, "copies": copies - 2 * self._elements(stored) + kept + embedding, "stored": kept, "state": state}
 
     def state_shapes(self) -> Dict[str, tuple]:
+        """What a decode state is built from (``state.DecodeState``): the shapes of a recurrent state, of a conv history and
+        of a cached key or value row, and the rotary facts of an attention layer -- the rotary width and theta, from
+        which a paged cache builds its cos / sin table."""
         g = self.geometry
         return {
             "state": (g.la_value_heads, g.la_head_dim, g.la_head_dim),
             "conv": (g.la_conv_width - 1, g.qkv_channels),
             "kv": (g.attn_kv_heads, g.attn_head_dim),
+            "rotary": (g.rotary_dim, g.rope_theta),
         }
 
     # ------------------------------------------------------------------ load

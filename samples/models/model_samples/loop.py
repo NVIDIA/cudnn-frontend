@@ -364,6 +364,39 @@ class Session:
                     layouts.setdefault(name, layout)
         return layouts
 
+    def cache_page(self) -> Optional[int]:
+        """The positions of a page of this session's attention cache, or ``None`` for the plain cache: what the blocks of its
+        plans ask for (``Block.cache_page``) -- of its step's plan and, where it has one, of its prompt's.  A session has
+        ONE state, so two blocks that name two pages are a ``ValueError``, a wrong table, named with their plans -- as is a
+        page that is no whole number of positions from 1; a block that names none reads either layout.  Two sessions on
+        one load share weights, never a state: each is built in the layout its own plans ask for.  The drafter's plan is
+        not asked: its cache is the drafter's own."""
+        asked = {}  # page -> the first block that asks for it, with its plan
+        for plan, _ in self._kinds():
+            for label, _, _, _, block in plan.parts():
+                page = getattr(block, "cache_page", None)
+                if page is None:
+                    continue
+                where = f"{label} in the plan of {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}{plan.tokens_text()}"
+                if isinstance(page, bool) or not isinstance(page, int) or page < 1:  # what a state asks of its page, asked here: before a byte is read
+                    raise ValueError(
+                        f"the provider table is wrong: {where} asks for pages of {page!r} positions; the page of an attention cache is a whole number of positions from 1"
+                    )
+                asked.setdefault(page, where)
+        if len(asked) > 1:
+            (one, first), (other, second) = list(asked.items())[:2]
+            raise ValueError(
+                "the provider table is wrong: the blocks of one session ask for two layouts of its attention cache -- "
+                f"{first} asks for pages of {one} positions, {second} for pages of {other}; a session has one state, in one layout"
+            )
+        return next(iter(asked), None)
+
+    def _paged(self) -> dict:
+        """The page of this session's attention cache as a keyword of a family's memory arithmetic, where a block of its
+        plans asks for a paged cache (a family whose states are plain is never asked)."""
+        page = self.cache_page()
+        return {} if page is None else {"page": page}
+
     def _kept(self) -> dict:
         """What the plans of the run ask the family's loader to keep, as its keyword arguments: nothing for a run whose every
         multiply reads a bf16 copy (a family without such a block is never asked)."""
@@ -437,15 +470,18 @@ class Session:
         self._followers = tuple(later)
         if self._share is None:
             self.stored_layouts()  # one weight in two row orders is a wrong table: named here, with the plans, before anything is built or read
+        for session in (self, *later):
+            session.cache_page()  # ... and so are two layouts of one session's attention cache
         sentence = ""
         if self.device.type == "cuda":
             # what the load of the first session holds follows the plans: the stored format of the weights a block multiplies
             # on, and no bf16 copy of those no block reads as one (asked of a family's model only where a plan has such a block)
             held = self._kept() if self._share is None else {}
-            need = self.model.memory_bytes(self.sequences, self.capacity, **held, **self._per_token()) - (
+            need = self.model.memory_bytes(self.sequences, self.capacity, **held, **self._per_token(), **self._paged()) - (
                 self.model.copy_bytes() if self._share is not None else 0
             )
-            need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token()) for session in later)
+            # a session whose blocks ask for a paged attention cache holds a pool and its tables where a plain one holds two tensors a layer
+            need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token(), **session._paged()) for session in later)
             need += sum(session._drafter_bytes() for session in (self, *later))
             # one state per session: a session that feeds its prompt through decode steps runs them on the state of its verify
             # steps, so it is counted once.  Nothing is added for its second plan either: what a first launch of the fused step
@@ -508,6 +544,7 @@ class Session:
         # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
         # two row orders of one weight end here -- before an entry builds anything, before a byte is read
         layouts = self.stored_layouts() if self._share is None else {}
+        self.cache_page()  # two layouts of this session's attention cache: the same kind of wrong table, named at the same place
         for each in self._first_used():
             each.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
@@ -580,9 +617,10 @@ class Session:
         self._report.clock.ids.clear()
 
     def _fresh_state(self) -> DecodeState:
-        """A zero state at position 0 for this session's sequences and tokens per sequence, in allocations of its own."""
+        """A zero state at position 0 for this session's sequences and tokens per sequence, in allocations of its own; its
+        attention caches in the layout the blocks of the session's plans ask for (``cache_page``)."""
         shapes = self.model.state_shapes()
-        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens)
+        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens, page=self.cache_page())
         if self.drafter is not None:  # the drafter's own cache: as many positions as the model's
             state.draft = self.drafter.state(self.sequences, self.capacity, self.device)
         return state

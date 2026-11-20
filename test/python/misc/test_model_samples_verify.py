@@ -27,6 +27,7 @@
 
 No GPU, no weights on disk, no profiler."""
 
+import contextlib
 import re
 import sys
 from pathlib import Path
@@ -57,6 +58,7 @@ GATHER = "void at::native::(anonymous namespace)::indexSelectSmallIndex<BFloat16
 ELEMENTWISE = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<double>, std::array<char*, 2ul> >(int, ...)"
 HOST_READ = "Memcpy DtoH (Device -> Pageable)"
 WHOLE = "the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): "
+PAGE = 64  # positions of a page of a paged attention cache
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -88,15 +90,39 @@ def _tiny_model(kinds=("linear_attention", "full_attention", "linear_attention")
     return QwenDense(geometry, reductions=("tiny geometry",))
 
 
-def _pair(sequences, tokens, steps=32):
+@contextlib.contextmanager
+def _a_block_asks_for_a_page(page=PAGE, key="torch_ref.attention_prepare"):
+    """Inside: a plan that is resolved serves the block of ``key`` with a stand-in that runs the reference chain under another
+    type and asks for an attention cache in pages of ``page`` positions (``Block.cache_page``) -- what the adapter of a
+    kernel that writes a paged pool states.  A session whose plan has it builds a paged state."""
+    from model_samples import providers
+
+    registry = providers.factories
+    served = registry()[key]
+
+    class AsksForAPage(served):
+        cache_page = page
+
+    providers.factories = lambda: dict(registry(), **{key: AsksForAPage})
+    try:
+        yield AsksForAPage
+    finally:
+        providers.factories = registry
+
+
+def _pair(sequences, tokens, steps=32, page=None):
     """A decode session that has run ``steps`` decode steps, and a verify session of ``tokens`` tokens per sequence on its
-    weights: the reference stack on the CPU."""
+    weights: the reference stack on the CPU.  ``page``: the verify session's attention cache is paged (a block of its
+    plan asks for pages of that many positions); the decode session's stays plain."""
     from model_samples import Session, TextIO
 
     model = _tiny_model()
     text = TextIO.synthetic(model.geometry.vocab)
     decode = Session(model, text, sequences=sequences, stack="reference", device="cpu", capacity=steps + tokens)
     verify = Session(model, text, sequences=sequences, stack="reference", device="cpu", capacity=steps + tokens, share=decode, tokens=tokens)
+    if page is not None:
+        with _a_block_asks_for_a_page(page):
+            verify.resolve()
     decode.plan_table([verify])
     decode.load()
     verify.load()
@@ -2039,11 +2065,13 @@ def test_a_row_that_hands_a_call_site_on_and_the_parts_of_its_block():
 
 
 # ---------------------------------------------------------------- one session for the prompt's decode steps and the verify steps
-def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, **more):
+def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, page=None, **more):
     """A plain session and a session built with ``draft_tokens=drafted`` on its weights -- the reference stack on the CPU,
     the tiny geometry -- both loaded; the prompts; and the plain run's new tokens of every sequence (``new`` and the
     ``drafted - 1`` more the last window reads): ``(plain, session, prompts, stream)``.  ``drafter``: what makes the
-    session's drafter from the model (``QwenDenseDrafter.seeded``, or a wrong one's); left out, the session has none."""
+    session's drafter from the model (``QwenDenseDrafter.seeded``, or a wrong one's); left out, the session has none.
+    ``page``: the session's attention cache is paged -- a block of both of its plans asks for pages of that many
+    positions -- while the plain session's stays plain."""
     from model_samples import Session, TextIO
 
     model = _tiny_model()
@@ -2053,6 +2081,9 @@ def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, **more):
     common = dict(sequences=sequences, stack="reference", device="cpu", capacity=prompt + new + drafted)
     plain = Session(model, text, **common)
     session = Session(model, text, share=plain, draft_tokens=drafted, **common, **more)
+    if page is not None:
+        with _a_block_asks_for_a_page(page):
+            session.resolve()
     plain.plan_table([session])
     plain.load()
     session.load()
@@ -4080,3 +4111,193 @@ def test_a_snapshot_behind_a_step_that_kept_drafted_tokens_gives_the_steps_behin
     state.restore(dict(snap, accepted=0))
     wrong, misdrafted = two_steps()
     assert wrong[0, 0, 0, 0] != behind[0, 0, 0, 0] and not torch.equal(misdrafted[0], drafted[0]), "what the kept count of a restore decides"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The verify step on a paged attention cache (``state.PagedKvCache``): the steps below cross positions 63 / 64, the first
+# boundary between two pages of a sequence, and reject drafted rows on both sides of it.
+
+
+def _pools(state):
+    """The pools of the attention layers of a paged state."""
+    from model_samples.state import PagedKvCache
+
+    return [layer.pool for layer in state.layers if isinstance(layer, PagedKvCache)]
+
+
+@pytest.mark.parametrize("sequences, tokens", [(3, 4), (1, 5)])
+def test_a_verify_step_on_a_paged_cache_is_that_many_decode_steps_across_a_page_boundary(sequences, tokens):
+    """A verify session whose cache is paged against a decode session on the plain cache, on one load: 80 decode steps go
+    through verify steps that keep every possible number of tokens in turn, among them steps that write rows of two
+    pages.  Tokens, logits and the kept state are the decode steps', byte for byte, and the session's own checks hold."""
+    from model_samples import tie_out
+    from model_samples.state import KvCache, PagedKvCache
+
+    decode, verify = _pair(sequences, tokens, steps=80, page=PAGE)
+    assert isinstance(decode.state.layers[1], KvCache) and isinstance(verify.state.layers[1], PagedKvCache), "two sessions on one load: a layout each"
+    assert (verify.state.pages, verify.state.table.tokens, verify.cache_page(), decode.cache_page()) == (2, tokens, PAGE, None)
+    stream = tie_out.Stream.of(decode)
+    schedule = tie_out.accept_schedule(tokens, stream.steps)
+    straddle = [(start, kept) for start, kept in schedule if start < PAGE <= start + tokens - 1]
+    assert straddle and any(start + kept + 1 < PAGE for start, kept in straddle), "a step writes rows of two pages and rejects rows on both sides"
+    checks = tie_out.verify_checks(verify, decode, stream)
+    rows = sequences * tokens * len(schedule)
+    assert checks.ok and checks.judged == 2, checks.text()
+    assert f"{rows} of {rows} greedy tokens equal to those of the decode steps of the same tokens; {rows} of {rows} decidable" in checks.lines[1]
+    assert "largest logit distance 0 = 0.00 bf16 units" in checks.lines[1] and checks.lines[1].endswith("    PASS")
+    assert "cached keys and values byte-equal in 1 of 1 attention layers" in checks.lines[2] and checks.lines[2].endswith("    PASS")
+    own = tie_out.run_checks(verify, prompt_tokens=0)
+    assert own.ok and own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS"), own.text()
+    assert f"{rows} of {rows} greedy tokens equal to the reference stack's" in own.text()
+    if sequences > 1:  # one sequence alone runs on its window of the pool
+        assert f"one sequence alone vs among {sequences} (step t: sequence t mod {sequences})" in own.text() and "12 of 12 blocks equal" in own.text()
+
+
+def test_the_verify_loop_on_a_paged_cache_keeps_every_count_and_reads_no_rejected_row():
+    """One session for a prompt and its verify steps on a paged cache, two sequences, a prompt of 57 tokens: the third step
+    starts at position 60, keeps two drafted tokens and rejects the rows of positions 63, 64 and 65 -- the last row of a
+    page and the first two of the next.  Nothing is restored: the next step starts at 63 and writes 63 to 68, so every
+    rejected row is written again before a row past the kept position is read.  Held here by filling those rows with
+    NaN behind the step: the run's tokens are the plain run's, no logit is a NaN, and the comparison with decode
+    steps holds on every line."""
+    from model_samples import sampling, tie_out
+
+    drafted, new, prompt = 5, 24, 57
+    plain, session, prompts, stream = _speculative(2, drafted, new, prompt, page=PAGE)
+    pools, pages, vocab = _pools(session.state), session.state.pages, session.model.geometry.vocab
+    assert len(pools) == 1 and pages == 2 and session.state.table.first_token().tokens == 1
+    out = [[token] for token in session.read(session.prefill(prompts))]
+    scheduled, done, filled, fills = [], 1, None, 0
+    while done < new:
+        length = len(scheduled) % (drafted + 1)
+        windows = [[out[i][-1], *tie_out.forced_drafts(stream[i][done:], length, drafted, vocab)] for i in range(2)]
+        start = session.state.position
+        greedy = session.read(session.verify(torch.tensor(windows, dtype=torch.int32)))
+        kept = sampling.accepted(windows, greedy)
+        session.accept(kept)
+        if filled is not None:  # the step behind the one whose rejected rows were filled: it wrote every one of them
+            assert start == filled[0] and set(filled) <= set(range(start, start + drafted + 1))
+            assert all(bool(torch.isfinite(pool.float()).all()) for pool in pools), "no rejected row is left: each was written again"
+            filled = None
+        if (start, kept) == (60, 2):  # rows of positions 60 to 65 written, 60 to 62 kept
+            filled, fills = list(range(start + kept + 1, start + drafted + 1)), fills + 1
+            assert filled == [63, 64, 65] and session.state.position == 63
+            for pool in pools:
+                for sequence in range(2):
+                    for position in filled:
+                        assert bool(pool[sequence * pages + position // PAGE, :, position % PAGE].any()), "what a rejected token wrote"
+                        pool[sequence * pages + position // PAGE, :, position % PAGE] = float("nan")
+            read = session.state.layers[1].keys(66, torch.bfloat16)  # what a reader of position 65 would be handed
+            assert bool(torch.isnan(read[:, :, 63:]).all()) and bool(torch.isfinite(read[:, :, :63].float()).all())
+        for i in range(2):
+            out[i] += greedy[i][: kept + 1]
+        scheduled.append(length)
+        done += kept + 1
+    assert fills == 1, "the step at position 60 that keeps two drafted tokens never came: no rejected row was filled, and nothing below could see one read"
+    assert [row[:new] for row in out] == [row[:new] for row in stream], "the ids are the plain session's"
+    assert session.record.accepted == scheduled and set(scheduled) == set(range(drafted + 1)), "every count from 0 to the drafted tokens was kept"
+    assert bool(torch.isfinite(session.record.logits[: session.record.count].float()).all()), "no row read what a rejected token left"
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    assert checks.ok, checks.text()
+    for name in ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "acceptance"):
+        assert _line(checks, name).endswith("    PASS"), _line(checks, name)
+    assert "in 3 of 3 layers (states and caches); ids and logits of 57 of 57 prompt steps" in _line(checks, "prompt")
+    own = tie_out.run_checks(session, prompt_tokens=prompt)
+    assert own.ok and own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS"), own.text()
+
+
+def test_a_snapshot_of_a_paged_state_gives_the_steps_behind_it_again():
+    """``snapshot`` / ``restore`` on a paged state that stands behind a step with rejected rows in two pages: the pool is
+    saved and written back in place, the tables are not part of it, and the steps behind the restored state give what
+    they gave the first time."""
+    from model_samples import tie_out
+
+    plain, session, prompts, stream = _speculative(2, 5, 24, 57, page=PAGE)
+    vocab, state = session.model.geometry.vocab, session.state
+    out = [[token] for token in session.read(session.prefill(prompts))]
+    done = 1
+    for length in (0, 1, 2):
+        windows = [[out[i][-1], *tie_out.forced_drafts(stream[i][done:], length, 5, vocab)] for i in range(2)]
+        greedy = session.read(session.verify(torch.tensor(windows, dtype=torch.int32), length))
+        for i in range(2):
+            out[i] += greedy[i][: length + 1]
+        done += length + 1
+    snap = state.snapshot()
+    (pool,) = _pools(state)
+    assert (
+        (state.position, state.accepted, snap["accepted"]) == (63, 2, 2) and len(snap["layers"][1]) == 1 and snap["layers"][1][0].data_ptr() != pool.data_ptr()
+    )
+
+    def two_steps():
+        made, at, kept_tokens = [], done, [list(row) for row in out]
+        for length in (3, 4):
+            windows = [[kept_tokens[i][-1], *tie_out.forced_drafts(stream[i][at:], length, 5, vocab)] for i in range(2)]
+            greedy = session.verify(torch.tensor(windows, dtype=torch.int32), length)
+            made.append(greedy.clone())
+            for i in range(2):
+                kept_tokens[i] += greedy[i, : length + 1].tolist()
+            at += length + 1
+        return torch.stack(made), pool.clone()
+
+    behind, written = two_steps()
+    assert state.position == 72 and not torch.equal(written, snap["layers"][1][0])
+    state.restore(snap)
+    assert (state.position, state.accepted) == (63, 2) and _pools(state)[0] is pool and torch.equal(pool, snap["layers"][1][0])
+    again, rewritten = two_steps()
+    assert torch.equal(again, behind) and torch.equal(rewritten, written), "behind the restored state: the same greedy ids, the same pool"
+
+
+#: the three wrong loops that kept every greedy token of the seeded model at the published widths ("What one session for a
+#: prompt and its verify steps taught"), on a paged cache and across a page boundary: the line that fails and its sentence
+PAGED_LOOPS = {
+    "the position moved by the kept count alone": (
+        "position",
+        "after step 1 the session stands at position 57, the decode steps at 58; the prompt's tokens and the kept ones are 58",
+    ),
+    "the prompt's attention cache is not the verify steps'": ("prompt", "is the decode session's bytes in 2 of 3 layers"),
+    "a row attends over the whole window": ("rejected rows", "byte-identical to the first replay after 0 of 8 steps"),
+}
+
+
+@pytest.mark.parametrize("defect", list(PAGED_LOOPS))
+def test_the_three_wrong_loops_fail_on_a_paged_cache_as_they_do_on_the_plain_one(monkeypatch, defect):
+    """The loops of ``test_a_wrong_loop_fails_the_line_that_sees_it`` that a comparison of tokens does not see at the
+    published widths, on a session whose cache is paged and whose steps cross positions 63 / 64: each fails the line that
+    is there for it, with its sentence, and leaves the other two of the three lines standing."""
+    from model_samples import state, tie_out
+    from model_samples.providers import torch_ref
+
+    failing, sentence = PAGED_LOOPS[defect]
+    if defect == "the position moved by the kept count alone":
+        accept = state.DecodeState.accept
+
+        def wrong(self, count):
+            accept(self, count)
+            self.position -= 1
+
+        monkeypatch.setattr(state.DecodeState, "accept", wrong)
+    elif defect == "the prompt's attention cache is not the verify steps'":  # the prompt's decode steps write a pool of their own
+
+        def apart(self):
+            return state.PagedKvCache(self.pool.clone(), self.pages, self.table.first_token(), 1, self.first, self.sequences)
+
+        monkeypatch.setattr(state.PagedKvCache, "first_token", apart)
+    else:  # a kept row reads the keys a rejected token wrote
+
+        def wrong(q, cache, position, tokens, acc):
+            rows = q.unflatten(0, (-1, tokens))
+            return torch.stack([torch_ref.attention(rows[:, t], cache, position + tokens - 1, acc) for t in range(tokens)], dim=1).flatten(0, 1)
+
+        monkeypatch.setattr(torch_ref, "attention_tokens", wrong)
+    plain, session, prompts, stream = _speculative(1, 5, prompt=57, page=PAGE)
+    assert _pools(session.state) and not _pools(plain.state), "the session's cache is paged, the decode session's plain"
+    try:
+        _, scheduled = _scheduled_loop(session, prompts, stream)
+    except ValueError as error:  # a run that left the plain run's tokens has no schedule to follow to its end: what it recorded is compared
+        assert "needs the tokens behind the kept one" in str(error) or "positions per sequence" in str(error), error
+        session._open, scheduled = False, None
+    checks = tie_out.speculative_checks(session, plain, None if scheduled is None or len(scheduled) != session.record.count else scheduled)
+    line = _line(checks, failing)
+    assert not checks.ok and line.endswith("    FAIL") and sentence in line, f"{defect}:\n{checks.text()}"
+    others = {"position", "prompt", "rejected rows"} - {failing}
+    assert all(_line(checks, name).endswith("    PASS") for name in others), f"{defect}: only its own line of the three fails\n{checks.text()}"

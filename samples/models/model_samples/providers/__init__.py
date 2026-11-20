@@ -152,6 +152,11 @@ class BlockBase:
     #: statement, as a run prints it beside the batch-invariance line and wherever it compares such a block across row
     #: counts.  Empty: the entry states no such difference
     batch_note = ""
+    #: for a block whose kernel reads or writes the attention cache as a pool of pages: the positions of a page.  A session
+    #: collects it over its plans and builds its state in that layout (``state.PagedKvCache``); two blocks of one session
+    #: that name two pages are a wrong table.  ``None``: the block reaches the cache through its accessors alone, in
+    #: either layout -- every reference chain
+    cache_page = None
     #: for a block whose first use does more than build an entry's kernel -- a library that builds kernels of its own with
     #: the installed compiler: the sentence a sample prints before the plan makes that first use.  Empty: nothing to announce
     first_use_note = ""
