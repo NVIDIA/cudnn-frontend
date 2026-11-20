@@ -9,7 +9,8 @@ and a self-check against a plain-PyTorch reference. Start with [README.md](READM
 A model sample has no socket, no request queue and no admission of work while a step runs. The set of sequences is fixed
 before the first step. A model sample keeps no state between two prompt sets, has no cache keyed by content, and chooses
 nothing at run time: every provider and route is a row of the printed table. The list of provider keys is closed; it changes
-only together with a kernel. A change that needs any of these belongs in a serving engine, not here.
+only together with a kernel, or with the reference chain of a block that a kernel is to serve. A change that needs any of
+these belongs in a serving engine, not here.
 
 Also out: a `generate()` method on the helper layer (the loop is in the script), stop strings, constrained output, logit
 processors, tool-call parsing of the output, automatic choice of a stack or a route. A field of a request body that asks
@@ -178,10 +179,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
     a test reads a run's lines from standard error. The text of sequence 0 of a checkpoint goes to standard output (or to
     the file of `--text-out`) and nothing else does; it is written piece by piece inside the loop, each piece flushed,
     between the host read of a step and the next launch, so its write is counted in that step's turnaround and never
-    inside a block. Seeded weights give no language, and their text is written nowhere. A request gets one text: a run
-    with a list of sequence counts writes the text of a prompt with the first count, and a later count reports whether
-    its sequence 0 produced the same text. A line of a run never goes to standard output, also where standard error
-    is closed (`print` writes to standard output when it is handed no stream). The GPU test of a default run holds
+    inside a block -- or once, after the report, with `--no-stream` and always in the performance mode. Seeded
+    weights give no language, and their text is written nowhere. A request gets one text: a run with a list of
+    sequence counts writes the text of a prompt with the first count, and a later count reports whether its
+    sequence 0 produced the same text. A line of a run never goes to standard output, also where standard error is
+    closed (`print` writes to standard output when it is handed no stream). The GPU test of a default run holds
     both streams: the run's lines on standard error and an empty standard output, in this process and in a fresh
     interpreter.
 18. **A request body is answered field by field, beside the script.** A sample that takes the body a serving engine's
@@ -201,6 +203,25 @@ does not hold is printed as not known and ignored, so a new name for one of them
     before the load to somebody who comes from a serving engine -- the decoding rule beside the checkpoint's own
     generation settings, the decode steps a prompt takes before the first new token -- states what is exact at that
     point, a rule and a count, never a time: the report measures the time.
+    A configuration object of a serving engine that selects what is launched is answered key by key in the same
+    module; a key it does not hold is an `ERROR` that names it. A key is read, accepted at the value that changes
+    nothing, or refused with its reason, and each key of its tables has its case in the same test module.
+19. **The performance mode states what it observed, never what it assumes.** One definition per statistic, written in
+    the report file, with a host test of its arithmetic on constructed time stamps. Nothing but the step runs inside a
+    timed request: no recorder, no call log, no profiler, no text; and no profiler pass runs in the process before its
+    last timed request. The report says at which positions the blocks were held against the reference, that every
+    timed request gave the checked request's tokens and state, and that the kernels of the traced steps are the
+    plan's; a run in which one of the three does not hold prints no rate, and kernels that could not be observed are
+    reported as not observed, the rate staying `orientation` with that reason. Another process, the clock and a
+    limit reason are observed or printed as not observed; `none seen` is printed only when the run's own process is
+    in the driver's list; the report never prints the word 'locked'. The rate of a run that is not a controlled run
+    says so in its own line, and line 2 says it of every other number. A report holds no speed-up, no baseline and
+    no figure of a second GPU class. The screen is rendered from the data the report file holds and from nothing
+    else, at no more than 110 characters a line; a line of it that would be longer breaks at a separator or between
+    two words. An ordinary run prints what it printed before the mode existed and does not import the mode's module:
+    the mode is a branch of its own in the script, and a pull request that touches the loop, the census, the checks
+    or the timing shows the area's plain runs line by line against the tree it started from
+    (`test/python/misc/test_model_samples_perf.py`).
 
 ## What the first GPU run of this area taught
 
@@ -740,3 +761,238 @@ per sequence alone). What building it showed:
   And state a comparison for the step shapes where it gated: a sentence that begins "at every step shape that ran"
   is read as a gate on all of them, also on those whose line was `REPORTED`. The memory sentence likewise: "within a
   tenth of a GiB" is a statement about every run, and one step shape reserved half a GiB less than it asked for.
+
+## What one session for a prompt and its verify steps taught
+
+A session built with `draft_tokens=` feeds its prompt through decode steps and runs verify steps behind it on one state
+(`Session.prefill`, `Session.verify`, `Session.accept`, `tie_out.speculative_checks`). What building it showed:
+
+- A comparison of tokens is blind where a model's token does not follow its state. The seeded model's output head is a
+  permutation of its embedding table: three wrong loops -- the position moved by the kept count alone, the prompt's
+  attention cache not the one the verify steps read, a row that attends over the whole window -- kept every greedy token
+  and stayed inside the logits band at the published widths. Hold what such a loop gets wrong by what it is: the
+  position as an integer, the prompt byte for byte, the rejected rows by a second replay with other tokens behind the
+  kept ones. Each of the three lines fails one of those loops, and a host test on the tiny geometry cannot show that
+  the token line does not: there the same loops leave the band. Run the wrong loops where the gate runs.
+- A line that cannot fail by rounding is gated on every stack; one that can is gated where the two runs are one chain.
+  `position`, `prompt` and `rejected rows` compare integers, or two runs of the same kernels on the same rows. `bytes`
+  compares a verify step with decode steps: the same chain on the reference stack, other kernels for some blocks on a
+  provider stack -- gated on the first, `REPORTED` on the second, and never given a band of its own.
+- The greedy rule is part of the token line. A decode session that is fed the tokens a loop kept agrees with that loop
+  row by row, whatever the loop kept: a count taken from a schedule, or a drafted token that went out, passed a
+  comparison of logits alone. The line also holds that every window starts with the greedy token kept last and that
+  every kept drafted token is the greedy token in front of it.
+- A kernel on a view is another compiled form, under the same name. The decode entry's compile key holds the strides of
+  its history operand; token 0 of a pool of several tokens per sequence has the plain taps and another slot stride. A
+  device run showed that form byte-equal to the plain pool's, the rest of the pool untouched and the launch the same;
+  the kernel check cannot tell the two forms apart and has no need to. The adapter builds the form with the plan (the
+  plan's option says the state's tokens), or the first prompt step would compile it.
+- Hand a block the tensor its band was written for. Token 0 of the recurrent pool is handed over as the null slot and
+  the plain slots, not as the whole pool: the band of the fused step takes its share over the slots of the pool it is
+  handed, and the untouched slots of the later tokens would have made that share easier to reach.
+- The method that is called selects the plan of a step. A session with two plans looks a block up in the plan of the
+  step that is running, set where the step starts; the state says what layout it is, never which kind of step runs.
+  A decode step on a state that stands behind a verify step is a `ValueError` with its own sentence, where it was an
+  error of a tensor shape.
+- A replay starts from zero, so the record of a run holds everything its steps stand on. The verify steps of such a
+  session began on the state its prompt left: the session keeps the prompt whole, and replay, the block check, the
+  reference's pass and the traced pass feed it first. The traced window holds the verify steps alone -- the prompt
+  is replayed in front of the profiler, and the report's line says so.
+- One count for several sequences is exactly greedy only if it is the smallest of the set. The helper that counts
+  returns that one, and the method that takes the count says so.
+- A comparison that replays a run judges the replay. `speculative_checks` drives its replays through the family's
+  step on the session's plans and state, and its first version read the inputs of the run and nothing else of it: a
+  session whose own methods were wrong -- a count never told to the state, the position moved by the count alone,
+  the prompt fed to a state the verify steps never read -- passed every line, and where the defect sat in a method
+  the session's own checks replay through as well, it passed those too. Tie a replay to the run: the ids and logits
+  the run recorded, byte for byte against the replay (`recorded`), and where the run ended, as integers
+  (`position`). And put a control defect where a caller reaches the code -- in the session's methods -- not only
+  below the path the check itself takes.
+- Hold as an integer what is one. Which token the state stands on after a step was seen through the kept state
+  alone, a band that gates a layer only where both runs fed it the same rows: on a stack whose front rows state no
+  batch invariance a forgotten count failed nothing that was gated. The kept token is a number the state holds; it
+  is compared with the count the step kept, beside the position, on every stack.
+- A number counted over the rows of a step is not a token's number. The kept rows of a step stand sequence by
+  sequence, so the first row that differs is the first kept token that differs at one sequence only. A line that
+  names a token keeps the token's number and its sequence for every row it compares.
+- What a first launch reserves outside the pool is reserved once in a process. A second plan of one session adds no
+  second reserve to the memory sentence. The class with such a reserve was not the class of the gate, so the
+  sentence of that class is held by a host test on stated facts.
+- A check says what it looked at. The traced window of such a session holds its verify steps; the prompt's decode
+  steps launch a compiled form of their own that the kernel check never sees. The run says so beside the verdict, a
+  line that compares nothing is `REPORTED`, and a kind of step of which no step was judged is named as that.
+
+## What building the drafter's pass taught
+
+The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDrafter.body`, `propose`, `draft`; the table
+`configs.DRAFTER_PROVIDERS`; the keys `torch_ref.pre_fc_norm_quantize`, `torch_ref.gate_row_quantize`,
+`torch_ref.silu_mul`, `torch_ref.quantize`, `torch.argmax+lookup`). What building it showed:
+
+- A quantiser per row of a step is a third rule beside the loader's two, and it is pinned to its operation like them.
+  The static scale of the model's activations multiplies by a reciprocal that is one number per operand, a constant
+  of the checkpoint; the loader's
+  weights divide by a scale per row; the rows of a drafter's step multiply by the reciprocal of a scale formed from
+  the row itself. The stated row that tells the division from the reciprocal for the weights tells them apart here
+  too, in the other direction: two elements whose quotient is the midpoint of two codes take the code above. Name the
+  operation in the docstring and hold both rules on one row.
+- A division by a host number is not a division on a GPU. PyTorch divides a CUDA tensor by a Python number as a
+  multiplication by that number's reciprocal, and by a tensor as a division: on bf16 values over 448 the two differed
+  in the last bit on more than half of the elements, on the device and never on the CPU. A rule that says "a division
+  in fp32" forms its constants as tensors on the operand's device, and no host test can show that it does: the device
+  run compares the codes and scales of a stated tensor with the CPU's. The first form of that comparison had seven
+  rows and passed a quantiser that divides by a host number, its few scales agreeing by chance; with 2,048 rows the
+  same quantiser failed on 954 scales. Run a check against the defect it is for before believing it.
+- A block that is the reference chain is judged by nothing, so its structure is held where it is made. The block check
+  compares a provider with the reference; a row whose provider IS the reference has no line, in any stack, and the
+  proposals of seeded weights mean nothing that a comparison of tokens could hold. Four things hold such a pass,
+  and each sees what the others do not: every function against a version written from its definition in the
+  test (an error inside a function); every block of the plan, as the plan builds it, against the function it stands
+  for, and one pass through the plan's blocks against the pass written out from the functions (an error inside a
+  block's class: operands exchanged, another function called, an epsilon of its own); a pass over several rows
+  against that many passes of one row, byte for byte (rows that read each other, a scale shared across a step, a
+  cache position written twice or not at all); and a recording stand-in for the blocks, which is handed what each
+  pass of a step reads -- the row the step kept, the pass's own last output and proposal, its position (an error
+  between the blocks, which passes every numeric test with seeded weights because every row is as good as the next).
+- A defect is put into every layer a call goes through. The first one-line defects of this pass were made in the
+  functions, the table and the pass, and the tests held them; eight made inside the classes of the new blocks
+  passed every test. The function tests call the functions, the stand-in replaces the blocks, and a pass compared
+  with passes of itself moves with the defect. What a block declares about its operands for a sequence run alone
+  was read by no test either: a block that no check taps yet is run through the tap in a test.
+- A value that a function hands on only in quantised form can still be read. The gate with one rounding and the
+  model's gate with two differ by one bf16 unit and give the same 8-bit code on almost every element; a row of ONE
+  element has that element as its largest, so its scale states its bf16 value exactly.
+- A formula with a transcendental function is not pinned to the last bit by a double. An fp32 sigmoid differs from
+  the double's by a unit in the last place, which moves a bf16 rounding only next to a midpoint: judge every element
+  that is clear of one, count them, and assert the count -- on bf16 inputs the values repeat, so "one in two
+  thousand" was one in a hundred and sixty.
+- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3.
+  One block may stand for more than one operation of another implementation (the attention preparation also writes
+  the cache), so a count read off another table is not this one. This area states no count of the launches of a
+  draft pass: no kernel census holds one.
+- A call says which pass it belongs to. The model's step hands every block its layer; a drafter has one layer and a
+  step has several passes, so `call(block, pass, *operands)` carries the pass where a step carries the layer, and
+  the wiring lists one pass. Whatever records the calls of a step can then tell its passes apart without counting.
+- A reference row names no form. A provider row that names call sites with fields is compared with what its entry
+  instance states, and a reference chain states nothing: the five sites of the drafter's multiply and the two of its
+  norm are data beside the table, handed to the blocks by name and read by the README, until a kernel's row takes them.
+- An arm that takes an input away has to take it away. On the checkpoint the pass's first proposal was the model's
+  token at 167 of 207 positions. With the two halves in front of the first multiply exchanged it was 0, with the
+  hidden row replaced by zeros 8 -- and with the hidden row of the position before, 108: a row one position old is
+  a row of the same text, and the token embeddings and the cache carry the rest. An arm that shifts an input is a
+  measurement of how much the shift costs, not a collapse; before a figure is held against an arm, run the arm and
+  see what it leaves.
+- What a load keeps for today's blocks is said where the load is shown. The reference blocks multiply on bf16 copies
+  that a kernel on the codes will not need; a default load makes them, the manifest's last line counts them, and the
+  argument that leaves them out is named in the same sentence.
+
+## What the speculative step taught
+
+A session that is handed the drafter runs the whole step of speculative decoding (`Session(drafter=)`,
+`Session.speculate`: the drafter's passes, one verify step, one host read; `tie_out.speculative_checks` with
+`drafter cache` and `draft proposals`). What building it showed:
+
+- The cut of a step follows the one host read. The count a step keeps is decided on the host, after the read, and the
+  first pass of the drafter needs that count: so a step is passes, verify step, read, and the acceptance follows the
+  read. The first step of a run then has no verify step in front of it and its first pass runs at one row per
+  sequence; every text that states the rows of a first pass says which step it means.
+- What the drafter reads of the step before it is state, and it goes where the state goes. The final-norm rows, the
+  greedy ids, the kept count and the drafter's cache are reset, snapshotted and restored with the model's state; a
+  cache kept beside the state would have carried the first prompt set into the second, and nothing reads a stale
+  position as an error -- an unwritten or a stale position is read as what it holds.
+- For the same reason a step that would leave the cache behind is refused, not allowed: `verify` on a session with a
+  drafter would run the model's step without the passes in front of it, and the next first pass would then go on
+  from a position nothing wrote. The step with the caller's drafted tokens is `speculate(force=)`, where the drafter
+  runs all the same.
+- A check that calls the function it checks holds nothing. The second run of the passes never calls `draft`: it
+  writes the passes out at one row per call from its own books of kept tokens and rows. And because both runs call
+  the same blocks, its two lines hold what a step hands its passes -- rows, tokens, positions, the row a step goes
+  on from -- and no arithmetic; the text beside them says so.
+- Each of the two lines sees what the other cannot. A first pass one position off, a prompt position without its
+  pass, a drafted token where the kept one belongs and the rows of an older step fail `drafter cache`; the row
+  select at row 0 and a later pass on the wrong row, the wrong proposal or the wrong position leave the cache up to
+  the last kept position as it must be and fail `draft proposals` alone. Eight wrong passes, each in a loop that
+  still emits the plain session's ids, hold that split in a host test.
+- The window of a step is the session's. With `verify` the caller builds the window, so a loop that emits a drafted
+  token feeds it back and the token line fails; with `speculate` the window starts with the session's own greedy
+  token, the emitted token goes nowhere but the output, and no line of the comparison sees it: the run's ids
+  against the plain run's do.
+- A traced step is the step the loop runs. The window and the pair are a concatenation each, launched between the
+  passes and the model's step and behind it; a traced pass that replayed the recorded window through the verify step
+  alone would have held a step no loop runs. The traced step is `speculate`'s own code, fed the recorded drafted
+  tokens, and its one host read is the pair's.
+- An index into a wiring moves when the wiring grows in front. The census records launch shapes by the index of a
+  site of the model's wiring; with the passes' sites in front of them an index that is not shifted names a site of a
+  pass, where no exact launch stands, and the shape is then held against nothing -- silently. `Traced.first` shifts
+  it, and the host test holds a launch in another shape at the model's site with both of its sentences.
+- The comparison counts the launches of one kernel id; it does not place them. The embedding lookups of the passes
+  and of the model are one id, so a lookup more is named with the count of the step and the plan, in front of the
+  run that matches, and a lookup less is named at the first pass.
+- An arm that shifts an input is not an arm that takes it away -- again. On the checkpoint the loop kept 3.22 tokens
+  a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, with the two halves in
+  front of the first multiply exchanged 1.00; with a later pass one position off, 3.25. Acceptance does not see that
+  shift at all: the line that holds the positions of the later passes is `draft proposals`, on bytes and ids.
+- Working memory is stated as arithmetic on what a pass holds at a time, then measured. A reference multiply
+  accumulates a chunk of the weight in fp64; the allowance of a pass is twice the largest such chunk, 1.33 GiB at the
+  published widths -- not a share of what the drafter holds. On the checkpoint the run asked for about 43.3 GiB,
+  reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
+- The counts of a run live with its record. The comparison resets the session and puts its record back; the kept
+  counts of the acceptance lines are part of that record, so the acceptance lines of a report printed behind the
+  comparison are still the run's. Its bytes of a step are not: they follow where the session stands, and the
+  comparison leaves it at position 0 -- a run prints its report first. Every step counts in full, the last one
+  included, whose tokens behind an end token are not emitted.
+- No count of the launches of a pass is stated, in any text, while no census section holds a draft pass: the kernel
+  check attributes them, the run says "kernel identity of the drafter's passes: not stated", and a count of block
+  calls -- 18 a pass -- is the wiring's.
+- What a step hands on by reference is held by identity, where it is handed on. The session and the second run of
+  the comparison read the same attribute of the state, so a step that left another tensor of the same shape there --
+  the rows in front of the final norm, a layer's normed rows, a copy -- passed every line of both checks and every
+  host test. One test holds it through the session's tap: `state.hidden` is the tensor the final norm's call
+  returned, the one whose quantised rows the head read, and `state.greedy` the one the token choice returned.
+- A traced step is held to the recorded step, not to its shape alone. The kernel check reads no token value: a
+  traced step whose window began with another token, or whose passes drafted on an empty cache, passed it. The host
+  test with the stand-in for the profiler holds the window the traced verify step is fed and what its passes
+  propose against the record.
+- A refusal stands in front of everything the refused call would leave. A step asked for in front of the prompt was
+  refused by its passes, behind the mark of a launch on the report's clock: the read that ends the prompt was then
+  taken for a step's and the first-token line read 0.0 ms. And a refusal names the step of the session that was
+  asked: on a session with a drafter that is `speculate`, also where the session refuses a decode step or a count.
+- The names beside a snippet are run as the text says they may be. The README's loop said "a described checkpoint"
+  and built no session with it: a session that was not handed the checkpoint drew seeded weights, and the drafter's
+  with them, without a word (it now refuses the drafter of a checkpoint by name). The loop is now run as written on the seeded pair and on a checkpoint a test
+  generates and describes, and the table it runs on is held against the file.
+- What describes shared weights is read at the session that loaded them: a session that shares reads no checkpoint
+  of its own, and a `seed=` says nothing about a checkpoint a session was handed. A drafter two links of `share=`
+  behind the loader had nothing to load from, and the drafter of a model handed seed 11's checkpoint was drawn from
+  seed 0 with every token still right, since the verify step decides the tokens; the load now follows `share=` to
+  its end (`Session._weights_owner`) and draws a seeded drafter from the seed its checkpoint records.
+
+## What building the speculative script taught
+
+`02_speculative_decode.py` runs the speculative step for one request: its own loop, the speculative configuration of a
+serving engine key by key, the comparison with decode steps and the checks of every run. What building it showed:
+
+- A configuration that selects what is launched has no class "printed and ignored". A request body's unknown field is
+  named and ignored; an unknown key of a speculative configuration would change which kernels run. So its tables are
+  read, neutral and refused, a key outside them is an `ERROR`, and the keys that are read must be named: an engine's
+  default for a missing one selects another launch set. What a refused key holds is not printed back.
+- A script that compares where another checks nothing needs the verdict's order. `_verdict` answered the reference
+  stack before it looked at the checks; the speculative script compares its run with decode steps on that stack
+  too. A failed line is `FAIL` on every stack, in both scripts, and one host test holds the two functions to each
+  other and to the README's table over every input.
+- What the library's comparison cannot see, the script holds itself. The window of a step is the session's, so a
+  drafted token a loop emits reaches no line of `speculative_checks`; the ids of both arms do, and the script
+  compares them. Three wrong loops run through `main()`, on a host and on the device. A count kept beyond the
+  compared one also fails the drafter's two lines: the first pass of the next step takes the greedy token of a kept
+  row for the token that follows it, which is true of an accepted draft alone.
+- A default follows what it is the default of. A scheduled run needs enough new tokens to keep every count once: 17
+  at five drafted tokens, 38 at eight. A fixed default of 32 answered eight drafted tokens with an error about the
+  token count; now the default follows the schedule, the plan declines by its row, and a typed count is still held.
+- A flag that is declared in order to be refused is still a string of the script. A test that took a flag for a
+  script's own when its string stood in a script of the folder passed for `--draft-vocab` whatever the speculative
+  script did; it now asks each script whether it takes the flag.
+- A refusal belongs where the object is built. A checkpoint's drafter on a session that was handed no checkpoint
+  proposed from rows of a seeded head without a word; a drafter of another model's widths ended in a tensor size
+  inside the warm-up step. Both are sentences of `Session` now, before a plan.
+- A stand-in that rounds otherwise is not given the product's band. On the tiny geometry of the host tests the fp32
+  chains of the stand-in providers leave the seeded model's logits band at six tokens per sequence: the test of the
+  last line holds `PASS` at three drafted tokens and says, for the default, which line fails.

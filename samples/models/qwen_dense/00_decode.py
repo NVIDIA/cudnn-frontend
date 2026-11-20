@@ -58,12 +58,25 @@ record of every launch of the traced steps, and holds them against each other --
 kernels of an entry by name, order, count, grid, block and shared memory.  Where the profiler cannot run the run ends in
 ``[00] RAN <stack> stack (kernels not observed: <reason>)``, never in ``PASS``.  ``--dump-census FILE`` writes those launch
 records as JSON.
+
+``--perf`` is the performance mode: the decode performance report of this GPU from one process.  One checked request
+with the reference checks on it, also at four positions of the timed steps; a warm-up request (``--perf-warmup`` forced
+steps, default 32); ``--perf-requests`` timed requests (default 3), each the prompt, its first new token and
+``--perf-steps`` forced decode steps (default 256, the end token ignored) with nothing but the step inside; only then
+the profiler, for one traced request of as many of those steps as ``--perf-trace-records`` launch records hold (default
+160000), and the kernel check on it.  The report goes to standard error and, with every number, its definition, the
+protocol and the environment, into a report file (``--perf-report FILE``; default ``report-<UTC time>.json`` in the
+current directory); the text is written once, after the report.  Without ``--model`` the same protocol runs on the
+reduced seeded model and prints no rate.  ``samples/models/README.md`` has the protocol, the statistics and the labels.
+
+    python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import sys
@@ -88,6 +101,9 @@ STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_STEPS = 16  # with a checkpoint the checks cover the first steps of every prompt
 TRACED_STEPS = 32
+SPECULATIVE = "02_speculative_decode.py"  # the script of this folder that drafts
+#: its two flags, each with what it takes: declared here so that each is refused by a sentence that names that script
+SPECULATIVE_FLAGS = (("--speculative-config", "JSON"), ("--draft-vocab", "list"))
 
 
 def _say(*lines, flush: bool = False) -> None:
@@ -104,6 +120,11 @@ def _reason(error) -> str:
     if isinstance(error, OSError) and error.filename:
         return f"{os.path.basename(os.path.normpath(str(error.filename)))}: {error.strerror or type(error).__name__}"
     return str(error)
+
+
+def _seeded_messages(sequence: int) -> list:
+    """The chat of the seeded prompt of one sequence: its open assistant turn ends in the sequence's own token."""
+    return [{"role": "user", "content": "count"}, {"role": "assistant", "content": str(sequence % 10)}]
 
 
 def _dump(path: str, stack: str, runs: list, flag: str = "--dump-tokens", **facts) -> str:
@@ -240,11 +261,18 @@ def _arguments(argv):
         help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory per launch), for a comparison "
         "made elsewhere; implies --check-kernels",
     )
+    _perf_flags(parser)
+    for flag, takes in SPECULATIVE_FLAGS:
+        parser.add_argument(flag, metavar=takes.upper(), help=f"not this script: speculative decoding is {SPECULATIVE}, which takes the same {takes}")
     args = parser.parse_args(argv)
+    for flag, takes in SPECULATIVE_FLAGS:
+        if getattr(args, flag[2:].replace("-", "_")) is not None:
+            parser.error(f"{flag}: speculative decoding is the script {SPECULATIVE} of this folder, which takes the same {takes}")
     args.check_kernels = args.check_kernels or args.dump_census is not None
     # the limit of new tokens has two spellings; a sentence about it names the one that was typed
     args.limit_flag = "--max-new-tokens" if any(word.split("=")[0] == "--max-new-tokens" for word in argv) else "--max-tokens"
     args.limit_given = args.max_new_tokens is not None
+    _perf_arguments(parser, args)
     if args.check_kernels and args.stack == "reference":
         parser.error("--check-kernels and --dump-census are for a provider stack; --stack reference checks nothing")
     if args.model is None and (args.prompt or args.messages):
@@ -280,16 +308,117 @@ def _arguments(argv):
     return args
 
 
+#: the counts of the performance mode: flag -> (default, what it counts)
+PERF_COUNTS = {
+    "--perf-warmup": (32, "forced decode steps of the warm-up request"),
+    "--perf-steps": (256, "timed decode steps of a request, behind its first new token; at the default 257 new tokens and 256 intervals"),
+    "--perf-requests": (3, "timed requests"),
+    "--perf-trace-records": (160_000, "the most launch records the traced request may hold; where the timed steps do not fit, it traces the first that do"),
+}
+
+
+def _perf_flags(parser) -> None:
+    """The flags of the performance mode.  A count that is left out is ``None`` here, so that one given without ``--perf``
+    can be told from a default."""
+    parser.add_argument(
+        "--perf",
+        action="store_true",
+        help="the performance mode: one checked request, a warm-up request, timed requests with nothing but the step inside, then one traced "
+        "request and the kernel check on it; prints the decode performance report and writes a report file. Implies one sequence count, the "
+        "kernel check, forced steps with the end token ignored, and the text written once, after the report; not with --stack reference",
+    )
+    for flag, (default, what) in PERF_COUNTS.items():
+        parser.add_argument(flag, type=int, default=None, metavar="N", help=f"with --perf: {what} (default {default})")
+    parser.add_argument(
+        "--perf-report",
+        metavar="FILE",
+        help="with --perf: the report file (default report-<UTC time>.json in the current directory); a file that exists, or that another flag of "
+        "the run writes, is an error before the load",
+    )
+
+
+def _perf_arguments(parser, args) -> None:
+    """The flags of the performance mode against each other and against the flags of an ordinary run: every refusal is a
+    usage error, before anything is read or loaded.  With ``--perf`` the run decodes the mode's own fixed count (the first
+    new token and ``--perf-steps`` forced steps), at one sequence count, and checks its kernels."""
+    counts = {flag: getattr(args, flag[2:].replace("-", "_")) for flag in PERF_COUNTS}
+    given = [flag for flag, value in counts.items() if value is not None] + (["--perf-report"] if args.perf_report is not None else [])
+    if not args.perf:
+        if given:
+            parser.error(f"{', '.join(given)}: a flag of the performance mode; it needs --perf")
+        return
+    if args.stack == "reference":
+        parser.error("--perf times a provider stack and holds it against the reference; --stack reference has no provider to time")
+    if args.limit_given or args.force_tokens is not None:
+        parser.error(
+            "--perf decodes a fixed count: the first new token and --perf-steps forced steps behind it, the end token ignored; "
+            f"{args.limit_flag if args.limit_given else '--force-tokens'} does not apply beside it"
+        )
+    if args.sequences is not None and "," in str(args.sequences):
+        parser.error("--perf times one sequence count; --sequences was given a list")
+    if len(args.prompt) + len(args.messages) > 1:
+        parser.error(f"--perf times one prompt; {len(args.prompt) + len(args.messages)} were given (--prompt, --messages)")
+    for flag, (default, _) in PERF_COUNTS.items():
+        setattr(args, flag[2:].replace("-", "_"), default if counts[flag] is None else counts[flag])
+    if args.perf_warmup < 1 or args.perf_steps < 2 or args.perf_requests < 1 or args.perf_trace_records < 1:
+        parser.error("--perf-warmup, --perf-requests and --perf-trace-records take positive integers, --perf-steps an integer from 2")
+    args.sequences = "1" if args.sequences is None else args.sequences  # one count: the seeded default of an ordinary run is a list
+    args.force_tokens = args.perf_steps + 1  # a request: the first new token and that many forced steps
+    args.check_kernels = True  # the kernels of the traced steps are one of the three statements of the report's checks
+
+
+def _perf_longest(args) -> tuple:
+    """``(forced steps, flag, name)`` of the longest request of a run of the performance mode.  The checked request and
+    every timed request run ``--perf-steps`` forced steps behind the first new token and the traced request at most as
+    many; the warm-up request runs ``--perf-warmup``, which may be the larger count.  One session serves every request of
+    the run: it is built for the longest of them, and ``--max-model-len`` is held against that one."""
+    if args.perf_warmup > args.perf_steps:
+        return args.perf_warmup, "--perf-warmup", "the warm-up request"
+    return args.perf_steps, "--perf-steps", "a timed request"
+
+
+def _positions(args, prompt_tokens: int, rule) -> int:
+    """The positions a sequence of one prompt set reaches, which its session is built for: the prompt and its new tokens.
+    In the performance mode the new tokens of the longest request of the run (``_perf_longest``): its first new token and
+    its forced steps."""
+    return prompt_tokens + (_perf_longest(args)[0] + 1 if args.perf else rule.limit)
+
+
+def _perf_limit(args, request, prompt_tokens: int) -> list:
+    """The longest request of a run of the performance mode (``_perf_longest``) -- the prompt, the first new token and that
+    request's forced steps -- held against ``--max-model-len`` in the mode's own words (``ValueError``: which request is
+    the longest, and every count to take lower).  Returns the line a run prints for a request body whose own limit does
+    not apply, in a list, or no line."""
+    steps, flag, longest = _perf_longest(args)
+    room = args.max_model_len - prompt_tokens - 1
+    if room < steps:
+        over = [name for name, count in (("--perf-steps", args.perf_steps), ("--perf-warmup", args.perf_warmup)) if count > room]
+        fewer = f"take {' and '.join(over)} {room:,} or fewer, or " if room >= 2 else ""  # a timed request has at least 2 steps
+        raise ValueError(
+            f"{request.shown}: {prompt_tokens:,} prompt tokens, the first new token and {flag} {steps:,} ({longest}, the longest request of "
+            f"this run) are {prompt_tokens + 1 + steps:,} positions and --max-model-len is {args.max_model_len:,}; {fewer}raise --max-model-len"
+        )
+    beside = f"does not apply beside --perf, which decodes --perf-steps {args.perf_steps:,} forced steps behind the first new token"
+    return [] if request.max_tokens is None else [f'{request.shown}: its "{request.limit_field}": {request.max_tokens} {beside}']
+
+
+def _record_steps(real: bool, perf: bool):
+    """The steps a session records for its checks: with a checkpoint the first steps an ordinary run checks and traces;
+    every step (``None``) of a seeded run and of the performance mode, whose checked request the checks replay whole."""
+    return max(CHECKED_STEPS, TRACED_STEPS) if real and not perf else None
+
+
 def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str:
     """The last line of a run.  ``PASS`` says that provider blocks were judged against the reference and held.  A run on the
     reference stack, or one whose ``--provider`` flags put every judged block on its reference row, compared the reference
     with itself: it reports ``RAN``.  So does a run that was asked to check its kernels and could not observe them
     (``unobserved``: why): its other checks held, the one it was asked for did not run.  A failed check is ``FAIL`` whatever
-    else is true."""
-    if stack == "reference":
-        return "RAN reference stack (no provider checked)"
+    else is true, on the reference stack too (no run of this script checks anything there; a script of this folder that
+    does shares this answer)."""
     if not passed:
         return "FAIL"
+    if stack == "reference":
+        return "RAN reference stack (no provider checked)"
     if unobserved:
         return f"RAN {stack} stack (kernels not observed: {unobserved})"
     return "PASS" if judged else "RAN (no provider block was judged)"
@@ -389,6 +518,17 @@ def main(argv=None) -> int:
         for flag, path in (("--dump-tokens", args.dump_tokens), ("--dump-census", args.dump_census), ("--text-out", args.text_out)):
             if path is not None:  # a file that cannot be written, or a flag without a name, is an error before the run, not after it
                 _writable(flag, path)
+        if args.perf:  # the report file's name is fixed now: one that exists is never written over, and that is known before the load
+            perf = importlib.import_module("model_samples.perf")  # the mode's module: an ordinary run does not import it
+            report = perf.default_report_name() if args.perf_report is None else args.perf_report
+            _writable("--perf-report", report)
+            if os.path.exists(report):
+                raise ValueError(f"--perf-report {os.path.basename(os.path.normpath(report))}: the file exists, and a report file is never written over")
+            for flag, path in (("--dump-tokens", args.dump_tokens), ("--dump-census", args.dump_census), ("--text-out", args.text_out)):
+                if path is not None and os.path.realpath(path) == os.path.realpath(report):  # written behind the report, over it
+                    raise ValueError(
+                        f"--perf-report and {flag} name one file, {os.path.basename(os.path.normpath(report))}: a report file is never written over"
+                    )
         if real and args.text_out is None and sys.stdout is None:  # closed before the process started (>&-): known now, said now
             raise ValueError("standard output is closed and the generated text has nowhere to go; redirect it, or name a file with --text-out")
         if real:  # the text side and the description of the checkpoint: config and shard headers, no weights
@@ -432,6 +572,10 @@ def main(argv=None) -> int:
     def stop_rule(request, prompt_tokens):
         """The stop rule of one request: its limit of new tokens, held against ``--max-model-len`` before anything is
         planned (``ValueError``); a limit that was given and does not apply is said in a line."""
+        if args.perf:  # the mode's fixed count, held against the context and said in the mode's own words
+            for note in _perf_limit(args, request, prompt_tokens):
+                _say(f"{TAG} {note}")
+            return model_samples.StopRule(text.eos_ids, max_new_tokens=args.force_tokens, force_tokens=args.force_tokens)
         flag = args.max_new_tokens if args.limit_given else None
         limit, note = serving_options.new_tokens(request, prompt_tokens, args.max_model_len, flag, args.force_tokens, args.limit_flag)
         if note:
@@ -462,10 +606,7 @@ def main(argv=None) -> int:
         for sequences in () if real else args.sequences:
             render = time.perf_counter()
             # the open assistant turn of every prompt ends in the sequence's own token
-            rendered = [
-                text.render_chat([{"role": "user", "content": "count"}, {"role": "assistant", "content": str(s % 10)}], add_generation_prompt=False)
-                for s in range(sequences)
-            ]
+            rendered = [text.render_chat(_seeded_messages(s), add_generation_prompt=False) for s in range(sequences)]
             tokenize = time.perf_counter()
             prompts = [text.encode(r) for r in rendered]
             seconds = {"render": (tokenize - render) / sequences, "tokenize": (time.perf_counter() - tokenize) / sequences}
@@ -487,10 +628,10 @@ def main(argv=None) -> int:
             device=device,
             overrides=overrides,
             reference_precision=args.reference_precision,
-            capacity=max(int(prompts[0].numel()) + rule.limit for prompts, _, rule in prompt_sets),
+            capacity=max(_positions(args, int(prompts[0].numel()), rule) for prompts, _, rule in prompt_sets),
             checkpoint=checkpoint,
             share=runs[0][0] if runs else None,
-            record_steps=max(CHECKED_STEPS, TRACED_STEPS) if real else None,
+            record_steps=_record_steps(real, args.perf),
             check_kernels=args.check_kernels,
         )
         runs.append((session, prompt_sets))
@@ -527,9 +668,14 @@ def main(argv=None) -> int:
     if real:  # before the load: what a prompt costs before its first new token
         _say(f"{TAG} {serving_options.first_token_line([(request.shown, int(ids.numel())) for request, (ids, _, _) in zip(requests, sets)])}")
 
+    if args.perf:  # before the load: what the mode will run, a rule and counts
+        protocol = perf.Protocol(args.perf_warmup, args.perf_steps, args.perf_requests, args.perf_trace_records)
+        _say(f"{TAG} {protocol.line(int(runs[0][1][0][0][0].numel()))}")
+
     passed, judged, digest, dumped = True, 0, hashlib.sha256(), []
+    outcome = None  # of the performance mode
     unobserved, censuses = "", []  # of the kernel check: why the kernels were not observed; the launch records per prompt set
-    sink = serving_options.TextSink(args.text_out, streamed=not args.no_stream)  # where the text of sequence 0 goes
+    sink = serving_options.TextSink(args.text_out, streamed=not args.no_stream and not args.perf)  # where the text of sequence 0 goes
     for number, ((session, prompt_sets), table, claim) in enumerate(zip(runs, tables, claims)):
         text_to = sink.later() if number else sink  # a request gets one text: a later sequence count writes none
         _say()
@@ -549,18 +695,45 @@ def main(argv=None) -> int:
                 _say(f"prompt {index + 1} of {len(prompt_sets)}        {int(prompts[0].numel())} tokens, {each}")
             session.new_report()
             session.report().text_path.update(seconds)
-            ok, blocks_judged, produced = _decode(
-                session,
-                text,
-                rule,
-                prompts,
-                tie_out,
-                check=args.stack != "reference",
-                checked_steps=CHECKED_STEPS if real else None,
-                sink=text_to,
-            )
+            if args.perf:  # the performance mode: its requests, its checks and its report in the place of the plain loop
+
+                def tokenize(sequences=session.sequences):
+                    """The text path of a request: render and tokenize, one prompt per sequence."""
+                    if not real:
+                        return [text.encode(text.render_chat(_seeded_messages(s), add_generation_prompt=False)) for s in range(sequences)]
+                    return [text.encode(text.render_chat(requests[0].messages, requests[0].tools, **requests[0].options))] * sequences
+
+                outcome = perf.run(
+                    session,
+                    text,
+                    tokenize,
+                    protocol,
+                    _say,
+                    name=name if real else f"{model.name}, reduced model",
+                    facts=facts,
+                    environment=environment,
+                    sink=text_to,
+                    report=report,
+                    verdict=lambda held, blocks, missing: _verdict(args.stack, held, blocks, missing),
+                    tag=TAG,
+                    real=real,
+                    source=requests[0].shown if real else "the seeded prompt",
+                    text_path=seconds,
+                )
+                ok, blocks_judged, produced = outcome.passed, outcome.judged, outcome.produced
+            else:
+                ok, blocks_judged, produced = _decode(
+                    session,
+                    text,
+                    rule,
+                    prompts,
+                    tie_out,
+                    check=args.stack != "reference",
+                    checked_steps=CHECKED_STEPS if real else None,
+                    sink=text_to,
+                )
             passed, judged = passed and ok, judged + blocks_judged
-            if session.check_kernels:
+            if session.check_kernels and session.traced is not None:  # None: a run of the performance mode that ended at its first checks
                 unobserved = unobserved or session.traced.unobserved
                 censuses.append({"sequences": session.sequences, "prompt": index, **session.traced.dump()})
             for ids in produced:
@@ -574,6 +747,8 @@ def main(argv=None) -> int:
     grown = (facts.free_bytes - torch.cuda.mem_get_info(device)[0]) / gib
     _say()
     peak, reserved = torch.cuda.max_memory_allocated(device) / gib, torch.cuda.max_memory_reserved(device) / gib
+    if outcome is not None:  # the performance mode resets PyTorch's peaks behind its checks: the process's peak is the larger of the two
+        peak, reserved = max(peak, outcome.peaks[0] / gib), max(reserved, outcome.peaks[1] / gib)
     _say(
         f"{TAG} GPU memory: PyTorch peak {peak:.2f} GiB allocated, {reserved:.2f} GiB reserved; in use on the device grew by {grown:.2f} GiB "
         "since the plan (PyTorch's pool, CUDA libraries and kernel reservations of this process; other processes' changes included)"
@@ -590,6 +765,8 @@ def main(argv=None) -> int:
     unwritten = []  # what a flag asked for and is not there
     if sink.error:  # the reader of standard output went away, or the file of --text-out stopped taking text
         unwritten.append(f"the generated text could not be written to {sink.name}: {sink.error}")
+    if outcome is not None and outcome.unwritten:  # the report file of the performance mode
+        unwritten.append(outcome.unwritten)
     if args.dump_tokens is not None:
         error = _dump(args.dump_tokens, args.stack, dumped)
         if error:
@@ -602,7 +779,8 @@ def main(argv=None) -> int:
             error = f"--dump-census {os.path.basename(os.path.normpath(args.dump_census))}: no launch records to write ({why})"
         else:
             gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
-            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=1, gpu=gpu, traced_steps=TRACED_STEPS)
+            traced_steps = TRACED_STEPS if outcome is None else outcome.data["traced"]["steps"]
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=1, gpu=gpu, traced_steps=traced_steps)
         if error:
             unwritten.append(error)
         else:

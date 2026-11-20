@@ -79,6 +79,14 @@ def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]
             yield engine_id, spec
 
 
+def _placement_row(spec: EngineSpec) -> str:
+    # The Ada D64 study timed the dedicated body. Its shared policy still
+    # governs the generic owner and fallback order.
+    if spec.name == "sdpa_bwd_sm89_f16_d64":
+        return spec.name
+    return policy_name(spec)
+
+
 def _leads(spec: EngineSpec, facts) -> bool:
     """Whether a default row's plans go ahead of the backend's block.
 
@@ -104,7 +112,7 @@ def _leads(spec: EngineSpec, facts) -> bool:
     from cudnn.sdpa import placement_table
 
     name = policy_name(spec)
-    measured = placement_table.lookup(name, facts)
+    measured = placement_table.lookup(_placement_row(spec), facts)
     if measured is not None:
         return measured
     if name == "sdpa_bwd_sm100_d128":
@@ -146,7 +154,7 @@ def _measured_lead(spec: EngineSpec, facts) -> bool:
     same goes for a non-square graph whose entry comes from a study in :data:`SQUARE_ONLY_STUDIES`."""
     from cudnn.sdpa import placement_table
 
-    name = policy_name(spec)
+    name = _placement_row(spec)
     entry = placement_table.matched_entry(name, facts)
     if entry is not None and facts.s_q != facts.s_kv and entry.study.startswith(SQUARE_ONLY_STUDIES):
         return False

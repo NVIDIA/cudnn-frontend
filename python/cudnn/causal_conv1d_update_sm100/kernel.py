@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""BF16 causal-convolution decode update kernel.
+"""FP16 and BF16 causal-convolution decode update kernels.
 
 The state transition follows the public ``causal_conv1d_update`` contract used
 by FLA's ``ShortConvolution.step``: append the current token to the history,
@@ -17,7 +17,7 @@ Semantic references consulted:
 * Dao-AILab/causal-conv1d's public ``causal_conv1d_update`` API contract
   (BSD-3-Clause), revision ``cd81f0413cad2fc1e6f17e785ac39f59aae690cd``.
 
-Only the four-wide, BF16, optional-bias inference specialization lives here.
+These inference specializations use width four, FP32 accumulation, and optional bias.
 State length four keeps the original vectorized path. State length three, the
 standard ``W - 1`` prefill handoff, uses a separate scalar state specialization.
 Identity and SiLU are separate compile-time specializations.
@@ -41,6 +41,22 @@ from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, sigmoid
 
 THREADS = 256
+
+
+@cute.jit
+def _word_to_f32(bits: cutlass.Uint16, dtype: cutlass.Constexpr) -> cutlass.Float32:
+    """Decode a raw 16-bit word for arithmetic while retaining its state payload."""
+    if cutlass.const_expr(dtype == cutlass.BFloat16):
+        return inline_ptx(
+            "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
+            write_only_types=[cutlass.Float32],
+            read_only_args=[bits],
+        )
+    return inline_ptx(
+        "cvt.f32.f16 $0, $1;",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[bits],
+    )
 
 
 @cute.kernel
@@ -126,21 +142,17 @@ def _causal_conv1d_update_kernel(
             read_only_args=[x_address],
         )
 
-        _state_0, state_1 = f16x2_to_f32(state_01, dtype=cutlass.BFloat16)
-        state_2, state_3 = f16x2_to_f32(state_23, dtype=cutlass.BFloat16)
-        weight_0, weight_1 = f16x2_to_f32(weight_01, dtype=cutlass.BFloat16)
-        weight_2, weight_3 = f16x2_to_f32(weight_23, dtype=cutlass.BFloat16)
+        _state_0, state_1 = f16x2_to_f32(state_01, dtype=state.element_type)
+        state_2, state_3 = f16x2_to_f32(state_23, dtype=state.element_type)
+        weight_0, weight_1 = f16x2_to_f32(weight_01, dtype=weight.element_type)
+        weight_2, weight_3 = f16x2_to_f32(weight_23, dtype=weight.element_type)
         bias_value = cutlass.Float32(0.0)
         if cutlass.const_expr(bias is not None):
             bias_value = bias[channel].to(cutlass.Float32)
-        x_f32 = inline_ptx(
-            "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
-            write_only_types=[cutlass.Float32],
-            read_only_args=[x_bits],
-        )
+        x_f32 = _word_to_f32(x_bits, x.element_type)
 
         # The updated state is [old_1, old_2, old_3, x].  Pack from the raw
-        # BF16 words so the shift and append are bitwise, including signed zero
+        # 16-bit words so the shift and append are bitwise, including signed zero
         # and NaN payloads; only the output path converts through FP32.
         updated_01, updated_23 = inline_ptx(
             "{ .reg .b16 s0, s1, s2, s3, xv; " "mov.b32 {s0, s1}, $2; mov.b32 {s2, s3}, $3; mov.b16 xv, $4; " "mov.b32 $0, {s1, s2}; mov.b32 $1, {s3, xv}; }",
@@ -169,11 +181,11 @@ def _causal_conv1d_update_kernel(
 
         if cutlass.const_expr(state_indices is not None):
             if is_padding:
-                output[row, channel] = cutlass.Float32(0.0).to(cutlass.BFloat16)
+                output[row, channel] = cutlass.Float32(0.0).to(output.element_type)
             else:
-                output[row, channel] = acc.to(cutlass.BFloat16)
+                output[row, channel] = acc.to(output.element_type)
         else:
-            output[row, channel] = acc.to(cutlass.BFloat16)
+            output[row, channel] = acc.to(output.element_type)
 
 
 @cute.kernel
@@ -259,33 +271,17 @@ def _causal_conv1d_update_l3_kernel(
             read_only_args=[x_address],
         )
 
-        state_0 = inline_ptx(
-            "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
-            write_only_types=[cutlass.Float32],
-            read_only_args=[state_0_bits],
-        )
-        state_1 = inline_ptx(
-            "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
-            write_only_types=[cutlass.Float32],
-            read_only_args=[state_1_bits],
-        )
-        state_2 = inline_ptx(
-            "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
-            write_only_types=[cutlass.Float32],
-            read_only_args=[state_2_bits],
-        )
-        weight_0, weight_1 = f16x2_to_f32(weight_01, dtype=cutlass.BFloat16)
-        weight_2, weight_3 = f16x2_to_f32(weight_23, dtype=cutlass.BFloat16)
+        state_0 = _word_to_f32(state_0_bits, state.element_type)
+        state_1 = _word_to_f32(state_1_bits, state.element_type)
+        state_2 = _word_to_f32(state_2_bits, state.element_type)
+        weight_0, weight_1 = f16x2_to_f32(weight_01, dtype=weight.element_type)
+        weight_2, weight_3 = f16x2_to_f32(weight_23, dtype=weight.element_type)
         bias_value = cutlass.Float32(0.0)
         if cutlass.const_expr(bias is not None):
             bias_value = bias[channel].to(cutlass.Float32)
-        x_f32 = inline_ptx(
-            "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
-            write_only_types=[cutlass.Float32],
-            read_only_args=[x_bits],
-        )
+        x_f32 = _word_to_f32(x_bits, x.element_type)
 
-        # Preserve BF16 payload bits in the state transition [old_1, old_2, x].
+        # Preserve payload bits in the state transition [old_1, old_2, x].
         # A compact three-element channel row is only two-byte aligned for odd
         # channels, while the prefill handoff strides across token planes. Every
         # state access is therefore deliberately scalar and uses the compiled
@@ -328,11 +324,11 @@ def _causal_conv1d_update_l3_kernel(
 
         if cutlass.const_expr(state_indices is not None):
             if is_padding:
-                output[row, channel] = cutlass.Float32(0.0).to(cutlass.BFloat16)
+                output[row, channel] = cutlass.Float32(0.0).to(output.element_type)
             else:
-                output[row, channel] = acc.to(cutlass.BFloat16)
+                output[row, channel] = acc.to(output.element_type)
         else:
-            output[row, channel] = acc.to(cutlass.BFloat16)
+            output[row, channel] = acc.to(output.element_type)
 
 
 class _CausalConv1dUpdateKernel:

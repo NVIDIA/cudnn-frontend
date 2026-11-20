@@ -326,6 +326,33 @@ class Execution_plan_list {
     EngineConfigList engine_configs;
 
     error_t
+    _get_restored_engine_config_at_index(int64_t index, ManagedOpaqueDescriptor& config) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!engine_configs.empty() || index < 0 ||
+                                           index >= static_cast<int64_t>(execution_plans.size()) ||
+                                           execution_plans[index] == nullptr,
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "Plan index " + std::to_string(index) + " is invalid.");
+        // Deserialization restores executable plans without the heuristic candidate
+        // list. Read their retained config only for these metadata queries; leave
+        // candidate state and the execution path unchanged.
+        config = make_shared_backend_pointer(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR);
+        _CUDNN_CHECK_CUDNN_ERROR(config->get_status());
+        auto descriptor = config->get_backend_descriptor();
+        int64_t count   = 0;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(execution_plans[index]->get_raw_desc(),
+                                                       CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                       1,
+                                                       &count,
+                                                       &descriptor));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            count != 1,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            "Failed to query engine config for restored plan at index " + std::to_string(index));
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
     _build_plan_at_index_impl(int64_t index) {
         if (execution_plans[index] == nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_execution_plan(
@@ -569,10 +596,11 @@ class Execution_plan_list {
 
     error_t
     get_name_at_index(int64_t index, std::string& name) const {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(index < 0 || index >= static_cast<int64_t>(engine_configs.size()),
-                                       error_code_t::GRAPH_EXECUTION_FAILED,
-                                       "Plan index " + std::to_string(index) + " is invalid.");
-        name = detail::get_engine_tag(engine_configs[index]);
+        ManagedOpaqueDescriptor restored_config;
+        if (index < 0 || index >= static_cast<int64_t>(engine_configs.size())) {
+            CHECK_CUDNN_FRONTEND_ERROR(_get_restored_engine_config_at_index(index, restored_config));
+        }
+        name = detail::get_engine_tag(restored_config ? restored_config : engine_configs[index]);
         return {error_code_t::OK, ""};
     }
 
@@ -582,18 +610,26 @@ class Execution_plan_list {
     get_engine_and_knobs_at_index(int64_t index,
                                   int64_t& engine_id,
                                   std::unordered_map<KnobType_t, int64_t>& knobs) const {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(index < 0 || index >= static_cast<int64_t>(engine_configs.size()),
-                                       error_code_t::GRAPH_EXECUTION_FAILED,
-                                       "Plan index " + std::to_string(index) + " is invalid.");
+        ManagedOpaqueDescriptor restored_config;
+        if (index < 0 || index >= static_cast<int64_t>(engine_configs.size())) {
+            CHECK_CUDNN_FRONTEND_ERROR(_get_restored_engine_config_at_index(index, restored_config));
+        }
         std::vector<std::pair<cudnnBackendKnobType_t, int64_t>> backend_knobs;
-        auto status = detail::get_engine_id_and_knobs(engine_configs[index], engine_id, backend_knobs);
+        auto status = detail::get_engine_id_and_knobs(
+            restored_config ? restored_config : engine_configs[index], engine_id, backend_knobs);
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             status != CUDNN_STATUS_SUCCESS,
             error_code_t::CUDNN_BACKEND_API_FAILED,
             "Failed to query engine id / knob choices for plan at index " + std::to_string(index));
         knobs.clear();
         for (auto const& backend_knob : backend_knobs) {
-            knobs[convert_from_backend_knob_type(backend_knob.first)] = backend_knob.second;
+            auto const type = convert_from_backend_knob_type(backend_knob.first);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(type == KnobType_t::NOT_SET,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Cannot represent backend knob type " +
+                                               std::to_string(static_cast<int64_t>(backend_knob.first)) +
+                                               " in the public knob vocabulary.");
+            knobs[type] = backend_knob.second;
         }
         return {error_code_t::OK, ""};
     }

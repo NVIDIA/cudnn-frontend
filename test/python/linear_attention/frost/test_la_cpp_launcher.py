@@ -1,18 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""KDA and GDN under the C++ launcher (docs/utilities/cpp_launcher.md): the repeated forward and backward run from a
-recording and match the op's Python bitwise, also for other values (cu_seqlens included) at the recorded shapes."""
+"""The linear-attention ops under the C++ launcher (docs/utilities/cpp_launcher.md): the repeated forward, backward, summary
+and summary backward run from a recording and match the op's Python bitwise, also for other values (cu_seqlens included) at
+the recorded shapes."""
 
+import functools
 import math
 
 import pytest
 import torch
 
 from cudnn import cpp_launcher
-from cudnn.linear_attention.ops import gdn, kda
+from cudnn.linear_attention.ops import gdn, gdn2, gdp, kda
+from cudnn.linear_attention.ops.mamba2 import run_mamba2_bwd, run_mamba2_fwd, run_mamba2_summary, run_mamba2_summary_bwd
 
-from linear_attention.test_la import frost_la_unavailable
+from linear_attention.test_la import (
+    LEAF_NAMES,
+    SEED,
+    frost_la_unavailable,
+    make_case,
+    mamba2_summary,
+    mamba2_summary_bwd,
+    op,
+    op_args,
+    run_summary,
+    run_summary_bwd,
+    set_seed,
+    to_thd,
+)
 
 requirement_error = frost_la_unavailable()
 if requirement_error:
@@ -175,3 +191,89 @@ def test_public_op_repeated_steps_are_replayed(family):
         broadcast = torch.autograd.grad(out.sum(), leaves)
     assert sorted(recorded_kinds(run_bwd)) == ["_Recording", "int"] and -1 in run_bwd.recordings.values()
     assert_bitwise(broadcast, grads[0])
+
+
+# family: its forward, backward, summary and summary backward, the bodies the C++ launcher records
+BODIES = {
+    "kda": (kda.run_kda_fwd, kda.run_kda_bwd, kda.run_kda_summary, kda.run_kda_summary_bwd),
+    "gdn": (gdn.run_gdn_fwd, gdn.run_gdn_bwd, gdn.run_gdn_summary, gdn.run_gdn_summary_bwd),
+    "gdn2": (gdn2.run_gdn2_fwd, gdn2.run_gdn2_bwd, gdn2.run_gdn2_summary, gdn2.run_gdn2_summary_bwd),
+    "gdp": (gdp.run_gdp_fwd, gdp.run_gdp_bwd, gdp.run_gdp_summary, gdp.run_gdp_summary_bwd),
+    "mamba2": (run_mamba2_fwd, run_mamba2_bwd, run_mamba2_summary, run_mamba2_summary_bwd),
+}
+# name: make_case's layout of the recorded calls and of the replay with other values, which has the same tokens and sequences
+LAYOUTS = {
+    "one_sequence": (dict(T=2048, H=32), dict(T=2048, H=32)),
+    "packed": (dict(seq_lens=[272] * 17, H=8), dict(seq_lens=[80 + 24 * i for i in range(17)], H=8)),
+}
+
+
+def tensors(result):
+    return [t for t in result if t is not None]
+
+
+def python_ran(*args):
+    raise AssertionError("the op's Python launched a kernel where its recording was to run")
+
+
+def assert_replays(monkeypatch, bodies, draw):
+    """``draw(seed, layout)`` is a call on one draw of values: its third run is a replay and equals its first, and the
+    replay of another draw at the same shapes, with other sequence boundaries, equals that draw's Python."""
+    for body in bodies:
+        body.recordings.clear()
+    call = draw(SEED, 0)
+    first = call()  # runs the API
+    call()  # records it
+    other = draw(SEED + 100, 1)
+    with monkeypatch.context() as recordings_only:
+        recordings_only.setattr(cpp_launcher, "launch", python_ran)
+        assert_bitwise(tensors(call()), tensors(first))
+        replayed = other()
+    for body in bodies:
+        assert set(recorded_kinds(body)) == {"_Recording"}
+        body.recordings.clear()
+    monkeypatch.setattr(cpp_launcher, "HOT_CALLS", 1 << 30)  # nothing recorded and nothing hot: the op's Python
+    assert_bitwise(tensors(replayed), tensors(other()))
+
+
+def cotangent(case, seed):
+    set_seed(seed + 1)
+    return to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("variant", ["gdn2", "gdp", "mamba2"])
+def test_training_step_is_replayed(monkeypatch, variant, layout):
+    """GDN-2, GDP and Mamba-2: the public op's forward and its autograd backward."""
+
+    def draw(seed, which):
+        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout][which])
+        args = op_args(case)
+        count = len(LEAF_NAMES[variant])
+        leaves = [t.detach().requires_grad_(True) for t in args[:count]]
+        run = functools.partial(op(variant), plan_name=f"{variant}_frost")
+        d_o = cotangent(case, seed)
+
+        def call():
+            out = run(*leaves, *args[count:])
+            out = out[0] if isinstance(out, tuple) else out
+            return (out, *torch.autograd.grad(out, leaves, d_o, allow_unused=True))
+
+        return call
+
+    assert_replays(monkeypatch, BODIES[variant][:2], draw)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("variant", BODIES)
+def test_summaries_are_replayed(monkeypatch, variant, layout):
+    """Every family's summary and summary backward."""
+
+    def draw(seed, which):
+        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout][which])
+        d_o = cotangent(case, seed)
+        if variant == "mamba2":
+            return lambda: (*mamba2_summary(case), *mamba2_summary_bwd(case, d_o))
+        return lambda: (*run_summary(case), run_summary_bwd(case, d_o))
+
+    assert_replays(monkeypatch, BODIES[variant][2:], draw)

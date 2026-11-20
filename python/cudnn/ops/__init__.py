@@ -15,6 +15,8 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "sdpa_forward_jax": ("cudnn.sdpa.jax_api", "sdpa_forward_jax"),
+    "sdpa_backward_jax": ("cudnn.sdpa.jax_api", "sdpa_backward_jax"),
     "dense_indexer_kl_forward": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl_forward"),
     "simplified_sparse_attention_forward": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_forward"),
     "simplified_sparse_attention_forward_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_forward_jax"),
@@ -49,6 +51,13 @@ _LAZY_EXPORTS = {
     "prepare_mok_training": ("cudnn.moe_ep.cake", "prepare_mok_training"),
     "create_mok_workspace": ("cudnn.moe_ep.cake", "create_mok_workspace"),
     "quantize_mok_weights": ("cudnn.moe_ep.cake", "quantize_mok_weights"),
+    "cutemok_prepare": ("cudnn.moe_ep.cutemok", "cutemok_prepare"),
+    "cutemok_forward": ("cudnn.moe_ep.cutemok", "cutemok_forward"),
+    "cutemok_backward": ("cudnn.moe_ep.cutemok", "cutemok_backward"),
+    "cutemok_quantize_weights": ("cudnn.moe_ep.cutemok", "cutemok_quantize_weights"),
+    "CuteMoKConfig": ("cudnn.moe_ep.cutemok", "CuteMoKConfig"),
+    "CuteMoKPlan": ("cudnn.moe_ep.cutemok", "CuteMoKPlan"),
+    "CuteMoKSplitWeight": ("cudnn.moe_ep.cutemok", "CuteMoKSplitWeight"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),

@@ -61,13 +61,24 @@ def validate_accumulation_scale(scale):
 # admitted 2026-10-28: the same tcgen05 / cta_group::2 / TMEM / CLC feature set) and Rubin (cc 10.7, admitted 2026-11-03: the same bodies,
 # unchanged).  The compile target follows the device in every prepared host (``--gpu-arch sm_{sm}a`` with ``sm = cc[0] * 10 + cc[1]``), so
 # admitting a part is this tuple plus the engine row's sm range -- never a copy of a kernel into another arch directory.
-ACCUMULATION_CCS = ((10, 0), (10, 3), (10, 7))
+ACCUMULATION_CCS = ((10, 0), (10, 3), (10, 7), (11, 0))
 # The text every decline off these parts carries (the graph row's declaration check and the THD / grouped standalone adapters pin ONE token).
-ACCUMULATION_PARTS = "SM100, SM103 or SM107 (cc 10.0 / 10.3 / 10.7)"
+ACCUMULATION_PARTS = "SM100, SM103, SM107 or SM110 (cc 10.0 / 10.3 / 10.7 / 11.0)"
 # The dense MHA envelope of the ``sdpa_bwd_sm100_d128`` row (its ``Capabilities.sm_lo`` / ``sm_hi``, inclusive): the one-launch recompute body
 # serves every cc in it, the accumulation chain the ``ACCUMULATION_CCS`` parts only; cc 10.7 closes the range (SM108+ is declined by name
 # until a part is admitted).  Read by the engine spec and the dense adapter's ``check_support`` -- one place.
 DENSE_SM_RANGE = (100, 107)
+# Parts outside that range the row also serves (Thor, cc 11.0: an SM100-class part), as cc pairs and as the engine row's sm codes.
+DENSE_EXTRA_CCS = ((11, 0),)
+DENSE_EXTRA_SMS = frozenset(major * 10 + minor for major, minor in DENSE_EXTRA_CCS)
+DENSE_PARTS = f"SM{DENSE_SM_RANGE[0]}-{DENSE_SM_RANGE[1]}" + "".join(f" or SM{code}" for code in sorted(DENSE_EXTRA_SMS))
+
+
+def dense_part_admitted(cc) -> bool:
+    code = cc[0] * 10 + cc[1]
+    return DENSE_SM_RANGE[0] <= code <= DENSE_SM_RANGE[1] or code in DENSE_EXTRA_SMS
+
+
 # The parts the deterministic kernel pair is measured on; elsewhere a deterministic dense MHA request keeps the recompute body.
 PAIR_CCS = ((10, 0), (10, 3))
 D192_FP8_CCS = ACCUMULATION_CCS

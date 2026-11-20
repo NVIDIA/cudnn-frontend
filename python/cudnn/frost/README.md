@@ -1169,6 +1169,12 @@ adds one `min.xorsign.abs.f32` against 448 per element and changes no code)
 and `fp8_dynamic_row_scale(amax)` (`scale = max(div.rn(amax, 448),
 fp32(1 / (448 * 512)))` and `inv = div.rn(1, scale)`: the per-row FP8 scale
 and its reciprocal, two IEEE divisions).
+One helper serves a sixteen-element-per-thread kernel:
+`row_store16_e2m1(addr, values, encode)` (the E2M1 codes of
+`values[j] * encode` as one 64-bit store, the code of `values[j]` in nibble
+`j`: the block of a 4-bit row that one block scale covers). The byte of that
+block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
+`tile_dsl.sf_layout.sf_band_offset(row, column, atoms_per_band)`.
 
 
 ## Adding coverage, cheapest first

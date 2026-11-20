@@ -53,11 +53,12 @@ import inspect
 import json
 import logging
 import os
+import struct
 import sys
 import threading
 import types
 import weakref
-from numbers import Integral, Real
+from numbers import Integral, Rational, Real
 from operator import itemgetter
 
 from cudnn._tupledict import TupleDict
@@ -75,7 +76,7 @@ _capturing = threading.Lock()  # one recording at a time: it patches the DSL's c
 _NOT_REPLAYED = object()  # the recording does not apply to this call: run the function
 _DECLINED = -1  # a signature whose call could not be recorded
 _MISSING = object()  # a parameter the call leaves out and that has no default
-_VALUES = frozenset({bool, int, float, str, type(None)})  # argument types keyed by value
+_VALUES = frozenset({bool, int, str, type(None)})  # argument types keyed by value
 _TENSORS = set()  # torch.Tensor and torch.nn.Parameter, once torch is loaded
 _EMPTY = {"empty", "empty_strided", "empty_like", "new_empty", "new_empty_strided"}
 _FILL_VALUES = {"zeros": 0, "zeros_like": 0, "new_zeros": 0, "ones": 1, "ones_like": 1, "new_ones": 1}
@@ -239,6 +240,8 @@ def _key(values, env, stream):
 
 
 def _item(v):
+    if type(v) is float:
+        return v or (v, float_bits(v))  # 0.0 == -0.0, and they are different arguments
     if isinstance(v, _torch.Tensor):
         return (v.dtype, v.shape, v.stride(), v.device)
     if _stream_like(v):
@@ -248,6 +251,11 @@ def _item(v):
             raise TypeError("a tensor inside a sequence")
         return tuple((type(x), _item(x)) for x in v)
     hash(v)
+    if isinstance(v, Real) and not isinstance(v, Rational):  # a float subclass, a numpy float: equal values of other bits
+        try:
+            return v, float_bits(v)
+        except Exception:  # a number that gives no double keys by its value alone
+            pass
     return v
 
 
@@ -560,7 +568,7 @@ class _Capture:
             where, offset = place(int(v))
             return {"int": int(v)} if where is None else {"where": where, "offset": offset, "as": "int"}
         if isinstance(v, Real):
-            return {"float": float(v)}
+            return {"float_bits": float_bits(v)}
         if isinstance(v, tvm_ffi.Tensor) or hasattr(cls, "__tvm_ffi_object__"):
             obj = v if isinstance(v, tvm_ffi.Tensor) else v.__tvm_ffi_object__()
             if not isinstance(obj, tvm_ffi.Tensor):
@@ -577,7 +585,7 @@ class _Capture:
         if hasattr(cls, "__tvm_ffi_int__"):
             return {"int": int(v.__tvm_ffi_int__())}
         if hasattr(cls, "__tvm_ffi_float__"):
-            return {"float": float(v.__tvm_ffi_float__())}
+            return {"float_bits": float_bits(v.__tvm_ffi_float__())}
         raise _Decline(f"a kernel argument {cls.__name__}")
 
     def tensor(self, t, place):
@@ -815,6 +823,11 @@ def _builder(template):
     return lambda values, buffers: kind([build(values, buffers) for build in parts])
 
 
+def float_bits(v):
+    """A float as its IEEE-754 double bits: JSON has no infinity or NaN."""
+    return struct.unpack("q", struct.pack("d", v))[0]
+
+
 def _dense_stride(shape):
     """The strides torch gives a contiguous tensor of ``shape``."""
     stride, step = [], 1
@@ -929,7 +942,9 @@ def _difference(a, b, where):
         if a.keys() != b.keys():
             return where
         return next((d for d in (_difference(a[k], b[k], f"{where}[{k!r}]") for k in a.keys()) if d is not None), None)
-    return None if a == b or _stream_like(a) else where
+    if isinstance(a, float):  # by the bits: a NaN is the same argument in the call and in its replay, and 0.0 is not -0.0
+        return None if float_bits(a) == float_bits(b) else where
+    return None if a is b or a == b or _stream_like(a) else where
 
 
 @atexit.register

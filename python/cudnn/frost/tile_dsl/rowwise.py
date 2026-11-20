@@ -67,7 +67,18 @@ once.
 import cutlass
 import cutlass.cute as cute
 
-from .pointwise import div_rn_f32, f16x2_to_f32, fmax_f32, fp32_to_fp16, fp32_to_fp8x2, min_xorsign_abs_f32, opaque_f32_bits, pack_fp8x2_pairs, rcp_div_rn
+from .pointwise import (
+    div_rn_f32,
+    f16x2_to_f32,
+    fmax_f32,
+    fp32_to_fp4_pack,
+    fp32_to_fp16,
+    fp32_to_fp8x2,
+    min_xorsign_abs_f32,
+    opaque_f32_bits,
+    pack_fp8x2_pairs,
+    rcp_div_rn,
+)
 from .tma import ld_global_v4, st_global_v2, st_global_v4
 
 WARP = 32
@@ -312,3 +323,24 @@ def fp8_dynamic_row_scale(amax):
     NOT :func:`~cudnn.frost.tile_dsl.pointwise.e4m3_scale_from_amax` (the block scale of NVFP4: another rule, another floor)."""
     scale = fmax_f32(div_rn_f32(amax, opaque_f32_bits(E4M3_MAX_BITS)), opaque_f32_bits(FP8_ROW_SCALE_FLOOR_BITS))
     return scale, rcp_div_rn(scale)
+
+
+# ---------------------------------------------------------------------------
+# Row helper of a sixteen-element-per-thread kernel: one block of a 4-bit (E2M1) code row.  ``addr`` is the byte address of
+# the block's first code byte; the block is 8 bytes and the caller keeps it aligned to 8.
+# ---------------------------------------------------------------------------
+ROW_BLOCK = 16  # elements per thread per block: the elements one block scale of NVFP4 covers
+
+
+def row_store16_e2m1(addr, values, encode) -> None:
+    """ONE 64-bit global store of the sixteen E2M1 codes of ``values[j] * encode``: the code of ``values[j]`` is NIBBLE ``j`` of
+    the eight bytes at ``addr`` -- the low nibble of byte ``j // 2`` for an even ``j``, the high nibble for an odd one.
+
+    Per element one fp32 multiply by ``encode`` (the block's encode scale, e.g. from
+    :func:`~cudnn.frost.tile_dsl.pointwise.nvfp4_block_scale_global`), then the saturating nearest-even convert of each pair
+    (:func:`~cudnn.frost.tile_dsl.pointwise.fp32_to_fp4_pack`: ties to the even code, saturation at +-6, the sign kept on a
+    zero).  The 4-bit sibling of :func:`row_store8_e4m3`: sixteen elements per thread, because one block scale covers sixteen."""
+    if not isinstance(values, (list, tuple)) or len(values) != ROW_BLOCK:
+        raise ValueError(f"row_store16_e2m1: values must be a list or tuple of {ROW_BLOCK} Float32 values, got {values!r}")
+    words = fp32_to_fp4_pack([v * encode for v in values])
+    st_global_v2(addr, [words[0], words[1]], cutlass.Int32)

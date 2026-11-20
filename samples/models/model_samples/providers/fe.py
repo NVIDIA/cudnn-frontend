@@ -443,7 +443,11 @@ class GdnDecodeFusedBlock(EntryBlock):
         qkv = (2 * g.la_key_heads + NV) * D
         bf16 = dict(dtype=torch.bfloat16, device=device)
         x, z = split_qkvz(torch.zeros((rows, qkv + NV * D), **bf16), qkv, NV, D)
-        slots = RecurrentSlots(torch.zeros((rows + 1, NV, D, D), dtype=torch.float32, device=device), torch.zeros((rows + 1, g.la_conv_width - 1, qkv), **bf16))
+        several = self._state_tokens()
+        pool = torch.zeros((rows * several + 1, NV, D, D), dtype=torch.float32, device=device)
+        slots = RecurrentSlots(pool, torch.zeros((rows + 1, g.la_conv_width - 2 + several, qkv), **bf16), several)
+        if several > 1:  # the prompt of a session that verifies behind it: token 0 of a pool of several tokens, as the state hands it out
+            slots = slots.first_token()
         params = GdnParams(
             g.la_key_heads,
             NV,
@@ -459,6 +463,13 @@ class GdnDecodeFusedBlock(EntryBlock):
         slot_ids = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
         return self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots)
 
+    def _state_tokens(self) -> int:
+        """The tokens per sequence of the state this plan's steps run on (the plan's option ``state_tokens``; 1 where it
+        names none).  More than one: the steps of this plan are the decode steps of a prompt on token 0 of a state of
+        several tokens per sequence -- the history operand then has that pool's slot stride, which is another compiled
+        form of the entry, so the scratch operands are built in that layout."""
+        return int(self.options.get("state_tokens", 1))
+
     def compile(self, sequences: int, tokens: int) -> None:
         import torch
 
@@ -468,6 +479,8 @@ class GdnDecodeFusedBlock(EntryBlock):
             entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
             if rows not in _FIRST_LAUNCH:
                 _FIRST_LAUNCH[rows] = _outside_pool(device, lambda: entry(*operands))
+            elif self._state_tokens() > 1:  # the form of another layout at a row count that has launched: launched once here too
+                entry(*operands)
         except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
             raise RuntimeError(self._declined(error, "its first launch")) from error
 

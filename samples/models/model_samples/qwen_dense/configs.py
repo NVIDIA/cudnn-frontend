@@ -35,6 +35,12 @@ the step (``VERIFY_OUT_ROWS``).
 
 ``readme_table()`` renders the tables of the decode step as the family README shows them; a host test keeps the two in
 agreement.
+
+The checkpoint's drafter has a table of its own, ``DRAFTER_PROVIDERS``: one row per block of its draft pass, in every
+stack, at any row count.  Every block of it is a reference chain -- no kernel serves a drafter here yet -- and its
+embedding lookup is PyTorch's gather.  A pass calls its multiply at five sites and its norm at two
+(``DRAFT_PROJECTION_SITES``, ``DRAFT_NORM_SITES``: the names ``QwenDenseDrafter.sites()`` hands the blocks); the rows
+name no form for them, because a reference chain is called in none.
 """
 
 from __future__ import annotations
@@ -48,6 +54,11 @@ BOTH = ("fe-cublas", "reference")
 TARGET_STACKS = ("native", "fe-entries")
 #: every stack with provider rows (all but the reference), and every stack
 PROVIDER_STACKS = ("fe-cublas", *TARGET_STACKS)
+#: the positions of one page of the paged attention cache that the attention core of the target kernel set reads (the census
+#: names that kernel).  The attention blocks of this family read one contiguous cache today; the performance mode of a sample
+#: judges the two positions on either side of the first page boundary inside its timed steps all the same, so that its
+#: judged positions do not move when the paged cache arrives
+ATTENTION_PAGE = 64
 EVERY = (*BOTH, *TARGET_STACKS)
 
 #: the forms the target calls the add + RMSNorm + quantise kernel in, by call site of the wiring: the residual mode (the first
@@ -370,6 +381,43 @@ PROVIDERS = {
     "token_choice": [ProviderRow(*ANY, "torch.argmax", EVERY, serves="any")],
 }
 
+#: the call sites of the drafter's multiply, by the loader's name of the weight (``drafter.MULTIPLIES``), each with the shape
+#: of that weight at the published widths (out features x in features).  A kernel that is one weight shape per instance
+#: takes them as the sites of its row; the reference chain of today is one function at all five
+DRAFT_PROJECTION_SITES = (
+    ("fc", (("OUT_FEATURES", 5120), ("IN_FEATURES", 10240))),
+    ("qkv", (("OUT_FEATURES", 14336), ("IN_FEATURES", 5120))),
+    ("o", (("OUT_FEATURES", 5120), ("IN_FEATURES", 6144))),
+    ("gate_up", (("OUT_FEATURES", 34816), ("IN_FEATURES", 5120))),
+    ("down", (("OUT_FEATURES", 5120), ("IN_FEATURES", 17408))),
+)
+#: the call sites of the drafter's norm + quantise, by what the codes feed: the layer's in-projection -- the rows it norms
+#: ARE the residual stream of the pass, nothing is added -- and the MLP, in front of which the attention branch is added
+#: to the stream.  (The final norm of a pass adds too and writes bf16 rows and no codes: a block of its own.)
+DRAFT_NORM_SITES = (
+    ("input", (("ADD", False),)),
+    ("mlp", (("ADD", True),)),
+)
+
+#: the blocks of one pass of the checkpoint's drafter.  Every row serves every stack, every GPU class and any row count:
+#: the first pass of a step behind a verify step runs at sequences x tokens rows and every other pass at one row per
+#: sequence, on the same rows of this table
+DRAFTER_PROVIDERS = {
+    "draft.embedding": [ProviderRow(*ANY, "torch.index_select", EVERY, serves="any")],
+    "draft.pre_fc_norm": [ProviderRow(*ANY, "torch_ref.pre_fc_norm_quantize", EVERY, serves="any", fallback="reference chain")],
+    "draft.projection": [ProviderRow(*ANY, "torch_ref.linear", EVERY, serves="any", fallback="reference chain")],
+    "draft.norm_quantize": [ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain")],
+    "draft.attention.prepare": [ProviderRow(*ANY, "torch_ref.attention_prepare", EVERY, serves="any", fallback="reference chain")],
+    "draft.attention.core": [ProviderRow(*ANY, "torch_ref.attention", EVERY, serves="any", fallback="reference chain over a plain cache of the drafter's own")],
+    "draft.gate_quantize": [ProviderRow(*ANY, "torch_ref.gate_row_quantize", EVERY, serves="any", fallback="reference chain")],
+    "draft.silu_mul": [ProviderRow(*ANY, "torch_ref.silu_mul", EVERY, serves="any", fallback="reference chain")],
+    "draft.activation_quantize": [ProviderRow(*ANY, "torch_ref.quantize", EVERY, serves="any", fallback="reference chain")],
+    "draft.final_norm": [ProviderRow(*ANY, "torch_ref.add_norm_quantize", EVERY, serves="any", fallback="reference chain")],
+    "draft.head.quantize": [ProviderRow(*ANY, "torch_ref.quantize", EVERY, serves="any", fallback="reference chain")],
+    "draft.head": [ProviderRow(*ANY, "torch_ref.linear", EVERY, serves="any", fallback="reference chain")],
+    "draft.token_choice": [ProviderRow(*ANY, "torch.argmax+lookup", EVERY, serves="any", fallback="reference chain")],
+}
+
 REGIMES = [
     Regime(
         ("any",),
@@ -394,6 +442,23 @@ BLOCK_TITLES = {
     "attention.gate_quantize": "gate + quantise",
     "output_head": "output head",
     "token_choice": "token choice",
+}
+
+#: how each block of the drafter's pass is named in text (``BLOCK_TITLES`` stays the model's)
+DRAFTER_BLOCK_TITLES = {
+    "draft.embedding": "token embedding lookup",
+    "draft.pre_fc_norm": "RMSNorm of the embedding rows and of the hidden rows + one quantisation per row over both",
+    "draft.projection": "8-bit multiply, a scale per weight row and per row of the step",
+    "draft.norm_quantize": "(residual add +) RMSNorm + quantise per row",
+    "draft.attention.prepare": "attention preparation",
+    "draft.attention.core": "attention core",
+    "draft.gate_quantize": "gate + quantise per row",
+    "draft.silu_mul": "SiLU x up",
+    "draft.activation_quantize": "quantise per row",
+    "draft.final_norm": "residual add + RMSNorm",
+    "draft.head.quantize": "4-bit quantisation of the head's operand",
+    "draft.head": "output head over the listed rows",
+    "draft.token_choice": "token choice over the listed rows",
 }
 
 #: device memory the first launch of the fused linear-attention step reserves outside PyTorch's allocator, per GPU class: an
@@ -424,18 +489,35 @@ LOGITS_BAND_UNITS = 4.0
 CHECKPOINT_LOGITS_BAND_UNITS = None
 
 
-def readme_table(calls: dict, stack: str = "fe-cublas", cc=(10, 0)) -> str:
+def readme_table(calls: dict, stack: str = "fe-cublas", cc=(10, 0), table=None, titles=None, per: str = "step (64 layers)") -> str:
     """The block table of the family README (markdown) for ``stack`` on compute capability ``cc``, with ``calls`` per step of
     the full model: per block the first row of the stack that serves the class in a step of one token per sequence -- the
-    decode step -- with the form its entry is called in."""
+    decode step -- with the form its entry is called in.  ``table`` and ``titles`` name another provider table of the
+    family and its block titles (the drafter's: ``DRAFTER_PROVIDERS``, ``DRAFTER_BLOCK_TITLES``), and ``per`` what its
+    calls are counted over (``"pass"``)."""
     from ..providers import ENTRY_NAMES
 
-    lines = ["| block | calls per step (64 layers) | provider key | entry [form] |", "|---|---|---|---|"]
-    for block, rows in PROVIDERS.items():
+    table, titles = PROVIDERS if table is None else table, BLOCK_TITLES if titles is None else titles
+    lines = [f"| block | calls per {per} | provider key | entry [form] |", "|---|---|---|---|"]
+    for block, rows in table.items():
         row = next(r for r in rows if stack in r.stacks and r.serves_class(cc) and r.tokens[0] <= 1)
         forms = f" + one of {len(row.served)} forms, by call site" if row.sites else ""
         entry = ENTRY_NAMES[row.key] + form_text(row.form) + forms + (f", fallback: {row.fallback}" if row.fallback else "")
-        lines.append(f"| {BLOCK_TITLES[block]} | {calls[block]} | `{row.key}` | {entry} |")
+        lines.append(f"| {titles[block]} | {calls[block]} | `{row.key}` | {entry} |")
+    return "\n".join(lines)
+
+
+def readme_draft_sites() -> str:
+    """The call-site table of the drafter in the family README (markdown): the five sites of its multiply with the shape
+    of the weight there at the published widths, and the two of its norm + quantise with whether the call adds the
+    branch to the residual stream."""
+    lines = ["| block | call site | what differs there |", "|---|---|---|"]
+    for site, fields in DRAFT_PROJECTION_SITES:
+        shape = dict(fields)
+        lines.append(f"| {DRAFTER_BLOCK_TITLES['draft.projection']} | `{site}` | weight {shape['OUT_FEATURES']} x {shape['IN_FEATURES']} |")
+    for site, fields in DRAFT_NORM_SITES:
+        added = "the branch is added to the residual stream first" if dict(fields)["ADD"] else "no add: its rows are the residual stream"
+        lines.append(f"| {DRAFTER_BLOCK_TITLES['draft.norm_quantize']} | `{site}` | {added} |")
     return "\n".join(lines)
 
 

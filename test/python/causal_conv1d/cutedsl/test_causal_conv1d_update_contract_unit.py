@@ -23,10 +23,11 @@ def _meta_inputs(
     n_slots: int = 3,
     state_len: int = 4,
     width: int = 4,
+    dtype: torch.dtype = torch.bfloat16,
 ):
-    x = torch.empty(n_rows, n_channels, device="meta", dtype=torch.bfloat16)
-    state = torch.empty(n_slots, n_channels, state_len, device="meta", dtype=torch.bfloat16)
-    weight = torch.empty(n_channels, width, device="meta", dtype=torch.bfloat16)
+    x = torch.empty(n_rows, n_channels, device="meta", dtype=dtype)
+    state = torch.empty(n_slots, n_channels, state_len, device="meta", dtype=dtype)
+    weight = torch.empty(n_channels, width, device="meta", dtype=dtype)
     return x, state, weight
 
 
@@ -47,9 +48,8 @@ def test_only_cudnn_ops_exports_the_semantic_api(tmp_path):
 
     source = Path(__file__).resolve().parents[4] / "python" / "cudnn"
     probe = tmp_path / "cudnn"
-    # Other pytest workers may atomically replace bytecode while this tree is
-    # copied. The fresh interpreter needs source, not another process's cache.
-    shutil.copytree(source, probe, ignore=shutil.ignore_patterns("__pycache__", "*.py[co]"))
+    # Copy source and link the active binding below, including for in-place builds.
+    shutil.copytree(source, probe, ignore=shutil.ignore_patterns("__pycache__", "*.py[co]", "_compiled_module*.so"))
     compiled_modules = list(Path(cudnn.__file__).resolve().parent.glob("_compiled_module*.so"))
     if len(compiled_modules) != 1:
         pytest.skip(f"expected one compiled module next to {cudnn.__file__}, " f"found {len(compiled_modules)}")
@@ -105,10 +105,11 @@ def test_public_semantic_signature():
 
 @pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
 @pytest.mark.parametrize("activation", [None, "identity", "silu", "swish"])
-def test_public_meta_contract_preserves_output_metadata(state_len, activation):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_public_meta_contract_preserves_output_metadata(state_len, activation, dtype):
     from cudnn.ops import causal_conv1d_update
 
-    x, state, weight = _meta_inputs(state_len=state_len)
+    x, state, weight = _meta_inputs(state_len=state_len, dtype=dtype)
     indices = torch.empty(x.shape[0], device="meta", dtype=torch.int32)
     output = causal_conv1d_update(
         x,
@@ -122,6 +123,30 @@ def test_public_meta_contract_preserves_output_metadata(state_len, activation):
     assert output.shape == x.shape
     assert output.dtype == x.dtype
     assert output.device == x.device
+
+
+@pytest.mark.parametrize("operand", ["conv_state", "weight", "bias"])
+def test_public_rejects_mixed_decode_dtypes(operand):
+    from cudnn.ops import causal_conv1d_update
+
+    x, state, weight = _meta_inputs(dtype=torch.float16)
+    tensors = {
+        "conv_state": state,
+        "weight": weight,
+        "bias": x.new_empty(x.shape[1]),
+    }
+    tensors[operand] = tensors[operand].to(torch.bfloat16)
+
+    with pytest.raises(TypeError, match=rf"{operand} must have dtype torch.float16"):
+        causal_conv1d_update(x, **tensors)
+
+
+def test_public_rejects_fp32_decode_operands():
+    from cudnn.ops import causal_conv1d_update
+
+    x, state, weight = _meta_inputs(dtype=torch.float32)
+    with pytest.raises(TypeError, match=r"x must have dtype torch.float16 or torch.bfloat16"):
+        causal_conv1d_update(x, state, weight)
 
 
 @pytest.mark.parametrize("channel_fast", [False, True])

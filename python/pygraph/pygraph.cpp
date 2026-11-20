@@ -142,6 +142,21 @@ convert_to_cudnn_data_type(const DLDataType& dtype) {
                     return cudnn_frontend::DataType_t::BOOLEAN;
             }
             break;
+        case DLDataTypeCode::kDLFloat8_e4m3fn:
+            if (dtype.bits == 8 && dtype.lanes == 1) {
+                return cudnn_frontend::DataType_t::FP8_E4M3;
+            }
+            break;
+        case DLDataTypeCode::kDLFloat8_e5m2:
+            if (dtype.bits == 8 && dtype.lanes == 1) {
+                return cudnn_frontend::DataType_t::FP8_E5M2;
+            }
+            break;
+        case DLDataTypeCode::kDLFloat8_e8m0fnu:
+            if (dtype.bits == 8 && dtype.lanes == 1) {
+                return cudnn_frontend::DataType_t::FP8_E8M0;
+            }
+            break;
     }
     return cudnn_frontend::DataType_t::NOT_SET;
 }

@@ -140,7 +140,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from cudnn._cutlass_compat import LayoutEnum
+from cudnn._cutlass_compat import AddressSpace, LayoutEnum
 
 from .fp8_projection_decode_config import (
     EMPTY_BAR_ARRIVERS,
@@ -301,13 +301,13 @@ class Fp8ProjectionDecodeKernel:
 
         sA = cute_ext.allocate(
             ab_dtype,
-            cute.AddressSpace.smem,
+            AddressSpace.smem,
             sm100_utils.make_smem_layout_a(tiled_mma, mnk_tiler, ab_dtype, stages),
             alignment=OPERAND_RING_ALIGN_BYTES,
         )
         sB = cute_ext.allocate(
             ab_dtype,
-            cute.AddressSpace.smem,
+            AddressSpace.smem,
             sm100_utils.make_smem_layout_b(tiled_mma, mnk_tiler, ab_dtype, stages),
             alignment=OPERAND_RING_ALIGN_BYTES,
         )
@@ -315,15 +315,15 @@ class Fp8ProjectionDecodeKernel:
         acc_layout = cute_ext.make_tmem_layout_acc(tiled_mma, self.mma_tiler_mn, acc_stage=1)
         c_tiler_mn = (self.cta_m, self.cta_n)
 
-        bar_full = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(stages), alignment=MBARRIER_BYTES).iterator
-        bar_empty = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(stages), alignment=MBARRIER_BYTES).iterator
-        bar_mma_epilog = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=MBARRIER_BYTES).iterator
-        bar_tmem_alloc = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=MBARRIER_BYTES).iterator
-        tmem_base_ptr = cute_ext.allocate(cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=TMEM_POINTER_BYTES).iterator
+        bar_full = cute_ext.allocate(cutlass.Int64, AddressSpace.smem, cute.make_layout(stages), alignment=MBARRIER_BYTES).iterator
+        bar_empty = cute_ext.allocate(cutlass.Int64, AddressSpace.smem, cute.make_layout(stages), alignment=MBARRIER_BYTES).iterator
+        bar_mma_epilog = cute_ext.allocate(cutlass.Int64, AddressSpace.smem, cute.make_layout(1), alignment=MBARRIER_BYTES).iterator
+        bar_tmem_alloc = cute_ext.allocate(cutlass.Int64, AddressSpace.smem, cute.make_layout(1), alignment=MBARRIER_BYTES).iterator
+        tmem_base_ptr = cute_ext.allocate(cutlass.Int32, AddressSpace.smem, cute.make_layout(1), alignment=TMEM_POINTER_BYTES).iterator
 
         if cutlass.const_expr(self.split_k > 1):
-            mailbox = cute_ext.allocate(cutlass.Float32, cute.AddressSpace.smem, cute.make_layout(self.mailbox_elements), alignment=MAILBOX_ALIGN_BYTES)
-            bar_reduce = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=MBARRIER_BYTES).iterator
+            mailbox = cute_ext.allocate(cutlass.Float32, AddressSpace.smem, cute.make_layout(self.mailbox_elements), alignment=MAILBOX_ALIGN_BYTES)
+            bar_reduce = cute_ext.allocate(cutlass.Int64, AddressSpace.smem, cute.make_layout(1), alignment=MBARRIER_BYTES).iterator
         else:
             # Placeholders: the reduction is elided at trace time for one K slice.
             mailbox = sA
@@ -551,8 +551,8 @@ class Fp8ProjectionDecodeKernel:
 
         # Each epilogue thread's registers mirror its partition of the accumulator tile.
         rmem_layout = cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, gD_epi, epi_tid)
-        rAcc = cute_ext.allocate(self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32)
-        rD = cute_ext.allocate(c_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32)
+        rAcc = cute_ext.allocate(self.acc_dtype, AddressSpace.rmem, rmem_layout, alignment=32)
+        rD = cute_ext.allocate(c_dtype, AddressSpace.rmem, rmem_layout, alignment=32)
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)

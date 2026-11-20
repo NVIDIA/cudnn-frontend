@@ -225,9 +225,12 @@ class SdpaDenseBinder {
         tail_native_  = flag("kv_tail_native");
         causal_       = flag("causal");
         bottom_right_ = flag("causal_bottom_right");
-        if (fused_split_ && (split_ < 2 || !fp32_partial_ || quantized_ || ragged_ || paged_ || has_sink_ || seq_q_ ||
-                             seq_kv_ || !spec.attr("gate_expect").is_none()))
-            invalid("native fused split requires dense FP32 partials without lengths, a sink, or a gate");
+        // The fused split folds the FP32 partials inside the tile launch. Paged pools and per-batch KV / Q lengths
+        // only change what a chunk reads or which rows it marks dead, so they bind as in the two-launch form; a
+        // sink, a ragged-Q leg and a gate are folded by the separate combine and keep refusing the fused frame.
+        if (fused_split_ &&
+            (split_ < 2 || !fp32_partial_ || quantized_ || ragged_ || has_sink_ || !spec.attr("gate_expect").is_none()))
+            invalid("native fused split requires FP32 partials without a sink, ragged Q, or a gate");
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || sq_ <= 0 || sk_ <= 0 || device_ < 0 || tile_n_ <= 0 ||
             (paged_ && page_size_ <= 0))
             invalid("invalid native dense plan geometry");
@@ -1018,6 +1021,9 @@ init_sdpa_dense_binding(py::module_ &m) {
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_d576_envelope", [](py::object) { return true; })
         .def_prop_ro_static("supports_fused_split", [](py::object) { return true; })
+        // The fused split over paged pools and per-batch KV / Q lengths (the Python side declines the in-launch
+        // reduction of such a decode plan on an extension without it).
+        .def_prop_ro_static("supports_fused_split_paged", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
         // The SM90 D128 causal claim counter's binder role (claim_counter spec flag): the adapter keeps a causal plan
         // on its static schedules on an older extension instead of launching a counter kernel whose counter pointer is

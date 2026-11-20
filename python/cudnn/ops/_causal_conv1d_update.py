@@ -18,11 +18,11 @@ def _normalize_activation(activation: Optional[str]) -> str:
 
 
 def _validate_x_stride(x: Tensor) -> None:
-    """Validate the native BF16 ``[N, D]`` row-strided input contract.
+    """Validate the native 16-bit ``[N, D]`` row-strided input contract.
 
     Compact rows retain the legacy behavior for every channel count.  Padded
-    rows are admitted only when every row begins at a 16-byte boundary; BF16
-    therefore requires an eight-element-aligned leading dimension.
+    rows require an eight-element-aligned leading dimension so every row
+    begins at a 16-byte boundary.
     """
 
     n_channels = x.shape[1]
@@ -32,7 +32,7 @@ def _validate_x_stride(x: Tensor) -> None:
     if row_stride < n_channels:
         raise ValueError(f"x row stride ld must be at least D={n_channels}, got ld={row_stride}")
     if row_stride > n_channels and row_stride % 8 != 0:
-        raise ValueError("padded x rows must start at 16-byte-aligned BF16 addresses " f"(ld % 8 == 0), got D={n_channels}, ld={row_stride}")
+        raise ValueError("padded x rows must start at 16-byte-aligned addresses " f"(ld % 8 == 0), got D={n_channels}, ld={row_stride}")
 
 
 def _has_supported_conv_state_layout(conv_state: Tensor) -> bool:
@@ -95,12 +95,15 @@ def _validate_semantic_contract(
     if cache_seqlens is not None and tuple(cache_seqlens.shape) != (n_rows,):
         raise ValueError(f"cache_seqlens must have shape {(n_rows,)}, got {tuple(cache_seqlens.shape)}")
 
+    dtype = x.dtype
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"x must have dtype torch.float16 or torch.bfloat16, got {dtype}")
     tensors = (("x", x), ("conv_state", conv_state), ("weight", weight), ("bias", bias))
     for name, tensor in tensors:
         if tensor is None:
             continue
-        if tensor.dtype != torch.bfloat16:
-            raise TypeError(f"{name} must have dtype torch.bfloat16, got {tensor.dtype}")
+        if tensor.dtype != dtype:
+            raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
         if name == "x":
             _validate_x_stride(tensor)
         elif name == "conv_state":
@@ -278,16 +281,16 @@ def causal_conv1d_update(
     select the same compile-time SiLU specialization.
 
     Args:
-        x: CUDA BF16 tensor with shape ``[N, D]`` and strides ``(ld, 1)``.
+        x: CUDA FP16 or BF16 tensor with shape ``[N, D]`` and strides ``(ld, 1)``.
             Compact ``ld == D`` is supported for every ``D``. Padded
-            ``ld > D`` must be divisible by eight so each BF16 row starts at a
+            ``ld > D`` must be divisible by eight so each row starts at a
             16-byte-aligned address.
-        conv_state: CUDA BF16 tensor with shape ``[S, D, L]``, where
+        conv_state: CUDA tensor with shape ``[S, D, L]`` and the same dtype as ``x``, where
             ``L >= W - 1``. Compact storage is accepted. For ``L=3``, the
             channel-last view returned by :func:`cudnn.ops.causal_conv1d` is
             also accepted directly.
-        weight: Contiguous CUDA BF16 tensor with shape ``[D, W]``.
-        bias: Optional contiguous CUDA BF16 tensor with shape ``[D]``.
+        weight: Contiguous CUDA tensor with shape ``[D, W]`` and the same dtype as ``x``.
+        bias: Optional contiguous CUDA tensor with shape ``[D]`` and the same dtype as ``x``.
         activation: ``None``, ``"identity"``, ``"silu"``, or ``"swish"``.
         cache_seqlens: Reserved compatibility keyword. The current
             implementation accepts only ``None``.
@@ -295,7 +298,7 @@ def causal_conv1d_update(
             ``[N]`` selecting unique state slots.
 
     Returns:
-        A contiguous CUDA BF16 Tensor with shape ``[N, D]``.
+        A contiguous CUDA Tensor with shape ``[N, D]`` and the same dtype as ``x``.
     """
 
     for name, tensor in (("x", x), ("conv_state", conv_state), ("weight", weight)):

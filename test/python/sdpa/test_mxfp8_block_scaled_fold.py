@@ -1,14 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pins for ``sdpa.mxfp8.block_scaled_o_draw``: the fold that decides whether a
-test_mhas_v2 MXFP8 forward draw runs the block-scaled O epilogue (``sf_o``) or a
-plain MXFP8 forward.
+"""Block-scaled MXFP8 output draws must match the FROST engine rows.
 
-The ``sf_o`` output has no backend lowering, so a draw the harness admits and the
-FROST MXFP8 engine then declines FAILS the test (not a skip). The predicate must
-therefore mirror the engine rows exactly -- including their ARCH RANGE and their
-block-size domain: the SM120 MXFP8 row serves the 32-element (MXFP8) O only. Pure
-python; runs on every lane."""
+The scale-factor output has no backend lowering. Cover architecture boundaries,
+block sizes, and runtime gates so unsupported draws fold to plain MXFP8 forward.
+"""
 
 import cudnn
 import pytest
@@ -39,22 +35,21 @@ def _draw(o_block_scale=32, **over):
     return block_scaled_o_draw(o_block_scale, **kw)
 
 
-@pytest.mark.parametrize("sm", [100, 103, 107, 110])
-def test_admitted_on_the_sm100_line(sm):
+@pytest.mark.parametrize("sm", [100, 103, 106, 107, 109])
+def test_admitted_on_the_sm100_and_sm107_lines(sm):
     assert _draw(32, sm=sm) == 32
     assert _draw(16, sm=sm) == 16
 
 
-@pytest.mark.parametrize("sm", [120, 121])
+@pytest.mark.parametrize("sm", [120, 121, 129])
 def test_sm120_admits_the_mxfp8_output_only(sm):
     """The SM120 MXFP8 row serves the E4M3 + UE8M0/32 O; an NVFP4 draw folds to a plain forward."""
     assert _draw(32, sm=sm) == 32
     assert _draw(16, sm=sm) == 0
 
 
-@pytest.mark.parametrize("sm", [80, 90])
+@pytest.mark.parametrize("sm", [80, 90, 99, 110, 119, 130])
 def test_folds_off_the_mxfp8_engine_rows(sm):
-    """Hopper and Ampere have no FROST MXFP8 row at all."""
     assert _draw(32, sm=sm) == 0
     assert _draw(16, sm=sm) == 0
 

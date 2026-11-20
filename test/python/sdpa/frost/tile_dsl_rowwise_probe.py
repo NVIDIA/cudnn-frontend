@@ -31,7 +31,8 @@ ELEMENT-WISE PROBES (one thread per element, ``THREADS`` per thread block, no sh
 ROW-HELPER PROBES (one thread per element or per eight-element vector, no shared state): ``frost_rowwise_scale_probe``
 (``fp8_dynamic_row_scale``), ``frost_rowwise_store_e4m3_probe`` (``row_store8_e4m3``; the code tensor carries ``PAD`` bytes in
 front), ``frost_rowwise_load8_probe`` (``row_load8`` widened out to fp32), ``frost_rowwise_roundtrip_probe`` (``row_load8`` ->
-``row_store8_bf16``).
+``row_store8_bf16``), ``frost_rowwise_store_e2m1_probe`` (``row_store16_e2m1``; one thread per sixteen-element block, the code
+tensor carries ``PAD`` bytes in front).
 
 Run as ``__main__`` (``<arch> <dump dir> [nvdisasm candidates...]``, ``CUTE_DSL_DUMP_DIR`` and ``CUTE_DSL_KEEP=ptx,cubin`` set by
 the caller) it trace-compiles one rendering per entry of ``RENDERS`` for ``<arch>`` and prints the PTX counts the rendering cell
@@ -51,7 +52,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.frost.tile_dsl import rowwise
 from cudnn.frost.tile_dsl.pointwise import div_full_f32, div_rn_f32, ex2_approx_f32, min_xorsign_abs_f32, rsqrt_approx_ftz_f32
 from cudnn.frost.tile_dsl.rowwise import WARP, block_reduce, slot_words
-from cudnn.frost.tile_dsl.rowwise import fp8_dynamic_row_scale, row_load8, row_store8_bf16, row_store8_e4m3
+from cudnn.frost.tile_dsl.rowwise import fp8_dynamic_row_scale, row_load8, row_store8_bf16, row_store8_e4m3, row_store16_e2m1
 
 THREADS = 256  # the element-wise probes
 POINTWISE_ROWS = ("div_full", "div_rn", "rsqrt_ftz", "rsqrt_plain", "ex2", "ex2_ftz", "min_xorsign")
@@ -373,6 +374,29 @@ def _launch_roundtrip(src: cute.Tensor, dst: cute.Tensor, n: cutlass.Int32, stre
     frost_rowwise_roundtrip_probe(src, dst, n).launch(grid=((n + THREADS - 1) // THREADS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
+BLOCK = 16  # elements per thread of the 4-bit store
+
+
+@cute.kernel
+def frost_rowwise_store_e2m1_probe(x: cute.Tensor, encode: cute.Tensor, codes: cute.Tensor, n: cutlass.Int32):
+    """Block ``i`` = the sixteen fp32 values ``x[16 i .. 16 i + 15]`` and the multiplier ``encode[i]``; its sixteen codes go to
+    the eight bytes at ``PAD + 8 i`` of ``codes``."""
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    i = bid * THREADS + tid
+    if i < n:
+        vals = [x[BLOCK * i + j] for j in range(BLOCK)]
+        row_store16_e2m1((codes.iterator + (PAD + (BLOCK // 2) * i)).toint(), vals, encode[i])
+
+
+frost_rowwise_store_e2m1_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _launch_store_e2m1(x: cute.Tensor, encode: cute.Tensor, codes: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+    frost_rowwise_store_e2m1_probe(x, encode, codes, n).launch(grid=((n + THREADS - 1) // THREADS, 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+
 def run_scale(amax):
     """``(scale, inv)`` of ``fp8_dynamic_row_scale`` for a contiguous 1-D fp32 CUDA tensor (>= 2 elements)."""
     scale = torch.full_like(amax, float("nan"))
@@ -387,6 +411,15 @@ def run_store_e4m3(x, inv, *, clamp, sentinel=0xA5):
     n = x.shape[0]
     codes = torch.full((PAD + VEC * n + PAD,), sentinel, dtype=torch.uint8, device=x.device)
     _run("store_e4m3", _launch_store_e4m3, (x.reshape(-1), inv, codes), (clamp,), n)
+    return codes
+
+
+def run_store_e2m1(x, encode, *, sentinel=0xA5):
+    """The code tensor (uint8, ``PAD + 8 n + PAD`` bytes, pre-filled with ``sentinel``) after ``row_store16_e2m1`` of ``n``
+    blocks: ``x`` is ``[n, 16]`` fp32, ``encode`` ``[n]`` fp32."""
+    n = x.shape[0]
+    codes = torch.full((PAD + (BLOCK // 2) * n + PAD,), sentinel, dtype=torch.uint8, device=x.device)
+    _run("store_e2m1", _launch_store_e2m1, (x.reshape(-1), encode, codes), (), n)
     return codes
 
 
@@ -417,6 +450,7 @@ RENDERS += [
     ("store_e4m3", "store_e4m3", (False,), False),
     ("load8_bf16", "load8", (BF16,), False),
     ("roundtrip", "roundtrip", (), False),
+    ("store16_e2m1", "store_e2m1", (), False),
 ]
 RENDERS += [
     ("sum_ascending_w4", "sum", (4, "ascending", False), False),
@@ -453,6 +487,7 @@ PTX_EXACT = (
     "ex2.approx.ftz.f32",
     "min.xorsign.abs.f32",
     "cvt.rn.satfinite.e4m3x2.f32",
+    "cvt.rn.satfinite.e2m1x2.f32",
     "cvt.rn.bf16x2.f32",
 )
 PTX_PREFIX = ("shfl.sync.bfly", "bar.sync", "st.shared", "ld.shared", "ld.global.v4", "st.global.v4", "st.global.v2")
@@ -515,6 +550,8 @@ if __name__ == "__main__":
             return _launch_scale, [fake(), fake(), fake(), cutlass.Int32(1)]
         if kind == "store_e4m3":
             return _launch_store_e4m3, [fake(), fake(), fake(cutlass.Uint8), *const, cutlass.Int32(1)]
+        if kind == "store_e2m1":
+            return _launch_store_e2m1, [fake(), fake(), fake(cutlass.Uint8), cutlass.Int32(1)]
         if kind == "load8":
             return _launch_load8, [fake(const[0]), fake(), *const, cutlass.Int32(1)]
         if kind == "roundtrip":

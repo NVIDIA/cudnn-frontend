@@ -1697,7 +1697,8 @@ def run_warmup_summary(
     tail_buffers=(),
 ) -> None:
     """Replay the summary launch: one crossing into the DSL."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,

@@ -115,11 +115,15 @@ frost_qsa_compact.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _compact_host(sel, lo, hi, first, last, ids, counts, stream: cuda.CUstream):
+def _fast_scan(sel):
     # The bit scan is tuned for long sparse rows. Preserve short-row dispatch.
-    use_fast = (sel.shape[1] >= 8192) & (sel.shape[1] % 16 == 0) & (sel.iterator.toint() % 16 == 0)
-    if use_fast:
-        _metadata_fast.frost_qsa_fast_compact_host(sel, lo, hi, first, last, ids, counts, stream)
+    return (sel.shape[1] >= 8192) & (sel.shape[1] % 16 == 0) & (sel.iterator.toint() % 16 == 0)
+
+
+@cute.jit
+def _compact_host(sel, lo, hi, first, last, ids, counts, stream: cuda.CUstream):
+    if _fast_scan(sel):
+        _metadata_fast.frost_qsa_fast_compact_host(sel, lo, hi, first, last, ids, counts, None, stream)
     else:
         frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None).launch(grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream)
 

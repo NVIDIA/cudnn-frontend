@@ -204,6 +204,7 @@ class QwenDense:
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
     target_stacks = configs.TARGET_STACKS  # the stacks a run of which is held against the census of the target kernel set
+    attention_page = configs.ATTENTION_PAGE  # positions per page of the target's attention cache: where a timed run is judged
     _target = None  # that census, read once per process
 
     @classmethod
@@ -536,19 +537,22 @@ class QwenDense:
         working = max(2 * GIB, held // 8) + kept // 4
         return held + self.state_bytes(sequences, capacity, tokens) + working + self.check_bytes(uncopied)
 
-    def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = ()) -> Dict[str, int]:
-        """What one decode step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
-        measurement.
+    def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = (), tokens: int = 1) -> Dict[str, int]:
+        """What one step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
+        measurement.  ``tokens``: the tokens per sequence the step feeds -- 1, the decode step; more, the verify step,
+        which reads every weight once and that many embedding rows, reads one recurrent state per sequence and writes
+        one per token, reads the three history columns and writes ``tokens + 2``, and reads the caches up to its last
+        position, ``positions + tokens - 1``.
 
         * ``weights``: every weight the step reads in full, in its stored format (8-bit: 1 byte per element; 4-bit: 0.5 byte
-          per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per sequence;
+          per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per row of the step;
         * ``copies``: the same weights as a stack of this family reads them: a bf16 copy at 2 bytes per element -- but the
           weights of the blocks ``stored`` (the blocks of the stack's plan whose provider multiplies on the stored format:
           ``STORED_WEIGHTS``) on that format, as the loader kept them;
         * ``stored``: the part of ``copies`` that is read on a stored format (``stored_bytes``); 0 for a stack whose every
           multiply reads a copy;
         * ``state``: the recurrent state and the conv history of every linear-attention layer, read and written, and the
-          cached keys and values of every attention layer up to ``positions`` positions, read."""
+          cached keys and values of every attention layer over ``positions + tokens - 1`` positions, read."""
         g = self.geometry
         on_disk = copies = 0
         for spec in self.tensor_specs():
@@ -556,13 +560,13 @@ class QwenDense:
                 continue
             on_disk += spec.stored_bytes
             copies += 2 * spec.numel
-        embedding = 2 * sequences * g.hidden
-        state = 0
+        embedding = 2 * sequences * tokens * g.hidden
+        taps, state = g.la_conv_width - 1, 0
         for kind in g.layer_kinds:
-            if kind == "linear_attention":
-                state += 2 * sequences * (g.la_value_heads * g.la_head_dim**2 * 4 + (g.la_conv_width - 1) * g.qkv_channels * 2)
+            if kind == "linear_attention":  # one state read and one per token written; the taps read, and tokens + taps - 1 columns written
+                state += sequences * ((1 + tokens) * g.la_value_heads * g.la_head_dim**2 * 4 + (2 * taps + tokens - 1) * g.qkv_channels * 2)
             else:
-                state += 2 * sequences * g.attn_kv_heads * positions * g.attn_head_dim * 2
+                state += 2 * sequences * g.attn_kv_heads * (positions + tokens - 1) * g.attn_head_dim * 2
         # a block that multiplies on the stored format reads its weight there (1 byte per element of an 8-bit weight, 0.5625 of
         # a 4-bit one), and the 2 bytes per element of a copy of it are not read by a step
         kept = self.stored_bytes(stored)
@@ -730,7 +734,7 @@ class QwenDense:
         )
 
     # ------------------------------------------------------------------ one decode step
-    def step(self, call, weights: Weights, state, ids):
+    def step(self, call, weights: Weights, state, ids, tokens: Optional[int] = None):
         """One step: ``ids`` ``[rows]`` int32 on the device -> ``(next ids [rows] int32, logits [rows, vocabulary])``.
         ``call(block, layer, *operands)`` runs one block; a session passes the plan's blocks, a check wraps them.
 
@@ -738,9 +742,25 @@ class QwenDense:
         one.  On a state of ``T`` tokens per sequence it is the verify step: ``rows`` = sequences x ``T``, sequence by
         sequence; the linear-attention block is handed the step's slot table, an attention layer works on ``T``
         positions per sequence from ``state.position`` on, and the position stays where it is until the caller says how
-        many of the tokens it keeps (``state.accept``)."""
+        many of the tokens it keeps (``state.accept``).
+
+        ``tokens`` is the tokens per sequence of THIS step; left out, it is the state's.  ``tokens=1`` on a state of
+        several is the decode step of a prompt in front of the verify steps: ``rows`` = sequences, the blocks are handed
+        the plain slot ids and the token-0 views of the state (``state.prompt_layers()``: a ``ValueError`` once the state
+        stands behind a verify step), and the position moves on by one.  Any other count than the state's is a
+        ``ValueError``: a state serves its own step and the decode step of its prompt.
+
+        The step leaves on the state what a drafter reads of it: ``state.hidden``, the final-norm rows ``[rows, hidden]``
+        bf16 -- the tensor the last norm's call returned, by reference -- and ``state.greedy``, the ids it chose."""
+        tokens = state.tokens if tokens is None else tokens
+        if tokens == state.tokens:
+            layers = state.layers
+        elif tokens == 1:
+            layers = state.prompt_layers()  # token 0 of every pool and cache, in the layout of one token per sequence
+        else:
+            raise ValueError(f"a state of {state.tokens} tokens per sequence runs steps of {state.tokens} tokens or of one (its prompt); got tokens={tokens!r}")
         position = state.position
-        slots = state.slot_ids if state.tokens == 1 else state.slots  # the slot of every row, or the table of a step of several tokens
+        slots = state.slot_ids if tokens == 1 else state.slots  # the slot of every row, or the table of a step of several tokens
         branch, residual = call("embedding", -1, ids, weights.embedding), None
         for i, layer in enumerate(weights.layers):
             site = layer.kind if residual is not None else layer.kind + FIRST  # the first norm of a step starts the residual stream
@@ -748,17 +768,21 @@ class QwenDense:
             row = call("projection.fp8.in", i, q, layer.in_proj, IN_PROJECTION_SITES[layer.kind])
             if layer.kind == "linear_attention":
                 x, z = split_qkvz(row, layer.gdn.qkv_channels, layer.gdn.value_heads, layer.gdn.head_dim)
-                mixed = call("linear_attention.step", i, x, z, normed, slots, layer.gdn, state.layers[i])
+                mixed = call("linear_attention.step", i, x, z, normed, slots, layer.gdn, layers[i])
             else:
-                qh, gate = call("attention.prepare", i, row, state.layers[i], position, layer.attn)
-                attended = call("attention.core", i, qh, state.layers[i], position)
+                qh, gate = call("attention.prepare", i, row, layers[i], position, layer.attn)
+                attended = call("attention.core", i, qh, layers[i], position)
                 mixed = call("attention.gate_quantize", i, attended, gate, layer.out_quant)
             branch = call("projection.fp8.out", i, mixed, layer.out_proj, OUT_PROJECTION_SITES[layer.kind])
             q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
-        q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
+        q, normed, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
-        if state.tokens == 1:
+        # what a drafter reads of this step, by reference: the final-norm rows and, for each of them, the token that follows it
+        state.hidden, state.greedy = normed, next_ids
+        if tokens == 1:
             state.position = position + 1
+        else:
+            state.verify_steps += 1  # the kept count moves the position (``state.accept``); a decode step no longer fits this state
         return next_ids, logits
