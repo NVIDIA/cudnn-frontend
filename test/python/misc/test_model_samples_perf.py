@@ -2984,19 +2984,20 @@ def _observed(monkeypatch, tmp_path, lock=None, dense=True, scenario=None, clock
     the stand-in: ``(outcome, lines, order, the stand-in's folder)``.  ``order`` holds, as they happened, every stamp
     the mode took (``"stamp"``), every reading (``("read", when)``) and the start and the stop of the sampler; with
     ``dense`` false the sampler is the real one, on the stand-in's loops.  ``order`` also gets what a run may not do: a
-    stamp taken while the process has another count of threads than before the run (``("threads", count)``), and a call
-    of the observer while a stage is open (``("inside the stage", name)``), whose seconds it would be counted into."""
+    stamp taken while the process runs a thread that it did not run before the run (``("threads", how many)``: told
+    by the thread itself, not by a count, which a thread that ends meanwhile would leave unchanged), and a call of the
+    observer while a stage is open (``("inside the stage", name)``), whose seconds it would be counted into."""
     from model_samples import observe, perf, timing
 
     folder, order, stamp = _tool(monkeypatch, tmp_path, **(scenario or {})), [], perf.now
     if dense:
         _dense(monkeypatch, order, clock, processes)
-    threads, opened, stage = threading.active_count(), [], timing.Stages.stage
+    threads, opened, stage = set(threading.enumerate()), [], timing.Stages.stage
 
     def stamped():
         order.append("stamp")
-        if threading.active_count() != threads:
-            order.append(("threads", threading.active_count()))
+        if set(threading.enumerate()) - threads:
+            order.append(("threads", len(set(threading.enumerate()) - threads)))
         return stamp()
 
     @contextlib.contextmanager
