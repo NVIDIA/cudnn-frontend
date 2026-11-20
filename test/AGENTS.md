@@ -240,6 +240,18 @@ scheduler domain stays the same. The D64 origins-helper host control exercises
 the actual helper and engine admission across SM100/SM103/SM107, including all
 eight dtype/Stats-layout/compact combinations of the SM107 scheduler clamp.
 
+A family check compares a range, never one minor version: the CI `sm120` lanes
+include GB10 (SM 12.1), so `_current_arch() == 120` is false there. In
+`gemm/frost`, branch on `active_family() == "sm120"` (or `120 <= arch < 130`).
+A helper that falls back to an sm100 config on SM 12.1 loses coverage without a
+report, because the frost conftest turns the arch decline into a skip; only a
+`pytest.raises(..., match=...)` around it fails. Detector: `git grep -nE
+'_current_arch\(\) *== *12[0-9]' test/python/gemm`. Likewise, a helper that
+looks for one engine's plan must catch `cudnnGraphNotSupportedError` from
+`create_execution_plans`: it raises when no engine at all proposes a plan
+(the cuDNN 9.29 and 9.30 backends decline an F8_128x4 scale tensor declared
+past the packed blob, which 9.24 accepts).
+
 Shared SDPA test helpers accept both public knob mappings and native knob
 dataclasses. Normalize mappings with `SdpaFwdKnobs.from_public` before attribute
 access or `dataclasses.replace`, preserving native callers and caller-owned
@@ -278,6 +290,14 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 **Read pytest's own summary line; do not post-process the output.** `... | grep -c "passed"` counts a collection error as a pass, and `cmd | tail` reports *tail's* exit status, so a failed build or a failed suite behind a pipe looks like success. Both have produced confidently wrong "all green" reports here. Requirements: `pip install -e .` plus `pytest pytest-xdist looseversion`. The `cutedsl/` directories additionally require an SM90/SM100-class GPU; tests skip (or should skip) on unsupported arch/dtype/backend-version combos rather than fail.
 
 ### conftest.py landmines — read before editing
+
+For DLPack dtype regressions, assert the descriptor's dtype immediately after
+`tensor_like`, before graph inference can replace `NOT_SET` with the IO default.
+Exercise the raw C++ binding separately from the Python wrapper, with a different
+graph default and mixed storage types. `core/graph/test_raw_tensor_like_dtype.py`
+covers FP8 encodings, scalar lane/width boundaries, and compact/strided buffers
+without requiring a framework's FP8 exporter. A later numerical failure can be
+a misdeclared input, even when the kernel handles explicitly typed inputs correctly.
 
 Before releasing Torch's cache, synchronize every device with reserved memory.
 Expandable-segment cleanup can synchronize a default-stream handle on the wrong

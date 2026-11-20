@@ -362,16 +362,27 @@ def test_byte_identity_element_budget(dtype, users, splits, needed, unpacked_tok
     assert compared >= needed
 
 
-def test_two_chunks_commute():
-    """With two chunks every order gives the same sum: the reverse-order control must reproduce the bytes there, which is why
-    the two-chunk cells count for nothing in the element budget."""
+def test_two_chunks_follow_the_split_order():
+    """Two chunks are reduced in split order like every other count, and their byte comparison takes that order too. The
+    separate pass accumulates ``acc + w * v`` from zero as a fused multiply-add: the first chunk's product is rounded before
+    the second is added, the second is not. Exchanging two chunks therefore keeps the Stats (their denominator is one FP32
+    addition of the two weights) and moves a stored O element now and then: about two in a hundred thousand BF16 elements
+    with random scores, mostly by one unit of the last place. Whether a small batch holds such an element follows the low
+    bits of the host's normal draw, which differ between hosts, so "the reverse order reproduces O" is no assertion. The
+    cell compares both forms and the separate pass in split order, over a full-cache batch large enough to hold moved
+    elements on about every draw (an exchanged order in either form would then move a stored byte), asserts the Stats of
+    the reverse order, and prints how many O elements that order moves. The element budget counts 4 and 8 chunks only."""
     _device()
-    runner = Runner(s_q=2, split=2, causal=True, lens=[2048] * 4, seed=7)
-    t, api, ws = runner.run([0, 1, 2, 3], reduce=True)
-    two = runner.plan(t, False)
-    slab_o, slab_lse = runner.slabs(api, ws, 4)
-    o_rev, _ = runner.separate_combine(two, slab_o.flip(0).contiguous(), slab_lse.flip(0).contiguous(), 4)
-    assert _same_bytes(o_rev, t["o_store"][:, :2])
+    users = 32
+    runner = Runner(s_q=2, split=2, causal=True, lens=[2048] * users, seed=7)
+    order = list(range(users))
+    compared = _compare_forms(runner, order)
+    t, api, ws = runner.run(order, reduce=True)
+    slab_o, slab_lse = runner.slabs(api, ws, users)
+    o_rev, lse_rev = runner.separate_combine(runner.plan(t, False), slab_o.flip(0).contiguous(), slab_lse.flip(0).contiguous(), users)
+    assert _same_bytes(lse_rev, t["lse_store"][:, :, : runner.s_q]), "two weights add to one denominator in either order: the Stats of the reverse order moved"
+    moved = int((o_rev.view(torch.int16) != t["o_store"][:, : runner.s_q].contiguous().view(torch.int16)).sum())
+    print(f"two chunks: {compared} bfloat16 O elements compared and equal in split order; the reverse order moves {moved} of them")
 
 
 @pytest.mark.parametrize("reduce", [False, True], ids=["two-launch", "in-launch"])
@@ -577,40 +588,62 @@ def _record(split, pack, reduce=None):
     return record
 
 
-@pytest.mark.parametrize("users,declared", [(1, 2048), (2, 2048), (4, 2048), (1, 1536)])
-def test_default_plan_reduces_in_the_launch_with_the_bytes_of_its_split(users, declared):
-    """The heuristics' own lead plan for a two-token step: the split of the existing rules with the knob on top where the
-    part has a recorded cluster bound for it, ONE launch, the public record carrying the knob; a record without the knob
-    rebuilds the two-launch plan of that split, byte for byte. The compiled plan's own record says which form ran."""
+# (heads, users, declared keys) of the default-plan cell below; ``test_sdpa_fwd_decode_cluster_reduce.py`` pins, without a
+# device, which form the rules give each step on a 148-SM and on a 152-SM part.
+DEFAULT_PLAN_STEPS = [
+    ((H, KH), 1, 2048),
+    ((H, KH), 2, 2048),
+    ((H, KH), 4, 2048),
+    ((H, KH), 1, 1536),
+    # around the rows of a 152-SM part (15 clusters of 8, 36 of 4, 76 of 2 are one wave): at a row, and one cluster past it
+    ((H, KH), 9, 2048),
+    ((H, KH), 10, 2048),
+    ((8, 1), 15, 2048),
+    ((8, 1), 16, 2048),
+    ((8, 1), 37, 2560),
+]
+
+
+@pytest.mark.parametrize("heads,users,declared", DEFAULT_PLAN_STEPS, ids=lambda value: "x".join(map(str, value)) if isinstance(value, tuple) else str(value))
+def test_default_plan_takes_the_form_inside_the_recorded_bound(heads, users, declared):
+    """The heuristics' own lead plan for a two-token step, with no knob record from the caller. Its split is the one of the
+    existing rules. Where the part has a recorded cluster bound that holds the plan's clusters, the plan carries the knob
+    and runs ONE launch; past the bound, or on a part without a row, it carries no knob and runs two. Either way the
+    compiled plan's own record says which form ran, and a public record of that split with and without the knob rebuilds
+    both forms with the bytes of the default plan."""
     import cudnn
     from cudnn.sdpa.fwd import heuristics as heur
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import SWAP_AB
     from frost_test_utils import _is_plan_for
 
     _device()
-    runner = Runner(s_q=2, causal=True, declared=declared, lens=[declared] * users, seed=61)
+    knob = cudnn.knob_type.CLUSTER_K_REDUCE
+    runner = Runner(s_q=2, causal=True, declared=declared, lens=[declared] * users, seed=61, heads=heads)
     order = list(range(users))
     g, pack, t = _graph(runner, order)
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     lead = next(i for i, n in enumerate(names) if _is_plan_for(n, SWAP_AB))
-    split = g.plans[lead].knobs.split_kv
+    knobs = g.plans[lead].knobs
+    split = knobs.split_kv
     sms = torch.cuda.get_device_properties(0).multi_processor_count
-    if users * KH > heur.fused_cluster_bound(sms, split):
-        assert not g.plans[lead].knobs.cluster_reduce
-        pytest.skip(f"no recorded cluster bound admits {users * KH} clusters of {split} on a {sms}-SM part: the plan keeps two launches")
-    assert g.plans[lead].knobs.pack_gqa and g.plans[lead].knobs.cluster_reduce is True
+    clusters = users * runner.kh  # the two tokens of a head group are one packed unit
+    if not 2 <= split <= 8:
+        assert not knobs.cluster_reduce
+        pytest.skip(f"the rules split this step {split} ways on a {sms}-SM part: outside the form")
+    inside = clusters <= heur.fused_cluster_bound(sms, split)
+    assert knobs.pack_gqa and bool(knobs.cluster_reduce) is inside, f"{clusters} clusters of {split} on a {sms}-SM part"
     engine_id, public = g.get_engine_and_knobs_at_index(lead)
-    assert public[cudnn.knob_type.CLUSTER_K_REDUCE] == 1 and public[cudnn.knob_type.SPLIT_KV] == split
+    assert public[cudnn.knob_type.SPLIT_KV] == split and (public.get(knob) == 1) is inside
     _execute_graph(g, pack, t, lead)
     compiled = g._compiled_plans[lead]._compiled
-    assert compiled.kernel_template == "decode_d256_f16" and compiled.implementation_config["cluster_reduce"] is True
-    fused = snapshot(runner.check(t, "default plan"))
-    without = {key: value for key, value in public.items() if key != cudnn.knob_type.CLUSTER_K_REDUCE}
-    for record, reduced in ((without, False), (dict(public), True)):
+    assert compiled.kernel_template == "decode_d256_f16" and compiled.implementation_config["cluster_reduce"] is inside
+    default = snapshot(runner.check(t, "default plan"))
+    without = {key: value for key, value in public.items() if key != knob}
+    for record, reduced in ((without, False), ({**without, knob: 1}, True)):
         g2, pack2, t2 = _graph(runner, order, knobs=record)
         _execute_graph(g2, pack2, t2, 0)
         assert g2._compiled_plans[0]._compiled.implementation_config["cluster_reduce"] is reduced
-        assert_bitwise(snapshot(runner.check(t2, "rebuilt record")), fused, "a public record against the default plan")
+        assert_bitwise(snapshot(runner.check(t2, "rebuilt record")), default, "a public record against the default plan")
 
 
 @pytest.mark.parametrize(

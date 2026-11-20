@@ -9,8 +9,9 @@ and a self-check against a plain-PyTorch reference. Start with [README.md](READM
 A model sample has no socket, no request queue and no admission of work while a step runs. The set of sequences is fixed
 before the first step. A model sample keeps no state between two prompt sets, has no cache keyed by content, and chooses
 nothing at run time: every provider and route is a row of the printed table. The list of provider keys is closed; it changes
-only together with a kernel, or with the reference chain of a block that a kernel is to serve. A change that needs any of
-these belongs in a serving engine, not here.
+only together with a kernel, with the reference chain of a block that a kernel is to serve, or with a declared library
+entry. A library's own tuner may choose among that library's kernels for a call a row names; the choice is printed with
+the kernel check and is never a row. A change that needs any of these belongs in a serving engine, not here.
 
 Also out: a `generate()` method on the helper layer (the loop is in the script), stop strings, constrained output, logit
 processors, tool-call parsing of the output, automatic choice of a stack or a route. A field of a request body that asks
@@ -44,7 +45,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
    A checkpoint is described from its `config.json` and shard headers first (`Checkpoint.describe`, the family's
    `describe`, its drafter's): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
    a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
-   the tests generate what they read.
+   the tests generate what they read. A third-party provider may build its own kernels at its first use; a sample makes
+   that first use while the run is planned, before anything is loaded, and says so in one line.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
    defined by the target kernel set of the family's census, not by a list of what happens to be fast; `fe-entries` is its
    cuDNN Frontend rows with every other block on a fallback row, so that those rows run where no further package is
@@ -59,8 +61,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
    key to `providers.KEYS` with its factory, add its row above the rows it should win against (and below a row of the
    same key that an existing command selects with `--provider`), name its tie-out band, and regenerate the family
    README's tables (`configs.readme_table`); a host test keeps them in agreement. A third-party
-   provider is imported inside its adapter, its version is checked there, and a missing or unvalidated version is a `SKIP`
-   that names it.
+   provider is imported inside its adapter, on a device; its version is read from the distribution's metadata there and
+   held to the validated list, and a missing or unvalidated version is a `SKIP` that names it, the requirement file and
+   the nearest command that runs without it. A plan on stated device facts imports no third-party package.
 8. **Bands are never widened in place.** The band of a block against the reference is named in its provider row
    (`tie_out.BANDS`). A provider whose kernel rounds at other points than the reference chain is compared with its twin
    (`Block.twin`): a reference block written at the kernel's rounding points, in the reference's accumulation precision.
@@ -106,14 +109,29 @@ does not hold is printed as not known and ignored, so a new name for one of them
     is a version the host tests of the text and weight readers were run against; raise it with evidence, in the same
     change as the code that needs it (for `jinja2`, whose sandbox a checkpoint's template runs in, with a sandbox fix). The
     family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
-    package versions and the GPU class of the last run with a checkpoint. Dependency alerts come through the `pip` entry for
-    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.
+    package versions and the GPU class of the last run with a checkpoint. Version updates come through the `pip` entry
+    for `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose
+    kernels a stack calls has a requirement file of its own, a lower bound with its "Validated with" line
+    (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the
+    versions the launch records of the family's census were recorded with. The maintainers of this area own that list; a
+    version joins it with a recorded run, never with an update of the pin alone.
 13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events.** An event is stamped
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
     Only the profiler's own start and stop -- and, where launch records are asked for, the export and the read of its
     trace -- are reported as a missing trace, in a sentence that names no path; an error of a step under it propagates.
+    The token-to-token interval and the rate come from the host clock of requests that are not traced; GPU busy and
+    the device time of a kernel come from kernel activity records of a traced request at the same positions, behind
+    the last timed request. The two are never taken from one pass, and a report says which is which. A figure that
+    sets one against the other -- launch overhead, a step less its GPU busy and its host time -- is formed step by
+    step, at the same position, before anything is aggregated: the medians of three lists need not be one step's, and
+    their difference can be a time no step has. Where its terms are printed as a sum they are the means over the same
+    steps, so that a reader can add them up, and it is called an estimate: the two sides are two requests. A row of the
+    per-kernel table is found by its place in the wiring, never by a kernel's name, and a traced pass whose kernel
+    check does not hold prints no table. The row of a block a library serves names the library's entry, as the plan
+    does, never the block alone and never a fallback; what a block launches beside a kernel of its own is the row of
+    its place in the wiring and says so.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
@@ -203,6 +221,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
     before the load to somebody who comes from a serving engine -- the decoding rule beside the checkpoint's own
     generation settings, the decode steps a prompt takes before the first new token -- states what is exact at that
     point, a rule and a count, never a time: the report measures the time.
+    A configuration object of a serving engine that selects what is launched is answered key by key in the same
+    module; a key it does not hold is an `ERROR` that names it. A key is read, accepted at the value that changes
+    nothing, or refused with its reason, and each key of its tables has its case in the same test module.
 19. **The performance mode states what it observed, never what it assumes.** One definition per statistic, written in
     the report file, with a host test of its arithmetic on constructed time stamps. Nothing but the step runs inside a
     timed request: no recorder, no call log, no profiler, no text; and no profiler pass runs in the process before its
@@ -924,14 +945,15 @@ A session that is handed the drafter runs the whole step of speculative decoding
 - The comparison counts the launches of one kernel id; it does not place them. The embedding lookups of the passes
   and of the model are one id, so a lookup more is named with the count of the step and the plan, in front of the
   run that matches, and a lookup less is named at the first pass.
-- An arm that shifts an input is not an arm that takes it away -- again. On the checkpoint the loop kept 3.22 tokens
-  a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, with the two halves in
-  front of the first multiply exchanged 1.00; with a later pass one position off, 3.25. Acceptance does not see that
-  shift at all: the line that holds the positions of the later passes is `draft proposals`, on bytes and ids.
+- An arm that shifts an input is not an arm that takes it away -- again. On the checkpoint, on the cuDNN Frontend
+  rows, the loop kept 3.22 tokens a step; with zeros in the place of the hidden row 1.04, with the rows of another
+  text 1.05, with the two halves in front of the first multiply exchanged 1.00; with a later pass one position off,
+  3.25. Acceptance does not see that shift at all: the line that holds the positions of the later passes is
+  `draft proposals`, on bytes and ids.
 - Working memory is stated as arithmetic on what a pass holds at a time, then measured. A reference multiply
   accumulates a chunk of the weight in fp64; the allowance of a pass is twice the largest such chunk, 1.33 GiB at the
-  published widths -- not a share of what the drafter holds. On the checkpoint the run asked for about 43.3 GiB,
-  reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
+  published widths -- not a share of what the drafter holds. On the checkpoint, on the cuDNN Frontend rows, the run
+  asked for about 43.3 GiB, reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
 - The counts of a run live with its record. The comparison resets the session and puts its record back; the kept
   counts of the acceptance lines are part of that record, so the acceptance lines of a report printed behind the
   comparison are still the run's. Its bytes of a step are not: they follow where the session stands, and the
@@ -954,11 +976,98 @@ A session that is handed the drafter runs the whole step of speculative decoding
   taken for a step's and the first-token line read 0.0 ms. And a refusal names the step of the session that was
   asked: on a session with a drafter that is `speculate`, also where the session refuses a decode step or a count.
 - The names beside a snippet are run as the text says they may be. The README's loop said "a described checkpoint"
-  and built no session with it: a session that is not handed the checkpoint draws seeded weights, and the drafter's
-  with them, without a word. The loop is now run as written on the seeded pair and on a checkpoint a test
+  and built no session with it: a session that was not handed the checkpoint drew seeded weights, and the drafter's
+  with them, without a word (it now refuses the drafter of a checkpoint by name). The loop is now run as written on the seeded pair and on a checkpoint a test
   generates and describes, and the table it runs on is held against the file.
 - What describes shared weights is read at the session that loaded them: a session that shares reads no checkpoint
   of its own, and a `seed=` says nothing about a checkpoint a session was handed. A drafter two links of `share=`
   behind the loader had nothing to load from, and the drafter of a model handed seed 11's checkpoint was drawn from
   seed 0 with every token still right, since the verify step decides the tokens; the load now follows `share=` to
   its end (`Session._weights_owner`) and draws a seeded drafter from the seed its checkpoint records.
+
+## What building the speculative script taught
+
+`02_speculative_decode.py` runs the speculative step for one request: its own loop, the speculative configuration of a
+serving engine key by key, the comparison with decode steps and the checks of every run. What building it showed:
+
+- A configuration that selects what is launched has no class "printed and ignored". A request body's unknown field is
+  named and ignored; an unknown key of a speculative configuration would change which kernels run. So its tables are
+  read, neutral and refused, a key outside them is an `ERROR`, and the keys that are read must be named: an engine's
+  default for a missing one selects another launch set. What a refused key holds is not printed back.
+- A script that compares where another checks nothing needs the verdict's order. `_verdict` answered the reference
+  stack before it looked at the checks; the speculative script compares its run with decode steps on that stack
+  too. A failed line is `FAIL` on every stack, in both scripts, and one host test holds the two functions to each
+  other and to the README's table over every input.
+- What the library's comparison cannot see, the script holds itself. The window of a step is the session's, so a
+  drafted token a loop emits reaches no line of `speculative_checks`; the ids of both arms do, and the script
+  compares them. Three wrong loops run through `main()`, on a host and on the device. A count kept beyond the
+  compared one also fails the drafter's two lines: the first pass of the next step takes the greedy token of a kept
+  row for the token that follows it, which is true of an accepted draft alone.
+- A default follows what it is the default of. A scheduled run needs enough new tokens to keep every count once: 17
+  at five drafted tokens, 38 at eight. A fixed default of 32 answered eight drafted tokens with an error about the
+  token count; now the default follows the schedule, the plan declines by its row, and a typed count is still held.
+- A flag that is declared in order to be refused is still a string of the script. A test that took a flag for a
+  script's own when its string stood in a script of the folder passed for `--draft-vocab` whatever the speculative
+  script did; it now asks each script whether it takes the flag.
+- A refusal belongs where the object is built. A checkpoint's drafter on a session that was handed no checkpoint
+  proposed from rows of a seeded head without a word; a drafter of another model's widths ended in a tensor size
+  inside the warm-up step. Both are sentences of `Session` now, before a plan.
+- A stand-in that rounds otherwise is not given the product's band. On the tiny geometry of the host tests the fp32
+  chains of the stand-in providers leave the seeded model's logits band at six tokens per sequence: the test of the
+  last line holds `PASS` at three drafted tokens and says, for the default, which line fails.
+
+## What the rows a library serves taught
+
+Three blocks of the target kernel set are multiplies of a library, and the stack `native` calls FlashInfer for them on
+the stored weights (`providers/flashinfer_calls.py`). What building these rows showed:
+
+- A library's pick of a kernel is a function of the call only until something tunes the operation. Outside a tuning
+  context the 4-bit multiply launched the same kernel class in the same grid for a weight shape and a row count every
+  time; inside one, the winner was not the same kernel in every process, and it outlived the context. So the row
+  names what makes the pick a function of the call (`TUNED False`), the adapter reads the library's tuner after each
+  call and the call log carries what it found, and the kernel class and launch shape of the untuned pick are census
+  data that the kernel check holds exactly. A row that cannot name such a condition holds its launch by membership and
+  prints the pick: the 8-bit multiply. Say what such a field sees: `TUNED` is the tuner's statement about this
+  process, and a tuning store a caller attached is outside it.
+- A launch held by membership is the same call, not the same kernel. In every run of these rows the library's untuned
+  8-bit multiply was its own CUTLASS kernel, not the cuBLASLt kernel the census records as the target's pick. A count
+  of target launches that includes such launches says how many are held to a recorded launch shape and how many by
+  membership, wherever the count stands.
+- The class and the grid of a pick follow the weight shape: the output head of a reduced vocabulary is another kernel
+  launch than the published one's. The census entry of such a call names the widths it was recorded at (`at`), and a
+  run of another width says that no launch shape is held for that block instead of failing.
+- A library that builds kernels at its first use must make that first use while the run is planned. Its first build
+  of a compiled module took more than a minute and printed nothing; inside a decode loop that would have been a
+  stalled step. The first use is the call on scratch operands at every row count the run will call the block with --
+  its own, and the rows of one sequence, which the batch-invariance check calls: the library builds per range of row
+  counts -- after the memory sentence and before any load, announced in one line; a decline there is typed -- the
+  adapter's operands an `ERROR`, the installation a `SKIP` with the type of the exception and never its text, which
+  can hold a local path. The catch that makes the `SKIP` is around the library call alone: around the adapter's own
+  code it would turn a fault of the adapter into advice about the installation, with exit code 0.
+- A library kernel's name may reach the profiler mangled, and long: two kernels of one template differ far from the
+  start of their names. The family pattern of such a kernel names what the declared call launches (the mainloop, the
+  operand type), not the head all kernels of the template share; and a line that prints such a name prints its length
+  and a digest with it.
+- What a census records is recorded per call. A line that prints it for a block whose call sites two rows serve looks
+  it up by call site; by block name it printed one row's recorded launch shape for the other row's kernel.
+- A layout that a provider builds of a stored weight at load is held to the bytes it was made from, at load. The
+  reference's copy of such a weight is made through the layout's own way back to the checkpoint's order, so a wrong
+  layout agrees with its reference in every later check of the run.
+- A third-party adapter is tested as it is, over a stand-in of the library: the adapter reaches the library through
+  one method, and a host test replaces that method. A stand-in of the adapter would test the stand-in. The stand-in
+  of the library has the library's own defaults and records what it is handed, or a call without the row's argument
+  passes on the stand-in and runs another kernel on a device.
+- A library's tuner may start worker processes that import the main module again. A script that calls a sample
+  inside a tuning context of the library needs its `if __name__ == "__main__":` guard, or every worker runs the
+  sample.
+- When a stack gains rows, every dated run of that stack in a README becomes a run of another row set. Say which
+  rows a dated run selected, and move the counts that the tree computes to the stack that still selects those rows.
+- A figure of a greedy run on a checkpoint is a figure of a row set as well. A library's multiply is inside the band
+  of the reference multiply and is not the bytes of the multiply it replaces, so the run follows its first other
+  token: with the three library rows the plain run of the default prompt was another text, and the speculative loop
+  kept 3.27 tokens a step where it had kept 3.22 on the cuDNN Frontend rows. Such a figure is stated per row set
+  that ran, each with its versions; it is never carried over.
+- A row a stack gains is a row of every script that plans the stack. The speculative script arrived while `native`
+  had no library row. With the rows it made the library's first use without the line rule 5 asks for, its help text
+  stated the memory of the other row set, and the runs its README dated on `native` were that row set's. When the rows
+  of a stack change, every script of the family is run on that stack again, and what it says of the stack is read.

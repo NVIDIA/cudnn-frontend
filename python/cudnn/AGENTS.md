@@ -218,6 +218,11 @@ not become a compile key.
   tensors (one symbol per ragged group) so one compiled artifact re-binds any
   total; runtime scalars the launch needs (grid extents like THD `max_sq`)
   are `cutlass.Int32` call arguments, never compile parameters.
+- **Cold-empty compilation cannot infer compact strides from empty samples.**
+  Packed tensors can retain arbitrary outer strides, and Torch's empty
+  `dim_order()` can ignore them. Build symbolic token extents from logical
+  descriptors, then verify empty-to-nonempty reuse with compilation forbidden.
+  Detector: `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py`.
 - **Derived values count.** A stride tuple whose batch stride is
   `t_q * token_stride` smuggles the runtime total into the key just as
   surely as `sq=t_q` — normalize it out (zero the never-stepped batch
@@ -361,6 +366,19 @@ the kernel that reads it).
   wrapper. Detector:
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
+
+- **A buffer an entry allocates for itself is initialized on the stream that was current when it was allocated.**
+  A direct-call entry that owns an output or a scratch buffer allocates it
+  with torch at the first `compile` / accessor / call that needs it, and a
+  later launch can run on another stream: the kernel's bytes are then written
+  first and the allocating stream's zero-fill (or a write it still owes a
+  recycled block) lands on top of them. The one implementation of the order is
+  `cudnn.frost.init_order` (`pending_of`, `record`, `order_behind`); every
+  direct-call entry is to call it and no entry adds event bookkeeping of its
+  own (`python/cudnn/frost/README.md` rule 16 lists the entries that call it
+  today and those that do not yet). Detector: a warm launch on another
+  stream than the allocation's while that stream is parked behind a delay
+  kernel (`test/python/init_order_schedules.py`).
 
 - **Restore caller device state after native context binding, including errors.**
   Scope `ensure_current_context` and the native call with the shared
@@ -618,7 +636,13 @@ spellings the torch vocabulary does not name.
   `cuStreamSynchronize`) and therefore checks `cuStreamIsCapturing` and raises
   under capture (`linear_attention/cake/compiler.py::check_not_capturing`).
   That is the only legal shape of an exception: declared in the engine, loud,
-  never on a captured stream.
+  never on a captured stream. One documented host wait exists outside the
+  engines: a direct-call entry whose captured launch writes an entry-owned
+  buffer of the device whose initialization is still pending (allocated on
+  any stream, by any entry) waits for that one event before the launch
+  (`cudnn.frost.init_order`; a capturing stream cannot wait for an event
+  recorded outside the capture). It is set-up, never part of a replay;
+  allocate before the capture, and let that work finish, to avoid it.
 - **Detectors.** `test_execute_allocates_nothing_and_never_synchronizes`
   (`torch.cuda.set_sync_debug_mode("error")` plus allocator accounting around
   a prepared execute) — run the same assertion around the BUILD;

@@ -1590,12 +1590,15 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     epilog_sync_barrier.arrive_and_wait()
 
                     if warp_idx == self.epilogue_warp_id[0]:
-                        cute.copy(
-                            tma_atom_c,
-                            bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, real_subtile_idx)],
-                            tma_desc_ptr=desc_ptr_c,
-                        )
+                        # An empty expert overwrites with zero, but accumulation
+                        # must leave its output untouched (even signed zero).
+                        if cutlass.const_expr(not self.accumulate_on_output) or k_tile_cnt > 0:
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buffer)],
+                                bSG_gC[(None, real_subtile_idx)],
+                                tma_desc_ptr=desc_ptr_c,
+                            )
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
                     epilog_sync_barrier.arrive_and_wait()

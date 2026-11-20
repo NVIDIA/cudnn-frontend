@@ -62,19 +62,19 @@ These APIs are not selected automatically by `cudnn.pygraph`.
 
 ### Current Limitations
 
-- SM100 or SM103 GPUs, `nvidia-cutlass-dsl >= 4.9`, and BF16 inference only;
+- SM100 or SM103 GPUs, `nvidia-cutlass-dsl >= 4.9`, and BF16 or FP32/TF32 inference;
   no backward implementation.
 - Fixed `3x3x3` convolution, unit stride and dilation, and one group. The
   valid-convolution APIs consume already-padded input when padding is needed.
-- Selected channel pairs from the WAN VAE `base_dim=160` family (160/320/640),
-  not arbitrary channels or the 128/256/512 family. Integrated normalization
-  supports only `160->160`, `160->320`, and `320->320`; C640 output uses raw
-  convolution followed by standalone normalization. The causal input variant
-  currently supports only `12->160`. Unsupported configurations have no fallback.
+- Selected Wan 2.1 and Wan 2.2 encoder/decoder channel pairs. Integrated normalization
+  supports Co=96/160/192/256/320; wider outputs compose raw convolution with standalone
+  normalization. The causal variant supports `12->160`. See the per-variant table below.
+- FP32 convolution requires explicit TF32 permission and input-rounding workspace.
+  Strict FP32 convolution stays with the caller, composed with FP32 standalone post-ops.
 - Contiguous NTHWC activations, except `CausalConv3dWithCacheSm100`, which accepts
   strided NCTHW input. Weights require variant-specific packing before execution.
 - Normalization uses an L2-norm clamp followed by `sqrt(C)` scaling, with fixed
-  BF16 rounding points; it is not arbitrary-epsilon RMSNorm.
+  storage-dtype rounding points; it is not arbitrary-epsilon RMSNorm.
 - Padding/cache layouts are fixed for streaming convolution. The fused
   normalization-and-padding variant writes current frames and zeros but leaves
   existing-history interiors for the caller to fill.

@@ -67,9 +67,16 @@ arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
+| `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
+| `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
-| `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified |
-| `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
+| `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
+| `grouped_gemm_wgrad_wrapper_sm100`, empty-expert output contract | wgrad | NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 or FP32 dW | Unsupported | Supported for empty experts (SM100); general nonempty determinism and SM103 unverified | Unverified |
+| `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | bprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported with reduction limits below (SM100); SM103 unverified | Unsupported |
+| `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 C/D | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
+| `grouped_gemm_glu_hadamard_quant_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 saved C; BF16 or NVFP4 rowwise RHT | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
+| `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales; both GLU input layouts | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified for interleaved input; gate/up unsupported |
+| `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified; gate/up unsupported | Unverified for interleaved input; gate/up unsupported |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -191,9 +198,21 @@ cache length and the batch: a caller that needs a sequence's bytes to stay
 equal across batch sizes fixes `SPLIT_KV`. At a fixed split count the tested
 sequences keep their bytes alone, among 8 and among 64, reordered, duplicated
 and with changed neighbours, in both forms. Bytes are not equal across split
-counts, to the unsplit plan, or to another engine. SM103 execution is
-unverified. See the
-[coverage record](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18).
+counts, to the unsplit plan, or to another engine. The configurations were
+run on a 148-SM and on a 152-SM compute capability 10.0 device (x86-64 and
+aarch64 hosts). On the 152-SM device the heuristics' default plan was also run
+in each form -- inside the cluster counts recorded for that part and, at 4 and
+8 chunks, one cluster past them -- and rebuilt from public records with equal
+bytes. At 76 and 77 clusters of 2 chunks it ran in the form the count gives
+and matched the reference, and explicit records of both forms stored equal
+bytes there. The two golden cases are recorded for one runtime of each device.
+SM103 execution is unverified.
+See the coverage records of the
+[suite](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18),
+of its
+[152-SM run](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-on-a-152-sm-part-2026-11-19)
+and of that part's
+[goldens](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-goldens-for-a-152-sm-part-2026-11-20).
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -322,6 +341,12 @@ a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
 
+The Conv3D/post-op APIs provide deterministic inference by default. FP32
+convolution requires `allow_tf32=True`; standalone RMSNorm/SiLU preparation
+supports strict FP32. Callers populate the history interiors of fused prepared
+outputs. See the [Conv3D coverage report](../../test/python/determinism_goldens/README.md#conv3d-post-operations)
+for replay, batch-invariance, and stress-test results.
+
 - `grouped_gemm_glu_hadamard_wrapper_sm100` with `act_func="srelu"`: no deterministic
   mode is needed for replay. The qualified case sets `tanh_clamp_scale` and
   `rht_sign_mask`, covers both `use_tmem_post_rht_amax` paths, and uses unequal
@@ -353,6 +378,28 @@ a row alone and inside a batch under the entry's own picks.
   Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
 
+- Canonical grouped GLU: the new branch-order option is distinct from the
+  APIs' natural-rank tensor support. The forward suite checks C, both D
+  orientations and their scale factors; backward checks both D orientations,
+  scales, dprob and optional dbias. Deterministic dprob uses the existing
+  deterministic reduction for MXFP8/NVFP4 (`deterministic=True`). BF16 dprob
+  byte qualification is limited to the tested single-N-tile F=128 case.
+  Atomic dbias and legacy-alias atomic dprob are separate numerical checks
+  and carry no new bitwise guarantee. SM100 passed independent references,
+  replay and batch invariance; SM103 is unverified.
+  The nonquant GLU+Hadamard path additionally qualifies its canonical 2CTA
+  SFB handoff on SM100: per-CTA TMA completion, per-stage reordered-scale
+  readiness, and a cluster-scope acquire before collective S2T. Tests cover
+  dense/discrete SMEM RHT and dense TMEM RHT, stage wraps, asymmetric CTA
+  arrival, and bounded warm/poisoned replay. SM103 remains unverified;
+  canonical discrete-weight TMEM RHT remains unsupported.
+  The GLU+Hadamard+quant natural-rank adapter additionally checks exact
+  equality with legacy tensor ranks for both GLU branch orders, dense/discrete
+  NVFP4 weights, BF16/NVFP4 rowwise outputs, and standard GEMM-blocked colwise scales.
+  Its replay and expert batch-invariance tests include payload and scale bytes,
+  empty experts, reordered/duplicated/changed neighbors, and changed-input
+  CUDA graph replay. These claims cover the tested SM100 shapes; natural-rank
+  execution on SM103/SM107 is unverified.
 - Custom reduction: these rows have no determinism switch and pin the native
   cuDNN backend. SM100 support applies only to the suite's dense, 257-element
   row reductions and consumed outputs. Argmax/argmin use bounded finite values

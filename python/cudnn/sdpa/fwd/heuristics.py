@@ -61,6 +61,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd import config_sm80 as _sm80_config
 from cudnn.sdpa.fwd.config_sm90 import d128_causal_route as _sm90_d128_causal_route
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
@@ -277,6 +278,21 @@ _SPLIT_KV_COMBINE_FLOOR = 0.35
 # regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
 _SM120_SPLIT_KV_MIN_TILES = 1
 _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
+# SM80 (A100, 108 SMs), half d128 dense causal graphs on the adapter's 128-row query tile: the model sees that
+# tile and the 64-key KV tile (_sm80_chunk_split), with these two constants. Fitted on a forced split ladder
+# (study sm80_d128_gqa_split_cal_20261117): regret 1.050 -> 1.005 on 99 train cells, 1.025 -> 1.002 on 37
+# holdout cells, no changed cell past 1.04 / 1.01 of today's choice. The 64-row tile keeps the shared model.
+_SM80_SPLIT_KV_CTA_COST = 3.0
+_SM80_SPLIT_KV_COMBINE_COST = 0.02
+# SM80 half d256 PAGED decode on the short-d256 tile (64-row Q tile, 32-key KV tiles): the wave model mis-splits it in both
+# directions, so it takes a direct rule (_sm80_paged_d256_split_choice): the largest power-of-two split that keeps >= 8 KV tiles
+# per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced split 1.388 -> 1.038 on
+# 60 train cells, 1.338 -> 1.033 on 30 holdout cells, no cell slower than today's choice. Dense d256 keeps the shared model.
+# Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128: 0.790 of split 64 on 18 fresh cells, none slower
+# (sm80_d256_split128_q1_20261118); at S_q 4 it was not always faster (sm80_d256_split128_base1_20261118: 1.101).
+_SM80_PAGED_D256_SPLIT_MIN_KV_TILES = 8
+_SM80_PAGED_D256_SPLIT_MAX_WAVES = 16
+_SM80_SPLIT_PARTIAL_O_MAX_ELEMS = 1 << 31  # SM80 split-KV faults once the partial-O buffer reaches 2^31 elements
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
 # S_q of _SERIAL_COMBINE_MIN_SQ and up there. That kernel walks the split axis
@@ -362,6 +378,8 @@ def choose_split_kv(
     combine_floor: Optional[float] = None,
     serial_combine: bool = False,
     serial_combine_cost: float = _SPLIT_KV_SERIAL_COMBINE_COST,
+    cta_cost: Optional[float] = None,
+    combine_cost: Optional[float] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -435,9 +453,14 @@ def choose_split_kv(
     assignment, as happens when D192 uses CGA1 unsplit but requires CGA2 for a
     split. It defaults to the split geometry, preserving the ordinary case.
 
+    ``cta_cost`` / ``combine_cost`` replace CTA_COST / COMBINE_COST for a
+    machine fitted on its own (_SM80_SPLIT_KV_CTA_COST).
+
     Returns 1 when there is nothing to split or nothing beats not splitting.
     ``candidates`` defaults to :func:`split_kv_candidates` for the device.
     """
+    cta_cost = _SPLIT_KV_CTA_COST if cta_cost is None else cta_cost
+    combine_cost = _SPLIT_KV_COMBINE_COST if combine_cost is None else combine_cost
     split_launch = _SplitKvLaunch(q_tiles, heads_q, kv_tiles, ctas_per_tile)
     if unsplit_launch is None:
         unsplit_launch = split_launch
@@ -454,7 +477,7 @@ def choose_split_kv(
     # ... and that one wave costs no less than a lone block's serial walk of
     # its partials: with fewer rows than the machine holds at once there is
     # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
-    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
+    per_partial = max(combine_waves * combine_cost, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -470,7 +493,7 @@ def choose_split_kv(
         waves = _ceil_div(base_ctas * split, sm_count)
         # No combine runs unsplit: the single-pass kernel writes O itself.
         combine = split * per_partial if split > 1 else 0.0
-        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine
+        cost = waves * (_ceil_div(launch.kv_tiles, split) + cta_cost) + combine
         if serial_combine and split > 1:
             cost += split * serial_combine_cost
         if best_cost is None or cost < best_cost:
@@ -1196,30 +1219,36 @@ def choose_decode_tile_split_kv(
     return pick
 
 
-def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> int:
+def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int, paged: bool = False) -> int:
     """How many KV chunks the SM120 decode tile cuts each unit into; 1 = do not split.
 
     ``units`` is the launch's CTA count before splitting (Q tiles x batch x
     packed KV-head groups, or query heads unpacked); ``kv_stages`` the K/V
     stages of the longest unit, ``stage_bytes`` each; ``d_v`` the O width the
-    combine reduces.
+    combine reduces; ``paged`` whether the stages gather KV pages.
 
     The tile streams K/V from DRAM, one CTA per SM. Its time is the longer of
     the longest unit's stage chain at one CTA's stream rate and all the units'
     bytes at the DRAM rate, so a split pays until the DRAM bound takes over and
     past it only adds combine work. The rates are an RTX PRO 6000 Blackwell
-    Workstation's. Candidates are :func:`split_kv_candidates`; ties keep the
-    smaller split.
+    Workstation's; gathering paged KV, one CTA streams about 6x slower and the
+    whole board about 0.6x (studies sm120_decode_split_20261117 and _v2, RTX PRO
+    6000 Server). Unsplit, the paged tile streams slower again: at 512-2048
+    units split 1 ran 1.34-1.49x the best split at the same bytes, so split 1
+    prices paged bytes at its own rate (study _v5; raising the shared rates
+    instead over-split small launches, _v3 / _v4). Candidates are
+    :func:`split_kv_candidates`; ties keep the smaller split.
     """
     if min(units, kv_stages, stage_bytes, d_v, sm_count) <= 0:
         return 1
-    cta_rate, dram_rate = 4.0e4, 1.55e6  # bytes / us: one CTA streaming alone; all CTAs together
-    dram_us = units * kv_stages * stage_bytes / dram_rate
+    cta_rate, dram_rate = (7.0e3, 9.0e5) if paged else (4.0e4, 1.55e6)  # bytes / us: one CTA streaming alone; all CTAs together
+    unsplit_rate = 8.75e5 if paged else dram_rate
+    nbytes = units * kv_stages * stage_bytes
 
     def cost_us(split: int) -> float:
         chain_us = _ceil_div(units * split, sm_count) * _ceil_div(kv_stages, split) * stage_bytes / cta_rate
         combine_us = 2.0 + split * 0.055 * d_v / 128 if split > 1 else 0.0
-        return max(chain_us, dram_us) + combine_us
+        return max(chain_us, nbytes / (dram_rate if split > 1 else unsplit_rate)) + combine_us
 
     return min(split_kv_candidates(sm_count=sm_count, kv_tiles=kv_stages, min_tiles=1), key=cost_us)
 
@@ -1250,13 +1279,27 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     decode tile puts its warps on the key axis and rings the K/V stages. Wider
     units keep the prefill rule (MQA at 64 heads: the 128-row packed tile reads
     the shared KV head once per 128 rows).
+
+    Paged d256 MTP and verify rows past 32 rows (``s_q <= 8``, ``G <= 32``) take
+    the 32-row tile over several Q tiles: the prefill body has no paged d256
+    plan, and there the decode tile ran 0.04-0.87 of the backend (studies
+    sm120_paged_d256_multiq_probe / _verify_v2_20261117). Past ``s_q`` 8 a group
+    that does not divide 32 lost up to 1.19x (_verify_20261117). Paged d64
+    verify rows (``5 <= s_q <= 8``) take it too, over the prefill body the
+    paged guard trails: 0.37 of the backend, worst 0.89 (_d64_verify_v2); d128
+    lost up to 1.36x at groups 5 / 10 / 12 (_d64_d128_verify) and keeps its path.
     """
     if facts.is_fp8 or facts.is_mxfp8 or facts.thd:
         return 0
     if max(facts.d_qk, facts.d_v) > _SM120_GENERAL_HEAD_TILE_MAX or facts.h_kv <= 0 or facts.h_q % facts.h_kv != 0:
         return 0
-    rows = facts.s_q * (facts.h_q // facts.h_kv)
-    return next((tile_m for tile_m in _SM120_DECODE_Q_TILES if tile_m in caps.tile_ms and rows <= tile_m), 0)
+    group = facts.h_q // facts.h_kv
+    rows = facts.s_q * group
+    tile_m = next((tile_m for tile_m in _SM120_DECODE_Q_TILES if tile_m in caps.tile_ms and rows <= tile_m), 0)
+    head = max(facts.d_qk, facts.d_v)
+    verify = 5 <= facts.s_q <= 8
+    multi_q = facts.has_paged_kv and group <= 32 and 32 in caps.tile_ms and ((head == 256 and facts.s_q <= 8) or (head == 64 and verify))
+    return tile_m or (32 if multi_q else 0)
 
 
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
@@ -2604,10 +2647,126 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     return longest
 
 
+def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice. S_q <= 16 and no window: the
+    range its study timed. A window caps the keys each row reads, but the rule counts the whole cache (gemma4's 1024-key window over
+    131k keys ran 1.35-1.94x slower at its split), so windowed and longer padded graphs keep the shared model."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.d_qk == facts.d_v == 256
+        and not facts.thd
+        and facts.has_paged_kv
+        and facts.s_q <= 16
+        and facts.window_left is None
+        and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 64
+    )
+
+
+def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
+    """The largest power-of-two split <= 64 (128 for single-row decode on a one-CTA grid) with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles
+    per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
+    kv_tiles = _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m or 64))
+    ctas = facts.b * (facts.h_q // pack_g) * _ceil_div(facts.s_q * pack_g, tile_m or 64)
+    cap = 128 if facts.s_q == 1 and ctas == 1 else 64
+    split = 1
+    while (
+        split < cap
+        and kv_tiles // (2 * split) >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES
+        and ctas * 2 * split <= _SM80_PAGED_D256_SPLIT_MAX_WAVES * sm_count
+        and 2 * split * facts.b * facts.s_q * facts.h_q * facts.d_v < _SM80_SPLIT_PARTIAL_O_MAX_ELEMS
+    ):
+        split *= 2
+    return split
+
+
+def _sm80_window_decode(caps: Capabilities, facts) -> bool:
+    """SM80 half sliding-window decode without a sink, S_q <= 16 and not THD: the domain of _sm80_window_split_cap, the range its study timed."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.window_left is not None
+        and not facts.has_sink
+        and not facts.thd
+        and facts.s_q <= 16
+    )
+
+
+def _sm80_window_split_cap(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int) -> int:
+    """The smallest power of two covering the window's issued KV tiles for one Q tile. The SM80 kernels partition only the clipped
+    window, so further splits run empty and add combine work; the shared model counts the whole cache (A100 nightly: b 1 over 131k keys
+    split 64 under a 1024-key window ran 1.5x the best; study sm80_window_decode_split_cap_pcie_20261118)."""
+    tile_m = tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)
+    tile_n = tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m)
+    tiles = _swa_kv_tiles(facts, token_span=max(1, tile_m // pack_g), tile_n=tile_n)
+    cap = 1
+    while cap < tiles:
+        cap *= 2
+    return cap
+
+
+SM107_WINDOW_SPLIT_MIN_TILES = 5  # a window issuing fewer KV tiles per Q tile runs unsplit (sm107_swa_split_v3_20261118)
+SM107_WINDOW_SPLIT_MAX_UNITS = 96  # so does a launch of this many (Q tile, head group, batch) units
+SM107_WINDOW_SPLIT_CAP_FACTOR = 4  # elsewhere at most this many splits per window tile (power of two at or above)
+
+
+def _sm107_window_decode(caps: Capabilities, facts) -> bool:
+    """Rubin half sliding-window decode on a paged cache with padded Q, S_q <= 16: the domain of _sm107_window_split, the range
+    its study timed."""
+    return (
+        caps.sm_lo == 107
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.window_left is not None
+        and facts.has_paged_kv
+        and not facts.thd
+        and facts.s_q <= 16
+    )
+
+
+def _sm107_window_split(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, split: int) -> int:
+    """The shared model counts the whole cache, but the Rubin kernels cut only the clipped window into SPLIT_KV chunks, and any split
+    costs a fixed 1.3-1.8x at the low end (split 2 never led). Over a narrow window or a wide grid the unsplit kernel leads; elsewhere
+    the model's split leads up to a few chunks per window tile (study sm107_swa_split_v2_20261118: 128-key windows ran unsplit at
+    0.40-0.75 of the shipped split)."""
+    launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g, split_kv=2)
+    rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=2)
+    tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
+    if tiles < SM107_WINDOW_SPLIT_MIN_TILES or launch.q_tiles * launch.heads_q * facts.b >= SM107_WINDOW_SPLIT_MAX_UNITS:
+        return 1
+    cap = 1
+    while cap < tiles:
+        cap *= 2
+    return min(split, SM107_WINDOW_SPLIT_CAP_FACTOR * cap)
+
+
+def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.d_qk == facts.d_v == 128
+        and not facts.thd
+        and not facts.has_paged_kv
+        and facts.causal
+        and facts.window_left is None
+        and not facts.has_bias
+        and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 128
+    )
+
+
 def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *, physical: bool = True, split_kv: int = 1) -> _SplitKvLaunch:
     """The launch the wave-cost model sees. ``physical=False`` counts the MMA
     width per cluster (the count the model's constants were fitted with);
     ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
+    if _sm80_chunk_split(caps, facts, tile_m):
+        # One CTA per 128-row tile of packed rows (groups may straddle tiles), walking 64-key tiles.
+        return _SplitKvLaunch(
+            _ceil_div(facts.s_q * pack_g, 128),
+            facts.h_q // pack_g,
+            _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, 128)),
+            1,
+        )
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=split_kv)
     if (
         _sm100_f16(caps, facts)
@@ -2621,10 +2780,12 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         rows = _D64_DECODE_TILE_ROWS
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
-    if _sm100_f16(caps, facts):
+    sm120_f16 = 120 <= caps.sm_lo and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+    if _sm100_f16(caps, facts) or sm120_f16:
+        # SM120 kernels clip the KV loop to the window too: the whole cache split 4 ways ran 2x (study sm120_swa_split_20261117).
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
-        if physical:
-            ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
+    if _sm100_f16(caps, facts) and physical:
+        ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
     # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
     # the tile, and the true one when it does not (SM120: tile_q % G != 0).
     return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)
@@ -2795,6 +2956,7 @@ def _split_points(
             stage_bytes=_sm120_decode_stage_bytes(*envelope),
             d_v=envelope[1],
             sm_count=sm_count,
+            paged=facts.has_paged_kv,
         )
         return [split, no_split] if split > 1 else [no_split]
     unsplit_pack_g = None
@@ -2822,13 +2984,17 @@ def _split_points(
             **(
                 dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
                 if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
-                else {}
+                else (dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST) if _sm80_chunk_split(caps, facts, tile_m) else {})
             ),
             serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )
 
-    split = _choose(physical=True)
+    split = _sm80_paged_d256_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_paged_d256_split(caps, facts, tile_m) else _choose(physical=True)
+    if _sm80_window_decode(caps, facts):
+        split = min(split, _sm80_window_split_cap(facts, tile_m, tile_n, pack_g))
+    if _sm107_window_decode(caps, facts):
+        split = _sm107_window_split(caps, facts, tile_m, tile_n, cga, pack_g, split)
     if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
         # The physical CTA count is a one-sided correction: every measured win of
         # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,
@@ -3781,10 +3947,22 @@ def select_sm100_d192_half_geometry(facts, knobs):
 # recorded measurement cell on that part with every cluster resident in one wave. A part or a split count without a row is
 # never marked: its plans keep two launches and take the form by an explicit knob only. Recorded values only; the planning
 # path makes no device query. Each row is confirmed or replaced by the exclusive-device measurement of the part.
+#
+# 148 SMs: recorded from cells on a shared device, not yet confirmed by that measurement.
+# 152 SMs: the exclusive-device measurement at a locked clock (compute capability 10.0). Each value is the part's count of
+# co-resident clusters of that size: every cluster count from 1 up to it has a measured cell with the form ahead of the two
+# launches, and one cluster more is 18 % to 22 % behind them (level only at 2 chunks with a full cache). Timed: BF16, head
+# width 256, a paged cache with Stats, declared lengths of 1,024 to 4,096 keys, and 2-chunk plans also at 8,192 and
+# 12,288 keys in a later session (the timed GPU exclusive, other GPUs of the machine in use); the rows apply to every plan
+# of the form's domain by its cluster count. The key carries no compute capability; the form's own domain does, so a
+# 152-SM part of another capability stays unmarked.
 FUSED_CLUSTER_BOUND: Dict[Tuple[int, int], int] = {
     (148, 2): 16,
     (148, 4): 16,
     (148, 8): 8,
+    (152, 2): 76,
+    (152, 4): 36,
+    (152, 8): 15,
 }
 
 

@@ -30,6 +30,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from ..glu_layout import interleaved_glu_view, validate_glu_layout
 
 from cutlass.cute.typing import Float32, Int32, AddressSpace
 from cutlass._mlir import ir
@@ -267,6 +268,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         situ_beta1: float = 4.0,
         use_single_group_runtime_offsets: bool = False,
         deterministic: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -314,6 +316,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
         self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
@@ -683,7 +686,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             )
 
             workspace = TensormapWorkspace(workspace_ptr, ["b", "sfb"])
-            store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx))
+            # The SFB store below publishes both descriptors written by this
+            # helper thread before the consuming GEMM kernel can start.
+            store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx), publish=False)
 
             sfb_ptr_val = sfb_ptr_tensor[expert_idx]
             sfb_ptr = cute.make_ptr(self.sf_dtype, sfb_ptr_val, AddressSpace.gmem)
@@ -949,6 +954,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
+
+        # Keep the epilogue's gate32/up32 pairing while TMA addresses canonical
+        # gate/up halves. This is a view over caller storage, with no repack launch.
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            c = interleaved_glu_view(c, axis=1)
+            d = interleaved_glu_view(d, axis=1)
+            if cutlass.const_expr(d_col is not None):
+                d_col = interleaved_glu_view(d_col, axis=1)
 
         # Setup TMA store for C
         c_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
@@ -1608,6 +1621,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         return tCgSFDCol_mnl
 
     @cute.jit
+    def canonical_glu_column(self, column, two_n):
+        """Map an internal interleave32 column to its persistent gate/up half."""
+        return (column // 64) * 32 + column % 32 + ((column // 32) % 2) * (two_n // 2)
+
+    @cute.jit
     def dbias_reduction(
         self,
         d1_vec,
@@ -1658,6 +1676,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 sum_b = sum_b + rDst_b[i]
 
         n_offset = (n_base_d1 + 2 * lane_idx) if lane_idx < 16 else (n_base_d2 + 2 * (lane_idx - 16))
+        valid_n_offset = n_offset < dbias_n_total
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            n_offset = self.canonical_glu_column(n_offset, dbias_n_total)
 
         if cutlass.const_expr(self.dbias_cross_warp_reduce):
             reduce_base = sDbias.iterator
@@ -1680,11 +1701,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     cute.copy_atom_call(copy_64bit_atom, sSrc_w, rDst_w)
                     cta_sum_a = cta_sum_a + rDst_w[0]
                     cta_sum_b = cta_sum_b + rDst_w[1]
-                if n_offset < dbias_n_total:
+                if valid_n_offset:
                     gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                     atomic_add_bf16x2(gmem_ptr, cta_sum_a, cta_sum_b)
         else:
-            if n_offset < dbias_n_total:
+            if valid_n_offset:
                 gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                 atomic_add_bf16x2(gmem_ptr, sum_a, sum_b)
 
@@ -3040,6 +3061,16 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     tCrSFDCol = cute.make_rmem_tensor(tCrSFDRow.layout, tCrSFDRow.element_type)
                     tCrSFDCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow_pvscale.layout, cutlass.Float32)
                     tCgSFDCol_mn = tCgSFDCol_mnl[(None, None, None, None, None, 0)]
+                    if cutlass.const_expr(self.glu_layout == "gate_then_up" and self.discrete_col_sfd):
+                        # Discrete column scales use expert-local M atom capacity.
+                        # The extension provides the plane pointer; quantization
+                        # indexes the transposed scale atom layout within it.
+                        canonical_sfd_col_layout = cute.tile_to_shape(
+                            blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
+                            (cute.size(real_sfd_col, mode=[0]), cute.size(real_sfd_col, mode=[1]), real_sfd_col.shape[2]),
+                            (1, 2, 3),
+                        )
+                        real_sfd_col = cute.make_tensor(real_sfd_col.iterator, canonical_sfd_col_layout)
 
                 if cutlass.const_expr(self.generate_amax):
                     thread_tile_amax = cutlass.Float32(0.0)
@@ -3323,10 +3354,23 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                             else:
                                 self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
                                 self.cvt_f32x4_to_f8x4(tCrSFDCol_pvscale, tCrSFDCol)
-                            if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
-                                cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                            if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
-                                cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                                # Each thread owns one row scale and one column
+                                # scale per 32-column branch tile. Scatter only
+                                # these scale bytes to canonical atoms; payloads
+                                # use TMA above. No global scale repack is needed.
+                                two_n = cute.size(mSFDRow_mnl, mode=[1])
+                                for scale_slot in cutlass.range_constexpr(4):
+                                    paired_n = sfd_row_idx_mn[1] * 128 + scale_slot * 32
+                                    canonical_n = self.canonical_glu_column(paired_n, two_n)
+                                    if paired_n < two_n:
+                                        real_sfd_row[(mPosition, canonical_n, 0)] = tCrSFDRow[scale_slot]
+                                        real_sfd_col[(mPosition - tidx % 32, canonical_n + tidx % 32, 0)] = tCrSFDCol[scale_slot]
+                            else:
+                                if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
+                                    cute.autovec_copy(tCrSFDRow, tCgSFDRow)
+                                if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                    cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         #
                         # Convert to D type

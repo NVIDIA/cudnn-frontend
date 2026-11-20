@@ -49,8 +49,11 @@ names (``model_samples/qwen_dense/kernel_census.json``), in the form the target 
 served here yet stays on its fallback row and is printed as ``not yet``; the run says how many launches of a step are target
 kernels, always as three numbers, and why its GPU class is ``NOT CLAIMED``.  It always checks its kernels, and it holds the
 launch shape of every target launch against the census.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with
-the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  Until ``native`` has a row a library serves, the two
-are the same rows.
+the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has three rows more: the multiplies the
+target runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone
+(``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``); without it, or with
+a version this area has not validated, on compute capability 10.x ``--stack native`` is a ``SKIP`` before anything is loaded.
+The library builds its kernels at its first use: the run makes that use while it plans and says so.
 
 ``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
 launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's
@@ -101,6 +104,9 @@ STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_STEPS = 16  # with a checkpoint the checks cover the first steps of every prompt
 TRACED_STEPS = 32
+SPECULATIVE = "02_speculative_decode.py"  # the script of this folder that drafts
+#: its two flags, each with what it takes: declared here so that each is refused by a sentence that names that script
+SPECULATIVE_FLAGS = (("--speculative-config", "JSON"), ("--draft-vocab", "list"))
 
 
 def _say(*lines, flush: bool = False) -> None:
@@ -152,7 +158,9 @@ The default run needs no checkpoint and no extra package; it needs a GPU of comp
 With --model: pip install -r samples/models/requirements.txt first.  The checkpoint is your own download (nothing is
 fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas, which holds a
 bf16 copy of every weight.  The stacks native and fe-entries keep a weight their kernels multiply on its stored format
-without that copy: about 37 GiB on compute capability 10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere.
+without that copy.  fe-entries: about 37 GiB on compute capability 10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere.
+native, whose three library rows need FlashInfer (pip install -c samples/models/constraints-native.txt -r
+samples/models/requirements-flashinfer.txt; the README: "The rows a library serves"): about 28 GiB and about 32 GiB there.
 The generated text goes to standard output; every other line of a run goes to standard error.
 The checkpoint, the memory, the checks, a request body field by field and every flag: samples/models/qwen_dense/README.md
 """
@@ -255,11 +263,16 @@ def _arguments(argv):
     parser.add_argument(
         "--dump-census",
         metavar="FILE",
-        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory per launch), for a comparison "
-        "made elsewhere; implies --check-kernels",
+        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory, start and end per launch), for a "
+        "comparison made elsewhere; implies --check-kernels",
     )
     _perf_flags(parser)
+    for flag, takes in SPECULATIVE_FLAGS:
+        parser.add_argument(flag, metavar=takes.upper(), help=f"not this script: speculative decoding is {SPECULATIVE}, which takes the same {takes}")
     args = parser.parse_args(argv)
+    for flag, takes in SPECULATIVE_FLAGS:
+        if getattr(args, flag[2:].replace("-", "_")) is not None:
+            parser.error(f"{flag}: speculative decoding is the script {SPECULATIVE} of this folder, which takes the same {takes}")
     args.check_kernels = args.check_kernels or args.dump_census is not None
     # the limit of new tokens has two spellings; a sentence about it names the one that was typed
     args.limit_flag = "--max-new-tokens" if any(word.split("=")[0] == "--max-new-tokens" for word in argv) else "--max-tokens"
@@ -405,11 +418,12 @@ def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str
     reference stack, or one whose ``--provider`` flags put every judged block on its reference row, compared the reference
     with itself: it reports ``RAN``.  So does a run that was asked to check its kernels and could not observe them
     (``unobserved``: why): its other checks held, the one it was asked for did not run.  A failed check is ``FAIL`` whatever
-    else is true."""
-    if stack == "reference":
-        return "RAN reference stack (no provider checked)"
+    else is true, on the reference stack too (no run of this script checks anything there; a script of this folder that
+    does shares this answer)."""
     if not passed:
         return "FAIL"
+    if stack == "reference":
+        return "RAN reference stack (no provider checked)"
     if unobserved:
         return f"RAN {stack} stack (kernels not observed: {unobserved})"
     return "PASS" if judged else "RAN (no provider block was judged)"
@@ -637,6 +651,9 @@ def main(argv=None) -> int:
         )
     planning = time.perf_counter()
     try:
+        # what a library row of the stack does at its first use beyond an entry's build, said before it is made
+        for note in dict.fromkeys(note for session, _ in runs for note in session.resolve().announcements()):
+            _say(f"{TAG} planning: {note}", flush=True)
         tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
         claims = [session.claim() for session, _ in runs]  # of a stack that declares a target: how each run stands to it
     except NotImplementedError as error:
@@ -771,7 +788,7 @@ def main(argv=None) -> int:
         else:
             gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
             traced_steps = TRACED_STEPS if outcome is None else outcome.data["traced"]["steps"]
-            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=1, gpu=gpu, traced_steps=traced_steps)
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=2, gpu=gpu, traced_steps=traced_steps)
         if error:
             unwritten.append(error)
         else:

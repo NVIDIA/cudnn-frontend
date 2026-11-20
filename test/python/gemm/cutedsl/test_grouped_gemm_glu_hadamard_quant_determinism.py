@@ -178,15 +178,18 @@ def test_colwise_scale_warm_stress(monkeypatch):
     _check_reference(experts, outputs, rht_norm_const=1.0)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = _call(kwargs)
-    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
-    assert_warm_stress(
-        StressCase(
-            "grouped GLU/RHT colwise scales M=[1024,0,2048] N=2048 K=4096",
-            launch=graph.replay,
-            outputs=_live(captured),
-            thread_blocks=2 * clusters,
-            refills_per_launch=1,  # Conservative lower bound, not a count of all ring refills.
+    try:
+        with torch.cuda.graph(graph):
+            captured = _call(kwargs)
+        clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+        assert_warm_stress(
+            StressCase(
+                "grouped GLU/RHT colwise scales M=[1024,0,2048] N=2048 K=4096",
+                launch=graph.replay,
+                outputs=_live(captured),
+                thread_blocks=2 * clusters,
+                refills_per_launch=1,  # Conservative lower bound, not a count of all ring refills.
+            )
         )
-    )
+    finally:
+        graph.reset()

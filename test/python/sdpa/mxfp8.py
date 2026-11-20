@@ -916,7 +916,7 @@ def _mxfp8_block_scaled_engine_covers(sm, o_block_scale):
 
 def _mxfp8_frost_row_offered(sm):
     """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 and SM120 rows
-    are default candidates; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
+    and the SM100 MXFP8 owners are default candidates) AND that row can admit a graph
     on this device: every row needs a CuTe DSL at the FROST floor (python/cudnn/AGENTS.md Rule 7 -- without one the row
     declines), and on cc 10.7 the row additionally needs a build with the sm_107a target (the public 4.7.0 wheel lacks
     it, and the row then declines through ``cutedsl_arch_requirement_error``), so the mirror requires both.  sf_o has no
@@ -946,8 +946,8 @@ def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fm
 
     Mirrors the engine's rules, so a draw admitted here and then declined is a
     FAILURE, not a waive: an MXFP8 engine row for this arch (and a FROST MXFP8
-    forward row covering the arch OFFERED by the manifest -- by default on cc 10.7,
-    with the opt-in flag on cc 10.0-10.6), a dense unpaged inference forward, no
+    forward row covering the arch OFFERED by the manifest -- by default on cc 10.0-10.7),
+    a dense unpaged inference forward, no
     backend-only ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile
     or covered by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure
     function (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""

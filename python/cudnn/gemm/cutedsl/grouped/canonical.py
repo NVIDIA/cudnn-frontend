@@ -246,3 +246,22 @@ def kernel_facing_prob(tensor):
         return tensor
     m = tensor.shape[0]
     return cute.make_tensor(tensor.iterator, cute.make_layout((m, 1, 1), stride=(1, m, m)))
+
+
+def kernel_facing_rowwise_sf(tensor, rows, cols, sf_vec_size):
+    """Dense physical SF buffer -> the six-dimensional MMA store view at trace time.
+
+    ``make_flat_sf_fake`` gives dense buffers dynamic strides at every rank;
+    legacy six-dimensional fakes have a static first stride and pass through.
+    This changes only the view, preserving the packed scale byte ordering.
+    """
+    if tensor is None:
+        return tensor
+    if cute.rank(tensor) == 6 and cute.is_static(tensor.stride[0]):
+        return tensor
+    rest_m = (rows + 127) // 128
+    rest_k = (cols + 4 * sf_vec_size - 1) // (4 * sf_vec_size)
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout((32, 4, rest_m, 4, rest_k, 1), stride=(16, 4, 512 * rest_k, 1, 512, 512 * rest_k * rest_m)),
+    )
