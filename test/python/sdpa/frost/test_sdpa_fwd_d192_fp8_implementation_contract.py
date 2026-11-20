@@ -70,6 +70,16 @@ def test_other_implementations_do_not_enter_the_owner(overrides):
     assert engines.mismatch(SPECS[NAME].capabilities, facts(**overrides)) is not None
 
 
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_paged_decode_recommends_fixed_owner(cc):
+    f = facts(device_cc=cc, b=1, h_q=64, h_kv=4, s_q=2, s_kv=16384, padded=True, has_paged_kv=True, page_size=16)
+    assert engines.mismatch(SPECS[NAME].capabilities, f) is None
+    for mode in ("A", "FALLBACK"):
+        plans = heuristics.recommend(mode, f, OFFERED)
+        assert {p.engine_id for p in plans} == {OFFERED[NAME]}
+    assert engines.mismatch(SPECS[NAME].capabilities, replace(f, thd=True)) is not None
+
+
 def test_dense_envelope_moves_to_fixed_owner():
     f = facts(d_qk=176, d_v=112)
     assert "owned by" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, f)

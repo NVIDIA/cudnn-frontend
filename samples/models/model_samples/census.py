@@ -68,6 +68,12 @@ has a seventh item:
 7. Every launch of a block call whose identity is ``target`` has the launch shape the census recorded for it on this GPU
    class, SM count and row count.
 
+A kernel of a library has no entry that states its launch: what is held of it is the census's.  Where the library serves
+one call with several classes of kernel, the census entry names the class (``class``, a part of the kernel's name) and item
+7 holds it with the launch shape.  Where the library's own tuner chooses the kernel, the census records that tuner's pick
+(``pick``) and no launch shape: the launch is held as a member of the kernels the call can launch, and the run prints the
+kernel it launched beside the recorded pick -- compared, never gated.
+
 A census holds one configuration per kind of step: ``plain`` for the decode step (one token per sequence) and ``verify``
 for the step that feeds several (:func:`configuration_of`); a section of the latter also names the tokens per sequence it
 was recorded with, and holds for no other count.
@@ -87,6 +93,7 @@ This module imports nothing beyond the standard library.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -195,6 +202,17 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
     ("swiglu_fp4", re.compile(r"^cudnn_kernel_frost_swiglu_fp4_decode_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
+    # FlashInfer's multiplies on the stored formats.  The 4-bit multiply launches one of two kernel classes of one module, and
+    # the class is in the name (a census entry names it: ``class``).  The 8-bit multiply is served by the kernel the library
+    # chooses among its own: a cuBLASLt kernel of 8-bit operands, or the library's own CUTLASS multiply, whose name the
+    # profiler leaves mangled -- of that one the name must carry what the call launches: the SM100 mainloop on tensor-core
+    # multiplies and E4M3 operands (another CUTLASS multiply is no member).  Both stand in front of the family they would
+    # otherwise fall to
+    ("fi_mm_fp4", re.compile(r"^kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100")),
+    (
+        "cublaslt_fp8_gemm",
+        re.compile(r"^nvjet_sm\d+_qq|^_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalI\w*MainloopSm100TmaUmmaWarpSpecializedI\w*NS_12float_e4m3_tE"),
+    ),
     # ``torch.index_select`` launches one of three kernels, by the number of rows it gathers and the size of a table row: the
     # small-index kernel up to 16 rows, and from 17 the large-index kernel or PyTorch's vectorized gather (seen on a bf16
     # table of 5120 columns with int32 ids)
@@ -206,7 +224,7 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
 #: it in a step is held against that row (a chain that launched the same kernel would count as an extra launch: no chain of
 #: this area does -- the embedding is the one ``index_select`` of a step, and a chain that gathers rows indexes its tensor,
 #: which is another kernel of PyTorch); where it has none, the kernel counts as its family's
-FAMILY_OF = {"embedding_gather": "pytorch"}
+FAMILY_OF = {"embedding_gather": "pytorch", "cublaslt_fp8_gemm": "cublas"}
 FAMILY_IDS = ("cublas", "pytorch")
 COPY = "copy"
 #: a copy is a record of the profiler's copy or fill categories -- or, for the copy node of a replayed launch graph that was
@@ -400,6 +418,15 @@ def shape_text(shape) -> str:
     return f"grid {tuple(grid)}, block {tuple(block)}, shared memory {shared:,} B"
 
 
+def _named(name: str, width: int = 72) -> str:
+    """A kernel name as a line names it where the name itself is the statement: whole up to ``width`` characters, else its
+    start with its length and a digest of the whole name -- two long names that differ late are told apart by the digest
+    (a mangled CUTLASS name runs to more than a thousand characters and carries its operand types far from its start)."""
+    if len(name) <= width:
+        return name
+    return f"{name[: width - 3]}... ({len(name):,} characters, sha256 {hashlib.sha256(name.encode()).hexdigest()[:12]})"
+
+
 def _short(name: str, width: int = 96) -> str:
     return repr(name if len(name) <= width else name[: width - 3] + "...")
 
@@ -455,6 +482,7 @@ class Comparison:
     exact: int = 0  # exact launches per step, as planned
     families: Dict[str, List[int]] = field(default_factory=dict)  # family -> attributed launches per step
     picks: Dict[str, Counter] = field(default_factory=dict)  # family -> kernel name -> the most launches in one step
+    served: Dict[str, Counter] = field(default_factory=dict)  # exact row whose entry states no launch -> kernel name -> launches over the pass
 
     @property
     def ok(self) -> bool:
@@ -486,11 +514,13 @@ def compare(
     call_log: Sequence[Sequence[Call]] = (),
     recorded: Optional[Mapping[int, tuple]] = None,
     census: str = "the target census",
+    named: Optional[Mapping[int, str]] = None,
 ) -> Comparison:
     """Items 1 to 7 of the kernel check: the launch records of every traced step (each list ends with the step's host read,
     as :func:`split_steps` cuts them) against the sites of one step in wiring order (:func:`expected`); and, where a call log
     is given, the block calls each step made against the wiring.  ``recorded`` (item 7) maps the index of a site to the
-    launch shape a target census recorded for it (:attr:`Claim.recorded`); ``census`` names that census in a sentence."""
+    launch shape a target census recorded for it (:attr:`Claim.recorded`), ``named`` to the kernel class it recorded for a
+    library kernel there (:attr:`Claim.classes`: a part of the kernel's name); ``census`` names that census in a sentence."""
     anchors = [(index, kernel) for index, site in enumerate(sites) for kernel in site.kernels if kernel.relation == "exact" for _ in range(kernel.launches)]
     planned = [kernel.id for _, kernel in anchors]
     anchor_ids = set(planned)
@@ -574,7 +604,11 @@ def compare(
                     result.unobserved = "the profiler's kernel records carry no launch arguments (grid, block, shared memory)"
                 elif record.shape != tuple(target):
                     fail((index, f"{site.name} launched {kernel.id} with {shape_text(record.shape)}; {census} has {shape_text(target)}"))
+            kind = None if named is None else named.get(site_index)
+            if kind and kind not in record.name:  # item 7, a library kernel: the class the census recorded, as the kernel's name carries it
+                fail((index, f"{site.name} launched {_short(record.name, 160)}; {census} has the kernel class {kind} of {kernel.id} there"))
             if kernel.shape != "entry" or site.facts is None:
+                result.served.setdefault(site.row, Counter())[record.name] += 1  # no entry states its symbol: the name is what the row shows
                 continue
             if record.name not in site.facts.symbols:  # two symbols of one kernel differ late in their text: both are printed whole
                 stated = ", ".join(_short(symbol, 240) for symbol in site.facts.symbols) or "no compiled kernel"
@@ -639,13 +673,18 @@ PARTS = ("prologue", "epilogue", "after_step")
 #: what an entry of a section may state beside its block and its kernel: ``launch`` = [grid, block, shared memory in bytes]
 #: of one launch at the section's row count; ``at`` = the fields of the model's geometry, beyond the section's layer widths,
 #: that this one launch shape was recorded with (the output head's: the vocabulary); ``form`` = the fields of the kernel's
-#: form the target passes at THIS call, beyond the form its kernel has everywhere (a kernel that is called in several forms)
-ENTRY_FACTS = ("launch", "at", "form")
+#: form the target passes at THIS call, beyond the form its kernel has everywhere (a kernel that is called in several forms);
+#: ``class`` = the kernel class of a library kernel at this call, as the kernel's name carries it (a library that serves one
+#: call with several classes of kernel: held like the launch shape, and with it); ``pick`` = the kernel a library's tuner
+#: chose at this call in the recorded run, by name (printed and compared, never gated: another run's tuner may choose another)
+ENTRY_FACTS = ("launch", "at", "form", "class", "pick")
 #: an optional part of a section's row count: per block the facts that differ at that block's first call in the model's
 #: first layer (the first norm of a step has no residual to add)
 FIRST_LAYER = "first_layer"
 #: the packages the providers of this area import, as a run names them: of the versions a census records, these are
-#: compared with what is installed.  A change that brings a provider of another package adds the package here
+#: compared with what is installed.  A change that brings a provider of another package adds the package here -- unless
+#: the provider's adapter holds that package to a validated version itself and does not run on another (FlashInfer:
+#: ``providers.flashinfer_calls.VALIDATED``); what such a package depends on is not compared
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
 
 
@@ -669,6 +708,8 @@ class Identity(NamedTuple):
     kind: str = ""  # of that kernel: "code" | "port"; "" for a stand-in and for the host path
     reason: str = ""  # of NOT_YET: the row's fallback reason; of OTHER: what differs; of TARGET / STAND_IN: why ``launch`` is not held
     launch: Optional[tuple] = None  # the launch shape the census recorded for the target's kernel at this place
+    named: str = ""  # the kernel class the census recorded there for a library kernel (a part of its name); held with ``launch``
+    pick: str = ""  # the kernel a library's tuner chose there in the recorded run: printed and compared, never gated
 
     def text(self) -> str:
         if self.relation in (NOT_YET, OTHER):
@@ -751,6 +792,18 @@ class Claim:
         """Index of a block call in the wiring -> the launch shape the census holds for it: the calls whose identity is
         ``target`` or ``stand-in`` and whose launch the census records (item 7 of the kernel check)."""
         return {index: identity.launch for index, identity in enumerate(self.identities) if identity.relation in (TARGET, STAND_IN) and identity.launch}
+
+    @property
+    def classes(self) -> Dict[int, str]:
+        """Index of a block call in the wiring -> the kernel class the census holds for a library kernel there (item 7 of the
+        kernel check: the class is a part of the launched kernel's name)."""
+        return {index: identity.named for index, identity in enumerate(self.identities) if identity.relation in (TARGET, STAND_IN) and identity.named}
+
+    @property
+    def picks(self) -> Dict[int, str]:
+        """Index of a block call in the wiring -> the kernel a library's tuner chose there in the recorded run: what a run
+        prints its own kernel beside.  Never gated."""
+        return {index: identity.pick for index, identity in enumerate(self.identities) if identity.relation in (TARGET, STAND_IN) and identity.pick}
 
     def of(self, block: str, site: Optional[str] = None) -> str:
         """The identity column of a block: the identity of its calls (of its calls at ``site``, for a part of a block whose
@@ -938,6 +991,8 @@ class Target:
                                 wrong(f"{where}, {rows} rows, {part}: at of {block} is not an object of geometry fields (name: whole number)")
                             if not isinstance(facts.get("form", {}), dict):
                                 wrong(f"{where}, {rows} rows, {part}: the form of {block} is not an object of form fields")
+                            if any(name in facts and (not isinstance(facts[name], str) or not facts[name]) for name in ("class", "pick")):
+                                wrong(f"{where}, {rows} rows, {part}: class and pick of {block} are names: a kernel class, a kernel")
                             meta = kernels[kernel_id]
                             if section["claimed"] and "launch" not in facts and meta["relation"] == TARGET and "selection" not in meta:
                                 wrong(
@@ -1080,7 +1135,10 @@ class Target:
         # a launch shape recorded with a field of the geometry this model does not share (the output head's: the vocabulary) is
         # not this model's: it is held by nothing, and the claim says so
         other = _other_widths(facts.get("at", {}), geometry) if shape is not None else ""
-        return Identity(STAND_IN if meta["relation"] == STAND_IN else TARGET, kernel_id, kind, other, None if other else shape)
+        named = "" if other else str(facts.get("class", ""))  # recorded with the launch shape: held where that one is
+        return Identity(
+            STAND_IN if meta["relation"] == STAND_IN else TARGET, kernel_id, kind, other, None if other else shape, named, str(facts.get("pick", ""))
+        )
 
 
 # ---------------------------------------------------------------------------------------------------------- a traced pass
@@ -1119,6 +1177,14 @@ class Traced:
         """Site index -> the launch shape the claim's census recorded there, counted among this pass's own sites."""
         return {} if self.claim is None else {index + self.first: shape for index, shape in self.claim.recorded.items()}
 
+    def _classes(self) -> Dict[int, str]:
+        """Site index -> the kernel class the claim's census recorded there for a library kernel, counted like :meth:`_recorded`."""
+        return {} if self.claim is None else {index + self.first: named for index, named in self.claim.classes.items()}
+
+    def _picks(self) -> Dict[int, str]:
+        """Site index -> the kernel a library's tuner chose there in the recorded run, counted like :meth:`_recorded`."""
+        return {} if self.claim is None else {index + self.first: pick for index, pick in self.claim.picks.items()}
+
     def judge(self) -> Tuple[str, List[str]]:
         """Run the kernel check on this pass: ``(PASS | FAIL | NOT OBSERVED, the lines under the check's own line)``.  Where the
         pass has launch records it has one call log per traced step, or it fails: the form check reads from the log which
@@ -1136,7 +1202,7 @@ class Traced:
             )
         if self.steps is not None:
             recorded, name = (None, "") if self.claim is None else (self._recorded(), f"the {self.claim.name}")
-            self.result = compare(self.steps, self.sites, self.call_log, recorded, name)
+            self.result = compare(self.steps, self.sites, self.call_log, recorded, name, None if self.claim is None else self._classes())
             lines += self.result.sentences()
             self.unobserved = self.result.unobserved
         else:
@@ -1167,7 +1233,9 @@ class Traced:
         """Per exact row what a step launched, and the kernels a library chose inside the fallback rows (printed, not gated)."""
         lines = []
         calls = Counter((site.block, site.site) for site in self.sites)
-        recorded = {self.sites[index].block: shape for index, shape in self._recorded().items()}
+        # what the census records is recorded per call: a block whose call sites two rows serve has it for one of them alone
+        recorded = {(self.sites[index].block, self.sites[index].site): shape for index, shape in self._recorded().items()}
+        classes = {(self.sites[index].block, self.sites[index].site): named for index, named in self._classes().items()}
         for site in {(site.block, site.site): site for site in self.sites}.values():
             for kernel in site.kernels:
                 if kernel.relation != "exact":
@@ -1181,13 +1249,17 @@ class Traced:
                     )
                 elif kernel.shape == "entry":
                     lines.append(f"{site.row}: {site.entry}{form_text(site.form)}, {count}; the entry states no launch for this run")
-                elif site.block in recorded:  # no entry states its shape; the census of the target records one
+                elif (site.block, site.site) in recorded:  # no entry states its shape; the census of the target records one for this call site
+                    at = (site.block, site.site)
+                    what = "the launch shape" if at not in classes else f"the kernel class {classes[at]} and the launch shape"
                     lines.append(
-                        f"{site.block}: {site.entry}, {count}; {kernel.id} by name, and in the launch shape the census records: {shape_text(recorded[site.block])}"
+                        f"{site.row}: {site.entry}{form_text(site.form)}, {count}; {kernel.id} by name, and in {what} the census records: "
+                        f"{shape_text(recorded[at])}"
                     )
                 else:
-                    lines.append(f"{site.block}: {site.entry}, {count}; {kernel.id} by name (no launch shape is declared for it)")
+                    lines.append(f"{site.row}: {site.entry}{form_text(site.form)}, {count}; {kernel.id} by name (no launch shape is declared for it)")
         lines += self.served()
+        lines += self.chosen()
         if self.result is not None:
             for family, picks in sorted(self.result.picks.items()):
                 if family == "pytorch":
@@ -1218,6 +1290,24 @@ class Traced:
         for block, by_instance in counts.items():
             parts = "; ".join(f"{count} x {instance or 'no entry instance'}{form_text(form)}" for (instance, form), count in by_instance.items())
             lines.append(f"{block}, as the call log of a traced step has it ({sum(by_instance.values())} calls): {parts}")
+        return lines
+
+    def chosen(self) -> List[str]:
+        """For every block whose kernel a library's tuner chooses -- the census records the tuner's pick of the recorded run,
+        never a launch shape -- the kernels the traced steps launched for it, and whether they are that pick.  Printed and
+        compared, never gated: the choice is the library's, and another process's tuner may make another."""
+        if self.claim is None or self.result is None:
+            return []
+        lines, rows = [], {}
+        for index, pick in self._picks().items():
+            rows.setdefault(self.sites[index].row, pick)
+        for row, pick in rows.items():
+            names = self.result.served.get(row)
+            if not names:
+                continue
+            launched = ", ".join(f"{_named(name)} x {count}" for name, count in names.most_common(4))
+            same = "the pick the census records" if set(names) == {pick} else f"not the pick the census records ({pick}): another kernel of the same entry"
+            lines.append(f"chosen by the library for {row} (printed and compared, never gated): {launched} over the traced steps; {same}")
         return lines
 
     def dump(self) -> dict:

@@ -681,10 +681,11 @@ def test_fp8_d256_dense_envelope_matches_adapter():
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256}
+    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256, (576, 512): 512}
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(512, 512): 256}, arch
+        expected_floors = {shape: floor for shape, floor in _SM100_FP8_ENVELOPE_FLOORS.items() if shape in spec.capabilities.d_shapes}
+        assert dict(spec.capabilities.d_envelope_floors) == expected_floors, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)

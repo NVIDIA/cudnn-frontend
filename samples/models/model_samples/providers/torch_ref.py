@@ -129,8 +129,8 @@ def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
 
 def attention_prepare(qkv: torch.Tensor, cache, position: int, p, eps: float, acc):
     """Split the in-projection's row into query, gate, key and value, norm query and key per head, rotate both, and insert key and
-    value at ``position`` of the layer's cache.  The row is ``[q | gate]`` per query head, then the keys, then the values.
-    Returns ``(q [rows, heads, D] bf16, gate [rows, heads * D] bf16)``."""
+    value at ``position`` of the layer's cache (``cache.write``).  The row is ``[q | gate]`` per query head, then the keys, then
+    the values.  Returns ``(q [rows, heads, D] bf16, gate [rows, heads * D] bf16)``."""
     rows, H, HK, D = qkv.shape[0], p.heads, p.kv_heads, p.head_dim
     q_gate = qkv[:, : 2 * H * D].view(rows, H, 2 * D)
     q, gate = q_gate[..., :D], q_gate[..., D:]
@@ -139,18 +139,18 @@ def attention_prepare(qkv: torch.Tensor, cache, position: int, p, eps: float, ac
     cos, sin = rope_cos_sin(position, p.rotary_dim, p.rope_theta, qkv.device)
     q = rotate(rms_norm(q.float(), p.q_norm, eps, acc), cos, sin)
     k = rotate(rms_norm(k.float(), p.k_norm, eps, acc), cos, sin)
-    cache.k[:, :, position] = k
-    cache.v[:, :, position] = v
+    cache.write(position, k, v)
     return q, gate.reshape(rows, H * D)
 
 
 def attention(q: torch.Tensor, cache, position: int, acc) -> torch.Tensor:
     """Scaled dot-product attention of one new token per sequence over the cached keys and values up to ``position``; every
-    query head reads the key/value head of its group.  Returns ``[rows, heads * D]`` bf16."""
+    query head reads the key/value head of its group.  Returns ``[rows, heads * D]`` bf16.  The cache is read through its
+    own accessors (``keys`` / ``values``: ``[rows, kv heads, positions, D]`` in ``acc``), whatever its layout."""
     rows, H, D = q.shape
-    HK = cache.k.shape[1]
-    k = cache.k[:, :, : position + 1].to(acc)
-    v = cache.v[:, :, : position + 1].to(acc)
+    k = cache.keys(position + 1, acc)
+    v = cache.values(position + 1, acc)
+    HK = k.shape[1]
     qg = q.to(acc).view(rows, HK, H // HK, D)
     p = torch.softmax(torch.einsum("bhgd,bhtd->bhgt", qg, k) * D**-0.5, dim=-1)
     return torch.einsum("bhgt,bhtd->bhgd", p, v).reshape(rows, H * D).to(BF16)

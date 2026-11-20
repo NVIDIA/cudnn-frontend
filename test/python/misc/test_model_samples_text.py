@@ -2440,8 +2440,10 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     assert "(17 at five drafted tokens) is an `ERROR` before the plan; left to its default, the count follows the schedule." in text
     assert "then 32 new tokens in 10 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens" in text and len(scheduled(32, 3)) == 13
     assert 'three drafted tokens (`"num_speculative_tokens": 3`) passed in 13 steps' in text
-    # the two checkpoint runs it reports: each one's counts are the counts of one loop (every step in full; the first token is the prompt's)
-    for new, steps, kept, chain in ((204, 63, (14, 11, 11, 9, 10, 8), (49, 38, 27, 18, 8)), (249, 74, (13, 14, 14, 10, 11, 12), (61, 47, 33, 23, 12))):
+    # the three checkpoint runs it reports -- native on the cuDNN Frontend rows, fe-cublas, native with its library rows: each one's counts
+    # are the counts of one loop (every step in full; the first token is the prompt's)
+    runs = ((204, 63, (14, 11, 11, 9, 10, 8), (49, 38, 27, 18, 8)), (249, 74, (13, 14, 14, 10, 11, 12), (61, 47, 33, 23, 12)))
+    for new, steps, kept, chain in (*runs, (231, 71, (9, 16, 20, 9, 7, 10), (62, 46, 26, 17, 10))):
         accepted = sum(index * count for index, count in enumerate(kept))
         assert sum(kept) == steps and [sum(kept[index:]) for index in range(1, 6)] == list(chain) and new <= 1 + steps + accepted
         assert f"{new} new tokens in {steps} steps: {1 + accepted / steps:.2f} kept tokens a step (1 + {accepted} " in text
@@ -2500,10 +2502,37 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     assert "tokens per second" not in text and not re.search(r"\d(?:\.\d+)? (?:ms|tokens/s)\b", text), "the section states no speed"
     # what ran, as the runs printed it: a figure of a run is changed with the run, here and there
     for sentence in (
-        "on the 64-layer model 370 of the 484 launches of a verify step are target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries "
-        "with byte-equal results), on the two-layer model of the default run 13 of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
-        "with byte-equal results)",
-        "Nor with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (the last run of this section has two).",
+        "on the 64-layer model 451 of the 484 launches of a verify step are target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend "
+        "entries with byte-equal results), on the two-layer model of the default run 17 of 20 (6 the target's own compiled kernels + 11 cuDNN Frontend "
+        "entries with byte-equal results); on `fe-entries`, without the library rows, 370 of the 484 (49 the target's own compiled kernels + 321 cuDNN "
+        "Frontend entries with byte-equal results) and 13 of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)",
+        "Nor with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last runs have three).",
+        # a dated run names its rows, and the run of native with the rows a library serves stands beside it with its versions
+        "correctness only; `native` on the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today).",
+        "With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class) the default run on `native` "
+        "ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of its process.",
+        "Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count, "
+        "and the kernel check passed over 10 traced steps, "
+        "with 17 of 20 launches of the verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal "
+        "results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens",
+        'Three drafted tokens passed in 13 steps, with "kernel identity: not stated for this run".',
+        "The memory sentence of the default run asked for about 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP "
+        "flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.",
+        "**The last run with a checkpoint on the cuDNN Frontend rows** (2026-11-19;",
+        "correctness only; `native` selected those rows then, as `fe-entries` does today; the third command of this section as it is written,",
+        "**The last run with a checkpoint on `native` with its library rows** (2026-11-20; PyTorch 2.14.0, FlashInfer 0.7.2.post1; the same checkpoint, "
+        "command, prompt, list and GPU class), made twice with the same figures. Both runs ended in `[02] PASS` at the end token.",
+        "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
+        'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
+        "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' on the same tokens, the first that differs kept token 17.",
+        "The kernel check passed over 16 traced steps, with "
+        "451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal "
+        "results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN Frontend entries with "
+        "byte-equal results), the 16 out-projections of the attention layers by membership, on the library's own CUTLASS multiply; nothing is stated "
+        "about the kernels of the passes. The memory sentence asked for about 32.2 GiB.",
+        '| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the '
+        "verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, "
+        "exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |",
         "so the tokens a checkpoint run writes are held by no line of that run: the loop that writes them is the one the default run proves.",
         "the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context length).",
         "a prompt of 26 tokens, then 32 new tokens in 10 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on "

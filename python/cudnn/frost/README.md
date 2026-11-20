@@ -304,6 +304,10 @@ python/cudnn/
                                 of its compiled forms, the form as plain data,
                                 the launch shape (kernel_symbols_for /
                                 form_for / launch_shape_for on the entry)
+    init_order.py               the order of a direct-call entry's launches
+                                behind the initialization of the buffers an
+                                entry allocates for itself (pending_of /
+                                record / order_behind)
     tile_dsl/                   shared CuTe-DSL primitives (barriers, TMA,
                                 MMA, softmax pieces, masks, row reductions).
                                 Import by dotted path:
@@ -1274,3 +1278,43 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     in new or changed kernel code, even when every test passes
     (`python/cudnn/AGENTS.md` Rule 11); existing sites move over in follow-up
     changes.
+16. **A direct-call entry orders its launches behind entry-owned allocations.**
+    A buffer an entry allocates for itself (an output, a scratch) is initialized
+    by stream work of torch's current stream at that moment: a zero-fill, a fill
+    torch adds under deterministic algorithms, a write that stream still owes a
+    recycled block. A launch on another stream is not ordered behind it. So an
+    entry that allocates calls `cudnn.frost.init_order.record` right behind the
+    allocation and its fills, before the tensors are stored where a launch
+    finds them; and EVERY direct-call entry -- one that owns nothing too, its
+    output can be another entry's buffer -- keeps `init_order.pending_of(device)`
+    at construction and, in front of every launch and behind the truth test of
+    those records, calls `init_order.order_behind` with the byte ranges the
+    launch writes. A `torch.zeros` or `torch.empty` handed to a launch without
+    it is not accepted in new or changed entry code, even when every test
+    passes: the first launch of a newly compiled kernel has been observed to
+    wait for the other streams and hides the missing order, a warm launch on
+    another stream does not. The ordering makes ONE host wait: a captured
+    launch that writes an allocation whose initialization is still pending
+    waits for that one event before the launch (a capturing stream cannot wait
+    for an event recorded outside the capture); it is set-up, bounded by what
+    the allocating stream had queued, never replayed, and a caller avoids it
+    by allocating before the capture and letting that work finish. An eager
+    launch stream waits for the event whatever its raw handle, the allocating
+    stream's too (a destroyed stream's handle can go to the next new one; on
+    the allocating stream itself the wait is free). An accessor returns a copy
+    of the entry's table. The test is a WARM launch on another stream than the
+    allocation's, with that stream held behind pending work
+    (`test/python/init_order_schedules.py`). On the helper today:
+    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`.
+    Not yet, to follow in a separate change: `GdnDecodeFused`,
+    `GdnVerifyFused`, `SharedExpertDecode` (they allocate: record and order),
+    `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order), and
+    `RowQuantizeFp4Decode` (an entry object orders the launches into the
+    outputs it allocated itself, with a copy of this ordering kept in the
+    entry; it moves onto the helper). Until then the caller orders (allocates
+    on the stream its calls run on, or orders that stream behind the
+    allocating one) every launch of one of the first five into an entry-owned
+    buffer, its own or another entry's; every launch of `RowQuantizeFp4Decode`
+    into a buffer another entry object allocated; and every launch of any
+    other entry into a buffer `GdnDecodeFused`, `GdnVerifyFused`,
+    `SharedExpertDecode` or `RowQuantizeFp4Decode` allocated.

@@ -227,8 +227,9 @@ this sample prefills a prompt with a kernel of its own, so a prompt of N tokens 
 N new tokens before the first new token appears. It gives a count and no time, because before the load a run has no
 time of its own to give; the `first token` line of the report has the measured one. In the runs of 2026-11-17 on
 compute capability 10.0, a prompt of 29 tokens took 4.3 s before the first new token on the stack `fe-cublas` (0.15 s
-per step) and the 58 tokens of the default prompt took 7.8 s on the stack `native` (0.13 s per step): orientation
-values of single runs on a shared GPU, as every timing on this page.
+per step) and the 58 tokens of the default prompt took 7.8 s on the cuDNN Frontend rows of the stack `native`, the
+rows `fe-entries` selects today (0.13 s per step): orientation values of single runs on a shared GPU, as every timing
+on this page.
 
 What is not here, and is not planned for a sample: a network interface of any kind; a request queue, or admission of
 work while a step runs; different prompts in one step; sampling; stop strings, constrained output, logit processors;
@@ -265,7 +266,9 @@ which is why a run counts them as "cuDNN Frontend entries with byte-equal result
 inside a serving engine and gets a declared stand-in.
 
 These are the numbers of the complete stack, not of today's. On compute capability 10.0 this stack launches all 273
-today: the norm entry's 129, the projection entry's 64, the fused gate / up entry's 64 and the gate entry's 16. The
+today: the norm entry's 129, the projection entry's 64, the fused gate / up entry's 64 and the gate entry's 16. Of
+the 210 it launches 178: the fused step's 48, PyTorch's gather and 129 calls of FlashInfer -- the MLP's 64 down
+multiplies, the 64 out-projections and the multiply of the output head. The
 numbers are those of the recorded class, compute capability 10.0: the target launches the
 projection kernel for the in-projections there and a library multiply on the other 10.x classes, so on those the
 in-projection of this stack stays on its fallback row. And "byte-equal" is the entry's own record, not something this
@@ -278,7 +281,8 @@ fused gate / up entry it was made on compute capability 10.0. What this
 sample holds an entry to is its documented numerics contract (the band of its row) and its launch facts.
 
 The stack is built block by block. A block whose target kernel is not served here yet stays on the fallback row it has in
-`fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today five entries are on their target forms:
+`fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today five entries of cuDNN Frontend and three
+calls of a library, FlashInfer, are on their target forms:
 
 | block | launches per step (64 layers) | what `native` launches | identity |
 |---|---|---|---|
@@ -288,7 +292,10 @@ The stack is built block by block. A block whose target kernel is not served her
 | linear-attention step | 48 | `cudnn.GdnDecodeFused` launched as a dependent of the launch before it and releasing the launch after it at entry (`PDL True`, `PDL_RELEASE True`) | target: the target's own compiled kernel |
 | MLP gate / up + SiLU x up + quantise | 64 | `cudnn.SwigluFp4Decode` on the stored 4-bit weight in the entry's own row order, the kernel stated whole: the token tile of the row count (8 tokens up to 8 rows), two weight stages issued ahead of the wait, the weight stream on the evict-first L2 policy, a persistent grid of at most 148 thread blocks, waiting for the launch before it (`TOKEN_TILE 8`, `PREWAIT_STAGES 2`, `L2_EVICT_FIRST True`, `MAX_CLUSTERS 148`, `PDL True`); compute capability 10.x, 1 to 64 rows | target: a cuDNN Frontend entry with byte-equal results |
 | gate + quantise | 16 | `cudnn.AttentionGateQuantDecode` with 256 threads per thread block, releasing the launch after it at entry (`THREADS 256`, `PDL_RELEASE True`); compute capability 10.x | target: a cuDNN Frontend entry with byte-equal results |
-| every other block of the table below | 161 | the fallback rows of `fe-cublas` | not yet |
+| 8-bit out-projection | 64 | `flashinfer.gemm.bmm_fp8` on the stored 8-bit weight (`BACKEND auto`): the library chooses the kernel among its own; needs FlashInfer ("The rows a library serves" below); compute capability 10.x | target: the target's own compiled kernel, held by membership -- the kernel the library chose is printed beside the pick the census records and is never gated |
+| MLP down | 64 | `flashinfer.gemm.mm_fp4` on the stored 4-bit weight, with the library's CuTe DSL backend and outside any tuning context (`BACKEND cute-dsl`, `TUNED False`): the library's own pick for the shape, its split-K kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records |
+| output head | 1 | the reference's 4-bit quantisation of the normed rows, then the same call of `flashinfer.gemm.mm_fp4` on the stored 4-bit weight: the library's persistent kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records (the quantisation in front of it is the last row of this table) |
+| attention preparation, attention core | 32 | the fallback rows of `fe-cublas` | not yet |
 | the 4-bit quantise in front of the output head | 1 | nothing: this sample has no block for it yet | the target's declared stand-in, not yet |
 
 The norm block is called at five kinds of site in a step, and the target calls its kernel in another form at each: the
@@ -395,23 +402,33 @@ compute capability 12.x, and for a checkpoint of the family with another hidden 
 multiply over a copy (`not yet (bf16 copy of 4-bit weights)`).
 
 What a consumer needs beyond a kernel's bytes is launched by the consumer, never inside the producer's call. The MLP's
-down multiply is still on its fallback row: it reads the codes of the gate / up kernel with their block scales in the
-layout the kernel writes (128 x 4), and the multiply over a copy gathers them when it dequantises. And where the norm's
-form ends at the bf16 rows, the output head on its fallback row quantises them itself: that quantisation is the
-target's declared stand-in, for which this sample has no block yet.
+down multiply reads the codes of the gate / up kernel with their block scales in the layout the kernel writes
+(128 x 4): the library's multiply reads that layout and is handed them as they are (on its fallback row, in
+`fe-entries`, the multiply over a copy gathers them when it dequantises). And where the norm's form ends at the bf16
+rows, the output head quantises them itself, with the reference's quantiser: that quantisation is the target's
+declared stand-in, for which this sample has no block yet.
 
 So a run with a checkpoint prints under its kernel table:
 
 ```text
 the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
+kernel identity, as planned: 451 of 484 launches of a step are target kernels (178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results); not yet: attention.prepare 16, attention.core 16; 1 declared stand-in (not yet: output_head.quantize)
+```
+
+On `--stack fe-entries`, the cuDNN Frontend rows alone, the second line is
+
+```text
 kernel identity, as planned: 322 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results); not yet: projection.fp8.out 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
 ```
 
 and with its checks the census line, `target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12): NOT CLAIMED (fallback
-rows present; ...); 322 launches of a step compared by launch shape (49 the target's own compiled kernels + 273 cuDNN
-Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded one`. The default run on the
-two-layer model counts 12 of 20 (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results;
-the declared stand-in not yet). The line always says what was compared: `EQUAL`, once a class is claimed, carries the
+rows present; ...); 387 launches of a step compared by launch shape (114 the target's own compiled kernels + 273 cuDNN
+Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded one; 64 more by membership
+alone` -- the 64 are the out-projections, whose kernel the library chooses. The default run on the two-layer model
+counts 17 of 20 (7 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results; the declared
+stand-in not yet), and `fe-entries` 12 of 20 there (2 the target's own compiled kernels + 10 cuDNN Frontend entries with
+byte-equal results; the declared stand-in not yet). The line always says what was compared: `EQUAL`, once a class is
+claimed, carries the
 number of launches that were held to a recorded launch shape and the number held by membership alone (a kernel a
 library's tuner selects, a stand-in), so it never stands for a comparison that was not made.
 
@@ -451,8 +468,10 @@ starts on the in-projection's release and waits before it reads the projection's
 well, on each 10.x class: the MLP's norm releases at its own wait, the gate / up kernel behind it starts on that
 release, issues two stages of its weight and waits for the norm before it reads the 4-bit operand, its block scales
 and the two scalars. The kernel signals the launch after it before its last output tile is written (it has no knob
-for that); the down multiply behind it is a fallback row, launched without the attribute, and starts when the kernel
-has completed. Each
+for that). In `fe-entries` the down multiply behind it is a fallback row, launched without the attribute, and starts
+when the kernel has completed; in `native` it is the library's kernel, which the library launches with programmatic
+dependent launch at its own default and which waits for the launch before it at its start. The library launches its
+8-bit multiply the same way: in `native` it starts on the release of the fused step or of the gate, and waits. Each
 row of `configs.py` says what the launch before it must not write and what the launch after it must wait for. With `--provider
 linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
@@ -460,27 +479,93 @@ target set.
 
 `--stack fe-entries` is every cuDNN Frontend row of `native` with each block that a library or a temporary kernel will
 serve there on its fallback row. It needs no package beyond cuDNN Frontend and PyTorch, and it is the stack the GPU test
-of this area runs, so the rows of the entries stay verified wherever that test runs. Until `native` has a row a library
-serves, the two stacks are the same rows.
+of this area runs, so the rows of the entries stay verified wherever that test runs. The two stacks differ in three
+rows: the MLP's down multiply, the output head and the 8-bit out-projection, which `native` hands to FlashInfer and
+`fe-entries` keeps on the multiplies over a copy of `fe-cublas`.
+
+### The rows a library serves
+
+Three blocks of the target kernel set are multiplies of a library on the stored weights, and `native` has a row for
+each on compute capability 10.x: `flashinfer.mm_fp4` for the MLP's down multiply, `torch_ref.quantize+flashinfer.mm_fp4`
+for the output head, and `flashinfer.bmm_fp8` for the out-projection (in a verify step behind the projection entry's
+rows, which keep the linear-attention layers' call). FlashInfer is an optional package of this stack alone. It is
+imported inside the adapters of the rows that call it, on a device; no other stack and no plan on stated device facts
+imports it. Such a plan is made through the helper layer (`model_samples.blocks.plan` with a `DeviceFacts` of your
+own; the script has no flag for it) and shows these rows without the package -- as `unverified in CI`, because no
+requirement file of this repository's tests names the package. Install it with
+
+```bash
+pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt
+```
+
+The requirement file is a lower bound; the constraints file pins the versions the launch records of the census were
+recorded with -- PyTorch 2.14.0, CuTe DSL 4.8.0, FlashInfer 0.7.2.post1 and apache-tvm-ffi 0.1.11 -- so in an
+environment that has another PyTorch the line replaces it, and its cuDNN with it: an environment of its own is the safe
+place for `native`. FlashInfer requires `nvidia-cudnn-frontend` itself; run `pip install -e .` again if pip lists
+that package among what it installed. The adapters hold the version of FlashInfer alone, to a validated one
+(`VALIDATED` in `model_samples/providers/flashinfer_calls.py`); a PyTorch or a CuTe DSL of another version than the
+recorded one is named in the census line of a run. Without the package, or with another version of it, `--stack native`
+on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0; the line names the version,
+the command above and `--stack fe-entries`, which runs the cuDNN Frontend rows of the stack without the package. On
+compute capability 12.x no row of the library serves, and the stack runs without the package.
+
+The 4-bit multiply is held exactly. The library picks the kernel of a call itself, by the shape and the GPU -- one of
+two kernel classes, in a grid of its own choice -- and that pick is a function of the call as long as nothing has
+tuned the operation in the process. So the row says `TUNED False`, the census records the kernel class and the launch
+shape of each call, and the kernel check fails a launch of another class or in another shape. The same call inside a
+tuning context of the library (`flashinfer.autotune`), or after one has tuned the operation in the process, is not the
+row's form: the call log reads `TUNED True`, and the kernel check fails with the form it found beside the form the row
+names. `TUNED` is a statement about this process: the library's tuner is tuning, or has tuned the operation here. A
+tuning store that a caller attached to the library is not seen by it (the sample attaches none); a tactic replayed
+from one is held by the kernel class and the launch shape alone, where the census has a section for the run. The 8-bit
+multiply is the other case, by design: which kernel serves `bmm_fp8` is the library's choice among its
+own -- its tuner's where one has run, else its first candidate -- so the kernel check holds the launch by membership,
+prints the kernel that was chosen beside the pick the census records, says whether it is that pick, and never fails
+on it. A member is a cuBLASLt kernel of 8-bit operands or the library's own CUTLASS multiply of 8-bit operands; a long
+kernel name is printed with its length and a digest, so that two such names are told apart. In every run of this page
+the library launched its own CUTLASS multiply there, not the cuBLASLt kernel the census records as the target's pick:
+those launches are the same call as the target's and another kernel, and a count of target launches that includes
+them says so.
+
+### What the first run does
+
+FlashInfer builds what a call needs when the call is first made: the kernel of a 4-bit multiply is compiled in the
+process, and the 8-bit multiply is a module the library compiles with the installed
+CUDA compiler and ninja and keeps in its own cache directory (`.cache/flashinfer` under the home directory, or under
+the directory `FLASHINFER_WORKSPACE_BASE` names) -- more than a minute on the machine these rows were
+written on, once per machine. A run of `native` therefore makes each call of a library row on scratch operands while
+it plans, after the memory sentence has held and before anything is loaded: at the run's row count and, for a run of
+several sequences, at the rows of one sequence, which its batch-invariance check calls (the kernel of the 4-bit
+multiply is compiled per range of row counts). It says so
+in one line, `[00] planning: first use of FlashInfer <version>: ...`, and the `plan` figure of its stage line is what
+that cost. A call the library refuses for the operands the adapter built ends the run in `[00] ERROR`; whatever else
+keeps the library itself from importing, building or launching there ends it in `[00] SKIP`, with the type of the
+exception and nothing loaded. A fault of the adapter's own code is neither: it is raised as it is.
 
 On compute capability 12.x neither the gate entry nor the norm entry serves; both blocks then stay on their reference
 chains (`not yet (reference chain)`) in both stacks, and the census has no section for that class. The row of the
 projection entry claims compute capability 10.0 only, the rows of the fused gate / up entry compute capability 10.x:
 on 12.x both multiplies are over copies.
 
-The stack was last run on compute capability 10.0 (2026-11-17, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
-line of every run names the PyTorch version as other than the recorded 2.14.0). Where every sequence count of a run is
+With its library rows the stack was last run on compute capability 10.0 on 2026-11-18 (a 148-SM part, PyTorch 2.14.0,
+CuTe DSL 4.8.0, FlashInfer 0.7.2.post1: the versions the census was recorded with): the first two rows of the table.
+Every other row is a run of 2026-11-17 on the cuDNN Frontend rows of the stack, as `--stack native` selected them
+then and `--stack fe-entries` selects them today (PyTorch 2.13.0; the census line of every such run names the PyTorch
+version as other than the recorded 2.14.0): the three library rows were fallback rows in those runs, and the counts
+of launches, copies and weights in them are those of `fe-entries`. Where every sequence count of a run is
 at most 32 and no row is selected away, the projection row and the gate / up row serve each count: the run holds the
 in-projections and the gate / up weights on their stored codes alone, and the reference of its checks reads bf16
 copies made on demand. From 33 sequences the in-projections have their copies, and from 65 the gate / up weights:
 
 | run | result |
 |---|---|
-| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 179 kernel launches and 13 copies (303 and 25 with the gate / up block on its fallback row); 12 are judged one by one. At 1 sequence the gather, the fused step, the gate, the five norm calls, the two in-projections and the two gate / up calls (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 4 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, each that of the nearest value; nothing outside -- and equal alone and among 4. The projection entry was inside the band of the reference multiply at both weight shapes (114 calls; the largest distance one bf16 unit, on fewer than 0.05 % of the elements, where the multiply over a copy it replaces is one unit off on 25.9 %), and equal alone and among 4. The fused gate / up entry was inside its band over 114 calls: at 1 sequence 124,032 block scales, each the byte of the fp64 chain, and 1,984,512 codes, 1,927 of them another code than the fp64 chain's, the farthest at 89 % of its bound; at 4 sequences 7,758 of 7,938,048 codes; nothing outside, and equal alone and among 4. The gate entry was inside its band (350,208 bytes at 1 sequence, each the code of the nearest bf16 value; 1,400,832 at 4, one of them the code of the other value around the gated value, inside the margin), and equal alone and among 4. At each count the reference read 460 copies of in-projection and gate / up weights made on demand (four per step and reader, 0.33 GiB the larger), and the four weights held the bytes of their load before and after the checks (`stored weights`) |
+| the default run with the library rows, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 118 kernel launches and 4 copies; 17 are judged one by one. At 1 sequence 14 of them have the recorded launch shapes (4 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results): the gather, the fused step and the two down multiplies -- these in the kernel class `Sm100BlockScaledSplitKGemmKernel`, grid (40, 1, 2), block (192, 1, 1), 231,424 B of shared memory -- and the ten launches of the cuDNN Frontend entries; the two out-projections are held by membership, and the output head by name alone, because the reduced vocabulary is another weight shape than the recorded one (the census line says so). The three library rows were inside the band of the reference multiply: the out-projection and the down multiply over 114 calls each, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the output head over 57 calls, every element equal. The kernel the library chose for the out-projection was its own CUTLASS multiply at both call sites, not the pick the census records, and the line said so. The run kept all 9 weights of its multiplies on their stored format alone, and at 1 sequence the reference read 1,035 copies made on demand |
+| the checkpoint with the library rows, `--stack native`, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 451 launches of every one of the 32 traced steps on target kernels (178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results; the declared stand-in has no block yet), in the wiring order; 387 of them in the recorded launch shape, the 64 down multiplies in the split-K kernel class and the output head in the persistent one, grid (1, 1, 148); the 64 out-projections by membership. 1,422 kernel launches and 5 copies per traced step in all. Replay held; 8 of 8 provider blocks inside their bands; the 257 weights held the bytes of their load before and after the checks, and the reference read 12,850 copies made on demand, the largest 2.37 GiB; the token line reported. The memory lines are in the section on checkpoints |
+| the default run, `--stack native` on 2026-11-17 | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 179 kernel launches and 13 copies (303 and 25 with the gate / up block on its fallback row); 12 are judged one by one. At 1 sequence the gather, the fused step, the gate, the five norm calls, the two in-projections and the two gate / up calls (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 4 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, each that of the nearest value; nothing outside -- and equal alone and among 4. The projection entry was inside the band of the reference multiply at both weight shapes (114 calls; the largest distance one bf16 unit, on fewer than 0.05 % of the elements, where the multiply over a copy it replaces is one unit off on 25.9 %), and equal alone and among 4. The fused gate / up entry was inside its band over 114 calls: at 1 sequence 124,032 block scales, each the byte of the fp64 chain, and 1,984,512 codes, 1,927 of them another code than the fp64 chain's, the farthest at 89 % of its bound; at 4 sequences 7,758 of 7,938,048 codes; nothing outside, and equal alone and among 4. The gate entry was inside its band (350,208 bytes at 1 sequence, each the code of the nearest bf16 value; 1,400,832 at 4, one of them the code of the other value around the gated value, inside the margin), and equal alone and among 4. At each count the reference read 460 copies of in-projection and gate / up weights made on demand (four per step and reader, 0.33 GiB the larger), and the four weights held the bytes of their load before and after the checks (`stored weights`) |
 | the four-layer model, `--stack native --layers 4 --sequences 1` | `[00] PASS`: all five forms a 64-layer model calls (the input norm of a later linear-attention layer is the fifth), four in-projections, three at 16384 x 5120 from one instance and one at 14336 x 5120 from the other, and four gate / up calls; 22 launches of a step judged one by one (4 the target's own compiled kernels + 18 cuDNN Frontend entries with byte-equal results), each in the recorded launch shape. Its memory sentence asked for about 4.4 GiB; PyTorch reserved 4.4 GiB and the device grew by 4.6 GiB -- on the reduced models the sentence is an estimate (the last section has the runs) |
 | the one-layer model, `--stack native --layers 1 --sequences 1` | `[00] PASS`: the sixth form, `full_attention.first` -- the model is one attention layer, so the first norm of a step is its input norm. 7 launches of a step judged one by one (the gather, three norm calls, the in-projection at the attention layer's weight shape, the gate / up call and the gate: 1 the target's own compiled kernel + 6 cuDNN Frontend entries with byte-equal results), each in the recorded launch shape; the three norm calls served by three instances, and the symbol of the first carries its form (`store`, `e4m3_static`, wait + release). The norm entry inside its band over 171 calls: 291,840 normed elements, 4 of them on the other bf16 value around the normalised value, and 601,920 codes and block scales, all those of the nearest value; the projection entry inside its band over 57 calls; the gate / up entry inside its band over 57 calls |
 | the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 322 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results; the declared stand-in has no block yet), in the wiring order, each in the recorded launch shape; 2,908 kernel launches and 200 copies per traced step in all (6,876 and 584 with the gate / up block on its fallback row). The call log of a step: the five forms of the norm entry served 1, 47, 16, 64 and 1 calls, each from its own instance, and the two instances of the projection entry 48 and 16. Replay held; 8 of 8 provider blocks inside their bands; the norm entry over 2,064 calls with 4,014,080 normed elements, 40 of them on the other bf16 value, and 10,813,440 codes and block scales, 3 of them not those of the nearest value, nothing outside; the projection entry over 1,024 calls, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the fused gate / up entry over 1,024 calls with 1,114,112 block scales, each the byte of the fp64 chain, and 17,825,792 codes, 12,528 of them another code than the fp64 chain's, the farthest at 96 % of its bound, nothing outside; the gate entry over 256 calls with 1 of its 1,572,864 bytes the code of the other bf16 value around the gated value, inside the margin; the token line reported. The reference read 6,400 copies of in-projection and gate / up weights made on demand, and the 128 weights held the bytes of their load before and after the checks; the memory lines are in the section on checkpoints |
-| the default run, `--stack fe-entries` | `[00] PASS`, the same lines; also as the L0 cell of the area's GPU test |
+| the default run, `--stack fe-entries` | `[00] PASS`, the lines of the default run of 2026-11-17 above; also as the L0 cell of the area's GPU test |
 | `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 11 remaining target launches (1 the target's own compiled kernel + 10 cuDNN Frontend entries with byte-equal results) in the recorded shape |
 | `--stack native --provider projection.fp8.in=cublas.bf16_dequantized`, 1 sequence | `[00] PASS`: the in-projection back on its multiply over a copy, so its weights have their copies and the reference's copies made on demand are those of the gate / up weights alone; `NOT CLAIMED (not the target set: projection.fp8.in selected by --provider; ...)`; the 10 remaining target launches (2 the target's own compiled kernels + 8 cuDNN Frontend entries with byte-equal results) in the recorded shape |
 | `--stack native --provider mlp.gate_up=cublas.bf16_dequantized+torch_ref.silu_mul_quantize`, 1 sequence | `[00] PASS`: the gate / up block back on its multiply over a copy (303 launches a step again), so its weights have their copies and only the in-projections are made on demand; `NOT CLAIMED (not the target set: mlp.gate_up selected by --provider; ...)`; the 10 remaining target launches (2 the target's own compiled kernels + 8 cuDNN Frontend entries with byte-equal results) in the recorded shape |
@@ -562,28 +647,33 @@ sequence and the default prompt: the copies, the state and working memory, which
 of this size (2 GiB for the default run). A run with this checkpoint held 51.5 GiB in PyTorch at its peak, reserved
 55.2 GiB from the device, and the device grew by 55.4 GiB. A GPU with less free memory than the 56.7 GiB is a `SKIP`
 before a tensor is read. A 32 GB GPU cannot run this stack with a checkpoint of this size; it prints the
-memory sentence and exits 0. On compute capability 10.0 the stack `native` keeps the in-projections on their stored
+memory sentence and exits 0. On compute capability 10.0 the stack `fe-entries` keeps the in-projections on their stored
 8-bit codes alone, 4.8 GiB where their copies are 9.7 GiB, and the gate / up weights on their stored 4-bit codes alone,
 6.0 GiB where their copies are 21.2 GiB: it holds 30.0 GiB of weights, and its plan asks for about
 37.1 GiB -- the weights, the state, working memory (an eighth of the weights held and a quarter of the stored tensors
 kept) and 0.33 GiB for the one copy its checks make at a time. A run held 31.4 GiB in PyTorch at its peak, reserved
 36.7 GiB, and the device grew by 36.9 GiB: inside the sentence by 0.2 GiB. On the other 10.x classes, where the
-in-projections stay on their copies, its plan asks for about 41.3 GiB; that is arithmetic, not a run. The working
+in-projections stay on their copies, its plan asks for about 41.3 GiB; that is arithmetic, not a run. The stack `native`
+keeps the weights of its three library rows on their stored codes as well -- every weight a multiply reads: it holds
+18.8 GiB of weights, and its plan asks for about 27.9 GiB, 2.37 GiB of it for the one copy its checks make at a time
+(the output head's is the largest). A run held 22.4 GiB in PyTorch at its peak, reserved 23.9 GiB, and the device grew
+by 24.1 GiB. On the other 10.x classes its plan asks for about 32.1 GiB; that is arithmetic as well. The working
 memory is an allowance taken from runs, not a bound: the room
 a run took beyond its weights did not shrink with the copies it left out -- 5.3 GiB with every weight as a copy, 6.9 GiB
 with the stored in-projections beside every copy and 6.6 GiB with the stored in-projections alone (two runs of
 `native` before it had the gate / up row), 6.9 GiB with the in-projections and the gate / up weights on their stored
 formats alone. The checks of the last run read 6,400 copies of in-projection and gate / up weights made on demand, 128
-per step and reader, and printed what they cost. A stack on the stored formats alone,
-which needs less than half, arrives with a later step of this area.
+per step and reader, and printed what they cost. The checks of the run of `native` with its library rows read 12,850
+copies made on demand.
 
 The prompt goes through the decode step, one step per token (the `first token` line says so), and a step issues 484 block
 calls from Python: on the run above about twelve thousand kernel launches and a thousand small copies per step, with the
 GPU busy for about a quarter of the period. That is what this stack is: it reads 51.6 GB per step where the model in its
-stored formats needs 17.9 GB, and it is bound by the launch path, not by the GPU. The stack `native` on compute
+stored formats needs 17.9 GB, and it is bound by the launch path, not by the GPU. The stack `fe-entries` on compute
 capability 10.0 reads the in-projections on their stored codes, 5.2 GB where the copies are 10.4 GB, and the gate / up
 weights on theirs, 6.4 GB where the copies are 22.8 GB: 30.0 GB per step,
-and its `bytes per step` line says so. The timings a run prints are orientation
+and its `bytes per step` line says so. The stack `native` reads every weight of a multiply on its stored codes there:
+17.9 GB per step, the model's own bytes. The timings a run prints are orientation
 values of that run and no more; no rate of this stack is a number to quote.
 
 The checks of a run with a checkpoint cover the first 16 steps of every prompt: replay, every provider block
@@ -904,8 +994,9 @@ calls is PyTorch's or cuBLAS's, by name: the embedding lookup is PyTorch's gathe
 the concatenations launch other PyTorch kernels than the gather. A second run printed the same bytes.
 
 *The published checkpoint, against the model's own tokens* (reported; no line of it is a gate of this sample). The
-model decoded three prompts greedily on the stack `native`, 70 new tokens each: the default prompt and two arithmetic
-word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens. The drafter then ran over each
+model decoded three prompts greedily on the cuDNN Frontend rows of the stack `native` (the rows `fe-entries` selects
+today), 70 new tokens each: the default prompt and two arithmetic word problems whose text is not part of this
+repository, 58, 117 and 78 prompt tokens. The drafter then ran over each
 of them teacher-forced: one body pass per prompt position fills its cache, and from the last prompt position on every
 position is one draft step of five passes behind one row, handed the model's final-norm row of that position and the
 token the model chose there. The list is the one the recipe above made in the runs of 2026-11-17: the 342 ids of six
@@ -1022,12 +1113,12 @@ the in-projections, at the weight shape 5120 x 6144 -- and keeps the library mul
 block has rows of `fe.fp8_projection_decode`, `cudnn.Fp8ProjectionDecode`, for a step of several tokens per sequence
 alone, in the stacks `native` and `fe-entries`, and such a row serves one of the block's two call sites: the
 linear-attention layers' call (`linear_attention.out`). The attention layers' call (`full_attention.out`) it hands on
-to the next row, the multiply over a copy. A plan of a verify step then prints the block once per call site (the
-64-layer model):
+to the next row: the library's multiply in `native`, the multiply over a copy in `fe-entries`. A plan of a verify step
+then prints the block once per call site (the 64-layer model, `native`):
 
 ```text
-projection.fp8.out at linear_attention.out  48  cuDNN FE  cudnn.Fp8ProjectionDecode      rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144  none
-projection.fp8.out at full_attention.out    16  cuBLAS    torch.matmul over a bf16 copy  any                                                                                                           fallback: bf16 copy of 8-bit weights
+projection.fp8.out at linear_attention.out  48       cuDNN FE    cudnn.Fp8ProjectionDecode                    rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144  none
+projection.fp8.out at full_attention.out    16       FlashInfer  flashinfer.gemm.bmm_fp8                      any row count, weight 5120 x 6144                                                                           none; unverified in CI
 ```
 
 The target chooses the split of this kernel by the rows of the step (sequences x tokens per sequence), and a split is
@@ -1058,11 +1149,13 @@ and of a step of 9 are not the same bytes, by the target's own choice of split. 
 row's bytes alone as among the others, and the batch-invariance check gates it there on compute capability 10.0 (one
 sequence alone runs on the entry instance of its step's range). The rows of compute capability 10.3 and 10.7 claim
 what the entry admits; the entry's page lists this weight shape as unverified on those classes, and no run of this
-sample has been made there. By provider, a verify plan with such a row counts what the decode plan counts on compute
+sample has been made there. By provider, a verify plan of `fe-entries` with such a row counts what the decode plan
+counts on compute
 capability 10.0 -- cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) -- because the two 8-bit
 projections count as one kind of block per provider and both providers have one there already. On the other 10.x
 classes the in-projection is a multiply over a copy, so the out-projection's row makes the verify plan cuDNN
-Frontend 5 where the decode plan is cuDNN Frontend 4, with the same fallbacks.
+Frontend 5 where the decode plan is cuDNN Frontend 4, with the same fallbacks. A plan of `native` counts FlashInfer 3
+beside them at either step shape, and one fallback multiply fewer per library row.
 
 The kernel multiplies on the stored 8-bit weight, and the load keeps the forms of this block per call site: the
 codes of the linear-attention layers' out-projections for a plan with such a row, the bf16 copies of the attention
@@ -1072,7 +1165,7 @@ stored bytes, one call at a time. A run in which a decode session shares the loa
 both plans read: the codes for the verify plan and the copies for the decode plan. The codes kept beside the copies
 add about 1.9 GiB to the memory sentence of the published model: their 1.4 GiB and their share of the working memory.
 
-**What a verify plan says about the target** (stack `native`, the 64-layer model, compute capability 10.0 with 148
+**What a verify plan says about the target** (stack `fe-entries`, the 64-layer model, compute capability 10.0 with 148
 SMs, one sequence of six tokens: the one step shape the census has a recorded section for):
 
 ```text
@@ -1084,7 +1177,14 @@ The target's verify step has other kernels than its decode step in two places --
 kernel, and the out-projection of a linear-attention layer is a kernel of cuDNN Frontend where the decode step has a
 library multiply -- so the whole is 162 + 321 + 1 where the decode step's is 210 + 273 + 1. With the out-projection
 row this stack launches all 321 at this step shape: the 16 out-projections still counted as `not yet` are the
-attention layers', a library multiply in the target. The census section holds
+attention layers', a library multiply in the target. On `native` that multiply, the down multiplies and the output
+head are the library's, and the second line reads
+
+```text
+kernel identity, as planned: 451 of 484 launches of a step are target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results); not yet: attention.prepare 16, attention.core 16; 1 declared stand-in (not yet: output_head.quantize)
+```
+
+The census section holds
 for the tokens per sequence, the row count, the layer widths and the GPU class it was recorded with; any other verify
 step prints `kernel identity: not stated for this run (no recorded section for ...)`. The drafter's own launches are
 not part of it.
@@ -1108,8 +1208,10 @@ the same rows by both: there the recurrent state is gated by the state rule of t
 rows -- a block in front of it is another kernel at another row count -- is printed, not gated; with no layer gated
 the line is `REPORTED`.
 
-On compute capability 10.0 (a 148-SM part), stack `native`, the two-layer seeded model: at every step shape that ran
-up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was the decode
+On compute capability 10.0 (a 148-SM part), on the cuDNN Frontend rows of the stack `native` -- the rows `fe-entries`
+selects today; these runs were made before the stack had its library rows --, the two-layer seeded model: at every step
+shape that ran up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows -- every greedy token of the verify steps was
+the decode
 steps', and the recurrent state of the kept tokens was within the band (at one sequence the same bytes); the kernel
 check passed with the verify kernel in the shape its entry states and, at one sequence of six tokens, with 13
 launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries
@@ -1129,7 +1231,12 @@ one sequence of two tokens and of eight, three of three, two of eight -- with on
 the elements, and each sequence alone wrote the bytes it wrote among the others. At two and three sequences, on a
 part of this SM count, the verify entry takes another form than at one sequence and at four: one thread block per
 value head and sequence, each on an SM of its own, with 224,672 B of shared memory at six tokens and 231,744 B at
-eight, the largest step that form holds. These are the runs of one GPU class.
+eight, the largest step that form holds. These are the runs of one GPU class. With its library rows the stack ran
+seven of these step shapes on 2026-11-18 (PyTorch 2.14.0, FlashInfer 0.7.2.post1) -- one sequence of two, six and
+eight tokens, two and four sequences of six, four of eight and 16 of two --: every greedy token of the verify steps
+was the decode steps', the recurrent state of the kept tokens was within the band, and the kernel check passed, at
+one sequence of six tokens with 17 of 20 launches of a step target kernels (6 the target's own compiled kernels + 11
+cuDNN Frontend entries with byte-equal results), 15 of them in the shapes the census records.
 
 **The checks of a session that verifies behind its prompt.** `tie_out.speculative_checks(session, decode)` holds a
 run of a session built with `draft_tokens=` against decode steps of the same tokens, line by line. It replays what
@@ -1155,7 +1262,10 @@ a zero state -- the prompt's decode steps under the block check of the decode pl
 check of the verify plan -- and its traced pass replays the prompt in front of the profiler and holds the verify
 steps alone.
 
-What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only). The seeded two-layer model, one sequence,
+What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only). These are runs of 2026-11-17: `native`
+selected the cuDNN Frontend rows then, the rows of `fe-entries` today, and what this passage states for `native` --
+memory, launches, coverage -- is of those rows unless a sentence names the library rows. The seeded two-layer model, one
+sequence,
 five drafted tokens, a prompt of 8 tokens, 32 new tokens through 10 verify steps whose drafted tokens were scheduled to
 be kept 0 to 5 in turn: on `native`, `fe-entries` and `fe-cublas` the 32 tokens were the plain session's; `tokens`
 passed with 31 of 31 kept tokens equal to the decode steps' and the logits within 1.00 bf16 unit, inside the band of 4;
@@ -1163,7 +1273,10 @@ passed with 31 of 31 kept tokens equal to the decode steps' and the logits withi
 `acceptance` passed; `bytes` was reported (on `native` 0 of 31 kept rows were the decode steps' bytes); the launches
 and copies of every prompt step were those of a plain session's step in the same process; replay, the blocks of both
 kinds of step and the kernel check passed, on `native` and `fe-entries` with 13 of 20 launches of a verify step target
-kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results). On `reference` every
+kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results): these were the runs
+of 2026-11-17, in which both stacks selected the cuDNN Frontend rows. With its library rows `native` passed the same
+lines on 2026-11-18 with 17 of 20 launches of a verify step target kernels (6 the target's own compiled kernels + 11
+cuDNN Frontend entries with byte-equal results). On `reference` every
 line passed, `bytes` included, and the run ended in `RAN`. One sequence of two and of eight tokens, four layers, and
 two sequences of six tokens (each with its own tokens, one count: the smallest) passed on `native` as well, and so did
 the ends of the sequence range of such a session: four sequences of six tokens and 16 of two.
@@ -1182,7 +1295,8 @@ tokens the run asked for about 3.6 GiB, reserved 4.3 GiB and grew the device by 
 session stands on after each step it replays -- 21 steps of 16 sequences in that run -- until its second replay has
 ended, and the memory sentence does not count that.
 
-On the published checkpoint (`native`, one sequence of six tokens, the default prompt of 58 tokens through
+On the published checkpoint (`native` on 2026-11-17, the rows `fe-entries` selects today; one sequence of six tokens,
+the default prompt of 58 tokens through
 `prefill`, then 10 verify steps fed a plain run's 32 new tokens with scheduled counts): `position`, `prompt`,
 `recorded` and `rejected rows` passed; `kept state` was gated in 1 of 48 linear-attention layers; `tokens` was reported --
 30 of 31 kept tokens were the decode steps' greedy tokens on the same tokens, the first that differs
@@ -1228,7 +1342,10 @@ width that differs. `text` is the tokenizer (`TextIO`), `stack` and
 whole run, the drafter in it; `session.plan_table()` prints the session's own three tables. A session with a drafter
 stands alone as well, without `share=`: it then loads the model itself. The loop reads the device once per step.
 `drafter=` needs `draft_tokens=`, and a session with a drafter serves one sequence: one request, as the drafter rows
-are for.
+are for. On `native` the three library rows serve the decode steps of the prompt and the verify step of such a
+session as they serve a plain run, and the drafter's passes call none of them: on compute capability 10.x the session
+needs FlashInfer at a validated version, and without it `plan_table` declines before anything is loaded, by the
+sentence of the section "The rows a library serves"; `fe-entries` runs the same session on the cuDNN Frontend rows.
 
 A step, in order. `speculate` hands the drafter what the step before left on the state: every final-norm row of
 that step, by reference (`state.hidden`), and the greedy token after each (`state.greedy`); the position of its first
@@ -1253,8 +1370,10 @@ the drafter: what its load and its cache hold (`memory_bytes`) and the working m
 an allowance of twice the largest chunk of a weight a reference multiply converts to fp64 at a time
 (`working_bytes`: 1.33 GiB at the published widths). At the
 published widths with 65,536 ids and 2,051 positions the drafter adds 3.3 GiB: a run of a plain session and such a
-session asks for about 43.6 GiB on `native` and about 61.2 GiB on `fe-cublas`, where the same run without a drafter
-asks for about 40.2 and 57.9 GiB. These are arithmetic on stated facts; a measured run is below.
+session asks for about 32.4 GiB on `native` (compute capability 10.0, where its library rows keep the weights of the
+down multiplies, the out-projections and the output head on their stored codes), about 43.6 GiB on `fe-entries` and
+about 61.2 GiB on `fe-cublas`, where the same run without a drafter asks for about 29.1, 40.2 and 57.9 GiB. These are
+arithmetic on stated facts; a measured run is below.
 
 **The checks of a speculative step.** Every block of the drafter but its embedding lookup is a reference chain, so
 the block check judges none of them. `tie_out.speculative_checks` holds a session with a drafter by two more lines.
@@ -1285,16 +1404,19 @@ of such a loop would be read as a speed. The bytes of a step are stated: the ver
 per sequence -- every weight once, six embedding rows, one recurrent state read and six written, three history
 columns read and eight written, the caches up to the step's last position -- and a draft pass's, five times.
 
-What ran (2026-11-18; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only). The seeded
+What ran (2026-11-18; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` with its library
+rows in PyTorch 2.14.0 with FlashInfer 0.7.2.post1, every other stack in PyTorch 2.13.0). The seeded
 two-layer model with its seeded drafter, one sequence, five drafted tokens, a prompt of 8 tokens and 32 new tokens
 through 10 steps of `speculate(force=)` whose drafted tokens were scheduled to be kept 0 to 5 in turn: on `native`,
 `fe-entries` and `fe-cublas` the 32 tokens were the plain session's, and what the drafter proposed in those steps was
 recorded beside the tokens they verified; every gated line of the comparison passed, `drafter cache` and
 `draft proposals` in 10 of 10 steps; replay with the proposals and the blocks of both kinds of step passed; the
 kernel check passed over 10 traced steps -- the embedding lookup of every pass and the model's in the wiring order,
-everything else the passes launch attributed to the drafter's fallback rows -- with, on `native` and `fe-entries`,
-13 of 20 launches of the verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries
-with byte-equal results); the acceptance line read "scheduled, not measured (reduction)"; and a second prompt set
+everything else the passes launch attributed to the drafter's fallback rows -- with 17 of 20 launches of the verify
+step target kernels on `native` (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal
+results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply)
+and 13 of 20 on `fe-entries` (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal
+results); the acceptance line read "scheduled, not measured (reduction)"; and a second prompt set
 behind `reset(fresh=False)` gave the ids, the kept counts and the proposals of the first. On `reference` every line
 passed and the run ended in `RAN`. One, three and seven drafted tokens and the four-layer model passed on `native`
 as well.
@@ -1315,7 +1437,8 @@ prompt step. A drafted token emitted by the caller failed no line of the compari
 the window of the next step is the session's -- and showed in the ids against the plain run's. A replay without the
 prompt was refused by name: such a session has no step in front of its prompt.
 
-On the published checkpoint (`native`, one sequence, five drafted tokens; the default prompt, 58 tokens through
+On the published checkpoint (the cuDNN Frontend rows -- the rows `native` selected when this run was made and
+`fe-entries` selects today; PyTorch 2.13.0 --, one sequence, five drafted tokens; the default prompt, 58 tokens through
 `prefill`; then the loop above on the drafter's own proposals until the end token or 256 new tokens; the draft
 vocabulary of this README's recipe as the runs of the section above made it -- the 342 ids of six dump files, then
 the lowest ids; the default prompt is one of the three prompts behind those dumps): the loop ended at the end token
@@ -1334,13 +1457,31 @@ verify step and a decode step launch other kernels for some blocks, and a greedy
 Replay with the proposals, the blocks of both kinds of step and the kernel check over 6 traced steps passed, with
 370 of 484 launches of the verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend
 entries with byte-equal results) and nothing stated about the kernels of the passes. The sentence asked for about
-43.3 GiB, PyTorch reserved 40.0 GiB and the device grew by 40.2 GiB, the GPU otherwise empty. The drafter's blocks
+43.3 GiB, PyTorch reserved 40.0 GiB and the device grew by 40.2 GiB, the GPU otherwise empty.
+
+With its library rows `native` runs three multiplies on other kernels -- inside the band of the reference multiply,
+not to the bytes of a multiply over a copy -- and a greedy run on a checkpoint follows its first other token: the
+plain run of the default prompt is another text there, and so is the loop. The same loop on `native` (PyTorch 2.14.0,
+FlashInfer 0.7.2.post1) ended at the end token after 231 new tokens in 71 steps and kept 3.27 tokens a step (1 + 161
+accepted drafted tokens / 71 steps); 9, 16, 20, 9, 7 and 10 steps kept one to six tokens; the first drafted token was
+accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, the fifth in
+10 of 17. With the passes handed something else it kept 1.05, 1.04 and 1.00 tokens a step, 2.58 with a later pass
+fed the model's row again and 3.31 with a later pass one position off. On the first 16 steps `drafter cache`,
+`draft proposals`, `position`, `prompt`, `recorded` and `rejected rows` passed; `tokens` was reported -- 39 of 45 kept
+tokens were the decode steps' greedy tokens on the same tokens, the first that differs kept token 17. Replay with the
+proposals, the blocks of both kinds of step and the kernel check over 6 traced steps passed, with 451 of 484 launches
+of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal
+results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN
+Frontend entries with byte-equal results), the 16 out-projections of the attention layers by membership, on the
+library's own CUTLASS multiply, and nothing stated about the kernels of the passes. The sentence asked for about
+32.2 GiB, PyTorch reserved 28.8 GiB and the device grew by 28.9 GiB, the GPU otherwise empty. The drafter's blocks
 are not compared with another implementation of the drafter in this repository.
 
 **Memory.** The memory sentence of a verify plan counts the state of its step shape -- a recurrent state per
 (sequence, token), `T + 2` history columns per sequence -- beside the flat working memory of every plan of the
-reduced models. Up to 32 rows of a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence
-said: one sequence of six tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB
+reduced models. The figures of this paragraph are those of the runs on the cuDNN Frontend rows, above. Up to 32 rows of
+a step PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said: one sequence of six tokens, with
+the decode session on the same load, asked for about 3.6 GiB, reserved 3.6 GiB
 and grew the device by 3.8 GiB; the verify session alone, which keeps the out-projection of the linear-attention
 layer on its codes without a copy, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; three
 sequences of three tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.1 GiB and
@@ -1374,9 +1515,10 @@ such a session are not stated either. With a drafter it states the bytes of its 
 kernel check and the coverage line of such a session are about its verify
 steps: the decode steps of its prompt are replayed in front of the traced window and their kernels are not observed,
 which the run says beside its kernel verdict; what they launch was compared with a plain session's step in the runs
-above, by the driver of those runs. The attention layers'
-out-projection, the attention blocks and the MLP's down multiply on their target kernels. A captured verify step. A verify step of more than eight tokens per
-sequence, of more than 16 sequences, or of more than 4 at six tokens and more: declined by name. The verify step
+above, by the driver of those runs. The attention blocks on their target kernels; and, in `fe-entries`, the attention
+layers' out-projection and the MLP's down multiply, which `native` runs on the library's kernels. A captured verify
+step. A verify step of more than eight tokens per sequence, of more than 16 sequences, or of more than 4 at six tokens
+and more: declined by name. The verify step
 has run on compute capability 10.0 only; every other class is uncovered, not passing -- the rows of the
 out-projection on compute capability 10.3 and 10.7 among them.
 
@@ -1402,8 +1544,9 @@ python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-
 | you need | |
 |---|---|
 | for the default run | this checkout and a GPU of compute capability 10.x or 12.x: no checkpoint, no extra package |
+| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |
 | with `--model` | the packages of `samples/models/requirements.txt`, the checkpoint on local disk (22 GB), and a draft vocabulary: a JSON list of token ids, `--draft-vocab FILE`. The recipe of the section "The checkpoint's drafter" makes one from the files `--dump-tokens` writes, of this script or of `00_decode.py`. Without a list the run ends in one `ERROR` line that names that recipe |
-| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stacks `native` and `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes, about 64 GiB elsewhere. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
+| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stack `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and about 64 GiB elsewhere; on the stack `native`, whose three library rows need FlashInfer (the section "The rows a library serves"), for about 32 GiB and about 37 GiB there. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
 
 **What a run is.** A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then
 every step is five draft passes and one verify step of six tokens, and keeps one to six of them. A run says so before it
@@ -1494,8 +1637,8 @@ per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .
 of n, 2: y of x, ..` -- per drafted token the steps that kept it among those that kept the one before. Every step counts
 in full, the last one included, whose tokens behind an end token are not written. The acceptance length is a figure of
 this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list. Nor
-with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (the last run of this
-section has two). The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
+with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last
+runs have three). The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the
 acceptance line)": a draft pass multiplies in fp64 on copies, and a rate of such a loop would be read as a speed. The
 `bytes per step` line is the verify step's arithmetic at six tokens per sequence and a draft pass's, five times. The
 `text out` line says how many tokens came out in how many steps. The report is printed before the checks.
@@ -1512,9 +1655,12 @@ script's own, and the checks of every run.
 | `native` and `fe-entries`, and any stack with `--check-kernels` | also the kernel check of whole steps: the lookups of the drafter's passes and the verify plan's rows one by one, everything else a pass launches attributed to the drafter's fallback rows |
 
 On `native`, at one sequence of six tokens on compute capability 10.0 with 148 SMs, a run proves what the verify step
-proves -- on the 64-layer model 370 of the 484 launches of a verify step are target kernels (49 the target's own
-compiled kernels + 321 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 13
-of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results) -- now behind a real
+proves -- on the 64-layer model 451 of the 484 launches of a verify step are target kernels (130 the target's own
+compiled kernels + 321 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 17
+of 20 (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results); on `fe-entries`,
+without the library rows, 370 of the 484 (49 the target's own compiled kernels + 321 cuDNN Frontend entries with
+byte-equal results) and 13 of 20 (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal
+results) -- now behind a real
 prefill, in one session, with kept counts the comparison decides. No block of the drafter is on a kernel yet: under the
 kernel check a run prints "kernel identity of the drafter's passes: not stated (the kernel census holds the verify
 step and the output head behind it; no section holds a draft pass)", and its last line before the verdict is "the
@@ -1527,7 +1673,8 @@ line of that run: the loop that writes them is the one the default run proves. T
 behind the prompt, the block check the first 16 prompt steps and the first 8 steps, the traced pass 16 steps. The last
 line of a run is the verdict of `00_decode.py` with the tag `[02]` ([../README.md](../README.md) has the table).
 
-**What ran** (2026-11-19; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only). The
+**What ran** (2026-11-19; PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` on
+the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today). The
 default run -- the seeded two-layer model with its seeded drafter, a prompt of 26 tokens, then 32 new tokens in 10
 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on `fe-cublas`,
 `native` and `fe-entries` and in `[02] RAN reference stack (no provider checked)` on `reference`. In each of the four
@@ -1548,8 +1695,19 @@ tree as it is, which passed; each of the three ended in `[02] FAIL`. A drafted t
 chose another failed `ids` alone; one drafted token kept beyond the compared count failed `tokens`, `drafter cache`,
 `draft proposals`, `acceptance` and `ids`; one kept below it failed `acceptance` alone.
 
-**The last run with a checkpoint** (2026-11-19; the published checkpoint; cuDNN Frontend 1.34.0, CuTe DSL 4.8.0, PyTorch
-2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; the third command of this section as it is
+With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class) the
+default run on `native` ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of
+its process. Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count,
+and the kernel check passed over 10 traced steps, with 17 of 20 launches of the verify step target kernels (6 the
+target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results; the attention layer's
+out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens passed in
+13 steps, with "kernel identity: not stated for this run". The memory sentence of the default run asked for about
+5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP flashinfer.gemm.bmm_fp8 needs
+flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.
+
+**The last run with a checkpoint on the cuDNN Frontend rows** (2026-11-19; the published checkpoint; cuDNN Frontend
+1.34.0, CuTe DSL 4.8.0, PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native`
+selected those rows then, as `fe-entries` does today; the third command of this section as it is
 written, and once more on the default stack `fe-cublas`: the default prompt as a chat request body with `max_tokens`
 256, 58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids).
 Both runs ended in `[02] PASS`, and both stopped at the end token. On `native` the loop wrote 204 new tokens in 63
@@ -1569,6 +1727,21 @@ compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothi
 passes. The memory sentence asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by
 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the
 GPU was otherwise empty at the start of each.
+
+**The last run with a checkpoint on `native` with its library rows** (2026-11-20; PyTorch 2.14.0, FlashInfer
+0.7.2.post1; the same checkpoint, command, prompt, list and GPU class), made twice with the same figures. Both runs
+ended in `[02] PASS` at the end token. The loop wrote 231 new tokens in 71 steps: 3.27 kept tokens a step (1 + 161
+accepted drafted tokens / 71 steps); 9, 16, 20, 9, 7 and 10 steps kept one to six tokens; the first drafted token was
+accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, the fifth in
+10 of 17 -- the counts of the library loop on `native` in the section "The verify step". `position`, `prompt`,
+`recorded`, `rejected rows`, `drafter cache` and `draft proposals` passed on the first 16 steps, and replay with the
+proposals and the blocks of both kinds of step passed; `tokens` was reported -- 39 of 45 kept tokens were the decode
+steps' on the same tokens, the first that differs kept token 17. The kernel check passed over 16 traced steps, with
+451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend
+entries with byte-equal results): 435 of them in the launch shape the census records (114 the target's own compiled
+kernels + 321 cuDNN Frontend entries with byte-equal results), the 16 out-projections of the attention layers by
+membership, on the library's own CUTLASS multiply; nothing is stated about the kernels of the passes. The memory
+sentence asked for about 32.2 GiB.
 
 **What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference
 chain, and a run says "kernel identity of the drafter's passes: not stated". More than one request: `--sequences` is
@@ -1604,24 +1777,30 @@ Frontend 1; fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4); PyTorch as the
 | residual add + RMSNorm + quantise | 129 | `fe.add_norm_quant_decode` | cudnn.AddNormQuantDecode [PDL True, PDL_RELEASE True] + one of 6 forms, by call site |
 | 8-bit in-projection (linear attention QKVZ / attention QKV) | 48 / 16 | `fe.fp8_projection_decode` | cudnn.Fp8ProjectionDecode [SPLIT_K 1, MMA_M 128, STAGES 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True] + one of 2 forms, by call site |
 | linear-attention step | 48 | `fe.gdn_decode_fused` | cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True] |
-| 8-bit out-projection | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
+| 8-bit out-projection | 48 / 16 | `flashinfer.bmm_fp8` | flashinfer.gemm.bmm_fp8 [BACKEND auto] |
 | MLP gate / up + SiLU x up + quantise | 64 | `fe.swiglu_fp4_decode` | cudnn.SwigluFp4Decode [TOKEN_TILE 8, PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True] |
-| MLP down | 64 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 4-bit weights |
+| MLP down | 64 | `flashinfer.mm_fp4` | flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False] |
 | attention preparation | 16 | `torch_ref.attention_prepare` | torch_ref.attention_prepare, fallback: reference chain |
 | attention core | 16 | `torch_ref.attention` | torch_ref.attention, fallback: reference chain over a plain per-layer cache |
 | gate + quantise | 16 | `fe.attention_gate_quant_decode` | cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True] |
-| output head | 1 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 4-bit weights |
+| output head | 1 | `torch_ref.quantize+flashinfer.mm_fp4` | torch_ref.quantize + flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False] |
 | token choice | 1 | `torch.argmax` | torch.argmax |
 
-By provider: cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2); PyTorch as the natural provider 2.
+By provider: cuDNN Frontend 5; FlashInfer 3; fallbacks 2 (PyTorch chains 2); PyTorch as the natural provider 2; 3 rows
+unverified in CI.
+The table is the one of `native`. `fe-entries` has the same rows but FlashInfer's three, which are its
+three multiplies over a copy of `fe-cublas`: cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2);
+PyTorch as the natural provider 2.
 The two 8-bit projections count as one kind of block per provider, and on this class they have two: the in-projection
-is cuDNN Frontend's, the out-projection a multiply over a copy. The six forms of the norm row and the two weight
+is cuDNN Frontend's, the out-projection FlashInfer's (a multiply over a copy in `fe-entries`). The six forms of the norm
+row and the two weight
 shapes of the projection row, by call site, are in the section on the stack `native`. The row of the MLP's gate / up
 multiply is the one of 1 to 8 rows; three more rows of the same key name the other token tiles: `TOKEN_TILE 16` from 9
 to 16 rows; `TOKEN_TILE 32` from 17 to 32 rows; `TOKEN_TILE 64` from 33 to 64 rows. From 65 rows the block is the
 multiply over a copy of `fe-cublas`. On the other 10.x classes the
-in-projection is the multiply over a copy of `fe-cublas`: cuDNN Frontend 4; fallbacks 5 (cuBLAS over copies 3, PyTorch
-chains 2). On compute capability 12.x the gate / up multiply is over a copy too, and the gate + quantise row and the
+in-projection is the multiply over a copy of `fe-cublas`: cuDNN Frontend 4; FlashInfer 3; fallbacks 3 (cuBLAS over
+copies 1, PyTorch chains 2); 3 rows unverified in CI. On compute capability 12.x no row of the library serves, so the
+three multiplies are over copies again; the gate / up multiply is over a copy too, and the gate + quantise row and the
 norm row are the reference chains of `fe-cublas` as well: cuDNN Frontend 1; fallbacks 8 (cuBLAS over copies 4, PyTorch
 chains 4).
 
@@ -1861,7 +2040,10 @@ capability 10.x; its own page lists 10.3 and 10.7 as not run on a device. So doe
 entry, whose rows here claim every 10.x class as the entry does: on 10.3 and 10.7 the rows, the weight in the kernel's
 row order and the memory sentence of that plan are unverified. The rows of the projection entry for the
 out-projection of a verify step claim 10.3 and 10.7 as well, in the split the target runs there, and are as
-unverified: the entry's page lists that weight shape as not run on those classes. So has the build of the entries' kernels while a run is
+unverified: the entry's page lists that weight shape as not run on those classes. The three rows a library serves claim
+every 10.x class too and have run on 10.0 alone: on 10.3 and 10.7 the rows are unrun, the census has no section, and
+which kernel the library picks there for either multiply is not recorded. So has the build of the entries' kernels while
+a run is
 planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
 decline, not on such an installation.
@@ -1879,11 +2061,15 @@ On the reduced models the memory sentence is an estimate: its working memory is 
 miss it by a few tenths of a GiB in either direction, with the copies of the in-projections and of the gate / up
 weights, with both of their forms and with their codes alone. Over these runs on compute capability 10.0 (one to four
 layers, 1 to 33 sequences) PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said, and the
-device grew by about 0.2 GiB more than PyTorch reserved. The default `native` run, with the in-projections and the
+device grew by about 0.2 GiB more than PyTorch reserved. The default run on the cuDNN Frontend rows (`fe-entries`
+today; `native` selected the same rows until 2026-11-17), with the in-projections and the
 gate / up weights on their codes alone, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; the
 four-layer run asked for about 4.4 GiB, reserved 4.4 GiB and grew it by 4.6 GiB; the one-layer run asked for about
-3.1 GiB, reserved 2.6 GiB and grew it by 2.8 GiB; `--stack native --sequences 32,33`, which keeps both forms of the
-in-projections, asked for about 4.0 GiB, reserved 4.1 GiB and grew it by 4.2 GiB. The room a run takes beyond its
+3.1 GiB, reserved 2.6 GiB and grew it by 2.8 GiB; `--sequences 32,33` on those rows, which keeps both forms of the
+in-projections, asked for about 4.0 GiB, reserved 4.1 GiB and grew it by 4.2 GiB. The default run of `native` with
+its library rows, which keeps every multiplied weight on its codes alone, asked for about 3.2 GiB, reserved 2.7 GiB
+and grew the device by 2.9 GiB; its four-layer run asked for about 3.8 GiB, reserved 3.2 GiB and grew it by 3.4 GiB.
+The room a run takes beyond its
 weights does not follow the copies it leaves out: with every multiplied weight of the two-layer model on its stored
 format alone (a driver's own blocks, 1.5 GiB of copies not made) a run asked for about 3.2 GiB, reserved 2.7 GiB and
 grew the device by 2.9 GiB. So a GPU whose free memory is within half a GiB of the sentence can still fail to allocate
@@ -1892,8 +2078,10 @@ and the runs stayed inside the sentence (the section on checkpoints).
 Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step -- the
 sentence is short, on every stack: what a run holds per row beyond the state the
 sentence counts is not in its flat allowance. At 64 sequences the default stack asked for about 3.9 GiB, reserved
-6.6 GiB and grew the device by 6.8 GiB; `--stack native` asked for about 3.8 GiB, reserved 6.0 GiB and grew it by
-6.2 GiB; and `--stack native --sequences 64,65` asked for about 4.4 GiB, reserved 8.0 GiB and grew it by 8.2 GiB. A
+6.6 GiB and grew the device by 6.8 GiB; the cuDNN Frontend rows (`fe-entries` today) asked for about 3.8 GiB,
+reserved 6.0 GiB and grew it by 6.2 GiB, and with `--sequences 64,65` for about 4.4 GiB, reserved 8.0 GiB and grew it
+by 8.2 GiB; `--stack native --sequences 64,65` with its library rows asked for about 4.2 GiB, reserved 7.1 GiB and
+grew it by 7.3 GiB. A
 verify plan of 48 to 80 rows is short by 0.3 to 2.6 GiB (the section "The verify step" has the runs). At
 such a count a GPU needs several GiB more than the sentence says.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center

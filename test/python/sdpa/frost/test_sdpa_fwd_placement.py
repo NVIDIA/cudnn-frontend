@@ -74,13 +74,13 @@ def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
         "sdpa_fwd_prefill_sm80",
         "sdpa_fwd_prefill_sm120_fp8",
         "sdpa_fwd_prefill_sm120_mxfp8",
-    }
-    opt_in_rows = {
-        "sdpa_fwd_prefill_sm100_mxfp8",
         "sdpa_fwd_sm100_d256_mxfp8_single_q",
         "sdpa_fwd_sm100_d128_mxfp8_multi_q",
         "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+        "sdpa_fwd_sm100_d512_mxfp8_retained_p",
     }
+    opt_in_rows = {"sdpa_fwd_prefill_sm100_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
@@ -107,6 +107,40 @@ def test_trail_only_rows_rank_behind_the_backend():
     assert [p.engine_id for p in final] == [7, frost.engine_id]
     assert [p.engine_id for p in _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], proposals, [])] == [frost.engine_id]
     assert [p.engine_id for p in _assemble([cudnn.heur_mode.OPENSOURCE], proposals, backend_fb)] == [frost.engine_id]
+
+
+_SM100_MXFP8_OWNERS = (
+    "sdpa_fwd_sm100_d256_mxfp8_single_q",
+    "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+    "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+    "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+    "sdpa_fwd_sm100_d512_mxfp8_retained_p",
+)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("flag", [None, "0"])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_sm100_mxfp8_owners_trail_the_backend_by_default(monkeypatch, flag, cc):
+    """The SM100 MXFP8 explicit owners (default since 2026-11-16) and their opt-in row rank after the backend's block and the
+    LAST_RESORT marker with the flag unset or 0; the flag puts them first."""
+    from cudnn.engines.heuristics import LAST_RESORT, is_last_resort
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    if flag is not None:
+        monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", flag)
+    specs = {s.name: s for s in ENGINE_SPECS}
+    facts = _facts(s_q=2048, s_kv=2048, h_kv=8, dtype=cudnn.data_type.FP8_E4M3, is_mxfp8=True, device_cc=cc)
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"  # noqa: E731
+    for name in _SM100_MXFP8_OWNERS:
+        assert name in _FAMILY.offered_ids() and placement.place(specs[name], facts) == placement.TRAIL, name
+        ours = [PlanConfig(_OFFERED[name], None)]
+        monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, ours=ours: list(ours))
+        assert [tag(p) for p in heuristics.propose("A", facts, _OFFERED)] == ["backend", "last_resort", "frost"], name
+    assert placement.place(specs["sdpa_fwd_prefill_sm100_mxfp8"], facts) == placement.TRAIL
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    assert [tag(p) for p in heuristics.propose("A", facts, _OFFERED)] == ["frost", "backend"]
+    assert LAST_RESORT not in heuristics.propose("A", facts, _OFFERED)
 
 
 @pytest.mark.L0

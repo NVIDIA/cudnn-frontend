@@ -26,6 +26,11 @@ Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entr
 the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
 there, not verified.
 
+The ``native`` cell runs the default run on the stack ``native`` itself, which has three rows more: the multiplies the target
+runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone, so the cell runs
+where it is installed at a validated version and is skipped elsewhere -- by this module where the package is absent, by the
+sample's own ``[00] SKIP`` line where its version is not validated.  A skipped cell is uncovered, not passing.
+
 That cell runs the sample in a FRESH INTERPRETER, as a user does.  The kernel check compares the profiler's kernel names
 with the symbols the entries state, and the profiler names a kernel wrongly after a kernel module was unloaded in the same
 process: a kernel loaded where an unloaded one had been was recorded under the unloaded kernel's name (two raw CUDA
@@ -52,7 +57,20 @@ then by the checks of every run.  The L0 cell is its default run, loaded by path
 streams held; it launches two forms no other L0 cell launches -- the fused verify step and the fused decode step on token
 0 of a state of six tokens per sequence, both in the form of the default stack -- and records what their first launches
 took.  The L1 cell is the same run on the stack ``fe-entries`` in a fresh interpreter: its kernel check holds whole steps,
-the lookups of the drafter's passes and the verify plan's rows."""
+the lookups of the drafter's passes and the verify plan's rows.
+
+The paged-cache cell runs no script: no provider row asks for the paged attention cache of a state yet
+(``state.PagedKvCache``), so no run builds one.  A small program in a fresh interpreter runs the two reference chains of an
+attention layer on a plain cache and on a paged one at the published widths, across the first page boundary, and holds
+the bytes of the two against each other, the pool against index arithmetic of its own, the state's cos / sin table against
+the chain's function on the device, and the kernels the chains launch on the pool to their families.  It runs where the
+family serves the GPU and on compute capability 8.0, and is skipped by name on any other class; a host case holds that
+condition on stated compute capabilities.
+
+Every line of a run is read from standard error, which is not the sample's alone: a library may print there first, and
+behind the run's last line.  A cell that reads the header of a run finds it by the script's tag (``_header``), and
+one that reads the line in front of the verdict counts from the verdict (``_in_front_of_the_verdict``); host cases
+hold both, and the cells of the speculative script read every run between two lines that are not the sample's."""
 
 import importlib.util
 import os
@@ -105,6 +123,10 @@ FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorc
 FE_ENTRIES = "by provider: cuDNN FE 4 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
 #: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
 FE_ENTRIES_CC100 = "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+#: the stack native on compute capability 10.x: the three multiplies FlashInfer serves are no fallbacks, and no lane of this
+#: repository runs them
+NATIVE = "by provider: cuDNN FE 4 | FlashInfer 3 | fallbacks 3 (cuBLAS over copies 1, PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
+NATIVE_CC100 = "by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
@@ -338,6 +360,50 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         assert (stack == "fe-cublas") == (not kernels["declared"]), "fe-cublas declares no target kernel set; fe-entries does"
 
 
+@pytest.mark.L0
+def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
+    """The stack ``native`` with the rows a library serves, on real launches, where FlashInfer is installed: the MLP's down
+    multiply and the output head on ``flashinfer.gemm.mm_fp4`` and the out-projections on ``flashinfer.gemm.bmm_fp8``, each
+    on the stored weight and each inside the band of the reference multiply at both sequence counts; the first use of the
+    library announced while the run is planned; the 4-bit multiply outside any tuning context (``TUNED False`` in the call
+    log, or the kernel check fails); every weight of a multiply on its stored format alone.  On the GPU class the family's
+    census has a section for, the down multiply is held to the recorded kernel class and launch shape, and the kernel the
+    library chose for the out-projection is printed beside the recorded pick.  Skipped where the package is absent."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the library rows of the stack native claim compute capability 10.x")
+    if importlib.util.find_spec("flashinfer") is None:  # looked up, not imported: the package is the child's to import
+        pytest.skip("the stack native calls FlashInfer, which is not installed here (samples/models/requirements-flashinfer.txt): uncovered, not passing")
+    cc100 = tuple(torch.cuda.get_device_capability()) == (10, 0)
+    out = _run(None, capsys, ["--stack", "native"], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)
+    assert "stack native" in out and out.count("[00] planning: first use of FlashInfer ") == 1, "the library's first use is announced once, while the run plans"
+    for block in ("projection.fp8.out", "mlp.down", "output_head"):
+        judged = [line for line in out.splitlines() if line.split()[:1] == [block] and "calls" in line and "[band: " in line]
+        assert len(judged) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), f"{block} was judged at both sequence counts"
+    down = [
+        line for line in out.splitlines() if line.strip().startswith("mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step")
+    ]
+    assert len(down) == 2, "one launch per MLP at both sequence counts, outside any tuning context"
+    kept, count = (
+        ("projection.fp8.in, projection.fp8.out, mlp.gate_up, mlp.down, output_head", 9)
+        if cc100
+        else ("projection.fp8.out, mlp.gate_up, mlp.down, output_head", 7)
+    )
+    made = [line for line in out.splitlines() if line.startswith("  on demand ")]
+    assert len(made) == 2 and all(
+        f"weights this run keeps on their stored format alone ({kept})" in line for line in made
+    ), "no bf16 copy of a multiply's weight"
+    held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
+    assert len(held) == 2 and all(line.startswith(f"  stored weights    {count} of {count} weights") and line.endswith("    PASS") for line in held)
+    if cc100 and torch.cuda.get_device_properties(0).multi_processor_count == 148:  # the class the census has a section for, at 1 sequence
+        assert "17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results)" in out
+        assert sum("in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records" in line for line in down) == 1
+        assert out.count("chosen by the library for projection.fp8.out at ") == 2, "the library's pick at both call sites: printed and compared, never gated"
+    observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
+    frost_routing.measured("model sample qwen_dense 00_decode --stack native: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
+
+
 @pytest.mark.L1
 def test_four_layer_run_passes_its_own_checks(sample, capsys):
     out = _run(sample, capsys, ["--layers", "4"])
@@ -394,10 +460,11 @@ raise SystemExit(0 if passed else 1)
 """
 
 
-def _program(program, tag, key, what, **fields):
+def _program(program, tag, key, what, unobserved="RAN fe-entries stack (kernels not observed: ", **fields):
     """A small program that drives the helper layer in a fresh interpreter (``program``, formatted with ``fields``): the
     run's lines.  ``tag`` starts its own lines (``[verify]``), ``key`` names the run in the routing record, ``what`` in a
-    failure.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
+    failure.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty.
+    ``unobserved``: how the program's last line begins, behind its tag, where its kernels could not be observed."""
     import cudnn
 
     if not torch.cuda.is_available():  # decided here, before a child is started
@@ -424,7 +491,7 @@ def _program(program, tag, key, what, **fields):
     if verdict.startswith(f"{tag} SKIP"):
         assert " FAIL" not in out, out[-6000:]  # a skip never covers a failed check
         pytest.skip(verdict)
-    held = verdict == f"{tag} PASS" or verdict.startswith(f"{tag} RAN fe-entries stack (kernels not observed: ")
+    held = verdict == f"{tag} PASS" or verdict.startswith(f"{tag} {unobserved}")
     assert done.returncode == 0 and held and " FAIL" not in out, out[-8000:]
     return out
 
@@ -508,6 +575,283 @@ def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_token
     assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"
 
 
+def _header(lines, tag):
+    """The header of a run among the lines of its standard error: the first line that begins with the script's tag.  Standard
+    error is not the sample's alone -- a library may print a warning there before the sample's first line -- so the header
+    is found, never taken to be line 0."""
+    tagged = [line for line in lines if line.startswith(tag)]
+    assert tagged, f"no line of the run begins with {tag}: the run printed no header"
+    return tagged[0]
+
+
+def _in_front_of_the_verdict(lines, tag):
+    """The line of a run that stands directly in front of its verdict, the last line that begins with the script's tag.  As
+    for the header, the place is counted from a line of the run and never from the end of standard error: a library
+    may print there behind the sample's last line (at interpreter exit)."""
+    verdict = max((index for index, line in enumerate(lines) if line.startswith(tag)), default=0)
+    assert verdict, f"no line of the run stands in front of a line that begins with {tag}"
+    return lines[verdict - 1]
+
+
+#: what the cells of the speculative script read a run's lines between: a line in front of the run and one behind it, as a
+#: library prints them on standard error at import and at interpreter exit
+NOT_THE_SAMPLES = ("a line on standard error in front of the run: a library's, at import", "a line on standard error behind the run: a library's, at exit")
+
+
+@pytest.mark.L0
+def test_the_header_of_a_run_is_found_behind_a_line_a_library_printed_first():
+    """A run's lines are read from standard error, and standard error is not the sample's alone: a library may print a
+    warning there before the sample's first line (seen in a fresh interpreter on one host: the sample ended in ``PASS``
+    and the cell that took line 0 for its header failed).  The header is the first line with the script's tag."""
+    header = "[02] qwen_dense speculative decode | reduced model: 2 of 64 layers (1 linear-attention + 1 attention) | the drafter runs on reference blocks"
+    run = [header, "[02] planning: an entry of this stack builds its kernel now", "served by (decided before the load)", "[02] PASS"]
+    warning = ["/site-packages/a_library/__init__.py:12: UserWarning: a library says something at import", "  warnings.warn(text)"]
+    assert _header(run, "[02] ") == header
+    assert _header(warning + run, "[02] ") == header, "two lines of a library in front of the run"
+    assert _header(run[:1] + warning + run[1:], "[02] ") == header and _header(["[00] a line of the other script", *run], "[02] ") == header
+    assert _header(["a library's line that quotes [02] PASS in passing", *run], "[02] ") == header, "a line of the run BEGINS with the tag"
+    with pytest.raises(AssertionError, match=r"no line of the run begins with \[02\] : the run printed no header"):
+        _header(warning, "[02] ")
+
+
+@pytest.mark.L0
+def test_the_line_in_front_of_the_verdict_is_found_where_a_library_printed_last():
+    """The other end of a run's lines.  A cell that holds the line in front of the verdict counts from the verdict -- the
+    last line with the script's tag -- and not from the end of standard error, where a library may print behind the
+    sample's last line (seen with an interpreter made to print its import times: the sample ended in ``PASS`` and the
+    cell that took the second line from the end failed).  Directly in front: no line of the run is skipped."""
+    last = "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    run = ["[02] qwen_dense speculative decode | reduced model", "  ids  ids hash 11bfb9f9bcf5, plain 11bfb9f9bcf5    PASS", last, "[02] PASS"]
+    behind = ["a line a library prints when the interpreter exits", "  and its second line"]
+    assert _in_front_of_the_verdict(run, "[02] ") == last
+    assert _in_front_of_the_verdict(run + behind, "[02] ") == last, "two lines of a library behind the verdict"
+    assert _in_front_of_the_verdict(behind + run + behind[:1], "[02] ") == last
+    assert _in_front_of_the_verdict([*run[:-1], "a line between the two", run[-1]], "[02] ") == "a line between the two", "nothing is skipped"
+    for nothing_in_front in (behind, run[-1:], []):
+        with pytest.raises(AssertionError, match=r"no line of the run stands in front of a line that begins with \[02\] "):
+            _in_front_of_the_verdict(nothing_in_front, "[02] ")
+
+
+PAGED_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import census, timing
+from model_samples.providers import AttentionParams, torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.state import DecodeState
+
+PAGE, SEQUENCES, FIRST, LAST = 64, 2, 60, 68  # the traced steps: positions 60 to 68, across the first page boundary
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def same(a, b):
+    return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16))
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+device = torch.device("cuda:0")
+model = QwenDense.reduced()  # the published widths: 24 query heads, 4 key / value heads of 256, a rotary part of 64
+g, shapes, kinds = model.geometry, model.state_shapes(), ("full_attention",)
+heads, width, capacity, pages = g.attn_kv_heads, g.attn_head_dim, LAST + 4, 2
+generator = torch.Generator().manual_seed(0)
+
+
+def draw(*shape, scale=1.0):
+    return (scale * torch.randn(*shape, generator=generator)).to(torch.bfloat16).to(device)
+
+
+params = AttentionParams(g.attn_heads, heads, width, g.rotary_dim, g.rope_theta, draw(width, scale=0.02), draw(width, scale=0.02))
+rows = [draw(SEQUENCES, g.in_projection("full_attention")[0]) for _ in range(capacity)]  # an in-projection's row of every sequence, per position
+
+
+def step(cache, position, tokens=1):
+    # the two reference chains of an attention layer on one cache: the preparation writes the position, the core reads up to it
+    if tokens > 1:
+        row = torch.stack(rows[position : position + tokens], dim=1).flatten(0, 1)  # sequence by sequence
+        q, gate = torch_ref.attention_prepare_tokens(row, cache, position, tokens, params, g.norm_eps, torch.float64)
+        return q, gate, torch_ref.attention_tokens(q, cache, position, tokens, torch.float64)
+    q, gate = torch_ref.attention_prepare(rows[position], cache, position, params, g.norm_eps, torch.float64)
+    return q, gate, torch_ref.attention(q, cache, position, torch.float64)
+
+
+plain = DecodeState(kinds, SEQUENCES, capacity, shapes, device)
+paged = DecodeState(kinds, SEQUENCES, capacity, shapes, device, page=PAGE)
+flat, cache, table = plain.layers[0], paged.layers[0], paged.table
+say(f"[paged] {{model_samples.check_environment().header()}}")
+say(f"[paged] the attention preparation and the attention core of the reference chain on a paged cache: {{SEQUENCES}} sequences, pool "
+    f"{{list(cache.pool.shape)}}, positions 0 to {{LAST}}, the steps at {{FIRST}} to {{LAST}} under the profiler")
+equal = sum(all(same(a, b) for a, b in zip(step(cache, position), step(flat, position))) for position in range(FIRST))
+theirs = [step(flat, position) for position in range(FIRST, LAST + 1)]
+mine, launches = [], []
+
+
+def traced(index):
+    mine.append(step(cache, FIRST + index))
+    mine[-1][2][0, :4].tolist()  # the host read that ends a step
+
+
+trace, missing = timing.trace_steps(traced, LAST + 1 - FIRST, device, records=launches)
+equal += sum(all(same(a, b) for a, b in zip(own, other)) for own, other in zip(mine, theirs))
+hold("outputs", equal == LAST + 1, f"queries, gates and attention outputs of {{equal}} of {{LAST + 1}} steps are the bytes of the same step on the plain cache")
+# the pool, read by arithmetic written here: position p of sequence i is row p % 64 of page i * pages + p // 64, keys then values
+rows_equal = behind = 0
+for sequence in range(SEQUENCES):
+    for position in range(pages * PAGE):
+        row = cache.pool[sequence * pages + position // PAGE, :, position % PAGE]
+        if position <= LAST:
+            rows_equal += int(same(row[:, :width], flat.k[sequence, :, position]) and same(row[:, width:], flat.v[sequence, :, position]))
+        else:
+            behind += int(bool(row.any()))
+hold("pool", rows_equal == SEQUENCES * (LAST + 1) and behind == 0,
+     f"{{rows_equal}} of {{SEQUENCES * (LAST + 1)}} rows of the pool hold the plain cache's key and value row of their position; {{behind}} of the "
+     f"{{SEQUENCES * (pages * PAGE - LAST - 1)}} rows behind position {{LAST}} hold anything")
+reads = 0
+for count in (1, 63, 64, 65, LAST + 1):
+    for dtype in (torch.bfloat16, torch.float64):
+        k = torch.stack([cache.pool[sequence * pages + p // PAGE, :, p % PAGE, :width] for sequence in range(SEQUENCES) for p in range(count)])
+        v = torch.stack([cache.pool[sequence * pages + p // PAGE, :, p % PAGE, width:] for sequence in range(SEQUENCES) for p in range(count)])
+        k, v = (t.view(SEQUENCES, count, heads, width).transpose(1, 2).to(dtype) for t in (k, v))
+        reads += int(torch.equal(cache.keys(count, dtype), k) and torch.equal(cache.values(count, dtype), v))
+hold("accessors", reads == 10, f"keys and values of the first 1, 63, 64, 65 and {{LAST + 1}} positions, in bf16 and in fp64: {{reads}} of 10 reads are the pool's rows")
+chain = torch.stack([torch.cat(torch_ref.rope_cos_sin(position, g.rotary_dim, g.rope_theta, device)) for position in range(capacity)])
+hold("cos / sin", same(table.cos_sin, chain), f"the table's row of each of {{capacity}} positions is what the chain forms for that position on this device, bit for bit")
+# a step of three tokens per sequence across the boundary: positions 62 to 64, on states of that layout
+several = [DecodeState(kinds, SEQUENCES, capacity, shapes, device, tokens=3, **layout) for layout in ({{}}, {{"page": PAGE}})]
+for position in range(62):
+    for state in several:
+        step(state.decode_layers[0], position)
+pair = [step(state.layers[0], 62, tokens=3) for state in several]
+_, positions, slots = several[1].layers[0].at(62)
+tables = positions.tolist() == [[62, 63, 64] * SEQUENCES] * 3 and slots.tolist() == [s * pages * PAGE + p for s in range(SEQUENCES) for p in (62, 63, 64)]
+hold("verify", all(same(a, b) for a, b in zip(*pair)) and tables,
+     "a step of 3 tokens per sequence at positions 62 to 64: the plain cache's bytes; its table rows name those positions and their slots")
+ids = {{}}
+for record in launches:
+    ids[census.canonical(record)] = ids.get(census.canonical(record), 0) + 1
+unnamed = sorted({{record.name[:80] for record in launches if not census.canonical(record)}})
+if not launches:
+    say(f"  kernels    not observed: {{missing}}")
+else:
+    counted = ", ".join(f"{{name or 'NO ID'}} {{count}}" for name, count in sorted(ids.items()))
+    gathers, nameless = ids.get("embedding_gather", 0), ids.get("", 0)
+    foreign = sum(count for name, count in ids.items() if name not in ("pytorch", "cublas", "copy", "embedding_gather", ""))
+    hold("kernels", gathers == nameless == foreign == 0,
+         f"{{len(launches)}} records of {{LAST + 1 - FIRST}} steps on the pool: {{counted}}; {{gathers}} with the id of a step's embedding lookup, "
+         f"{{nameless}} unnamed{{'' if not unnamed else ' (' + '; '.join(unnamed) + ')'}}, {{foreign}} with an id outside the chains' families")
+if failed:
+    say("[paged] FAIL")
+elif not launches:
+    say(f"[paged] RAN (kernels not observed: {{missing}})")
+else:
+    say("[paged] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.L0
+def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_launch_no_gather():
+    """The paged attention cache of a state (``state.PagedKvCache``) under the two reference chains of an attention layer,
+    on the device, at the published widths and two sequences -- no provider row asks for that layout yet, so no run of a
+    script builds it.  A small program in a fresh interpreter runs the attention preparation and the attention core at
+    positions 0 to 68 on a plain cache and on a paged one, the steps at 60 to 68 of the paged one under the profiler:
+
+    * the queries, gates and attention outputs of every step are the plain cache's bytes;
+    * the pool, read by index arithmetic written in the program, holds the plain cache's key and value row of every
+      position, and the accessors return those rows;
+    * the cos / sin table of the state is, row for row, what the chain forms for that position on this device;
+    * a step of three tokens per sequence across positions 62 to 64 gives the plain cache's bytes;
+    * no kernel the chains launch on the pool has the id of a step's embedding lookup, and none is unnamed: a gather
+      through an index tensor would be counted as the embedding's launch by the kernel check of every stack.
+
+    The chains are PyTorch's, so no row of the family declines a GPU here; the cell is gated all the same.  It runs on
+    the classes the family serves -- compute capability 10.x and 12.x, where the other cells of this module run -- and
+    on compute capability 8.0: a GPU the family serves and one of 8.0 are the two kinds it has run on, and it holds
+    every kernel the chains launch.  On any other class it skips with a sentence that names the classes and the device.
+    Where the profiler's records cannot be had the last line says so, and the kernels are uncovered there, not verified."""
+    cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None  # no GPU: the runner of the program skips
+    if cc is not None and cc[0] not in (10, 12) and cc != (8, 0):
+        pytest.skip(
+            "the cell of the paged cache runs where the family serves the GPU (compute capability 10.x or 12.x) and on compute capability 8.0; "
+            f"this device is {cc[0]}.{cc[1]}, which the family does not serve: uncovered, not passing"
+        )
+    out = _program(
+        PAGED_PROGRAM,
+        "[paged]",
+        "model sample: the reference chains on a paged attention cache",
+        "run on a paged cache",
+        unobserved="RAN (kernels not observed: ",
+    )
+    lines = out.splitlines()
+    assert any(line.startswith("[paged] ") and line.endswith("positions 0 to 68, the steps at 60 to 68 under the profiler") for line in lines)
+    for name in ("outputs", "pool", "accessors", "cos / sin", "verify"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert "queries, gates and attention outputs of 69 of 69 steps" in out and "138 of 138 rows of the pool" in out and "0 of the 118 rows behind" in out
+    observed = [line for line in lines if line.startswith("  kernels ")]
+    none = "; 0 with the id of a step's embedding lookup, 0 unnamed, 0 with an id outside the chains' families    PASS"  # the line states its counts
+    assert len(observed) == 1 and (observed[0].endswith(none) or observed[0].startswith("  kernels    not observed: ")), observed
+    frost_routing.measured("model sample: the reference chains on a paged attention cache, the kernels of the traced steps", observed[0].strip())
+
+
+@pytest.mark.L0
+def test_the_cell_of_the_paged_cache_runs_where_the_family_serves_the_gpu_and_on_compute_capability_8_0(sample, monkeypatch):
+    """Where the cell of the paged cache runs, without a GPU: the cell is called on stated compute capabilities, with a
+    stand-in for the runner of its program.  It reaches its program on every class the family serves -- read here from
+    the family's own table: the classes on which the default stack has a row for every block, which is what lets the
+    other cells of this module run -- and on compute capability 8.0, and on no other class.  There it skips, and the
+    sentence names the classes it runs on and the device.  Without a GPU it asks for no class: the runner skips."""
+    from model_samples.qwen_dense import configs  # on the path while the fixture holds the script
+
+    def served(cc):  # the plan of the default stack declines a class on which one of its blocks has no row
+        return all(any("fe-cublas" in row.stacks and row.serves_class(cc) for row in rows) for rows in configs.PROVIDERS.values())
+
+    class Reached(Exception):
+        pass
+
+    def runner(*_, **__):
+        raise Reached
+
+    def cell(cc):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: cc)
+        try:
+            test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_launch_no_gather()
+        except Reached:
+            return "runs"
+        except pytest.skip.Exception as skipped:
+            return skipped.msg
+
+    monkeypatch.setattr(sys.modules[__name__], "_program", runner)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    classes = [(major, minor) for major in range(7, 14) for minor in range(10)]
+    family = [cc for cc in classes if served(cc)]
+    assert family == [cc for cc in classes if cc[0] in (10, 12)], "the classes the family serves: compute capability 10.x and 12.x"
+    assert [cc for cc in classes if cell(cc) == "runs"] == sorted([(8, 0), *family]), "where the family serves the GPU, and on compute capability 8.0"
+    elsewhere = (
+        "the cell of the paged cache runs where the family serves the GPU (compute capability 10.x or 12.x) and on compute capability 8.0; "
+        "this device is {}.{}, which the family does not serve: uncovered, not passing"
+    )
+    assert all(cell(cc) == elsewhere.format(*cc) for cc in classes if cc != (8, 0) and cc not in family), "a skip names the classes and the device"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert cell(None) == "runs", "without a GPU the cell asks for no class: the runner of its program skips"
+
+
 def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     """Run ``main()`` of the speculative script and hold what every such run prints; with ``sample`` None, run the script in
     a fresh interpreter instead.  Standard output must stay empty (a seeded run has no language); the verdict is ``[02]
@@ -522,7 +866,10 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
         out, written = captured.err, captured.out
     seconds = time.perf_counter() - start
     assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
-    lines = out.splitlines()
+    # Standard error is not the sample's alone: a library may print there in front of the run and behind it.  Every cell
+    # that comes through here reads the run's lines with such a line at either end, so that nothing below can take a
+    # line of the run by its place from the start or from the end of standard error.
+    lines = [NOT_THE_SAMPLES[0], *out.splitlines(), NOT_THE_SAMPLES[1]]
     tagged = [line for line in lines if line.startswith("[02] ")]
     versions = next((line[5:] for line in tagged if line.startswith("[02] cuDNN Frontend ")), "no environment line")
     device = next((line[5:].split(" | ")[0] for line in tagged if " SMs)" in line), "no device line")
@@ -535,10 +882,9 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert code == 0 and (verdict == "[02] PASS" or verdict.startswith(f"[02] RAN {stack} stack (kernels not observed: ")), out[-6000:]
     assert " FAIL" not in out and "distribution" in versions and "source hash" in versions
     # before the load: the reductions, the configuration key by key, the seeded list, what a prompt and a step are
-    assert "2 of 64 layers (1 linear-attention + 1 attention)" in lines[0] and lines[0].endswith(" | the drafter runs on reference blocks")
-    assert (
-        "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in lines[0]
-    )
+    header = _header(lines, "[02] ")
+    assert "2 of 64 layers (1 linear-attention + 1 attention)" in header and header.endswith(" | the drafter runs on reference blocks")
+    assert "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in header
     load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
     before = (
         '[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
@@ -591,7 +937,8 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert len(judged) == 2 and all(line.endswith("    PASS") for line in judged), "the prompt's decode steps and the verify steps, each against the reference"
     steps = [line for line in lines if line.split()[:1] == ["linear_attention.step"] and "[band: gdn_step]" in line]
     assert len(steps) == 2 and all(line.endswith("[band: gdn_step]  PASS") and "conv history equal; null slot untouched" in line for line in steps)
-    assert lines[-2] == "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    last = "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    assert _in_front_of_the_verdict(lines, "[02] ") == last
     return out
 
 
