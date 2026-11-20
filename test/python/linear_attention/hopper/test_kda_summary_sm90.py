@@ -443,7 +443,7 @@ def test_current_empty_input_does_not_alias_output(backward, cudnn_handle):
     x = make_case((0,), heads=1)
     graph, tensors, _, _, bindings, state, _ = make_graph(x, backward)
     # A zero-length view can carry a nonnull address inside a live output allocation.
-    # It has no addressed elements, so it must not fail the output alias guard.
+    # It has no addressed elements, so the output alias guard must ignore it.
     from cudnn.frost.buffers import DeviceView
 
     bindings[tensors["k"]] = DeviceView(state.data_ptr() + 32, (0, 1, 128), "bfloat16", state.device.index)

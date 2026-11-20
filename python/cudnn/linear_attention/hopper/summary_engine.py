@@ -95,7 +95,7 @@ class KdaSummaryHopperPlan(CompiledPlan):
     takes_variant_pack = True
     plan_name = "kda_summary_hopper_cuda"
 
-    def __init__(self, graph, facts):
+    def __init__(self, graph, facts, *, compile_direct=True):
         node = next(iter(graph.nodes))
         self.device = current_device()
         self.is_bwd = facts.is_bwd
@@ -106,8 +106,9 @@ class KdaSummaryHopperPlan(CompiledPlan):
         self.outputs = set(node.outputs)
         self.cu64 = facts.cu_dtype == cudnn.data_type.INT64
         self.ports = None
-        self.library = _library(self.device)
-        self.function = self.library.function("cudnn_kda_summary_bwd" if self.is_bwd else "cudnn_kda_summary_fwd")
+        if compile_direct:
+            self.library = _library(self.device)
+            self.function = self.library.function("cudnn_kda_summary_bwd" if self.is_bwd else "cudnn_kda_summary_fwd")
 
     def get_workspace_size(self):
         return 0
@@ -227,17 +228,8 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
         from cudnn.frost.workspace import WorkspaceLayout
         from . import cuda_bwd_host
 
-        node = next(iter(graph.nodes))
-        self.device = current_device()
-        self.is_bwd = True
+        super().__init__(graph, facts, compile_direct=False)
         self.total = facts.total_t
-        self.heads = facts.h_o
-        self.seqs = facts.n_seq
-        self.scale = float(facts.scale) if facts.scale is not None else 128**-0.5
-        self.cu64 = facts.cu_dtype == cudnn.data_type.INT64
-        self.geometry = {name: (tuple(t.dim), to_buffer_dtype(t.get_data_type())) for name, t in {**node.inputs, **node.outputs}.items()}
-        self.outputs = set(node.outputs)
-        self.ports = None
         layout = WorkspaceLayout(align=256)
         self.scratch_offset = layout.add(cuda_bwd_host.reverse_workspace_bytes(self.total, self.heads, self.seqs), align=256)
         self.workspace_bytes = layout.size
