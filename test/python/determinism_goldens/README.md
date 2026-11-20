@@ -994,6 +994,8 @@ pytest core/test_determinism_utils.py
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
+| `causal_conv1d/cutedsl/test_causal_conv1d_packed_determinism.py`, `test_causal_conv1d_packed_public_determinism.py`, `test_causal_conv1d_packed_goldens.py` | `causal_conv1d(..., backend="se")`, packed FP16/BF16/FP32 | output and final history | input, weight, bias, initial history; parameter gradients tested for replay, not assumed batch invariant |
+| `causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py` | SM103 BF16 width-four SiLU persistent backward, packed and dense | output | dX, dW, db; tiled-parent dX comparison, public graph replay, parameter repeatability, warm staging stress |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -8843,3 +8845,217 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+## SE packed port and persistent backward integration
+
+The new explicit `backend="se"` route is qualified independently from the
+prototype benchmark. The packed suites cover FP16/BF16/FP32, widths 2 through
+8, identity/SiLU, empty sequences, strided tensors, initial/final history,
+all gradients, changed-offset graph replay, full-graph AOT autograd, and
+invalid-offset traps in isolated processes. The persistent suite checks the
+SM103 dispatch, byte-exact dX against the tiled parent, FP64 numerical
+references, replay, and warm staging stress. Parameter reduction grouping can
+change with packing; repeatability does not imply batch invariance.
+
+Qualification on 2026-11-19 used an exclusive NVIDIA B300 SXM6 AC (SM103,
+148 SMs), driver 615.71.10, Torch 2.14.1+cu130, cuDNN 9.29.0.2, CuTe DSL
+4.8.0, and TVM-FFI 0.1.15.post2. CUDA 13.4 and CUDA 12.9 compiler flavors
+ran against the same CUDA 13 Torch environment. The Python implementation
+resolved to the candidate worktree; the nanobind package was an existing
+Frontend 1.32.0 build.
+
+| Selection | Compiler | Result | Runtime |
+| --- | --- | --- | --- |
+| Packed/private/public, determinism, decode replay, persistent, schedule; excluding goldens/stress | CUDA 13.4 | 241 passed | 846.49 s |
+| Packed FP32, tiled FP32 SiLU, semantic API, device scope | CUDA 13.4 | 123 passed; 15 two-GPU cases skipped | 104.53 s |
+| Public packed, public determinism, persistent, golden recording | CUDA 12.9 | 135 passed | 421.03 s |
+| Final persistent and staging suites plus strict golden comparison | CUDA 13.4 | 36 passed | 116.16 s |
+| Final persistent and staging suites plus strict golden comparison | CUDA 12.9 | 36 passed | 45.24 s |
+| Public dense signed-zero tail versus the original dense parent | CUDA 13.4 / 12.9 | 1 passed per compiler | 7.19 / 10.23 s |
+
+The final suites include dense launch-boundary rejection without large
+allocations, full-graph autograd, changed-offset replay on a nondefault stream,
+and strict deterministic mode. The initial public rerun found a singleton
+batch-stride mismatch: the adapter now constructs the BDT view in the correct
+order and uses the existing output-layout helper. The corrected suite above
+passes; that initial failure was not a numerical mismatch.
+
+Thirty-two new golden files cover 15 packed cases and one persistent case per
+compiler. Before recording, packed cases pass full FP64 references for every
+output/gradient; the large persistent case checks eight fixed channels across
+all tokens against FP64 and checks every output for finiteness. The 30 packed
+input/output hash records exactly match the previous port on SM103; only the
+TVM-FFI environment version changes their record key. The two persistent
+records cover a new schedule and its fixed parameter-reduction grouping.
+Strict replay runs without the recording variable.
+
+Five staging cases each compare all output and partial-scratch bytes across
+3,000 warm and 3,000 shared-memory-poisoned launches. Each compiler run has
+zero mismatches in all 30,000 launches; the unsafe control fails 200/200 in
+each process (60,000 measured launches across both compiler lanes).
+Packed persistent uses 294 CTAs (1.99 per SM) and one refill, dense persistent
+uses 296 CTAs and 54 refills, and the three tiled cases use 320/384/320 CTAs
+with 3/2/3 refills. Cold references come from two agreeing cache-flushed
+launches: these stress checks measure stability, while the independent FP64
+checks establish numerical accuracy separately. The zero-count rate bound
+is below 0.0998% per block at 95% confidence; it is not a proof of absence of
+races. Persistent PTX and SASS retain the async-proxy fence before stage reuse in
+five compiled variants per compiler (packed C=768/2048 with/without bias,
+and dense C=2048). A dedicated public dense test also checks full dX bytes
+against the original dense kernel under signed-zero underflow at sequence
+tails; the tail correction preserves the parent's padded arithmetic.
+
+Other GPU architectures and actual two-device behavior remain unverified.
+The CUDA 12 compiler run does not qualify a complete CUDA 12 deployment.
+Repository CI is separate from these local runs.
+
+Commands (from `test/python`; run with the intended compiler flavor):
+
+```bash
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_packed*.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_schedule_unit.py -m L0 -q -rs
+```
+
+The focused signed-zero regression command was:
+
+```bash
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  -m L0 -q -rs -x -k dense_signed_zero_tail_matches_parent
+```
+
+## SM100 packed backward and parallel parameter reduction qualification
+
+The packed BF16 K4 SiLU persistent schedule now runs on SM100 and SM103. The tap-parallel final reducer retains each output's split-sum order; BF16 uses FP32 accumulation, and FP32 outputs retain FP64 accumulation. Small BF16 tiled calls avoid empty splits. The 256-channel, 4096–8191-token range uses one split per 64-token tile. Public dense SE remains SM103-only.
+
+Agent-run qualification on 2026-11-19 used exclusive B200 and B300 SXM6 AC GPUs, each with 148 SMs, driver 615.71.10, cuDNN 9.29.0.2, Torch 2.14.1+cu130, CuTe DSL 4.8.0, and the existing FE 1.32.0 binding build overlaid with this checkout. Both actual compiler flavors, CUDA 12.9 and 13.4, ran against the same CUDA 13 Torch/driver environment. This does not qualify a complete CUDA 12 deployment.
+
+| GPU | Selection | Compiler | Passed | Skipped | Runtime (s) |
+|---|---|---|---:|---:|---:|
+| B200 | broad | 12.9 | 405 | 23 | 989.25 |
+| B200 | golden-stress-record | 12.9 | 23 | 1 | 84.07 |
+| B200 | strict-goldens | 12.9 | 19 | 0 | 5.06 |
+| B200 | broad | 13.4 | 338 | 15 | 916.41 |
+| B200 | focused | 13.4 | 67 | 8 | 94.32 |
+| B200 | golden-stress-record | 13.4 | 23 | 1 | 82.47 |
+| B200 | strict-goldens | 13.4 | 19 | 0 | 5.10 |
+| B300 | broad | 12.9 | 413 | 15 | 438.85 |
+| B300 | device-repro | 12.9 | 1 | 0 | 33.65 |
+| B300 | golden-stress-record | 12.9 | 24 | 0 | 93.59 |
+| B300 | strict-goldens | 12.9 | 19 | 0 | 4.53 |
+| B300 | broad | 13.4 | 338 | 15 | 916.40 |
+| B300 | focused | 13.4 | 75 | 0 | 166.60 |
+| B300 | golden-stress-record | 13.4 | 24 | 0 | 93.42 |
+| B300 | strict-goldens | 13.4 | 19 | 0 | 5.06 |
+
+Broad runs cover the packed private and public interfaces, FP16/BF16/FP32, widths 2–8, identity/SiLU, strided tensors, empty sequences, initial/final history, autograd, full-graph AOT tracing, changed-offset CUDA Graph replay, numerical edge cases, and invalid-offset traps. The focused selection adds public persistent dispatch boundaries and 12 cancellation/strided-output checks that compare all BF16 parameter bytes with the original reducer. CUDA 12.9 broad runs also include the focused selection.
+
+The first B300 allocation became unavailable late in the CUDA 12.9 suite: 299 cases passed before a launch error, fresh processes then failed CUDA initialization, and NVML reported GPU Recovery Action: Reboot. The exact failing case and complete CUDA 12.9 suite passed on a replacement B300 with unchanged kernel sources. The failed attempt remains in the task artifacts; it is excluded from the accepted-run table.
+
+The 15 skipped broad cases per GPU/compiler require two devices and exercise the existing backend binding device-scope tests. B200 also skips eight dense-only focused cases and one dense staging-stress case because public dense SE remains SM103-only. These skips do not represent correctness failures. Actual multi-device SE execution and other admitted GPU families remain unverified.
+
+Golden review checked 76 records: 32 existing records were unchanged and 44 records were added for B200 runtime coverage and the tiny, tail, and ragged tuned paths. Independent references and input-mutation checks precede recording. Each of the four GPU/compiler combinations then passed 19 strict golden comparisons in a separate process with recording disabled. No existing golden was replaced.
+
+Each compiler lane ran four staging-stress cases on B200 and five on B300: 3,000 warm and 3,000 poisoned launches per case, 108,000 launches total. All output and partial-scratch bytes matched the cold reference. The unsafe control must reproduce before these tests pass. The persistent cases exercise roughly two CTAs per SM and stage reuse; the tiled cases cover BF16 K4, BF16 K8 double buffering, and FP32 K8. Zero observed mismatches are bounded evidence, not proof for every rendering.
+
+Generated PTX control-flow and SASS checks covered 18 persistent variants across the four GPU/compiler combinations. The async-proxy fence remains on every loop path before stage reuse, followed by a warp barrier. Correctness and synchronization qualification are separate from the warm backward performance measurements.
+
+The separate native-architecture benchmark compares 13 shared workloads in three fresh processes per source version on B200, B300, and a 208-SM Rubin device. B200 dense and all Rubin calls remain experimental raw-kernel comparisons; they do not expand public API admission or determinism support. Repository CI remains unrun for this unpublished branch.
+
+Run from `test/python`, with the intended compiler environment and an exclusive supported GPU:
+
+```bash
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_packed*.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_schedule_unit.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_reduction.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_semantic_api_unit.py \
+  causal_conv1d/torch/test_causal_conv1d_device_scope.py \
+  -n 0 -m L0 -q -rs -x -k 'not golden and not warm_stress'
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_packed_goldens.py \
+  -n 0 -m L0 -q -rs -x -k golden
+python -m pytest causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  -n 0 -m L0 -q -rs -x -k warm_stress
+```
+
+
+## SM107 SE and green-context qualification
+
+The public packed SE route now admits SM107. Dense BF16 width-four SiLU,
+packed persistent backward, paired tiled arithmetic, and tap-parallel
+parameter reduction also admit SM107. CuTe DSL 4.8.0 must use a CUDA compiler
+version of at least 13.4. An actual CUDA 12.9 compiler rejects the public
+SM107 call before JIT; a mocked missing target is rejected separately.
+
+Qualification on 2026-11-19 used native SM107 with 216 SMs, driver 630.10,
+Torch 2.14.1+cu130, cuDNN 9.29.0.2, and CuTe DSL 4.8.0 compiling CUDA 13.4.
+The current Python source was overlaid on an existing FE 1.32.0 binding
+build. The current `_device` helper was reloaded from this checkout after
+the binding package import; the binding build itself was not rebuilt.
+
+| Selection | Passed | Skipped | Runtime |
+| --- | ---: | ---: | ---: |
+| Broad packed/public/dense/API/reduction/schedule sweep, excluding goldens and stress | 435 | 0 | 688.04 s |
+| Final runtime, green-context, schedule, persistent, golden and staging checks | 112 | 0 | 31.10 s |
+| Public sharding, state and gradient checks with ordinary/localized inputs | 36 | 0 | Artifact runner |
+
+The broad sweep uses Torch's bundled CUDA runtime. The final 112-case run
+and green-context checks preload CUDA 13.6's runtime; the effective
+`cudaRuntimeGetVersion` result is 13060. Both runtime libraries remain mapped,
+so this is a CUDA 13.6 runtime preload over a Torch CUDA 13.0 build.
+The bundled runtime produced context diagnostics in Compute Sanitizer for
+both SE capture and a Torch-only control. Both controls report zero errors
+with the preload. The older runtime combination is not qualified for green
+contexts by these results.
+
+Nineteen new environment-specific goldens cover 15 packed combinations and
+four persistent/tuned cases. No existing golden is replaced. Each record
+follows independent numerical checks, then passes strict comparison in a
+fresh process with recording disabled. Packed reference tests compare all
+outputs and gradients with FP64. Large persistent checks sample eight fixed
+channels across every token, check all values for finiteness, and compare
+complete dX bytes against the tiled parent.
+
+The two green-context domains each expose 108 SMs. Modern stream-resource
+queries and the legacy converted-context query both report 108; the ordinary
+stream reports 216. Persistent C=768 backward uses 72 splits in each domain.
+Tests recreate contexts, exercise cold autograd workers, capture execution
+without host synchronization, and replay after input and offset changes.
+The changed-offset replay matches every output and gradient byte against a
+direct call on the same partition.
+
+Sharding keeps whole sequences and their state together. The 36 combinations
+cover FP16/BF16/FP32, with/without history, empty/short/ragged/long packs, and
+ordinary/localized inputs. Output, dX, final history and initial-history
+gradient bytes match the unsharded call. Shard parameter gradients are summed
+in FP32 before casting; the changed grouping is checked numerically.
+All 36 combinations also pass Compute Sanitizer memcheck with zero errors
+in the CUDA 13.6 runtime environment.
+Independent FP64 checks use absolute/relative tolerances of 0.003/0.002 for
+FP16, 0.03/0.02 for BF16, and 2e-5/2e-5 for FP32. The sharding artifact checks
+eight fixed channels and full-output finiteness; it does not establish a
+worst-case cancellation bound.
+
+Five staging cases each pass 3,000 warm and 3,000 poisoned launches, for
+30,000 launches with zero byte mismatches in the final runtime. The unsafe
+control fails 200/200. Packed persistent launches 432 CTAs, two per SM;
+tiled cases have fewer than two CTAs per SM, which limits that stress result.
+Control-flow inspection of five persistent PTX/SASS variants verifies the
+async-proxy fence and warp barrier on each loop path before stage reuse.
+
+Final pytest selection, from `test/python`, with the intended CUDA runtime:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_green_context.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_runtime_unit.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_schedule_unit.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_se_persistent.py \
+  causal_conv1d/cutedsl/test_causal_conv1d_packed_goldens.py -n 0 -m L0 -q -rs -x
+```
+
+Green-context creation requires the tested locality-domain driver interfaces.
+Other admitted GPU families and multiple physical devices retain their earlier
+coverage status. These local results do not establish repository CI coverage.
