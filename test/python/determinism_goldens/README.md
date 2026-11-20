@@ -2464,6 +2464,11 @@ two-device test because Slurm assigned one GPU. CUDA 12, real mixed-architecture
 or multiprocess execution, refilled-stage warm stress, and dedicated tail and ragged route checks remain
 unqualified. The prior nanobind shutdown diagnostics remain observable.
 
+After merging the GDP normalization epsilon change at `9718a044` (base
+`fdae16db`), the GDN and GDP packed, checkpoint, and chain numerical cases
+passed on B200 (`6230177`, 6 passed) and B300 (`6230176`, 8 passed including
+both strict BF16 golden comparisons). JAX uses the native default epsilon.
+
 To reproduce the selections, use `python -m pytest --confcutdir=linear_attention/jax
 -o addopts= -m L0` from `test/python`, with
 `CUBLAS_WORKSPACE_CONFIG=:4096:8` in the determinism jobs.
