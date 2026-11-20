@@ -36,6 +36,46 @@ the same operand bytes, so the split follows the host CPU's `randn` path, not
 the PyTorch version. Outputs from these four files are only comparable with
 records drawn on an aarch64 host.
 
+### SM100 D256 swap-AB in-launch reduction goldens for a 152-SM part (2026-11-20)
+
+The two golden cells of `TestClusterReduce`
+(`test_replay_capture_and_golden[bf16-packed-split8-kwargs0]` and
+`[f16-unpacked-split4-kwargs1]`) had no golden for a GB200: with
+`CUDNN_DETERMINISM_GOLDENS` set they failed there at the comparison, their
+last statement (the
+[record below](#sm100-d256-swap-ab-in-launch-reduction-on-a-152-sm-part-2026-11-19)).
+This adds the two files; no kernel or test code changes.
+
+Runtime: NVIDIA GB200 (compute capability 10.0, 152 SMs, aarch64 host),
+PyTorch 2.14.0+cu130, CUDA 13.0, driver API 13020, cuDNN 92700, CuTe DSL
+4.8.0, tvm-ffi 0.1.14.post0, at commit `edbcff2db`, the commit in front of the
+one that adds the files. The goldens are in `52ecb6a4cddc4ab8/`. The key
+carries the cuDNN version and not its build: the libraries were the
+pre-release debug build 9.27.0.21, and a released 9.27 reads 92700 as well.
+
+```
+S=sdpa/frost/test_sdpa_fwd_decode_d256_sm100.py
+G="TestClusterReduce and replay_capture_and_golden"
+CUDNN_DETERMINISM_RECORD=<new directory> pytest $S -k "$G"            # 2 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> pytest $S -k "$G"           # second process: 2 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> pytest $S -k TestClusterReduce  # 68 passed, 0 skipped
+```
+
+Run from `test/python`. Before its hashes are recorded each cell checks both
+forms against the float64 reference, replays each form eight times with fresh
+buffers and concurrent GPU work, compares the two forms byte for byte and
+compares a retained CUDA graph of the in-launch form with eager execution.
+Both forms reproduce the one record of their path.
+
+The two files equal, byte for byte, the candidates recorded the day before on
+another device of the class at an earlier head of
+[PR #2780](https://github.com/NVIDIA/cudnn-frontend/pull/2780), before the
+152-SM rows existed; no kernel rendering differs between the two heads.
+Against the records of the same two cases for the 148-SM part (x86-64 host) in
+`c84dd9abaee769b4/` the shapes and dtypes are equal and all ten hashes differ,
+those of the inputs included: the aarch64 host draws other operand bytes, as
+in the GH200 record above.
+
 ### SM100 D256 swap-AB in-launch reduction on a 152-SM part (2026-11-19)
 
 The suite of the [record below](#sm100-d256-swap-ab-in-launch-reduction-2026-11-18)
