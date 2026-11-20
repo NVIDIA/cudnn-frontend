@@ -1584,6 +1584,19 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         None,
     ]
     assert perf._kernel_lines(quiet, "")[6] == f"  {'beside its kernel: both':<58}{0:>9}{'--':>11}{0.0:>9.3f}{'0.0 %':>9}", "a row of the plan, printed"
+    # what serves a row is decided from the census entries of ALL its block calls: one library entry names the row; a block whose calls two
+    # entries serve is named by neither, and a kernel of cuDNN Frontend is no library's -- at another call of the block, or in the same call
+    library = (census.Kernel("cublaslt_fp8_gemm", "FlashInfer", "exact", launches=1),)
+    second = ((census.Kernel("fi_mm_fp4", "FlashInfer", "exact", launches=1),), "another.library.call")
+    own = (census.Kernel("fp8_projection", "cuDNN FE", "exact", launches=1),)
+    cases = [[(library, "a.library.call")] * 2, [(library, "a.library.call"), second], [(library, "a.library.call"), (own, "an entry")]]
+    cases += [[(library + own, "a.library.call")] * 2]
+    named = []
+    for calls in cases:
+        served = [census.Site("p", layer, kernels, entry=name) for layer, (kernels, name) in enumerate(calls)]
+        row = perf.kernel_table(*_walked(served, [_records(served)]))["rows"][0]
+        named.append((row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]))
+    assert named == [("a.library.call: p", "library", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 4, 4)]
     # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches; the row of a block
     # a library serves carries the library's entry as the plan names it, and holds the launches of the library's kernel
     sites, claim = _planned(monkeypatch)
@@ -1668,6 +1681,7 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     ]
     rows = perf.kernel_table(traced, busy)["rows"]
     assert [row["label"] for row in rows] == ["x", "y", "fallback: f + g (one row)", "fallback: f", "host path: choice", "host read"]
+    assert [row["relation"] for row in rows] == ["exact", "exact", "fallback", "fallback", "host", "read"], "what the file calls each row"
     assert [block["identity"] for row in rows for block in row["blocks"]] == [None] * 6, "no census: no identity is stated for a block"
     assert rows[2]["launches_per_step"] == 2 * (2 + 3) and [block["calls_per_step"] for block in rows[2]["blocks"]] == [2, 2]
     assert rows[3]["launches_per_step"] == 2 and rows[4]["launches_per_step"] == 1 and rows[2]["us_per_launch_added"] == pytest.approx(4.3)
@@ -1691,6 +1705,16 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     wide = perf.kernel_table(*_walked(many, [_records(many)]))["rows"][1]
     assert wide["label"] == "fallback: a_block_with_a_long_name_0 + 3 more (one row)" and len(wide["blocks"]) == 4 and len(wide["label"]) <= perf.LABEL
     _says("area", "a list of blocks wider than the column is shortened to its first block and `+ N more`.")
+    # a gap that holds a block on a fallback entry and what another block launches beside its kernel is a fallback row: the mark is the chain's
+    shared = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch"), _site("both", 0, "swiglu_fp4", "pytorch"), _site("y", 0, "gate_quant")]
+    assert [(row["label"], row["relation"]) for row in perf.kernel_table(*_walked(shared, [_records(shared)]))["rows"]] == [
+        ("x", "exact"),
+        ("both", "exact"),
+        ("y", "exact"),
+        ("fallback: f + both (one row)", "fallback"),
+        ("beside its kernel: both", "beside"),
+        ("host read", "read"),
+    ]
     # the family's plan: the attention preparation and the attention core of a layer have no exact kernel between them.  On the stack native
     # three blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
     # out-projection, the reference quantiser in front of the output head's multiply -- is the row of its place in the wiring, and says so
