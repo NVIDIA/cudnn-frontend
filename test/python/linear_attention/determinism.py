@@ -38,7 +38,8 @@ def pack(samples):
     return tensors
 
 
-def run(variant, inputs, backward):
+def run(variant, inputs, backward, **op_kwargs):
+    """``op_kwargs`` are further options of the family's op (the fused q/k normalization and its epsilon, say)."""
     names = (*la.LEAF_NAMES[variant], "initial_state")
     leaves = {name: inputs[name].detach().clone().requires_grad_(backward) for name in names}
     kwargs = dict(
@@ -47,6 +48,7 @@ def run(variant, inputs, backward):
         output_final_state=True,
         batch_invariant=True,
         plan_name=f"{variant}_frost",
+        **op_kwargs,
     )
     if variant == "gdp":
         kwargs["num_householder"] = inputs["k"].shape[0] // inputs["q"].shape[0]
@@ -58,12 +60,17 @@ def run(variant, inputs, backward):
     return snapshot(result)
 
 
-def check_reference(variant, inputs, result, backward):
+def check_reference(variant, inputs, result, backward, l2norm_eps=None):
+    """``l2norm_eps``: the reference runs on q / k normalized at this epsilon (the op's fused normalization); the
+    gradients stay those of the raw q / k."""
     names = la.LEAF_NAMES[variant]
     leaves = {name: inputs[name].detach().cpu().double().unsqueeze(0).requires_grad_(backward) for name in names}
     state = inputs["initial_state"].detach().cpu().double().requires_grad_(backward)
     n = inputs["k"].shape[0] // inputs["q"].shape[0] if variant == "gdp" else 1
-    out, final = la.reference_call(variant, leaves, n=n, initial_state=state, cu_seqlens=inputs["cu"].cpu())
+    tensors = dict(leaves)
+    if l2norm_eps is not None:
+        tensors["q"], tensors["k"] = la.l2norm_ref(leaves["q"], l2norm_eps), la.l2norm_ref(leaves["k"], l2norm_eps)
+    out, final = la.reference_call(variant, tensors, n=n, initial_state=state, cu_seqlens=inputs["cu"].cpu())
     expected = {"out": out[0], "final_state": final}
     if backward:
         grads = torch.autograd.grad((out, final), (*leaves.values(), state), (inputs["do"].cpu().double().unsqueeze(0), inputs["dfs"].cpu().double()))
@@ -91,13 +98,13 @@ def split(variant, result, samples):
     return pieces
 
 
-def check_partitions(variant, samples, backward):
-    expected = split(variant, assert_replays(lambda: run(variant, pack(samples), backward), repeats=4), samples)
+def check_partitions(variant, samples, backward, **op_kwargs):
+    expected = split(variant, assert_replays(lambda: run(variant, pack(samples), backward, **op_kwargs), repeats=4), samples)
     orders = [(index,) for index in range(len(samples))]
     orders += [tuple(reversed(range(len(samples)))), (0, 0)]
     for order in orders:
         selected = [samples[index] for index in order]
-        actual = split(variant, run(variant, pack(selected), backward), selected)
+        actual = split(variant, run(variant, pack(selected), backward, **op_kwargs), selected)
         for index, part in zip(order, actual):
             assert_bitwise(part, expected[index], f"batch {order}, sequence {index}")
 

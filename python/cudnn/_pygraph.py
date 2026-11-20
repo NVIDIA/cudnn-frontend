@@ -3926,6 +3926,7 @@ _STRUCTURED_OPS = {
             "overwrite_initial_state",
             "input_context",
             "output_context",
+            "qk_l2norm_eps",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -3974,6 +3975,7 @@ _STRUCTURED_OPS = {
             "overwrite_initial_state",
             "input_context",
             "context_from_forward",
+            "qk_l2norm_eps",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -4007,6 +4009,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "batch_invariant",
             "output_context",
+            "qk_l2norm_eps",
         ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -4028,6 +4031,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "output_context",
             "checkpoint_every_n_tokens",
+            "qk_l2norm_eps",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
