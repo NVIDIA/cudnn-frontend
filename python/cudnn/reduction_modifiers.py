@@ -10,6 +10,8 @@ The semantic keys are the keys of the C++ ``cudnn_frontend::graph::reduction_mod
   They set no identity and no compute type.
 - ``argmax`` and ``argmin`` (a value stream and an index stream that holds the position of each
   element along the reduced dimensions) also return ``identity_values``. They set no compute type.
+  Make the index stream in the graph with ``graph.gen_index`` along the reduced dimension, so that
+  the kernel computes it and reads no index tensor from memory.
 """
 
 import enum

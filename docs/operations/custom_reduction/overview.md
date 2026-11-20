@@ -34,9 +34,11 @@ Graph JSON records inspection structure and the semantic key. Execution-plan ser
 
 ## Argmax as a state transition
 
-Supply a value tensor and an equally shaped tensor of index values. The argmax helper builds comparisons and selects that carry the winning `(value, index)` pair together, including its tie and NaN policy. Its default identities are typed negative infinity and the largest index value. The caller chooses which result to expose:
+Supply a value tensor and an equally shaped index stream. Make the index stream in the graph with `gen_index` along the reduced dimension: the kernel then computes each index and reads no index tensor from memory. The argmax helper builds comparisons and selects that carry the winning `(value, index)` pair together, including its tie and NaN policy. Its default identities are typed negative infinity and the largest index value. The caller chooses which result to expose:
 
 ```python
+indices = graph.gen_index(values, axis=1, compute_data_type=cudnn.data_type.INT32)
+indices.set_data_type(cudnn.data_type.INT32)
 value, index = graph.custom_reduction(
     [values, indices], reduction_dims=[1],
     **cudnn.reduction_modifiers.argmax(cudnn.data_type.FLOAT),

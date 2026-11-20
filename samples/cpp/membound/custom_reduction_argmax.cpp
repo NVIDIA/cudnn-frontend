@@ -6,6 +6,9 @@
 // argmax and argmin with reduction_modifiers, for each NaN rule, over FLOAT, BFLOAT16 and HALF values and an INT32
 // index. Every row is checked against a host reference of the rule. The rows hold NaN (one, two, all, any payload and
 // sign), ties, signed zeros, infinities, subnormals and random bit patterns.
+//
+// The index stream is made in the graph: a GEN_INDEX pointwise operation counts 0, 1, ... along the reduced axis.
+// The kernel computes the index, so it reads no index tensor from memory, and the caller binds only the values.
 
 #include <catch2/catch_test_macros.hpp>
 #include "../utils/helpers.h"
@@ -298,25 +301,29 @@ struct Arg_graph {
     Arg_nan_rule rule;
     std::shared_ptr<fe::graph::Graph> graph;
     std::shared_ptr<fe::graph::Tensor_attributes> value;
-    std::shared_ptr<fe::graph::Tensor_attributes> index;
     std::shared_ptr<fe::graph::Tensor_attributes> out;
     int64_t mismatches = 0;
 };
 
 Arg_graph
 build_arg_graph(cudnnHandle_t handle, Value_type const& vt, Rows_by_extent shape, bool is_max, Arg_nan_rule rule) {
-    Arg_graph g{is_max, rule, std::make_shared<fe::graph::Graph>(), nullptr, nullptr, nullptr, 0};
+    Arg_graph g{is_max, rule, std::make_shared<fe::graph::Graph>(), nullptr, nullptr, 0};
     std::vector<int64_t> const dims   = {shape.rows, shape.extent};
     std::vector<int64_t> const stride = {shape.extent, 1};
     g.value                           = g.graph->tensor(
         fe::graph::Tensor_attributes().set_name("value").set_dim(dims).set_stride(stride).set_data_type(vt.type));
-    g.index =
-        g.graph->tensor(fe::graph::Tensor_attributes().set_name("index").set_dim(dims).set_stride(stride).set_data_type(
-            fe::DataType_t::INT32));
+    // The index stream: GEN_INDEX along the reduced axis 1 gives each element its position in the row.
+    auto index = g.graph->pointwise(g.value,
+                                    fe::graph::Pointwise_attributes()
+                                        .set_name("index")
+                                        .set_mode(fe::PointwiseMode_t::GEN_INDEX)
+                                        .set_axis(1)
+                                        .set_compute_data_type(fe::DataType_t::INT32));
+    index->set_data_type(fe::DataType_t::INT32);
     auto attributes = Attributes().set_name(is_max ? "argmax" : "argmin").set_reduction_dims({1});
     attributes      = is_max ? fe::graph::reduction_modifiers::argmax(attributes, vt.type, fe::DataType_t::INT32, rule)
                              : fe::graph::reduction_modifiers::argmin(attributes, vt.type, fe::DataType_t::INT32, rule);
-    g.out           = g.graph->custom_reduction({g.value, g.index}, attributes).at(1);
+    g.out           = g.graph->custom_reduction({g.value, index}, attributes).at(1);
     g.out->set_output(true);
 
     REQUIRE(g.graph->validate().is_good());
@@ -353,15 +360,9 @@ run_parity(Value_type const& vt, std::vector<Rows_by_extent> const& shapes) {
         std::vector<uint32_t> words(elements);
         std::vector<float> values(elements);
         std::vector<uint16_t> narrow(vt.bits == 16 ? elements : 0);
-        std::vector<int32_t> iota(elements);
-        for (size_t i = 0; i < elements; ++i) {
-            iota[i] = static_cast<int32_t>(static_cast<int64_t>(i) % shape.extent);
-        }
         Device_buffer d_value(elements * word_size);
-        Device_buffer d_index(elements * sizeof(int32_t));
         Device_buffer d_out(static_cast<size_t>(shape.rows) * sizeof(int32_t));
         Device_buffer workspace(static_cast<size_t>(workspace_size));
-        CUDA_CHECK(cudaMemcpy(d_index.get(), iota.data(), elements * sizeof(int32_t), cudaMemcpyHostToDevice));
         std::vector<int32_t> got(static_cast<size_t>(shape.rows));
         std::vector<Row_reference> max_reference(static_cast<size_t>(shape.rows));
         std::vector<Row_reference> min_reference(static_cast<size_t>(shape.rows));
@@ -389,7 +390,7 @@ run_parity(Value_type const& vt, std::vector<Rows_by_extent> const& shapes) {
             for (auto& g : graphs) {
                 CUDA_CHECK(cudaMemset(d_out.get(), 0xFF, got.size() * sizeof(int32_t)));
                 std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> pack = {
-                    {g.value, d_value.get()}, {g.index, d_index.get()}, {g.out, d_out.get()}};
+                    {g.value, d_value.get()}, {g.out, d_out.get()}};
                 REQUIRE(g.graph->execute(handle, pack, workspace.get()).is_good());
                 CUDA_CHECK(cudaDeviceSynchronize());
                 CUDA_CHECK(cudaMemcpy(got.data(), d_out.get(), got.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
@@ -447,15 +448,9 @@ run_every_pattern(Value_type const& vt) {
         size_t const elements     = static_cast<size_t>(rows * extent);
         std::vector<uint16_t> words(elements);
         std::vector<float> values(elements);
-        std::vector<int32_t> iota(elements);
-        for (size_t i = 0; i < elements; ++i) {
-            iota[i] = static_cast<int32_t>(static_cast<int64_t>(i) % extent);
-        }
         Device_buffer d_value(elements * sizeof(uint16_t));
-        Device_buffer d_index(elements * sizeof(int32_t));
         Device_buffer d_out(static_cast<size_t>(rows) * sizeof(int32_t));
         Device_buffer workspace(static_cast<size_t>(workspace_size));
-        CUDA_CHECK(cudaMemcpy(d_index.get(), iota.data(), elements * sizeof(int32_t), cudaMemcpyHostToDevice));
         std::vector<int32_t> got(static_cast<size_t>(rows));
         for (int probe = 0; probe < 4; ++probe) {
             for (int64_t row = 0; row < rows; ++row) {
@@ -480,7 +475,7 @@ run_every_pattern(Value_type const& vt) {
             for (auto& g : graphs) {
                 CUDA_CHECK(cudaMemset(d_out.get(), 0xFF, got.size() * sizeof(int32_t)));
                 std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> pack = {
-                    {g.value, d_value.get()}, {g.index, d_index.get()}, {g.out, d_out.get()}};
+                    {g.value, d_value.get()}, {g.out, d_out.get()}};
                 REQUIRE(g.graph->execute(handle, pack, workspace.get()).is_good());
                 CUDA_CHECK(cudaDeviceSynchronize());
                 CUDA_CHECK(cudaMemcpy(got.data(), d_out.get(), got.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));

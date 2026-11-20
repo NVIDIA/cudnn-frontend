@@ -214,6 +214,8 @@ min(Custom_reduction_attributes attributes) {
 }
 
 // Two streams, (value, index); the index stream holds the position of each element along the reduced dimensions.
+// Make the index stream in the graph with a GEN_INDEX pointwise operation along the reduced dimension, so that the
+// kernel computes it and reads no index tensor from memory.
 // Sets the reducer, the semantic key and the identities: (-inf, largest index) for argmax and (+inf, largest index)
 // for argmin, or (NaN, largest index) for IGNORE_NAN, in value_type and index_type.
 [[nodiscard]] inline Custom_reduction_attributes
