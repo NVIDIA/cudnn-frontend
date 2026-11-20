@@ -732,6 +732,23 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
 
             self._compiled_kernel = tensor_api
 
+    def _check_flat_scale_binding(self, tensor, desc, elements, name):
+        """Validate each physical scale binding before its dense view is rebuilt in-kernel."""
+        if tensor is None:
+            raise ValueError(f"{name} must be provided")
+        if tensor.dtype != desc.dtype:
+            raise ValueError(f"{name} must have dtype {desc.dtype}, got {tensor.dtype}")
+        if tensor.device != self.a_desc.device:
+            raise ValueError(f"{name} must be on {self.a_desc.device}, got {tensor.device}")
+        if tensor.ndim != len(desc.shape) or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous packed buffer of rank {len(desc.shape)}")
+        if tensor.numel() < elements:
+            raise ValueError(f"{name} requires at least {elements} packed scale elements, got {tensor.numel()}")
+        # The compiled fake promises this alignment. Check the current pointer,
+        # including storage offsets, even when all other metadata is unchanged.
+        if tensor.data_ptr() % 16:
+            raise ValueError(f"{name} must have a 16-byte aligned data pointer")
+
     def execute(
         self,
         a_tensor: torch.Tensor,
@@ -759,6 +776,8 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
 
         Colwise scales are written directly in standard GEMM-blocked order
         within each flat per-expert segment, independently of ``glu_layout``.
+        Physical scale buffers are checked on every binding, including their
+        capacity for the current M, without allocations or device reads.
         """
         import torch
 
@@ -769,8 +788,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
             raise ValueError("gate_then_up requires F divisible by 128")
         if a_tensor.shape[0] == 0:
             return
-        if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
         if self.d_quant and sfd_tensor is None:
             raise ValueError("sfd_tensor must be provided when D is NVFP4")
         rht_tensor = None
@@ -793,6 +810,31 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         if self.weight_mode == MoEWeightMode.DENSE:
             if b_tensor is None or sfb_tensor is None:
                 raise ValueError("b_tensor and sfb_tensor must be provided in dense mode")
+        elif b_ptrs is None or sfb_ptrs is None:
+            raise ValueError("b_ptrs and sfb_ptrs must be provided in discrete mode")
+
+        # Flat SF signatures have dynamic extents/strides, but the kernels use
+        # only their base pointers. Constructor checks do not protect rebindings.
+        m = a_tensor.shape[0]
+        sf_rows = ceil_div(m, 128)
+        if self.sfa_is_flat:
+            elements = 512 * sf_rows * ceil_div(2 * a_tensor.shape[1], 4 * self.sf_vec_size)
+            self._check_flat_scale_binding(sfa_tensor, self.sfa_desc, elements, "sfa_tensor")
+        if self.weight_mode == MoEWeightMode.DENSE and self.sfb_is_flat:
+            n, packed_k, experts = b_nkl(b_tensor)
+            elements = 512 * ceil_div(n, 128) * ceil_div(2 * packed_k, 4 * self.sf_vec_size) * experts
+            self._check_flat_scale_binding(sfb_tensor, self.sfb_desc, elements, "sfb_tensor")
+        output_sf_elements = 512 * sf_rows * ceil_div(self.n_out, 4 * self.sf_vec_size)
+        if self.d_quant and self.sfd_is_flat:
+            self._check_flat_scale_binding(sfd_tensor, self.sfd_desc, output_sf_elements, "sfd_tensor")
+        if self.generate_rht_rowwise and self.rht_quant and self.sfrht_is_flat:
+            self._check_flat_scale_binding(sfrht_rowwise_tensor, self.sfrht_rowwise_desc, output_sf_elements, "sfrht_rowwise_tensor")
+        if self.generate_rht_colwise:
+            self._check_flat_scale_binding(sfrht_colwise_tensor, self.sfrht_colwise_desc, m * self.n_out // self.sf_vec_size, "sfrht_colwise_tensor")
+
+        if current_stream is None:
+            current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
+        if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(
                 a_tensor,
                 b_tensor,
@@ -812,8 +854,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 current_stream,
             )
         else:
-            if b_ptrs is None or sfb_ptrs is None:
-                raise ValueError("b_ptrs and sfb_ptrs must be provided in discrete mode")
             self._compiled_kernel(
                 a_tensor,
                 b_ptrs,

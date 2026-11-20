@@ -68,6 +68,16 @@ The class similarly accepts caller-owned natural-rank outputs; contiguous
 rowwise scale output buffers may have any rank. Trace-time views normalize
 these tensors for the existing kernel, without per-execution tensor reshapes.
 
+For plans compiled with contiguous scale buffers, each class-API `execute()`
+validates the current SFA, dense SFB, SFD, and rowwise/colwise SFRHT bindings.
+These buffers must retain their compiled dtype,
+rank and CUDA device, be contiguous and 16-byte aligned, and cover the packed
+scale extent for the current dimensions. In particular, increasing M requires
+sufficient new scale storage even when the compiled plan is reused. Invalid
+bindings raise `ValueError` before launch; these checks read only tensor metadata.
+In discrete mode, the caller remains responsible for the allocations addressed
+by the raw `sfb_ptrs` entries.
+
 Natural tensor ranks work with both `glu_layout="interleaved_32"` and
 `glu_layout="gate_then_up"`. Colwise RHT scales use the same standard
 GEMM-blocked output order for either branch layout. Legacy input ranks and

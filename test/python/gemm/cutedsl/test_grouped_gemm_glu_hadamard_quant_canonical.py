@@ -237,3 +237,110 @@ def test_natural_rank_no_rht_and_empty(layout, empty):
     assert_bitwise(live_bits(legacy_outputs(actual)), live_bits(old), "empty or no-RHT natural call")
     assert actual["rht_rowwise_tensor"] is None and actual["rht_colwise_tensor"] is None
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("layout", ["gate_then_up", "interleaved_32"])
+@pytest.mark.parametrize("mode", ["row_fp4", "col_fp4"])
+@pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
+def test_prepared_scale_rebinding(layout, mode, discrete, monkeypatch):
+    import importlib
+
+    api_module = importlib.import_module("cudnn.gemm.cutedsl.grouped.glu_hadamard_quant.api")
+    cache = {}
+    monkeypatch.setattr(api_module, "_cache_of_GroupedGemmGluHadamardQuantSm100Objects", cache)
+    prepared = None
+    previous_scales = None
+    for counts in ((256, 0, 512), (512, 256, 512)):
+        kwargs, owners = natural_kwargs(make_problem(f=128, counts=counts, precision="nvfp4"), mode, discrete, layout)
+        expected = api_module.grouped_gemm_glu_hadamard_quant_wrapper_sm100(**kwargs)
+        assert len(cache) == 1, "Changing M must reuse the prepared kernel"
+        api = next(iter(cache.values()))
+        if prepared is not None:
+            assert api is prepared
+        prepared = api
+        outputs = {name: torch.empty_like(tensor) if tensor is not None else None for name, tensor in expected.items()}
+        execute = {
+            name: kwargs[name]
+            for name in (
+                "a_tensor",
+                "b_tensor",
+                "b_ptrs",
+                "sfa_tensor",
+                "sfb_tensor",
+                "sfb_ptrs",
+                "padded_offsets",
+                "alpha_tensor",
+                "prob_tensor",
+                "bias_tensor",
+            )
+            if name in kwargs
+        }
+        execute.update(outputs, norm_const=16.0, rht_norm_const=16.0)
+        api.execute(**execute)
+        torch.cuda.synchronize()
+        assert_bitwise(live_bits(outputs), live_bits(expected), "valid prepared baseline")
+        scales = {name: tensor for name, tensor in execute.items() if name.startswith("sf") and name.endswith("_tensor") and tensor is not None}
+
+        def forbid_launch(*args, **kwargs):
+            raise AssertionError("Invalid scale binding reached the GPU launcher")
+
+        for name, tensor in scales.items():
+            faults = ["short", "strided", "dtype", "device", "alignment"]
+            if previous_scales is not None and previous_scales[name].numel() < tensor.numel():
+                faults.append("previous_m")
+            for fault in faults:
+                # Keep even the invalid views inside a large owned allocation.
+                # The launch recorder also prevents invalid-device/dtype probes
+                # from poisoning the CUDA context when this test runs on old code.
+                storage = torch.full((2 * tensor.numel() + 256,), 0xA5, dtype=torch.uint8, device=tensor.device)
+                if fault == "short":
+                    invalid = storage[: tensor.numel() // 2].view(tensor.dtype)
+                elif fault == "strided":
+                    invalid = storage[: 2 * tensor.numel() : 2].view(tensor.dtype)
+                elif fault == "dtype":
+                    invalid = storage[: tensor.numel()]
+                elif fault == "device":
+                    invalid = torch.empty_like(tensor, device="cpu")
+                elif fault == "alignment":
+                    invalid = storage[1 : tensor.numel() + 1].view(tensor.dtype)
+                else:
+                    invalid = previous_scales[name]
+                guarded = {"storage": storage, **live_bits(outputs)}
+                before = {key: value.clone() for key, value in guarded.items()}
+                with monkeypatch.context() as patch:
+                    patch.setattr(api, "_compiled_kernel", forbid_launch)
+                    with pytest.raises(ValueError, match=name):
+                        api.execute(**dict(execute, **{name: invalid}))
+                torch.cuda.synchronize()
+                assert_bitwise(guarded, before, f"rejected {name}: {fault}")
+
+        # Fresh, aligned storage is legal, including after rejected bindings.
+        rebound = dict(execute)
+        for name, tensor in scales.items():
+            storage = torch.empty(tensor.numel() + 32, dtype=tensor.dtype, device=tensor.device)
+            fresh = storage[16 : 16 + tensor.numel()]
+            fresh.copy_(tensor)
+            rebound[name] = fresh
+        prior_sync_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            api.execute(**rebound)
+        finally:
+            torch.cuda.set_sync_debug_mode(prior_sync_mode)
+        torch.cuda.synchronize()
+        actual = {name: rebound[name] for name in outputs}
+        assert_bitwise(live_bits(actual), live_bits(expected), "valid bindings after rejection")
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                try:
+                    torch.cuda.set_sync_debug_mode("error")
+                    api.execute(**rebound)
+                finally:
+                    torch.cuda.set_sync_debug_mode(prior_sync_mode)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_bitwise(live_bits(actual), live_bits(expected), "prepared scale checks during capture")
+        finally:
+            graph.reset()
+        previous_scales = scales
