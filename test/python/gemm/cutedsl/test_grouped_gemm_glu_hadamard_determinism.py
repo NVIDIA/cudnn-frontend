@@ -99,16 +99,52 @@ def test_hadamard_sfb_warm_stress(monkeypatch, discrete, tmem):
     reference(problem, actual)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = invoke(args)
-    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
-    report = assert_warm_stress(
-        StressCase(
-            f"canonical Hadamard SFB M=[1024,0,2048] N=2048 K=4096 discrete={discrete} tmem={tmem}",
-            launch=graph.replay,
-            outputs=captured,
-            thread_blocks=2 * clusters,
-            refills_per_launch=1,
+    try:
+        with torch.cuda.graph(graph):
+            captured = invoke(args)
+        clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+        report = assert_warm_stress(
+            StressCase(
+                f"canonical Hadamard SFB M=[1024,0,2048] N=2048 K=4096 discrete={discrete} tmem={tmem}",
+                launch=graph.replay,
+                outputs=captured,
+                thread_blocks=2 * clusters,
+                refills_per_launch=1,
+            )
         )
-    )
-    print(report.text())
+        print(report.text())
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("case", ["quant", "dense-smem", "discrete-smem", "dense-tmem"])
+def test_warm_stress_resets_graph_on_skip(monkeypatch, case):
+    import warm_stress
+
+    graphs = []
+    resets = []
+    original_reset = torch.cuda.CUDAGraph.reset
+
+    def skip_stress(stress_case):
+        graphs.append(stress_case.launch.__self__)
+        pytest.skip("Exercise the warm-stress budget skip cleanup")
+
+    def record_reset(graph):
+        resets.append(graph)
+        original_reset(graph)
+
+    monkeypatch.setattr(warm_stress, "assert_warm_stress", skip_stress)
+    monkeypatch.setattr(torch.cuda.CUDAGraph, "reset", record_reset)
+    try:
+        with pytest.raises(pytest.skip.Exception, match="budget skip cleanup"):
+            if case == "quant":
+                module = importlib.import_module("gemm.cutedsl.test_grouped_gemm_glu_hadamard_quant_determinism")
+                module.test_colwise_scale_warm_stress(monkeypatch)
+            else:
+                test_hadamard_sfb_warm_stress(monkeypatch, discrete=case == "discrete-smem", tmem=case == "dense-tmem")
+        assert len(graphs) == 1
+        assert graphs[0] in resets, "The skipped stress test must reset its captured graph"
+    finally:
+        # The RED control must also leave the CUDA context clean on old code.
+        for graph in graphs:
+            original_reset(graph)
