@@ -1906,18 +1906,21 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     ]
     assert perf._kernel_lines(quiet, "")[6] == f"  {'beside its kernel: both':<58}{0:>9}{'--':>11}{0.0:>9.3f}{'0.0 %':>9}", "a row of the plan, printed"
     # what serves a row is decided from the census entries of ALL its block calls: one library entry names the row; a block whose calls two
-    # entries serve is named by neither, and a kernel of cuDNN Frontend is no library's -- at another call of the block, or in the same call
+    # entries serve is named by neither, and a kernel of cuDNN Frontend is no library's -- at another call of the block, or in the same call --
+    # nor is an operator of PyTorch that a call launches beside the library's kernel
     library = (census.Kernel("cublaslt_fp8_gemm", "FlashInfer", "exact", launches=1),)
     second = ((census.Kernel("fi_mm_fp4", "FlashInfer", "exact", launches=1),), "another.library.call")
     own = (census.Kernel("fp8_projection", "cuDNN FE", "exact", launches=1),)
+    operator = (census.Kernel("embedding_gather", "PyTorch", "exact", launches=1),)
     cases = [[(library, "a.library.call")] * 2, [(library, "a.library.call"), second], [(library, "a.library.call"), (own, "an entry")]]
-    cases += [[(library + own, "a.library.call")] * 2]
+    cases += [[(library + own, "a.library.call")] * 2, [(library + operator, "a.library.call")] * 2]
     named = []
     for calls in cases:
         served = [census.Site("p", layer, kernels, entry=name) for layer, (kernels, name) in enumerate(calls)]
         row = perf.kernel_table(*_walked(served, [_records(served)]))["rows"][0]
         named.append((row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]))
-    assert named == [("a.library.call: p", "library", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 4, 4)]
+    assert named == [("a.library.call: p", "library", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 4, 4), ("p", "exact", 4, 4)]
+    assert set(perf.OWN_ORIGINS) == {"cuDNN FE", "PyTorch"} == {kernel.origin for kernel in own + operator}, "the two origins that are no library's"
     # a name longer than its column -- a block's own, or a library's entry in front of its block -- is cut at the column: the columns behind it
     # stay where they are and no line is wider than the screen; the file's row still names the block and its entry in full
     long_block = "a_block_whose_name_alone_is_longer_than_the_column_of_the_names"
@@ -1930,6 +1933,16 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     shown = perf._kernel_lines(cut, "")
     assert shown[3] == f"  {long_block[:58]}{1:>9}{'4.30':>11}{0.004:>9.3f}{'33.3 %':>9}", "the columns behind a name that fills its column"
     assert len({len(line) for line in shown[3:]}) == 1 and max(len(line) for line in shown) <= perf.WIDTH, "every row in its columns, no line too wide"
+    # the row of a wiring gap is cut at the same column, behind what the row is: one block of a long name, and two whose first name is long
+    gaps = [_site("first", 0, "gate_quant"), _site(long_block, 0, "pytorch"), _site("second", 0, "gate_quant")]
+    gaps += [_site(long_block, 1, "cublas"), _site("tail", 1, "pytorch")]
+    gap = perf.kernel_table(*_walked(gaps, [_records(gaps)]))
+    assert len(f"fallback: {long_block}") > perf.LABEL and [row["relation"] for row in gap["rows"]] == ["exact", "exact", "fallback", "fallback", "read"]
+    assert [row["label"] for row in gap["rows"][2:4]] == [f"fallback: {long_block}"[:58]] * 2, "the name alone, and `+ 1 more (one row)` behind it: cut alike"
+    assert [[block["block"] for block in row["blocks"]] for row in gap["rows"][2:4]] == [[long_block], [long_block, "tail"]], "the file names every block"
+    shown = perf._kernel_lines(gap, "")
+    assert shown[5].startswith(f"  {f'fallback: {long_block}'[:58]}{2:>9}{'--':>11}") and len({len(line) for line in shown[3:]}) == 1
+    assert max(len(line) for line in shown) <= perf.WIDTH, "every row in its columns, no line too wide"
     # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches; the row of a block
     # a library serves carries the library's entry as the plan names it, and holds the launches of the library's kernel
     sites, claim = _planned(monkeypatch)

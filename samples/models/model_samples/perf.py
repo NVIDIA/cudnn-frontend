@@ -96,7 +96,8 @@ OWN_ORIGINS = ("cuDNN FE", "PyTorch")
 #: of cuDNN Frontend or of an operator of PyTorch (``exact``), a library's kernel (``library``), the host read
 #: (``read``: a copy to the host, not a kernel).  A time per launch is printed for them.  The edge of ``exact``
 #: (``_row_kind``): a block that two library entries serve, and a block call that launches a library's kernel
-#: together with one of cuDNN Frontend, are ``exact`` too -- every launch of such a row is still one kernel
+#: together with one of cuDNN Frontend or with an operator of PyTorch, are ``exact`` too -- every launch of such a
+#: row is still one kernel
 ONE_KERNEL = ("exact", "library", "read")
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
