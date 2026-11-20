@@ -27,7 +27,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from cudnn.engines.base import PlanConfig
 
-from .engines import ENGINE_SPECS, EngineSpec, SdpaBwdKnobs, mismatch
+from .engines import ENGINE_SPECS, EngineSpec, SdpaBwdKnobs, legal_implementations, mismatch, policy_name
 
 
 def _sm120_default_tiles(facts) -> Optional[Tuple[int, int]]:
@@ -60,7 +60,7 @@ def default_knobs(spec: EngineSpec, facts) -> Optional[SdpaBwdKnobs]:
     caps = spec.capabilities
     if not caps.tile_ms and not caps.tile_ns:
         return None
-    resolver = _DEFAULT_TILE_RESOLVERS.get(spec.name)
+    resolver = _DEFAULT_TILE_RESOLVERS.get(policy_name(spec))
     if resolver is not None:
         tiles = resolver(facts)
         if tiles is None:
@@ -77,6 +77,14 @@ def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]
         engine_id = offered.get(spec.name)
         if engine_id is not None and mismatch(spec.capabilities, facts, None) is None:
             yield engine_id, spec
+
+
+def _placement_row(spec: EngineSpec) -> str:
+    # The Ada D64 study timed the dedicated body. Its shared policy still
+    # governs the generic owner and fallback order.
+    if spec.name == "sdpa_bwd_sm89_f16_d64":
+        return spec.name
+    return policy_name(spec)
 
 
 def _leads(spec: EngineSpec, facts) -> bool:
@@ -103,23 +111,36 @@ def _leads(spec: EngineSpec, facts) -> bool:
     A measured entry in ``cudnn.sdpa.placement_table`` answers first; the rules above decide every graph without one."""
     from cudnn.sdpa import placement_table
 
-    measured = placement_table.lookup(spec.name, facts)
+    name = policy_name(spec)
+    measured = placement_table.lookup(_placement_row(spec), facts)
     if measured is not None:
         return measured
-    if spec.name == "sdpa_bwd_sm100_d128":
+    if name == "sdpa_bwd_sm100_d128":
         return facts.device_cc in D128_LEAD_CCS and facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
-    if spec.name == "sdpa_bwd_sm100_d256":
+    if name == "sdpa_bwd_sm100_d256":
         return _d256_leads(facts)
-    return spec.name not in TRAIL_ONLY_ROWS
+    return name not in TRAIL_ONLY_ROWS
 
 
-TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
+TRAIL_ONLY_ROWS = frozenset(
+    {
+        "sdpa_bwd_sm80",
+        "sdpa_bwd_sm89",
+        "sdpa_bwd_sm120",
+        "sdpa_bwd_sm107",
+        "sdpa_bwd_sm107_d512",
+        "sdpa_bwd_sm100_mxfp8",
+        "sdpa_bwd_sm107_fp8",
+        "sdpa_bwd_sm107_mxfp8",
+        "sdpa_bwd_sm107_d192",
+    }
+)
 """Default-offered rows with no hand-written lead shard: ranked after the backend's block, so they serve a graph only when the
 backend declines it (a correctness fallback, not a performance claim) -- except where a measured ``placement_table`` entry
 leads the graph's class (:func:`_measured_lead`)."""
 
 
-SQUARE_ONLY_STUDIES = ("sm80_bwd_square_", "sm120_bwd_")
+SQUARE_ONLY_STUDIES = ("sm80_bwd_square_", "sm120_bwd_", "sm120_det_bwd_", "sm80_det_bwd_")
 """Study name prefixes whose train and holdout timed square graphs only. ``class_key`` excludes squareness (Rule S12: a feature the key does not
 hold), so a non-square graph that one of their entries answers for keeps trailing. A100 under a left window: every square holdout case ran faster
 than the backend, while q < kv ran up to 1.45x slower in the same classes (b12 40/8 d64 q128 kv8960, 7.0 vs 4.8 ms). RTX 5090 (cc 12.0): the
@@ -133,10 +154,11 @@ def _measured_lead(spec: EngineSpec, facts) -> bool:
     same goes for a non-square graph whose entry comes from a study in :data:`SQUARE_ONLY_STUDIES`."""
     from cudnn.sdpa import placement_table
 
-    entry = placement_table.matched_entry(spec.name, facts)
+    name = _placement_row(spec)
+    entry = placement_table.matched_entry(name, facts)
     if entry is not None and facts.s_q != facts.s_kv and entry.study.startswith(SQUARE_ONLY_STUDIES):
         return False
-    return not facts.padded and not facts.seq_q_trim and placement_table.lookup(spec.name, facts) is True
+    return not facts.padded and not facts.seq_q_trim and placement_table.lookup(name, facts) is True
 
 
 D128_LEAD_CCS = ((10, 0), (10, 3), (10, 7))
@@ -170,7 +192,7 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     from cudnn.engines.heuristics import BACKEND, LAST_RESORT
 
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and not _measured_lead(spec_of[p.engine_id], facts)]
+    last = [p for p in ours if policy_name(spec_of[p.engine_id]) in TRAIL_ONLY_ROWS and not _measured_lead(spec_of[p.engine_id], facts)]
     lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
     trail = [p for p in ours if p not in last and p not in lead]
     if last:
@@ -181,16 +203,26 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 def _lists_last(spec: EngineSpec, facts) -> bool:
     """Rows listed after the other eligible rows: the d192 half row on a dense graph, where the d256 row's native
     192/128 geometry serves the same declaration."""
-    return spec.name == "sdpa_bwd_sm100_d192" and not facts.thd
+    return policy_name(spec) == "sdpa_bwd_sm100_d192" and not facts.thd
+
+
+def _default_rank(spec: EngineSpec, facts) -> int:
+    """An explicit engine's place among its row's legal bodies for ``facts`` (0 = the row's default)."""
+    legal = legal_implementations(spec.capabilities, facts)
+    return legal.index(spec.capabilities.implementation) if spec.capabilities.implementation in legal else 0
 
 
 def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
-    """One complete entry per eligible row, in ``ENGINE_SPECS`` order except for :func:`_lists_last`; ``kind``
-    does not change the answer (no runner-up candidates to thin out)."""
+    """One complete entry per eligible engine, in ``ENGINE_SPECS`` order except for :func:`_lists_last` and, among
+    owners legal for the same graph, the row's default first; ``kind`` does not change the answer (no runner-up
+    candidates to thin out)."""
     out: List[Tuple[EngineSpec, PlanConfig]] = []
     for engine_id, spec in _eligible(facts, offered):
         knobs = default_knobs(spec, facts)
         if knobs is None or mismatch(spec.capabilities, facts, knobs) is None:
             out.append((spec, PlanConfig(engine_id, knobs)))
-    out.sort(key=lambda entry: _lists_last(entry[0], facts))
+    row_position = {}
+    for position, spec in enumerate(ENGINE_SPECS):
+        row_position.setdefault(policy_name(spec), position)
+    out.sort(key=lambda entry: (_lists_last(entry[0], facts), row_position[policy_name(entry[0])], _default_rank(entry[0], facts)))
     return [plan for _, plan in out]

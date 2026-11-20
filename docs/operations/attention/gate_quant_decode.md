@@ -78,8 +78,23 @@ kernel module is imported.
 never written. Without it the entry returns a view of ONE entry-owned `[160, width]` buffer whose bytes are valid until
 the entry's NEXT call from any host thread. Stream order does not serialize host calls, so two host threads that share
 one entry, on one stream or two, pass their own `out` (or build one entry each). The entry-owned buffer is allocated
-at the first `compile()` or call that passes no `out`; compile without `out` before a CUDA-graph capture if a captured
-call will use it.
+at the first `compile()`, `output(rows)` or call that passes no `out` and is not declined (every decline runs before
+the allocation: a declined one allocates nothing); compile without `out` before a CUDA-graph capture if a captured
+call will use it. The buffer is allocated on torch's current stream of the entry's device at
+that moment and that stream can still write it (torch fills it under deterministic algorithms; a recycled block can
+carry a write the stream still owes it): every launch that writes its bytes, by default or as a view passed back as
+`out`, by this entry or by another entry that orders its launches the same way (today `AddNormQuantDecode`,
+`AttentionPrepareDecode` and `AttentionGateQuantDecode`), is ordered behind that work on whatever stream it runs. The
+launch stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a
+stream or the device (on the allocating stream itself the event is already behind the launch and the wait is free; a
+stream that was given the raw handle of a destroyed allocating stream waits like any other); a captured call that
+finds the work still pending waits for that one event on the host before its launch (set-up, never part of a replay;
+not needed for a buffer allocated before the capture once its stream's earlier work is done). Not ordered: a buffer
+allocated inside a stream capture (nothing is recorded: allocate before the capture). An allocation on the legacy
+default stream while a blocking stream of another host thread captures raises torch's error: allocate before that
+capture or on a stream of your own. Once a call has seen it complete nothing is kept of it; while it is pending on the
+device, every call of such an entry on that device reads the device's records. The caller's: `attn`, `gate` and
+`scale`, which a launch only reads, and its own reads and writes of the returned view outside a call.
 
 **Layout.** `attn`, `gate` and `out` are contiguous and start at a 16-byte aligned address (`scale`: 4-byte); every
 operand lives on the entry's device.
@@ -101,6 +116,19 @@ programmatic-stream-serialization attribute, and transitively its own dependents
 the attribute is unaffected. The release is verified standalone only: its bytes equal the default's with no dependent
 grid on the stream; a chain with a dependent launched under the attribute is not covered by this suite.
 
+## Launch facts
+
+The entry states what a row count launches without launching it: three read-only answers, with `cfg_for`'s argument.
+
+| fact | answer |
+| --- | --- |
+| `kernel_symbols_for(rows)` | the symbol of the kernel compiled for the config of `rows`, as a one-element tuple; empty until that config is compiled. One compiled kernel serves every row count of the config |
+| `form_for(rows)` | the form as plain data: `{"THREADS": ..., "PDL_RELEASE": ...}`, the fields of the config `cfg_for` returns with the launch knob applied. The compile key is the config alone, so nothing else is part of it. A fresh `dict` on every call |
+| `launch_shape_for(rows)` | `(grid, block, shared_memory)`: a flat grid of `ceil(rows x width / 8 / THREADS)` thread blocks, `THREADS` threads, no shared memory -- `((3, 1, 1), (256, 1, 1), 0)` for one row of width 6144. A profiler's kernel record of the launch reads the same three values |
+
+A row count outside 1 .. 160 is a typed decline (`ValueError` for one that is not a positive `int`,
+`NotImplementedError` past 160), and none of the three compiles, launches or touches device memory.
+
 ## Support matrix
 
 | question | answer |
@@ -114,7 +142,8 @@ grid on the stream; a chain with a dependent launched under the attribute is not
 | DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 the CUDA 12.9 and CUDA 13.4 compiler flavours of 4.8.0 render the same PTX and are both served; on cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT) |
 
 Tests: `test/python/attention_gate/frost/test_gate_quant_decode.py` (host declines, config and pick pins, the rendering
-pinned per target and tied to the entry's own launch arguments, the device cells against the fp64 reference, an entry
+pinned per target and tied to the entry's own launch arguments, the launch facts against the configuration arithmetic
+and against the profiler's record of a launch, the device cells against the fp64 reference, an entry
 on a device that is not the caller's current one), `test_gate_quant_decode_determinism.py` (replay, batch
 invariance, goldens) and `test_gate_quant_decode_census.py` (`pytest -m L2`: every bf16 pair). Source:
 `python/cudnn/attention_gate/frost/`.

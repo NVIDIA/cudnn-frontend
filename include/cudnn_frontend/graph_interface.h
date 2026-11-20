@@ -87,6 +87,36 @@ class Graph : public ICudnn, public INode {
     // uid -> byte alignment execute() enforces on the caller's pointer (SDPA operands, #1571).
     mutable AlignedOperands cached_aligned_operands;
 
+    // Override checks need each operand's addressing mode as well as its alignment.
+    // Cache it with the existing values so execute still needs only one UID lookup.
+    std::unordered_map<uid_t, std::tuple<int64_t, int64_t, bool>> cached_aligned_stride_operands;
+
+    error_t
+    refresh_aligned_stride_operands_(std::unordered_set<uid_t> const &ragged_uids = {}) {
+        cached_aligned_stride_operands.clear();
+        for (auto const &[uid, value] : cached_aligned_operands) {
+            cached_aligned_stride_operands.emplace(
+                uid, std::make_tuple(value.first, value.second, ragged_uids.count(uid) != 0));
+        }
+        if (cached_aligned_stride_operands.empty()) {
+            return {error_code_t::OK, ""};
+        }
+        std::vector<std::shared_ptr<Tensor_attributes>> tensors;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensor_attributes_subtree(tensors));
+        tensors.insert(tensors.end(), full_graph_inputs.begin(), full_graph_inputs.end());
+        tensors.insert(tensors.end(), full_graph_outputs.begin(), full_graph_outputs.end());
+        tensors.insert(tensors.end(), deserialized_tensor_properties.begin(), deserialized_tensor_properties.end());
+        for (auto const &tensor : tensors) {
+            if (tensor && tensor->get_ragged_offset()) {
+                auto it = cached_aligned_stride_operands.find(tensor->get_uid());
+                if (it != cached_aligned_stride_operands.end()) {
+                    std::get<2>(it->second) = true;
+                }
+            }
+        }
+        return {error_code_t::OK, ""};
+    }
+
     // Host sources of the host-to-device copies among cached_workspace_modifications (operation 0, e.g.
     // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
     // recorded by populate_cuda_graph()/update_cuda_graph() or by stream capture of execute(), holds a
@@ -1395,6 +1425,7 @@ class Graph : public ICudnn, public INode {
         }
         count_node_producing_workspace_modifications_();
         CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_subtree(cached_aligned_operands));
+        CHECK_CUDNN_FRONTEND_ERROR(refresh_aligned_stride_operands_());
         refresh_host_copy_sources_();
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
@@ -1406,6 +1437,16 @@ class Graph : public ICudnn, public INode {
             CUDNN_FE_LOG_BANNER("  BUILD KERNEL CACHE  ");
             CHECK_CUDNN_FRONTEND_ERROR(kernel_cache->build(operation_graph->get_raw_desc()));
         }
+
+#if (CUDNN_VERSION >= 90500)
+        // Binding a cache to the operation graph requires 9.5 headers as well as a 9.5 runtime.
+        // Older-header builds retain the existing no-cache path on newer runtimes.
+        if (!kernel_cache && detail::get_backend_version() >= 90500) {
+            auto scoped_cache = std::make_shared<KernelCache>();
+            CHECK_CUDNN_FRONTEND_ERROR(scoped_cache->build(operation_graph->get_raw_desc()));
+            plans.set_kernel_cache(std::move(scoped_cache));
+        }
+#endif
 
         CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH ALL OK === ");
 
@@ -1904,13 +1945,13 @@ class Graph : public ICudnn, public INode {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             n_user > 0 && sorted_user_ptrs == nullptr, error_code_t::INVALID_VARIANT_PACK, "sorted_user_ptrs is null.");
         for (size_t k = 0; k < override_uids.size() && k < override_shapes.size() && k < override_strides.size(); k++) {
-            auto it = cached_aligned_operands.find(override_uids[k]);
-            if (it == cached_aligned_operands.end()) {
+            auto it = cached_aligned_stride_operands.find(override_uids[k]);
+            if (it == cached_aligned_stride_operands.end()) {
                 continue;
             }
-            auto const &[alignment, element_bytes] = it->second;
-            auto const &stride                     = override_strides[k];
-            auto const i = misaligned_stride_dimension(override_shapes[k], stride, element_bytes, alignment);
+            auto const &[alignment, element_bytes, is_ragged] = it->second;
+            auto const &stride                                = override_strides[k];
+            auto const i = misaligned_stride_dimension(override_shapes[k], stride, element_bytes, alignment, is_ragged);
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 i >= 0,
                 error_code_t::INVALID_VARIANT_PACK,
@@ -2205,6 +2246,15 @@ class Graph : public ICudnn, public INode {
         }
         j["aligned_operands"] = aligned_operands_json;
 
+        // Plan-only blobs omit tensors, so retain addressing mode separately from
+        // the legacy two-integer alignment entries. Old readers may ignore this field.
+        std::vector<uid_t> ragged_aligned_uids;
+        for (auto const &[uid, value] : cached_aligned_stride_operands) {
+            if (std::get<2>(value)) ragged_aligned_uids.push_back(uid);
+        }
+        std::sort(ragged_aligned_uids.begin(), ragged_aligned_uids.end());
+        j["ragged_aligned_operands"] = ragged_aligned_uids;
+
         j["variant_pack_replacements"] = variant_pack_replacements;
 
         j["fe_workspace_size"] = fe_workspace_size;
@@ -2434,6 +2484,7 @@ class Graph : public ICudnn, public INode {
         cached_workspace_modifications = deserialized_workspace_modifications;
         count_node_producing_workspace_modifications_();
         cached_aligned_operands = deserialized_aligned_operands;
+        CHECK_CUDNN_FRONTEND_ERROR(refresh_aligned_stride_operands_(metadata.ragged_aligned));
         refresh_host_copy_sources_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
@@ -2771,6 +2822,19 @@ class Graph : public ICudnn, public INode {
         return check_support();
     }
 
+    // cuDNN 9.11 removed Maxwell, Pascal and Volta (compute capability below 7.5), but its heuristics still return
+    // plans for them that build and only fail at execute (CUDNN_STATUS_EXECUTION_FAILED); decline them up front.
+    error_t
+    check_backend_supports_sm_(int32_t const sm_version) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(sm_version > 0 && sm_version < 75 && detail::get_backend_version() >= 91100,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "cuDNN " + std::to_string(detail::get_backend_version()) +
+                                           " supports compute capability 7.5 (Turing) and newer; the target is SM" +
+                                           std::to_string(sm_version) +
+                                           ". cuDNN 9.10 is the last release for Maxwell, Pascal and Volta.");
+        return {error_code_t::OK, ""};
+    }
+
     // overload for deviceless AoT compilation
     error_t
     check_support() {
@@ -2778,6 +2842,7 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
         auto sm_version = context.get_sm_version();
+        CHECK_CUDNN_FRONTEND_ERROR(check_backend_supports_sm_(sm_version));
 
         // Check OSS RmsNorm+SiLU engine
         if (plans.has_oss_rms_norm_silu_engine()) {
@@ -4002,6 +4067,13 @@ inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
 
+    // An unset target (-1, or 0) resolves from the current device; a deviceless AoT graph without a target stays
+    // unresolved and skips this gate.
+    if (context.get_sm_version() <= 0 && detail::get_backend_version() >= 91100) {
+        (void)context.populate_sm_version_from_device();
+    }
+    CHECK_CUDNN_FRONTEND_ERROR(check_backend_supports_sm_(context.get_sm_version()));
+
     // A node's preferred engine (INode::override_heuristics_query) goes FIRST and the heuristics' configs follow it:
     // the deterministic SDPA backward on Blackwell needs the part's own bprop engine, which no heuristics mode proposes
     // (they return only the SM80 bprop over a quadratic dS workspace, 5-26x slower on cc 10.7, or nothing for D192 /
@@ -4081,7 +4153,9 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
 
         plans.set_tag(operation_graph->getTag());
         plans.enqueue_engine_configs(op_graph_to_configs);
-        plans.set_kernel_cache(kernel_cache);
+        if (kernel_cache) {
+            plans.set_kernel_cache(kernel_cache);
+        }
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());

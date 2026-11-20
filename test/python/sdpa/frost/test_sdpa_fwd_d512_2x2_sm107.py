@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The Rubin (SM107) d512 f16/bf16 forward on the 2x2 DATAPATH (sm107/prefill_d512_f16_2x2.py, TemplateParams.mma_2x2).
+"""The Rubin (SM107) d512 f16/bf16 forward on the 2x2 DATAPATH (sm107/d512_f16_2x2/kernel.py, TemplateParams.mma_2x2).
 
 GPU half of the sm107 2x2 coverage (the host-only structural pins -- Cfg / ledger / DESC_VERSION / SPIN_RING_WAITS /
 levers / arrive sites / sm_107a SASS -- live in test_sdpa_fwd_dsl_sm107.py next to the role-split rows).  requires_rubin:
@@ -33,7 +33,7 @@ import test_sdpa_fwd_d512_2x2_sm100 as _t2x2
 
 pytestmark = requires_dsl
 
-_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
+_KERNEL_FILE = "sm107/d512_f16_2x2/kernel.py"
 _TEMPLATE = _t2x2._TEMPLATE  # the template stem is the same on both arch lines ("prefill_d512_f16_2x2")
 _ROLE_SPLIT_TEMPLATE = _t2x2._ROLE_SPLIT_TEMPLATE
 _D = 512
@@ -143,8 +143,8 @@ def test_two_by_two_graph_api(two_by_two, dtype, is_causal, fold):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=1)
 def test_two_by_two_role_split_untouched_when_twin_off(monkeypatch):
-    """With the twin switched OFF (`api_dsl.D512_2X2 = False`; True is the default since 2026-10-06) the same graph keeps
-    the Rubin role-split kernel -- the A/B control."""
+    """The explicit role-split graph owner retains the A/B control independently
+    of the standalone twin switch or the default graph ranking."""
     from cudnn.sdpa.fwd import api_dsl
 
     monkeypatch.setattr(api_dsl, "D512_2X2", False)

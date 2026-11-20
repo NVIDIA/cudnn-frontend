@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from functools import partial
+from importlib import import_module
 
 import numpy as np
 import pytest
@@ -67,8 +68,8 @@ def inputs(kind, *, dtype=jnp.bfloat16, bounds=(0, 17, 17, 35), fused=False, see
 
 def invoke(kind, values, cu, *, explicit=False, output_final_state=True, **options):
     name = OPERATIONS[kind]
-    fn = getattr(cudnn.ops, name + "_forward_jax") if explicit else getattr(cudnn.jax, name)
-    kwargs = dict(initial_state=values.get("initial_state"), output_final_state=output_final_state, **options)
+    fn = getattr(cudnn.ops, name + "_forward_jax")
+    kwargs = dict(initial_state=values.get("initial_state"), output_final_state=output_final_state, return_residual=explicit, **options)
     if kind == "mamba2":
         return fn(
             values["v"], values["g"], values["a"], values["k"], values["q"], cu, D=values.get("d"), dt_bias=values.get("dt_bias"), z=values.get("z"), **kwargs
@@ -152,14 +153,33 @@ def upstream(values, seed=8):
     return jnp.asarray(rng.normal(size=shape), values["q"].dtype), jnp.asarray(rng.normal(size=state.shape), state.dtype)
 
 
+def observe_chain_plans(monkeypatch, kind):
+    family = "gdn" if kind == "gdp" else kind
+    engine = import_module(f"cudnn.linear_attention.frost.{family}_engine")
+    builder_name = f"build_{family}"
+    build = getattr(engine, builder_name)
+    directions = set()
+
+    def build_and_check(graph):
+        plan = build(graph)
+        node_type = plan.node.node_type.name
+        assert plan.chain, f"{node_type} did not select the chain plan"
+        directions.add(node_type)
+        return plan
+
+    monkeypatch.setattr(engine, builder_name, build_and_check)
+    return directions
+
+
 @pytest.mark.parametrize("kind", OPERATIONS)
 @pytest.mark.parametrize(
     "dtype,fused,chain",
     [(jnp.bfloat16, False, False), (jnp.float16, True, False), (jnp.bfloat16, True, True)],
     ids=["bf16-packed", "fp16-fused-checkpoint", "bf16-default-chain"],
 )
-def test_forward_and_jitted_gradients(kind, dtype, fused, chain):
-    bounds = (0, 1537) if chain else (0, 17, 17, 146 if fused else 35)
+def test_forward_and_jitted_gradients(kind, dtype, fused, chain, monkeypatch):
+    directions = observe_chain_plans(monkeypatch, kind) if chain else None
+    bounds = (0, 2051) if chain else (0, 17, 17, 146 if fused else 35)
     values, cu, options = inputs(
         kind, dtype=dtype, bounds=bounds, fused=fused, heads=(1, 1, 1) if chain else None, value_dim=128 if chain and kind != "mamba2" else 64
     )
@@ -180,6 +200,8 @@ def test_forward_and_jitted_gradients(kind, dtype, fused, chain):
         return jnp.sum(out.astype(jnp.float32) * do) + jnp.sum(state.astype(jnp.float32) * ds)
 
     actual = jax.jit(jax.grad(loss))(values)
+    if chain:
+        assert directions == {kind.upper(), f"{kind.upper()}_BWD"}
     for name, got in actual.items():
         assert got.dtype == values[name].dtype
         if kind == "mamba2" and chain and name == "dt_bias":
@@ -195,20 +217,24 @@ def test_forward_and_jitted_gradients(kind, dtype, fused, chain):
     for name in actual:
         np.testing.assert_array_equal(explicit[name], actual[name])
     changed = {name: value * 0.7 for name, value in values.items()}
-    changed_expected, _ = reference(kind, changed, bounds, do, ds, **options)
-    for name, got in zip(("out", "final_state"), run(changed, cu)):
+    changed_bounds = (0, 0, 13, bounds[-1]) if not fused else bounds
+    changed_cu = jnp.asarray(changed_bounds, dtype=cu.dtype)
+    changed_expected, _ = reference(kind, changed, changed_bounds, do, ds, **options)
+    for name, got in zip(("out", "final_state"), run(changed, changed_cu)):
         assert_close(got, changed_expected[name], 0.02 if dtype == jnp.bfloat16 else 0.01)
 
 
-def test_mamba2_matches_torch_chain(cuda_device):
+def test_mamba2_matches_torch_chain(cuda_device, monkeypatch):
     from cudnn.linear_attention import mamba2
 
-    values, cu, options = inputs("mamba2", fused=True, bounds=(0, 1537), heads=(1, 1, 1), value_dim=64)
+    directions = observe_chain_plans(monkeypatch, "mamba2")
+    values, cu, options = inputs("mamba2", fused=True, bounds=(0, 2053), heads=(1, 1, 1), value_dim=64)
     options["batch_invariant"] = False
     do, ds = upstream(values)
     run = jax.jit(partial(invoke, "mamba2", **options))
     result = run(values, cu)
     actual = jax.jit(jax.grad(lambda args: sum(jnp.sum(x.astype(jnp.float32) * dy) for x, dy in zip(run(args, cu), (do, ds)))))(values)
+    assert directions == {"MAMBA2", "MAMBA2_BWD"}
     with torch.cuda.device(cuda_device.local_hardware_id):
         native = {name: torch_array(value).cuda().requires_grad_() for name, value in values.items()}
         expected = mamba2(
@@ -350,7 +376,7 @@ import cudnn
 device = next(d for d in jax.local_devices() if d.platform == "gpu" and str(d.compute_capability) in ("10.0", "10.3"))
 with jax.default_device(device):
     for name in ("gated_delta_net", "gated_delta_net_v2", "gated_delta_product", "mamba2"):
-        op = getattr(cudnn.jax, name)
+        op = getattr(cudnn.ops, name + "_forward_jax")
         q = jnp.full((17, 1, 128), 0.01, jnp.bfloat16)
         v = jnp.full((17, 1, 64), 0.02, jnp.bfloat16)
         cu = jnp.asarray([0, 17], jnp.int32)

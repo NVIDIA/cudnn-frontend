@@ -11,7 +11,8 @@ BF16 d_initial_state, and an optional BF16 upstream d_final_state contributes
 to both dX and d_initial_state. Residual and other widths are intentionally
 outside this surface.
 
-Compilation is exact-shape. Packed metadata values stay on device: a small
+Compilation is exact-shape except for packed N, which each call reads from
+``cu_seqlens``. Packed metadata values stay on device: a small
 pre-kernel validates the prefix sums and builds a bounded per-sequence tile
 map, after which the dense backward math is reused without cross-sequence
 reads. The default schedules accumulate dweight with FP32 atomics; partial
@@ -53,9 +54,12 @@ from .api import (
     _MAX_PACKED_SEQUENCES,
     _MAX_SCALAR_GRID_CHANNELS,
     _as_torch_stream,
+    _make_packed_fake_operands,
+    _packed_num_sequences,
     _record_streams,
     _require_storage_alignment,
     _tensors_overlap,
+    _validate_runtime_leading_extent_tensor,
 )
 
 _WIDTH = 4
@@ -231,9 +235,46 @@ class CausalConv1dBulkBwdPrototype(APIBase):
         if desc.device.type != "cuda":
             raise ValueError(f"{name} must be a CUDA tensor, got device {desc.device}")
 
+    def packed_tile_capacity_for(self, num_sequences: int) -> int:
+        """Tight shape-only bound on sum_i ceil(length_i / K) over N non-empty sequences."""
+
+        if not self.is_packed:
+            return 0
+        assert self.total_tokens is not None and self.tokens_per_cta is not None
+        return num_sequences + (self.total_tokens - num_sequences) // self.tokens_per_cta
+
+    def packed_tile_map_numel_for(self, num_sequences: int) -> int:
+        return self.packed_tile_capacity_for(num_sequences) * _WIDTH
+
+    def dweight_workspace_numel_for(self, num_sequences: int) -> int:
+        if self.dweight_mode != _DWEIGHT_PARTIAL:
+            return 0
+        assert self.n_channels is not None
+        partials = self.packed_tile_capacity_for(num_sequences) if self.is_packed else self.num_dweight_partials
+        assert partials is not None
+        return partials * self.n_channels * _WIDTH
+
+    def runtime_num_sequences(self, cu_seqlens: torch.Tensor | None) -> int:
+        """Packed N is read from each call's ``cu_seqlens``; the compiled plan is N-agnostic."""
+
+        if not self.is_packed:
+            assert self.batch_size is not None
+            return self.batch_size
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens presence must match the compiled signature")
+        assert self.total_tokens is not None
+        return _packed_num_sequences(cu_seqlens, self.total_tokens)
+
+    def validate_per_sequence_tensor(self, tensor: torch.Tensor, desc: TensorDesc, num_sequences: int, name: str) -> None:
+        if self.is_packed:
+            leading = num_sequences + 1 if name == "cu_seqlens" else num_sequences
+            _validate_runtime_leading_extent_tensor(tensor, desc, leading, name)
+        else:
+            self._validate_runtime_tensor(tensor, desc, name)
+
     @property
     def packed_tile_map_numel(self) -> int:
-        """Number of int32 elements in the device-built packed tile map."""
+        """Number of int32 elements in the device-built packed tile map for the sample N."""
 
         return self.packed_tile_capacity * _WIDTH
 
@@ -243,7 +284,7 @@ class CausalConv1dBulkBwdPrototype(APIBase):
 
     @property
     def dweight_workspace_numel(self) -> int:
-        """Number of FP32 elements required by the selected dweight mode."""
+        """Number of FP32 elements required by the selected dweight mode for the sample N."""
 
         if self.dweight_mode != _DWEIGHT_PARTIAL:
             return 0
@@ -589,24 +630,31 @@ class CausalConv1dBulkBwdPrototype(APIBase):
         if self.dweight_mode == _DWEIGHT_PARTIAL:
             fake_dw_partials = self._make_fake_cute_tensor(
                 dtype=torch.float32,
-                shape=(self.dweight_workspace_numel,),
+                shape=(cute.sym_int(divisibility=1) if self.is_packed else self.dweight_workspace_numel,),
                 stride=(1,),
                 assumed_align=16,
             )
-        fake_cu_seqlens = self._make_fake_cute_tensor_from_desc(self.cu_seqlens_desc, assumed_align=4)
-        fake_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
-        fake_d_final_state = self._make_fake_cute_tensor_from_desc(self.d_final_state_desc, assumed_align=16)
-        fake_d_initial_state = None
-        if self.initial_state_desc is not None:
-            fake_d_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
         fake_packed_tile_map = None
         if self.is_packed:
+            fake_cu_seqlens, (fake_initial_state, fake_d_final_state, fake_d_initial_state) = _make_packed_fake_operands(
+                self,
+                self.cu_seqlens_desc,
+                (self.initial_state_desc, self.d_final_state_desc, self.initial_state_desc),
+                assumed_align=16,
+            )
             fake_packed_tile_map = self._make_fake_cute_tensor(
                 dtype=torch.int32,
-                shape=(self.packed_tile_map_numel,),
+                shape=(cute.sym_int(divisibility=1),),
                 stride=(1,),
                 assumed_align=16,
             )
+        else:
+            fake_cu_seqlens = None
+            fake_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
+            fake_d_final_state = self._make_fake_cute_tensor_from_desc(self.d_final_state_desc, assumed_align=16)
+            fake_d_initial_state = None
+            if self.initial_state_desc is not None:
+                fake_d_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
         if self.kernel_variant == _VEC2_CPASYNC_KERNEL:
             from .backward_kernel_vec2_cpasync import CausalConv1dBulkBackwardVec2CpAsyncKernel
@@ -634,8 +682,6 @@ class CausalConv1dBulkBwdPrototype(APIBase):
             kernel = CausalConv1dBulkBackwardKernel(
                 batch_size=self.batch_size,
                 sequence_length=self.sequence_length,
-                num_sequences=self.num_sequences,
-                packed_tile_capacity=self.packed_tile_capacity,
                 threads=self.threads,
                 tokens_per_cta=self.tokens_per_cta,
                 use_dweight_partials=self.dweight_mode == _DWEIGHT_PARTIAL,
@@ -722,6 +768,13 @@ class CausalConv1dBulkBwdPrototype(APIBase):
             ):
                 raise ValueError(f"dBias accumulator must be contiguous FP32 ({self.n_channels},) on {x.device}")
 
+        if (cu_seqlens is None) != (self.cu_seqlens_desc is None):
+            raise ValueError("cu_seqlens presence must match the compiled signature")
+        num_sequences = self.runtime_num_sequences(cu_seqlens)
+        if cu_seqlens is not None:
+            assert self.cu_seqlens_desc is not None
+            self.validate_per_sequence_tensor(cu_seqlens, self.cu_seqlens_desc, num_sequences, "cu_seqlens")
+
         for name, tensor, desc in (
             ("Initial state", initial_state, self.initial_state_desc),
             ("dFinal state", d_final_state, self.d_final_state_desc),
@@ -730,42 +783,44 @@ class CausalConv1dBulkBwdPrototype(APIBase):
                 raise ValueError(f"{name} presence must match the compiled signature")
             if tensor is not None:
                 assert desc is not None
-                self._validate_runtime_tensor(tensor, desc, name)
+                self.validate_per_sequence_tensor(tensor, desc, num_sequences, name)
         if (d_initial_state is None) != (self.initial_state_desc is None):
             raise ValueError("dInitial state presence must match the compiled initial-state signature")
         if d_initial_state is not None:
             assert self.initial_state_desc is not None
-            self._validate_runtime_tensor(d_initial_state, self.initial_state_desc, "dInitial state")
+            self.validate_per_sequence_tensor(d_initial_state, self.initial_state_desc, num_sequences, "dInitial state")
+        if (
+            self.kernel_variant == _SCALAR_KERNEL
+            and (initial_state is not None or d_final_state is not None)
+            and num_sequences * self.n_channels * _WIDTH > _INT32_MAX
+        ):
+            raise ValueError("The scalar backward schedule requires each state tensor to contain at most " f"{_INT32_MAX} elements")
 
-        if (cu_seqlens is None) != (self.cu_seqlens_desc is None):
-            raise ValueError("cu_seqlens presence must match the compiled signature")
-        if cu_seqlens is not None:
-            assert self.cu_seqlens_desc is not None
-            self._validate_runtime_tensor(cu_seqlens, self.cu_seqlens_desc, "cu_seqlens")
-
+        tile_map_numel = self.packed_tile_map_numel_for(num_sequences)
         if self.is_packed:
             if packed_tile_map is None:
-                raise ValueError(f"packed backward requires {self.packed_tile_map_bytes} bytes " "of int32 tile-map workspace")
+                raise ValueError(f"packed backward requires {tile_map_numel * 4} bytes " "of int32 tile-map workspace")
             if (
                 packed_tile_map.dtype != torch.int32
                 or not packed_tile_map.is_contiguous()
-                or packed_tile_map.numel() != self.packed_tile_map_numel
+                or packed_tile_map.numel() != tile_map_numel
                 or packed_tile_map.device != x.device
             ):
-                raise ValueError("packed tile map must be contiguous int32 " f"[{self.packed_tile_map_numel}] on {x.device}")
+                raise ValueError("packed tile map must be contiguous int32 " f"[{tile_map_numel}] on {x.device}")
         elif packed_tile_map is not None:
             raise ValueError("dense backward does not consume a packed tile map")
 
         if self.dweight_mode == _DWEIGHT_PARTIAL:
+            workspace_numel = self.dweight_workspace_numel_for(num_sequences)
             if dweight_workspace is None:
-                raise ValueError(f"schedule {self.schedule!r} requires " f"{self.dweight_workspace_bytes} bytes of FP32 dweight workspace")
+                raise ValueError(f"schedule {self.schedule!r} requires " f"{workspace_numel * 4} bytes of FP32 dweight workspace")
             if (
                 dweight_workspace.dtype != torch.float32
                 or not dweight_workspace.is_contiguous()
-                or dweight_workspace.numel() != self.dweight_workspace_numel
+                or dweight_workspace.numel() != workspace_numel
                 or dweight_workspace.device != x.device
             ):
-                raise ValueError("dweight workspace must be contiguous FP32 " f"[{self.dweight_workspace_numel}] on {x.device}")
+                raise ValueError("dweight workspace must be contiguous FP32 " f"[{workspace_numel}] on {x.device}")
         elif dweight_workspace is not None:
             raise ValueError(f"schedule {self.schedule!r} does not consume dweight workspace")
 

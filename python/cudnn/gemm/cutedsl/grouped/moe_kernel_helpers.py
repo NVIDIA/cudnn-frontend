@@ -1033,10 +1033,13 @@ def compute_stages_wgrad(
     sf_vec_size: int,
     num_smem_capacity: int,
     occupancy: int,
+    num_c_stage: int = 2,
 ) -> Tuple[int, int, int]:
-    """Compute pipeline stages for the grouped GEMM wgrad kernel."""
+    """Compute pipeline stages for the grouped GEMM wgrad kernel.
+
+    ``num_c_stage`` output (TMA reduce) stages are reserved first; the rest of shared memory goes to A/B stages.
+    """
     num_acc_stage = 2
-    num_c_stage = 2
     num_tile_stage = 2
 
     a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)

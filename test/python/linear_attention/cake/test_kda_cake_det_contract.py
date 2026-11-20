@@ -31,6 +31,18 @@ def test_unsupported(changes):
         check_contract(facts(**(config | changes)), SimpleNamespace(inputs={}, outputs={}))
 
 
+def test_old_toolkit_declines(monkeypatch):
+    from cudnn._cake import loader
+    from cudnn.linear_attention.cake.kda_det_engine import KdaCakeDetEngine
+
+    config = dict(op="KDA", h_q=16, h_k=16, h_v=16, gate_channels=128, beta_dtype=cudnn.data_type.BFLOAT16, use_qk_l2norm=False)
+    monkeypatch.setattr(loader, "device_arch", lambda: "sm_100a")
+    monkeypatch.setattr(loader, "_toolkit", lambda *args: ("nvcc", loader.CudaVersion(13, 3, "13.3.73")))
+    graph = SimpleNamespace(_facts_for=lambda analyzer: facts(**config), nodes=[SimpleNamespace(inputs={}, outputs={})])
+    with pytest.raises(NotImplementedError, match="kda_cake_det: .* needs CUDA 13.4"):
+        KdaCakeDetEngine().check_support(graph)
+
+
 @pytest.mark.parametrize("mode", ["replay", "tape", "light"])
 def test_native_backward_saved_rows(monkeypatch, mode):
     """Replay and tape recompute WY rows; light mode uses the saved rows."""

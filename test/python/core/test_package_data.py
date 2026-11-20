@@ -21,7 +21,15 @@ _PKG_ROOT = _REPO / "python"
 # Not package data: sources, bytecode, docs, development metadata, and the
 # extension built in place.
 _NOT_DATA = {".py", ".pyc", ".md", ".so", ".pyd"}
-_NOT_DATA_NAMES = {".gitignore", ".clang-format"}
+_NOT_DATA_NAMES = {
+    ".gitignore",
+    ".clang-format",
+    "VENDORED_MHC.json",
+    "VENDORED_GQA.json",
+    "VENDORED_DSA_INDEXER.json",
+    "VENDORED_DSA_SPARSE.json",
+    "VENDORED_DSA_DET.json",
+}
 
 
 def _package_data():

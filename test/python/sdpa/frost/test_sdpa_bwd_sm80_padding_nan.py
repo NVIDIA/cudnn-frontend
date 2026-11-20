@@ -6,7 +6,7 @@ import cudnn
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, select_engine
+from frost_test_utils import SM80_BWD_OWNERS, requires_dsl, select_engine
 from sdpa.frost.test_sdpa_bwd_dsl_sm120 import _ref_bwd
 
 pytestmark = [
@@ -72,7 +72,7 @@ def test_runtime_padding_nan_backward(d, dv, hk, causal, dtype, sq, skv):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_bwd_sm80")
+    select_engine(graph, SM80_BWD_OWNERS)
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")

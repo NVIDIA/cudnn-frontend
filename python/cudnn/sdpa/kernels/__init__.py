@@ -11,8 +11,8 @@ Each phase package keeps the modules its own arch lines share at its ``kernels/`
 neither phase; it sits here, one level above both, for the same reason.
 
 - ``_mxfp8_sf.py`` -- the MXFP8 scale-factor TMA descriptors (rowwise per-tile, columnwise D-plane-major) and the cga2
-  peer split of an SF slab.  The Rubin MXFP8 forwards (``fwd/kernels/sm107/prefill_d256_mxfp8.py``,
-  ``fwd/kernels/sm107/prefill_d192_d128_mxfp8.py``) build theirs here; the MXFP8 d=256 backward chain and the
+  peer split of an SF slab.  The Rubin MXFP8 forwards (``fwd/kernels/sm107/d256_mxfp8_single_q/kernel.py``,
+  ``fwd/kernels/sm107/d192_mxfp8_multi_q/kernel.py``) build theirs here; the MXFP8 d=256 backward chain and the
   stage-3 block-scale GEMM arm are the next consumers.
 
 Nothing here is a template: these are plain Python helpers that trace inside a ``@cute.jit`` host or a ``@cute.kernel``.

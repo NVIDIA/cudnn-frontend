@@ -11,7 +11,8 @@ from __future__ import annotations
 import math
 from operator import itemgetter
 
-from cudnn import behavior_note
+import cudnn
+from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -39,10 +40,10 @@ def build_mamba2(graph):
 
 def mamba2_support_gates(engine: str, facts) -> None:
     """The Mamba-2 kernel family's dtype/attribute gates."""
-    import cudnn
-
     checkpoint = facts.checkpoint_every_n_tokens
     checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
+    if not facts.is_bwd:
+        checkpoint_dtypes = checkpoint_dtypes + (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
     if checkpoint and checkpoint % 128 != 0:
         raise NotImplementedError(f"{engine}: checkpoint_every_n_tokens must be a positive multiple of 128 (got {checkpoint})")
     if not facts.gates_at_ho:
@@ -50,13 +51,10 @@ def mamba2_support_gates(engine: str, facts) -> None:
     if facts.h_v != facts.h_o:
         raise NotImplementedError(f"{engine}: x (v) must carry every head ({facts.h_o}); B / C (k / q) may be grouped")
     if facts.has_state_indices:
-        if facts.state_indices_dtype != cudnn.data_type.INT32:
-            raise NotImplementedError(f"{engine}: 'state_indices' must be int32, got {facts.state_indices_dtype}")
+        if facts.state_indices_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64):
+            raise NotImplementedError(f"{engine}: 'state_indices' must be int32 or int64, got {facts.state_indices_dtype}")
         if facts.is_bwd:
             raise NotImplementedError(f"{engine}: 'state_indices' is a forward-only pool addressing mode")
-        if checkpoint:
-            raise NotImplementedError(f"{engine}: 'state_indices' cannot be combined with checkpoint_every_n_tokens")
-    io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     for port, got in (("a", facts.a_dtype), ("dt_bias", facts.dt_bias_dtype), ("d", facts.d_dtype)):
@@ -66,9 +64,11 @@ def mamba2_support_gates(engine: str, facts) -> None:
         raise NotImplementedError(f"{engine}: 'z' must match the io dtype ({facts.io_dtype}), got {facts.z_dtype}")
     if facts.wants_pre_gate and facts.o_pre_dtype not in (facts.io_dtype, None):
         raise NotImplementedError(f"{engine}: 'O_pre' must match the io dtype")
+    fp8 = (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+    forward_state_dtypes = state_dtypes if facts.is_bwd else state_dtypes + fp8
     for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
-        if got not in state_dtypes + (None,):
-            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
+        if got not in forward_state_dtypes + (None,):
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16 (fp8 in a forward graph), got {got}")
     if not facts.state_pair_match:
         raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
     if facts.is_bwd:
@@ -87,8 +87,8 @@ def mamba2_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
         if facts.dg_dtype not in (facts.g_dtype, None):
             raise NotImplementedError(f"{engine}: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-        if facts.do_dtype not in io + (None,):
-            raise NotImplementedError(f"{engine}: 'dO' must be fp16/bf16, got {facts.do_dtype}")
+        if facts.do_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError(f"{engine}: 'dO' must match the io dtype ({facts.io_dtype}), got {facts.do_dtype}")
         if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
             raise NotImplementedError(
                 f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
@@ -103,7 +103,7 @@ class Mamba2FrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node MAMBA2 graphs (THD layout) on SM100 / SM103 / SM107."""
 
     name = "mamba2_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)
@@ -132,17 +132,19 @@ class CompiledMamba2:
     summaries and an fp32 state chain seeding every piece)."""
 
     def __init__(self, node, kernel_module):
-        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
+        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_capacity, piece_table_layout, ragged_pieces
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.tail import GATE_WORDS, choose_tail
         from cuda.bindings.driver import CUstream
 
         from .kernel.mamba2_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
-        from .kernel.mamba2_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
+        from .kernel.mamba2_warmup_forward_f16 import TAIL_BUFFERS, build_warmup_forward, run_warmup_forward
 
         self.node = node
         self.warmup_launch = None
         self.chain_launch = None
         self.chain_buffer_names = CHAIN_FORWARD_BUFFERS
+        self.tail_buffer_names = TAIL_BUFFERS
         self.stream_type = CUstream
         self.build_warmup_forward = build_warmup_forward
         self.run_warmup_forward = run_warmup_forward
@@ -164,15 +166,12 @@ class CompiledMamba2:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.has_final_state = "final_state" in node.outputs
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.checkpoint_after_block = bool(node.params.get("checkpoint_after_block", False))
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
         self.has_pre_gate = "O_pre" in node.outputs
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_sm = multiprocessor_count(self.device)
-        from .common.piece_chain import build_scalar_boundary_fold, run_scalar_boundary_fold
-
-        self.build_boundary_fold, self.run_boundary_fold = build_scalar_boundary_fold, run_scalar_boundary_fold
-        self.composed_fold = None
         self.n_heads_out = HO
         self.dim_v, self.dim_k = V, K
         self.num_seqs = B
@@ -188,6 +187,22 @@ class CompiledMamba2:
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
+        self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=total)
+        if not self.chain and not self.batch_invariant:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=total,
+                b_t=self.b_t,
+                cadence_tokens=self.checkpoint,
+                expand_num=1,
+            )
+            if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
+                self.tail = None
         self.split = (
             not self.chain
             and not self.batch_invariant
@@ -201,7 +216,7 @@ class CompiledMamba2:
 
         regions = []
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
             self.ideal = None
@@ -212,7 +227,7 @@ class CompiledMamba2:
                 ("scheduler_all", off_scheduler, "int32", (4,)),
                 ("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -239,10 +254,66 @@ class CompiledMamba2:
                 self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.tail is not None or self.ragged_pieces:
+                off_gate = layout.add(4 * GATE_WORDS, align=16)
+                regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
             if self.split:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
+            if self.tail is not None:
+                tail = self.tail
+                self.tail_pieces_total = tail.num_seqs * tail.pieces
+                tail_tiles = self.tail_pieces_total * HO
+                off_tail_scheduler = layout.add(16)
+                regions += [
+                    ("tail_scheduler_prefill", off_tail_scheduler, "int32", (2,)),
+                    ("tail_scheduler_summary", off_tail_scheduler + 8, "int32", (2,)),
+                    ("tail_scheduler_all", off_tail_scheduler, "int32", (4,)),
+                    ("tail_work_items", layout.add(tail_tiles * WORK_ITEM_FIELDS * 4), "int32", (tail_tiles, WORK_ITEM_FIELDS)),
+                ]
+                table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+                off_tail_table = layout.add(table.nbytes, align=256)
+                regions += [
+                    ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                    ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                    ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                    ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                    ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                    ("tail_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                    ("tail_state_h", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                    ("tail_transition", layout.add(self.tail_pieces_total * HO * 4), "float32", (self.tail_pieces_total, HO)),
+                    ("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ]
+                self.chain_rows = 4 * CHAIN_THREADS // K
+                tail_words = tensormap_workspace_bytes(kernel_module, self.tail_pieces_total) // 8
+                regions.append(("tail_tensormaps", layout.add(tail_words * 8, align=128), "int64", (tail_words,)))
+            if self.ragged_pieces:
+                slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=total, batch_invariant=True)
+                ragged_tiles = slots * HO
+                off_ragged_scheduler = layout.add(16)
+                regions += [
+                    ("ragged_scheduler_prefill", off_ragged_scheduler, "int32", (2,)),
+                    ("ragged_scheduler_summary", off_ragged_scheduler + 8, "int32", (2,)),
+                    ("ragged_scheduler_all", off_ragged_scheduler, "int32", (4,)),
+                    ("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)),
+                ]
+                table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+                off_ragged_table = layout.add(table.nbytes, align=256)
+                regions += [
+                    ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                    ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                    ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                    ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                    ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                    ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                    ("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                    ("ragged_transition", layout.add(slots * HO * 4), "float32", (slots, HO)),
+                    ("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ]
+                self.chain_rows = 4 * CHAIN_THREADS // K
+                ragged_words = tensormap_workspace_bytes(kernel_module, slots) // 8
+                regions.append(("ragged_tensormaps", layout.add(ragged_words * 8, align=128), "int64", (ragged_words,)))
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
         self.workspace_size = layout.size
@@ -298,26 +369,39 @@ class CompiledMamba2:
                 int(self.checkpoint if self.has_state_checkpoints else 0),
                 float(self.dt_min),
                 float(self.dt_max),
+                0,
+                0,
             )
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {"words": "tail_tensormaps", "seed": "initial_state"}
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {"words": "ragged_tensormaps", "seed": "initial_state"}
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (int(self.ragged_pieces), int(self.num_seqs), 0, 0)
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, *, launch_host=None) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
-        if self.index_preceding_state_update is not None:
-            table = views[self.index_initial_state] if self.index_initial_state is not None else None
-            summaries = views[self.index_preceding_state_update]
-            if self.composed_fold is None:
-                self.composed_fold = self.build_boundary_fold(
-                    composed,
-                    summaries,
-                    reverse=False,
-                    device=self.device,
-                    seed_dtype=table.dtype if table is not None else None,
-                )
-            self.run_boundary_fold(self.composed_fold, table, composed, summaries, views[self.index_preceding_transition], int(stream or 0))
+        fold = self.index_preceding_state_update is not None
+        fold_buffers = (
+            views[self.index_preceding_state_update] if fold else None,
+            views[self.index_preceding_transition] if fold else None,
+            views[self.index_initial_state] if fold and self.index_initial_state is not None else None,
+            composed if fold else None,
+        )
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)))
+            (launch_host or cpp_launcher.launch)(
+                self.chain_launch, *self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)), None, *fold_buffers
+            )
             return
         k = views[self.index_k]
         v = views[self.index_v]
@@ -336,7 +420,9 @@ class CompiledMamba2:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.chain:
-            self.run_chain(q, k, v, g, a, dt_bias, d, z, cu, state0, composed, state_indices, o, final_state, state_checkpoints, o_pre, region, stream)
+            self.run_chain(
+                q, k, v, g, a, dt_bias, d, z, cu, state0, composed, state_indices, o, final_state, state_checkpoints, o_pre, region, stream, fold_buffers
+            )
             return
 
         buffers = dict(
@@ -363,10 +449,26 @@ class CompiledMamba2:
             chunk_scratch=region.get("chunk_scratch"),
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
+            item_limit_word=region.get("gate"),
+            tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 4 if self.ragged_pieces else (),
+            tail_buffers=(
+                self.tail_buffers((*views, *region.values(), None))
+                if self.tail is not None
+                else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+            ),
+            ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+            ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+            ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
+            fold_buffers=fold_buffers,
         )
         if self.warmup_launch is None:
             self.warmup_launch = self.build_warmup_forward(
                 **buffers,
+                ragged_pieces=self.ragged_pieces,
+                ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                ragged_chain_rows=self.chain_rows if self.ragged_pieces else 0,
+                tail=self.tail,
+                tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                 split=self.split,
                 n_tiles=self.n_tiles,
                 ideal_chunks=self.ideal,
@@ -376,6 +478,7 @@ class CompiledMamba2:
                 dt_min=self.dt_min,
                 dt_max=self.dt_max,
                 checkpoint_every_n_tokens=self.checkpoint,
+                checkpoint_after_block=self.checkpoint_after_block,
                 device=self.device,
                 stream=stream,
             )
@@ -388,7 +491,9 @@ class CompiledMamba2:
             stream=stream,
         )
 
-    def run_chain(self, q, k, v, g, a, dt_bias, d, z, cu, state0, composed, state_indices, o, final_state, state_checkpoints, o_pre, region, stream) -> None:
+    def run_chain(
+        self, q, k, v, g, a, dt_bias, d, z, cu, state0, composed, state_indices, o, final_state, state_checkpoints, o_pre, region, stream, fold_buffers
+    ) -> None:
         """Chain prologue, recompute summary, scalar state chain and the prefill over the pieces, launched from one compiled
         host (kernel/mamba2_chain_forward_f16.py)."""
         buffers = dict(
@@ -423,6 +528,7 @@ class CompiledMamba2:
             final_state=final_state,
             final_indices=state_indices,
             checkpoints=state_checkpoints if self.has_state_checkpoints and self.checkpoint else None,
+            fold_buffers=fold_buffers,
         )
         checkpoint = self.checkpoint if self.has_state_checkpoints else 0
         if self.chain_launch is None:
@@ -438,6 +544,7 @@ class CompiledMamba2:
                 dt_min=self.dt_min,
                 dt_max=self.dt_max,
                 checkpoint_every_n_tokens=checkpoint,
+                checkpoint_after_block=self.checkpoint_after_block,
                 chain_rows=self.chain_rows,
                 device=self.device,
                 num_sm=self.num_sm,
@@ -463,26 +570,29 @@ class CompiledMamba2Bwd:
 
     def __init__(self, node, bwd_module, prefill_module, recompute_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.gate_bwd import mamba2_gate_bwd, mamba2_zgate_bwd
-        from .common.head_reduce import head_group_reduce
-        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
+        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_capacity, piece_table_layout, ragged_pieces
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.tail import GATE_WORDS, choose_tail
         from .kernel.mamba2_chain_backward_f16 import build_chain_backward, run_chain_backward
-        from .kernel.mamba2_warmup_backward_f16 import build_regenerate_backward, build_warmup_backward, run_regenerate_backward, run_warmup_backward
+        from .kernel.mamba2_warmup_backward_f16 import (
+            TAIL_BUFFERS,
+            build_regenerate_backward,
+            build_warmup_backward,
+            run_regenerate_backward,
+            run_warmup_backward,
+        )
 
         self.node = node
         self.warmup_launch = None
         self.regenerate_launch = None
         self.chain_launch = None
+        self.tail_buffer_names = TAIL_BUFFERS
         self.build_warmup_backward = build_warmup_backward
         self.run_warmup_backward = run_warmup_backward
         self.build_regenerate_backward = build_regenerate_backward
         self.run_regenerate_backward = run_regenerate_backward
         self.build_chain_backward = build_chain_backward
         self.run_chain_backward = run_chain_backward
-        self.head_group_reduce = head_group_reduce
-        self.zgate_bwd = mamba2_zgate_bwd
-        self.gate_bwd = mamba2_gate_bwd
         self.plan_name = "Mamba2FrostEngine (MAMBA2_BWD)"
         self.device = current_device()
         self.dt_softplus = bool(node.params.get("dt_softplus", True) if node.params.get("dt_softplus") is not None else True)
@@ -498,8 +608,9 @@ class CompiledMamba2Bwd:
         V = v.dim[2]
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         B = node.inputs["cu_seqlens"].dim[0] - 1
-        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
-        self.has_state_checkpoints = "state_checkpoints" in node.inputs
+        after_block = bool(node.params.get("checkpoint_after_block", False))
+        self.checkpoint_cadence = 0 if after_block else int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.has_state_checkpoints = "state_checkpoints" in node.inputs and not after_block
         self.coarse_checkpoints = self.has_state_checkpoints and (
             self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
         )
@@ -516,10 +627,6 @@ class CompiledMamba2Bwd:
         self.wants_dz = "dZ" in node.outputs
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.num_sm = multiprocessor_count(self.device)
-        from .common.piece_chain import build_scalar_boundary_fold, run_scalar_boundary_fold
-
-        self.build_boundary_fold, self.run_boundary_fold = build_scalar_boundary_fold, run_scalar_boundary_fold
-        self.composed_fold = None
         self.n_heads_out = HO
         self.dim_v, self.dim_k = V, K
         self.num_seqs = B
@@ -536,6 +643,22 @@ class CompiledMamba2Bwd:
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
+        self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=total)
+        if not self.chain and not self.batch_invariant:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=total,
+                b_t=self.b_t,
+                cadence_tokens=self.checkpoint_cadence if self.has_state_checkpoints else 0,
+                expand_num=1,
+            )
+            if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
+                self.tail = None
         self.split = (
             not self.chain
             and not self.batch_invariant
@@ -548,7 +671,7 @@ class CompiledMamba2Bwd:
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             off_scheduler = layout.add(32)
             regions += [
                 ("scheduler_summary_fwd", off_scheduler, "int32", (2,)),
@@ -557,7 +680,7 @@ class CompiledMamba2Bwd:
                 ("scheduler_regenerate", off_scheduler + 24, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (8,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -633,10 +756,92 @@ class CompiledMamba2Bwd:
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         if not self.chain:
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.tail is not None or self.ragged_pieces:
+                off_gate = layout.add(4 * GATE_WORDS, align=16)
+                regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
         if self.split:
             self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
             regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
+        if self.tail is not None:
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            tail_tiles = self.tail_pieces_total * HO
+            off_tail_scheduler = layout.add(32)
+            regions += [
+                ("tail_scheduler_summary_fwd", off_tail_scheduler, "int32", (2,)),
+                ("tail_scheduler_summary_bwd", off_tail_scheduler + 8, "int32", (2,)),
+                ("tail_scheduler_bwd", off_tail_scheduler + 16, "int32", (2,)),
+                ("tail_scheduler_regenerate", off_tail_scheduler + 24, "int32", (2,)),
+                ("tail_scheduler_all", off_tail_scheduler, "int32", (8,)),
+            ]
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items", layout.add(tail_tiles * WORK_ITEM_FIELDS * 4), "int32", (tail_tiles, WORK_ITEM_FIELDS)),
+                ("tail_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_g", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_state_dx", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_transition", layout.add(self.tail_pieces_total * HO * 4), "float32", (self.tail_pieces_total, HO)),
+                ("tail_exit_base", layout.add(self.tail_pieces_total * 4), "int32", (self.tail_pieces_total,)),
+            ]
+            if not self.reuse_series and not self.coarse_checkpoints:
+                regions += [
+                    ("tail_state_h", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                    ("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ]
+            if self.coarse_checkpoints:
+                regions.append(("tail_seed_row_base", layout.add(4), "int32", (1,)))
+            self.chain_rows = 4 * CHAIN_THREADS // K
+            tail_words = tensormap_workspace_bytes(bwd_module, self.tail_pieces_total) // 8
+            regions.append(("tail_tensormaps", layout.add(tail_words * 8, align=128), "int64", (tail_words,)))
+            if not self.reuse_series:
+                tail_recompute_words = tensormap_workspace_bytes(prefill_module, self.tail_pieces_total) // 8
+                regions.append(("tail_recompute_tensormaps", layout.add(tail_recompute_words * 8, align=128), "int64", (tail_recompute_words,)))
+        if self.ragged_pieces:
+            slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=total, batch_invariant=True)
+            ragged_tiles = slots * HO
+            off_ragged_scheduler = layout.add(32)
+            regions += [
+                ("ragged_scheduler_summary_fwd", off_ragged_scheduler, "int32", (2,)),
+                ("ragged_scheduler_summary_bwd", off_ragged_scheduler + 8, "int32", (2,)),
+                ("ragged_scheduler_bwd", off_ragged_scheduler + 16, "int32", (2,)),
+                ("ragged_scheduler_regenerate", off_ragged_scheduler + 24, "int32", (2,)),
+                ("ragged_scheduler_all", off_ragged_scheduler, "int32", (8,)),
+            ]
+            table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+            off_ragged_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                ("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)),
+                ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("ragged_state_g", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ("ragged_state_dx", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ("ragged_transition", layout.add(slots * HO * 4), "float32", (slots, HO)),
+                ("ragged_exit_base", layout.add(slots * 4), "int32", (slots,)),
+            ]
+            if not self.reuse_series and not self.coarse_checkpoints:
+                regions += [
+                    ("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                    ("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ]
+            if self.coarse_checkpoints:
+                regions.append(("ragged_seed_row_base", layout.add(4), "int32", (1,)))
+            self.chain_rows = 4 * CHAIN_THREADS // K
+            ragged_words = tensormap_workspace_bytes(bwd_module, slots) // 8
+            regions.append(("ragged_tensormaps", layout.add(ragged_words * 8, align=128), "int64", (ragged_words,)))
+            if not self.reuse_series:
+                ragged_recompute_words = tensormap_workspace_bytes(prefill_module, slots) // 8
+                regions.append(("ragged_recompute_tensormaps", layout.add(ragged_recompute_words * 8, align=128), "int64", (ragged_recompute_words,)))
         self.workspace_size = layout.size
         self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -673,6 +878,32 @@ class CompiledMamba2Bwd:
         self.index_d_dt_bias = pos.get("d_dt_bias")
         self.index_dd = pos.get("dD")
         self.index_dz = pos.get("dZ")
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_bprop": "tail_scheduler_bwd",
+                "prefill_words": "tail_recompute_tensormaps",
+                "bprop_words": "tail_tensormaps",
+                "seed": "initial_state",
+                "dfs": "d_final_state",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_bprop": "ragged_scheduler_bwd",
+                "prefill_words": "ragged_recompute_tensormaps",
+                "bprop_words": "ragged_tensormaps",
+                "seed": "initial_state",
+                "dfs": "d_final_state",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (int(self.ragged_pieces), int(self.num_seqs), 0, 0)
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -704,28 +935,39 @@ class CompiledMamba2Bwd:
         dz = views[self.index_dz] if self.index_dz is not None else None
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        dcomposed = None
-        if self.index_following_state_grad is not None:
-            dcomposed = region["composed_dstate"]
-            summaries = views[self.index_following_state_grad]
-            if self.composed_fold is None:
-                self.composed_fold = self.build_boundary_fold(
-                    dcomposed,
-                    summaries,
-                    reverse=True,
-                    device=self.device,
-                    seed_dtype=dstate_in.dtype if dstate_in is not None else None,
-                )
-            self.run_boundary_fold(self.composed_fold, dstate_in, dcomposed, summaries, views[self.index_following_transition], int(stream or 0))
+        fold = self.index_following_state_grad is not None
+        dcomposed = region["composed_dstate"] if fold else None
+        fold_buffers = (
+            views[self.index_following_state_grad] if fold else None,
+            views[self.index_following_transition] if fold else None,
+            dstate_in if fold else None,
+            dcomposed,
+        )
 
         # ---- z gate: dO_pre = dO silu(z), dZ --------------------------------------------
+        zgate = (None,) * 4
         if self.has_z:
-            self.zgate_bwd(do, z, o_pre, region["do_pre"], dz, stream=stream)
+            zgate = (do, z, o_pre, dz)
             do = region["do_pre"]
 
         dq_out = region["dq_ho"] if self.fold_dq else dq
         dk_out = region["dk_ho"] if self.fold_dk else dk
         skip_bwd_part = region["skip_bwd_part"] if self.skip_bwd_in_kernel else None
+        post_buffers = (
+            *zgate,
+            g,
+            a,
+            dt_bias,
+            dg,
+            region["gate_part_a"],
+            region.get("gate_part_dt"),
+            skip_bwd_part.view(-1) if self.skip_bwd_in_kernel else None,
+            da,
+            d_dt_bias,
+            dd if self.skip_bwd_in_kernel else None,
+            *((dq_out, dq) if self.fold_dq else (None, None)),
+            *((dk_out, dk) if self.fold_dk else (None, None)),
+        )
         if self.chain:
             self.run_chain(
                 q,
@@ -749,6 +991,8 @@ class CompiledMamba2Bwd:
                 skip_bwd_part,
                 region,
                 stream,
+                post_buffers,
+                fold_buffers,
             )
         else:
             self.run_uncut(
@@ -773,34 +1017,15 @@ class CompiledMamba2Bwd:
                 skip_bwd_part,
                 region,
                 stream,
+                (
+                    self.tail_buffers((*views, *region.values(), None))
+                    if self.tail is not None
+                    else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+                ),
+                self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
+                post_buffers,
+                fold_buffers,
             )
-
-        # ---- the dt gate, the parameters, the D skip, the group folds -------------------------
-        if self.fold_dq:
-            self.head_group_reduce(dq_out, dq, stream=stream)
-        if self.fold_dk:
-            self.head_group_reduce(dk_out, dk, stream=stream)
-        self.gate_bwd(
-            region["dot_q"],
-            region["dot_k"],
-            region["exit_dots"],
-            g,
-            a,
-            dt_bias,
-            region["gate_slots"],
-            dg,
-            da,
-            d_dt_bias,
-            region["gate_part_a"],
-            region.get("gate_part_dt"),
-            b_t=self.b_t,
-            dt_softplus=self.dt_softplus,
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
-            stream=stream,
-            skip_bwd_part=skip_bwd_part.view(-1) if self.skip_bwd_in_kernel else None,
-            dd=dd if self.skip_bwd_in_kernel else None,
-        )
         return None
 
     def run_chain(
@@ -826,6 +1051,8 @@ class CompiledMamba2Bwd:
         skip_bwd_part,
         region,
         stream,
+        post_buffers,
+        fold_buffers,
     ) -> None:
         """Chain prologue, the forward chain's three steps when regenerating (zero-state summaries, scalar chain, the series
         from the chain states), backward summary, reverse scalar chain and the bprop over the pieces, launched from one
@@ -878,6 +1105,8 @@ class CompiledMamba2Bwd:
             skip_bwd_part=skip_bwd_part,
             exit_slots=region["gate_slots"],
             exit_base=region["exit_base"],
+            post_buffers=post_buffers,
+            fold_buffers=fold_buffers,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(
@@ -930,6 +1159,10 @@ class CompiledMamba2Bwd:
         skip_bwd_part,
         region,
         stream,
+        tail_buffers,
+        ragged_buffers,
+        post_buffers,
+        fold_buffers,
     ) -> None:
         """The uncut or warmup-split bprop over the forward's series, or the regenerate path (one host: table, one
         prologue, the recompute writing the chunk-cadence series, the bprop) when the graph passed none."""
@@ -972,10 +1205,23 @@ class CompiledMamba2Bwd:
                 series_count=region.get("work_count_recompute"),
                 seed_span_tokens=self.recompute_span_tokens if coarse else 0,
                 seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
+                item_limit_word=region.get("gate"),
+                tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 4 if self.ragged_pieces else (),
+                tail_buffers=tail_buffers,
+                ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+                ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+                ragged_buffers=ragged_buffers,
+                post_buffers=post_buffers,
+                fold_buffers=fold_buffers,
             )
             if self.regenerate_launch is None:
                 self.regenerate_launch = self.build_regenerate_backward(
                     **buffers,
+                    ragged_pieces=self.ragged_pieces,
+                    ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                    ragged_chain_rows=self.chain_rows if self.ragged_pieces else 0,
+                    tail=self.tail,
+                    tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                     split=self.split,
                     n_tiles=self.n_tiles,
                     ideal_chunks=self.ideal,
@@ -1019,10 +1265,23 @@ class CompiledMamba2Bwd:
             scheduler=region["scheduler_bwd"],
             workspace=region["tensormaps"],
             exit_slots=region["gate_slots"],
+            item_limit_word=region.get("gate"),
+            tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 4 if self.ragged_pieces else (),
+            tail_buffers=tail_buffers,
+            ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+            ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+            ragged_buffers=ragged_buffers,
+            post_buffers=post_buffers,
+            fold_buffers=fold_buffers,
         )
         if self.warmup_launch is None:
             self.warmup_launch = self.build_warmup_backward(
                 **buffers,
+                ragged_pieces=self.ragged_pieces,
+                ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                ragged_chain_rows=self.chain_rows if self.ragged_pieces else 0,
+                tail=self.tail,
+                tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                 split=self.split,
                 n_tiles=self.n_tiles,
                 ideal_chunks=self.ideal,
@@ -1059,13 +1318,21 @@ class CompiledMamba2Summary:
 
     def __init__(self, node, kernel_module):
         from .common.host import tensormap_workspace_bytes
+        from .common.piece_chain import CHAIN_THREADS, choose_pieces, piece_capacity, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS
-        from .kernel.mamba2_warmup_forward_f16 import build_recompute, run_recompute
+        from .common.tail import GATE_WORDS, choose_tail
+        from .kernel import mamba2_prefill_f16
+        from .kernel.mamba2_chain_forward_f16 import build_chain_summary, run_chain_summary
+        from .kernel.mamba2_warmup_forward_f16 import SUMMARY_TAIL_BUFFERS, build_recompute, run_recompute
 
         self.node = node
         self.launch = None
+        self.chain_launch = None
+        self.tail_buffer_names = SUMMARY_TAIL_BUFFERS
         self.build_recompute = build_recompute
         self.run_recompute = run_recompute
+        self.build_chain_summary = build_chain_summary
+        self.run_chain_summary = run_chain_summary
         self.plan_name = "Mamba2SummaryFrostEngine (MAMBA2_SUMMARY)"
         self.device = current_device()
         self.dt_softplus = bool(node.params.get("dt_softplus", True) if node.params.get("dt_softplus") is not None else True)
@@ -1077,14 +1344,84 @@ class CompiledMamba2Summary:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
+        K = node.inputs["k"].dim[2]
+        V = node.inputs["v"].dim[2]
+        self.n_heads_out = HO
+        self.num_seqs = B
+        self.batch_invariant = bool(node.params.get("batch_invariant", False))
+        self.pieces, self.unit_chunks = choose_pieces(
+            num_seqs=B,
+            heads_out=HO,
+            num_sm=self.num_sm,
+            total_tokens=node.inputs["k"].dim[0],
+            b_t=self.b_t,
+            cadence_tokens=0,
+            batch_invariant=self.batch_invariant,
+            expand_num=1,
+            compose_tail=True,
+        )
+        self.chain = self.pieces > 0
+        self.length_rule = self.chain and self.batch_invariant
+        self.tail = None
+        if not self.chain and not self.batch_invariant and self.has_transition:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=node.inputs["k"].dim[0],
+                b_t=self.b_t,
+                cadence_tokens=0,
+                expand_num=1,
+            )
 
         layout = WorkspaceLayout()
         regions = []
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
+        if self.chain:
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=node.inputs["k"].dim[0], batch_invariant=self.batch_invariant)
+            self.n_tiles = self.num_pieces * HO
+            self.tensormap_words = tensormap_workspace_bytes(mamba2_prefill_f16, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
         regions.append(("scheduler", layout.add(8), "int32", (2,)))
         regions.append(("work_items", layout.add(self.n_tiles * WORK_ITEM_FIELDS * 4), "int32", (self.n_tiles, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
+        if self.tail is not None:
+            regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+        if self.chain:
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
+            off_piece_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
+                ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
+                ("cu_pieces", off_piece_table + table.cu_pieces, "int32", (self.num_pieces + 1,)),
+                ("main_count", off_piece_table + table.main_count, "int32", (1,)),
+                ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
+                ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
+                ("slot_transition", layout.add(self.num_pieces * HO * 4), "float32", (self.num_pieces, HO)),
+            ]
+            self.chain_rows = 4 * CHAIN_THREADS // K
+        if self.tail is not None:
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            tail_tiles = self.tail_pieces_total * HO
+            regions.append(("tail_scheduler", layout.add(8), "int32", (2,)))
+            regions.append(("tail_work_items", layout.add(tail_tiles * WORK_ITEM_FIELDS * 4), "int32", (tail_tiles, WORK_ITEM_FIELDS)))
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_h", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_slot_transition", layout.add(self.tail_pieces_total * HO * 4), "float32", (self.tail_pieces_total, HO)),
+            ]
+            self.chain_rows = 4 * CHAIN_THREADS // K
+            tail_words = tensormap_workspace_bytes(mamba2_prefill_f16, self.tail_pieces_total) // 8
+            regions.append(("tail_tensormaps", layout.add(tail_words * 8, align=128), "int64", (tail_words,)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -1103,6 +1440,13 @@ class CompiledMamba2Summary:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_final_state = pos["final_state"]
         self.index_transition = pos.get("transition")
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {"words": "tail_tensormaps", "seed": "initial_state", "final_state": "final_state"}
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
 
     def run(self, views, workspace, stream) -> None:
         k = views[self.index_k]
@@ -1116,6 +1460,58 @@ class CompiledMamba2Summary:
         transition = views[self.index_transition] if self.index_transition is not None else None
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+
+        if self.chain:
+            buffers = dict(
+                k=k,
+                v=v,
+                gate=g,
+                a=a,
+                dt_bias=dt_bias,
+                cu_seqlens=cu,
+                cu_pieces=region["cu_pieces"],
+                main_rows=region["main_rows"],
+                summary_rows=region["summary_rows"],
+                main_count=region["main_count"],
+                summary_count=region["summary_count"],
+                work_items=region["work_items"],
+                work_items_summary=region["work_items_summary"],
+                scheduler=region["scheduler"],
+                words=region["tensormaps"],
+                state_h=region["state_h"],
+                slot_transition=region["slot_transition"],
+                seed=state0,
+                final_state=final_state,
+                transition=transition,
+            )
+            if self.chain_launch is None:
+                self.chain_launch = self.build_chain_summary(
+                    **buffers,
+                    pieces=self.pieces,
+                    heads_out=self.n_heads_out,
+                    num_seqs=self.num_seqs,
+                    unit_chunks=self.unit_chunks,
+                    b_t=self.b_t,
+                    length_rule=self.length_rule,
+                    dt_softplus=self.dt_softplus,
+                    dt_min=self.dt_min,
+                    dt_max=self.dt_max,
+                    chain_rows=self.chain_rows,
+                    device=self.device,
+                    num_sm=self.num_sm,
+                    stream=stream,
+                )
+            self.run_chain_summary(
+                self.chain_launch,
+                **buffers,
+                pieces=self.pieces,
+                heads_out=self.n_heads_out,
+                num_seqs=self.num_seqs,
+                dt_min=self.dt_min,
+                dt_max=self.dt_max,
+                stream=stream,
+            )
+            return
 
         buffers = dict(
             k=k,
@@ -1135,10 +1531,15 @@ class CompiledMamba2Summary:
             chunk_scratch=None,
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
+            item_limit_word=region.get("gate"),
+            tail_scalars=self.tail_scalars if self.tail is not None else (),
+            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
         )
         if self.launch is None:
             self.launch = self.build_recompute(
                 **buffers,
+                tail=self.tail,
+                tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                 split=False,
                 n_tiles=self.n_tiles,
                 ideal_chunks=None,
@@ -1170,13 +1571,21 @@ class CompiledMamba2SummaryBwd:
 
     def __init__(self, node, kernel_module):
         from .common.host import tensormap_workspace_bytes
+        from .common.piece_chain import CHAIN_THREADS, choose_pieces, piece_capacity, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS
-        from .kernel.mamba2_warmup_backward_f16 import build_summary_backward, run_summary_backward
+        from .common.tail import GATE_WORDS, choose_tail
+        from .kernel import mamba2_prefill_f16
+        from .kernel.mamba2_chain_backward_f16 import build_chain_summary_backward, run_chain_summary_backward
+        from .kernel.mamba2_warmup_backward_f16 import SUMMARY_TAIL_BUFFERS, build_summary_backward, run_summary_backward
 
         self.node = node
         self.launch = None
+        self.chain_launch = None
+        self.tail_buffer_names = SUMMARY_TAIL_BUFFERS
         self.build_summary_backward = build_summary_backward
         self.run_summary_backward = run_summary_backward
+        self.build_chain_summary_backward = build_chain_summary_backward
+        self.run_chain_summary_backward = run_chain_summary_backward
         self.plan_name = "Mamba2SummaryFrostEngine (MAMBA2_SUMMARY_BWD)"
         self.device = current_device()
         self.dt_softplus = bool(node.params.get("dt_softplus", True) if node.params.get("dt_softplus") is not None else True)
@@ -1188,14 +1597,85 @@ class CompiledMamba2SummaryBwd:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
+        K = node.inputs["q"].dim[2]
+        V = node.inputs["dO"].dim[2]
+        self.n_heads_out = HO
+        self.num_seqs = B
+        self.batch_invariant = bool(node.params.get("batch_invariant", False))
+        self.pieces, self.unit_chunks = choose_pieces(
+            num_seqs=B,
+            heads_out=HO,
+            num_sm=self.num_sm,
+            total_tokens=node.inputs["q"].dim[0],
+            b_t=self.b_t,
+            cadence_tokens=0,
+            batch_invariant=self.batch_invariant,
+            expand_num=1,
+            reverse=True,
+            compose_tail=True,
+        )
+        self.chain = self.pieces > 0
+        self.length_rule = self.chain and self.batch_invariant
+        self.tail = None
+        if not self.chain and not self.batch_invariant:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=node.inputs["q"].dim[0],
+                b_t=self.b_t,
+                cadence_tokens=0,
+                expand_num=1,
+            )
 
         layout = WorkspaceLayout()
         regions = []
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
+        if self.chain:
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=node.inputs["q"].dim[0], batch_invariant=self.batch_invariant)
+            self.n_tiles = self.num_pieces * HO
+            self.tensormap_words = tensormap_workspace_bytes(mamba2_prefill_f16, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
         regions.append(("scheduler", layout.add(8), "int32", (2,)))
         regions.append(("work_items", layout.add(self.n_tiles * WORK_ITEM_FIELDS * 4), "int32", (self.n_tiles, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
+        if self.tail is not None:
+            regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+        if self.chain:
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
+            off_piece_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
+                ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
+                ("cu_pieces", off_piece_table + table.cu_pieces, "int32", (self.num_pieces + 1,)),
+                ("main_count", off_piece_table + table.main_count, "int32", (1,)),
+                ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
+                ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
+                ("slot_transition", layout.add(self.num_pieces * HO * 4), "float32", (self.num_pieces, HO)),
+            ]
+            self.chain_rows = 4 * CHAIN_THREADS // K
+        if self.tail is not None:
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            tail_tiles = self.tail_pieces_total * HO
+            regions.append(("tail_scheduler", layout.add(8), "int32", (2,)))
+            regions.append(("tail_work_items", layout.add(tail_tiles * WORK_ITEM_FIELDS * 4), "int32", (tail_tiles, WORK_ITEM_FIELDS)))
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_g", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_slot_transition", layout.add(self.tail_pieces_total * HO * 4), "float32", (self.tail_pieces_total, HO)),
+            ]
+            self.chain_rows = 4 * CHAIN_THREADS // K
+            tail_words = tensormap_workspace_bytes(mamba2_prefill_f16, self.tail_pieces_total) // 8
+            regions.append(("tail_tensormaps", layout.add(tail_words * 8, align=128), "int64", (tail_words,)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -1214,6 +1694,13 @@ class CompiledMamba2SummaryBwd:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_d_initial_state = pos["d_initial_state"]
         self.index_transition = pos.get("transition")
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {"words": "tail_tensormaps", "dstate_in": "d_final_state", "dstate0": "d_initial_state"}
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -1228,6 +1715,58 @@ class CompiledMamba2SummaryBwd:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
 
+        if self.chain:
+            buffers = dict(
+                q=q,
+                do=do,
+                gate=g,
+                a=a,
+                dt_bias=dt_bias,
+                cu_seqlens=cu,
+                cu_pieces=region["cu_pieces"],
+                main_rows=region["main_rows"],
+                summary_rows=region["summary_rows"],
+                main_count=region["main_count"],
+                summary_count=region["summary_count"],
+                work_items=region["work_items"],
+                work_items_summary=region["work_items_summary"],
+                scheduler=region["scheduler"],
+                words=region["tensormaps"],
+                state_g=region["state_g"],
+                slot_transition=region["slot_transition"],
+                dstate_in=dstate_in,
+                dstate0=dstate0,
+                transition=transition,
+            )
+            if self.chain_launch is None:
+                self.chain_launch = self.build_chain_summary_backward(
+                    **buffers,
+                    pieces=self.pieces,
+                    heads_out=self.n_heads_out,
+                    num_seqs=self.num_seqs,
+                    unit_chunks=self.unit_chunks,
+                    b_t=self.b_t,
+                    length_rule=self.length_rule,
+                    dt_softplus=self.dt_softplus,
+                    dt_min=self.dt_min,
+                    dt_max=self.dt_max,
+                    chain_rows=self.chain_rows,
+                    device=self.device,
+                    num_sm=self.num_sm,
+                    stream=stream,
+                )
+            self.run_chain_summary_backward(
+                self.chain_launch,
+                **buffers,
+                pieces=self.pieces,
+                heads_out=self.n_heads_out,
+                num_seqs=self.num_seqs,
+                dt_min=self.dt_min,
+                dt_max=self.dt_max,
+                stream=stream,
+            )
+            return
+
         buffers = dict(
             q=q,
             do=do,
@@ -1241,10 +1780,15 @@ class CompiledMamba2SummaryBwd:
             work_count=region["work_count"],
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
+            item_limit_word=region.get("gate"),
+            tail_scalars=self.tail_scalars if self.tail is not None else (),
+            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
         )
         if self.launch is None:
             self.launch = self.build_summary_backward(
                 **buffers,
+                tail=self.tail,
+                tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                 num_sm=self.num_sm,
                 b_t=self.b_t,
                 dt_softplus=self.dt_softplus,
@@ -1261,7 +1805,7 @@ class Mamba2SummaryFrostEngine(BaseEngine):
     """FROST summary backend for single-node MAMBA2_SUMMARY and MAMBA2_SUMMARY_BWD graphs (THD layout)."""
 
     name = "mamba2_summary_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)

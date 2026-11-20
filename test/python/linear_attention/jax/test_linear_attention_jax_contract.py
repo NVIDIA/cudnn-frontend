@@ -5,12 +5,24 @@ import numpy as np
 import pytest
 
 pytest.importorskip("jax", minversion="0.9.1")
+pytest.importorskip("cudnn._jax", exc_type=ImportError)
 import jax.numpy as jnp
 
 from cudnn import ops
+from cudnn.frost import buffers
 from cudnn.linear_attention import _jax_execution
 
 pytestmark = pytest.mark.L0
+
+
+def test_old_cutedsl_rejected_before_build(monkeypatch):
+    q = jnp.zeros((1, 1, 64), jnp.bfloat16)
+    g = jnp.zeros((1, 1), jnp.float32)
+    cu = jnp.arange(2, dtype=jnp.int32)
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(_jax_execution, "_device", lambda *_: (0, "sm_100a"))
+    with pytest.raises(ImportError, match=r"requires nvidia-cutlass-dsl >= 4\.8\.1; found 4\.8\.0"):
+        ops.gated_delta_net_forward_jax(q, q, q, g, g, cu)
 
 
 @pytest.fixture
@@ -32,7 +44,7 @@ def forward_residual(monkeypatch):
         else:
             args = (q, q, q, g, g, cu)
         forward = getattr(ops, name + "_forward_jax")
-        return forward(*args, output_final_state=True)
+        return forward(*args, output_final_state=True, return_residual=True)
 
     return prepare
 

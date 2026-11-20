@@ -3,6 +3,7 @@
 """Opaque MXFP8 scale storage has one native contract for dense and THD."""
 
 import sdpa_binding_reference as binding_reference
+from frost_test_utils import mxfp8_engine_name
 
 import ast
 from pathlib import Path
@@ -53,6 +54,16 @@ def _fixture(thd=False, d=128, dv=128, split=1, output="bfloat16", carrier="uint
     roles = (prep._NATIVE_THD_ROLES if thd else prep._NATIVE_DENSE_ROLES) + prep._native_quant_roles(s.quant)
     s.native = (cudnn._pybind_module._SdpaThdBinder if thd else cudnn._pybind_module._SdpaDenseBinder)(s)
     return s, facts, frames, combined, roles
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_count", [2, 3])
+def test_native_mxfp8_rejects_per_tensor_mla_width(scale_count):
+    spec, *_ = _fixture()
+    spec.d_qk, spec.d_v = 576, 512
+    spec.quant = spec.quant._replace(sf_sizes=spec.quant.sf_sizes[:scale_count])
+    with pytest.raises(ValueError, match="supported quantized attention head dimension pair"):
+        cudnn._pybind_module._SdpaDenseBinder(spec)
 
 
 def _execute(s, facts, roles, thd, workspace=0x50000000):
@@ -200,7 +211,7 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     g.build_operation_graph()
     # The cc 10.7 row serves the same pool contract on d128 (cga2) / d256 (cga1): separate V table, batch-innermost
     # tables, e4m3 O, Stats, CUDA-graph replay after mutating the SF bytes, native-binder-only execution.
-    name = engine_name(arch="sm107" if rubin else "sm100", mxfp8=True)
+    name = mxfp8_engine_name("sm107" if rubin else "sm100", d, d)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     cga = max(dict(caps.cgas_by_d_shape).get((d, d), caps.cgas))

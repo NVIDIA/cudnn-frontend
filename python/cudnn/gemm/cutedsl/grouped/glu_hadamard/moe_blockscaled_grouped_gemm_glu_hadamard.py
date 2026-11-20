@@ -29,6 +29,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import nvvm, llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cudnn._cutlass_helpers.warp_reduce import warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -38,7 +40,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Float32, Int32, AddressSpace
+from cudnn.api_base import is_sm107_device
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
+from ..glu_layout import validate_glu_layout, interleaved_glu_view, paired_glu_sfb_view, interleave_sfb_in_place
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -49,6 +53,7 @@ from ..moe_utils import (
     MoEWeightMode,
     TensormapWorkspace,
     store_tma_desc,
+    tensormap_ptr_for_copy,
 )
 from .hadamard_utils import (
     hadamard_setup,
@@ -66,6 +71,7 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     fmin,
     fmax,
+    tanh_clamp_unit,
     atomic_max_float32,
     silu_f32,
     silu_f32_geglu_scaled,
@@ -74,6 +80,22 @@ from ..moe_kernel_helpers import (
     can_implement,
     amax_reduction_per_thread,
 )
+
+
+@dsl_user_op
+def _wait_sfb_ready(ptr, phase, *, loc=None, ip=None):
+    """Acquire both CTAs' scale stores before the collective SMEM->TMEM copy."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(ptr.toint()).ir_value(loc=loc, ip=ip), cutlass.Int32(phase).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred done; WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [$0], $1, 10000000; @!done bra WAIT; }",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class BlockScaledMoEGroupedGemmGluHadamardKernel:
@@ -151,6 +173,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         situ_beta1: float = 4.0,
         enable_bias: bool = False,
         use_tmem_post_rht_amax: bool = False,
+        tanh_clamp_scale: Optional[float] = None,
+        rht_sign_mask: int = 0,
+        glu_layout: str = "interleaved_32",
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -160,6 +185,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -228,7 +254,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             num_threads=32 * self.epilogue_warp_group_size,
         )
 
-        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
+        # Size the A/B pipeline from the shared memory of the device that runs the kernel: SM107 (Rubin) has more
+        # than SM100, and the hard-coded "sm_100" budget left A/B stages unused there.
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107" if is_sm107_device() else "sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -241,6 +269,18 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         self.situ_beta1 = float(situ_beta1)
         if act_func not in ["swiglu", "geglu", "situglu", "srelu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
+        # Soft-clamp scale ``s`` for the SReLU epilogue: computes (s * tanh(relu(x) / s))^2
+        # in place of relu(x)^2. A trace-time constant, like in the plain SReLU kernel.
+        if tanh_clamp_scale is not None and act_func != "srelu":
+            raise ValueError("tanh_clamp_scale is only supported with act_func='srelu'")
+        self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
+        # Random sign mask of the consumer's randomized Hadamard transform: bit ``i`` negates
+        # input element ``i`` of each 16-token block before the transform. The post-RHT amax
+        # is computed for that transform (with the TMEM path, the signs are folded into the
+        # Hadamard tensor by the API). Trace-time constant.
+        if not isinstance(rht_sign_mask, int) or not 0 <= rht_sign_mask < (1 << HADAMARD_SIZE):
+            raise ValueError(f"rht_sign_mask must be a {HADAMARD_SIZE}-bit integer, got {rht_sign_mask!r}")
+        self.rht_sign_mask = int(rht_sign_mask)
 
     def _setup_attributes(self):
         """Set up configurations dependent on GEMM inputs (called inside __call__)."""
@@ -355,11 +395,15 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.d_layout,
             self.sf_dtype,
             self.sf_vec_size,
-            self.num_smem_capacity,
+            self.num_smem_capacity - (256 if self.glu_layout == "gate_then_up" else 0),
             self.occupancy,
             self.bias_dtype if self.enable_bias else None,
             self.use_tmem_post_rht_amax,
         )
+
+        # Two 8-byte SFB barriers per stage, with room for at most 16 stages.
+        if self.glu_layout == "gate_then_up":
+            assert self.num_ab_stage <= 16
 
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -391,6 +435,12 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.epi_tile_c,
             self.num_c_stage,
         )
+        if self.glu_layout == "gate_then_up":
+            # Canonical branch chunks expose only 32 contiguous BF16 elements.
+            c_atom_kind = sm100_utils.get_smem_layout_atom_epi(self.c_layout, self.c_dtype, (self.epi_tile_c[0], 32))
+            c_atom = sm100_utils.make_smem_layout_atom(c_atom_kind, self.c_dtype)
+            self.c_smem_layout_staged = cute.tile_to_shape(c_atom, (*self.epi_tile_c, self.num_c_stage), order=(0, 1, 2))
+
         self.d_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.d_dtype,
             self.d_layout,
@@ -470,6 +520,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
             b_tma_op_arg = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma_arg.thr_id)
             sfb_tma_op_arg = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma_arg.thr_id)
+            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                sfb_tma_op_arg = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
 
             # Read per-expert base addresses from the pointer arrays
             b_ptr_tensor = cute.make_tensor(
@@ -497,6 +549,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 b_ptr,
                 cute.make_layout((n, k, c1), stride=(stride_n, stride_k, c0)),
             )
+            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                b_expert = interleaved_glu_view(b_expert, 0)
             tma_atom_b, _ = cute.nvgpu.make_tiled_tma_atom_B(
                 b_tma_op_arg,
                 b_expert,
@@ -513,6 +567,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             sfb_ptr = cute.make_ptr(self.sf_dtype, sfb_ptr_val, AddressSpace.gmem)
             sfb_layout = blockscaled_utils.tile_atom_to_shape_SF((n, k, c1), self.sf_vec_size)
             sfb_expert = cute.make_tensor(sfb_ptr, sfb_layout)
+            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                sfb_expert = paired_glu_sfb_view(sfb_expert)
             tma_atom_sfb, _ = cute.nvgpu.make_tiled_tma_atom_B(
                 sfb_tma_op_arg,
                 sfb_expert,
@@ -623,6 +679,13 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             sfb_layout = blockscaled_utils.tile_atom_to_shape_SF((n, k, c1), self.sf_vec_size)
             sfb = cute.make_tensor(sfb_ptr_typed, sfb_layout)
 
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            b = interleaved_glu_view(b, 0)
+            sfb = paired_glu_sfb_view(sfb)
+            c = interleaved_glu_view(c, 1)
+            if cutlass.const_expr(self.enable_bias):
+                bias = interleaved_glu_view(bias, 0)
+
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
         sfa = cute.make_tensor(sfa.iterator, sfa_layout)
 
@@ -690,6 +753,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
         # TMA load SFB
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma.thr_id)
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            sfb_op = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
         tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_op,
@@ -725,6 +790,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
+        self.num_sfb_load_bytes = sfb_copy_size
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            self.num_tma_load_bytes -= sfb_copy_size * atom_thr_size
 
         # TMA store C
         c_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
@@ -773,7 +841,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
             b_n, b_k, b_l = cute.shape(b)
-            sched_expert_shape = (self.expert_cnt, b_n, b_k)
+            sched_expert_shape = (self.expert_cnt, cute.size(b_n), b_k)
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
 
@@ -799,6 +867,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         class SharedStorage:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            sfb_load_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage if self.glu_layout == "gate_then_up" else 0]
+            sfb_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage if self.glu_layout == "gate_then_up" else 0]
             pingpong_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_pingpong_stage * 2]
             if cutlass.const_expr(self.enable_bias):
                 bias_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_bias_stage * 2]
@@ -1136,24 +1206,66 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
     @cute.jit
     def srelu_act(self, tCompute, acc_vec, mProb):
-        acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
-        if cutlass.const_expr(self.vectorized_f32):
-            for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
-                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                    (acc_relu[i], acc_relu[i + 1]),
-                    (acc_relu[i], acc_relu[i + 1]),
-                    rnd="rn",
-                    ftz=False,
-                )
-                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                    (tCompute[i], tCompute[i + 1]),
-                    (mProb, mProb),
-                    rnd="rn",
-                    ftz=False,
-                )
+        # Backward and activation recomputation consume the saved C, which is
+        # stored in c_dtype. Evaluate the activation from that same rounded value
+        # so the dsrelu kernel's d_srelu regeneration is bit-identical to D,
+        # while retaining FP32 activation arithmetic. This mirrors the plain
+        # grouped SReLU kernel (moe_blockscaled_grouped_gemm_srelu_quant.py).
+        acc_vec = acc_vec.to(self.c_dtype).to(self.acc_dtype)
+        if cutlass.const_expr(self.tanh_clamp_scale is not None):
+            # Soft-clamped squared ReLU: out = (s * tanh(relu(x) / s))^2 * w, computed as
+            # t^2 * prob_scale with t = tanh(relu(x) / s) and prob_scale = s^2 * w. This is
+            # the same expression, in the same order, as the plain SReLU kernel and the
+            # dsrelu kernel's d_srelu regeneration (clamp_k_srelu); keep them identical.
+            # tanh_clamp_unit is relu, tanh and the defensive t <= 1 cap (negative x -> 0).
+            clamp_s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+            clamp_s2 = cutlass.Float32(self.tanh_clamp_scale * self.tanh_clamp_scale)
+            prob_scale = cutlass.Float32(mProb) * clamp_s2
+            if cutlass.const_expr(self.vectorized_f32):
+                for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                    u0, u1 = cute.arch.mul_packed_f32x2(
+                        (acc_vec[i], acc_vec[i + 1]),
+                        (clamp_s_rcp, clamp_s_rcp),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                    t0 = tanh_clamp_unit(u0)
+                    t1 = tanh_clamp_unit(u1)
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (t0, t1),
+                        (t0, t1),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (prob_scale, prob_scale),
+                        rnd="rn",
+                        ftz=False,
+                    )
+            else:
+                for i in cutlass.range_constexpr(cute.size(tCompute)):
+                    t = tanh_clamp_unit(acc_vec[i] * clamp_s_rcp)
+                    tCompute[i] = (t * t) * prob_scale
         else:
-            for i in cutlass.range_constexpr(cute.size(tCompute)):
-                tCompute[i] = acc_relu[i] * acc_relu[i] * mProb
+            acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
+            if cutlass.const_expr(self.vectorized_f32):
+                for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (acc_relu[i], acc_relu[i + 1]),
+                        (acc_relu[i], acc_relu[i + 1]),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (mProb, mProb),
+                        rnd="rn",
+                        ftz=False,
+                    )
+            else:
+                for i in cutlass.range_constexpr(cute.size(tCompute)):
+                    tCompute[i] = acc_relu[i] * acc_relu[i] * mProb
 
     @cute.jit
     def query_hadamard_tmem_a_ptr(self, tile_idx, reverse_subtile, tmem_ptr):
@@ -1342,6 +1454,13 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            if warp_idx == self.mma_warp_id:
+                with cute.arch.elect_one():
+                    for stage in cutlass.range_constexpr(self.num_ab_stage):
+                        cute.arch.mbarrier_init(storage.sfb_load_mbar_ptr.data_ptr() + stage, 1)
+                        cute.arch.mbarrier_init(storage.sfb_ready_mbar_ptr.data_ptr() + stage, 2)
+            cute.arch.mbarrier_init_fence()
 
         # AB pipeline
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -1599,7 +1718,16 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 real_a, _ = ext.get_gmem_tensor("a", mA_mkl, padded_offsets, work_tile_info)
                 real_b, desc_ptr_b = ext.get_gmem_tensor("b", mB_nkl, padded_offsets, work_tile_info)
                 real_sfa, _ = ext.get_gmem_tensor("sfa", mSFA_mkl, padded_offsets, work_tile_info)
-                real_sfb, desc_ptr_sfb = ext.get_gmem_tensor("sfb", mSFB_nkl, padded_offsets, work_tile_info)
+                if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                    # Preserve the paired SF atom view through expert selection.
+                    real_sfb = mSFB_nkl
+                    desc_ptr_sfb = None
+                    if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
+                        desc_ptr_sfb = tensormap_ptr_for_copy(ext.tensormap_ctor.get_desc_ptr("sfb", work_tile_info.expert_idx))
+                    else:
+                        real_sfb = cute.domain_offset((0, 0, work_tile_info.expert_idx), real_sfb)
+                else:
+                    real_sfb, desc_ptr_sfb = ext.get_gmem_tensor("sfb", mSFB_nkl, padded_offsets, work_tile_info)
 
                 gA_mkl = cute.local_tile(real_a, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
                 gB_nkl = cute.local_tile(real_b, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
@@ -1687,7 +1815,14 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar_ptr=tma_bar, mcast_mask=a_full_mcast_mask)
                     cute.copy(tma_atom_b, tBgB_k, tBsB_pipe, tma_bar_ptr=tma_bar, mcast_mask=b_full_mcast_mask, tma_desc_ptr=desc_ptr_b)
                     cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_pipe, tma_bar_ptr=tma_bar, mcast_mask=sfa_full_mcast_mask)
-                    cute.copy(tma_atom_sfb, tBgSFB_k, tBsSFB_pipe, tma_bar_ptr=tma_bar, mcast_mask=sfb_full_mcast_mask, tma_desc_ptr=desc_ptr_sfb)
+                    sfb_bar = tma_bar
+                    if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                        # Both half-tile multicasts contribute to this CTA's
+                        # complete SFB stage. Group-one completion stays local.
+                        sfb_bar = storage.sfb_load_mbar_ptr.data_ptr() + ab_producer_state.index
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(sfb_bar, self.num_sfb_load_bytes)
+                    cute.copy(tma_atom_sfb, tBgSFB_k, tBsSFB_pipe, tma_bar_ptr=sfb_bar, mcast_mask=sfb_full_mcast_mask, tma_desc_ptr=desc_ptr_sfb)
 
                     ab_producer_state.advance()
 
@@ -1793,8 +1928,23 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                        # Each CTA observes its own TMA destination before
+                        # permuting SFB. The permutation stores and proxy fence
+                        # precede the release; both arrivals are required before
+                        # the leader's collective S2T can consume either copy.
+                        cute.arch.mbarrier_wait(storage.sfb_load_mbar_ptr.data_ptr() + ab_consumer_state.index, ab_consumer_state.phase)
+                        interleave_sfb_in_place(sSFB, ab_consumer_state.index, lane_idx, self.mma_tiler[2], self.sf_vec_size, self.num_ab_stage)
+                        ready_barrier = storage.sfb_ready_mbar_ptr.data_ptr() + ab_consumer_state.index
+                        with cute.arch.elect_one():
+                            if is_leader_cta:
+                                cute.arch.mbarrier_arrive(ready_barrier)
+                            else:
+                                cute.arch.mbarrier_arrive(ready_barrier, cta_rank_in_cluster ^ 1, scope=nvvm.MemScopeKind.CLUSTER)
                     if is_leader_cta:
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                            _wait_sfb_ready(storage.sfb_ready_mbar_ptr.data_ptr() + ab_consumer_state.index, ab_consumer_state.phase)
                         s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
                         tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
                         tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
@@ -1817,6 +1967,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
                         ab_pipeline.consumer_release(ab_consumer_state)
                         ab_consumer_state = ab_consumer_state_next
+                    elif cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                        ab_consumer_state.advance()
 
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acd_producer_state)
@@ -1858,7 +2010,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 thr_bias_g2s = bias_g2s_tiled.get_slice(cute.arch.lane_idx())
                 tBs_sBias = thr_bias_g2s.partition_D(sBias)
 
-                bias_n_total = mBias_nl.shape[0]
+                bias_n_total = cute.size(mBias_nl.shape[0])
                 tBpBias = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Boolean)
 
                 tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
@@ -2256,7 +2408,16 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                         self.situglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, situ_beta1, situ_beta2)
 
                     if cutlass.const_expr(self.generate_amax):
-                        thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
+                        # The amax describes D as it is stored in d_dtype, not the FP32 values
+                        # in registers: round-to-nearest can lift the largest element above
+                        # the FP32 maximum, and it would then saturate when D is quantized
+                        # with this amax.
+                        if cutlass.const_expr(self.d_dtype in (cutlass.BFloat16, cutlass.Float16)):
+                            tComputeD = cute.make_rmem_tensor(tCompute.shape, self.acc_dtype)
+                            tComputeD.store(tCompute.load().to(self.d_dtype).to(self.acc_dtype))
+                            thread_tile_amax = self.amax_reduction_per_thread(tComputeD, thread_tile_amax)
+                        else:
+                            thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
 
                     #
                     # Store post-activation output to D.
@@ -2522,6 +2683,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                 0,
                                 epi_tidx,
                                 thread_tile_post_rht_amax,
+                                self.rht_sign_mask,
                             )
                             thread_tile_post_rht_amax = hadamard_smem_transpose_fwht_amax(
                                 sD,
@@ -2529,6 +2691,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                 HADAMARD_SIZE,
                                 epi_tidx,
                                 thread_tile_post_rht_amax,
+                                self.rht_sign_mask,
                             )
 
                     #
@@ -2604,6 +2767,7 @@ class BlockScaledMoEGroupedGemmGluHadamardCompatKernel(BlockScaledMoEGroupedGemm
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
         enable_bias: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         del generate_sfd, discrete_col_sfd
         super().__init__(
@@ -2618,6 +2782,7 @@ class BlockScaledMoEGroupedGemmGluHadamardCompatKernel(BlockScaledMoEGroupedGemm
             use_dynamic_sched=use_dynamic_sched,
             act_func=act_func,
             enable_bias=enable_bias,
+            glu_layout=glu_layout,
         )
 
     def __call__(

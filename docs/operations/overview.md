@@ -4,6 +4,7 @@ The API reference groups graph operations and experimental Python kernels by
 operation. Use the sidebar to find an operation and its related APIs.
 
 - [Attention](/operations/Attention)
+- [JAX SDPA Python frontend (experimental)](sdpa_jax.md)
 - [Sparse Attention](/operations/sparse_attention)
 - [Linear Attention](/operations/LinearAttention)
 - [Matmul and GEMM Fusions](/operations/Matmul)
@@ -19,8 +20,8 @@ operation. Use the sidebar to find an operation and its related APIs.
 
 The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only when torch tensors are passed. JAX arrays are additionally accepted wherever the kernel's tensor layouts are expressible as row-major arrays (each API's page has a "JAX support" section with its exact contract):
 
-- **Dense fusions** (amax, swiglu, srelu, dsrelu): full JAX eager support, plus `jax.jit`-compatible XLA custom-call entry points for all four (built on `cudnn.jax.call` / CuTeDSL's native `cutlass.jax` bridge; see `gemm_amax.md` "Using JAX arrays").
-- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Contiguous grouped MXFP8 SwiGLU/dSwiGLU wrappers accept Torch tensors and canonical JAX arrays, including under `jax.jit`, with explicit FP8 output dtype and `sf_vec_size=32` for JAX. The unified GLU wrapper likewise dispatches canonical MXFP8 JAX inputs to `grouped_gemm_glu_jax_sm100` (SwiGLU/GeGLU), which runs the Rubin GLU kernel on SM107. The unified dGLU, wgrad and quant wrappers likewise dispatch canonical JAX inputs to `grouped_gemm_dglu_jax_sm100` (dSwiGLU/dGeGLU), `grouped_gemm_wgrad_jax_sm100` and `grouped_gemm_quant_jax_forward`, which run the Rubin kernels on SM107. The grouped SReLU, dSReLU, GLU+Hadamard and GLU+Hadamard+quant wrappers dispatch to `grouped_gemm_srelu_jax_forward`, `grouped_gemm_dsrelu_jax_sm100`, `grouped_gemm_glu_hadamard_jax_forward` and `grouped_gemm_glu_hadamard_quant_jax_forward` (SM100+, as in Torch; GLU+Hadamard+quant runs its Rubin kernel on SM107). These canonical entries take dense weights in MXFP8 or packed FP4 (as `uint8`, with E4M3 scales per 16 for NVFP4), and GLU, dGLU and wgrad also take BF16; each page lists its formats. Existing Torch behavior and wrapper defaults are unchanged. Discrete block-scaled weights, column-major bias layouts and the op classes reject JAX with clear errors.
+- **Dense fusions** (amax, swiglu, srelu, dsrelu): full JAX eager support, plus `jax.jit`-compatible XLA custom-call entry points for all four (built on `cutlass.jax.cutlass_call` / CuTeDSL's native `cutlass.jax` bridge; see `gemm_amax.md` "Using JAX arrays").
+- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cutlass.jax.cutlass_call`; each API page documents its exact jit contract). Contiguous grouped MXFP8 SwiGLU/dSwiGLU wrappers accept Torch tensors and canonical JAX arrays, including under `jax.jit`, with explicit FP8 output dtype and `sf_vec_size=32` for JAX. The unified GLU wrapper likewise dispatches canonical MXFP8 JAX inputs to `grouped_gemm_glu_jax_sm100` (SwiGLU/GeGLU), which runs the Rubin GLU kernel on SM107. The unified dGLU, wgrad and quant wrappers likewise dispatch canonical JAX inputs to `grouped_gemm_dglu_jax_sm100` (dSwiGLU/dGeGLU), `grouped_gemm_wgrad_jax_sm100` and `grouped_gemm_quant_jax_forward`, which run the Rubin kernels on SM107. The grouped SReLU, dSReLU, GLU+Hadamard and GLU+Hadamard+quant wrappers dispatch to `grouped_gemm_srelu_jax_forward`, `grouped_gemm_dsrelu_jax_sm100`, `grouped_gemm_glu_hadamard_jax_forward` and `grouped_gemm_glu_hadamard_quant_jax_forward` (SM100+, as in Torch; GLU+Hadamard+quant runs its Rubin kernel on SM107). These canonical entries take dense weights in MXFP8 or packed FP4 (as `uint8`, with E4M3 scales per 16 for NVFP4), and GLU, dGLU and wgrad also take BF16; each page lists its formats. Existing Torch behavior and wrapper defaults are unchanged. Discrete block-scaled weights, column-major bias layouts and the op classes reject JAX with clear errors.
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 New APIs follow the [Python API Naming Conventions](/operations/api_conventions).
@@ -31,8 +32,13 @@ The experimental API catalog includes:
 - [Gated DeltaNet, Gated DeltaNet v2, Gated DeltaProduct, and Mamba-2 in JAX](/operations/LinearAttention/linear_attention_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/linear_attention/linear_attention_jax.md))
 - [Fused GDN Decode / Verify Steps as a FlashInfer Backend (SM100 / SM120)](/operations/LinearAttention/gdn_decode_flashinfer_backend) — the fused Gated DeltaNet decode step and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer as one FROST launch each, registered as the `frost_fe` backend of FlashInfer's experimental Qwen 3.5 GDN block (bf16 operands, fp32 state, FP8 output)
 - [Shared-Expert Decode Pair (SM100-class)](/operations/MoeGroupedMatmul/shared_expert_decode) — the bf16 shared expert next to a routed MoE at decode-time token counts (1 .. 24) as two FROST launches (gate_up + SiLU-mul with the gate logit, down + sigmoid gate), bitwise repeatable and batch-invariant
+- [CuTe MoK (SM100 / SM103)](/operations/MoeGroupedMatmul/cutemok) — one expert-parallel MoE layer (token dispatch across ranks, the routed and shared experts' SwiGLU MLPs, combine) as one persistent CuTe DSL megakernel per direction, BF16 or MXFP8 routed weights, derived from Mixture-of-Kittens
 - [Attention Gate + Quantize Decode Step (SM100-class)](/operations/Attention/gate_quant_decode) — the sigmoid output gate of an attention block fused with the static FP8 (E4M3) quantization of the following projection's input, at decode-time row counts (1 .. 160), as one FROST launch (bf16 in, E4M3 out), bitwise repeatable and batch-invariant
-- [FP8 Projection for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/fp8_projection_decode) — an FP8 E4M3 weight times FP8 E4M3 activations to bf16 at decode-time row counts (1 .. 32) as one FROST launch with split-K clusters and the weight stream ahead of the dependent-launch wait; the split is a numerics attribute fixed per entry, bitwise repeatable and batch-invariant
+- [FP8 Projection for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/fp8_projection_decode) — an FP8 E4M3 weight times FP8 E4M3 activations to bf16 at decode-time row counts (1 .. 32) as one FROST launch with split-K clusters (or one K slice per weight tile, without a cluster) and the weight stream ahead of the dependent-launch wait; the split is a numerics attribute fixed per entry, bitwise repeatable and batch-invariant
+- [Add + RMSNorm + Quantize Decode Step (SM100-class)](/operations/Normalizations/add_norm_quant_decode) — the residual add, the RMSNorm and the quantization of the next projection's input at decode-time row counts (1 .. 1024) as one FROST launch (bf16 in; bf16, FP8 E4M3 or NVFP4 out), bitwise repeatable and batch-invariant
+- [SwiGLU FP4 Gate / Up Product for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/swiglu_fp4_decode) — the gate / up product of a block-scaled FP4 (NVFP4) MLP with SiLU(gate) x up and the FP4 re-quantization of the result at decode-time row counts (1 .. 64) as one FROST launch, with the weight stream ahead of the dependent-launch wait; no numerics knob, bitwise repeatable and batch-invariant
+- [Attention Preparation Decode Step (SM100-class)](/operations/Attention/attention_prepare_decode) — per token of a decode step the RMSNorm of every query and key head row, the rotation of its rotary part by the token's position (one or three position rows), the gate rows copied beside the queries and the keys and values written into paged pools at the token's slot, at decode-time token counts (1 .. 1024), as one FROST launch (bf16 in and out), bitwise repeatable and batch-invariant
+- [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode) — the block-scaled FP4 (NVFP4) quantization of bf16 rows under a global scale (E2M1 codes, one E4M3 block scale per sixteen elements in the 128 x 4 scale layout) at decode-time row counts (1 .. 1024) as one FROST launch; no numerics knob, bitwise repeatable and batch-invariant
 - [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
@@ -62,6 +68,10 @@ The experimental API catalog includes:
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
+- [Pooled DSA](/operations/sparse_attention/pooled_dsa): full indexer, selection from logits, cache update, and index expansion
+- [Fused DSA indexer and exact top-k (Cake)](/operations/dsa_indexer_topk)
+- [Cake sparse-attention training](/operations/dsa_sparse_training)
+- [Cake deterministic DSA and Lightning indexer](/operations/dsa_deterministic)
 - [Flex Attention](/operations/sparse_attention/flex_attention) and [mask plan design](/operations/sparse_attention/flex_attention/flex_attention_design)
 - [HSTU Attention (Blackwell SM100/SM103)](/operations/sparse_attention/hstu_attention)
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](/operations/sparse_attention/hstu_lmsd)
@@ -76,10 +86,12 @@ The experimental API catalog includes:
 - [SDPA Backward (SM120)](/operations/Attention/sdpa_bwd_sm120)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](/operations/Attention/sdpa_bwd_sm107)
 - [Compact GQA Backward (SM107)](/operations/Attention/compact_gqa_backward)
+- [Packed GQA training (Cake)](/operations/gqa_training)
 - [NVFP4 Attention QAT Backward](/operations/Attention/nvfp4_attention_qat_backward)
 - [RMSNorm + SiLU](/operations/Normalizations/rmsnorm_silu)
 - [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](/operations/Convolutions/conv3d_postops)
 - [NVFP4 Block-Scale Conversion](/operations/BlockScaling/nvfp4_block_scale_conversion)
+- [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode)
 - [DSv4.1 mHC projection/RMS backward](/operations/Matmul/gemm_fusions/mhc_projection_bwd)
 
 - [Ragged grouped GEMM training](/operations/gemm_fusions/ragged_grouped_gemm)

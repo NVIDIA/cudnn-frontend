@@ -38,7 +38,7 @@ from cudnn.frost.tile_dsl.tma import ld_shared_v4, st_global_v4, st_shared_v4, t
 # module off the Rubin package (engine-contract S8: a shared module never leans
 # on one arch's package) and is cycle-free -- config_sm100 imports only
 # tile_dsl.constants, never this package.
-from cudnn.sdpa.fwd.config_sm100 import o_swz_bytes as _o_swz_bytes
+from cudnn.sdpa.fwd.config_common import o_swz_bytes as _o_swz_bytes
 
 
 @cute.jit
@@ -259,7 +259,7 @@ def make_d256_bars(CFG, *, N_O_CHUNKS: int, epilogue_gate: bool = False) -> D256
 
 
 class D512X2Bars(NamedTuple):
-    """Barrier bundle of the d512 2x2-datapath forward (sm100/prefill_d512_f16_2x2.py)."""
+    """Barrier bundle of the d512 2x2-datapath forward (sm100/d512_f16_2x2/kernel.py)."""
 
     mb_q_full: object
     mb_q_empty: object
@@ -427,7 +427,7 @@ def make_classic_bars(
     handshakes run over: one stage per Q sub-tile on the classic pipeline
     (``CFG.TILES_Q``, the default), or the number of slots a single-sub-tile
     kernel alternates its S between so BMM1(i+1) can overlap softmax(i)
-    (``sm100/decode_d128_f16.py`` passes 2).  Every other barrier keeps its
+    (``sm100/d128_f16_single_q/kernel.py`` passes 2).  Every other barrier keeps its
     per-sub-tile count.
 
     ``bias_resident``: the two item-level rows of the resident additive-bias
@@ -481,7 +481,7 @@ def make_classic_bars(
 
     return Bars(
         # q_full_arrivers > 1: besides the leader's expect_tx arrive, each peer CTA's TMA-LDG warp arrives once
-        # after filling its own SF_Q tile by hand (the MXFP8 PackGQA gather, sm100/prefill_d128_mxfp8.py).
+        # after filling its own SF_Q tile by hand (the MXFP8 PackGQA gather, sm100/d128_mxfp8_multi_q/kernel.py).
         mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE + q_full_arrivers - 1, producer=Producer.TMA_LOAD),
         mb_k_full=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_v_full=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
@@ -1469,8 +1469,8 @@ def make_sdpa_helpers(
 
 # ======================================================================# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8 / MXFP8)
 # =============================================================================
-# Shared between the three SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
-# ``sm107/prefill_d256_fp8.py``, ``sm107/prefill_d256_mxfp8.py``); each kernel splices these under
+# Shared between the three SM107 d256 prefill kernels (``sm107/d256_f16_lookahead/kernel.py``,
+# ``sm107/d256_fp8_single_q/kernel.py``, ``sm107/d256_mxfp8_single_q/kernel.py``); each kernel splices these under
 # ``cutlass.const_expr(CFG.EPILOGUE_GATE)`` at its ``EPILOGUE_FUSION_SEAM``
 # tokens (one per splice; a source test counts them per kernel).  The gate ``SmemTile(`` itself is constructed INLINE in each kernel
 # (multi-line, ``desc_version=DESC_VERSION``) so the per-kernel "every SmemTile
@@ -1610,7 +1610,7 @@ def gate_epilogue_pairs(o_scaled, g_vals: list, half_opaque, o_chunk: int) -> li
     UNGATED value halved -- exactly, see ``gate_inv_sum``) and doubles the
     running max once per tile: Amax_O is a statistic of the sdpa node, which
     precedes the gate, so it must not depend on G
-    (``sm107/prefill_d256_fp8.py`` and ``sm107/prefill_d256_mxfp8.py``,
+    (``sm107/d256_fp8_single_q/kernel.py`` and ``sm107/d256_mxfp8_single_q/kernel.py``,
     corr_chunk / corr_release)."""
     out = []
     for p in range(o_chunk // 2):

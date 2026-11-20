@@ -245,6 +245,7 @@ def test_dglu_blockscaled_workspace_alias_rejected_before_launch(discrete, opera
 
     # Exercise the real execute gate, intercepting only the compiled consumer.
     op = object.__new__(GroupedGemmDgluBlockScaledAPI)
+    op.glu_layout = "interleaved_32"
     op._logger = Mock()
     op._get_default_stream = lambda stream: stream
     op._has_dbias = True

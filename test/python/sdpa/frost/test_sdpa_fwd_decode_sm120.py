@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SM120 half DECODE tile (``sm120/decode_f16.py``, ``tile_m`` 16 / 32).
+"""The SM120 half DECODE tile (``sm120/decode_f16_key_group/kernel.py``, ``tile_m`` 16 / 32).
 
 KNOB ROUTE: the adapter runs the decode tile when the plan's ``tile_m`` names
 it, exactly as ``lower_dsl_prefill`` forwards a plan's knobs; the kernel tests
@@ -203,8 +203,11 @@ def _facts(**over):
 
 
 def _spec(name: str = _SM120_ROW):
-    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd import engines, heuristics
 
+    if name == _SM120_ROW:
+        # The row's policy domain: exact head-tile records are delegated to their TILE_M-named owners.
+        return heuristics.sm100_legacy_policy_spec(name)
     return next(s for s in engines.ENGINE_SPECS if s.name == name)
 
 
@@ -277,8 +280,14 @@ def test_sm120_tile_requests_the_kernels_cannot_serve_are_ineligible(facts_over,
     if knobs_over.get("sched_policy") == "lpt":
         knobs_over = dict(knobs_over, sched_policy=SCHED_LPT)
     knobs = replace(SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=False), **knobs_over)
-    got = mismatch(_spec().capabilities, _facts(**facts_over), knobs)
+    from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
+    from frost_test_utils import sm120_half_owner
+
+    facts = _facts(**facts_over)
+    # The kernel table's reason is the legacy policy domain's; the exact wide-head owner declines the same request.
+    got = mismatch(sm100_legacy_policy_spec(_SM120_ROW).capabilities, facts, knobs)
     assert got is not None and reason in got, got
+    assert mismatch(_spec(sm120_half_owner(facts.d_qk, facts.d_v, knobs.tile_m)).capabilities, facts, knobs) is not None
 
 
 @pytest.mark.L0
@@ -301,9 +310,9 @@ def test_sm120_knob_admission_for_the_decode_tile():
     # Unequal small widths can require a48-key stage, not only powers of two.
     assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(16, 48, split=3)) is None
     assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(64, 48)) is not None
-    fp8 = next(s for s in _fp8_specs()).capabilities
     fp8_facts = _facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    assert "outside this engine's domain" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
+    fp8 = next(s.capabilities for s in _fp8_specs() if mismatch(s.capabilities, fp8_facts) is None)
+    assert "runs TILE_M in (64, 128)" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
 
 
 def _fp8_specs():
@@ -391,7 +400,7 @@ def test_decode_tile_plans_carry_the_split_choice(monkeypatch, over, chosen):
     monkeypatch.setattr(heuristics, "choose_sm120_decode_split_kv", recording)
     spec = _spec()
     facts = _facts(**over)
-    plans = heuristics.recommend("A", facts, {spec.name: 20504})
+    plans = heuristics.recommend("A", facts, {spec.name: 20504, "sdpa_fwd_sm120_d256_all_compute": 20537, "sdpa_fwd_sm120_decode_key_group": 20538})
     decode = [p.knobs for p in plans if sm120_decode_tile(spec.capabilities, p.knobs.tile_m)]
     assert decode and seen
     stage = decode_kv_stage(*head_tiles(facts.d_qk, facts.d_v, HEAD_TILE_GRANULE))
@@ -468,6 +477,36 @@ def test_sm120_decode_shaped_graphs_lead_on_the_decode_tile(over, lead):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_q, h_kv, s_q", [(16, 1, 3), (32, 2, 4), (64, 4, 3), (24, 1, 2), (20, 1, 8), (32, 2, 6)])
+def test_sm120_paged_d256_mtp_past_32_rows_takes_the_decode_tile(h_q, h_kv, s_q):
+    """Paged d256 MTP past 32 packed rows (Qwen3.5 at s_q 3-4) runs the 32-row decode tile over several Q tiles: the prefill body
+    has no paged d256 plan, and the decode tile ran 0.04-0.87 of the backend up to s_q 8 (sm120_paged_d256_multiq_probe /
+    _verify_v2_20261117). Dense graphs, longer queries (non-dividing groups lost at s_q 13-15) and groups past 32 keep the
+    prefill rule."""
+    from cudnn.sdpa.fwd import heuristics
+
+    paged = dict(b=8, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=32768, d_qk=256, d_v=256, has_paged_kv=True, page_size=16, padded=True)
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**paged)) == 32
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, has_paged_kv=False, page_size=0, padded=False))) == 0
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, s_q=9))) == 0
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, h_q=64, h_kv=1, s_q=1))) == 0  # 64 rows: G > 32
+
+
+@pytest.mark.L0
+def test_sm120_paged_d64_verify_takes_the_decode_tile():
+    """Paged d64 verify rows past 32 packed rows (muse_spark at s_q 8) run the decode tile over several Q tiles, 0.37 of the backend
+    (sm120_paged_d64_verify_v2_20261117); d64 MTP (s_q <= 4) and d128 verify keep their measured paths."""
+    from cudnn.sdpa.fwd import heuristics
+
+    caps = _spec().capabilities
+    paged = dict(b=128, h_q=128, h_kv=16, s_q=8, s_kv=131072, d_qk=64, d_v=64, has_paged_kv=True, page_size=16, padded=True)
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**paged)) == 32
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**dict(paged, s_q=5, h_q=40, h_kv=4))) == 32
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**dict(paged, s_q=4, h_q=64, h_kv=4))) == 0  # MTP: 64 rows on the prefill body
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**dict(paged, d_qk=128, d_v=128))) == 0
+
+
+@pytest.mark.L0
 def test_sm120_decode_split_model_anchors():
     """The decode tile's split model, unmocked: a launch that fills the machine stays unsplit, a lone KV stream over
     128K keys splits until the DRAM bound takes over, and a one-stage unit never splits."""
@@ -480,9 +519,31 @@ def test_sm120_decode_split_model_anchors():
     split = choose(units=8, kv_stages=8192, stage_bytes=stage, d_v=128, sm_count=188)
     assert split > 1 and split & (split - 1) == 0, split
     assert choose(units=8, kv_stages=1, stage_bytes=stage, d_v=128, sm_count=188) == 1
+    # One CTA gathering paged KV streams ~6x slower (sm120_decode_split_20261117): 64 units over 8K keys split there, not dense.
+    assert choose(units=64, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188) == 1
+    paged_split = choose(units=64, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True)
+    assert paged_split > 1 and paged_split & (paged_split - 1) == 0, paged_split
+    # 512 paged units split in two: unsplit, the paged tile ran 1.34-1.49x the best split (sm120_decode_split_v5_20261117), while many
+    # chunks lost 1.11-1.17x (_v2 verification). Dense keeps them whole.
+    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True) == 2
+    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188) == 1
     # Through the heuristics: b = 1, GQA 4 over 128K keys leads with that split on the packed decode tile.
     lead_set = heuristics._knob_sets(_spec(), _facts(s_kv=131072))[0]
     assert (lead_set.tile_m, lead_set.pack_gqa, lead_set.split_kv) == (16, True, split), lead_set
+
+
+@pytest.mark.L0
+def test_sm120_prefill_split_counts_the_windowed_kv_range():
+    """Study sm120_swa_split_20261117: the SM120 prefill kernels clip the KV loop to the window, so the split model counts the
+    window's tiles, not the whole cache (a 128-key window over 128K keys split 4 ways and ran 2x)."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = _spec()
+    chunk = dict(h_q=32, h_kv=4, s_q=1024, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True)
+    full = heuristics._split_launch(spec.capabilities, _facts(**chunk), 64, 128, 1, 1)
+    windowed = heuristics._split_launch(spec.capabilities, _facts(window_left=128, **chunk), 64, 128, 1, 1)
+    assert full.kv_tiles == 1024
+    assert windowed.kv_tiles <= 3, windowed
 
 
 # --- the kernel through the adapter -----------------------------------------
@@ -697,7 +758,7 @@ def test_decode_tile_graph_capture_reads_current_inputs_and_storage(split, sink,
     import cudnn
     import cutlass.cute as cute
 
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, engine_name
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from frost_test_utils import select_engine
 
     b, h_q, h_kv, s_kv, d = 2, 32, 8, 4133, 128
@@ -724,7 +785,9 @@ def test_decode_tile_graph_capture_reads_current_inputs_and_storage(split, sink,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    row = select_engine(g, engine_name(arch="sm120"))
+    from frost_test_utils import sm120_half_owner
+
+    row = select_engine(g, sm120_half_owner(d, d, 16))
     g.create_execution_plan(row.engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=16, cga=1, pack_gqa=True, split_kv=split))
     g.select_plan(len(g.plans) - 1)
     g.check_support()

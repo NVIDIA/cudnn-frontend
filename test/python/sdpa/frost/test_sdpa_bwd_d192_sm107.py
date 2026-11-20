@@ -42,11 +42,14 @@ def test_decode_declines_before_lowering(monkeypatch, dt, thd):
     assert reason is not None and "decode" in reason, reason
 
 
-def test_stable_opt_in_slot():
+def test_stable_slot_offered_behind_the_backend():
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
 
     slot = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd").slots[_ENGINE]
-    assert slot.opt_in and slot.slot == 10
+    # Default since 2026-11-16, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert not slot.opt_in and slot.slot == 10
+    assert _ENGINE in TRAIL_ONLY_ROWS
 
 
 @requires_rubin

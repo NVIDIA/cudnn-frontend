@@ -9,6 +9,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from cudnn._device import ensure_current_context
+from cudnn._torch_stream import device_context
+
 _TORCH_DTYPE_TO_CUDNN = {
     torch.float32: 0,  # CUDNN_DATA_FLOAT
     torch.float64: 1,  # CUDNN_DATA_DOUBLE
@@ -95,19 +98,22 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
 
     import cudnn
 
-    cudnn.causal_conv1d_forward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        y_contiguous.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_forward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            y_contiguous.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _activation_to_int(activation),
+        )
     return _match_causal_conv1d_output_layout(y_contiguous, public_x)
 
 
@@ -168,23 +174,26 @@ def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, ac
 
     import cudnn
 
-    cudnn.causal_conv1d_backward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        grad_out.data_ptr(),
-        dx.data_ptr(),
-        dweight.data_ptr(),
-        dbias.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _dtype_to_int(grad_dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_backward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            grad_out.data_ptr(),
+            dx.data_ptr(),
+            dweight.data_ptr(),
+            dbias.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _dtype_to_int(grad_dtype),
+            _activation_to_int(activation),
+        )
     return [dx, dweight.to(x.dtype), dbias.to(x.dtype)]
 
 
@@ -275,6 +284,19 @@ def _tensor_plan_signature(tensor: Optional[Tensor]):
     )
 
 
+def _per_sequence_plan_signature(tensor: Optional[Tensor]):
+    """Plan signature of a packed per-sequence operand, without its runtime N extent."""
+
+    if tensor is None:
+        return None
+    return (
+        tuple(tensor.shape[1:]),
+        tuple(tensor.stride()[1:]),
+        tensor.dtype,
+        tensor.device,
+    )
+
+
 def _causal_conv1d_training_key(
     x_btd: Tensor,
     weight: Tensor,
@@ -287,23 +309,25 @@ def _causal_conv1d_training_key(
     """Key every plan-time field consumed by the exact-shape training backend.
 
     The routed backend is fixed to BF16 width-four SiLU. Tensor signatures key
-    its remaining specializations: dense versus packed presence, packed N,
-    bias and state presence, final-state output, shapes, strides, dtypes, and
-    device. Device properties key the architecture-dependent schedule, and the
-    torch deterministic-algorithms mode keys the dweight schedule. Runtime
-    ``cu_seqlens`` values are intentionally absent because the kernel consumes
-    them on device.
+    its remaining specializations: dense versus packed presence, bias and
+    state presence, final-state output, shapes, strides, dtypes, and device.
+    Device properties key the architecture-dependent schedule, and the torch
+    deterministic-algorithms mode keys the dweight schedule. Packed N
+    (``cu_seqlens`` length and the state leading extent) and ``cu_seqlens``
+    values are intentionally absent: the plan reads both at run time, so a
+    varying sequence count per microbatch reuses one plan.
     """
 
     properties = torch.cuda.get_device_properties(x_btd.device)
+    state_signature = _tensor_plan_signature if cu_seqlens is None else _per_sequence_plan_signature
     return (
         "bf16-width4-silu",
         "packed" if cu_seqlens is not None else "dense",
         _tensor_plan_signature(x_btd),
         _tensor_plan_signature(weight),
         _tensor_plan_signature(bias),
-        _tensor_plan_signature(cu_seqlens),
-        _tensor_plan_signature(initial_state),
+        _per_sequence_plan_signature(cu_seqlens),
+        state_signature(initial_state),
         bool(output_final_state),
         bool(deterministic),
         (properties.major, properties.minor),
@@ -845,19 +869,22 @@ def _nwh_fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str)
 
     import cudnn
 
-    cudnn.causal_conv1d_nwh_forward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        y.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_nwh_forward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            y.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _activation_to_int(activation),
+        )
     return y
 
 
@@ -918,23 +945,26 @@ def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor
 
     import cudnn
 
-    cudnn.causal_conv1d_nwh_backward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        grad_out.data_ptr(),
-        dx.data_ptr(),
-        dweight.data_ptr(),
-        dbias.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _dtype_to_int(grad_dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_nwh_backward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            grad_out.data_ptr(),
+            dx.data_ptr(),
+            dweight.data_ptr(),
+            dbias.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _dtype_to_int(grad_dtype),
+            _activation_to_int(activation),
+        )
     return [dx, dweight.to(x.dtype), dbias.to(x.dtype)]
 
 
@@ -1067,21 +1097,24 @@ def _b2b_fwd_primitive(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, s
 
     import cudnn
 
-    cudnn.b2b_causal_conv1d_forward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weights_proj.data_ptr(),
-        weights_mixer.data_ptr(),
-        skip_bias.data_ptr(),
-        y.data_ptr(),
-        y_gated.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size_proj,
-        kernel_size_mixer,
-        _dtype_to_int(x.dtype),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.b2b_causal_conv1d_forward(
+            stream,
+            x.data_ptr(),
+            weights_proj.data_ptr(),
+            weights_mixer.data_ptr(),
+            skip_bias.data_ptr(),
+            y.data_ptr(),
+            y_gated.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size_proj,
+            kernel_size_mixer,
+            _dtype_to_int(x.dtype),
+        )
     return y, y_gated
 
 
@@ -1167,26 +1200,29 @@ def _b2b_bwd_primitive(
 
     import cudnn
 
-    cudnn.b2b_causal_conv1d_backward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weights_proj.data_ptr(),
-        weights_mixer.data_ptr(),
-        skip_bias.data_ptr(),
-        y.data_ptr(),
-        grad_y.data_ptr(),
-        dx.data_ptr(),
-        dweights_proj.data_ptr(),
-        dweights_mixer.data_ptr(),
-        dskip_bias.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size_proj,
-        kernel_size_mixer,
-        _dtype_to_int(x.dtype),
-        _dtype_to_int(grad_dtype),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.b2b_causal_conv1d_backward(
+            stream,
+            x.data_ptr(),
+            weights_proj.data_ptr(),
+            weights_mixer.data_ptr(),
+            skip_bias.data_ptr(),
+            y.data_ptr(),
+            grad_y.data_ptr(),
+            dx.data_ptr(),
+            dweights_proj.data_ptr(),
+            dweights_mixer.data_ptr(),
+            dskip_bias.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size_proj,
+            kernel_size_mixer,
+            _dtype_to_int(x.dtype),
+            _dtype_to_int(grad_dtype),
+        )
     return [
         dx,
         dweights_proj.to(x.dtype),

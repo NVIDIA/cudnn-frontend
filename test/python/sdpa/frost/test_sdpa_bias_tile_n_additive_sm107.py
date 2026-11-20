@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The second half of the Rubin small-tile bias / kv_mask arm (``sm107/prefill_d128_f16.py``; the first half is
+"""The second half of the Rubin small-tile bias / kv_mask arm (``sm107/d128_f16_multi_q/kernel.py``; the first half is
 ``test_sdpa_bias_sm107.py``, whose helpers this module reuses): the TILE_N = 64 renderings as REAL cells, the ADDITIVE per-key
 ``kv_mask`` vector, and the strided outer axes.
 
@@ -21,9 +21,8 @@
   stride that is not a 16-byte multiple, and an EXPLICIT TILE_N 128 for the fp32 vector WITH a bias (that rendering spills on the
   softmax role -- the measured counts are the pins below; the heuristics and the adapter run that form at TILE_N 64, its only served
   width, and the io-dtype vector is the fast path).
-* **Strided outer axes**: the activations stay in the row's ``bshd`` envelope (Q/K/V/O BSHD-physical, a 16-byte padded head
-  stride included; a (B, H, S, D)-CONTIGUOUS activation is the row's pre-existing typed decline, pinned below -- the
-  ``dense_flex`` envelope is the SM100 line's, not this row's) with the arm on, a bias in a permuted outer order
+* **Strided outer axes**: aligned BSHD-physical and contiguous BHSD activations are addressed natively with the arm on,
+  including a 16-byte padded head stride, a bias in a permuted outer order
   (``[B, S_q, H, S_kv]``-physical) or with a padded row stride, a kv_mask with a padded batch stride -- graph FACTS the row
   judges and the kernels address through the declared strides (TMA descriptors from the caller's 4-D strides, the granule
   loads from the batch stride): no reshape, no copy; a non-16-byte stride is a typed decline on a real graph.
@@ -55,6 +54,7 @@ from test_sdpa_bias_sm107 import (  # noqa: F401  (the two fixtures are re-expor
     _facts,
     _frost_plans,
     _mask_kw,
+    _owner,
     _ref,
     _rubin_device_for_the_adapter,
     _sm107_target_for_metadata,
@@ -409,6 +409,14 @@ def _run2(
         record = dict(record)
         record[cudnn.knob_type.TILE_CGA_M] = want_cga
         record[cudnn.knob_type.TILE_N] = want_tile_n
+        # A width change can select a different implementation; batch-pair
+        # itself intentionally has no CTA2 variant.
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.graph_analyzer import analyze
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        owner = _owner(analyze(g), SdpaFwdKnobs.from_public(record))
+        engine_id = family_for(g).offered_ids(g)[owner]
         g.create_execution_plan(engine_id, record)
         idx = g.get_execution_plan_count() - 1
     g.select_plan(idx)
@@ -740,25 +748,11 @@ def test_strided_outer_axes_are_addressed_through_the_declared_strides(case):
 
 
 @requires_rubin
-def test_bhsd_contiguous_activations_are_the_rows_pre_existing_typed_decline():
-    """The row's layout envelope is ``bshd`` (Q/K/V/O BSHD-physical, padded 16-byte strides included -- the "layout_left" customer
-    form): a (B, H, S, D)-CONTIGUOUS activation is the row's pre-existing typed decline ("must be BSHD-physical"), with or without
-    the bias; with the python-only kv_mask bound nothing else serves it either."""
-    import cudnn
-
-    q, k, v, kw = _inputs(dict(s=256, layout="bhsd", bias=True), torch.bfloat16)
-    g, *_ = _build(q, k, v, scale=kw["scale"], bias=kw["bias"])
-    try:
-        g.create_execution_plans([cudnn.heur_mode.A])
-        names, ours = _frost_plans(g)
-    except cudnn.cudnnGraphNotSupportedError:
-        names, ours = [], []
-    assert not ours, names
-    from cudnn.sdpa import graph_analyzer as ga
-    from cudnn.sdpa.fwd import engines
-
-    why = engines.mismatch(_caps(), ga.analyze(g))
-    assert why is not None and "BSHD" in why, why
+@pytest.mark.parametrize("mask", [False, True])
+def test_bhsd_contiguous_activations_use_the_declared_strides(mask):
+    """The native layout path serves contiguous BHSD with bias and an optional per-key mask."""
+    out, ref, _ = _run_cell(dict(s=256, layout="bhsd", bias=True, mask=mask), torch.bfloat16)
+    _check(out, ref)
 
 
 def _no_frost_service(g):
@@ -831,7 +825,7 @@ def test_non_16_byte_outer_strides_are_typed_declines_on_real_graphs():
     from cudnn.sdpa.fwd import engines
 
     why = engines.mismatch(_caps(), ga.analyze(g))
-    assert why is not None and "prepared launch" in why and "bind without a copy" in why, why
+    assert why is not None and why.startswith("q:") and "16-byte outer-stride alignment" in why, why
     # (b) a bias with a row stride of S + 4: the FROST row is out (the backend may serve it)
     q, k, v = (_bhsd(2, 4, s, d, torch.bfloat16) for _ in range(3))
     bias = torch.randn(1, 4, s, s + 4, device="cuda", dtype=torch.bfloat16)[..., :s]

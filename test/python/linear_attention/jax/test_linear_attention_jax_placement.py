@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 jax = pytest.importorskip("jax", minversion="0.9.1")
+pytest.importorskip("cudnn._jax", exc_type=ImportError)
 
 from cudnn.frost import device
 from cudnn.linear_attention import _jax_execution

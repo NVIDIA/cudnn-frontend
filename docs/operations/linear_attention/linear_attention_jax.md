@@ -5,15 +5,16 @@ SM103, without importing PyTorch. They support eager calls, `jax.jit`, and
 first-order reverse-mode differentiation through output, initial/final state,
 and optional gate parameters.
 
-| Operation | Differentiable function | Explicit forward / backward |
+| Operation | Forward in `cudnn.ops` | Explicit backward in `cudnn.ops` |
 |---|---|---|
-| Gated DeltaNet | `cudnn.jax.gated_delta_net` | `cudnn.ops.gated_delta_net_forward_jax` / `gated_delta_net_backward_jax` |
-| Gated DeltaNet v2 | `cudnn.jax.gated_delta_net_v2` | `cudnn.ops.gated_delta_net_v2_forward_jax` / `gated_delta_net_v2_backward_jax` |
-| Gated DeltaProduct | `cudnn.jax.gated_delta_product` | `cudnn.ops.gated_delta_product_forward_jax` / `gated_delta_product_backward_jax` |
-| Mamba-2 | `cudnn.jax.mamba2` | `cudnn.ops.mamba2_forward_jax` / `mamba2_backward_jax` |
+| Gated DeltaNet | `gated_delta_net_forward_jax` | `gated_delta_net_backward_jax` |
+| Gated DeltaNet v2 | `gated_delta_net_v2_forward_jax` | `gated_delta_net_v2_backward_jax` |
+| Gated DeltaProduct | `gated_delta_product_forward_jax` | `gated_delta_product_backward_jax` |
+| Mamba-2 | `mamba2_forward_jax` | `mamba2_backward_jax` |
 
-The differentiable functions return `(output, final_state_or_None)`. Explicit
-forward adds an opaque residual: `(output, final_state_or_None, residual)`.
+Forward returns `(output, final_state_or_None)` and supports `jax.grad`.
+Set `return_residual=True` to receive `(output, final_state_or_None, residual)`
+for explicit backward.
 Pass that residual unchanged to the matching backward function. XLA owns
 outputs and scratch; no workspace, output buffer, or stream argument is needed.
 [Kimi Delta Attention](/operations/LinearAttention/kda_jax) has its own JAX API.
@@ -84,7 +85,7 @@ All scalar options are static:
 ```python
 import jax
 import jax.numpy as jnp
-from cudnn.jax import gated_delta_net
+from cudnn.ops import gated_delta_net_forward_jax
 
 q = jnp.full((35, 1, 64), 0.05, jnp.bfloat16)
 k, v = q, jnp.ones_like(q)
@@ -94,7 +95,7 @@ cu = jnp.array([0, 17, 17, 35], jnp.int32)
 state = jnp.zeros((3, 1, 64, 64), jnp.float32)
 
 def loss(q, k, v, g, beta, state):
-    out, final = gated_delta_net(
+    out, final = gated_delta_net_forward_jax(
         q, k, v, g, beta, cu, initial_state=state,
         output_final_state=True, batch_invariant=True,
     )
@@ -110,7 +111,7 @@ grads = jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4, 5)))(
 Mamba-2 follows the model-facing Torch signature:
 
 ```python
-output, final = cudnn.jax.mamba2(
+output, final = cudnn.ops.mamba2_forward_jax(
     x, dt, A, B, C, cu_seqlens,
     D=None, dt_bias=None, z=None, initial_state=None,
     output_final_state=True, checkpoint_every_n_tokens=0,
@@ -137,6 +138,7 @@ from cudnn.ops import gated_delta_net_forward_jax, gated_delta_net_backward_jax
 
 out, final, residual = gated_delta_net_forward_jax(
     q, k, v, g, beta, cu, initial_state=state, output_final_state=True,
+    return_residual=True,
 )
 grads = gated_delta_net_backward_jax(
     residual, jnp.ones_like(out), d_final_state=jnp.ones_like(final),
@@ -151,8 +153,8 @@ order. Missing optional inputs have `None` gradients. An omitted
 `d_final_state` contributes zero; supplying it requires a forward call with
 `output_final_state=True`. Cotangents must match output/state shape and dtype.
 
-Only the `cudnn.jax` convenience functions register custom VJPs. Explicit
-forward/backward calls do not themselves support automatic differentiation.
+Automatic differentiation is available in the default forward mode.
+`return_residual=True` selects the explicit forward/backward workflow.
 Offsets and static options are not differentiable. Forward-mode AD, higher
 derivatives, `vmap`, and distributed array partitioning are outside this API.
 
@@ -172,9 +174,10 @@ Mamba-2 A, D, and `dt_bias`. Their fixed-shape replay is deterministic, but
 changing batch shape or order can change the association of FP32 sums and
 their result bytes, even when only one sequence has nonzero cotangents.
 
-SM103 FP16/BF16 numerical/API checks, raw-byte replay, and per-sequence batch
-checks have passed, along with scheduling-boundary replay and strict BF16
-golden comparisons. SM100 and other runtime configurations remain unqualified.
+The original SM103 adapter passed FP16/BF16 numerical and raw-byte replay
+checks, per-sequence batch checks, and strict BF16 golden comparisons. The
+bindings now share native FROST scheduling and workspace binding. Refer to the
+measurement record for results on that path.
 See the [determinism support page](/operations/determinism) and the
 [measurement record on GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#jax-linear-attention--partial-qualification-2026-11-12-utc)
 for the measured scope, numerical limitations, and unmeasured configurations.
@@ -182,5 +185,5 @@ for the measured scope, numerical limitations, and unmeasured configurations.
 These bindings cover the four recurrent forward/backward operations. Summary
 and context-parallel composition, paged/in-place state, and dedicated decode
 or verify entry points are not exposed here. Install the frontend's JAX
-dependency group and a CUDA-enabled JAX build; the bindings use
+dependency group, a CUDA-enabled JAX build, and CuTeDSL 4.8.1 or later. The bindings use
 `cutlass.jax` and do not fall back to a Torch or cuTile implementation.

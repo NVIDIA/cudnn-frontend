@@ -32,6 +32,8 @@ and upstream license texts and attributions are reproduced in
 carries both an MIT declaration and a BSD notice, its expression retains both.
 The adapted CUTLASS static scheduler in `python/cudnn/_cutlass_helpers/` likewise
 retains BSD-3-Clause for the upstream code and applies Apache-2.0 to local changes.
+The decode-row block-scaled SwiGLU kernel in `python/cudnn/gemm/frost/swiglu_decode/kernel/`
+likewise retains BSD-3-Clause for the upstream code and applies Apache-2.0 to local changes.
 
 An Apache-2.0 modification does not assert that upstream authors relicensed
 their contributions. Files whose complete NVIDIA ownership is established can

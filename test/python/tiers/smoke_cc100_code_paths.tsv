@@ -140,6 +140,13 @@ sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_dense[bf16]	bwd mxfp8 SM100 (two-k
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_causal	bwd mxfp8 SM100 | causal
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_gqa	bwd mxfp8 SM100 | GQA
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_ragged_tails	bwd mxfp8 SM100 | ragged tails
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_dense[gqa]	bwd mxfp8 d128 BHSD (CuTeDSL prep / dK-dV / persistent dQ chain) | dense | GQA 8/2, walk split
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_sequence_tails[s100]	bwd mxfp8 d128 BHSD | sequence tail (S % 256 != 0): clipped maps, -inf LSE rows, dQ key mask
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_causal[gqa-512]	bwd mxfp8 d128 BHSD | causal
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_causal[gqa-1000]	bwd mxfp8 d128 BHSD | causal + sequence tail
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_causal[mha-384]	bwd mxfp8 d128 BHSD | causal MHA, odd block count: walk split compiled out
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_amax	bwd mxfp8 d128 BHSD | amax dQ / dK / dV
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_large_batch_plans	bwd mxfp8 d128 BHSD | B = 8: unsplit throughput plan + split batch-invariant plan
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]	graph suite fwd (FROST-routed where claimed)
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]	graph suite bwd
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]	graph suite decode
@@ -154,7 +161,7 @@ sdpa/frost/test_fp4_pointwise_primitives.py::test_e2m1_rne_emulation_matches_the
 sdpa/frost/test_heuristic_geometry.py::test_d512_model_counts_all_roles_in_split_and_unsplit	rule: first L0 cell of test_d512_model_counts_all_roles_in_split_and_unsplit
 sdpa/frost/test_heuristic_geometry.py::test_each_geometry_runner_recomputes_split_and_obeys_cap	rule: first L0 cell of test_each_geometry_runner_recomputes_split_and_obeys_cap
 sdpa/frost/test_knob_vocabulary_frost.py::test_frost_plan_reports_names_and_replays_public_knobs	rule: first L0 cell of test_frost_plan_reports_names_and_replays_public_knobs
-sdpa/frost/test_mxfp8_sf_desc_shared.py::test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module[sm107/prefill_d192_d128_mxfp8.py]	rule: first L0 cell of test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module
+sdpa/frost/test_mxfp8_sf_desc_shared.py::test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module[sm107/d192_mxfp8_multi_q/kernel.py]	rule: first L0 cell of test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module
 sdpa/frost/test_mxfp8_sf_desc_shared.py::test_peer_split_of_the_forwards_slabs	rule: first L0 cell of test_peer_split_of_the_forwards_slabs
 sdpa/frost/test_sdpa_build_all.py::test_build_all_preserves_selection_and_executes_both_providers[backend]	rule: first L0 cell of test_build_all_preserves_selection_and_executes_both_providers
 sdpa/frost/test_sdpa_bwd_config_sm100_2x2.py::test_make_bwd_decode_reads_the_span_through_getattr_defaults	rule: first L0 cell of test_make_bwd_decode_reads_the_span_through_getattr_defaults

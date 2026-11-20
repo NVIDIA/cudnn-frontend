@@ -15,7 +15,7 @@ def test_native_d256_prefill_split_admission(shape, dtype, splits):
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
 
-    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
     facts = SdpaGraphFacts(b=2, h_q=4, h_kv=2, s_q=385, s_kv=512, d_qk=shape[0], d_v=shape[1], dtype=getattr(cudnn.data_type, dtype), device_cc=(10, 7))
     assert mismatch(caps, facts, SdpaFwdKnobs(split_kv=splits, tile_m=128, tile_n=128, cga=2, pack_gqa=False)) is None
 
@@ -40,6 +40,7 @@ _CASES = [
     # name, B, H, HK, SQ, SKV, split, causal, bottom-right, left, sink, Stats, scheduler, head pair
     ("unsplit_plain", 2, 4, 2, 256, 512, 1, False, False, None, False, True, 0, (256, 256)),
     ("unsplit_window_sink", 2, 4, 2, 385, 257, 1, True, True, 63, True, False, 0, (256, 256)),
+    ("past_decode_boundary", 2, 4, 4, 33, 256, 2, False, False, None, False, True, 0, (256, 256)),
     ("plain", 2, 4, 2, 256, 512, 2, False, False, None, False, True, 0, (256, 256)),
     ("empty_partitions", 2, 4, 4, 257, 128, 16, False, False, None, False, False, 0, (256, 256)),
     ("top_left_tail", 2, 4, 2, 129, 257, 4, True, False, None, False, True, 0, (256, 256)),
@@ -138,7 +139,7 @@ def _run_case(case, dtype, monkeypatch, *, graph_mode=False, stats_log2=False, o
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plan(
-            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm107"],
+            family_for(graph).offered_ids()["sdpa_fwd_sm107_d256_lookahead"],
             SdpaFwdKnobs(tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=splits, sched_policy=sched).to_public(),
         )
         graph.select_plan(0)
@@ -147,7 +148,7 @@ def _run_case(case, dtype, monkeypatch, *, graph_mode=False, stats_log2=False, o
         api = inspect.getclosurevars(graph._compiled_plans[0]._compiled.default_stream).nonlocals["api"]
     else:
         api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d256_f16.py")
+    assert api._k_mod.__file__.endswith("sm107/d256_f16_lookahead/kernel.py")
     assert api._k_mod.CFG.SPLIT_KV == splits and api._k_mod._FP32_PARTIALS == (splits > 1)
     assert api._dense_spec.native is not None
     assert api._dense_spec.fp32_partial == (splits > 1)

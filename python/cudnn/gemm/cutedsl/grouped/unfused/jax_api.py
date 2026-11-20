@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for the unfused BF16 grouped GEMM
-(discrete weight mode), built on :func:`cudnn.jax.call`.
+(discrete weight mode), built on :func:`cudnn._jax.call`.
 
 Discrete mode only (dense mode's expert-outermost strided B has no row-major JAX
 equivalent) and no bias (its (n, experts) column-major layout is likewise
@@ -28,7 +28,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import TensorSpec, call, gemm_operand_spec
+from cudnn._jax import TensorSpec, call, gemm_operand_spec
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
 

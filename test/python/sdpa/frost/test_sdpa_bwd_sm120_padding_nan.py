@@ -74,7 +74,7 @@ def test_runtime_padding_nan_backward(d, dv, hk, causal, dtype, sq, skv):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_bwd_sm120")
+    select_engine(graph, "sdpa_bwd_sm120_f16_fused")
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")

@@ -13,13 +13,15 @@ watchdog (``CUDNN_TEST_TIMEOUT`` in ``test/python/conftest.py``), which a second
 The operand builders, the reference and the device gate live in ``gate_quant_utils.py`` beside this module."""
 
 import glob
+import json
 import os
 import shutil
 import subprocess
 import sys
 import textwrap
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +41,20 @@ from gate_quant_utils import (  # noqa: E402  (the operand builders, the referen
 
 from cudnn.attention_gate.frost import gate_quant_decode as entry  # noqa: E402
 from cudnn.attention_gate.frost.kernel import gate_quant_decode_config as kcfg  # noqa: E402
+from cudnn.frost import init_order  # noqa: E402
+from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fixture)
+    deterministic_fill,
+    host_allocations,
+    on_device,
+    park,
+    pooled,
+    previous_owner,
+    settled_records,
+    spans_of,
+    stand_ins,
+    warm_fills,
+)
+from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
@@ -233,6 +249,103 @@ def test_typed_declines_name_the_operand(name):
         entry.check_binding(ops["attn"], ops["gate"], ops["scale"], ops.get("out"), width=2048)
 
 
+def test_the_entry_owned_buffer_is_recorded_before_a_launch_can_find_it(monkeypatch):
+    """The record of the buffer's allocation, on stand-ins (no device): the buffer is allocated and only THEN an event is recorded
+    on the stream that is current at that moment, with the buffer's whole byte range, BEFORE the entry holds the buffer.  A second
+    ``output`` allocates and records nothing.  The records are the device's, one object for every entry.  What a launch is
+    ordered by is the live rows of its resolved ``out``, not a taller tensor's extent."""
+    s = stand_ins(monkeypatch)
+    dev = torch.device("cuda", 5)
+    host_allocations(monkeypatch, dev, s.calls)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(multi_processor_count=148))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    k = entry.AttentionGateQuantDecode(dev, 2048)
+    assert k._pending is init_order.pending_of(dev) and entry.AttentionGateQuantDecode(dev, 6144)._pending is k._pending
+    held, real = [], init_order.record
+    monkeypatch.setattr(init_order, "record", lambda pending, tensors: (held.append(k.out_buffer), real(pending, tensors)))
+    view = k.output(3)
+    assert s.calls == [("empty", (kcfg.MAX_ROWS, 2048)), ("enter", dev), ("record", 100), ("leave", dev)]
+    assert held == [None], "the record is made before the entry holds the buffer"
+    ((_, handle, spans),) = k._pending.values()
+    assert handle == 100 and spans == spans_of((k.out_buffer,)) and view.data_ptr() == k.out_buffer.data_ptr()
+    s.calls.clear()
+    assert k.output(5).data_ptr() == view.data_ptr() and not s.calls and len(k._pending) == 1, "allocated and recorded once"
+    mine = _e4m3(9, 2048)
+    assert k._launch_writes(3, mine) == ((mine.data_ptr(), mine.data_ptr() + 3 * 2048),) and mine.numel() > 3 * 2048
+
+
+def test_a_call_orders_its_launch_behind_a_pending_record_over_the_out_it_writes(monkeypatch):
+    """The wiring, on stand-ins with the launch intercepted (no device): IN FRONT of the launch and on the LAUNCH stream, a call
+    is ordered behind a pending record over the bytes of the ``out`` it writes -- passed, or the entry's buffer -- and behind
+    none over an operand it only reads; without a record nothing but the launch happens."""
+    s = stand_ins(monkeypatch)
+    k = entry.AttentionGateQuantDecode("cpu", 2048)
+    monkeypatch.setattr(entry, "_flat", lambda t: t)
+    k.compiled[k.key(3)] = lambda *args: s.calls.append(("launch", int(args[-1])))
+    ops = _host_operands()
+
+    def ordering_of_a_call(over=None, out=None):
+        k._pending.clear()
+        event = s.Event(False)
+        if over is not None:
+            k._pending[0] = (event, 7, spans_of((over,)))
+        s.calls.clear()
+        k(ops["attn"], ops["gate"], ops["scale"], out)
+        return [c for c in s.calls if c[0] in ("wait_event", "launch")], [("wait_event", 100, event), ("launch", 100)]
+
+    got, ordered = ordering_of_a_call(ops["out"], ops["out"])
+    assert got == ordered, "a record over the passed out"
+    got, ordered = ordering_of_a_call(k.output(3))
+    assert got == ordered, "a record over the entry-owned buffer"
+    for name in ("attn", "gate", "scale"):
+        assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
+    assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+
+
+def test_a_declined_call_compile_or_output_allocates_nothing_and_leaves_no_record(monkeypatch):
+    """A decline touches nothing, on stand-ins (no device).  Whatever declines a call, a ``compile`` or an ``output`` that
+    would use the entry-owned buffer -- a part the kernel does not serve, a DSL gate, a binding check, the row count, a host
+    device -- runs IN FRONT of the buffer's allocation: the entry holds no buffer, nothing was allocated and the device has
+    no record.  A ``compile`` without ``out`` that is not declined allocates the buffer and records it."""
+    from cudnn.frost import buffers
+
+    s = stand_ins(monkeypatch)
+    dev, part = torch.device("cuda", 5), [(10, 0)]
+    host_allocations(monkeypatch, dev, s.calls)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(multi_processor_count=148))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: part[0])
+    plain = _host_operands(with_out=False)
+    plain = (plain["attn"], plain["gate"], plain["scale"])
+    attn, gate, scale = on_device(dev, *plain)
+    tall, fp32 = on_device(dev, torch.zeros(161, 2048, dtype=torch.bfloat16), torch.zeros(3, 2048))
+    missing, old = (False, None), (True, ("nvidia-cutlass-dsl", "4.7.1"))
+    declines = (  # what declines: the entry's device, the part, the DSL state, the operands, the decline
+        ("a part the kernel does not serve", dev, (8, 0), missing, (attn, gate, scale), NotImplementedError, r"this device is 8\.0"),
+        ("a missing DSL", dev, (10, 0), missing, (attn, gate, scale), NotImplementedError, "the CuTe DSL is not installed"),
+        ("a DSL below the floor", dev, (10, 3), old, (attn, gate, scale), NotImplementedError, r"found 4\.7\.1"),
+        ("the row count", dev, (10, 0), missing, (tall, tall, scale), NotImplementedError, "at most 160 rows"),
+        ("a dtype", dev, (10, 0), missing, (fp32, gate, scale), TypeError, "attn must be torch.bfloat16"),
+        ("a host device", "cpu", (10, 0), missing, plain, NotImplementedError, "serves CUDA tensors only"),
+    )
+    for what, device, cc, dsl, operands, error, match in declines:
+        part[0] = cc
+        monkeypatch.setattr(buffers, "_DSL_STATE", dsl)
+        for route in ("a call", "a compile"):
+            k = entry.AttentionGateQuantDecode(device, 2048)
+            s.calls.clear()
+            with pytest.raises(error, match=match):
+                k(*operands) if route == "a call" else k.compile(*operands)
+            assert k.out_buffer is None and not s.calls and not init_order.pending_of(dev), f"{route} declined by {what} allocated or recorded"
+    k = entry.AttentionGateQuantDecode(dev, 2048)
+    with pytest.raises(NotImplementedError, match="at most 160 rows"):
+        k.output(161)
+    assert k.out_buffer is None and not s.calls and not k._pending, "an output declined by the row count allocated or recorded"
+    k.compiled.update({(cfg,): None for cfg in k.cfgs})  # a compiled entry: nothing is missing, so no DSL gate is asked
+    k.compile(attn, gate, scale)
+    assert [c[0] for c in s.calls] == ["empty", "enter", "record", "leave"] and len(k._pending) == 1, "a compile that is not declined allocates and records"
+    assert k.out_buffer is not None and k.output(3).data_ptr() == k.out_buffer.data_ptr()
+
+
 def test_declines_an_unserved_compute_capability_by_name():
     for cc in ((8, 0), (9, 0), (12, 0), (12, 1), (11, 0)):
         with pytest.raises(NotImplementedError, match=rf"serves compute capability 10\.x.*this device is {cc[0]}\.{cc[1]}"):
@@ -344,6 +457,88 @@ def test_slab_views_bind_a_runtime_extent():
     for scale in (torch.tensor([0.01]), torch.tensor(0.01)):
         view = entry._flat(scale)
         assert tuple(view.shape) == (1,) and tuple(view.dynamic_shapes_mask) == (0,), f"scale {tuple(scale.shape)}: one static element ({view})"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# host-only: the launch facts (cudnn.frost.launch_facts) -- the symbol of the compiled config, the form as plain data, the launch shape
+# ---------------------------------------------------------------------------------------------------------------------------
+def _launch_arithmetic(cfg, rows, width):
+    """The launch of ``kernel/gate_quant_decode_f16.py`` restated: a flat grid that covers ``rows x width`` elements at eight per thread
+    and ``THREADS`` threads per thread block; no shared memory."""
+    threads_needed = rows * width // 8
+    return ((-(-threads_needed // cfg.THREADS), 1, 1), (cfg.THREADS, 1, 1), 0)
+
+
+LAUNCH_FACT_ARMS = [dict(), dict(pdl_release=True), dict(cfg=kcfg.Cfg(THREADS=128)), dict(cfg=kcfg.Cfg(THREADS=128, PDL_RELEASE=True))]
+
+
+@pytest.mark.parametrize("arm", LAUNCH_FACT_ARMS, ids=["pick", "release", "threads128", "threads128-release"])
+@pytest.mark.parametrize("width", (8, 1032, 2048, 6144, kcfg.MAX_WIDTH))
+def test_launch_facts_equal_the_configuration_arithmetic_at_every_row_count(width, arm):
+    """EVERY served row count, 1 .. 160, per width and config arm: the launch shape is the configuration arithmetic of the config
+    ``cfg_for`` returns (the grid follows ``rows x width`` and ``THREADS``; no shared memory), and the form is that config's fields --
+    nothing else, because the compile key is the config alone."""
+    k = entry.AttentionGateQuantDecode("cpu", width, **arm)
+    for rows in range(1, kcfg.MAX_ROWS + 1):
+        cfg = k.cfg_for(rows)
+        shape = k.launch_shape_for(rows)
+        assert shape == _launch_arithmetic(cfg, rows, width), (rows, shape)
+        assert all(type(v) is int for v in (*shape.grid, *shape.block, shape.shared_memory)), shape
+        assert shape.grid[0] * cfg.THREADS * 8 >= rows * width > (shape.grid[0] - 1) * cfg.THREADS * 8, "the grid covers the slab with no empty block"
+        assert k.form_for(rows) == asdict(cfg) == dict(THREADS=cfg.THREADS, PDL_RELEASE=cfg.PDL_RELEASE), rows
+    assert k.form_for(1)["PDL_RELEASE"] is bool(arm.get("pdl_release") or (arm.get("cfg") or kcfg.Cfg()).PDL_RELEASE), "the launch knob is part of the form"
+
+
+def test_launch_shape_of_the_served_configs_at_the_recorded_slabs():
+    """The shapes a profiler recorded for launches on a cc 10.0 part at width 6144: 256 threads at 1 and at 6 rows, 128 threads at 3 rows
+    (the device cell below repeats the comparison on whatever part runs it)."""
+    k = entry.AttentionGateQuantDecode("cpu", 6144)
+    assert k.launch_shape_for(1) == ((3, 1, 1), (256, 1, 1), 0) and k.launch_shape_for(6) == ((18, 1, 1), (256, 1, 1), 0)
+    assert entry.AttentionGateQuantDecode("cpu", 6144, cfg=kcfg.Cfg(THREADS=128)).launch_shape_for(3) == ((18, 1, 1), (128, 1, 1), 0)
+
+
+def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
+    """The facts are plain data, a fresh object per call (a caller's edit reaches nothing of the entry) and the entry's typed declines
+    for a row count outside 1 .. 160; a row count that is not an ``int`` is a ``ValueError`` that says so, as on every entry's launch
+    facts (never the per-row table's index error)."""
+    k = entry.AttentionGateQuantDecode("cpu", 2048, pdl_release=True)
+    form = k.form_for(7)
+    assert json.loads(json.dumps(form)) == form == dict(THREADS=256, PDL_RELEASE=True) and type(form) is dict
+    form["PDL_RELEASE"] = "edited"
+    assert k.form_for(7)["PDL_RELEASE"] is True and k.cfg_for(7).PDL_RELEASE is True
+    for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
+        for rows in (0, -1):
+            with pytest.raises(ValueError, match="a call holds at least one row"):
+                fact(rows)
+        with pytest.raises(NotImplementedError, match="at most 160 rows.*got 161"):
+            fact(161)
+        for rows in (1.0, "1", None, True):
+            with pytest.raises(ValueError, match="rows must be an int"):
+                fact(rows)
+        fact(160)
+
+
+class _CompiledStandIn:
+    """What the entry keeps per compile key, as far as the launch facts read it: a compiled DSL host function carries ``kernel_info``,
+    keyed by the symbols of the kernels it launches."""
+
+    def __init__(self, *symbols):
+        self.kernel_info = {symbol: {} for symbol in symbols}
+
+
+def test_kernel_symbol_is_that_of_the_compiled_config_at_every_row_count():
+    """Host-only, with a stand-in in the entry's compile cache: nothing compiled -> an empty tuple; once the config is compiled its ONE
+    symbol answers every row count (one compiled kernel serves them all); a compiled kernel of another config is not named; a compiled
+    object that does not expose its kernels is the typed decline, never a guess."""
+    k = entry.AttentionGateQuantDecode("cpu", 2048)
+    assert k.kernel_symbols_for(1) == () == k.kernel_symbols_for(160)
+    k.compiled[(kcfg.Cfg(THREADS=128),)] = _CompiledStandIn("cudnn_kernel_frost_attention_gate_quant_other_0")
+    assert k.kernel_symbols_for(1) == (), "a config the row count does not run is not named"
+    k.compiled[k.key(1)] = _CompiledStandIn("cudnn_kernel_frost_attention_gate_quant_A_0")
+    assert all(k.kernel_symbols_for(rows) == ("cudnn_kernel_frost_attention_gate_quant_A_0",) for rows in range(1, kcfg.MAX_ROWS + 1))
+    k.compiled[k.key(1)] = object()
+    with pytest.raises(NotImplementedError, match="the attention gate \\+ quantize decode step: the installed CuTe DSL .* does not expose the kernel symbols"):
+        k.kernel_symbols_for(1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -932,6 +1127,121 @@ def test_warm_call_allocates_nothing_and_never_synchronizes():
     assert torch.equal(_bytes(mine), want)
 
 
+# The allocation of the entry-owned buffer is stream work of the stream that allocated it (Rule 5; ``cudnn.frost.init_order``):
+# the entry does not initialize it, but torch fills it under deterministic algorithms and a recycled block can carry a queued
+# write.  The cells below warm an entry with a CALLER-OWNED ``out`` (it has no buffer yet), park a side stream behind a delay
+# kernel, let ``output(rows)`` allocate the buffer on it and launch from the original stream while that work is still queued
+# (``init_order_schedules`` says what every such cell must do).
+def _warm_entry_without_a_buffer(dev, rows, width, seed):
+    """``(entry, attn, gate, scale, want)``: the entry warmed by a real launch into a caller-owned ``out``, whose bytes -- held to
+    the suite's reference -- are ``want``."""
+    k = entry.AttentionGateQuantDecode(dev, width)
+    attn, gate = make_operands(rows, width, dev, seed=seed)
+    scale = scale_tensor(0.02, dev)
+    mine = _run(k, attn, gate, scale, torch.empty(rows, width, dtype=E4M3, device=dev))
+    assert_reference(mine, attn, gate, scale, label=f"rows {rows}: a caller-owned out")
+    assert k.out_buffer is None, "the warm-up allocated the entry-owned buffer"
+    warm_fills(dev, E4M3, U8)
+    return k, attn, gate, scale, _bytes(mine).clone()
+
+
+def _park_the_buffers_allocation(dev, k, rows, fill):
+    """``output(rows)`` on a side stream parked behind a delay, with stream work queued on the buffer's block: ``(view, marker)``."""
+    view, recycled = [], []
+
+    def allocate():
+        if fill.startswith("a previous owner"):
+            recycled.append(previous_owner(lambda: torch.empty(kcfg.MAX_ROWS, k.width, dtype=U8, device=dev), 0xEE))
+            view.append(k.output(rows))
+        else:
+            with deterministic_fill():
+                view.append(k.output(rows))
+
+    marker = park(pooled(dev, lambda: torch.empty(kcfg.MAX_ROWS, k.width, dtype=U8, device=dev)), allocate)
+    if recycled and view[0].data_ptr() != recycled[0]:
+        pytest.skip("the allocator did not hand the freed block to the entry: the schedule shows nothing")
+    return view[0], marker
+
+
+@pytest.mark.usefixtures("settled_records")
+@pytest.mark.parametrize("out_reaches_the_call", ("by default", "the view passed back"))
+@pytest.mark.parametrize("fill", ("the fill torch adds under deterministic algorithms", "a previous owner's fill of a recycled block"))
+def test_warm_launch_waits_for_what_the_allocating_stream_still_owes_the_entry_owned_buffer(fill, out_reaches_the_call):
+    """The launch that writes the entry-owned buffer -- by default, or as the view ``output(rows)`` returned, passed back as
+    ``out`` -- is ordered behind the stream work queued on the buffer's block although the host does not wait; unordered, that
+    work lands on the kernel's bytes."""
+    dev = _device_or_skip()
+    rows, width = 7, 2048
+    k, attn, gate, scale, want = _warm_entry_without_a_buffer(dev, rows, width, 131)
+    view, pending = _park_the_buffers_allocation(dev, k, rows, fill)
+    out = k(attn, gate, scale) if out_reaches_the_call == "by default" else k(attn, gate, scale, view)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert out.data_ptr() == k.out_buffer.data_ptr() and out.shape == (rows, width)
+    differing = int((_bytes(out) != want).sum())
+    assert differing == 0, f"the entry-owned buffer behind {fill}, {out_reaches_the_call}: {differing} of {want.numel()} bytes differ"
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_buffer_allocated_by_compile_without_out_is_ordered_like_one_allocated_by_output():
+    """The entry's OTHER allocating route: ``compile(attn, gate, scale)`` without ``out`` on the parked side stream (under
+    deterministic algorithms), then a call by default on the original stream."""
+    dev = _device_or_skip()
+    rows, width = 7, 2048
+    k, attn, gate, scale, want = _warm_entry_without_a_buffer(dev, rows, width, 136)
+
+    def allocate():
+        with deterministic_fill():
+            k.compile(attn, gate, scale)
+
+    pending = park(pooled(dev, lambda: torch.empty(kcfg.MAX_ROWS, width, dtype=U8, device=dev)), allocate)
+    assert k.out_buffer is not None, "compile without out did not allocate the buffer"
+    out = k(attn, gate, scale)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    differing = int((_bytes(out) != want).sum())
+    assert differing == 0, f"the buffer allocated by compile on another stream: {differing} of {want.numel()} bytes differ"
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_warm_call_does_nothing_for_an_allocation_whose_stream_work_is_complete(monkeypatch):
+    """A record is dropped by the first call that sees its event complete -- one with a caller-owned ``out`` too -- and then
+    the warm path is what it was: calls with the entry-owned buffer and with a caller-owned ``out`` allocate no device memory,
+    raise nothing under ``set_sync_debug_mode('error')``, read or wait for no event and no stream, and do not enter the ordering
+    step."""
+    dev = _device_or_skip()
+    rows, width = 8, 2048
+    k, attn, gate, scale, want = _warm_entry_without_a_buffer(dev, rows, width, 135)
+    view, pending = _park_the_buffers_allocation(dev, k, rows, "the fill torch adds under deterministic algorithms")
+    out = k(attn, gate, scale)
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert torch.equal(_bytes(out), want), "the call that met the pending fill"
+    mine = torch.empty(rows, width, dtype=E4M3, device=dev)
+    k(attn, gate, scale, mine)  # a caller-owned out: the call writes no entry-owned byte and still drops what is complete
+    assert not k._pending, "a complete record was kept by a call that does not write its allocation"
+    touched = []
+    monkeypatch.setattr(init_order, "order_behind", lambda *a, **kw: touched.append("the ordering step"))
+    for name in ("query", "synchronize", "wait"):
+        monkeypatch.setattr(torch.cuda.Event, name, lambda *a, _name=name, **kw: touched.append(f"Event.{_name}"))
+    for name in ("wait_event", "wait_stream", "synchronize"):
+        monkeypatch.setattr(torch.cuda.Stream, name, lambda *a, _name=name, **kw: touched.append(f"Stream.{_name}"))
+    allocated = torch.cuda.memory_stats(dev)["allocation.all.allocated"]
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            k(attn, gate, scale)
+            k(attn, gate, scale, mine)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    assert not touched, f"a warm call behind a complete allocation touched {sorted(set(touched))}"
+    assert torch.cuda.memory_stats(dev)["allocation.all.allocated"] == allocated, "a warm call allocated device memory"
+    assert torch.equal(_bytes(out), want) and torch.equal(_bytes(mine), want), "the warm calls' bytes"
+
+
 def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_up():
     dev = _device_or_skip()
     k = entry.AttentionGateQuantDecode(dev, 2048)
@@ -1014,3 +1324,25 @@ def test_reciprocal_primitive_is_the_correctly_rounded_division():
     assert not bool(
         diff.any()
     ), f"{int(diff.sum())} of {scales.numel()} reciprocals differ from the IEEE division (first: scale {float(scales.cpu()[diff][0])!r})"
+
+
+@pytest.mark.parametrize(
+    "rows, arm", [(1, dict()), (6, dict(pdl_release=True)), (3, dict(cfg=kcfg.Cfg(THREADS=128)))], ids=["rows1", "rows6-release", "rows3-threads128"]
+)
+def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, arm):
+    """On the device, width 6144: one launch of the entry (the pick, the released form, the 128-thread config) is ONE kernel whose
+    profiler record -- name, grid, block, shared memory -- equals the entry's launch facts; nothing is named before the first compile;
+    and the SAME compiled kernel serves another row count, whose launch record follows its own row count's shape."""
+    dev = _device_or_skip()
+    width = 6144
+    k = entry.AttentionGateQuantDecode(dev, width, **arm)
+    scale = scale_tensor(0.02, dev)
+    assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
+    records = []
+    for call_rows in (rows, 17):
+        attn, gate = make_operands(call_rows, width, dev, seed=3)
+        out = torch.empty(call_rows, width, dtype=E4M3, device=dev)
+        records.append(assert_facts_equal_the_launch(k, lambda: k(attn, gate, scale, out), call_rows, what=entry.NAME))
+    assert records[0].name == records[1].name and records[0].name.startswith("cudnn_kernel_frost_attention_gate_quant_"), records
+    assert records[0].grid != records[1].grid and records[0].block == records[1].block, "one kernel, the grid of each call's row count"
+    assert k.form_for(rows) == asdict(k.cfg_for(rows)) and len(k.compiled) == 1

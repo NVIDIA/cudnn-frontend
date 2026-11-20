@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the SM100 block-scaled (MXFP8/MXFP4) scale-layout and UMMA descriptor contract."""
+"""Tests for the SM100 block-scaled (MXFP8/MXFP4/NVFP4) scale-layout and UMMA descriptor contract."""
 
 from types import SimpleNamespace
 
@@ -44,14 +44,20 @@ def test_mxfp8_scale_reference_roundtrip_and_datapath_order_host_only():
     assert torch.equal(tile[16:32], logical[[1, 33, 65, 97], :4, 0].reshape(-1))
 
 
-@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="requires torch.float8_e8m0fnu")
-def test_mxfp8_scale_reference_preserves_e8m0_bits_host_only():
-    """Verify that the oracle preserves the raw E8M0 encoding."""
+@pytest.mark.parametrize("dtype_name", ["float8_e8m0fnu", "float8_e4m3fn"], ids=["e8m0", "e4m3"])
+def test_mxfp8_scale_reference_preserves_scale_bits_host_only(dtype_name):
+    """Verify that the oracle packs and unpacks one-byte scales (MXFP E8M0, NVFP4 E4M3) as their raw encoding."""
+    dtype = getattr(torch, dtype_name, None)
+    if dtype is None:
+        pytest.skip(f"requires torch.{dtype_name}")
     logical_bytes = torch.arange(130 * 5 * 3, dtype=torch.int64).to(torch.uint8).reshape(130, 5, 3)
     expected = mxfp8_scale_reference.pack_blockscaled_scale_mkl(logical_bytes)
-    actual = mxfp8_scale_reference.pack_blockscaled_scale_mkl(logical_bytes.view(torch.float8_e8m0fnu))
-    assert actual.dtype == torch.float8_e8m0fnu
+    actual = mxfp8_scale_reference.pack_blockscaled_scale_mkl(logical_bytes.view(dtype))
+    assert actual.dtype == dtype
     assert torch.equal(actual.view(torch.uint8), expected)
+    unpacked = mxfp8_scale_reference.unpack_blockscaled_scale_mkl(actual, 130, 5)
+    assert unpacked.dtype == dtype
+    assert torch.equal(unpacked.view(torch.uint8), logical_bytes)
 
 
 @pytest.mark.parametrize("qhead_per_kv_head,seqlen_q", [(64, 2), (32, 4), (4, 33)])
@@ -219,6 +225,22 @@ def test_cuda_bshd_packers_match_reference_and_reuse_outputs(batch, sq, sk, hkv,
 
 
 @pytest.mark.usefixtures("cuda_scale_packer")
+def test_cuda_bshd_packers_preserve_nvfp4_e4m3_scales():
+    """NVFP4's E4M3 scales (eight per 128-value row) pack through the CUDA BSHD packers as their raw bytes, keeping the
+    E4M3 dtype."""
+    groups, ratio = 8, 64
+    q_bytes = torch.arange(2 * 131 * ratio * groups).to(torch.uint8).reshape(2, 131, ratio, groups)
+    k_bytes = torch.arange(2 * 259 * groups).to(torch.uint8).reshape(2, 259, 1, groups)
+    q_ref, k_ref = mxfp8_scale_reference.pack_qk_scale_bshd(q_bytes, k_bytes, ratio)
+    q, k = mxfp8_scale_utils.pack_qk_scale_bshd(q_bytes.cuda().view(torch.float8_e4m3fn), k_bytes.cuda().view(torch.float8_e4m3fn), ratio)
+    torch.cuda.synchronize()
+    assert q.dtype == k.dtype == torch.float8_e4m3fn
+    assert q.shape[-1] == k.shape[-1] == groups
+    assert torch.equal(q.view(torch.uint8).cpu(), q_ref)
+    assert torch.equal(k.view(torch.uint8).cpu(), k_ref)
+
+
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_cuda_mkl_packer_matches_reference():
     """Compare the CUDA MKL layout packer with the PyTorch oracle."""
     logical_cpu = torch.arange(130 * 5 * 3).to(torch.uint8).reshape(130, 5, 3)
@@ -379,7 +401,9 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
     op = SimpleNamespace(
         a_dtype=cutlass.Float8E4M3FN,
         b_dtype=cutlass.Float8E5M2,
-        shape_mnk=(128, 256, 64),
+        sf_dtype=cutlass.Float8E8M0FNU,
+        sf_vec_size=32,
+        shape_mnk=(128, 256, 32),
         a_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.K,
         b_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.MN,
     )
@@ -435,3 +459,90 @@ def test_blockscaled_umma_descriptor_mxfp4_host_only():
     # scale_vec::2X reads a scale pair per MMA, so odd scale ids are refused.
     with pytest.raises(ValueError, match="must be 0 or 2"):
         mxfp4_desc(sf_id=1)
+
+
+def test_blockscaled_umma_descriptor_nvfp4_host_only():
+    """Packed E2M1 with UE4M3 scales in 16-value blocks selects the .kind::mxf4nvf4 scale_vec::4X encodings: the MXFP4
+    formats with the scale type bit (23) cleared, and scale id 0 only (each MMA reads a whole scale column)."""
+    cutlass = pytest.importorskip("cutlass")
+    mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
+
+    def nvfp4_desc(sf_id=0, packed_fp4=True, dtype=cutlass.Float4E2M1FN):
+        return mma_desc.make_blockscaled_instr_desc(
+            dtype,
+            dtype,
+            M=128,
+            N=128,
+            a_major=mma_desc.Major.K,
+            b_major=mma_desc.Major.K,
+            a_sf_id=sf_id,
+            b_sf_id=sf_id,
+            scale_format=mma_desc.ScaleFormat.UE4M3,
+            packed_fp4=packed_fp4,
+            scale_vec=4,
+        )
+
+    desc = nvfp4_desc()
+    assert (desc >> 7) & 0x7 == mma_desc.MXF4Format.E2M1
+    assert (desc >> 10) & 0x3 == mma_desc.MXF4Format.E2M1
+    assert (desc >> 23) & 0x1 == 0  # UE4M3 scales
+    assert (desc >> 4) & 0x3 == 0 and (desc >> 29) & 0x3 == 0
+    assert desc == 0x08200480
+    for sf_id in (1, 2, 3):
+        with pytest.raises(ValueError, match="scale_vec::4X scale factor IDs must be 0$"):
+            nvfp4_desc(sf_id=sf_id)
+    # scale_vec::4X is a packed-FP4 (kind::mxf4nvf4) mode: kind::mxf8f6f4 operands refuse it.
+    with pytest.raises(ValueError, match="packed_fp4=False"):
+        nvfp4_desc(packed_fp4=False, dtype=cutlass.Float8E4M3FN)
+    # UE4M3 scales exist only in the 4X form: kind::mxf4 (2X) and kind::mxf8f6f4 (1X) take UE8M0.
+    for packed_fp4, dtype, scale_vec in ((True, cutlass.Float4E2M1FN, 2), (False, cutlass.Float8E4M3FN, 1)):
+        with pytest.raises(ValueError, match="UE4M3 scales need scale_vec::4X"):
+            mma_desc.make_blockscaled_instr_desc(
+                dtype,
+                dtype,
+                M=128,
+                N=128,
+                a_major=mma_desc.Major.K,
+                b_major=mma_desc.Major.K,
+                scale_format=mma_desc.ScaleFormat.UE4M3,
+                packed_fp4=packed_fp4,
+                scale_vec=scale_vec,
+            )
+    assert mma_desc.to_scale_format(cutlass.Float8E4M3FN) == mma_desc.ScaleFormat.UE4M3
+    assert mma_desc.to_scale_format(cutlass.Float8E8M0FNU) == mma_desc.ScaleFormat.UE8M0
+    # Scales per MMA row are the MMA's K over the scale vector size.
+    for k, sf_vec_size, scale_vec in ((32, 32, 1), (64, 32, 2), (64, 16, 4)):
+        assert mma_desc.blockscaled_scale_vec(SimpleNamespace(shape_mnk=(128, 128, k), sf_vec_size=sf_vec_size)) == scale_vec
+
+
+def test_blockscaled_mma_op_adapter_nvfp4():
+    """The op adapter derives the kind, scale_vec and scale type from a real CuTe DSL ``MmaMXF4NVF4Op``, which the DSL
+    builds only for an SM100-family target."""
+    cutlass = pytest.importorskip("cutlass")
+    mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
+    tcgen05 = pytest.importorskip("cutlass.cute.nvgpu.tcgen05")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("MmaMXF4NVF4Op is built only for an SM100-family target")
+
+    op = tcgen05.mma.MmaMXF4NVF4Op(cutlass.Float8E4M3FN, (128, 128, 64), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM)
+    assert mma_desc.blockscaled_scale_vec(op) == 4
+    assert mma_desc.blockscaled_mma_op_to_idesc(op, 0) == 0x08200480
+
+
+def test_block_scaled_format_table_matches_kernels_host_only():
+    """Each format's host-side scale contract (torch scale dtype, scale vector size) is its kernel class's, and the tests'
+    packed-FP4 precisions are the formats that pack two values per byte."""
+    cutlass = pytest.importorskip("cutlass")
+    block_scaled = pytest.importorskip("cudnn.deepseek_sparse_attention.score_recompute._block_scaled")
+    from deepseek_sparse_attention.cutedsl.dsa_utils import PACKED_FP4_PRECISIONS
+
+    kernel_scale_dtypes = {"float8_e8m0fnu": cutlass.Float8E8M0FNU, "float8_e4m3fn": cutlass.Float8E4M3FN}
+    formats = block_scaled.BLOCK_SCALED_FORMATS
+    for name, fmt in formats.items():
+        assert kernel_scale_dtypes[fmt.scale_dtype_name] is fmt.kernel_cls.scale_dtype, name
+        assert fmt.sf_vec_size == fmt.kernel_cls.sf_vec_size, name
+    assert {name: fmt.sf_vec_size for name, fmt in formats.items()} == {"mxfp8": 32, "mxfp4": 32, "nvfp4": 16}
+    assert set(PACKED_FP4_PRECISIONS) == {name for name, fmt in formats.items() if fmt.elems_per_storage > 1}
+    # BF16 has no scales: whatever sf_vec_size a caller passes, the compile keys see None.
+    assert block_scaled.validate_sf_vec_size("bf16", 32) is None
+    assert block_scaled.validate_sf_vec_size("nvfp4", None) == 16

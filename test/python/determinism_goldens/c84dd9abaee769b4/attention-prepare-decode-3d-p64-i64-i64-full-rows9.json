@@ -1,0 +1,94 @@
+{
+  "inputs": {
+    "cos_sin": {
+      "dtype": "torch.bfloat16",
+      "sha256": "eb63630b0b117490ecd45b9950fae2c479e356c196eb8a582dc768aa8aea6777",
+      "shape": [
+        4096,
+        64
+      ]
+    },
+    "k_weight": {
+      "dtype": "torch.bfloat16",
+      "sha256": "4b32c87eeadc60e0416ea3b47e2d6b88d93a91989bd4e84bade2bfeab1ee0ba5",
+      "shape": [
+        256
+      ]
+    },
+    "positions": {
+      "dtype": "torch.int64",
+      "sha256": "d96031ac4a19b94c2e56d7cedf087b012712c395eb90a925b3a26b5aa9abdc8d",
+      "shape": [
+        3,
+        9
+      ]
+    },
+    "q_weight": {
+      "dtype": "torch.bfloat16",
+      "sha256": "c5d1c24c53aabdd5095cbe7e41b4b9012b73f41252b10ea236c52ae0aa8ad1c9",
+      "shape": [
+        256
+      ]
+    },
+    "slab": {
+      "dtype": "torch.bfloat16",
+      "sha256": "bc91b88b60861aa9f7139d7b3f4b9ac7d8f9dce3f1754ee34276ddf156bbe1cb",
+      "shape": [
+        9,
+        14336
+      ]
+    },
+    "slot_mapping": {
+      "dtype": "torch.int64",
+      "sha256": "42f8bfff29b2d7567ca2239e7ecd42e15746b8c4cc44f1baecda452d5c67aead",
+      "shape": [
+        9
+      ]
+    }
+  },
+  "outputs": {
+    "cache": {
+      "dtype": "torch.int16",
+      "sha256": "71f411bc6e3464597852f7209b88a91f9a6b8582af125fde9505ad129585c01b",
+      "shape": [
+        3,
+        4,
+        64,
+        512
+      ]
+    },
+    "gate_out": {
+      "dtype": "torch.int16",
+      "sha256": "f1c1aafbb67e85234cd30eb6e594bf28c6e05345e40dc7d7e37991c15a3b05a9",
+      "shape": [
+        9,
+        24,
+        256
+      ]
+    },
+    "q_out": {
+      "dtype": "torch.int16",
+      "sha256": "6544e96ad4aaa2e70ba1431cdea857eb6ebede1d64bf2797b87737895bc4e8ac",
+      "shape": [
+        9,
+        24,
+        256
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13010,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.13.0+cu130",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}

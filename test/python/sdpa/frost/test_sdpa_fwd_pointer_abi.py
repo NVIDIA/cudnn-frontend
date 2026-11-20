@@ -61,7 +61,19 @@ def _load(arch, template, d_qk, d_v, **overrides):
     if template == "decode_d256_f16":
         values["decode_q_tile"] = 16
     values.update(overrides)
-    path = Path(api_dsl.__file__).parent / "kernels" / arch / f"{template}.py"
+    folders = {
+        "decode_d128_f16": "d128_f16_single_q",
+        "decode_d256_f16": "d256_f16_swap_ab",
+        "prefill_d128_f16": "d128_f16_multi_q",
+        "prefill_d192_d128_f16": "d192_f16_multi_q",
+        "prefill_d256_f16": "d256_f16_lookahead",
+        "prefill_d512_f16": "d512_f16_role_split",
+        "prefill_d128_mxfp8": "d128_mxfp8_multi_q",
+        "prefill_d192_d128_mxfp8": "d192_mxfp8_multi_q",
+        "prefill_d256_mxfp8": "d256_mxfp8_single_q",
+        "prefill_d512_mxfp8": "d512_mxfp8_slice_recompute" if arch == "sm100" else "d512_mxfp8_role_split",
+    }
+    path = Path(api_dsl.__file__).parent / "kernels" / arch / folders[template] / "kernel.py"
     return load_template(str(path), TemplateParams(**values), tag=f"pointer_abi_{arch}_{template}_{d_qk}_{d_v}")
 
 

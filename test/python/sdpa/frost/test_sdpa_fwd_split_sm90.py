@@ -82,7 +82,7 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa, g
         fe.validate()
         fe.build_operation_graph()
         fe.create_execution_plans([cudnn.heur_mode.A])
-        selected = select_engine(fe, "sdpa_fwd_prefill_sm90")
+        selected = select_engine(fe, "sdpa_fwd_sm90_f16_three_wg")
         knobs = {cudnn.knob_type.SPLIT_KV: 17, cudnn.knob_type.SCHED_POLICY: 1, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
         fe.create_execution_plan(selected.engine_id, knobs)
         fe.select_plan(len(fe.plans) - 1)
@@ -258,7 +258,7 @@ def test_split_launch_domain():
     for splits in (0, 65536, True):
         with pytest.raises(ValueError, match="split_kv"):
             config_sm90.validate_params(replace(params, split_kv=splits))
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
     knobs = engines.SdpaFwdKnobs(split_kv=3, sched_policy=0)
     assert engines.launch_grid_mismatch(caps, SimpleNamespace(b=65535, h_q=1), knobs) is None
     for batch, heads, splits in ((65536, 1, 3), (1, 65536, 3), (1, 1, 65536)):

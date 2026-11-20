@@ -8,7 +8,13 @@ import pytest
 def cuda_device(request):
     if request.module.__name__.endswith(("test_linear_attention_jax", "test_linear_attention_jax_determinism")):
         jax = pytest.importorskip("jax", minversion="0.9.1")
+        pytest.importorskip("cudnn._jax", exc_type=ImportError)
         from cudnn.frost import cutedsl_runtime_available
+        from cudnn.frost.buffers import cutedsl_requirement_error
+        from cudnn.linear_attention._jax_execution import _MIN_DSL
+
+        if error := cutedsl_requirement_error("JAX linear attention", floor=_MIN_DSL):
+            pytest.skip(error)
 
         devices = [device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) in ("10.0", "10.3")]
         devices = [device for device in devices if cutedsl_runtime_available(tuple(map(int, str(device.compute_capability).split("."))))]

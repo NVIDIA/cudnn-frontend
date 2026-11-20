@@ -10,12 +10,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _KERNEL_ROOTS = (
     _REPO_ROOT / "python" / "cudnn" / "QSA",
     _REPO_ROOT / "python" / "cudnn" / "attention_gate",
+    _REPO_ROOT / "python" / "cudnn" / "attention_prepare",
     _REPO_ROOT / "python" / "cudnn" / "conv",
     _REPO_ROOT / "python" / "cudnn" / "gemm",
     _REPO_ROOT / "python" / "cudnn" / "norm",
     _REPO_ROOT / "python" / "cudnn" / "sdpa",
     _REPO_ROOT / "python" / "cudnn" / "engram",
     _REPO_ROOT / "python" / "cudnn" / "rope",
+    _REPO_ROOT / "python" / "cudnn" / "row_quantize",
 )
 
 
@@ -108,3 +110,10 @@ def test_state_snapshot_has_cudnn_name_prefix():
     path = _REPO_ROOT / "python" / "cudnn" / "linear_attention" / "frost" / "common" / "state_snapshot.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     assert not _missing_prefixes(tree), "The state snapshot kernel needs its cuDNN name prefix"
+
+
+@pytest.mark.L0
+def test_kda_head_wave_has_cudnn_name_prefix():
+    path = _REPO_ROOT / "python" / "cudnn" / "linear_attention" / "frost" / "common" / "head_wave.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert not _missing_prefixes(tree), "Both shared KDA queues need prefixes without importing a backward caller"

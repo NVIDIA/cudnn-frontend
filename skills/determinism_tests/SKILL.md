@@ -43,7 +43,7 @@ Choose the nearest example; do not copy its temporary skips into a new API:
 | Packed sparse attention and saved statistics | [QSA](../../test/python/QSA/cutedsl/test_qsa_determinism.py) |
 | Sparse indices, shared sink gradient, empty-row sentinels | [DSA attention](../../test/python/deepseek_sparse_attention/cutedsl/test_DSA_determinism.py) |
 | Mutable scores and sparse/dense gradient reductions | [DSA indexer](../../test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py) |
-| Fixed quantized payloads and repacked scales | [FP8/MXFP8 indexer](../../test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py) |
+| Fixed quantized payloads and repacked scales | [FP8/MXFP8/NVFP4 indexer](../../test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py) |
 
 Cover these checks in each supported direction:
 

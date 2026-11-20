@@ -18,7 +18,7 @@ indexer's selected-key distribution. The teacher distribution is detached.
 
 ```python
 import torch
-from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention
+from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention_forward
 
 # Q: [Tq, Hq, 256]; K/V: [Tk, 1, 256]; indexer Q/K: [Tq, 128]/[Tk, 128].
 metadata = SimplifiedSparseAttentionMetadata(
@@ -29,7 +29,7 @@ metadata = SimplifiedSparseAttentionMetadata(
     triangular_scores=False,
     mask_invalid_rows=True,
 )
-result = simplified_sparse_attention(q, k, v, q_idx, k_idx, metadata, topk=512)
+result = simplified_sparse_attention_forward(q, k, v, q_idx, k_idx, metadata, topk=512)
 output, indexer_loss = result       # Also result["output"], result["indexer_loss"].
 loss = output.float().square().sum() + indexer_loss
 loss.backward()
@@ -73,15 +73,15 @@ on both producer and consumer streams.
 
 ## Phase 1: dense indexer warmup
 
-`dense_indexer_kl` trains the indexer against the frozen dense teacher over
+`dense_indexer_kl_forward` trains the indexer against the frozen dense teacher over
 every permitted key. It is available from both `cudnn.ops` and
 `cudnn.simplified_sparse_attention`. It returns a scalar tensor, with gradients
 only for indexer Q and K; teacher Q/K and `teacher_lse` receive no gradients.
 
 ```python
-from cudnn.ops import dense_indexer_kl
+from cudnn.ops import dense_indexer_kl_forward
 
-indexer_loss = dense_indexer_kl(
+indexer_loss = dense_indexer_kl_forward(
     q, k, q_idx, k_idx,
     key_starts=key_starts, key_ends=key_ends, query_valid=query_valid,
     loss_denominator=denominator,
@@ -142,17 +142,17 @@ support for the public training call. There is no cuDNN Graph API node.
 
 ## JAX
 
-`cudnn.ops.simplified_sparse_attention_jax` returns a plain
+`cudnn.ops.simplified_sparse_attention_forward_jax` returns a plain
 `(output, indexer_loss)` tuple. It supports `jax.jit`, `jax.grad`, and
 `jax.vjp` for the five activation inputs. Pass metadata as array arguments:
 
 ```python
 import jax
-from cudnn.ops import simplified_sparse_attention_jax
+from cudnn.ops import simplified_sparse_attention_forward_jax
 
 @jax.jit
 def training_loss(q, k, v, q_idx, k_idx, starts, ends, valid, denominator):
-    output, indexer_loss = simplified_sparse_attention_jax(
+    output, indexer_loss = simplified_sparse_attention_forward_jax(
         q, k, v, q_idx, k_idx, starts, ends, valid, denominator,
         topk=512, loss_coeff=0.1,
     )

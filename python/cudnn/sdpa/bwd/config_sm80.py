@@ -4,7 +4,7 @@
 """Compile-time flavor configs for the SM80 SDPA backward kernel.
 
 Single source of truth for the shared 2-sub-group backward pipeline
-(``kernels/sm80/bprop_f16.py``); all shape-dependent sizes are derived in the
+(``kernels/sm80/f16_two_subgroup/kernel.py``); all shape-dependent sizes are derived in the
 kernel from these fields — do NOT inline ``128`` / ``64`` literals there.
 The pipeline shape the knobs describe:
 
@@ -29,7 +29,7 @@ Flavors (d is read from the tensor shapes; the kernel runs both unchanged):
   SMEM at TILE_Q=128 is ~144 KiB < the A100 163 KiB dynamic-SMEM cap. SQ must
   be a multiple of TILE_Q=128; SKV a multiple of TILE_KV=64.
   NOTE: the shipped gptoss-sm80 (d=64) BPROP kernel is
-  ``kernels/sm80/bprop_d64_f16.py``, which uses a FIXED tile shape
+  ``kernels/sm80/f16_d64/kernel.py``, which uses a FIXED tile shape
   (m_block=64, n_block=128) and does not read this config. GPTOSS_CFG
   configures the shared path when run at d=64.
 """
@@ -48,6 +48,80 @@ class Cfg:
 
 LLAMA_CFG = Cfg(D_QK=128, D_V=128, TILE_KV=64, TILE_Q=64, WARPS_PER_SG=4)
 GPTOSS_CFG = Cfg(D_QK=64, D_V=64, TILE_KV=64, TILE_Q=128, WARPS_PER_SG=4)
+
+# The backward flavor envelopes, in pick order (exact match first, then the first that covers the heads).
+from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80  # noqa: E402
+
+BWD_FLAVOR_DIMS = {
+    name: (cfg.D_QK, cfg.D_V)
+    for name, cfg in (
+        ("gptoss", _fwd_config_sm80.GPTOSS_CFG),
+        ("llama", _fwd_config_sm80.LLAMA_CFG),
+        ("dsv3", _fwd_config_sm80.DSV3_CFG),
+        ("qwen", _fwd_config_sm80.QWEN_CFG),
+    )
+}
+D64_M_BLOCK, D64_N_BLOCK = 64, 128  # bprop_d64_f16.py's fixed tile
+
+
+def envelope_dims(d_qk: int, d_v: int):
+    """The flavor envelope the shared pipeline compiles for ``(d_qk, d_v)``; None when no flavor covers them."""
+    for dims in BWD_FLAVOR_DIMS.values():
+        if (d_qk, d_v) == dims:
+            return dims
+    return next((dims for dims in BWD_FLAVOR_DIMS.values() if d_qk <= dims[0] and d_v <= dims[1]), None)
+
+
+def d64_smem_bytes(io_bytes: int = 2) -> int:
+    """Shared memory of one CTA of the dedicated d=64 kernel (sK, sV, the two-stage sQ / sdO, sP, sdS)."""
+    return (2 * D64_N_BLOCK * 64 + 4 * D64_M_BLOCK * 64 + 2 * D64_M_BLOCK * D64_N_BLOCK) * io_bytes
+
+
+def pipeline_smem_bytes(
+    d_qk: int,
+    d_v: int,
+    qo_stages: int,
+    dq_smem_coalesce: bool,
+    *,
+    has_rope: bool = False,
+    tile_kv: int = LLAMA_CFG.TILE_KV,
+    tile_q: int = LLAMA_CFG.TILE_Q,
+    io_bytes: int = 2,
+) -> int:
+    """Shared memory of one CTA of the shared pipeline (``bprop_f16.py``): sK, sV, the Q / dO rings, sP (fp32), sdS^T and the
+    optional fp32 dQ staging tile."""
+    total = (tile_kv * (d_qk + d_v) + qo_stages * tile_q * (d_qk + d_v) + tile_q * tile_kv) * io_bytes + tile_kv * tile_q * 4
+    if dq_smem_coalesce or has_rope:
+        total += tile_q * d_qk * 4
+    return total
+
+
+def default_levers(d_qk: int):
+    """The established ``(qo_stages, dq_smem_coalesce)`` pair of the shared pipeline at ``d_qk``."""
+    return (1 if d_qk >= 256 else 2), d_qk <= 128
+
+
+def resolved_levers(p: "TemplateParams"):
+    qo_stages, dq_smem_coalesce = default_levers(p.d_qk)
+    return (p.qo_stages or qo_stages), (dq_smem_coalesce if p.dq_smem_coalesce is None else p.dq_smem_coalesce)
+
+
+def levers_within_budget(d_qk: int, d_v: int, budget: int, *, has_rope: bool = False):
+    """The lever pair to run the shared pipeline at the envelope ``(d_qk, d_v)`` under ``budget`` bytes: the established pair
+    when it fits, else the first shallower variant that does; None when none fits."""
+    qo_stages, dq_smem_coalesce = default_levers(d_qk)
+    for levers in ((qo_stages, dq_smem_coalesce), (1, dq_smem_coalesce), (qo_stages, False), (1, False)):
+        if pipeline_smem_bytes(d_qk, d_v, *levers, has_rope=has_rope) <= budget:
+            return levers
+    return None
+
+
+def backward_smem_mismatch(d_qk: int, d_v: int, budget: int):
+    """Decline text when no lever pair fits the flavor envelope covering ``(d_qk, d_v)`` into ``budget`` bytes."""
+    dims = envelope_dims(d_qk, d_v)
+    if dims is None or levers_within_budget(*dims, budget) is not None:
+        return None
+    return f"SM80 backward at D_QK={dims[0]}/D_V={dims[1]} needs {pipeline_smem_bytes(*dims, 1, False)} bytes of shared memory per CTA; the device provides {budget}"
 
 
 # ---------------------------------------------------------------------------

@@ -604,7 +604,10 @@ def pytest_configure(config):
         print(f"PyTorch Version: {torch.__version__}")
         print(f"PyTorch Path: {torch.__file__}")
         print(f"PyTorch CUDA Version: {torch.version.cuda}")
-        print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+        try:
+            print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+        except RuntimeError as e:  # e.g. cuDNN 9.11+ on a GPU below SM75, which PyTorch refuses to initialize
+            print(f"PyTorch cuDNN Version: unavailable ({str(e)[:120]})")
     try:
         # The CuTe DSL wheel and the CUDA toolchain it bound (its cu12 / cu13 flavour, picked by the driver): the compiler floors of the
         # OSS kernels (python/cudnn/AGENTS.md Rule 7) read THIS, never torch.version.cuda, so a lane's log names the compiler it ran.

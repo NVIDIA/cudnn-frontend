@@ -15,7 +15,10 @@ import jax.numpy as jnp
 import numpy as np
 
 import cudnn
-from cudnn.jax import call, zeros_init
+from cudnn._jax import call, zeros_init
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+_MIN_DSL = (4, 8, 1)
 
 
 class _Operation(Enum):
@@ -209,6 +212,8 @@ def _attributes(config, backward):
 
 @lru_cache(maxsize=128)
 def _build(metadata, config, device, gpu_arch):
+    if error := cutedsl_requirement_error("JAX linear attention", floor=_MIN_DSL):
+        raise ImportError(error)
     from cudnn.frost.device import build_device
 
     operation = config.operation

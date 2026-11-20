@@ -31,7 +31,8 @@ validate_sdpa_operand_stride_alignment(std::shared_ptr<Tensor_attributes> const&
         return {error_code_t::OK, ""};
     }
     auto const& stride = tensor->get_stride();
-    auto const i       = misaligned_stride_dimension(tensor->get_dim(), stride, element_bytes, alignment);
+    auto const i       = misaligned_stride_dimension(
+        tensor->get_dim(), stride, element_bytes, alignment, tensor->get_ragged_offset() != nullptr);
     RETURN_CUDNN_FRONTEND_ERROR_IF(i >= 0,
                                    error_code_t::GRAPH_NOT_SUPPORTED,
                                    name + ": stride " + std::to_string(stride[i]) + " of dimension " +
@@ -650,9 +651,13 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 return {error_code_t::GRAPH_NOT_SUPPORTED, "Dropout for unified SDPA node requires cuDNN 9.22.0"};
             }
 
-            if (dropout_probability.has_value() && generate_stats.value_or(false)) {
+            // Dropout with generated stats is the training forward: the backward regenerates the dropout mask
+            // from the seed and offset, so the forward has to draw that same mask. Before cuDNN 9.28.0 the unified
+            // forward could draw a different one on SM100 class devices (a graph its native kernel declined was
+            // served by a kernel with another mask layout), which gives wrong gradients without any error.
+            if (dropout_probability.has_value() && generate_stats.value_or(false) && effective_cudnn_ver < 92800) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Dropout for unified SDPA node with generated stats is not supported"};
+                        "Dropout for unified SDPA node with generated stats requires cuDNN 9.28.0"};
             }
 
             // Unified engine in cuDNN < 9.15 can't meaningfully support max sequence length,

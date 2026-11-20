@@ -398,6 +398,17 @@ _ARCH_DELTA_CONSTANTS = (
     "BODY_ARCH",
 )
 
+# The sm100 body's only code beyond the arch constants: ptxas -O2 for the output-stage c 128 register-form rendering on the CUDA 12
+# compiler (the sm107 body never compiles with CUDA 12).
+_SM100_ONLY_CODE = (
+    "def _cuda12_compiler() -> bool:",
+    '    """Whether the DSL compiles with its CUDA 12 toolkit flavour (the cu12 wheel\'s embedded CUDA 12.9 ptxas)."""',
+    "    from cutlass.base_dsl.version_info import CUDA_VERSION",
+    "    return int(CUDA_VERSION.major) < 13",
+    "if _DUAL and _K == 128 and not _LN_SMEM and _cuda12_compiler():",
+    '    frost_compile_options += " --ptxas-options=-O2"',
+)
+
 
 def test_the_two_bodies_differ_only_in_the_arch_delta():
     """The sm100 body is the sm107 body with the arch constants the renderer moves (and the docstring / comment lines that state them): every
@@ -423,9 +434,11 @@ def test_the_two_bodies_differ_only_in_the_arch_delta():
         in_docstring = idx < spans[side]
         is_comment = ln.lstrip().startswith("#")
         is_constant = any(ln.startswith(f"{name} = ") or ln.startswith(f"{name}: ") for name in _ARCH_DELTA_CONSTANTS)
-        if not (in_docstring or is_comment or is_constant):
+        is_sm100_only = side == 1 and (not ln.strip() or ln in _SM100_ONLY_CODE)
+        if not (in_docstring or is_comment or is_constant or is_sm100_only):
             offenders.append((side, idx + 1, ln))
     assert not offenders, f"code lines outside the arch delta differ between the two bodies: {offenders[:10]}"
+    assert set(_SM100_ONLY_CODE) <= set(b), "the sm100 body lost its CUDA 12 ptxas -O2 block: update _SM100_ONLY_CODE"
     moved = {ln.split(" = ")[0].split(":")[0] for side, idx, ln in changed if any(ln.startswith(n) for n in _ARCH_DELTA_CONSTANTS)}
     assert moved == set(_ARCH_DELTA_CONSTANTS), moved
 

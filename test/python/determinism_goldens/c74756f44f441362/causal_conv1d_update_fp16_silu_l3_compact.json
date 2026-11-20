@@ -1,0 +1,77 @@
+{
+  "inputs": {
+    "bias": {
+      "dtype": "torch.float16",
+      "sha256": "5182648381c2232aff8940a967341c86da965bd01b685b4fa456138750f9dedf",
+      "shape": [
+        17
+      ]
+    },
+    "indices": {
+      "dtype": "torch.int32",
+      "sha256": "05a38ce0e7c0669349f922173148afb07968d00b6ab677d4d121a1671d2215a2",
+      "shape": [
+        2
+      ]
+    },
+    "initial_state": {
+      "dtype": "torch.float16",
+      "sha256": "d8f38775684154e055736e002982b94d17c331045a79f0545072027e1ca9f76a",
+      "shape": [
+        3,
+        17,
+        3
+      ]
+    },
+    "weight": {
+      "dtype": "torch.float16",
+      "sha256": "9d0b55f944b7233c6fd8b9012b50370ec88f365f502311c0a3660790272c8d38",
+      "shape": [
+        17,
+        4
+      ]
+    },
+    "x": {
+      "dtype": "torch.float16",
+      "sha256": "c6f2ef5c15e83cf957eb83fafe2378a689ac66e7870854ee1c555014d94f4105",
+      "shape": [
+        2,
+        17
+      ]
+    }
+  },
+  "outputs": {
+    "output": {
+      "dtype": "torch.float16",
+      "sha256": "8824cbd21ecd788bc98b7ab51f3745d3dcc83610b0583e78b35280c5193736e2",
+      "shape": [
+        2,
+        17
+      ]
+    },
+    "state": {
+      "dtype": "torch.float16",
+      "sha256": "4ab11a0afc85c9a08217facf22433beabbc58e1fb19deba94593d5eca99454ae",
+      "shape": [
+        3,
+        17,
+        3
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "sm": [
+      8,
+      9
+    ],
+    "sm_count": 128,
+    "torch": "2.12.1+cu130",
+    "tvm_ffi": "0.1.16"
+  },
+  "schema": 1
+}

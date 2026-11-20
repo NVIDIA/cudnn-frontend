@@ -41,14 +41,19 @@ import argparse
 import math
 import os
 import sys
+from contextlib import nullcontext
+from pathlib import Path
+from statistics import median
 from typing import Optional, Tuple
 
 import torch
 
-try:
-    from .config_types import attn_mask
-except ImportError:  # run as a script
-    from config_types import attn_mask
+if not __package__ or __package__ == "attention_inference":
+    # The sweep runner launches this file by path, possibly outside the repository.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmark.attention_inference.config_types import attn_mask
+from benchmark.attention_training.flops import count_causal_nonmasked_elems
 
 # GPU-name substring -> peak DRAM bandwidth in GB/s, for % SOL reporting.
 # Override with CUDNN_BENCH_PEAK_BW_GBPS.
@@ -73,18 +78,24 @@ def get_peak_bw_gbps() -> Optional[float]:
     if env:
         return float(env)
     name = torch.cuda.get_device_name()
+    if "GH200" in name:
+        # GH200 has HBM3 and HBM3e variants. CUDA gives the memory clock in kHz and bus width in bits.
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        clock_khz = getattr(props, "memory_clock_rate", 0)
+        width_bits = getattr(props, "memory_bus_width", 0)
+        if clock_khz and width_bits:
+            return 2 * clock_khz * width_bits / (8 * 1e6)
+        return None
     for key, bw in PEAK_BW_GBPS.items():
         if key in name:
             return bw
     return None
 
 
-def attention_flops(batch, q_tokens, kv_len, num_q_heads, d_qk, d_vo, causal_prefill) -> float:
-    """2*B*H*Sq*Skv*(d_qk+d_vo), halved for square causal prefill."""
-    f = 2.0 * batch * num_q_heads * q_tokens * kv_len * (d_qk + d_vo)
-    if causal_prefill and q_tokens == kv_len:
-        f *= 0.5
-    return f
+def attention_flops(batch, q_tokens, kv_len, num_q_heads, d_qk, d_vo, mask, sliding_window) -> float:
+    """QK and PV FLOPs over the pairs admitted by the benchmark's attention mask."""
+    pairs = q_tokens * kv_len if mask == "no_mask" else count_causal_nonmasked_elems(q_tokens, kv_len, mask, sliding_window or None)
+    return 2.0 * batch * num_q_heads * pairs * (d_qk + d_vo)
 
 
 def attention_bytes(batch, q_tokens, kv_len, num_q_heads, num_kv_heads, d_qk, d_vo, kv_shared, sliding_window, kv_elt_size=2, qo_elt_size=2) -> float:
@@ -158,6 +169,34 @@ def time_fn(fn, num_warmup, num_iters) -> float:
         times.append(sum(it.device_time_total for it in matched) / 1000.0)
     times.sort()
     return times[len(times) // 2]
+
+
+def time_graph_replay(fn, num_warmup, num_iters, calls_per_replay) -> float:
+    """Median CUDA-event milliseconds per execution in a warm graph replay."""
+    stream = torch.cuda.current_stream()
+    for _ in range(max(1, num_warmup)):
+        fn()
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(calls_per_replay):
+            fn()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    graph.replay()
+    end.record(stream)
+    end.synchronize()
+    samples = []
+    for _ in range(num_iters):
+        start.record(stream)
+        graph.replay()
+        end.record(stream)
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / calls_per_replay)
+    return median(samples)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +376,7 @@ def setup_cudnn(args, dtype, oss=False, auto=False):
     if sink_gpu is not None:
         variant_pack[sdpa_kwargs["sink_token"]] = sink_gpu
     handle = cudnn.create_handle()
+    cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
 
     def fn():
         graph.execute(variant_pack, workspace, handle=handle)
@@ -361,7 +401,12 @@ def _built_plan_name(graph) -> str:
     """Name of the plan build_plans() settled on ('backend_heuristics' = the
     backend's own OSS candidate space)."""
     try:
-        return graph.get_plan_name_at_index(graph._plan_index)
+        name = graph.get_plan_name_at_index(graph._plan_index)
+        compiled = getattr(graph._compiled_plans.get(graph._plan_index), "_compiled", None)
+        resolved = getattr(compiled, "implementation_config", None)
+        if resolved:
+            name += " resolved=" + ";".join(f"{key}:{value}" for key, value in resolved.items())
+        return name
     except Exception:
         return "unknown"
 
@@ -392,6 +437,15 @@ def setup_cudnn_auto(args, dtype):
     return setup_cudnn(args, dtype, auto=True)
 
 
+def _make_fp8_input(shape):
+    tensor = torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn)
+    # Long-context page pools can fit in FP8 but exceed memory during an
+    # all-at-once float initialization. Limit the temporary to 16M elements.
+    for chunk in tensor.view(-1).split(1 << 24):
+        chunk.copy_(torch.randn(chunk.numel(), device=chunk.device).mul_(0.1))
+    return tensor
+
+
 def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     """FP8 attention graph (q/k/v e4m3 with unit descales) for the fp8-KV axis."""
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
@@ -406,7 +460,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     q_lens = kv_lens = table = None
     if paged:
         q_lens, kv_lens = request_lens(args)
-        k_gpu, v_gpu, table = _paged_pool(args, kv_lens, lambda shape: (torch.randn(*shape, device="cuda") * 0.1).to(f8))
+        k_gpu, v_gpu, table = _paged_pool(args, kv_lens, _make_fp8_input)
     elif args.kind == "mla_absorbed":
         rec = (torch.randn(b, skv, hkv, dqk, device="cuda") * 0.1).to(f8).transpose(1, 2)
         k_gpu, v_gpu = rec, rec[..., :dvo]
@@ -482,6 +536,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     for n in ones:
         variant_pack[scalars[n]] = ones[n]
     handle = cudnn.create_handle()
+    cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
 
     def fn():
         graph.execute(variant_pack, workspace, handle=handle)
@@ -507,6 +562,11 @@ def _paged_kv_layout(kv_lens, page_size, device="cuda"):
     return total, indptr, indices, last_page_len, table.to(device)
 
 
+def _window_left(width):
+    """FlashInfer, FA4 and b12x take an inclusive left distance. The preset's width includes the current key."""
+    return width - 1 if width else -1
+
+
 def setup_flashinfer(args, dtype, fi_backend=None):
     import flashinfer
 
@@ -520,6 +580,8 @@ def setup_flashinfer(args, dtype, fi_backend=None):
     if args.phase == "context" and args.kv_layout == "paged":
         return _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace)
     if args.phase == "context":
+        if args.has_sink:
+            raise NotImplementedError("the flashinfer ragged prefill leg does not pass sinks")
         # Ragged (contiguous) batch prefill, per-request lengths.
         q_lens, kv_lens = request_lens(args)
         q_gpu = torch.randn(int(q_lens.sum()), hq, dqk, device="cuda", dtype=dtype) * 0.1
@@ -536,7 +598,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
             dqk,
             head_dim_vo=dvo,
             causal=args.causal,
-            window_left=args.sliding_window_size if args.sliding_window_size else -1,
+            window_left=_window_left(args.sliding_window_size),
             sm_scale=args.sm_scale,
             q_data_type=dtype,
             kv_data_type=dtype,
@@ -581,6 +643,8 @@ def setup_flashinfer(args, dtype, fi_backend=None):
 
         return fn, f"flashinfer mla backend={getattr(wrapper, '_backend', mla_backend)}"
 
+    if dvo != dqk:
+        raise NotImplementedError("the flashinfer decode legs run V / O at the Q / K width")
     kv_dtype = torch.float8_e4m3fn if args.kv_cache_dtype == "fp8_e4m3" else dtype
     _, kv_lens = request_lens(args)
     total, kv_indptr, kv_indices, last_page_len, block_tables = _paged_kv_layout(kv_lens, args.page_size)
@@ -595,7 +659,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
         # trtllm layout: (pages, 2, num_kv_heads, page_size, head_dim)
         kv_trt = (torch.randn(total, 2, hkv, args.page_size, dqk, device="cuda") * 0.1).to(kv_dtype)
         seq_lens = kv_lens.to(device="cuda", dtype=torch.int32)
-        wl = args.sliding_window_size - 1 if args.sliding_window_size else -1
+        wl = _window_left(args.sliding_window_size)
 
         def fn():
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -624,7 +688,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
             hkv,
             dqk,
             args.page_size,
-            window_left=args.sliding_window_size if args.sliding_window_size else -1,
+            window_left=_window_left(args.sliding_window_size),
             sm_scale=args.sm_scale,
             q_data_type=dtype,
             kv_data_type=kv_dtype,
@@ -649,7 +713,7 @@ def setup_flashinfer(args, dtype, fi_backend=None):
         dqk,
         args.page_size,
         causal=True,
-        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        window_left=_window_left(args.sliding_window_size),
         sm_scale=args.sm_scale,
         q_data_type=dtype,
         kv_data_type=kv_dtype,
@@ -677,7 +741,7 @@ def _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace):
     qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(q_lens, 0)]).to(torch.int32)
     kw = dict(
         causal=args.causal,
-        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        window_left=_window_left(args.sliding_window_size),
         sm_scale=args.sm_scale,
         q_data_type=dtype,
         kv_data_type=dtype,
@@ -725,7 +789,7 @@ def setup_b12x(args, dtype):
         k_gpu = torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
         v_gpu = torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
         causal = args.causal if args.phase == "context" else sq > 1
-        window = (args.sliding_window_size, 0) if args.sliding_window_size else None
+        window = (_window_left(args.sliding_window_size), 0) if args.sliding_window_size else None
         sink = torch.randn(hq, device="cuda", dtype=torch.float32) if args.has_sink else None
         kplan = varlen.create_plan_batched(q_gpu, k_gpu, v_gpu, causal=causal, window_size=window, attention_sink_bias=sink)
         splan = varlen.plan_batched(kplan)
@@ -898,7 +962,7 @@ def setup_flash_attention_4(args, dtype):
     k_gpu = torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
     v_gpu = torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
     causal = args.causal if args.phase == "context" else sq > 1
-    window = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
+    window = (_window_left(args.sliding_window_size), 0) if args.sliding_window_size else (-1, -1)
 
     detail = "fa4"
     kwargs = dict(causal=causal, window_size=window, softmax_scale=args.sm_scale)
@@ -967,6 +1031,7 @@ def main():
     p.add_argument("--has_sink", action="store_true", help="per-head attention sinks")
     p.add_argument("--num_iterations", type=int, default=20)
     p.add_argument("--num_warmup_iterations", type=int, default=5)
+    p.add_argument("--graph_replay", type=int, default=0, metavar="N", help="capture N cuDNN executions per graph and measure warm replay with CUDA events")
     p.add_argument("--fa4_num_splits", default="auto", help="'auto', or an integer for a fixed split count")
     p.add_argument(
         "--kv_layout",
@@ -1005,18 +1070,31 @@ def main():
     dtype = torch.bfloat16 if args.data_type == "bfloat16" else torch.float16
 
     cudnn_leg = args.backend in ("cudnn", "cudnn_oss", "cudnn_auto")
+    if args.graph_replay < 0:
+        p.error("--graph_replay must be nonnegative")
+    if args.graph_replay and not cudnn_leg:
+        p.error("--graph_replay is supported for cuDNN backends only")
+    if args.graph_replay and args.num_iterations < 1:
+        p.error("--graph_replay requires at least one timed iteration")
     fi_leg = args.backend.startswith("flashinfer")
     if min(args.kv_min_fill, args.q_min_fill) < 1.0 and not ((cudnn_leg and args.kv_layout == "paged") or fi_leg):
         raise NotImplementedError("per-request lengths are wired for the paged cudnn legs and flashinfer only")
     if args.q_min_fill < 1.0 and args.phase != "context":
         raise NotImplementedError("--q_min_fill applies to the context phase")
-    fn, detail = SETUPS[args.backend](args, dtype)
-    ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
+    # Build and bind the cuDNN handle on the side stream before capture.
+    with torch.cuda.stream(torch.cuda.Stream()) if args.graph_replay else nullcontext():
+        fn, detail = SETUPS[args.backend](args, dtype)
+        if args.graph_replay:
+            ms = time_graph_replay(fn, args.num_warmup_iterations, args.num_iterations, args.graph_replay)
+            detail += f" [graph-replay x{args.graph_replay}]"
+        else:
+            ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
 
     # FLOPs and bytes per request, at each request's own lengths.
+    mask = attn_mask(args.phase, args.causal, args.q_tokens, args.kv_len, args.sliding_window_size)
     flops = byts = 0.0
     for q_len, kv_len in zip(*(t.tolist() for t in request_lens(args))):
-        flops += attention_flops(1, q_len, kv_len, args.num_q_heads, args.head_dim_qk, args.head_dim_vo, causal_prefill=args.causal and args.phase == "context")
+        flops += attention_flops(1, q_len, kv_len, args.num_q_heads, args.head_dim_qk, args.head_dim_vo, mask, args.sliding_window_size)
         byts += attention_bytes(
             1,
             q_len,

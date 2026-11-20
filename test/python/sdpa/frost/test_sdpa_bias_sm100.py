@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 """The additive attention bias and the per-key kv_mask on the SM100 (cc 10.0 / 10.3) f16/bf16 small head-dim tiles -- the RESIDENT
-row-block arm of ``sm100/prefill_d128_f16.py`` (``TemplateParams.bias_mode = 1`` / ``kv_mask_form`` 1 / 2 / 3; the first body seam of the
+row-block arm of ``sm100/d128_f16_multi_q/kernel.py`` (``TemplateParams.bias_mode = 1`` / ``kv_mask_form`` 1 / 2 / 3; the first body seam of the
 Rubin small tiles' port onto the SM100 file).  The Rubin module ``test_sdpa_bias_sm107`` carries the arch-neutral pieces (the fp64 oracle of
 the whole contract, the graph builder, the degenerate-input cells, the checks); this module runs them against the SM100 row at the SM100
 budget: the 32-wide tile holds S_kv <= 256 at cga1, the 64-wide tile S_kv <= 128 at cga2 (``config_sm100.sm100_bias_resident_s_kv_max``:
@@ -23,7 +23,7 @@ from frost_test_utils import _SM, requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_ROW = "sdpa_fwd_prefill_sm100"
+_ROW = "sdpa_fwd_sm100_d128_multi_q"
 requires_sm100_line = pytest.mark.skipif(_SM not in (100, 103), reason="needs a cc 10.0 / 10.3 device, have " + ("none" if _SM is None else f"sm_{_SM}"))
 
 

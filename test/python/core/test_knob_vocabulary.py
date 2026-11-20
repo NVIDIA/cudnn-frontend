@@ -58,6 +58,21 @@ def test_backend_mirror_values_are_frozen():
         "INPUT_TMA_ENABLE": 30,
         "OUTPUT_TMA_ENABLE": 31,
         "TILE_CGA": 32,
+        "FULL_PRECISION_MATH": 33,
+        "SPLIT_K": 34,
+        "USE_TEX": 35,
+        "KBLOCK": 36,
+        "LDGA": 37,
+        "LDGB": 38,
+        "CHUNK_K": 39,
+        "SPLIT_H": 40,
+        "WINO_TILE": 41,
+        "CTA_SPLIT_K_MODE": 42,
+        "SLICED": 43,
+        "SPLIT_RS": 44,
+        "SINGLEBUFFER": 45,
+        "LDGC": 46,
+        "NUM_C_PER_BLOCK": 47,
     }
     backend_band = {name: int(member) for name, member in kt.__members__.items() if not cudnn.is_frontend_knob_type(member)}
     # Every member the backend band has today, with the value it shipped with;
@@ -170,6 +185,12 @@ def test_sdpa_fwd_knobs_round_trip():
         kt.SPLIT_KV: 4,
     }
     assert SdpaFwdKnobs.from_public(public) == native
+    for value in (0, 1):
+        swapped = SdpaFwdKnobs(swap_ab=value)
+        assert swapped.to_public() == {kt.SWAP_AB: value}
+        assert SdpaFwdKnobs.from_public({int(kt.SWAP_AB): value}) == swapped
+    with pytest.raises(ValueError):
+        SdpaFwdKnobs.from_public({kt.SWAP_AB: True})
     # A persisted record is ints; anything that would round-trip to a different
     # native knob than the one recorded is refused rather than coerced.
     assert SdpaFwdKnobs.from_public({kt.PACK_GQA: True}) == SdpaFwdKnobs(pack_gqa=True)

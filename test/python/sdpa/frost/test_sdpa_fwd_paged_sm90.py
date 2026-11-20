@@ -6,16 +6,14 @@ import pytest
 import torch
 
 import test_sdpa_fwd_paged_sm120 as paging
-from frost_test_utils import _SM, requires_dsl
+from frost_test_utils import _SM, requires_dsl, sm90_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 90, reason="requires native SM90")]
 
 
 @pytest.fixture(autouse=True)
 def native(monkeypatch):
-    from cudnn.sdpa.fwd.engines import engine_name
-
-    monkeypatch.setattr(paging, "engine_name", lambda **kw: engine_name(arch="sm90"))
+    monkeypatch.setattr(paging, "sm120_half_owner", lambda dq, dv, tile_m=None: sm90_half_owner(dq, dv, paged=True))
     with torch.cuda.stream(torch.cuda.Stream()):
         yield
 

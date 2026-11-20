@@ -42,6 +42,7 @@ the honest answer while nobody has timed it.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from math import gcd
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
@@ -49,6 +50,7 @@ from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 import cudnn
 
 from cudnn.engines.base import PlanConfig
+from .implementation_selection import select_sm107_d512_geometry
 from cudnn.frost.tile_dsl.constants import (
     DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
@@ -59,6 +61,8 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd import config_sm80 as _sm80_config
+from cudnn.sdpa.fwd.config_sm90 import d128_causal_route as _sm90_d128_causal_route
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     FP8_DUAL_KV_STREAM_MAX_ROWS,
@@ -106,11 +110,14 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    select_sm107_half_geometry,
+    sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
     paged_thd_split_domain,
+    packed_thd_split,
     thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
@@ -121,6 +128,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    effective_tile_ms,
     launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
@@ -167,7 +175,18 @@ _SM100_MEASURED_SMS = 148
 _SM100_D192_LPT_MAX_WAVES = 12
 # GB10 (cc 12.1): its SM count, the fallback where the graph facts carry none (the causal NATURAL rule in _sched_points).
 _SM121_MEASURED_SMS = 48
-# cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
+# The SM90 D128 causal route's CTA count where the facts carry no device (a host without CUDA): an H100 SXM's SM count,
+# the board the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+_SM90_MEASURED_SMS = 132
+# api_dsl's call-time switches that decide whether a causal D128 plan runs the walk's record, at the values api_dsl
+# ships them with: _sm90_d128_causal_walks reads the module's own once it is loaded.
+_SM90_D128_SHIPPED_SWITCHES = (
+    ("D128_INTRA_WG_OVERLAP", True),
+    ("D128_PERSISTENT", True),
+    ("D128_PERSISTENT_CAUSAL_WALK", 2),
+    ("D128_CAUSAL_WALK_ROUTE", True),
+)
+# cc 10.7 half, the shared d128 DECODE tile (sm100/d128_f16_single_q/kernel.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
 # verify tables, bottom-right causal, no window): LPT / NATURAL median 0.989 over 224 (cell, policy) pairs at KV 2k-16k
@@ -259,6 +278,21 @@ _SPLIT_KV_COMBINE_FLOOR = 0.35
 # regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
 _SM120_SPLIT_KV_MIN_TILES = 1
 _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
+# SM80 (A100, 108 SMs), half d128 dense causal graphs on the adapter's 128-row query tile: the model sees that
+# tile and the 64-key KV tile (_sm80_chunk_split), with these two constants. Fitted on a forced split ladder
+# (study sm80_d128_gqa_split_cal_20261117): regret 1.050 -> 1.005 on 99 train cells, 1.025 -> 1.002 on 37
+# holdout cells, no changed cell past 1.04 / 1.01 of today's choice. The 64-row tile keeps the shared model.
+_SM80_SPLIT_KV_CTA_COST = 3.0
+_SM80_SPLIT_KV_COMBINE_COST = 0.02
+# SM80 half d256 PAGED decode on the short-d256 tile (64-row Q tile, 32-key KV tiles): the wave model mis-splits it in both
+# directions, so it takes a direct rule (_sm80_paged_d256_split_choice): the largest power-of-two split that keeps >= 8 KV tiles
+# per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced split 1.388 -> 1.038 on
+# 60 train cells, 1.338 -> 1.033 on 30 holdout cells, no cell slower than today's choice. Dense d256 keeps the shared model.
+# Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128: 0.790 of split 64 on 18 fresh cells, none slower
+# (sm80_d256_split128_q1_20261118); at S_q 4 it was not always faster (sm80_d256_split128_base1_20261118: 1.101).
+_SM80_PAGED_D256_SPLIT_MIN_KV_TILES = 8
+_SM80_PAGED_D256_SPLIT_MAX_WAVES = 16
+_SM80_SPLIT_PARTIAL_O_MAX_ELEMS = 1 << 31  # SM80 split-KV faults once the partial-O buffer reaches 2^31 elements
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
 # S_q of _SERIAL_COMBINE_MIN_SQ and up there. That kernel walks the split axis
@@ -344,6 +378,8 @@ def choose_split_kv(
     combine_floor: Optional[float] = None,
     serial_combine: bool = False,
     serial_combine_cost: float = _SPLIT_KV_SERIAL_COMBINE_COST,
+    cta_cost: Optional[float] = None,
+    combine_cost: Optional[float] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -417,9 +453,14 @@ def choose_split_kv(
     assignment, as happens when D192 uses CGA1 unsplit but requires CGA2 for a
     split. It defaults to the split geometry, preserving the ordinary case.
 
+    ``cta_cost`` / ``combine_cost`` replace CTA_COST / COMBINE_COST for a
+    machine fitted on its own (_SM80_SPLIT_KV_CTA_COST).
+
     Returns 1 when there is nothing to split or nothing beats not splitting.
     ``candidates`` defaults to :func:`split_kv_candidates` for the device.
     """
+    cta_cost = _SPLIT_KV_CTA_COST if cta_cost is None else cta_cost
+    combine_cost = _SPLIT_KV_COMBINE_COST if combine_cost is None else combine_cost
     split_launch = _SplitKvLaunch(q_tiles, heads_q, kv_tiles, ctas_per_tile)
     if unsplit_launch is None:
         unsplit_launch = split_launch
@@ -436,7 +477,7 @@ def choose_split_kv(
     # ... and that one wave costs no less than a lone block's serial walk of
     # its partials: with fewer rows than the machine holds at once there is
     # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
-    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
+    per_partial = max(combine_waves * combine_cost, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -452,7 +493,7 @@ def choose_split_kv(
         waves = _ceil_div(base_ctas * split, sm_count)
         # No combine runs unsplit: the single-pass kernel writes O itself.
         combine = split * per_partial if split > 1 else 0.0
-        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine
+        cost = waves * (_ceil_div(launch.kv_tiles, split) + cta_cost) + combine
         if serial_combine and split > 1:
             cost += split * serial_combine_cost
         if best_cost is None or cost < best_cost:
@@ -461,7 +502,7 @@ def choose_split_kv(
 
 
 # --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
-# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# sm100/d256_f16_swap_ab/kernel.py is not the machine choose_split_kv was fitted on: one
 # cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
 # tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
 # kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
@@ -531,7 +572,7 @@ def decode_tile_split_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # A KV tile's cost to a lone CTA by the tile's N extent (its packed Q rows), in
 # units of the 16-column tile's, PER ARCH LINE -- the two lines' decode tiles are
-# sibling kernels (sm100/ and sm107/decode_d256_f16.py), so each carries its own
+# sibling kernels (sm100/ and sm107/d256_f16_swap_ab/kernel.py), so each carries its own
 # fit and the model reads the caller's ``device_cc``:
 #   * the Blackwell line (B200 fit): the 32-column tile at _DECODE_TILE_WIDE_Q_TILE_COST.
 #   * cc 10.7 (measured on the Rubin performance class, 212 SMs, per-CTA device
@@ -1025,7 +1066,7 @@ def choose_decode_tile_split_kv(
     declared S_kv; ``q_tile`` the tile's N extent (16, 32 or 64 packed Q rows,
     :func:`config_sm107.decode_d256_q_tile`).  ``device_cc`` names the ARCH LINE
     the launch is priced on, and the two lines are two fits of two sibling
-    kernels (sm100/ and sm107/decode_d256_f16.py), each measured on its own
+    kernels (sm100/ and sm107/d256_f16_swap_ab/kernel.py), each measured on its own
     part -- the model answers for one line exactly as that line's fit says:
 
     * the Blackwell line (cc 10.0 / 10.3, measured on B200 / B300):
@@ -1178,30 +1219,36 @@ def choose_decode_tile_split_kv(
     return pick
 
 
-def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int) -> int:
+def choose_sm120_decode_split_kv(*, units: int, kv_stages: int, stage_bytes: int, d_v: int, sm_count: int, paged: bool = False) -> int:
     """How many KV chunks the SM120 decode tile cuts each unit into; 1 = do not split.
 
     ``units`` is the launch's CTA count before splitting (Q tiles x batch x
     packed KV-head groups, or query heads unpacked); ``kv_stages`` the K/V
     stages of the longest unit, ``stage_bytes`` each; ``d_v`` the O width the
-    combine reduces.
+    combine reduces; ``paged`` whether the stages gather KV pages.
 
     The tile streams K/V from DRAM, one CTA per SM. Its time is the longer of
     the longest unit's stage chain at one CTA's stream rate and all the units'
     bytes at the DRAM rate, so a split pays until the DRAM bound takes over and
     past it only adds combine work. The rates are an RTX PRO 6000 Blackwell
-    Workstation's. Candidates are :func:`split_kv_candidates`; ties keep the
-    smaller split.
+    Workstation's; gathering paged KV, one CTA streams about 6x slower and the
+    whole board about 0.6x (studies sm120_decode_split_20261117 and _v2, RTX PRO
+    6000 Server). Unsplit, the paged tile streams slower again: at 512-2048
+    units split 1 ran 1.34-1.49x the best split at the same bytes, so split 1
+    prices paged bytes at its own rate (study _v5; raising the shared rates
+    instead over-split small launches, _v3 / _v4). Candidates are
+    :func:`split_kv_candidates`; ties keep the smaller split.
     """
     if min(units, kv_stages, stage_bytes, d_v, sm_count) <= 0:
         return 1
-    cta_rate, dram_rate = 4.0e4, 1.55e6  # bytes / us: one CTA streaming alone; all CTAs together
-    dram_us = units * kv_stages * stage_bytes / dram_rate
+    cta_rate, dram_rate = (7.0e3, 9.0e5) if paged else (4.0e4, 1.55e6)  # bytes / us: one CTA streaming alone; all CTAs together
+    unsplit_rate = 8.75e5 if paged else dram_rate
+    nbytes = units * kv_stages * stage_bytes
 
     def cost_us(split: int) -> float:
         chain_us = _ceil_div(units * split, sm_count) * _ceil_div(kv_stages, split) * stage_bytes / cta_rate
         combine_us = 2.0 + split * 0.055 * d_v / 128 if split > 1 else 0.0
-        return max(chain_us, dram_us) + combine_us
+        return max(chain_us, nbytes / (dram_rate if split > 1 else unsplit_rate)) + combine_us
 
     return min(split_kv_candidates(sm_count=sm_count, kv_tiles=kv_stages, min_tiles=1), key=cost_us)
 
@@ -1232,13 +1279,27 @@ def _sm120_decode_tile_m(caps: Capabilities, facts) -> int:
     decode tile puts its warps on the key axis and rings the K/V stages. Wider
     units keep the prefill rule (MQA at 64 heads: the 128-row packed tile reads
     the shared KV head once per 128 rows).
+
+    Paged d256 MTP and verify rows past 32 rows (``s_q <= 8``, ``G <= 32``) take
+    the 32-row tile over several Q tiles: the prefill body has no paged d256
+    plan, and there the decode tile ran 0.04-0.87 of the backend (studies
+    sm120_paged_d256_multiq_probe / _verify_v2_20261117). Past ``s_q`` 8 a group
+    that does not divide 32 lost up to 1.19x (_verify_20261117). Paged d64
+    verify rows (``5 <= s_q <= 8``) take it too, over the prefill body the
+    paged guard trails: 0.37 of the backend, worst 0.89 (_d64_verify_v2); d128
+    lost up to 1.36x at groups 5 / 10 / 12 (_d64_d128_verify) and keeps its path.
     """
     if facts.is_fp8 or facts.is_mxfp8 or facts.thd:
         return 0
     if max(facts.d_qk, facts.d_v) > _SM120_GENERAL_HEAD_TILE_MAX or facts.h_kv <= 0 or facts.h_q % facts.h_kv != 0:
         return 0
-    rows = facts.s_q * (facts.h_q // facts.h_kv)
-    return next((tile_m for tile_m in _SM120_DECODE_Q_TILES if tile_m in caps.tile_ms and rows <= tile_m), 0)
+    group = facts.h_q // facts.h_kv
+    rows = facts.s_q * group
+    tile_m = next((tile_m for tile_m in _SM120_DECODE_Q_TILES if tile_m in caps.tile_ms and rows <= tile_m), 0)
+    head = max(facts.d_qk, facts.d_v)
+    verify = 5 <= facts.s_q <= 8
+    multi_q = facts.has_paged_kv and group <= 32 and 32 in caps.tile_ms and ((head == 256 and facts.s_q <= 8) or (head == 64 and verify))
+    return tile_m or (32 if multi_q else 0)
 
 
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
@@ -1346,13 +1407,35 @@ def _sm107_cluster_waves(facts) -> float:
     return (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
 
 
-def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
+def _sm90_d128_causal_walks(facts) -> bool:
+    """Whether check_support gives a causal SM90 D128 graph of ``facts`` the walk's record (persistent, causal_walk 1,
+    the NATURAL order unless pinned) rather than the one-tile record (the causal order): the choice a check_support
+    without a pinned order makes, mirrored here because a graph-route plan carries its proposal as a pin. A record
+    check_support then hands to the claim counter (api_dsl.D128_CAUSAL_CLAIM, past its gate) is persistent and NATURAL
+    too, so the counter's switches do not move this answer. The walk's
+    record needs api_dsl's switches at the walk (D128_INTRA_WG_OVERLAP, D128_PERSISTENT, D128_PERSISTENT_CAUSAL_WALK 2,
+    as api_dsl._sm90_d128_persistence reads them) and a plan the route keeps (config_sm90.d128_causal_route, while
+    D128_CAUSAL_WALK_ROUTE is on) at the device's SM count, the CTA count compile() gives the record. The switches are
+    api_dsl's call-time module constants, read from the module once it is loaded; it imports torch, so this module does
+    not load it, and until something does they hold the values it ships with (_SM90_D128_SHIPPED_SWITCHES; getattr on
+    the absent module's None returns them)."""
+    api = sys.modules.get("cudnn.sdpa.fwd.api_dsl")
+    overlap, persistent, walk, route = (getattr(api, name, shipped) for name, shipped in _SM90_D128_SHIPPED_SWITCHES)
+    if not (overlap and persistent and walk == 2):
+        return False
+    shape = (int(facts.b), int(facts.h_q), int(facts.h_kv), int(facts.s_q), int(facts.s_kv))
+    return not (route and _sm90_d128_causal_route(shape, bool(facts.bottom_right), int(facts.device_sm_count or _SM90_MEASURED_SMS)))
+
+
+def _sched_points(caps: Capabilities, facts, *, d128: bool = False) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
     The PRIMARY follows the measured preference for the graph's shape; the
     remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
-    standalone wrapper users who bypass ranking.
+    standalone wrapper users who bypass ranking. ``d128`` asks for the SM90 row's
+    128 x 128 sets (the dedicated D128 template, :func:`_sm90_d128_knob_sets`),
+    whose causal walk record takes its own order; every other set leaves it False.
     """
     # The FLAVOR's domain, not the row-wide floor: a `sched_policies_by_d_shape`
     # claim (the Rubin f16 / FP8 (256, 256) LPT entries) must reach the ranking,
@@ -1505,7 +1588,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # band above the decode tile is unmeasured and keeps the L2-budget rule.
         primary = SCHED_NATURAL
     elif causal_ish and caps.sm_lo == 100 and facts.is_mxfp8 and _selected_d_shape(caps, facts) == (128, 128):
-        # SM100 d128 MXFP8 (sm100/prefill_d128_mxfp8.py): plain LPT beats the L2-budget
+        # SM100 d128 MXFP8 (sm100/d128_mxfp8_multi_q/kernel.py): plain LPT beats the L2-budget
         # arm's LPT_L2 on EVERY measured causal shape -- MEASURED on B200 (cc 10.0,
         # 148 SMs, 2026-09-22; CUPTI device time, L2 flushed per launch, 3 rounds,
         # one process per slot, controls <= 0.35 %): LPT over LPT_L2 +5.1 / +7.2 /
@@ -1533,6 +1616,18 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     ):
         # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
         primary = SCHED_LPT
+    elif causal_ish and d128 and not facts.thd and _sm90_d128_causal_walks(facts):
+        # The SM90 row's 128 x 128 tile (the D128 template; ``d128``, _sm90_d128_knob_sets), on a causal plan
+        # check_support gives the walk's record (_sm90_d128_causal_walks): its
+        # persistent loop walks the work in NATURAL order, a head's Q tiles side by side, so they run at once on
+        # neighbouring CTAs and share the head's K and V in L2 (the stride deals its rounds straight or snaked by the
+        # planner's busiest-CTA cost). MEASURED on an H100 SXM (2026-11-06, Nsight, 8 causal shapes): the LPT_L2 walk
+        # read K and V from HBM 1.26 to 2.16 times the read-once floor where cuDNN 9.27 read it once; the NATURAL stride
+        # read it 1.00 to 1.03 times. A graph-route plan carries this knob, and the adapter honours a carried knob as a
+        # pin, so the proposal here is what a causal D128 graph runs. LPT and LPT_L2 stay behind for autotune. A plan
+        # the route sends one tile per CTA takes the causal rule below instead, the order the one-tile record keeps and
+        # the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+        primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -1760,7 +1855,7 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
 #
 # The SM100 f16 row's (128, 128) flavor has two tiles behind TILE_CGA_M
 # (_d128_decode_tile_fits below): cga1 IS the decode tile -- one independent
-# 128-row CTA per (batch, packed head) unit, sm100/decode_d128_f16.py -- and
+# 128-row CTA per (batch, packed head) unit, sm100/d128_f16_single_q/kernel.py -- and
 # cga2 the prefill pipeline, 512 rows per cluster.  The rules here measure a
 # unit by its live rows, S_q * PACK_G -- the kernel's packed subgroup (the
 # whole GQA group when it divides the tile, its largest divisor that does
@@ -1873,7 +1968,7 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
 # The d128 decode tile's Q rows per CTA (config_sm100.CfgD128Decode: TILES_Q=1 x
 # TILE_M=128 x CTA_MMA=1).  The SM100 f16 row's (128, 128) flavor has two
 # tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
-# cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
+# cluster), cga1 the decode tile (sm100/d128_f16_single_q/kernel.py).
 _D128_DECODE_TILE_ROWS = 128
 # The d64 f16 decode tile's Q rows (api_dsl._D64_DECODE_TILE_ROWS): the one d64 leg
 # narrower than the flavor's 256-row cga1 prefill, selected by the adapter once
@@ -2276,7 +2371,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/d256_f16_swap_ab/kernel.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
@@ -2290,7 +2385,7 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv:
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
     """The heads the DECODE tile packs per token for a set whose prefill-tile
     group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
-    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    ratio.  sm100/d256_f16_swap_ab/kernel.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
     one unit per (KV head, batch) with every head of the group in its 16-column
     tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
     the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not
@@ -2552,10 +2647,126 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     return longest
 
 
+def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice. S_q <= 16 and no window: the
+    range its study timed. A window caps the keys each row reads, but the rule counts the whole cache (gemma4's 1024-key window over
+    131k keys ran 1.35-1.94x slower at its split), so windowed and longer padded graphs keep the shared model."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.d_qk == facts.d_v == 256
+        and not facts.thd
+        and facts.has_paged_kv
+        and facts.s_q <= 16
+        and facts.window_left is None
+        and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 64
+    )
+
+
+def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
+    """The largest power-of-two split <= 64 (128 for single-row decode on a one-CTA grid) with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles
+    per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
+    kv_tiles = _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m or 64))
+    ctas = facts.b * (facts.h_q // pack_g) * _ceil_div(facts.s_q * pack_g, tile_m or 64)
+    cap = 128 if facts.s_q == 1 and ctas == 1 else 64
+    split = 1
+    while (
+        split < cap
+        and kv_tiles // (2 * split) >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES
+        and ctas * 2 * split <= _SM80_PAGED_D256_SPLIT_MAX_WAVES * sm_count
+        and 2 * split * facts.b * facts.s_q * facts.h_q * facts.d_v < _SM80_SPLIT_PARTIAL_O_MAX_ELEMS
+    ):
+        split *= 2
+    return split
+
+
+def _sm80_window_decode(caps: Capabilities, facts) -> bool:
+    """SM80 half sliding-window decode without a sink, S_q <= 16 and not THD: the domain of _sm80_window_split_cap, the range its study timed."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.window_left is not None
+        and not facts.has_sink
+        and not facts.thd
+        and facts.s_q <= 16
+    )
+
+
+def _sm80_window_split_cap(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int) -> int:
+    """The smallest power of two covering the window's issued KV tiles for one Q tile. The SM80 kernels partition only the clipped
+    window, so further splits run empty and add combine work; the shared model counts the whole cache (A100 nightly: b 1 over 131k keys
+    split 64 under a 1024-key window ran 1.5x the best; study sm80_window_decode_split_cap_pcie_20261118)."""
+    tile_m = tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)
+    tile_n = tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m)
+    tiles = _swa_kv_tiles(facts, token_span=max(1, tile_m // pack_g), tile_n=tile_n)
+    cap = 1
+    while cap < tiles:
+        cap *= 2
+    return cap
+
+
+SM107_WINDOW_SPLIT_MIN_TILES = 5  # a window issuing fewer KV tiles per Q tile runs unsplit (sm107_swa_split_v3_20261118)
+SM107_WINDOW_SPLIT_MAX_UNITS = 96  # so does a launch of this many (Q tile, head group, batch) units
+SM107_WINDOW_SPLIT_CAP_FACTOR = 4  # elsewhere at most this many splits per window tile (power of two at or above)
+
+
+def _sm107_window_decode(caps: Capabilities, facts) -> bool:
+    """Rubin half sliding-window decode on a paged cache with padded Q, S_q <= 16: the domain of _sm107_window_split, the range
+    its study timed."""
+    return (
+        caps.sm_lo == 107
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.window_left is not None
+        and facts.has_paged_kv
+        and not facts.thd
+        and facts.s_q <= 16
+    )
+
+
+def _sm107_window_split(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, split: int) -> int:
+    """The shared model counts the whole cache, but the Rubin kernels cut only the clipped window into SPLIT_KV chunks, and any split
+    costs a fixed 1.3-1.8x at the low end (split 2 never led). Over a narrow window or a wide grid the unsplit kernel leads; elsewhere
+    the model's split leads up to a few chunks per window tile (study sm107_swa_split_v2_20261118: 128-key windows ran unsplit at
+    0.40-0.75 of the shipped split)."""
+    launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g, split_kv=2)
+    rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=2)
+    tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
+    if tiles < SM107_WINDOW_SPLIT_MIN_TILES or launch.q_tiles * launch.heads_q * facts.b >= SM107_WINDOW_SPLIT_MAX_UNITS:
+        return 1
+    cap = 1
+    while cap < tiles:
+        cap *= 2
+    return min(split, SM107_WINDOW_SPLIT_CAP_FACTOR * cap)
+
+
+def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
+    return (
+        caps.sm_hi == 80
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.d_qk == facts.d_v == 128
+        and not facts.thd
+        and not facts.has_paged_kv
+        and facts.causal
+        and facts.window_left is None
+        and not facts.has_bias
+        and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 128
+    )
+
+
 def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *, physical: bool = True, split_kv: int = 1) -> _SplitKvLaunch:
     """The launch the wave-cost model sees. ``physical=False`` counts the MMA
     width per cluster (the count the model's constants were fitted with);
     ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
+    if _sm80_chunk_split(caps, facts, tile_m):
+        # One CTA per 128-row tile of packed rows (groups may straddle tiles), walking 64-key tiles.
+        return _SplitKvLaunch(
+            _ceil_div(facts.s_q * pack_g, 128),
+            facts.h_q // pack_g,
+            _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, 128)),
+            1,
+        )
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=split_kv)
     if (
         _sm100_f16(caps, facts)
@@ -2569,10 +2780,12 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
         rows = _D64_DECODE_TILE_ROWS
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
-    if _sm100_f16(caps, facts):
+    sm120_f16 = 120 <= caps.sm_lo and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+    if _sm100_f16(caps, facts) or sm120_f16:
+        # SM120 kernels clip the KV loop to the window too: the whole cache split 4 ways ran 2x (study sm120_swa_split_20261117).
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
-        if physical:
-            ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
+    if _sm100_f16(caps, facts) and physical:
+        ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
     # Whole tokens per tile (rows // pack_g): the same count as ceil(S_q * pack_g / rows) when the group divides
     # the tile, and the true one when it does not (SM120: tile_q % G != 0).
     return _SplitKvLaunch(_ceil_div(facts.s_q, rows // pack_g), facts.h_q // pack_g, kv_tiles, ctas)
@@ -2688,9 +2901,16 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(
-            caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
-        )
+        from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+        if caps.sm_lo == 100 and in_pilot_domain(facts):
+            # Cost the same immutable geometry that becomes the public plan;
+            # there is no adapter route to predict for these candidates.
+            decode_q_tile = select_sm100_d256_geometry(facts, decode_pack_g > 1).query_tile
+        else:
+            decode_q_tile = decode_d256_q_tile_for_row(
+                caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
+            )
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,
@@ -2736,6 +2956,7 @@ def _split_points(
             stage_bytes=_sm120_decode_stage_bytes(*envelope),
             d_v=envelope[1],
             sm_count=sm_count,
+            paged=facts.has_paged_kv,
         )
         return [split, no_split] if split > 1 else [no_split]
     unsplit_pack_g = None
@@ -2763,13 +2984,17 @@ def _split_points(
             **(
                 dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
                 if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
-                else {}
+                else (dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST) if _sm80_chunk_split(caps, facts, tile_m) else {})
             ),
             serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )
 
-    split = _choose(physical=True)
+    split = _sm80_paged_d256_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_paged_d256_split(caps, facts, tile_m) else _choose(physical=True)
+    if _sm80_window_decode(caps, facts):
+        split = min(split, _sm80_window_split_cap(facts, tile_m, tile_n, pack_g))
+    if _sm107_window_decode(caps, facts):
+        split = _sm107_window_split(caps, facts, tile_m, tile_n, cga, pack_g, split)
     if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
         # The physical CTA count is a one-sided correction: every measured win of
         # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,
@@ -3236,6 +3461,27 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return splits, pack
 
 
+def _sm90_d128_knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
+    """The SM90 row's 128 x 128 set: the dedicated D128 template (#378). Its tile names the template, and mismatch()
+    admits it only on an exact (128, 128) graph the template serves (engines._sm90_d128_tile_mismatch), so the set
+    exists there alone and leads the D512 body's 64 x 64 sets (:func:`_knob_sets`). One CTA, unsplit, unpacked, in the
+    order the template's route proposes (_sched_points with ``d128``): its other orders measured slower on causal
+    graphs on H100 SXM, so the remaining slots go to the D512 body's sets, split and packed runners among them. Empty on
+    every other row and graph, and below config_sm90.D128_LEAD_MIN_SQ query rows, where the D512 body's 64-row and
+    packed decode tiles keep the row's order (the template stays reachable by pinning its tile)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
+
+    caps = spec.capabilities
+    lead = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    if caps.sm_lo != 90 or 128 not in effective_tile_ms(caps, facts, lead) or mismatch(caps, facts, lead) is not None:
+        return []
+    if facts.s_q < D128_LEAD_MIN_SQ:
+        return []
+    scheds = _sched_points(caps, facts, d128=True)
+    first, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)
+    return [replace(lead, sched_policy=first)]
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -3416,7 +3662,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         unique.insert(
             0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
         )
-    return unique[:_MAX_SETS_PER_ENGINE]
+    # SM90 at exact (128, 128): the dedicated D128 template's 128 x 128 set first, where it serves the graph, then the
+    # D512 body's 64 x 64 sets above.
+    lead = _sm90_d128_knob_sets(spec, facts)
+    return (lead + [knobs for knobs in unique if knobs not in lead])[:_MAX_SETS_PER_ENGINE]
 
 
 def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
@@ -3448,6 +3697,365 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     )
 
 
+def select_sm100_d256_geometry_for_shape(s_q, pack_g, *, batch=None, h_q=None, s_kv=None, windowed=False, thd=False, prefolded=False, gated=False):
+    """The sole SM100 half D256 implementation/Q-tile performance choice.
+
+    Both the graph candidate generator and standalone auto use this result.
+    A selected engine instead receives a fixed geometry and never calls this
+    selector during build or execution.
+    """
+    from .config_sm100 import decode_d256_q_tile, d256_wide_decode_launch
+    from .kernels.sm100.d256_f16_contract import D256Geometry, LOOKAHEAD, SWAP_AB
+
+    if not (thd or prefolded or gated):
+        wide = batch is not None and h_q is not None and s_kv is not None and d256_wide_decode_launch(batch, h_q // pack_g, s_kv, windowed)
+        q_tile = decode_d256_q_tile(s_q, pack_g, wide_launch=wide)
+        if q_tile:
+            return D256Geometry(SWAP_AB, q_tile)
+    return D256Geometry(LOOKAHEAD, 128)
+
+
+def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
+    return select_sm100_d256_geometry_for_shape(
+        facts.s_q,
+        (facts.h_q // facts.h_kv if pack_gqa else 1) if pack_g is None else pack_g,
+        batch=facts.b,
+        h_q=facts.h_q,
+        s_kv=facts.s_kv,
+        windowed=facts.window_left is not None,
+        thd=facts.thd,
+        prefolded=facts.attn_scale_prefolded,
+        gated=facts.has_epilogue_gate,
+    )
+
+
+def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
+    """Central wide-half body choice; explicit implementation replay never calls it."""
+    from .kernels.sm100.d512_f16_contract import D512Geometry, ROLE_SPLIT, TWO_BY_TWO
+
+    two_by_two = d_qk == 576 or (prefer_two_by_two and split_kv == 1 and not paged and 64 % max(1, pack_g) == 0)
+    return D512Geometry(TWO_BY_TWO if two_by_two else ROLE_SPLIT, d_qk)
+
+
+def select_sm100_d512_geometry(facts, knobs):
+    from .kernels.sm100.half_flavor_contract import padded_shape
+
+    return select_sm100_d512_geometry_for_shape(
+        padded_shape(facts)[0],
+        paged=facts.has_paged_kv,
+        split_kv=knobs.split_kv or 1,
+        pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
+    )
+
+
+def select_sm100_small_fp8_geometry(facts, knobs):
+    """Resolve the existing small-head FP8 policy before compiling an engine.
+
+    The explicit swap-AB request and automatic SM100 paged D128 route precede
+    the dual-KV policy, matching the legacy adapter's final parameter override.
+    This selector is not used when replaying a fixed implementation record.
+    """
+    from .config_sm100 import supports_d64_fp8_swap_ab, supports_dense_fp8_swap_ab
+    from .kernels.sm100.d128_fp8_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
+    from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .kernels.sm100.small_fp8_contract import in_domain
+    from .kernels.sm100.fp8_flavor_contract import padded_shape
+
+    shape = padded_shape(facts)
+    if not in_domain(facts):
+        raise ValueError("small-head FP8 selection requires SM100/SM103 per-tensor inputs covered by D64 or D128")
+    cga = knobs.cga if knobs.cga is not None else 1 if shape[0] == 64 else 2
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    rows = facts.s_q * group
+    decode_semantics = (
+        facts.o_block_scale == 0
+        and facts.dtype_o in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.softmax_precision in (None, cudnn.data_type.FLOAT)
+        and not facts.attn_scale_prefolded
+        and not (facts.has_epilogue_gate or facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp)
+    )
+    geometry = dict(
+        device_cc=facts.device_cc,
+        paged=facts.has_paged_kv,
+        thd=facts.thd,
+        batch_size=facts.b,
+        s_q=facts.s_q,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        pack_gqa=knobs.pack_gqa,
+        cga=knobs.cga,
+    )
+    explicit_decode = knobs.swap_ab == 1 and (supports_d64_fp8_swap_ab(shape, **geometry) or supports_dense_fp8_swap_ab(shape, **geometry, tile_n=knobs.tile_n))
+    automatic_decode = (
+        facts.device_cc == (10, 0) and shape == (128, 128) and cga == 1 and facts.has_paged_kv and not facts.thd and 0 < rows <= 8 and facts.b <= 65535
+    )
+    if decode_semantics and (explicit_decode or automatic_decode):
+        return SwapAB(d_flavor=shape[0])
+    if fp8_dual_kv_stream_routed() and shape == (128, 128) and knobs.cga == 1 and not facts.thd and rows <= FP8_DUAL_KV_STREAM_MAX_ROWS:
+        return DualKV()
+    return MultiQ(d_flavor=shape[0], cga=cga)
+
+
+def select_sm107_small_fp8_geometry(facts, knobs):
+    """Resolve the existing Rubin native/swap-AB choice before fixed lowering."""
+    from .kernels.sm107.d128_fp8_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm107.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .kernels.sm107.fp8_flavor_contract import padded_shape
+    from .config_sm100 import supports_dense_fp8_swap_ab
+
+    shape = padded_shape(facts)
+    if knobs.swap_ab == 1 and supports_dense_fp8_swap_ab(
+        shape,
+        device_cc=facts.device_cc,
+        paged=facts.has_paged_kv,
+        thd=facts.thd,
+        batch_size=facts.b,
+        s_q=facts.s_q,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        pack_gqa=knobs.pack_gqa,
+        cga=knobs.cga,
+        tile_n=knobs.tile_n,
+    ):
+        return SwapAB()
+    return MultiQ(d_flavor=shape[0], cga=(1 if shape[0] == 64 else 2) if knobs.cga is None else knobs.cga)
+
+
+def resolve_sm100_half_multi_q_geometry(facts, knobs, *, d_flavor):
+    """Resolve local defaults of a fixed multi-Q body, without body selection.
+
+    Keep the shared bias-budget and TILE_N policy used by the existing adapter.
+    Explicit knobs remain requests; unsupported pairs are declined by support.
+    """
+    from .kernels.sm100.d128_f16_multi_q.contract import Geometry
+
+    caps = sm100_legacy_policy_spec().capabilities
+    shape = (d_flavor, d_flavor)
+    tile_n = knobs.tile_n
+    if tile_n is None:
+        tile_n = sm100_tile_n_pick(
+            d_flavor,
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            kv_mask_fp32=facts.kv_mask_dtype == cudnn.data_type.FLOAT,
+            padded=facts.padded,
+            domain=dict(caps.tile_ns_by_d_shape).get(shape, frozenset({128})),
+        )
+    cga = knobs.cga
+    if cga is None:
+        if facts.has_bias and d_flavor <= 64:
+            widths = dict(caps.cgas_by_d_shape).get(shape, caps.cgas)
+            cga = sm100_bias_auto_cga(d_flavor, facts.s_kv, widths, tile_n=tile_n) or 1
+        else:
+            cga = 1 if d_flavor <= 64 else 2
+    return Geometry(d_flavor=d_flavor, cga=cga, tile_n=tile_n)
+
+
+def select_sm100_small_half_geometry(facts, knobs):
+    """Resolve small-half main bodies centrally, preserving the existing policy.
+
+    Width-envelope selection is common legality. Short-Q, quadrant and the
+    paged live-column swap-AB choices happen here before a fixed engine is
+    compiled; an implementation's host never re-enters this selector.
+    """
+    from .kernels.sm100.small_half_contract import in_domain
+    from .kernels.sm100.d128_f16_single_q.contract import small_geometry as single_q
+    from .kernels.sm100.d64_f16_quadrant.contract import Geometry as Quadrant
+    from .kernels.sm100.d256_f16_contract import D256Geometry, SWAP_AB
+
+    if not in_domain(facts):
+        raise ValueError("small-head half selection requires SM100/SM103 queries covered by the D32/D64/D128 half geometries")
+    policy = sm100_legacy_policy_spec()
+    flavor = _selected_d_shape(policy.capabilities, facts, knobs)
+    if flavor not in ((32, 32), (64, 64), (128, 128)):
+        raise ValueError("small-head half selection has no supported width envelope")
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    rows = facts.s_q * group
+    split = knobs.split_kv or 1
+    multi_q = resolve_sm100_half_multi_q_geometry(facts, knobs, d_flavor=flavor[0])
+    cga = multi_q.cga
+    # Optional score outputs need the multi-Q epilogue. An omitted CGA must
+    # keep that legal default instead of selecting a body without the stores.
+    if knobs.cga is None and flavor == (128, 128) and not (facts.has_score_max or facts.has_score_sum_exp):
+        # The adapter enables ragged decode only for an explicit CGA1 request.
+        # An omitted width retains the THD prefill default, even if the graph
+        # would qualify for a separately requested split decode plan.
+        cga = select_d128_auto_cga(s_q=facts.s_q, pack_g=gcd(group, 128), thd=facts.thd, thd_decode_leg=False)
+    decode_tile = False
+    if flavor == (64, 64) and facts.uniform_dtype:
+        if facts.thd and packed_thd_split(policy.capabilities, facts, knobs):
+            decode_tile = True
+        elif not (facts.has_bias or facts.has_kv_mask) and knobs.cga in (None, 1):
+            if facts.thd:
+                decode_tile = facts.has_paged_kv and split == 1 and not knobs.pack_gqa and facts.s_q <= 128
+            else:
+                decode_tile = rows <= 128
+    swap_ab = (
+        flavor == (128, 128)
+        and cga == 1
+        and facts.has_paged_kv
+        and not facts.thd
+        and facts.uniform_dtype
+        and facts.dtype_o in (None, facts.dtype)
+        and 0 < rows <= 8
+        and not (facts.has_epilogue_gate or facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp or facts.attn_scale_prefolded)
+    )
+    if swap_ab:
+        return D256Geometry(SWAP_AB, 16, head_dim=128, live_columns=8, early_q=True)
+    if decode_tile and not facts.thd and rows <= 32:
+        return Quadrant()
+    if decode_tile or (flavor == (128, 128) and cga == 1 and (not facts.thd or split > 1)):
+        return single_q(facts, knobs, d_flavor=flavor[0])
+    return replace(multi_q, cga=cga)
+
+
+def select_sm90_geometry(facts, knobs):
+    """Resolve the old candidate's body once; explicit replay never calls this."""
+    from .kernels.sm90.d64_f16_one_wg import contract as native
+    from .kernels.sm90.f16_three_wg import contract as three_wg
+    from .kernels.sm90.d128_f16_multi_q import contract as d128
+
+    if native.in_domain(facts):
+        return native.Geometry()
+    return d128.Geometry() if 128 in (knobs.tile_m, knobs.tile_n) else three_wg.Geometry()
+
+
+def select_sm100_d192_half_geometry(facts, knobs):
+    """Name the existing D192 body choice before entering a fixed engine."""
+    from .kernels.sm100.d192_half_contract import in_domain
+    from .kernels.sm100.d192_f16_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
+
+    if not in_domain(facts):
+        raise ValueError("D192 half selection requires SM100/SM103 half inputs covered by D192/V128")
+    cga = 2 if knobs.cga is None else knobs.cga
+    if facts.thd and not facts.has_paged_kv and cga == 1:
+        return SingleQ()
+    return MultiQ(cga=cga)
+
+
+# ---------------------------------------------------------------------------
+# CLUSTER_K_REDUCE on the SM100 D256 swap-AB decode tile: the split's partials reduced inside the launch
+# ---------------------------------------------------------------------------
+# The rule below never chooses a split. It marks knob sets the rules above already list for that engine, where the set's own
+# split is one the form reduces and the launch stays inside a recorded cluster count. Clearing the mark in every listed set
+# gives the list of a tree without the form: no set is added, removed or reordered and no split count moves.
+
+# The largest count of thread-block clusters of `split` one-SM blocks, keyed (SM count, split), up to which the form has a
+# recorded measurement cell on that part with every cluster resident in one wave. A part or a split count without a row is
+# never marked: its plans keep two launches and take the form by an explicit knob only. Recorded values only; the planning
+# path makes no device query. Each row is confirmed or replaced by the exclusive-device measurement of the part.
+#
+# 148 SMs: recorded from cells on a shared device, not yet confirmed by that measurement.
+# 152 SMs: the exclusive-device measurement at a locked clock (compute capability 10.0). Each value is the part's count of
+# co-resident clusters of that size: every cluster count from 1 up to it has a measured cell with the form ahead of the two
+# launches, and one cluster more is 18 % to 22 % behind them (level only at 2 chunks with a full cache). Timed: BF16, head
+# width 256, a paged cache with Stats, declared lengths of 1,024 to 4,096 keys, and 2-chunk plans also at 8,192 and
+# 12,288 keys in a later session (the timed GPU exclusive, other GPUs of the machine in use); the rows apply to every plan
+# of the form's domain by its cluster count. The key carries no compute capability; the form's own domain does, so a
+# 152-SM part of another capability stays unmarked.
+FUSED_CLUSTER_BOUND: Dict[Tuple[int, int], int] = {
+    (148, 2): 16,
+    (148, 4): 16,
+    (148, 8): 8,
+    (152, 2): 76,
+    (152, 4): 36,
+    (152, 8): 15,
+}
+
+
+def fused_cluster_bound(sm_count: int, split: int) -> int:
+    """Clusters of ``split`` one-SM thread blocks up to which a part with ``sm_count`` SMs has a recorded cell of the
+    in-launch reduction (:data:`FUSED_CLUSTER_BOUND`); 0 where it has none, which keeps every plan on two launches."""
+    return FUSED_CLUSTER_BOUND.get((int(sm_count), int(split)), 0)
+
+
+def fused_selected(facts, knobs: SdpaFwdKnobs) -> bool:
+    """Whether a LISTED knob set of the SM100 D256 swap-AB engine reduces its split inside the launch (``CLUSTER_K_REDUCE``).
+
+    A pure function of the facts, the set and the installed extension: the form's own domain (the swap-AB contract's
+    ``cluster_reduce_decline``: the part, the 16-column tile, 2 .. 8 chunks, one token unit, a head width of whole warps, no fold
+    the separate pass carries); an extension
+    that binds the reduced launch; the packed whole-group set of any head ratio and token count whose rows fit one tile (an
+    unpacked set has no recorded cell and takes the form by an explicit knob only); and at most the recorded cluster count
+    of the part for the set's split (``units <= fused_cluster_bound``: past one wave of clusters a chunk that ended would
+    hold its SM until its cluster's slowest chunk ends, where the two-launch form frees it at once). The split is the set's
+    own, so the summation order of a default plan is what it was."""
+    from .kernels.sm100.d256_f16_swap_ab.contract import cluster_reduce_decline
+    from .kernels.sm100.half_flavor_contract import padded_shape
+
+    split = int(knobs.split_kv or 1)
+    sm_count = int(facts.device_sm_count or 0)
+    if split < 2 or sm_count <= 0 or knobs.tile_m is None or not (knobs.pack_gqa and facts.h_kv):
+        return False
+    pack_g = facts.h_q // facts.h_kv
+    declined = cluster_reduce_decline(
+        device_cc=facts.device_cc,
+        d_shape=padded_shape(facts),
+        tile=knobs.tile_m,
+        split_kv=split,
+        q_rows=facts.s_q * pack_g,
+        d_v=facts.d_v,
+        thd=facts.thd,
+        has_sink=facts.has_sink,
+        stats_log2=facts.has_stats_log2,
+        gated=facts.has_epilogue_gate,
+        o_matches_qkv=facts.dtype_o in (None, facts.dtype),
+    )
+    if declined is not None:
+        return False
+    units = int(facts.b) * (int(facts.h_q) // pack_g) * decode_d256_q_units(facts.s_q, pack_g, knobs.tile_m)
+    if units <= 0 or units > fused_cluster_bound(sm_count, split):
+        return False
+    # A static property of the installed extension, not a device query: an older extension keeps every set unmarked, so a
+    # default graph keeps the two-launch plan of its split instead of falling to another plan.
+    return bool(getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_fused_split_paged", False))
+
+
+def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
+    """Retain the existing candidate budget/order, naming each actual body.
+
+    The old row's policy domain generates pack/split and scheduler combinations.
+    It is not an offered engine: each combination resolves to one explicit
+    implementation before being returned, and its split model consumes the
+    same selected geometry.
+    """
+    policy = sm100_legacy_policy_spec() if policy is None else policy
+    if mismatch(policy.capabilities, facts) is not None:
+        return []
+    sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
+    by_name = {s.name: s for s in ENGINE_SPECS}
+    out = []
+    for knobs in sets:
+        if mismatch(policy.capabilities, facts, knobs) is not None:
+            if knobs.split_kv != 1 or launch_grid_mismatch(policy.capabilities, facts, knobs) is None:
+                continue
+            knobs = next(
+                (lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(policy.capabilities, facts, lpt) is None),
+                None,
+            )
+            if knobs is None:
+                continue
+        geometry = select_geometry(facts, knobs)
+        engine_id = offered.get(geometry.implementation)
+        if engine_id is None:
+            continue
+        resolved = geometry.canonical_knobs(knobs)
+        if mismatch(by_name[geometry.implementation].capabilities, facts, resolved) is not None:
+            continue
+        if True in by_name[geometry.implementation].capabilities.cluster_reduces and fused_selected(facts, resolved):
+            # Same set, same split; only the launch count differs. Honoured or never listed: the row re-checks the marked set.
+            fused = replace(resolved, cluster_reduce=True)
+            if mismatch(by_name[geometry.implementation].capabilities, facts, fused) is None:
+                resolved = fused
+        plan = PlanConfig(engine_id, resolved)
+        if plan not in out:
+            out.append(plan)
+    return out
+
+
 def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]]:
     """(engine_id, spec) for each offered cell whose capability row admits ``facts``."""
     for spec in ENGINE_SPECS:
@@ -3471,6 +4079,124 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
     """
+    from .kernels.sm107 import d512_half_contract as sm107_wide_half
+
+    from .kernels.sm107 import shared_half_contract as sm107_half
+
+    if sm107_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm107_half_geometry, policy=sm100_legacy_policy_spec(sm107_half.LEGACY_ROW))
+    if sm107_wide_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm107_d512_geometry, policy=sm100_legacy_policy_spec(sm107_wide_half.LEGACY_ROW))
+    from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+    if in_pilot_domain(facts):
+        # Only the explicit D256 implementations admit this domain. Keep the
+        # eligible-row contract test in sync before adding another owner here.
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: select_sm100_d256_geometry(f, k.pack_gqa))
+    from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+
+    if in_wide_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
+    from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
+
+    if in_d192_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d192_half_geometry)
+    from .kernels.sm100.small_half_contract import in_domain as in_small_half_domain
+
+    if in_small_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_half_geometry)
+    from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
+
+    if in_d512_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.d256_mxfp8_single_q.contract import Geometry as Mxfp8D256Geometry, LEGACY_ROW as MXFP8_LEGACY_ROW, in_domain as in_d256_mxfp8_domain
+
+    from .kernels.sm100.d128_mxfp8_multi_q import contract as small_mxfp8
+    from .kernels.sm100.d192_mxfp8_multi_q import contract as mid_mxfp8
+
+    if small_mxfp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: small_mxfp8.Geometry(d_flavor=f.d_qk, cga=k.cga), policy=sm100_legacy_policy_spec(MXFP8_LEGACY_ROW)
+        )
+    if mid_mxfp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: mid_mxfp8.Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(MXFP8_LEGACY_ROW)
+        )
+    if in_d256_mxfp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Mxfp8D256Geometry(), policy=sm100_legacy_policy_spec(MXFP8_LEGACY_ROW))
+    from .kernels.sm107.small_fp8_contract import in_domain as in_sm107_small_fp8
+
+    if in_sm107_small_fp8(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, select_sm107_small_fp8_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107_fp8")
+        )
+    from .kernels.sm107.d192_fp8_multi_q import contract as sm107_d192_fp8
+    from .kernels.sm107.d256_fp8_single_q import contract as sm107_d256_fp8
+
+    if sm107_d192_fp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: sm107_d192_fp8.Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(sm107_d192_fp8.LEGACY_ROW)
+        )
+    if sm107_d256_fp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: sm107_d256_fp8.Geometry(), policy=sm100_legacy_policy_spec(sm107_d256_fp8.LEGACY_ROW)
+        )
+    from .kernels.sm107.d512_fp8_role_split import contract as sm107_d512_fp8
+
+    if sm107_d512_fp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: sm107_d512_fp8.Geometry(), policy=sm100_legacy_policy_spec(sm107_d512_fp8.LEGACY_ROW)
+        )
+    from .kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
+    if d512_mxfp8.in_domain(facts):
+        # The SWA band and SPLIT_KV name the body: retained P for exact top-left SWA of one KV tile, unsplit.
+        return _recommend_sm100_implementation(kind, facts, offered, d512_mxfp8.select_geometry, policy=sm100_legacy_policy_spec(d512_mxfp8.LEGACY_ROW))
+    from .kernels.sm107 import mxfp8_contract as sm107_mxfp8
+
+    if sm107_mxfp8.in_domain(facts):
+        # The head shape names the body; the row's policy keeps the candidate order and budget.
+        return _recommend_sm100_implementation(kind, facts, offered, sm107_mxfp8.select_geometry, policy=sm100_legacy_policy_spec(sm107_mxfp8.LEGACY_ROW))
+    from .kernels.sm100.d256_fp8_single_q.contract import Geometry as Fp8D256Geometry, in_domain as in_d256_fp8_domain
+
+    if in_d256_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D256Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.d192_fp8_multi_q.contract import Geometry as Fp8D192Geometry, in_domain as in_d192_fp8_domain
+
+    if in_d192_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D192Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.small_fp8_contract import in_domain as in_small_fp8_domain
+
+    if in_small_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_fp8_geometry, policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+
+    from .kernels.sm120.d512_f16_paired.contract import Geometry as Sm120PairedGeometry, LEGACY_ROW as SM120_LEGACY_ROW, in_domain as in_sm120_paired_domain
+
+    if in_sm120_paired_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Sm120PairedGeometry(), policy=sm100_legacy_policy_spec(SM120_LEGACY_ROW))
+    from .kernels.sm120.d512_fp8_paired import contract as fp8_wide
+    from .kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
+
+    for wide in (fp8_wide, mxfp8_wide):
+        if wide.in_domain(facts):
+            return _recommend_sm100_implementation(kind, facts, offered, lambda f, k, g=wide.Geometry: g(), policy=sm100_legacy_policy_spec(wide.LEGACY_ROW))
+    from .kernels.sm120 import quantized_general_contract as sm120_quant_general
+
+    owner = sm120_quant_general.owner(facts)
+    if owner is not None:
+        legacy = sm120_quant_general.explicit_geometry(owner, None).lowering_row_name
+        return _recommend_sm100_implementation(kind, facts, offered, sm120_quant_general.select_geometry, policy=sm100_legacy_policy_spec(legacy))
+    from .kernels.sm80 import half_flavor_contract as sm80_half
+
+    if sm80_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, sm80_half.select_geometry, policy=sm100_legacy_policy_spec(sm80_half.LEGACY_ROW))
+    from .kernels.sm120 import half_exact_contract as sm120_half
+
+    if sm120_half.in_domain(facts):
+        # TILE_M names the body: the decode tile (16 / 32), else the all-compute D256 or general tile (64 / 128).
+        return _recommend_sm100_implementation(kind, facts, offered, sm120_half.select_geometry, policy=sm100_legacy_policy_spec(sm120_half.LEGACY_ROW))
+    if facts.device_cc == (9, 0) and not (facts.is_fp8 or facts.is_mxfp8 or facts.is_backward):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm90_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm90"))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
@@ -3510,7 +4236,8 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if not rest:
         return [BACKEND, LAST_RESORT] + last
     spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
-    placed = rest + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + rest
+    position = place(spec, facts, rest[0].knobs) if spec.capabilities.implementation else place(spec, facts)
+    placed = rest + [BACKEND] if position == LEAD else [BACKEND] + rest
     return placed + [LAST_RESORT] + last if last else placed
 
 

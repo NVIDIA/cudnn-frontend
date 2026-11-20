@@ -16,10 +16,14 @@ slice is one tensor-core chain in ascending K, the slice sums are added in slice
 
 NUMERICS AND PICKS.  The output bytes are a function of ``(geometry, split_k)`` on one runtime.  ``split_k`` is therefore fixed at
 construction -- given, or :func:`split_k_for` of the geometry alone -- and never depends on the row count: a caller that wants another
-split builds another entry and owns the statement that the two are different byte classes.  Everything else is a performance ``Form``
-(weight tile, ring stages, tensor-memory columns, token tile, the weight stream ahead of the dependent-launch wait): the measured
-:func:`pick` per row count on THIS part's readings, or the caller's ``form`` as a whole; no form changes a byte, and a row's bytes are
-the same alone and among up to 32 rows.
+split builds another entry and owns the statement that the two are different byte classes.  The default split is not a served class
+at every geometry: where it is not, the entry is built with an explicit ``split_k`` (``split_k=1`` = one K slice per weight tile, no
+cluster reduction) and the decline names the splits the geometry is served at.  Everything else is a performance ``Form``
+(weight tile, ring stages, tensor-memory columns, token tile, the weight stream ahead of the dependent-launch wait, the release of the
+tensor memory): :func:`pick` per row count on THIS part's readings -- a measured form at the classes of ``ONE_WAVE_CLASSES``, the table
+row as written (not measured with this entry; its grid may take more than one wave) with the late tensor-memory release at every
+other class -- or the caller's ``form`` as a whole; no form changes a byte, and a row's bytes are the same alone and among up to 32
+rows.
 
 Served (declined otherwise, by name): the validated geometries and splits (``SERVED_CLASSES``), rows 1 .. 32, contiguous operands with
 32-byte aligned storage, every operand on the entry's device, a compute capability 10.x part, a CuTe DSL >= 4.8.0 that provides the
@@ -48,6 +52,7 @@ device read; the launch goes onto torch's current stream of the entry's device.
 from typing import Any, Dict, Optional, Tuple
 
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
 from .kernel.fp8_projection_decode_config import (
     MAX_ROWS,
@@ -56,6 +61,7 @@ from .kernel.fp8_projection_decode_config import (
     SM100_SM_COUNT,
     SM100_SMEM_OPTIN_BYTES,
     SM100_SMEM_PER_SM_BYTES,
+    THREADS_PER_CTA,
     Cfg,
     Form,
     Geometry,
@@ -283,7 +289,10 @@ class Fp8ProjectionDecode:
     entry built for a non-CUDA device (host tests) keeps the SM100-class reference readings; it validates and picks, and declines to
     compile.  Construction resolves and validates the form of EVERY served row count, so a row count the entry admits never declines on
     the execute path: a part that cannot hold a form is a ``NotImplementedError`` (a part fact), a given ``form`` no SM100-class part
-    can run a ``ValueError`` (a knob combination) -- either raised here."""
+    can run a ``ValueError`` (a knob combination) -- either raised here.
+
+    What a row count launches is readable without a launch: :meth:`kernel_symbols_for`, :meth:`form_for` and :meth:`launch_shape_for`
+    (the launch facts of :mod:`cudnn.frost.launch_facts`)."""
 
     def __init__(
         self,
@@ -345,6 +354,31 @@ class Fp8ProjectionDecode:
     def key(self, rows: int) -> tuple:
         """The compile key: plan-time facts only -- the rendering of the row count (geometry, split, rows, form, launch knobs)."""
         return (self.cfg_for(rows),)
+
+    # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served row count ----
+    def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
+        """The symbol of the kernel this entry has compiled for ``rows``: a one-element tuple, empty until that row count is compiled.
+        At a class of ``SHAPE_SYMBOL_CLASSES`` the symbol names the weight's shape and nothing of the split, the form or the row count
+        -- every rendering of one geometry shares it -- so it never proves a form (:meth:`form_for` states it).  At every other class
+        the symbol carries the rendering's ``Cfg.SYMBOL_TEXT`` right behind the kernel's name (inside its first 100 characters): two
+        renderings that differ in a field the kernel depends on have two symbols, and :meth:`form_for` still states the form."""
+        fn = self.compiled.get(self.cfg_for(rows))
+        return kernel_symbols(() if fn is None else (fn,), NAME)
+
+    def form_for(self, rows: int) -> Dict[str, Any]:
+        """The form of ``rows`` as plain data: every field of the rendering :meth:`cfg_for` returns -- the geometry as a nested
+        ``dict``, the split, the row count, the performance form resolved for it (weight tile, stages, token tile, tensor-memory
+        columns, the weight stream ahead of the wait, the tensor-memory release), the launch knobs and this part's readings.  The
+        rendering is the whole compile key, so nothing else is part of it."""
+        return plain_form(self.cfg_for(rows))
+
+    def launch_shape_for(self, rows: int) -> LaunchShape:
+        """``(grid, block, shared memory)`` of the launch of ``rows``: one cluster of ``SPLIT_K`` thread blocks along y per ``MMA_M``
+        weight rows along x, so grid ``(OUT_FEATURES / MMA_M, SPLIT_K, 1)`` (the one token tile holds every served row count); 256
+        threads; ``SMEM_BYTES`` of shared memory per thread block (the two operand rings, the barriers and the reduction mailbox: what
+        the launch reserves)."""
+        cfg = self.cfg_for(rows)
+        return LaunchShape((cfg.N // cfg.MMA_M, cfg.SPLIT_K, 1), (THREADS_PER_CTA, 1, 1), cfg.SMEM_BYTES)
 
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan-time compile: one row count, or every served one when ``rows`` is None.  Typed declines first (the row count, the device,

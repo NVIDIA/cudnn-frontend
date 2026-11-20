@@ -170,7 +170,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.33.0"
+__version__ = "1.34.0"
 # Keep in sync with the JAX dependency minimum in pyproject.toml.
 CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
 CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
@@ -245,6 +245,22 @@ def load_cudnn():
     _pybind_module._set_dlhandle_cudnn(handle)
 
 
+def _cudnn_wheel_lib_on_sys_path():
+    """The nvidia-cudnn-cuXX (or nvidia-cudnn-jit) wheel's libcudnn.so.x in any
+    sys.path entry, for wheels installed outside purelib: ``pip install --user``,
+    ``pip install --target`` plus PYTHONPATH, or the base environment of a
+    ``--system-site-packages`` venv."""
+    for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
+        for base in sys.path:
+            # The import system only looks at str entries, so skip the rest too.
+            if not base or not isinstance(base, str):
+                continue
+            lib_path = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]"))
+            if lib_path:
+                return lib_path
+    return []
+
+
 def _dlopen_cudnn():
     # Honor the dynamic linker search path before packaged cuDNN so local backend
     # builds can override the wheel dependency during development.
@@ -265,6 +281,9 @@ def _dlopen_cudnn():
 
     if not lib_path:
         lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
+
+    if not lib_path:
+        lib_path = _cudnn_wheel_lib_on_sys_path()
 
     if lib_path:
         assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
@@ -399,6 +418,10 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AttentionGateQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowQuantizeFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -423,6 +446,22 @@ _LAZY_OPTIONAL_IMPORTS = {
     # the FP8 split-K projection for decode rows (E4M3 x E4M3 -> bf16, 1 .. 32 rows, SM100-class parts): a direct-call entry like the
     # GDN steps (also `cudnn.gemm.Fp8ProjectionDecode`, with its `ProjectionGeometry` / `ProjectionForm`)
     "Fp8ProjectionDecode": (".gemm.frost.projection_decode.fp8_projection_decode", "Fp8ProjectionDecode"),
+    # the add + RMSNorm + quantize decode step (the residual add, the RMSNorm and the quantization of the following projection's input --
+    # bf16, FP8 E4M3 or NVFP4 -- in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.norm.frost.AddNormQuantDecode`)
+    "AddNormQuantDecode": (".norm.frost.add_norm_quant_decode", "AddNormQuantDecode"),
+    # the gate / up product of an FP4 MLP for decode rows with SiLU(gate) x up and the FP4 re-quantisation in one launch (block-scaled FP4
+    # in and out, 1 .. 64 rows, SM100-class parts): a direct-call entry like the steps above (also `cudnn.gemm.SwigluFp4Decode`, with
+    # its `SwigluGeometry`)
+    "SwigluFp4Decode": (".gemm.frost.swiglu_decode.swiglu_fp4_decode", "SwigluFp4Decode"),
+    # the attention preparation decode step (per token the RMSNorm and the rotation of the query and key head rows, the gate rows copied
+    # and the keys and values written into paged pools, in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.attention_prepare.frost.AttentionPrepareDecode`, with its `AttentionPrepareGeometry`)
+    "AttentionPrepareDecode": (".attention_prepare.frost.prepare_decode", "AttentionPrepareDecode"),
+    # the FP4 row quantization decode step (the block-scaled FP4 quantization of bf16 rows under a global scale -- E2M1 codes, one E4M3
+    # block scale per sixteen elements in the 128 x 4 scale layout -- in one launch, SM100-class parts): a direct-call entry like the
+    # steps above (also `cudnn.row_quantize.frost.RowQuantizeFp4Decode`)
+    "RowQuantizeFp4Decode": (".row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -493,8 +532,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "block_sparse_attention_backward_metadata": (".block_sparse_attention", "block_sparse_attention_backward_metadata"),
     "kpage_prepare_layout": (".block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": (".block_sparse_attention", "KPageLayout"),
+    "BsaBackwardMetadata": (".block_sparse_attention", "BsaBackwardMetadata"),
     "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
@@ -812,17 +853,9 @@ def __getattr__(name: str) -> Any:
         globals()[name] = module
         return module
 
-    if name == "jax":
-        # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
-        # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
-        _jax = importlib.import_module(".jax", __name__)
-        globals()["jax"] = _jax
-        return _jax
-
     if name == "torch":
-        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
-        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`.
+        # Deferred so `import cudnn` never
         # eagerly imports torch; the submodule raises its own descriptive error
         # when torch (or the 2.13+ flash-impl registry) is unavailable — which
         # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
