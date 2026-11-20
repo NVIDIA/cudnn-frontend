@@ -168,3 +168,67 @@ def test_execute_restores_cold_worker_context(attention, monkeypatch, python_fal
         raise result["error"]
     torch.cuda.synchronize(handle.device.ordinal)
     _check(values)
+
+
+def _deserialized(graph, handle):
+    if graph.selected_engine is not None:
+        pytest.skip("only a backend plan deserializes into a C++-owned plan list")
+    replica = cudnn.pygraph(handle=handle)
+    replica.deserialize(graph.serialize())
+    return replica
+
+
+def _execute_deserialized(replica, handle, pack, workspace, entry):
+    uids = [tensor.get_uid() for tensor in pack]
+    if entry == "mapping":
+        return replica.execute_plan_at_index(dict(zip(uids, pack.values())), workspace, index=0, handle=handle)
+    return replica.execute_plan_at_index(list(pack.values()), workspace, index=0, handle=handle, tensor_uids=uids)
+
+
+@pytest.mark.parametrize("entry", ["mapping", "ordered"])
+def test_deserialized_plan_at_index_restores_cold_worker_context(attention, entry):
+    graph, handle, pack, workspace, values = attention
+    replica = _deserialized(graph, handle)
+    values[3].fill_(float("nan"))
+    values[4].fill_(float("nan"))
+    torch.cuda.synchronize()
+    result = {}
+
+    def worker():
+        try:
+            assert _current() == 0
+            _execute_deserialized(replica, handle, pack, workspace, entry)
+            assert _current() == 0, "execute_plan_at_index must restore the worker's originally empty context"
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "execute_plan_at_index did not return"
+    if "error" in result:
+        raise result["error"]
+    torch.cuda.synchronize(handle.device.ordinal)
+    _check(values)
+
+
+@pytest.mark.parametrize("entry", ["mapping", "ordered"])
+def test_deserialized_plan_at_index_preserves_foreign_device(attention, entry):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible GPUs")
+    graph, handle, pack, workspace, values = attention
+    replica = _deserialized(graph, handle)
+    target = handle.device.ordinal
+    foreign = next(i for i in range(torch.cuda.device_count()) if i != target)
+    values[3].fill_(float("nan"))
+    values[4].fill_(float("nan"))
+    stream = torch.cuda.Stream(device=target)
+    stream.wait_stream(torch.cuda.current_stream(target))
+    cudnn.set_stream(handle, stream.cuda_stream)
+    with torch.cuda.device(foreign):
+        previous = _current()
+        _execute_deserialized(replica, handle, pack, workspace, entry)
+        assert _current() == previous
+        assert torch.cuda.current_device() == foreign
+    stream.synchronize()
+    _check(values)

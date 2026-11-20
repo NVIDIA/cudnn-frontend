@@ -53,7 +53,7 @@ produced the same text there.
 | `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header. `ieee-fp32` sets `torch.backends.cuda.matmul.fp32_precision` for the rest of the process, which ends with the run |
 | `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
 | `--check-kernels` | off; always on with `--stack native` and `--stack fe-entries` | adds the kernel check: prints the kernel table, keeps the profiler's record of every launch of the traced steps and holds them against the plan ("The kernel check" below). Not with `--stack reference`, which checks nothing |
-| `--dump-census FILE` | -- | the launch records of the traced steps as JSON (per launch its kernel id, name, grid, block, shared memory, registers per thread), with the block calls of a step, what the entries state, and per call site the entry instance that served it and the form that instance states (`served`, beside the row's `form`), for a comparison made elsewhere; implies `--check-kernels`. In a stack that declares a target, also each call's identity and the run's three numbers (`target`) |
+| `--dump-census FILE` | -- | the launch records of the traced steps as JSON (per launch its kernel id, name, grid, block, shared memory, registers per thread, and its start and end in milliseconds on the profiler's clock), with the block calls of a step, what the entries state, and per call site the entry instance that served it and the form that instance states (`served`, beside the row's `form`), for a comparison made elsewhere; implies `--check-kernels`. In a stack that declares a target, also each call's identity and the run's three numbers (`target`) |
 
 A `--messages` file (the `chat.json` of the last command above), here with a system turn and the reasoning switched off:
 
@@ -1986,8 +1986,9 @@ chose are printed under the line and are not gated. The token choice is the samp
 
 What the check cannot say. A kernel name does not prove a form: a generated symbol is the kernel's name followed by the
 text of its compile-time arguments, cut at a fixed length, so two forms can share a symbol and a launch shape. That is
-why the form is compared on the objects and the name only against the entry's own symbol. Registers per thread are
-recorded in `--dump-census` and compared with nothing. Nothing here is a timing.
+why the form is compared on the objects and the name only against the entry's own symbol. Registers per thread, and
+the start and the end of every launch, are recorded in `--dump-census` and compared with nothing. Nothing the check
+says is a timing.
 
 The names themselves come from the profiler, and the profiler names a kernel wrongly in one situation: after a kernel
 module was unloaded in the same process, a kernel loaded where the unloaded one had been can be recorded under the
