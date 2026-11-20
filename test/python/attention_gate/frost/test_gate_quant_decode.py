@@ -45,6 +45,7 @@ from cudnn.frost import init_order  # noqa: E402
 from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fixture)
     deterministic_fill,
     host_allocations,
+    on_device,
     park,
     pooled,
     previous_owner,
@@ -299,6 +300,50 @@ def test_a_call_orders_its_launch_behind_a_pending_record_over_the_out_it_writes
     for name in ("attn", "gate", "scale"):
         assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
     assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+
+
+def test_a_declined_call_compile_or_output_allocates_nothing_and_leaves_no_record(monkeypatch):
+    """A decline touches nothing, on stand-ins (no device).  Whatever declines a call, a ``compile`` or an ``output`` that
+    would use the entry-owned buffer -- a part the kernel does not serve, a DSL gate, a binding check, the row count, a host
+    device -- runs IN FRONT of the buffer's allocation: the entry holds no buffer, nothing was allocated and the device has
+    no record.  A ``compile`` without ``out`` that is not declined allocates the buffer and records it."""
+    from cudnn.frost import buffers
+
+    s = stand_ins(monkeypatch)
+    dev, part = torch.device("cuda", 5), [(10, 0)]
+    host_allocations(monkeypatch, dev, s.calls)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(multi_processor_count=148))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: part[0])
+    plain = _host_operands(with_out=False)
+    plain = (plain["attn"], plain["gate"], plain["scale"])
+    attn, gate, scale = on_device(dev, *plain)
+    tall, fp32 = on_device(dev, torch.zeros(161, 2048, dtype=torch.bfloat16), torch.zeros(3, 2048))
+    missing, old = (False, None), (True, ("nvidia-cutlass-dsl", "4.7.1"))
+    declines = (  # what declines: the entry's device, the part, the DSL state, the operands, the decline
+        ("a part the kernel does not serve", dev, (8, 0), missing, (attn, gate, scale), NotImplementedError, r"this device is 8\.0"),
+        ("a missing DSL", dev, (10, 0), missing, (attn, gate, scale), NotImplementedError, "the CuTe DSL is not installed"),
+        ("a DSL below the floor", dev, (10, 3), old, (attn, gate, scale), NotImplementedError, r"found 4\.7\.1"),
+        ("the row count", dev, (10, 0), missing, (tall, tall, scale), NotImplementedError, "at most 160 rows"),
+        ("a dtype", dev, (10, 0), missing, (fp32, gate, scale), TypeError, "attn must be torch.bfloat16"),
+        ("a host device", "cpu", (10, 0), missing, plain, NotImplementedError, "serves CUDA tensors only"),
+    )
+    for what, device, cc, dsl, operands, error, match in declines:
+        part[0] = cc
+        monkeypatch.setattr(buffers, "_DSL_STATE", dsl)
+        for route in ("a call", "a compile"):
+            k = entry.AttentionGateQuantDecode(device, 2048)
+            s.calls.clear()
+            with pytest.raises(error, match=match):
+                k(*operands) if route == "a call" else k.compile(*operands)
+            assert k.out_buffer is None and not s.calls and not init_order.pending_of(dev), f"{route} declined by {what} allocated or recorded"
+    k = entry.AttentionGateQuantDecode(dev, 2048)
+    with pytest.raises(NotImplementedError, match="at most 160 rows"):
+        k.output(161)
+    assert k.out_buffer is None and not s.calls and not k._pending, "an output declined by the row count allocated or recorded"
+    k.compiled.update({(cfg,): None for cfg in k.cfgs})  # a compiled entry: nothing is missing, so no DSL gate is asked
+    k.compile(attn, gate, scale)
+    assert [c[0] for c in s.calls] == ["empty", "enter", "record", "leave"] and len(k._pending) == 1, "a compile that is not declined allocates and records"
+    assert k.out_buffer is not None and k.output(3).data_ptr() == k.out_buffer.data_ptr()
 
 
 def test_declines_an_unserved_compute_capability_by_name():

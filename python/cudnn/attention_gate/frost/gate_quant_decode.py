@@ -36,9 +36,10 @@ is implicit state exactly like the stream).
 
 Output ownership.  With ``out`` the caller owns the storage and gets its own tensor back.  Without it the entry returns a view of ONE
 entry-owned ``[160, width]`` buffer, allocated at the first compile, ``output(rows)`` or call that passes no ``out`` (never on a warm
-path; allocate it outside a capture by compiling without ``out`` first): its bytes are valid until the entry's NEXT call from ANY host
-thread.  Stream order does not serialize host calls, so two host threads that share one entry -- on one stream or two -- pass their own
-``out`` (or build one entry each).  The buffer's allocation is stream work of torch's current stream of the entry's device at that
+path, and never by one that is declined: every decline runs before the allocation; allocate it outside a capture by compiling without
+``out`` first): its bytes are valid until the entry's NEXT call from ANY host thread.  Stream order does not serialize host calls, so
+two host threads that share one entry -- on one stream or two -- pass their own ``out`` (or build one entry each).
+The buffer's allocation is stream work of torch's current stream of the entry's device at that
 moment (the buffer is not initialized by the entry, but under deterministic algorithms torch fills it, and its block can be a recycled
 one that stream still owes a write), and every launch that writes its bytes -- by default, or as a view passed back as ``out``, by
 this entry or by another entry that orders its launches the same way -- is ordered behind it on whatever stream it runs: a
@@ -337,8 +338,10 @@ class AttentionGateQuantDecode:
 
     def output(self, rows: int):
         """The entry-owned ``[rows, width]`` E4M3 view a call without ``out`` returns (allocates the buffer on first use, on
-        torch's current stream; returned without waiting: the module docstring says what is ordered behind that allocation)."""
-        return self._default_out()[: validate_rows(rows)]
+        torch's current stream; returned without waiting: the module docstring says what is ordered behind that allocation).
+        A row count the kernel does not serve is declined before the buffer is allocated."""
+        rows = validate_rows(rows)
+        return self._default_out()[:rows]
 
     def _args(self, attn, gate, scale, out, given: bool):
         """The four DSL views of a compile or a launch (one form for both: :func:`_flat`).  ``out`` binds through its ``uint8`` view (a
@@ -354,18 +357,21 @@ class AttentionGateQuantDecode:
         return [_flat(attn), _flat(gate), _flat(scale), out_view]
 
     def compile(self, attn, gate, scale, out=None) -> None:
-        """Validate (typed declines, on every call), gate the DSL, trace-compile the kernel's host entry once per config of the entry."""
+        """Validate (typed declines, on every call), gate the DSL, trace-compile the kernel's host entry once per config of the entry.
+        Without ``out`` it allocates the entry-owned buffer -- behind every decline: a declined compile allocates nothing and
+        leaves no record of an allocation."""
         rows = check_support(attn, gate, scale, out, device=self.device, width=self.width)
-        given = out is not None
-        out = out if given else self._default_out()
         missing = [cfg for cfg in self.cfgs if (cfg,) not in self.compiled]
+        if missing:
+            import torch
+
+            msg = _dsl_error(torch.cuda.get_device_capability(self.device))
+            if msg is not None:
+                raise NotImplementedError(msg)
+        given = out is not None
+        out = out if given else self._default_out()  # behind the declines
         if not missing:
             return
-        import torch
-
-        msg = _dsl_error(torch.cuda.get_device_capability(self.device))
-        if msg is not None:
-            raise NotImplementedError(msg)
         import cutlass.cute as cute
         from cutlass.cute.runtime import make_fake_stream
 
@@ -382,16 +388,17 @@ class AttentionGateQuantDecode:
         kernel is looked up.  The launch is scoped to the entry's device (a no-op when that device is the caller's current one) and the
         caller's current device is restored behind it: the compiled kernel belongs to that device's context (Rule 4), and a launch that
         left another device current would move the caller's next default-device work (Rule 5).  The launch is ordered behind the
-        pending stream work of every entry-owned allocation of the device it writes (the module docstring)."""
+        pending stream work of every entry-owned allocation of the device it writes (the module docstring).  A declined call
+        has allocated nothing: the compile and its declines run before the entry-owned buffer is resolved."""
         import cuda.bindings.driver as cuda
         import torch
 
         rows = check_binding(attn, gate, scale, out, device=self.device, width=self.width)
         given = out is not None
-        out = out if given else self._default_out()
         key = self.key(rows)
         if key not in self.compiled:
-            self.compile(attn, gate, scale, out if given else None)
+            self.compile(attn, gate, scale, out)  # its declines run before the entry-owned buffer is allocated
+        out = out if given else self._default_out()
         with device_context(self.device):
             args = self._args(attn, gate, scale, out, given)
             stream = torch.cuda.current_stream(self.device)

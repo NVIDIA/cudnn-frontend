@@ -78,8 +78,9 @@ kernel module is imported.
 never written. Without it the entry returns a view of ONE entry-owned `[160, width]` buffer whose bytes are valid until
 the entry's NEXT call from any host thread. Stream order does not serialize host calls, so two host threads that share
 one entry, on one stream or two, pass their own `out` (or build one entry each). The entry-owned buffer is allocated
-at the first `compile()`, `output(rows)` or call that passes no `out`; compile without `out` before a CUDA-graph
-capture if a captured call will use it. The buffer is allocated on torch's current stream of the entry's device at
+at the first `compile()`, `output(rows)` or call that passes no `out` and is not declined (every decline runs before
+the allocation: a declined one allocates nothing); compile without `out` before a CUDA-graph capture if a captured
+call will use it. The buffer is allocated on torch's current stream of the entry's device at
 that moment and that stream can still write it (torch fills it under deterministic algorithms; a recycled block can
 carry a write the stream still owes it): every launch that writes its bytes, by default or as a view passed back as
 `out`, by this entry or by another entry that orders its launches the same way (today `AddNormQuantDecode`,
