@@ -801,10 +801,9 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         # need a 32-byte swizzle the FP8 kernels' P.V descriptors do not model.
         return (1,) if fp8 else (1, 2)
     if fp8 and flavor == (256, 256):
-        # cc 10.7 admits both widths: the MXFP8 dense unsplit legs run the 2-CTA pair by default (config_sm100.d256_mxfp8_pair_leg,
-        # the width template_params derives); per-tensor FP8 d256 keeps cga1 by default and serves the two-warpgroup pair on an
-        # explicit cga=2 for the dense unsplit HALF-softmax leg (check_support declines the other per-tensor legs at cga2).
-        return (1, 2) if device_cc == (10, 7) else (1,)
+        # cc 10.7 MXFP8 admits both widths: the dense unsplit legs run the 2-CTA pair (config_sm100.d256_mxfp8_pair_leg,
+        # the width template_params derives); per-tensor FP8 d256 keeps cga1.
+        return (1, 2) if (device_cc == (10, 7) and not pertensor) else (1,)
     if fp8 and pertensor and flavor == (128, 128):
         # Per-tensor FP8 d128 builds at both widths: cga1 is one 256-row CTA
         # (no collective MMA, STAGES_KV=2, Q/O aliased), cga2 the 2-CTA pair.
@@ -2470,6 +2469,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _d256_fp8_pair_leg(self) -> bool:
+        """The cc 10.7 per-tensor FP8 d256 leg that also builds at cga 2 (the two-warpgroup body), on an explicit request only:
+        HALF softmax, dense queries, unsplit, nonpaged, unpacked, ungated.  Every other per-tensor d256 leg keeps cga 1."""
+        from cudnn import data_type
+
+        return (
+            self._device_cc == (10, 7)
+            and self._fp8
+            and self._pertensor
+            and self.flavor == (256, 256)
+            and self.softmax_precision == data_type.HALF
+            and not self.thd
+            and not self.paged
+            and self.split_kv == 1
+            and not self.pack_gqa
+            and self.gate_desc is None
+            and not self.packed_thd_split
+        )
+
     def _sm100_nonpaged_thd_single_cta_leg(self) -> bool:
         """The SM100 single-CTA D128 half THD prefill leg (``config_sm100.supports_sm100_nonpaged_d128_thd_single_cta``)."""
         return not self.softmax_scale_prefolded and supports_sm100_nonpaged_d128_thd_single_cta(
@@ -3165,6 +3183,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # This adapter parameter names the MMA group. Wide explicit
             # engines expose the physical cluster and lower its fixed pair.
             supported_cgas = (getattr(selected_kernel, "cta_group", selected_kernel.cga),)
+        elif self._d256_fp8_pair_leg():
+            supported_cgas = (1, 2)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
@@ -3533,24 +3553,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.softmax_precision == _cudnn_dtype.HALF and (self._device_cc != (10, 7) or self.flavor not in _SM107_HALF_SOFTMAX_FLAVORS),
             "softmax_precision=HALF is served for FP8 and MXFP8 inputs on cc10.7 (d128, d192x128, d256, d512) only (FLOAT is the default everywhere)",
-        )
-        self._not_implemented_error_if(
-            self.cga == 2
-            and self._device_cc == (10, 7)
-            and self._fp8
-            and self._pertensor
-            and self.flavor == (256, 256)
-            and not (
-                self.softmax_precision == _cudnn_dtype.HALF
-                and not self.thd
-                and not self.paged
-                and self.split_kv == 1
-                and not self.pack_gqa
-                and self.gate_desc is None
-                and not self.packed_thd_split
-            ),
-            "the d256 per-tensor FP8 2-CTA pair serves dense unsplit unpacked ungated queries with softmax_precision=HALF on cc 10.7; "
-            "the other per-tensor d256 legs run cga1 (leave cga unset or pass cga=1)",
         )
         # The pre-folded scale: per-tensor FP8 folds descale_q * descale_k into the softmax scale
         # in-kernel from device tensors, so skipping the per-score multiply would drop the

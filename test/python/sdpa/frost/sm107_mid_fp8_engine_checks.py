@@ -276,11 +276,11 @@ def _d256_pair_check(out, lse, q8, k8, v8, **mask):
 
 
 def test_d256_pair_admission():
-    """Explicit cga=2 reaches the pair on the HALF-softmax dense leg only; the default width and the public record stay at cga 1."""
+    """Explicit cga=2 reaches the pair on the HALF-softmax dense leg only; the knob domain of every other per-tensor d256 leg,
+    the default width and the public record stay at cga 1."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, supported_cgas_for
 
-    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
-    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=True) == (1,)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1,)
     q8, k8, v8 = _d256_pair_problem(b=1, hq=2, hkv=2, sq=64, skv=256)
     out = torch.empty_like(q8, dtype=torch.bfloat16)
     lse = torch.empty(1, 2, 64, device="cuda", dtype=torch.float32)
@@ -290,7 +290,7 @@ def test_d256_pair_admission():
         dict(cga=2, softmax_precision=cudnn.data_type.HALF, split_kv=2),
         dict(cga=2, softmax_precision=cudnn.data_type.HALF, pack_gqa=True),
     ):
-        with pytest.raises(NotImplementedError, match="per-tensor FP8 2-CTA pair"):
+        with pytest.raises(ValueError, match="only supports cga in"):
             SdpaFwdDslSm100(**common, **declined).check_support()
     default = SdpaFwdDslSm100(**common, softmax_precision=cudnn.data_type.HALF)
     assert default.check_support()
