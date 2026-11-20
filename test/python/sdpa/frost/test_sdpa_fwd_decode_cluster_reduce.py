@@ -392,13 +392,13 @@ def test_form_holds_the_split_counts_of_the_lean_group():
 
 
 @pytest.mark.parametrize("s_kv", [128, 2048, 16384])
-def test_default_placement_is_unchanged(monkeypatch, s_kv):
-    """With the engines' opt-in flag unset: one user x one token still ranks the backend first up to 16,384 declared keys
-    (the marked plan does not change its class), two tokens lead as before, and six tokens lead with the prefill kernel."""
+def test_default_placement(monkeypatch, s_kv):
+    """With the engines' opt-in flag unset, the marked plan does not change its class: one and two tokens lead up to 16,384
+    declared keys (the SM100 paged D256 decode rule, PR #2803), and six tokens lead with the prefill kernel."""
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     spec = SPECS[SWAP_AB]
     one = facts(1, 1, s_kv)
-    assert placement.place(spec, one, _lead_swap_ab(one)) == placement.TRAIL
+    assert placement.place(spec, one, _lead_swap_ab(one)) == placement.LEAD
     two = facts(1, 2, s_kv)
     assert placement.place(spec, two, _lead_swap_ab(two)) == placement.LEAD
     six = _plans(facts(1, 6, s_kv))

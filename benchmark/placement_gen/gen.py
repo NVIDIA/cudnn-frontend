@@ -166,6 +166,11 @@ def fit(points, margin):
     return min([split, *flat], key=regret)
 
 
+def _ran_frost(plan):
+    """FROST plan names carry the direction: sdpa_fwd* for inference / forward cells, sdpa_bwd* for backward ones."""
+    return any(t in (plan or "") for t in ("sdpa_fwd", "sdpa_bwd"))
+
+
 def _cells(paths, s):
     """Per class key, the cells with all three legs timed: facts, backend / FROST / measured-default ms, and whether the default
     ran FROST."""
@@ -177,7 +182,7 @@ def _cells(paths, s):
         f = to_facts(d["cudnn"]["case"], s)
         key = pt.class_key(s["row"], f)
         if key is not None:
-            x = dict(be=d["cudnn"]["ms"], fr=d["cudnn_oss"]["ms"], au=d["cudnn_auto"]["ms"], dflt="sdpa_fwd" in (d["cudnn_auto"].get("plan") or ""))
+            x = dict(be=d["cudnn"]["ms"], fr=d["cudnn_oss"]["ms"], au=d["cudnn_auto"]["ms"], dflt=_ran_frost(d["cudnn_auto"].get("plan")))
             x.update({k: round(fn(f), 6) for k, fn in pt.FEATURES.items()})
             by[key].append(x)
     return by
