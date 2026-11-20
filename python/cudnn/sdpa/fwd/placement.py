@@ -255,7 +255,7 @@ Rubin row has its own arm ("SM107 per-tensor FP8 row" below).
   4k, 4 x 8k, 1 x 32k) the cells are MIXED, 0.78-1.79, and 12 of them are launch-bound and unverifiable, so the band starts
   at 2**16 (replay alone also led at 16 x 2k, 0.82-0.85 with three geometries unverifiable, and at 8 x 4k, 0.89-0.95: not admitted);
   fewer than 4 units lost up to 1.79x below the 128k endpoint on that tree, where 1-2 units led 0.75-0.83 in one column. Re-measured
-  on FE 9bdf9a8ab (study rubin_paged_d256_small_units_20261117: computelab Rubin, cuDNN 9.30.0.4, the nightly harness legs timed
+  on FE 9bdf9a8ab (study rubin_paged_d256_small_units_20261117: a Rubin test node, cuDNN 9.30.0.4, the nightly harness legs timed
   as back-to-back GPU time; groups 4 / 6 / 8 / 12 / 16, pages 16 / 32 / 64), 1-3 units lead on all 88 train cells from 4k declared KV
   (0.35-0.88) and on a fresh seeded 32-cell holdout scored once (0.37-0.69, geomean 0.55). The same tree re-measured the 2**15 step
   (study rubin_paged_d256_band_floor_20261117, 75 train cells at 4-48 units x 1k-16k declared KV): it separates on declared KV and
