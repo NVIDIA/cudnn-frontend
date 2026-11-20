@@ -131,17 +131,21 @@ def test_candidate_order_and_budget_follow_original_policy(dim, kind):
     assert [p.knobs for p in plans] == list(dict.fromkeys(expected))
 
 
-def test_discovery_preserves_opt_in_and_own_block_unlock(monkeypatch):
+@pytest.mark.parametrize("flag", [None, "0", "1"])
+def test_discovery_offers_both_owners_and_keeps_the_own_block_unlock(monkeypatch, flag):
     from cudnn.engines import MANIFEST
 
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
-    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0")
-    assert small.NAME not in family.offered_ids() and mid.NAME not in family.offered_ids()
-    assert family.slots[small.NAME].unlocked_by == ("causal_exclude_own_block",)
-    assert not family.slots[mid.NAME].unlocked_by
-    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    if flag is None:
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    else:
+        monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", flag)
+    # Default since 2026-11-16, behind the backend (placement.TRAIL_ONLY_ROWS).
     assert family.offered_ids()[small.NAME] == 20550
     assert family.offered_ids()[mid.NAME] == 20551
+    assert {small.NAME, mid.NAME} <= placement.TRAIL_ONLY_ROWS
+    assert family.slots[small.NAME].unlocked_by == ("causal_exclude_own_block",)
+    assert not family.slots[mid.NAME].unlocked_by
 
 
 @pytest.mark.parametrize("owner,dim", [(small, 128), (mid, 192)])

@@ -463,8 +463,8 @@ SM120 MXFP8 row (``sdpa_fwd_prefill_sm120_mxfp8``, offered by default): the back
 SDPA on cc 12.x ("MXFP8 SDPA is only supported on Blackwell Data Center architectures"), so the row is the only
 provider there and leads every graph it admits.
 
-Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
-opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
+Rows with no measurement rank after the backend (``TRAIL_ONLY_ROWS``): SM80, and the SM100 MXFP8 explicit owners
+(offered by default since 2026-11-16) together with the opt-in MXFP8 row they split.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
 pack, so the lead is the unpacked FROST plan; it leads the backend when the declaration admits no chunk over a longer
 cache (equal Q and KV extents and, with packed totals declared, equal totals), the declared cache holds at least 4096
@@ -654,10 +654,22 @@ def _d512_swa(facts) -> bool:
     )
 
 
-TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative"})
+TRAIL_ONLY_ROWS = frozenset(
+    {
+        "sdpa_fwd_prefill_sm80",
+        "sdpa_fwd_sm80_f16_k_prefetch",
+        "sdpa_fwd_sm80_d256_kv_prefetch",
+        "sdpa_fwd_sm80_wide_cooperative",
+        "sdpa_fwd_sm100_d256_mxfp8_single_q",
+        "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+        "sdpa_fwd_sm100_d512_mxfp8_retained_p",
+    }
+)
 """Default-offered rows with no hand-written lead shard: offered after the backend's block, so they serve a graph only when
 the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph. An SM80
-implementation engine inherits its row's policy."""
+implementation engine inherits its row's policy; an SM100 MXFP8 owner resolves to its opt-in row, which :func:`place` trails."""
 
 
 def place(spec, facts, knobs=None) -> str:
@@ -669,9 +681,8 @@ def place(spec, facts, knobs=None) -> str:
     attention sink inside its measured band; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
     admits (a qualification verdict, module docstring); the SM107 per-tensor FP8 row leads at d256 / d512 on exact
     cc 10.7 (module docstring); the SM120 per-tensor FP8 row leads outside its short-cache d128 prefill band and
-    the SM120 MXFP8 row leads everywhere (the backend has no MXFP8 SDPA on cc 12.x). ``TRAIL_ONLY_ROWS`` (SM80) rank
-    after the backend. The remaining unmeasured row (SM100 mxfp8) keeps the historical order -- it stays opt-in, so
-    the order is only observable with the flag set, which ranks ours first anyway.
+    the SM120 MXFP8 row leads everywhere (the backend has no MXFP8 SDPA on cc 12.x). ``TRAIL_ONLY_ROWS`` (SM80, the
+    SM100 MXFP8 explicit owners) and the opt-in SM100 MXFP8 row rank after the backend.
 
     A measured entry in ``cudnn.sdpa.placement_table`` (generated from a frozen sweep) answers first; the hand-written
     rules below decide every graph the table has no entry for."""
@@ -876,7 +887,7 @@ def place(spec, facts, knobs=None) -> str:
         return _place_sm120_fp8(facts)
     if spec.name == "sdpa_fwd_prefill_sm120_mxfp8":
         return LEAD  # the backend declines MXFP8 SDPA on cc 12.x ("only supported on Blackwell Data Center")
-    if spec.name in TRAIL_ONLY_ROWS:
+    if spec.name in TRAIL_ONLY_ROWS or spec.name == MXFP8_LEGACY_ROW:
         return TRAIL
     return LEAD
 
