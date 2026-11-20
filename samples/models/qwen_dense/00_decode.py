@@ -263,8 +263,8 @@ def _arguments(argv):
     parser.add_argument(
         "--dump-census",
         metavar="FILE",
-        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory per launch), for a comparison "
-        "made elsewhere; implies --check-kernels",
+        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory, start and end per launch), for a "
+        "comparison made elsewhere; implies --check-kernels",
     )
     _perf_flags(parser)
     for flag, takes in SPECULATIVE_FLAGS:
@@ -788,7 +788,7 @@ def main(argv=None) -> int:
         else:
             gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
             traced_steps = TRACED_STEPS if outcome is None else outcome.data["traced"]["steps"]
-            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=1, gpu=gpu, traced_steps=traced_steps)
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=2, gpu=gpu, traced_steps=traced_steps)
         if error:
             unwritten.append(error)
         else:
