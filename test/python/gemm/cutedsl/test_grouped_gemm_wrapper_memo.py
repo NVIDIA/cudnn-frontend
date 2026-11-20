@@ -243,6 +243,14 @@ class CountingMemo(dict):
 
 
 def install_memo(monkeypatch, module, name):
+    """A counting memo, with the C++ launcher out of the way: a recording answers before the memo."""
+    import inspect
+
+    import cudnn
+
+    for kind in ("", "glu_", "dglu_", "quant_", "wgrad_"):
+        attr = f"grouped_gemm_{kind}wrapper_sm100"
+        monkeypatch.setattr(cudnn, attr, inspect.unwrap(getattr(cudnn, attr)))
     memo = CountingMemo()
     monkeypatch.setattr(module, name, memo)
     return memo

@@ -176,3 +176,13 @@ For a discrete class instance, replace `sample_b` with
   their existing FP4/FP8 block-scaled backends. For BF16 on those fused APIs,
   scale-factor controls are `None`; see their operation pages for the exact
   dispatch and return contracts.
+
+## C++ launcher
+
+`grouped_gemm_wrapper_sm100` and the GLU, dGLU, quant and WGrad wrappers run through
+the [C++ launcher](../../utilities/cpp_launcher.md): once a call with the same
+arguments (tensor dtypes, shapes and strides, other argument values) has run 16
+times, a call allocates its outputs and launches its kernels from C++ without
+running the wrapper's Python. Outputs match the wrapper's own. Calls that pass
+per-expert pointers (`b_ptrs`, `wgrad_ptrs`) keep running the wrapper.
+`CUDNN_FRONTEND_CPP_LAUNCHER=0` turns this off.

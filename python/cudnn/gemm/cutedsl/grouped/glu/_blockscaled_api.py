@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from ..glu_layout import validate_glu_layout
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import kernel_stream, rubin_single_group_offsets_kwarg
 from ..canonical import (
     canonical_b_fake,
     canonical_mx_fake,
@@ -48,6 +48,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.cpp_launcher import launch, scratch
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 
 
@@ -1033,6 +1034,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             situ_beta2: float = 25.0,
             scheduler_counter_tensor: Optional[torch.Tensor] = None,
         ) -> None:
+            scratch(self._workspace)
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             kernel_args = (
                 a_tensor,
@@ -1054,16 +1056,17 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
-                stream,
+                kernel_stream(stream),
                 linear_offset,
                 geglu_alpha,
                 glu_clamp_max,
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, scheduler_counter_tensor)
+                launch(_compiled_kernel, *kernel_args, scheduler_counter_tensor)
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     *kernel_args,
                     situ_beta1,
                     situ_beta2,
@@ -1254,6 +1257,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             situ_beta1: float = 4.0,
             situ_beta2: float = 25.0,
         ) -> None:
+            scratch(self._workspace)
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             b_ptrs_addr = int(b_ptrs_device.data_ptr())
             sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
@@ -1278,16 +1282,17 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
-                stream,
+                kernel_stream(stream),
                 linear_offset,
                 geglu_alpha,
                 glu_clamp_max,
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args)
+                launch(_compiled_kernel, *kernel_args)
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     *kernel_args,
                     situ_beta1,
                     situ_beta2,
