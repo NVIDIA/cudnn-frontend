@@ -28,6 +28,13 @@ collected cases separately from replay executions. Include tile/routing
 boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
 and isolated upstream-gradient sources when the operation supports them.
 Keep these determinism suites in L0, including stress cases.
+For SM100 two-CTA D576 backward, run
+`test_DSA_sparse_attention_backward_sm100_h96_native_boundaries` under
+Synccheck for both sentinel padding and explicit lengths. A split dedicated
+to dQ can release the P/dS stage before its producer commits. A split
+can also advance a dQ- or dKV-only barrier with no waiter. Numerical
+checks can pass in both cases.
+
 For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
 invalid after packing. Use unique active indices for deterministic backward,
 except in cases pinned to an SM100/SM103 conflict-rank dKV layout (records,
