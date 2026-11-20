@@ -65,6 +65,20 @@ class KvCache:
         """The same cache as a decode step takes it: one position per sequence and step."""
         return KvCache(self.k, self.v, 1)
 
+    def write(self, position: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Insert the key and value rows of one token per sequence, ``[sequences, kv_heads, head_dim]`` each, at ``position``."""
+        self.k[:, :, position] = k
+        self.v[:, :, position] = v
+
+    def keys(self, count: int, dtype) -> torch.Tensor:
+        """The keys of the first ``count`` positions of every sequence, ``[sequences, kv_heads, count, head_dim]`` in ``dtype``:
+        what an attention over those positions reads.  In the cache's own dtype it is a view of the cache."""
+        return self.k[:, :, :count].to(dtype)
+
+    def values(self, count: int, dtype) -> torch.Tensor:
+        """The values of the first ``count`` positions of every sequence, as :meth:`keys`."""
+        return self.v[:, :, :count].to(dtype)
+
 
 @dataclass
 class TokenSlots:
@@ -232,7 +246,7 @@ class DecodeState:
                 taps = layer.conv_storage.shape[1] - self.tokens + 1
                 standing.append((layer.state[slots], layer.conv_storage[1:, kept : kept + taps]))
             else:
-                standing.append((layer.k[:, :, : self.position], layer.v[:, :, : self.position]))
+                standing.append((layer.keys(self.position, torch.bfloat16), layer.values(self.position, torch.bfloat16)))
         return standing
 
     def bytes(self) -> int:
