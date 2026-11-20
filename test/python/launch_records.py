@@ -11,7 +11,6 @@ device cell makes, so the four cells cannot drift apart.
 
 A non-test module (no ``test_`` prefix): imported by name from the entry suites."""
 
-import gc
 import json
 import os
 import tempfile
@@ -34,17 +33,21 @@ def _triple(value) -> Optional[Tuple[int, int, int]]:
     return tuple(int(v) for v in value) if isinstance(value, (list, tuple)) and len(value) == 3 else None
 
 
+# The entries whose launch a cell has profiled, kept for the life of the process (under pytest-xdist: one list per worker).
+# torch.profiler can record a launch under the NAME of an earlier profiled kernel whose module was unloaded just before the launched
+# kernel's module was loaded -- beside this launch's own grid, block and shared memory.  An entry owns its compiled kernels, and the
+# CuTe DSL does not unload a kernel's module while its compiled function is alive.  Kept here, a profiled kernel stays loaded until the process
+# ends, so no later kernel is loaded behind the unload of a profiled one: a kernel that is still loaded cannot lend its name to a
+# later load.  Never cleared: a cell that emptied the list would bring the order back for every cell after it.
+_PROFILED_ENTRIES: list = []
+
+
 def kernel_records(launch: Callable[[], object]) -> List[KernelRecord]:
     """The kernel records of ONE call of ``launch`` under ``torch.profiler``, in launch order, after one warm call (which also compiles
     on first use).  Memory copies and fills are not kernels and are not returned.  An empty list when the profiler recorded no kernel
     (a node without CUPTI): the caller reports that as a skip, never as a pass."""
     from torch.profiler import ProfilerActivity, profile
 
-    # Collect garbage first.  torch.profiler can record a launch under the NAME of an earlier profiled kernel whose module was unloaded
-    # just before the launched kernel's module was loaded -- beside this launch's own grid, block and shared memory.  An earlier case's
-    # compiled kernels can stay loaded until a garbage collection, and an automatic one late in the warm call's compile is that order:
-    # the name comparison has failed on such a record in some whole-module sessions.  Collected here, they are unloaded before the compile.
-    gc.collect()
     launch()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -93,6 +96,7 @@ def assert_facts_equal_the_launch(entry, launch: Callable[[], object], *rows, wh
         _measured(rows, f"NOT COMPARED: {text}")
         pytest.skip(f"{label}: {text}")
 
+    _PROFILED_ENTRIES.append(entry)  # before the first launch: the kernel this cell profiles stays loaded whatever the cell's outcome
     records = kernel_records(launch)
     if not records:
         skip("torch.profiler recorded no kernel launch on this node (no CUPTI): the launch facts were not compared with a launch")
