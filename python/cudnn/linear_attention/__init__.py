@@ -66,13 +66,14 @@ def _collect(ids, *specs):
 
 
 def GdnEngines(ids):
-    """The GDN family, frost first and cuTile second (candidate order, not rank)."""
+    """The GDN family: frost, cuTile, the opt-in CAKE route and the Hopper sm90 path (candidate order, not rank)."""
     return _collect(
         ids,
         ("gdn_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnFrostEngine"),
         ("gdn_cutile", "cudnn.linear_attention.cutile.gdn_engine", "GdnCuTileEngine"),
         ("gdn_summary_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnSummaryFrostEngine"),
         ("gdn_cake_det", "cudnn.linear_attention.cake.gdn_engine", "GdnCakeDetEngine"),
+        ("gdn_hopper_cuda", "cudnn.linear_attention.hopper.gdn_cuda_engine", "GdnHopperCudaEngine"),
     )
 
 

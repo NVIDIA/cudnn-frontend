@@ -19,8 +19,9 @@ heads, dim]`` tensors plus ``cu_seqlens`` sequence boundaries.
 The op is a thin adapter over the graph API; forward
 and backward execute cached single-node ``GDN`` / ``GDN_BWD`` pygraphs.
 Engine selection happens at graph planning time over the manifest's python
-engines, ``GdnFrostEngine`` (default on SM100/SM103) with ``GdnCuTileEngine``
-as the fallback everywhere else. Registered through
+engines, ``GdnFrostEngine`` (default on SM100/SM103), ``GdnHopperCudaEngine``
+(default on SM90, ranked first there by ``gdn_heuristics``) and
+``GdnCuTileEngine`` as the fallback everywhere else. Registered through
 ``torch.library.custom_op`` so it composes with autograd, ``torch.compile``,
 and DDP.
 

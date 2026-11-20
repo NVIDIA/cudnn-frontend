@@ -1,0 +1,119 @@
+{
+  "inputs": {
+    "beta": {
+      "dtype": "torch.float32",
+      "sha256": "2df8fd4f9b225f1ee0627572c8a01822a524890aa9565bb7b0b9d04f2f0806f8",
+      "shape": [
+        20,
+        2
+      ]
+    },
+    "cu": {
+      "dtype": "torch.int32",
+      "sha256": "88702398ef1ac3707d182dfd94cf84975d2b0270a0df53dd4cb8836694a4b254",
+      "shape": [
+        3
+      ]
+    },
+    "dfs": {
+      "dtype": "torch.float32",
+      "sha256": "911e3651a74f23f2ea6466ec10db91d275b1ba7b1a535474c6b3529fe4d4cb38",
+      "shape": [
+        2,
+        2,
+        128,
+        128
+      ]
+    },
+    "do": {
+      "dtype": "torch.bfloat16",
+      "sha256": "94669d7dfa1cee1a9366b504833a711c2cc3f70670f2677c9642bc4fd065e787",
+      "shape": [
+        20,
+        2,
+        128
+      ]
+    },
+    "g": {
+      "dtype": "torch.float32",
+      "sha256": "18c3666a5c0dffaf3f9a7e8f2cbf2faa265d7b0396b2e1a67cf7034397f82917",
+      "shape": [
+        20,
+        2
+      ]
+    },
+    "initial_state": {
+      "dtype": "torch.float32",
+      "sha256": "0c4cd1d26695becf4cd2691a3a7895395889b4a68f67a4ff8c0144bb0122f7cd",
+      "shape": [
+        2,
+        2,
+        128,
+        128
+      ]
+    },
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "743547146e702ff7a0b0e83b6f734a7c8a941ebc7d0c2c6760bfaa8577372303",
+      "shape": [
+        20,
+        2,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "97bec5d9d818aa97151db8c390c3c55b56b93ac3b69a15e902c3c4fd9db59708",
+      "shape": [
+        20,
+        2,
+        128
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "574f078a183bd9e0cfbb8e9e4f3bd2c3e375d0f388ca59100685192a71357ec3",
+      "shape": [
+        20,
+        2,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "final_state": {
+      "dtype": "torch.float32",
+      "sha256": "47c4822d712ec3c7f2818f0fbbd165110d316d26224b50cacafedf0cda762b46",
+      "shape": [
+        2,
+        2,
+        128,
+        128
+      ]
+    },
+    "out": {
+      "dtype": "torch.bfloat16",
+      "sha256": "568e6c3e6569825f0f997fd86b1c99f7480398bb4de7d46fbfacbcc885645ee6",
+      "shape": [
+        20,
+        2,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13040,
+    "cudnn": 92600,
+    "cutlass": "4.8.1",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.14.0a0+b2c75dd062.nv26.09",
+    "tvm_ffi": "0.1.11"
+  },
+  "schema": 1
+}

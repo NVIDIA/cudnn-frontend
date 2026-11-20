@@ -74,6 +74,20 @@ _NAME_EXPRESSIONS = (
     "k_bwd<false>",
 )
 
+# 64 value columns and 16 warps per CTA: half as many serial chains. See _wide_scan.
+# Compiled into the scalar-gate module only, so the per-channel (KDA) module is
+# exactly the set of entry points it has always had.
+_WIDE_SCAN_EXPRESSIONS = (
+    "k_scan_t<64, 512, true, true>",
+    "k_scan_t<64, 512, true, false>",
+    "k_scan_t<64, 512, false, false>",
+)
+
+
+def _name_expressions(scalar_gate: bool) -> Tuple[str, ...]:
+    return _NAME_EXPRESSIONS + _WIDE_SCAN_EXPRESSIONS if scalar_gate else _NAME_EXPRESSIONS
+
+
 # -std=c++17 -default-device --use_fast_math -DNDEBUG matches what the CAKE
 # bodies use. The artifact's nvcc build also passed --expt-relaxed-constexpr;
 # NVRTC has no such option and does not need one, because -default-device
@@ -91,8 +105,31 @@ _DEFINES = (
     f"-DKDA_BWD_SMEM_BWD={SMEM_BWD}",
 )
 
+# The [T, H] gate variant (Gated DeltaNet): same file, same entry points, one more -D.
+_SCALAR_GATE_DEFINE = ("-DKDA_BWD_SCALAR_GATE=1",)
+
+# k_scan_t runs serial chains of CTAs, 2 * 128 / BV of them per (sequence, head), each pinned at
+# one CTA per SM by its shared memory. At BV=32 a training launch (4 sequences x 32 heads = 1024
+# chains on 132 SMs) queues almost eight deep; BV=64 halves the chain count and measures 9-20%
+# faster there (H100: 0.80 -> 0.73 ms at 4x4096x32, 1.89 -> 1.52 ms at 64x512x32). Below this many
+# (sequence, head) pairs the wide form no longer fills the machine and the tuned tilings stay.
+# Scalar-gate launches only for now: the per-channel path keeps what it was verified with.
+_WIDE_SCAN_MIN_PAIRS = 32
+
+
+def _wide_scan(n_seqs: int, n_heads: int, scalar_gate: bool) -> bool:
+    """Whether this launch runs the 64-column scan -- and with it the aliased workspace.
+
+    The two go together. Aliasing puts each scan output on the input it supersedes, and a scan
+    CTA owns a 2 * BV byte slab of every row: at BV=64 that is a whole 128-byte line, at BV=32
+    two CTAs share each line and the stores of one invalidate what the other is prefetching
+    (measured +28% on the scan). So the workspace is only folded where the slabs are line-sized.
+    """
+    return bool(scalar_gate) and n_seqs * n_heads >= _WIDE_SCAN_MIN_PAIRS
+
+
 _LOCK = threading.Lock()
-_LIBRARIES: Dict[int, "BwdLibrary"] = {}
+_LIBRARIES: Dict[Tuple[int, bool], "BwdLibrary"] = {}
 
 
 def _arch_for_device(device: int) -> str:
@@ -108,7 +145,7 @@ def _arch_for_device(device: int) -> str:
     return "sm_90a"
 
 
-def _compile(source: Path, arch: str) -> Tuple[bytes, Dict[str, str]]:
+def _compile(source: Path, arch: str, extra_defines: Tuple[str, ...] = (), expressions: Tuple[str, ...] = _NAME_EXPRESSIONS) -> Tuple[bytes, Dict[str, str]]:
     """Cubin plus the mangled name of every entry point.
 
     Both halves are cached together on disk: a cubin without its lowered names
@@ -121,6 +158,7 @@ def _compile(source: Path, arch: str) -> Tuple[bytes, Dict[str, str]]:
         f"--gpu-architecture={arch}",
         *_BASE_OPTIONS,
         *_DEFINES,
+        *extra_defines,
         *(f"-I{path}" for path in includes),
     ]
     version = compiler.nvrtc_version()
@@ -129,7 +167,7 @@ def _compile(source: Path, arch: str) -> Tuple[bytes, Dict[str, str]]:
             [
                 src,
                 json.dumps(options).encode(),
-                json.dumps(_NAME_EXPRESSIONS).encode(),
+                json.dumps(expressions).encode(),
                 repr(version).encode(),
                 b"kda-bwd-cubin-v1",
             ]
@@ -142,7 +180,7 @@ def _compile(source: Path, arch: str) -> Tuple[bytes, Dict[str, str]]:
 
     program = compiler._ck(nvrtc.nvrtcCreateProgram(src, source.name.encode(), 0, [], []), "nvrtcCreateProgram")
     try:
-        for expression in _NAME_EXPRESSIONS:
+        for expression in expressions:
             compiler._ck(
                 nvrtc.nvrtcAddNameExpression(program, expression.encode()),
                 f"nvrtcAddNameExpression({expression})",
@@ -151,7 +189,7 @@ def _compile(source: Path, arch: str) -> Tuple[bytes, Dict[str, str]]:
         if int(err) != 0:
             raise compiler.CakeCompileError(f"NVRTC failed on {source.name} ({err}):\n{compiler._program_log(program)}")
         lowered = {}
-        for expression in _NAME_EXPRESSIONS:
+        for expression in expressions:
             name = compiler._ck(
                 nvrtc.nvrtcGetLoweredName(program, expression.encode()),
                 f"nvrtcGetLoweredName({expression})",
@@ -174,11 +212,13 @@ def _compile(source: Path, arch: str) -> Tuple[bytes, Dict[str, str]]:
 class BwdLibrary:
     """The backward module loaded into one device's primary context."""
 
-    def __init__(self, device: int):
+    def __init__(self, device: int, scalar_gate: bool = False):
         from cudnn._device import _device_handle
 
         self.device = int(device)
-        self.cubin, self.lowered = _compile(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device))
+        extra = _SCALAR_GATE_DEFINE if scalar_gate else ()
+        self.expressions = _name_expressions(scalar_gate)
+        self.cubin, self.lowered = _compile(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), extra, self.expressions)
         # Hold our own reference on the primary context: a module dies with its
         # context, and nothing else need have retained it on this device.
         self._device_handle = _device_handle(self.device)
@@ -188,7 +228,7 @@ class BwdLibrary:
             self.module = compiler._ck(cu.cuModuleLoadData(self.cubin), f"cuModuleLoadData({KERNEL_BODY})")
             # Raise the dynamic shared-memory ceiling once per function. Every
             # one of these kernels asks for far more than the 48 KB default.
-            for expression in _NAME_EXPRESSIONS:
+            for expression in self.expressions:
                 want = SMEM_BWD if expression.startswith("k_bwd") else SMEM_OPTIN
                 self._set_smem(self._lookup(expression), expression, want)
 
@@ -224,12 +264,13 @@ class BwdLibrary:
             return self._lookup(name)
 
 
-def library(device: int) -> BwdLibrary:
+def library(device: int, scalar_gate: bool = False) -> BwdLibrary:
+    key = (int(device), bool(scalar_gate))
     with _LOCK:
-        lib = _LIBRARIES.get(int(device))
+        lib = _LIBRARIES.get(key)
         if lib is None:
-            lib = BwdLibrary(int(device))
-            _LIBRARIES[int(device)] = lib
+            lib = BwdLibrary(int(device), bool(scalar_gate))
+            _LIBRARIES[key] = lib
         return lib
 
 
@@ -269,9 +310,14 @@ def _chunk_slots(total_tokens: int, n_seqs: int) -> int:
     return raw if raw > 0 else 1
 
 
-def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
+def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int, scalar_gate: bool = False):
     """The workspace arena, in the artifact's exact order. Returns the sub-buffer
-    addresses and the total size."""
+    addresses and the total size.
+
+    On the wide-scan path (see ``_wide_scan``) three k_scan_t outputs share storage
+    with the inputs they supersede (``vnew``/``uu``, ``dv2``/``dvl``, ``dhst``/``pmat``);
+    SCAN_ALIASED in the kernel body says why that is safe."""
+    alias = _wide_scan(n_seqs, n_heads, scalar_gate)
     ncs = _chunk_slots(total_tokens, n_seqs)
     a = _Arena(workspace)
     cs_t0 = a.take(ncs, _I32)
@@ -284,11 +330,14 @@ def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
     uu = a.take(total_tokens * n_heads * DH, _BF16)
     kg = a.take(total_tokens * n_heads * DH, _BF16)
     dvl = a.take(total_tokens * n_heads * DH, _BF16)
-    vnew = a.take(total_tokens * n_heads * DH, _BF16)
-    dv2 = a.take(total_tokens * n_heads * DH, _BF16)
+    if alias:
+        vnew, dv2 = uu, dvl
+    else:
+        vnew = a.take(total_tokens * n_heads * DH, _BF16)
+        dv2 = a.take(total_tokens * n_heads * DH, _BF16)
     hst = a.take(ncs * n_heads * DH * DH, _BF16)
     dhst = a.take(ncs * n_heads * DH * DH, _BF16)
-    pmat = a.take(ncs * n_heads * DH * DH, _BF16)
+    pmat = dhst if alias else a.take(ncs * n_heads * DH * DH, _BF16)
     return (
         dict(
             cs_t0=cs_t0,
@@ -312,9 +361,9 @@ def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
     )
 
 
-def workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int) -> int:
+def workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int, scalar_gate: bool = False) -> int:
     """Scratch the backward needs, mirroring ``kda_bwd_workspace_bytes``."""
-    _, _, size = _layout(0, total_tokens, n_heads, n_seqs)
+    _, _, size = _layout(0, total_tokens, n_heads, n_seqs, scalar_gate)
     return size
 
 
@@ -341,14 +390,17 @@ def launch(
     n_heads: int,
     n_seqs: int,
     scale: float,
+    scalar_gate: bool = False,
 ) -> None:
     """One backward pass: k_meta (varlen only), k_prep, k_scan_t, k_bwd.
 
     All tensor arguments are device addresses; ``scale`` is the query scale the
-    forward applied. Restated from the artifact's ``kda_bwd_launch``.
+    forward applied. Restated from the artifact's ``kda_bwd_launch``. With
+    ``scalar_gate`` the kernels built for a ``[T, H]`` gate run instead: ``g``
+    and ``dg`` are then one value per (token, head).
     """
-    lib = library(device)
-    ws, ncs, _ = _layout(workspace, total_tokens, n_heads, n_seqs)
+    lib = library(device, scalar_gate)
+    ws, ncs, _ = _layout(workspace, total_tokens, n_heads, n_seqs, scalar_gate)
     T, H, N = int(total_tokens), int(n_heads), int(n_seqs)
 
     single_sequence = N == 1
@@ -390,7 +442,11 @@ def launch(
         # Scan variant: the H==8 single-sequence case splits the value dim 16
         # ways at 128 threads; every other single-sequence case 32 ways at 256;
         # varlen always takes the untemplated-tail variant.
-        if single_sequence and H == 8:
+        if _wide_scan(N, H, scalar_gate):
+            single = "true" if single_sequence else "false"
+            scan_name = f"k_scan_t<64, 512, {single}, {'true' if full else 'false'}>"
+            grid, block = (2 * (DH // 64), N * H, 1), (512, 1, 1)
+        elif single_sequence and H == 8:
             scan_name = f"k_scan_t<16, 128, true, {'true' if full else 'false'}>"
             grid, block = (2 * (DH // 16), H, 1), (128, 1, 1)
         elif single_sequence:

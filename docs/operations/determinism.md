@@ -74,7 +74,7 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | BF16 (`gdn_hopper_cuda`): Supported; FP16: Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
@@ -392,6 +392,14 @@ for replay, batch-invariance, and stress-test results.
   it is not a hard workspace cap. The new H/X alias and sixteen-wave paths
   have not been requalified on SM103 or SM107; earlier architecture coverage
   remains recorded separately in the test report.
+- `gated_delta_net` on SM90: `gdn_hopper_cuda` is the default engine, for BF16
+  Q/K/V with K=V=128 and an FP32 gate, beta and state. It accepts
+  `batch_invariant=True`, and its bytes are the same with or without it: the
+  forward runs one unsplit chain per (sequence, head), and the backward's
+  per-(sequence, head) arithmetic does not depend on the batch. Other SM90 GDN
+  configurations that `gdn_cutile` accepts run there and are unverified; the
+  rest (for example `output_context`, `state_checkpoints`, `state_indices`)
+  have no SM90 engine.
 - Linear attention cuTile engine (GDN, KDA): the launch autotune times
   occupancy and worker-warp candidates, and the worker-warp count changes the
   cross-warp summation trees of the kernels that reduce with `ct.sum`, so two
@@ -670,7 +678,7 @@ for replay, batch-invariance, and stress-test results.
   FP8 are outside these rows.
 - Use a compatible CuTe DSL runtime, including `sm_107a` support for SM107.
 
-Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
+Linear-attention backends other than FROST and SM90 `gdn_hopper_cuda`, FP16 indexer inputs, MXFP4, paged indexer,
 separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, distributed execution, and the block-sparse attention blk128,
 KPage and FP8 paths are outside this status page's scope.

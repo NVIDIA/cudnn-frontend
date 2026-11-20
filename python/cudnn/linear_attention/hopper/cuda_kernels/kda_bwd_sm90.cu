@@ -20,7 +20,15 @@
 // order, plus k_meta from kernel.cu and the explicit template instantiations.
 // The host launcher (kda_bwd_launch / kda_bwd_workspace_bytes) is NOT vendored
 // -- NVRTC compiles device code only -- and is reproduced in cuda_bwd_host.py.
-// No device code is modified.
+// k_prep and k_bwd take the query scale as an argument (#1892) where the vendored
+// code baked in 1/sqrt(128). With KDA_BWD_SCALAR_GATE unset (the default) the
+// device code is otherwise equivalent to that, but not textually identical:
+// shared lines read the gate through aliases and constant-folded selects.
+//
+// Added since, outside the campaign and written with an AI coding assistant,
+// all under #if KDA_BWD_SCALAR_GATE: the scalar-gate build
+// that hopper/gdn_cuda_engine.py runs for Gated DeltaNet. It is NOT covered by
+// the campaign verification above; test_gdn_sm90_cuda.py is what covers it.
 
 // NVRTC ships no host C++ headers, so the fixed-width types the bodies use --
 // and which nvcc supplied through the <cstdint>/<cuda_runtime.h> chain -- are
@@ -47,6 +55,61 @@ static constexpr float RCP_LN2 = 1.4426950408889634f;
 // stride puts rows r and r+1 four banks apart, so the 16-lane phase of every
 // LDS.64 at mma coordinates is 2-way conflicted.
 static constexpr int GST = 136;  // padded fp32 SMEM row stride (bank spread)
+
+// Scalar gate: `gg` and `dgo` are [T, H], one log-decay (and one gradient) per
+// (token, head), instead of the per-key-channel [T, H, 128]. That is Gated
+// DeltaNet's contract -- the same recurrence with a channel-constant gate.
+// k_prep and k_bwd stage a chunk's 64 gates in the gate plane's first padding
+// column (GST - DH = 8 spare words per row) and broadcast them while building
+// the cumulative plane, so everything downstream of the plane is untouched;
+// k_bwd reduces the per-channel gate gradient over the 128 channels before the
+// one store it makes. k_scan_t never reads the gate. A -D rather than a runtime
+// flag so the per-channel build compiles to the same machine code as before.
+#ifndef KDA_BWD_SCALAR_GATE
+#define KDA_BWD_SCALAR_GATE 0
+#endif
+//
+// The scalar build also drops the ANCHORED operands. The per-channel kernels
+// form every intra-chunk decay 2^(G_i - G_j), j <= i, as a product of a row
+// operand scaled by 2^(G_i - G_anchor) and a column operand scaled by
+// 2^(G_anchor - G_j), the anchor being a 16-row sub-block boundary. The second
+// factor is >= 1 and is bounded only by KDA's gate floor (15 tokens * 5 nats);
+// GDN's gate has no floor, and 2^(G_anchor - G_j) overflows a bf16 as soon as a
+// sub-block decays by more than ~88 nats. A scalar gate commutes with the
+// channel contraction, so here the products run on the RAW q/k tiles and the
+// decay is applied where it is a plain 2^(G_i - G_j) <= 1: on the 64x64 results
+// in k_prep (Aqk, M) and on the 64x64 operands dAqk / dAkk in k_bwd.
+// GLG(i) is row i's cumulative gate in log2 units, read from the plane.
+#define GLG(i) (sG[(i) * GST])
+
+// Those decays are differences of in-chunk prefix sums, and a prefix sum cannot
+// carry an arbitrarily large term: one gate of -1e8 (a hard reset, which GDN
+// allows) absorbs every later gate of its chunk in fp32. exp(g) is exactly zero
+// in fp32 below about -104, so a gate below GATE_FLOOR is staged as GATE_FLOOR:
+// same result, -inf becomes representable, and a 64-token prefix stays under
+// 2^14, where fp32 still resolves about 2e-3 (that is the spacing at the bound,
+// not a bound on the error the serial prefix adds accumulate). A NaN gate stays NaN.
+#if KDA_BWD_SCALAR_GATE
+static constexpr float GATE_FLOOR = -128.0f;
+__device__ __forceinline__ float
+gate_in(float g) {
+    return g < GATE_FLOOR ? GATE_FLOOR : g;
+}
+#endif
+
+// In the scalar build the host may hand k_scan_t three of its outputs on top of
+// three of its inputs (vnew = uu, dv2 = dvl, dhst = P; it does so on the 64-column
+// scan, see cuda_bwd_host._wide_scan), which takes 0.5 GiB off the workspace at
+// 16K tokens x 32 heads. It is safe because a scan CTA writes a
+// (chunk, value-slab) only after its own read of that same slab has landed --
+// cpasync_wait<1> at the top of the iteration -- no other CTA touches the slab,
+// and k_bwd reads only the outputs. Those parameters cannot stay __restrict__.
+#if KDA_BWD_SCALAR_GATE
+#define SCAN_ALIASED
+#else
+#define SCAN_ALIASED __restrict__
+#endif
+static_assert(GST - DH >= 1, "the scalar gate is staged in the gate plane's padding column");
 
 // ---------------------------------------------------------------- smem utils
 // bf16 tile stored row-major [ROWS][COLS] with the classic 128B xor swizzle.
@@ -592,12 +655,16 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
     const int e4o    = swz(e4r, e4c, 128);
     const int e4G    = e4r * GST + e4c;
     const size_t e4g = (size_t)e4r * gs + e4c;
+#if KDA_BWD_SCALAR_GATE
+    if (tid < 64) sG[tid * GST + DH] = (tid < L) ? gate_in(gg[(size_t)(t0 + tid) * H + h]) : 0.f;
+#else
     {
         const uint32_t gso = SMB + OFF_PG + (uint32_t)e4G * 4;
         const float* gsrc  = gg + base + e4g;
 #pragma unroll
         for (int i = 0; i < 4; ++i, gsrc += 16 * gs) cpasync16z(gso + i * (16u * GST * 4), gsrc, e4r + i * 16 < L);
     }
+#endif
     cpasync_commit();
     TilePlan<64, 128, PNT> pt;
     pt.init(tid, gs);
@@ -617,11 +684,16 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
         const int qd = tid >> 7, dd = tid & 127;
         float* sQ4 = sAf;  // free until the triangular solve
         float* gp  = sG + qd * 16 * GST + dd;
+#if KDA_BWD_SCALAR_GATE
+        const float* gsrc = sG + qd * 16 * GST + DH;  // the staged per-token gate, same for every channel
+#else
+        const float* gsrc = gp;
+#endif
         float r[16];
         float a = 0.f;
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            a += gp[i * GST];
+            a += gsrc[i * GST];
             r[i] = a;
         }
         sQ4[qd * 128 + dd] = a;
@@ -647,6 +719,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
     // ---- row operands: qr / kr scaled by 2^(G_i - ghat_{i/16})
     // The four sub-block anchors are the same rows the anchored-k chain below
     // needs, so they are read once here and carried into it.
+#if !KDA_BWD_SCALAR_GATE
     F4 anc[NSB], cf[NSB - 1];
 #pragma unroll
     for (int s = 0; s < NSB; ++s) anc[s] = ld4f(sG + (s * 16) * GST + e4c);
@@ -665,6 +738,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
         st4bf(sB1 + o, qv);
         st4bf(sB2 + o, kv);
     }
+#endif
 
     // ---- Aqk^T and M, one 16-row block at a time; warps 0-7 do Aqk, 8-15 do M.
     // All four anchored k operands are built first, so the four products need no
@@ -681,6 +755,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
     // remaining operands are reached by multiplying that chain factor in -- 40
     // exp2 and 60 shared wavefronts per thread become 28 and 24.  Every exponent
     // stays <= 0, so the chain can only underflow.
+#if !KDA_BWD_SCALAR_GATE
 #pragma unroll
     for (int s = 1; s < NSB; ++s)
 #pragma unroll
@@ -700,6 +775,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
             st4bf(sKC + s * (64 * 128) + o, kv);
         }
     }
+#endif
     __syncthreads();
     // Operand traffic per mma of a single-warp 16 x 8n tile with K=128 is
     // (4 + 8/n) KB per 8n mma: a one-tile-per-warp split pays 6 shared
@@ -713,8 +789,14 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
         constexpr int SWN[8] = {0, 0, 2, 0, 3, 0, 3, 6};  // first column tile
         constexpr int SWC[8] = {2, 2, 2, 3, 3, 3, 3, 2};  // tiles in the range
         const int sb = SWB[gw], n0 = SWN[gw], nc = SWC[gw];
+#if KDA_BWD_SCALAR_GATE
+        // Raw q/k rows against raw k: the decay goes onto the result below.
+        const bf16* Ab = (isQ ? sQ : sK) + sb * 16 * 128;
+        const bf16* Bb = sK + n0 * (8 * 128);
+#else
         const bf16* Ab = (isQ ? sB1 : sB2) + sb * 16 * 128;
         const bf16* Bb = sKC + sb * (64 * 128) + n0 * (8 * 128);
+#endif
         float ac[3][4];
         zero_acc<3>(ac);
         if (nc == 2)
@@ -732,6 +814,14 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
 #pragma unroll
             for (int rp = 0; rp < 2; ++rp) {
                 const int i = sb * 16 + (lane >> 2) + (rp << 3), r = rp * 2;
+#if KDA_BWD_SCALAR_GATE
+                // 2^(G_i - G_j) on the lower triangle. The entries above it are masked
+                // below; masking their EXPONENT here keeps them from forming exp2 of a
+                // large positive number, without clamping the live ones.
+                const float gi_ = GLG(i);
+                ac[t][r] *= ex2((j0 <= i) ? gi_ - GLG(j0) : 0.f);
+                ac[t][r + 1] *= ex2((j0 + 1 <= i) ? gi_ - GLG(j0 + 1) : 0.f);
+#endif
                 if (isQ)
                     *reinterpret_cast<uint32_t*>(sAqk + swz(i, j0, 64)) =
                         bf2((j0 <= i) ? ac[t][r] * scale : 0.f, (j0 + 1 <= i) ? ac[t][r + 1] * scale : 0.f);
@@ -1062,10 +1152,10 @@ static constexpr uint32_t O_GN = O_A + 64 * PCV * 2;
 template <int BV, int NT, bool SINGLE, bool FULL>
 __global__
 __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
-                                       const bf16* __restrict__ uu,
+                                       const bf16* SCAN_ALIASED uu,
                                        const bf16* __restrict__ kg,
-                                       const bf16* __restrict__ Pg,
-                                       const bf16* __restrict__ dvl,
+                                       const bf16* SCAN_ALIASED Pg,
+                                       const bf16* SCAN_ALIASED dvl,
                                        const bf16* __restrict__ dO,
                                        const float* __restrict__ gn2,
                                        const float* __restrict__ ist,
@@ -1075,9 +1165,9 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
                                        const int* __restrict__ seq_c0,
                                        const int* __restrict__ seq_nc,
                                        bf16* __restrict__ hst,
-                                       bf16* __restrict__ dhst,
-                                       bf16* __restrict__ vnew,
-                                       bf16* __restrict__ dv2o,
+                                       bf16* SCAN_ALIASED dhst,
+                                       bf16* SCAN_ALIASED vnew,
+                                       bf16* SCAN_ALIASED dv2o,
                                        float* __restrict__ dis,
                                        int T,
                                        int H) {
@@ -1431,6 +1521,9 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
     // the xor swizzle term is invariant: one address computation per plane, then
     // compile-time increments.
     const uint32_t SMB = sad(smem);
+#if KDA_BWD_SCALAR_GATE
+    if (tid < 64) sG[tid * GST + DH] = (tid < L) ? gate_in(gg[(size_t)(t0 + tid) * H + h]) : 0.f;
+#else
     {  // fp32 gate plane: 4 units per thread, 16 rows apart
         const int gr = tid >> 5, gc = (tid & 31) * 4;
         const uint32_t gso = SMB + OFF_G + (uint32_t)(gr * GST + gc) * 4;
@@ -1438,6 +1531,7 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
 #pragma unroll
         for (int i = 0; i < 4; ++i, gsrc += 16 * gs) cpasync16z(gso + i * (16u * GST * 4), gsrc, gr + i * 16 < L);
     }
+#endif
     cpasync_commit();
     TilePlan<64, 128, BNT> pt;
     pt.init(tid, gs);
@@ -1478,11 +1572,16 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
         // the gate plane is written once instead of twice and the read-back's
         // dependent add chain (6.5% of this kernel's stalls) disappears.
         float* gp = sG + qd * 16 * GST + dd;
+#if KDA_BWD_SCALAR_GATE
+        const float* gsrc = sG + qd * 16 * GST + DH;  // the staged per-token gate, same for every channel
+#else
+        const float* gsrc = gp;
+#endif
         float r[16];
         float a = 0.f;
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            a += gp[i * GST];
+            a += gsrc[i * GST];
             r[i] = a;
         }
         sQ4[qd * 128 + dd] = a;
@@ -1512,8 +1611,17 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
             for (int rp = 0; rp < 2; ++rp) {
                 const int i = i0 + rp * 8, r = rp * 2;
                 const float v0 = dAq[j][r] * scale, v1 = dAq[j][r + 1] * scale;
+#if KDA_BWD_SCALAR_GATE
+                // dAqk carries 2^(G_i - G_j) itself, so the B6 sweeps contract it
+                // with the raw k and q tiles. The diagonal's factor is 1.
+                const float gi_ = GLG(i);
+                *reinterpret_cast<uint32_t*>(sdAqk + o0 + rp * (8 * 64)) =
+                    bf2((c0 < i) ? v0 * ex2((c0 < i) ? gi_ - GLG(c0) : 0.f) : 0.f,
+                        (c0 + 1 < i) ? v1 * ex2((c0 + 1 < i) ? gi_ - GLG(c0 + 1) : 0.f) : 0.f);
+#else
                 *reinterpret_cast<uint32_t*>(sdAqk + o0 + rp * (8 * 64)) =
                     bf2((c0 < i) ? v0 : 0.f, (c0 + 1 < i) ? v1 : 0.f);
+#endif
                 if (c0 == i) sDiag[i] = v0;
                 if (c0 + 1 == i) sDiag[i] = v1;
             }
@@ -1765,8 +1873,15 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
 #pragma unroll
             for (int rp = 0; rp < 2; ++rp) {
                 const int i = i0 + rp * 8;
+#if KDA_BWD_SCALAR_GATE
+                const float gi_ = GLG(i);  // same folding as dAqk
+                *reinterpret_cast<uint32_t*>(sdAkk + o0 + rp * (8 * 64)) =
+                    bf2((c0 < i) ? -xacc[j][rp * 2] * ex2((c0 < i) ? gi_ - GLG(c0) : 0.f) : 0.f,
+                        (c0 + 1 < i) ? -xacc[j][rp * 2 + 1] * ex2((c0 + 1 < i) ? gi_ - GLG(c0 + 1) : 0.f) : 0.f);
+#else
                 *reinterpret_cast<uint32_t*>(sdAkk + o0 + rp * (8 * 64)) =
                     bf2((c0 < i) ? -xacc[j][rp * 2] : 0.f, (c0 + 1 < i) ? -xacc[j][rp * 2 + 1] : 0.f);
+#endif
             }
         }
     }
@@ -1851,8 +1966,21 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
         // anchor registers instead of 32.
         const int bm = tid >> 7, bq = (tid >> 5) & 3, bc = (tid & 31) << 2;
         const int rq = bm * 16 + bq * 4;
-        const F4 aS  = ld4f(sG + (bm * 16) * GST + bc);
-        const F4 aE  = ld4f(sG + (bm * 16 + 15) * GST + bc);
+#if KDA_BWD_SCALAR_GATE
+        // dAqk / dAkk already carry the decay, so the row sweep reads k and the
+        // column sweep reads q straight from their tiles; only k*beta is built.
+#pragma unroll
+        for (int u4 = 0; u4 < 4; ++u4) {
+            const int i = rq + u4, o = swz(i, bc, 128);
+            F4 kb         = ld4bf(sK + o);
+            const float b = sBeta[i];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) kb.v[t] *= b;
+            st4bf(sScr2 + o, kb);
+        }
+#else
+        const F4 aS = ld4f(sG + (bm * 16) * GST + bc);
+        const F4 aE = ld4f(sG + (bm * 16 + 15) * GST + bc);
 #pragma unroll
         for (int u4 = 0; u4 < 4; ++u4) {
             const int i = rq + u4, o = swz(i, bc, 128);
@@ -1871,17 +1999,18 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
             st4bf(sQcb + o, qv);
             st4bf(sScr2 + o, kb);
         }
+#endif
     }
     __syncthreads();
     {  // row sweep: t ascending, anchor moves 16t -> 16(t+1)
         const LdA A1      = a0_addr<64>(sdAqk, lane);
         const uint32_t dA = sad(sdAkk) - sad(sdAqk);
-        const LdA B       = b1_addr_p<128>(sScr, lane);
+        const LdA B       = b1_addr_p<128>(KDA_BWD_SCALAR_GATE ? sK : sScr, lane);
         float2 gp[TB::TPW];
 #pragma unroll
         for (int j = 0; j < TB::TPW; ++j) gp[j] = *reinterpret_cast<const float2*>(sG + bd0[j]);
         for (int t = 0; t <= bmi; ++t) {
-            if (t) {
+            if (t && !KDA_BWD_SCALAR_GATE) {
 #pragma unroll
                 for (int j = 0; j < TB::TPW; ++j) {
                     const float2 gc = *reinterpret_cast<const float2*>(sG + (16 * t) * GST + bd0[j]);
@@ -1915,13 +2044,14 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
         // Both products land in one accumulator; only their sum is ever used.
         const LdA A1      = a1_addr<64>(sdAqk, lane);
         const uint32_t dA = sad(sdAkk) - sad(sdAqk);
-        const LdA B1      = b1_addr_p<128>(sQcb, lane);
-        const uint32_t dB = sad(sScr2) - sad(sQcb);
+        const bf16* sQop  = KDA_BWD_SCALAR_GATE ? sQ : sQcb;
+        const LdA B1      = b1_addr_p<128>(sQop, lane);
+        const uint32_t dB = sad(sScr2) - sad(sQop);
         float2 gp[TB::TPW];
 #pragma unroll
         for (int j = 0; j < TB::TPW; ++j) gp[j] = *reinterpret_cast<const float2*>(sG + 63 * GST + bd0[j]);
         for (int u = 3; u >= bmi; --u) {
-            if (u < 3) {
+            if (u < 3 && !KDA_BWD_SCALAR_GATE) {
 #pragma unroll
                 for (int j = 0; j < TB::TPW; ++j) {
                     const float2 gc = *reinterpret_cast<const float2*>(sG + (16 * u + 15) * GST + bd0[j]);
@@ -1972,8 +2102,16 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
                 const float2 kv = un2(*reinterpret_cast<const uint32_t*>(sK + o));
                 const float2 qv = un2(*reinterpret_cast<const uint32_t*>(sQ + o));
                 const float b = bt[rp], dg = dgd[rp];
+#if KDA_BWD_SCALAR_GATE
+                // The sweeps contracted decay-carrying dAqk / dAkk with raw operands.
+                const float rf0 = 1.f, rf1 = 1.f, cf0 = 1.f, cf1 = 1.f;
+                (void)gA;
+                (void)gZ;
+                (void)gi;
+#else
                 const float rf0 = ex2(gi.x - gA.x), rf1 = ex2(gi.y - gA.y);
                 const float cf0 = ex2(gZ.x - gi.x), cf1 = ex2(gZ.y - gi.y);
+#endif
                 const float dqx0 = a1[j][r0] * rf0, dqx1 = a1[j][r0 + 1] * rf1;
                 const float dl0 = a2[j][r0] * rf0, dl1 = a2[j][r0 + 1] * rf1;
                 const float c = dl0 * kv.x + dl1 * kv.y;
@@ -2039,6 +2177,35 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
             r[i] = sp[i * GS2];
             tot += r[i];
         }
+#if KDA_BWD_SCALAR_GATE
+        // The gate is one value per token, so its gradient is the per-channel one
+        // summed over the 128 channels -- and the reverse cumsum is linear, so the
+        // channels are reduced FIRST and the cumsum then runs on 64 scalars. Each
+        // warp holds 32 channels of one 16-row segment: five shuffles per row, one
+        // partial per (warp, row), four partials per row, then a suffix sum.
+        (void)tot;
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+#pragma unroll
+            for (int o = 16; o; o >>= 1) r[i] += __shfl_xor_sync(0xffffffffu, r[i], o);
+        __syncthreads();
+        if (lane == 0) {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) sR4[warp * 16 + i] = r[i];
+        }
+        __syncthreads();
+        float* sRow = sR4 + BNW * 16;
+        if (tid < 64) {
+            const int w0 = (tid >> 4) * 4, i = tid & 15;
+            sRow[tid] = sR4[w0 * 16 + i] + sR4[(w0 + 1) * 16 + i] + sR4[(w0 + 2) * 16 + i] + sR4[(w0 + 3) * 16 + i];
+        }
+        __syncthreads();
+        if (tid < 64 && tid < L) {
+            float a = 0.f;
+            for (int t = 63; t >= tid; --t) a += sRow[t];
+            dgo[(size_t)(t0 + tid) * H + h] = a;
+        }
+#else
         __syncthreads();
         sR4[qd * 128 + dd] = tot;
         __syncthreads();
@@ -2050,6 +2217,7 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
             a += r[i];
             if (qd * 16 + i < L) *dp = a;
         }
+#endif
     }
     // sRed was published before the two barriers of the reverse cumsum above.
     if (tid < 64 && tid < L) dbeta[(size_t)(t0 + tid) * H + h] = sRed[tid];
