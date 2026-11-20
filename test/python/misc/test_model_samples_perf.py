@@ -2862,10 +2862,10 @@ def asked(*_):
     sys.exit(0)
 
 
-with open(os.path.join(here, "calls.log"), "a") as log:
-    log.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:]}) + "\\n")
 now = scenario()
 signal.signal(signal.SIGTERM, signal.SIG_IGN if now.get("deaf") else asked)
+with open(os.path.join(here, "calls.log"), "a") as log:
+    log.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:]}) + "\\n")
 if now.get("unbound"):
     import ctypes
 
