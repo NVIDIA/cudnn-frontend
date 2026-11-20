@@ -23,6 +23,7 @@ from cudnn.tensor_adapter import detect_framework, framework_dtype
 from ..backend_utils import block_scaled_sfd_tensors, row_major_layout
 from ..canonical import is_canonical_b, is_flat_sf
 from ..glu._blockscaled_api import GroupedGemmGluBlockScaledAPI
+from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 
 _JAX_SF_LAYOUT_ERROR = (
     "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
@@ -54,6 +55,9 @@ class GroupedGemmSwigluSm100(GroupedGemmGluBlockScaledAPI):
         >>> api.execute(..., stream)
     """
 
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("nvfp4", "mxfp8")
+
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -80,6 +84,7 @@ class GroupedGemmSwigluSm100(GroupedGemmGluBlockScaledAPI):
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         """Initialize the GroupedGemmSwigluSm100 API.
 
@@ -103,6 +108,7 @@ class GroupedGemmSwigluSm100(GroupedGemmGluBlockScaledAPI):
         :param sf_vec_size: Scale factor vector size
         :param vector_f32: Use vectorized f32 operations
         :param m_aligned: Alignment for group M dimension
+        :param glu_layout: Persistent B, SFB, and C branch order: interleaved_32 or gate_then_up.
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor. Only applies when already output scale factor tensors are provided.
         """
         framework = detect_framework(sample_a)
@@ -133,6 +139,7 @@ class GroupedGemmSwigluSm100(GroupedGemmGluBlockScaledAPI):
             m_aligned=m_aligned,
             discrete_col_sfd=discrete_col_sfd,
             act_func="swiglu",
+            glu_layout=glu_layout,
         )
 
     def execute(
@@ -216,6 +223,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    glu_layout: str = "interleaved_32",
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM SwiGLU forward operation.
 
@@ -258,6 +266,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor. Only applies when already output scale factor tensors are provided.
         current_stream: CUDA stream
+        glu_layout: Persistent B, SFB, and C branch order: interleaved_32 or gate_then_up.
 
     Returns:
         TupleDict: A dictionary-like object containing output tensors that can also be unpacked as a tuple.
@@ -282,8 +291,11 @@ def grouped_gemm_swiglu_wrapper_sm100(
                 # Integer indexing
                 c = result[0]  # c_tensor
     """
+    glu_layout = validate_glu_layout(glu_layout)
     framework = detect_framework(a_tensor)
     if framework == "jax":
+        if glu_layout != "interleaved_32":
+            raise ValueError("JAX SwiGLU does not support glu_layout=gate_then_up")
         from cudnn.frost.buffers import cutedsl_requirement_error
 
         requirement = cutedsl_requirement_error("grouped_gemm_swiglu")
@@ -327,6 +339,8 @@ def grouped_gemm_swiglu_wrapper_sm100(
         l, n, _ = b_tensor.shape
     else:
         n, _, l = b_tensor.shape
+    if glu_layout == "gate_then_up" and n % 256:
+        raise NotImplementedError("gate_then_up SwiGLU requires each gate/up branch N divisible by 128; padding is not implicit")
     n_out = n // 2  # After SwiGLU
 
     # Canonical (sum_m, k) A selects natural-shaped outputs: (m, x) row-major C/D and
@@ -380,6 +394,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
 
     cache_key = (
+        glu_layout,
         a_tensor.device,
         use_full_dynamic,
         a_tensor.shape[1:] if not use_full_dynamic else None,
@@ -466,6 +481,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             vector_f32=vector_f32,
             m_aligned=m_aligned,
             discrete_col_sfd=discrete_col_sfd,
+            glu_layout=glu_layout,
         )
 
         assert grouped_gemm_swiglu.check_support(), "Unsupported configuration"
@@ -499,3 +515,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
     )
+
+
+grouped_gemm_swiglu_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_swiglu_wrapper_sm100.supports_gate_then_up_precisions = GroupedGemmSwigluSm100.supports_gate_then_up_precisions

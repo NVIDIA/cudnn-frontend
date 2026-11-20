@@ -109,8 +109,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             raise ValueError("Provide either sample_wgrad for dense mode or " "(num_experts, wgrad_shape, wgrad_dtype) for discrete mode, but not both")
 
         self._interpret_uint8_as_fp4x2 = True
-        self.sample_a_tensor = sample_a if self._is_fp4x2(sample_a) else None
-        self.sample_b_tensor = sample_b if self._is_fp4x2(sample_b) else None
+        # Empty packed tensors have no compact layout to infer from DLPack (and
+        # torch's empty dim_order may ignore their strides). Compile their token
+        # dimension symbolically from the descriptors, as for the FP8 path.
+        self.sample_a_tensor = sample_a if self._is_fp4x2(sample_a) and sample_a.numel() else None
+        self.sample_b_tensor = sample_b if self._is_fp4x2(sample_b) and sample_b.numel() else None
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
         self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
