@@ -3590,10 +3590,7 @@ def test_the_sampler_is_a_child_process_whose_loops_end_with_its_pipe(monkeypatc
     sampler.stop()  # a second stop finds nothing to do
     # the run is gone without a stop: its end of the pipe closes, and the keeper ends the loops
     gone = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
-    started = gone.start()
-    assert started == ""
-    _wait(lambda: len(loops()) == 4)
-    left = [call["pid"] for call in loops()][2:]
+    left = begun(gone, 4)  # both loops writing: a loop that is asked to end before it has its handler ends by the default action
     gone.child.stdin.close()
     _wait(lambda: not any(_running(pid) for pid in left))
     ended_with = gone.child.wait(timeout=30)
@@ -3601,10 +3598,7 @@ def test_the_sampler_is_a_child_process_whose_loops_end_with_its_pipe(monkeypatc
     gone.folder.cleanup()
     # the keeper is ended from outside: the loops end with it, and a stop behind it reads what there is
     ended = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
-    started = ended.start()
-    assert started == ""
-    _wait(lambda: len(loops()) == 6)
-    last = [call["pid"] for call in loops()][4:]
+    last = begun(ended, 6)
     ended.child.terminate()
     _wait(lambda: not any(_running(pid) for pid in last))
     assert set(last) <= _asked(folder), "the keeper took the signal and ended its loops in order"
