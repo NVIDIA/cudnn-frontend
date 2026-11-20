@@ -29,9 +29,13 @@ def frost_qsa_fprop_sm107(
     mode,
     scale: cutlass.Float32,
     group_size: cutlass.Constexpr[int],
+    serial: cutlass.Constexpr[bool],
 ):
     if cutlass.const_expr(mode is None):
         _fprop_body(q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size)
+    elif cutlass.const_expr(not serial):
+        if mode[cutlass.Int64(cute.arch.block_idx()[0] // 128)] != 0:
+            _fprop_body(q_desc, k_desc, v_desc, k_contiguous_desc, v_contiguous_desc, out, out_fp32, lse, ids, counts, lo, hi, first, last, scale, group_size)
     else:
         first_query = cute.arch.block_idx()[0] * 8
         if first_query < out.shape[0]:

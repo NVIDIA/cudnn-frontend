@@ -31,7 +31,9 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 import cutlass.experimental.cuda.tensor_map as tma
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common import gate_bwd, head_reduce, split_k
@@ -862,7 +864,7 @@ def build_warmup_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        warmup_backward_cache[key] = cute.compile(
+        warmup_backward_cache[key] = compile_cached(
             warmup_backward_host,
             facts.split,
             facts.b_t,
@@ -926,6 +928,8 @@ def build_warmup_backward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_warmup_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_backward_cache[key]
@@ -977,7 +981,8 @@ def run_warmup_backward(
     ragged_buffers=(),
 ) -> None:
     """Replay the warmup or uncut backward: one crossing into the DSL for the table, prologue and bprop launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
@@ -2035,7 +2040,7 @@ def build_regenerate_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        regenerate_backward_cache[key] = cute.compile(
+        regenerate_backward_cache[key] = compile_cached(
             regenerate_backward_host,
             facts.split,
             facts.b_t,
@@ -2110,6 +2115,8 @@ def build_regenerate_backward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, "regenerate", key)),
+            symbol="frost_la_mamba2_regenerate_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return regenerate_backward_cache[key], facts
@@ -2169,7 +2176,8 @@ def run_regenerate_backward(
     ragged_buffers=(),
 ) -> None:
     """Replay the regenerate backward: one crossing into the DSL for the table, prologue, recompute and bprop launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
@@ -2467,7 +2475,7 @@ def build_summary_backward(
                 from_dlpack(buffers["dstate_in"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["dstate_in"] is not None else None,
                 from_dlpack(buffers["dstate0"], assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        summary_backward_cache[key] = cute.compile(
+        summary_backward_cache[key] = compile_cached(
             summary_backward_host,
             int(b_t),
             io_dtype,
@@ -2492,6 +2500,8 @@ def build_summary_backward(
             from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
             *tail_constexprs,
             *tail_placeholders,
+            cache_key=repr((__name__, "summary", key)),
+            symbol="frost_la_mamba2_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return summary_backward_cache[key]
@@ -2522,7 +2532,8 @@ def run_summary_backward(
     tail_buffers=(),
 ) -> None:
     """Replay the backward summary: one crossing into the DSL for the prologue and kernel launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         float(dt_min),
         float(dt_max),
         q,

@@ -51,5 +51,8 @@ The SM100 d=256 MXFP8 kernels (``sm100/d256_mxfp8/dq``,
 ``sm100/d256_mxfp8/dkdv``, their shared ``masks`` / ``common`` helpers
 and the ``sf_repack`` scale-factor repack in the same directory) are the exception:
 ported CuTe DSL kernel CLASSES that specialize through their constructors, so
-they are ordinary importable modules with no template parameters.
+they are ordinary importable modules with no template parameters. So are the
+SM100 / SM103 D128 MXFP8 chain kernels (``sm100/d128_mxfp8/prep``, ``dkdv``
+and ``dq``, their shared ``common`` helpers and the ``chain`` launcher), which
+specialize on the plan-time ``geometry`` in the same directory.
 """

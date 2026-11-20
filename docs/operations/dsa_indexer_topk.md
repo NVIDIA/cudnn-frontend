@@ -5,9 +5,9 @@ SM103a, and SM107a. It requires CUDA Toolkit 13.4 or newer. Kernels compile
 on first use; warm the geometry before CUDA graph capture.
 
 ```python
-from cudnn.ops import dsa_indexer_topk_forward
+from cudnn.ops.dsa import indexer_top_k_forward
 
-indices, scores = dsa_indexer_topk_forward(q, k, weights, cu_q, cu_k, top_k=2048)
+indices, scores = indexer_top_k_forward(q, k, weights, cu_q, cu_k, top_k=2048)
 ```
 
 The result is `TupleDict(indices=..., scores=...)`. This is a selection
@@ -52,7 +52,7 @@ No dense `[Tq, Tk]` score matrix is materialized.
 The wrapper allocates omitted outputs and workspace. Supply `indices`,
 `scores`, and `workspace` to avoid device allocations after warmup.
 Outputs are contiguous, 16-byte-aligned `[Tq, top_k]` INT32/FP32 tensors.
-Use `dsa_indexer_topk_workspace_size(Tq, Tk, B, top_k, ratio=ratio, device=device)`
+Use `indexer_top_k_workspace_size(Tq, Tk, B, top_k, ratio=ratio, device=device)`
 to size a contiguous, 256-byte-aligned UINT8 workspace. Its size includes
 the launch ticket and storage for unread ABI operands. Outputs, scratch,
 and inputs must not overlap. Concurrent calls need separate scratch.

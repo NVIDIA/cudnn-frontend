@@ -30,6 +30,9 @@ navigation:
         path: ../../operations/Attention.md
         slug: operations/Attention
         contents:
+          - page: JAX SDPA Python frontend (experimental)
+            path: ../../operations/sdpa_jax.md
+            slug: jax_sdpa
           - page: Ahead-of-time Attention (SM120 C/C++)
             path: ../../operations/attention/aot_sm120_attention.md
             slug: aot_sm120_attention
@@ -39,6 +42,9 @@ navigation:
           - page: Attention Gate + Quantize Decode Step (SM100-class)
             path: ../../operations/attention/gate_quant_decode.md
             slug: gate_quant_decode
+          - page: Attention Preparation Decode Step (SM100-class)
+            path: ../../operations/attention/attention_prepare_decode.md
+            slug: attention_prepare_decode
           - page: Compact GQA backward (SM107)
             path: ../../operations/attention/compact_gqa_backward.md
             slug: compact_gqa_backward
@@ -67,6 +73,9 @@ navigation:
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../operations/sparse_attention/dsa.md
             slug: dsa
+          - page: Pooled DSA
+            path: ../../operations/sparse_attention/pooled_dsa.md
+            slug: pooled_dsa
           - section: Query Sparse Attention (QSA)
             path: ../../operations/sparse_attention/qsa.md
             slug: qsa
@@ -104,6 +113,9 @@ navigation:
           - page: NVFP4 block-scale conversion
             path: ../../operations/block_scaling/nvfp4_block_scale_conversion.md
             slug: nvfp4_block_scale_conversion
+          - page: FP4 Row Quantization Decode Step (SM100-class)
+            path: ../../operations/block_scaling/row_quantize_fp4_decode.md
+            slug: row_quantize_fp4_decode
       - section: Causal Conv1d
         path: ../../operations/CausalConv1d.md
         slug: operations/CausalConv1d
@@ -227,6 +239,9 @@ navigation:
           - page: Shared-Expert Decode Pair (SM100-class)
             path: ../../operations/moe/shared_expert_decode.md
             slug: shared_expert_decode
+          - page: CuTe MoK (SM100 / SM103)
+            path: ../../operations/cutemok.md
+            slug: cutemok
       - section: Normalizations
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
@@ -320,6 +335,9 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
+          - page: 'C++ launcher: repeated calls launched from C++'
+            path: ../../utilities/cpp_launcher.md
+            slug: cpp_launcher
   - section: Developer Guide
     slug: developer
     contents:

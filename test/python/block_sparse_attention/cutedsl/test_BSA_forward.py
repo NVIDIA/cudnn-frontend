@@ -1039,16 +1039,15 @@ def _require_fa4():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "dtype, block_sparse_num",
-    # The 16-bit type is independent of the list length: it alternates over the counts.
-    [(torch.float16 if count % 2 else torch.bfloat16, count) for count in (1, 2, 3, 4, 5)],
-)
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16"))
+@pytest.mark.parametrize("block_sparse_num", (1, 2, 3, 4, 5))
 @torch_fork_set_rng(seed=20)
-def test_sm120_blk128_fixed_topk(dtype, block_sparse_num):
-    """Cover fixed top-k 1-5, GQA, partial Q, and query-dependent KV selections."""
+def test_sm120_blk128_fixed_topk(dtype, block_sparse_num, monkeypatch):
+    """Pin the FA4 caller and replay changed dense KV/selection through its inherited loader."""
     ops = import_bsa(families=(12,), reason="FA4-style blk128 forward is specific to SM120")
     _require_fa4()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface.bsa_attn_fwd, "compile_cache", {})
     block_size = 128
     batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 6 * block_size, 128
     q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=dtype)
@@ -1073,6 +1072,27 @@ def test_sm120_blk128_fixed_topk(dtype, block_sparse_num):
     o_ref, lse_ref = attention_reference(q, k, v, mask)
     torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+    cache = interface.bsa_attn_fwd.compile_cache
+    assert len(cache) == 1 and next(iter(cache))[0] == "sm120_blk128_fa4"
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("the warmed FA4 plan must replay without compiling")
+
+    monkeypatch.setattr(interface.cute, "compile", unexpected_compile)
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            with no_host_sync():
+                captured = ops.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num=block_sparse_num, sparse_block_size=block_size)
+        # Keep storage fixed while changing both V and the selected KV blocks.
+        v.neg_()
+        q2k.add_(1).remainder_(6)
+        mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+        changed_o, changed_lse = attention_reference(q, k, v, mask)
+        captured["o_tensor"].fill_(float("nan"))
+        captured["lse_tensor"].fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(captured["o_tensor"].float(), changed_o, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(captured["lse_tensor"], changed_lse, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0

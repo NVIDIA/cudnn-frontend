@@ -833,6 +833,15 @@ treatment at the caller boundary.**
   Exercise earlier supported versions in both default-planning and explicit
   replay tests, and do not version-skip their numerical detector. The SM90
   ragged-backward cases in `test_sdpa_bwd_backend_guard.py` cover this boundary.
+- **Configuration-specific backend defects need a plan guard.** Preserve the
+  same engine's valid knobs. Filter concrete enumeration records, check explicit
+  replay after the backend resolves missing knobs, and prevent an opaque
+  delegator or custom ranking from restoring the rejected configuration.
+  Check resolved records at planning/build time, without adding execute-time
+  validation or querying knobs for families without a guard. Detector:
+  `sdpa/frost/test_sdpa_fp8_backend_split_guard.py`, including raw-backend
+  numerical controls and an exact constant-V output oracle; correct Stats alone
+  do not establish a correct FP8 split output.
 - **Provider support is not graph invalidity.** A layout a FROST engine cannot
   run may still be valid for the backend. Preserve its graph facts and let the
   provider's matcher decline it; returning an empty `invalid` fact record can
@@ -1036,6 +1045,9 @@ different path; do not infer a slicing guarantee from it. Detector:
 `TestNativeHalfStrides::test_physical_wide_stride` in the SM100/SM107 forward
 suites physically allocates a wide batch stride and checks output and replay,
 including D256 SwapAB decode at one query row.
+Wide-index fixes can increase register pressure. Retain the wide indexing and
+rerun spill checks for each admitted form and dtype. The SM107 D256 decode
+spill probe checks both half precisions at the 96-register limit.
 
 Widen operands before triangular workspace products, in both producer and
 consumer. Widening an already-overflowed offset cannot recover it. Derive tile
@@ -1170,6 +1182,32 @@ it reads the outputs. Detector: `test_dependent_that_waits_reads_the_eager_bytes
 (SwiGLU FP4 decode suite: a waiting dependent behind the entry copies the
 outputs, eager and captured); the rendering pin counts one
 `launch_dependents`.
+
+**The pairing order of a block reduction is part of a kernel's bytes.** A sum
+over a thread block is a tree of fp32 additions. Pairing the lanes of a warp
+with the shuffle offsets 1, 2, 4, 8, 16 or with 16, 8, 4, 2, 1 gives totals
+that differ in the last bit on some rows, and at EITHER level alone: a body
+that is right inside the warp and wrong over the warp sums passes every row
+whose mass sits in one warp. Spell a row reduction through
+`tile_dsl.rowwise.block_reduce`, whose `order` has no default, and name the
+order in the entry's text. Detector: `test_block_sum_is_the_documented_tree`
+in `test/python/sdpa/frost/test_tile_dsl_rowwise.py` compares every lane with
+a host replay of the tree on three row classes (all mass in one warp, one
+non-zero lane per warp, a full row), each shown to tell a wrong level apart;
+the rendering pin of the same module reads the shuffle offsets in program
+order.
+
+**`redux.sync.max.f32` assembles for compute capability 10.x targets only.**
+The single-instruction fp32 warp maximum is rejected by the assembler for
+`sm_90a`, `sm_110a`, `sm_120a` and `sm_121a` (`Instruction 'redux.f32' not
+supported`); the integer forms assemble there. A kernel that may be admitted
+on such a target takes its warp maximum from a helper that carries the
+shuffle arm. `tile_dsl.rowwise.block_reduce` (`kind="max"`, `"max_index"`)
+chooses by a positive list, so a target nobody named gets the arm that
+assembles everywhere. Detector: `test_rendering_of_every_primitive[sm_120a]`
+(ten shuffles with ten `max.f32`, no `redux.sync.max.f32`) and
+`test_shuffle_arm_is_the_redux_arm` (the two arms bitwise equal on a
+compute-capability-10.x device).
 
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
@@ -1367,7 +1405,7 @@ jitted functions on non-default devices with changed inputs and gradients (see
 
 1. Kernel package under the closest existing family (layout above).
 2. Public functions in `api.py`.
-3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family); register any new package dir in `pyproject.toml` packages list.
+3. Exports: `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py` (or `python/cudnn/ops/<family>/__init__.py` for an op in a family). A new package directory under `python/cudnn/` needs no registration: `pyproject.toml` finds packages (`include = ["cudnn*", ...]`, namespace packages on).
 4. Docs: page under `docs/operations/<family>/`, listed in `docs/fern/versions/latest.yml` and linked from `docs/operations/overview.md`.
 5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
 6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.

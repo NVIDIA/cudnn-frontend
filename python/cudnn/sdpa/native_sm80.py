@@ -2,6 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Declaration-only SM80 native addressing contract shared by graph and adapters."""
 
+# The parts the SM80 rows serve: the A100 the kernels were written for, and the GA10x / AD10x parts that run the same
+# sm_80 binaries under a smaller per-CTA shared-memory budget (the opt-in limits, bytes).
+DENSE_CU_PARTS = frozenset({(8, 0)})
+SM80_ROW_PARTS = ((8, 0), (8, 6), (8, 9))
+# The parts the SM80 backward row serves itself; cc 8.9 backward has its own rows (``sdpa_bwd_sm89``).
+SM80_BACKWARD_PARTS = ((8, 0), (8, 6))
+SMEM_OPTIN_BYTES = {(8, 0): 166912, (8, 6): 101376, (8, 9): 101376}
+
+
+def smem_budget_bytes(device_cc):
+    """Opt-in dynamic shared memory per CTA on an SM80-row part; None off those parts."""
+    return None if device_cc is None else SMEM_OPTIN_BYTES.get(tuple(device_cc))
+
+
+def part_mismatch(device_cc, what, parts=SM80_ROW_PARTS):
+    if device_cc is not None and tuple(device_cc) in parts:
+        return None
+    major, minor = device_cc
+    names = [f"SM{a}{b}" for a, b in parts]
+    return f"{what} requires {', '.join(names[:-1])} or {names[-1]}; found SM{major}{minor}"
+
 
 def data_layout_mismatch(name, shape, stride, *, thd=False):
     from cudnn.sdpa.graph_analyzer import dense_layout_ok
@@ -78,6 +99,13 @@ def graph_mismatch(facts, _version=None):
         )
         if reason is not None:
             return reason
+        budget = smem_budget_bytes(facts.device_cc) if facts.device_cc is not None and tuple(facts.device_cc) in SM80_BACKWARD_PARTS else None
+        if budget is not None:
+            from cudnn.sdpa.bwd.config_sm80 import backward_smem_mismatch
+
+            reason = backward_smem_mismatch(facts.d_qk, facts.d_v, budget)
+            if reason is not None:
+                return reason
         if facts.has_bias != facts.has_dbias:
             return "SM80 bias and dbias must both be declared for native backward"
         if facts.has_sink != facts.has_dsink:

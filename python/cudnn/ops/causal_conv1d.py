@@ -284,6 +284,19 @@ def _tensor_plan_signature(tensor: Optional[Tensor]):
     )
 
 
+def _per_sequence_plan_signature(tensor: Optional[Tensor]):
+    """Plan signature of a packed per-sequence operand, without its runtime N extent."""
+
+    if tensor is None:
+        return None
+    return (
+        tuple(tensor.shape[1:]),
+        tuple(tensor.stride()[1:]),
+        tensor.dtype,
+        tensor.device,
+    )
+
+
 def _causal_conv1d_training_key(
     x_btd: Tensor,
     weight: Tensor,
@@ -296,23 +309,25 @@ def _causal_conv1d_training_key(
     """Key every plan-time field consumed by the exact-shape training backend.
 
     The routed backend is fixed to BF16 width-four SiLU. Tensor signatures key
-    its remaining specializations: dense versus packed presence, packed N,
-    bias and state presence, final-state output, shapes, strides, dtypes, and
-    device. Device properties key the architecture-dependent schedule, and the
-    torch deterministic-algorithms mode keys the dweight schedule. Runtime
-    ``cu_seqlens`` values are intentionally absent because the kernel consumes
-    them on device.
+    its remaining specializations: dense versus packed presence, bias and
+    state presence, final-state output, shapes, strides, dtypes, and device.
+    Device properties key the architecture-dependent schedule, and the torch
+    deterministic-algorithms mode keys the dweight schedule. Packed N
+    (``cu_seqlens`` length and the state leading extent) and ``cu_seqlens``
+    values are intentionally absent: the plan reads both at run time, so a
+    varying sequence count per microbatch reuses one plan.
     """
 
     properties = torch.cuda.get_device_properties(x_btd.device)
+    state_signature = _tensor_plan_signature if cu_seqlens is None else _per_sequence_plan_signature
     return (
         "bf16-width4-silu",
         "packed" if cu_seqlens is not None else "dense",
         _tensor_plan_signature(x_btd),
         _tensor_plan_signature(weight),
         _tensor_plan_signature(bias),
-        _tensor_plan_signature(cu_seqlens),
-        _tensor_plan_signature(initial_state),
+        _per_sequence_plan_signature(cu_seqlens),
+        state_signature(initial_state),
         bool(output_final_state),
         bool(deterministic),
         (properties.major, properties.minor),

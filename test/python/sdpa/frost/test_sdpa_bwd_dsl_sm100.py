@@ -712,7 +712,7 @@ def test_capabilities_match_what_is_implemented():
     assert not c.padded, "DENSE padding masks: the kernel compiles a scalar length; THD carries its own"
     assert not c.bias and not c.dbias and not c.sink and not c.dsink
     assert c.deterministic, "the chain has no atomics; a deterministic request is served as is"
-    assert c.sm_lo == 100 and c.sm_hi == 103
+    assert c.sm_lo == 100 and c.sm_hi == 103 and c.sm_extra == frozenset({110})
 
 
 @requires_pre_rubin_blackwell

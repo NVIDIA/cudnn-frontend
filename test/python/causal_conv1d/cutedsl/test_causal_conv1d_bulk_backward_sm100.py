@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from cudnn._causal_conv1d_arch import F32X2_COMPUTE_CAPABILITIES, is_functional_arch
-from causal_conv1d.cutedsl.reference import causal_conv1d_bulk_reference
+from causal_conv1d.cutedsl.causal_conv1d_reference import causal_conv1d_bulk_reference
 
 pytestmark = pytest.mark.L1
 

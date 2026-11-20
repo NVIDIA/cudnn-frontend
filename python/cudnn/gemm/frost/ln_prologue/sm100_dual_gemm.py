@@ -183,6 +183,18 @@ if _DUAL:
         raise ValueError(
             f"{__name__}: the accumulators arm keeps every K stage of a tile resident: K={_K} must be a multiple of 64 and at most {64 * ab_stages}"
         )
+
+
+def _cuda12_compiler() -> bool:
+    """Whether the DSL compiles with its CUDA 12 toolkit flavour (the cu12 wheel's embedded CUDA 12.9 ptxas)."""
+    from cutlass.base_dsl.version_info import CUDA_VERSION
+
+    return int(CUDA_VERSION.major) < 13
+
+
+# On the CUDA 12 compiler, ptxas -O2 reduces the risk of register spills for the output-stage c 128 register-form rendering.
+if _DUAL and _K == 128 and not _LN_SMEM and _cuda12_compiler():
+    frost_compile_options += " --ptxas-options=-O2"
 _A_LANDS_MN: tuple = tuple((i == 0 and PARAMS.a0_major == "mn") for i in range(num_a_operands))
 _A_MMA_MAJOR: tuple = tuple(1 if (_A_LANDS_MN[i] and not _A0_TRANSPOSE) else 0 for i in range(num_a_operands))
 _A_LBO: tuple = tuple(8192 if mj else a_smem_desc_leading_byte_offset for mj in _A_MMA_MAJOR)

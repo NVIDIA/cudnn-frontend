@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestRaggedBackwardMetadata:
+    """Keep the shared backward metadata regression in the SM107 CI selection."""
+
+    from sdpa.graph.test_ragged_offset_multiplier import test_fp8_ragged_sm107_existing_route as _ragged
+
+    test_offset_units_and_declared_totals = staticmethod(_ragged)
+
+
 class TestServiceRegisterRelease:
     from service_register_release_checks import test_sm107_service_register_release as _release
 
@@ -234,7 +242,7 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
-    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 109)
     assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
     assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})

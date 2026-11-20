@@ -10,7 +10,7 @@ from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd import engines
 
 pytestmark = pytest.mark.L0
-_ARCHES = [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7), (12, 0)]
+_ARCHES = [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7), (12, 0)]
 
 
 def _graph(dtype, forms, *, ambiguous=False, padding=True):
@@ -59,9 +59,6 @@ def _offered(graph):
 @pytest.mark.parametrize("forms", [(False, False), (True, False), (False, True), (True, True)], ids=["ordinary", "cu-q", "cu-kv", "cu-both"])
 def test_dense_length_forms_keep_existing_owners(architecture, dtype, forms):
     ordinary = _offered(_graph(dtype, (False, False)))
-    if architecture == (8, 9):
-        assert not ordinary and not _offered(_graph(dtype, forms)), "SM89 has no forward owner"
-        return
     assert ordinary, f"ordinary dense padded control has no owner on {architecture}"
     candidate = _offered(_graph(dtype, forms))
     if architecture == (8, 0) or not any(forms):

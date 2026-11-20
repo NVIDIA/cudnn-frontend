@@ -11,10 +11,12 @@ This module uses public CuTe DSL APIs except for the small gather4
 bridge in ``_tma_gather4.py``.  The bridge is compile-time optional so the
 audited predicated cp.async path remains available with older DSL wheels.
 
-This is a correctness-first implementation. A CTA owns one query and its
-twelve warps split the 64 heads. Q is staged once by a regular public
-1-CTA TMA copy and each 64-token sparse tile is gathered with 2-D TMA gather4
-(or safe, predicated 128-bit cp.async copies as a compatibility fallback).
+A CTA runs one query at a time; its twelve warps split the work by role.
+With gather4 the kernel is persistent: CTAs claim queries through cluster
+launch control, and the next query's Q load, first gathers and first QK
+overlap the current query's epilogue.  Q is staged by a regular public 1-CTA
+TMA copy and each 64-token sparse tile is gathered with 2-D TMA gather4 (or,
+one query per CTA, with predicated 128-bit cp.async copies as a fallback).
 QK and the two 256-column PV halves are real 1-SM tcgen05
 MMAs; online-softmax statistics stay in registers while O persists in TMEM
 across sparse tiles.  Keeping validity separate from the zero-filled KV tile
@@ -48,6 +50,7 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint8, Uint32, con
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T
+from cutlass.experimental import primitives as prims
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cudnn._cutlass_compat import SmemAllocator, TmemAllocator
@@ -83,9 +86,11 @@ def _initialize_mbarriers(
     p_free_mbar: cute.Pointer,
     so_ready_mbar: cute.Pointer,
     pv_done_mbar: cute.Pointer,
+    o_writeback_mbar: cute.Pointer,
     num_kv_stages: cutlass.Constexpr[int],
     num_kv_parts: cutlass.Constexpr[int],
     num_tail_stages: cutlass.Constexpr[int],
+    q_tail_arrivals: cutlass.Constexpr[int],
 ) -> None:
     """Initialize all CTA barriers without carrying ``SharedStorage`` through a dynamic branch."""
 
@@ -94,8 +99,9 @@ def _initialize_mbarriers(
     # pointer-only helper so the branch state consists entirely of DSL values.
     if tidx == Int32(0):
         cute.arch.mbarrier_init(q_ready_mbar, 1)
-        cute.arch.mbarrier_init(q_tail_ready_mbar, 4 * cute.arch.WARP_SIZE)
-        cute.arch.mbarrier_init(q_s2t_done_mbar, 1)
+        cute.arch.mbarrier_init(q_tail_ready_mbar, q_tail_arrivals)
+        for slot in cutlass.range_constexpr(2):
+            cute.arch.mbarrier_init(q_s2t_done_mbar + slot, 1)
         for stage_part in cutlass.range_constexpr(num_kv_stages * num_kv_parts):
             cute.arch.mbarrier_init(kv_ready_mbar + stage_part, 1)
         for stage in cutlass.range_constexpr(num_kv_stages):
@@ -109,6 +115,8 @@ def _initialize_mbarriers(
         cute.arch.mbarrier_init(so_ready_mbar, 4 * cute.arch.WARP_SIZE)
         for stage in cutlass.range_constexpr(num_kv_stages):
             cute.arch.mbarrier_init(pv_done_mbar + stage, 1)
+        for slot in cutlass.range_constexpr(2):
+            cute.arch.mbarrier_init(o_writeback_mbar + slot, 1)
         cute.arch.mbarrier_init_fence()
 
 
@@ -151,6 +159,7 @@ class SparseAttentionForwardSm100Head64:
     NUM_WARPS = 12
     WARP_SIZE = 32
     THREADS_PER_CTA = NUM_WARPS * WARP_SIZE
+    CLC_WARP = 4
     RESCALE_THRESHOLD_LOG2 = 6.0
     COPY_BITS = 128
     COPY_ELEMS = COPY_BITS // 16
@@ -190,6 +199,9 @@ class SparseAttentionForwardSm100Head64:
         # compatibility cp.async path keeps its proven two-stage allocation
         # and schedule.
         self.num_kv_stages = 3 if self.use_tma_gather4 else 2
+        # The next query's Q and the current query's O borrow two different KV
+        # stages.
+        assert not self.use_tma_gather4 or self.num_kv_stages >= 3, "the persistent gather4 schedule needs at least three KV stages"
         self.num_tail_stages = 1 if self.use_tma_gather4 else self.num_kv_stages
         self.num_kv_parts = 2
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.THREADS_PER_CTA)
@@ -359,7 +371,7 @@ class SparseAttentionForwardSm100Head64:
         )
         q_tma_bytes = cute.size_in_bytes(self.element_dtype, q_nope_tma_layout)
 
-        # Reuse the drained arena as an eight-tile SW128 output stage.  Keep
+        # Reuse a drained KV surface as an eight-tile SW128 output stage.  Keep
         # the tensor map rank three, (D, H, Tq), so every 64x64 store lowers to
         # the rank-3 bulk TMA store form rather than a tiled-dimension 4-D map.
         o_chunk_smem_layout = cute.make_composed_layout(
@@ -397,7 +409,8 @@ class SparseAttentionForwardSm100Head64:
         q_nope_elements = cute.cosize(q_nope_layout)
         tail_elements = cute.cosize(q_tail_layout) if self.head_dim == 576 else 0
         kv_nope_elements = cute.cosize(kv_nope_layout)
-        # Fast arena: [tail?][K0/K1/K2(Q alias)][independent FP32 P exchange].
+        # Fast arena: [tail?][K0/K1/K2][independent FP32 P exchange]; Q and O
+        # borrow KV stages.
         # Fallback arena: [Q][K0/K1], including each D=576 tail.  A constexpr
         # expression keeps the nested SharedStorage extent code-read-time
         # constant; staged ``if`` assignments are not visible to that type.
@@ -412,7 +425,7 @@ class SparseAttentionForwardSm100Head64:
         class SharedStorage:
             q_ready_mbar: cute.struct.MemRange[Int64, 1]
             q_tail_ready_mbar: cute.struct.MemRange[Int64, 1]
-            q_s2t_done_mbar: cute.struct.MemRange[Int64, 1]
+            q_s2t_done_mbar: cute.struct.MemRange[Int64, 2]
             kv_ready_mbar: cute.struct.MemRange[Int64, self.num_kv_stages * self.num_kv_parts]
             valid_ready_mbar: cute.struct.MemRange[Int64, self.num_kv_stages]
             valid_free_mbar: cute.struct.MemRange[Int64, self.num_kv_stages]
@@ -422,6 +435,9 @@ class SparseAttentionForwardSm100Head64:
             p_free_mbar: cute.struct.MemRange[Int64, 1]
             so_ready_mbar: cute.struct.MemRange[Int64, 1]
             pv_done_mbar: cute.struct.MemRange[Int64, self.num_kv_stages]
+            o_writeback_mbar: cute.struct.MemRange[Int64, 2]
+            clc_mbar: cute.struct.MemRange[Int64, 2]
+            clc_response: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
             tmem_holding_buf: Int32
             # Pack all small metadata before the first 1-KiB surface.  It fits
             # in exactly two alignment pages for every specialization, which
@@ -441,7 +457,10 @@ class SparseAttentionForwardSm100Head64:
         assert SharedStorage.size_in_bytes() <= 227 * 1024, f"H64 shared storage is {SharedStorage.size_in_bytes()} bytes"
         self.shared_storage = SharedStorage
 
-        grid = (cute.size(q.shape[0]), 1, 1)
+        # One CTA per query; with gather4, resident CTAs also claim the queries
+        # of unstarted CTAs (cluster launch control).
+        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((cute.size(q.shape[0]), 1, 1), (1, 1, 1))
+        grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
         self.kernel(
             q_tma,
             q_tail_global,
@@ -477,6 +496,7 @@ class SparseAttentionForwardSm100Head64:
             row_layout,
             p_exchange_layout,
             o_full_smem_layout,
+            tile_sched_params,
         ).launch(
             grid=grid,
             block=(self.THREADS_PER_CTA, 1, 1),
@@ -523,6 +543,7 @@ class SparseAttentionForwardSm100Head64:
         row_layout: cute.Layout,
         p_exchange_layout: cute.Layout,
         o_full_smem_layout: cute.ComposedLayout,
+        tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
     ):
         query_idx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -546,6 +567,9 @@ class SparseAttentionForwardSm100Head64:
         p_free_mbar_ptr = storage.p_free_mbar.data_ptr()
         so_ready_mbar_ptr = storage.so_ready_mbar.data_ptr()
         pv_done_mbar_ptr = storage.pv_done_mbar.data_ptr()
+        o_writeback_mbar_ptr = storage.o_writeback_mbar.data_ptr()
+        clc_mbar_ptr = storage.clc_mbar.data_ptr()
+        clc_response_ptr = storage.clc_response.data_ptr()
         s_index_base_ptr = storage.sIndex.data_ptr()
         s_valid_base_ptr = storage.sValid.data_ptr()
         arena_base_ptr = storage.sArena.data_ptr()
@@ -557,10 +581,9 @@ class SparseAttentionForwardSm100Head64:
         kv_nope_elements = cute.cosize(kv_nope_layout)
         tail_elements = cute.cosize(kv_tail_layout) if self.head_dim == 576 else 0
         if const_expr(self.use_tma_gather4):
-            # [tail0?][K0 64KiB][K1 64KiB][K2/Q 64KiB]
+            # [tail0?][K0 64KiB][K1 64KiB][K2 64KiB]; Q-NoPE uses a KV stage.
             sKV_tail_base_ptr = arena_base_ptr
             sKV_base_ptr = arena_base_ptr + tail_elements
-            sQ_base_ptr = sKV_base_ptr + Int32(2 * kv_nope_elements)
             sQ_tail_base_ptr = storage.sWeight.data_ptr()
         else:
             # Compatibility arena retains [Q][K0][K1], including per-stage
@@ -570,18 +593,11 @@ class SparseAttentionForwardSm100Head64:
             sKV_base_ptr = sQ_tail_base_ptr + tail_elements
             sKV_tail_base_ptr = sKV_base_ptr + kv_nope_elements
 
-        sQ_nope_mma = cute.make_tensor(cute.recast_ptr(sQ_base_ptr, q_nope_layout.inner), q_nope_layout.outer)
         sQ_tail_mma = cute.make_tensor(
             cute.recast_ptr(sQ_tail_base_ptr, q_tail_layout.inner),
             q_tail_layout.outer,
         )
         sQ_tail = cute.composition(sQ_tail_mma, cute.make_layout((self.NUM_HEADS, 64)))
-        sQ_dual_nope_mma = cute.make_tensor(cute.recast_ptr(sQ_base_ptr, kv_dual_nope_layout.inner), kv_dual_nope_layout.outer)
-        sQ_dual_nope_slice = sQ_dual_nope_mma[(None, None), 0, (None, None), 0]
-        sQ_dual_nope = cute.composition(
-            sQ_dual_nope_slice,
-            cute.make_layout((2 * self.NUM_HEADS, self.VALUE_DIM // 2)),
-        )
         sQ_dual_tail_mma = cute.make_tensor(
             cute.recast_ptr(sQ_tail_base_ptr, kv_dual_tail_layout.inner),
             kv_dual_tail_layout.outer,
@@ -656,10 +672,32 @@ class SparseAttentionForwardSm100Head64:
             p_free_mbar_ptr,
             so_ready_mbar_ptr,
             pv_done_mbar_ptr,
+            o_writeback_mbar_ptr,
             self.num_kv_stages,
             self.num_kv_parts,
             self.num_tail_stages,
+            # q_tail_ready arrivals: gather4 copies the D=576 Q tail with warps 10-11.
+            2 * self.WARP_SIZE if self.use_tma_gather4 else 4 * self.WARP_SIZE,
         )
+        if const_expr(self.use_tma_gather4):
+            clc_pipeline = pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar_ptr,
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.THREADS_PER_CTA),
+                tx_count=16,
+                defer_sync=True,
+            )
+            clc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+            clc_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.ProducerConsumer, 1)
+            cute.arch.mbarrier_init_fence()
+            tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                tile_sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                clc_response_ptr,
+            )
+        # The TMEM allocation barrier also publishes the barrier inits above.
         tmem.allocate(self.TMEM_COLUMNS)
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(Float32)
@@ -673,616 +711,722 @@ class SparseAttentionForwardSm100Head64:
             q_tmem_tail_layout,
         )
 
-        # Stage the regular Q tile once with an ordinary 1-CTA TMA.  Sparse KV
-        # remains on the audited predicated gather path below.
-        gQ = cute.local_tile(q_tma, (self.NUM_HEADS, self.VALUE_DIM), (0, 0, query_idx))
-        tAgQ = tiled_mma_qk_storage.get_slice(0).partition_A(gQ)
-        tQsQ, tQgQ = cpasync.tma_partition(
-            tma_atom_q,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sQ_nope_mma, 0, cute.rank(sQ_nope_mma)),
-            cute.group_modes(tAgQ, 0, cute.rank(tAgQ)),
-        )
+        # One iteration per claimed query.  Barrier rings take stage and phase
+        # from the per-CTA tile count, tile_base + the query's tile.  The
+        # cp.async fallback runs one iteration.
+        has_query = Int32(1)
+        tile_base = Int32(0)
+        query_count = Int32(0)
         if warp_idx == Int32(0):
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_o)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(q_ready_mbar_ptr, q_tma_bytes)
-            cute.copy(tma_atom_q, tQgQ, tQsQ, tma_bar_ptr=q_ready_mbar_ptr)
-        if const_expr(not self.use_tma_gather4):
-            cute.arch.mbarrier_wait(q_ready_mbar_ptr, 0)
-        if const_expr(self.head_dim == 576):
-            # The public TMA-A builder decomposes this SW64 tail into 64-byte
-            # destination steps, which violate the bulk TMA load alignment contract.
-            # Copy the small one-time 8-KiB tail with aligned cp.async chunks;
-            # the following S2T path and QK descriptor remain source-exact.
-            if tidx < Int32(4 * self.WARP_SIZE):
-                for copy_iter in cutlass.range_constexpr((self.NUM_HEADS * 64 // self.COPY_ELEMS) // (4 * self.WARP_SIZE)):
-                    linear_chunk = tidx + Int32(copy_iter * 4 * self.WARP_SIZE)
-                    q_head = linear_chunk // Int32(64 // self.COPY_ELEMS)
-                    q_chunk = linear_chunk % Int32(64 // self.COPY_ELEMS)
-                    g_tail_row = q_tail_global[q_head, None, query_idx]
-                    s_tail_row = sQ_tail[q_head, None]
-                    g_tail_chunk = cute.local_tile(g_tail_row, (self.COPY_ELEMS,), (q_chunk,))
-                    s_tail_chunk = cute.local_tile(s_tail_row, (self.COPY_ELEMS,), (q_chunk,))
-                    cute.copy(copy_atom, g_tail_chunk, s_tail_chunk)
-                if const_expr(self.use_tma_gather4):
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.mbarrier_arrive(q_tail_ready_mbar_ptr)
-            if const_expr(not self.use_tma_gather4):
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-        if const_expr(not self.use_tma_gather4):
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_threads()
-        if warp_idx == Int32(8):
-            if const_expr(self.use_tma_gather4):
-                cute.arch.mbarrier_wait(q_ready_mbar_ptr, 0)
-                if const_expr(self.head_dim == 576):
-                    cute.arch.mbarrier_wait(q_tail_ready_mbar_ptr, 0)
-                cute.arch.fence_view_async_shared()
-            tcgen05_fence_after_thread_sync()
-            copy_q_128xk_f16_s2t_cta1(sQ_dual_nope, tQ_nope)
-            if const_expr(self.head_dim == 576):
-                copy_q_128xk_f16_s2t_cta1(sQ_dual_tail, tQ_tail)
-            if const_expr(self.use_tma_gather4):
-                with cute.arch.elect_one():
-                    tcgen05.commit(q_s2t_done_mbar_ptr)
-            tcgen05_fence_before_thread_sync()
-        if const_expr(not self.use_tma_gather4):
-            cute.arch.sync_threads()
-
         if warp_idx == Int32(4):
             cpasync.prefetch_descriptor(tma_atom_kv)
-
-        physical_topk = Int32(cute.size(indices.shape[1]))
-        effective_length = physical_topk
-        if const_expr(topk_length is not None):
-            effective_length = Int32(topk_length[query_idx])
-        effective_length = effective_length if effective_length > Int32(0) else Int32(0)
-        effective_length = effective_length if effective_length < physical_topk else physical_topk
-        tile_count = (effective_length + Int32(self.BLOCK_TOPK - 1)) // Int32(self.BLOCK_TOPK)
-        tile_count = tile_count if tile_count > Int32(0) else Int32(1)
-
-        # In the double-buffered schedule, WG1 (warps 4-7) is a pure gather
-        # producer, warp 8 is the pure UMMA issuer, and WG0 uses the
-        # two-threads-per-head softmax mapping.
         rMi = cute.make_rmem_tensor((1,), Float32)
         rLi = cute.make_rmem_tensor((1,), Float32)
         rRealMax = cute.make_rmem_tensor((1,), Float32)
         rMiIndexer = cute.make_rmem_tensor((1,), Float32)
         rLiIndexer = cute.make_rmem_tensor((1,), Float32)
-        rMi.fill(Float32(self.MAX_INIT_VALUE))
-        rLi.fill(Float32(0.0))
-        rRealMax.fill(-Float32.inf)
-        rMiIndexer.fill(Float32(self.MAX_INIT_VALUE))
-        rLiIndexer.fill(Float32(0.0))
-
-        # The gather4 warpgroup owns one dynamic producer loop. It naturally
-        # establishes the two-tile lead (K0/K1/K2
-        # are launched before the first stage-reuse wait) without statically
-        # cloning the 32 gather4 instructions for prime and steady state.
-        # The compatibility path retains its proven one-tile prime/refill flow.
-        kv_stage_elements = Int32(cute.cosize(kv_nope_layout))
-        if const_expr(not self.use_tma_gather4):
-            kv_stage_elements = kv_stage_elements + Int32(cute.cosize(kv_tail_layout) if self.head_dim == 576 else 0)
-        if const_expr(self.use_tma_gather4):
-            if warp_idx >= Int32(4) and warp_idx < Int32(8):
-                producer_tile = Int32(0)
-                while producer_tile < tile_count:
-                    producer_stage = producer_tile % Int32(self.num_kv_stages)
-                    if producer_tile >= Int32(self.num_kv_stages):
-                        prior_use = producer_tile // Int32(self.num_kv_stages) - Int32(1)
-                        cute.arch.mbarrier_wait(
-                            pv_done_mbar_ptr + producer_stage,
-                            prior_use % Int32(2),
-                        )
-                    if producer_tile == Int32(2):
-                        cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr, 0)
-
-                    producer_stage_elem_offset = producer_stage * kv_stage_elements
-                    producer_kv_ptr = sKV_base_ptr + cute.assume(
-                        producer_stage_elem_offset,
-                        divby=self.COPY_ELEMS,
-                    )
-                    logical_tile_is_full = Int32(1)
-                    if const_expr(topk_length is not None):
-                        logical_tile_is_full = cute.arch.make_warp_uniform(Int32((producer_tile + Int32(1)) * Int32(self.BLOCK_TOPK) <= effective_length))
-                    self._gather_kv_tma_direct(
-                        indices,
-                        query_idx,
-                        producer_tile,
-                        effective_length,
-                        logical_tile_is_full,
-                        producer_kv_ptr,
-                        tma_atom_kv,
-                        kv_ready_mbar_ptr + producer_stage * Int32(self.num_kv_parts),
-                        kv_tma_bytes,
-                        warp_idx,
-                    )
-                    producer_tile = producer_tile + Int32(1)
-
-            # Warp 9 independently publishes the two packed validity words.
-            # Its three-stage ring is released only after every WG0 thread has
-            # consumed the corresponding half-tile mask.
-            if warp_idx == Int32(9):
-                valid_tile = Int32(0)
-                while valid_tile < tile_count:
-                    valid_stage = valid_tile % Int32(self.num_kv_stages)
-                    valid_phase = (valid_tile // Int32(self.num_kv_stages)) % Int32(2)
-                    cute.arch.mbarrier_wait(
-                        valid_free_mbar_ptr + valid_stage,
-                        valid_phase ^ Int32(1),
-                    )
-                    for half in cutlass.range_constexpr(self.BLOCK_TOPK // self.WARP_SIZE):
-                        slot = valid_tile * Int32(self.BLOCK_TOPK) + Int32(half * self.WARP_SIZE) + lane_idx
-                        token = Int32(indices[query_idx, slot])
-                        valid = slot < effective_length and token >= Int32(0) and Int64(token) < Int64(kv.shape[0])
-                        valid_mask = cute.arch.vote_ballot_sync(valid)
-                        if lane_idx == Int32(0):
-                            valid_offset = valid_stage * Int32(self.BLOCK_TOPK // self.WARP_SIZE) + Int32(half)
-                            sValidWords[valid_offset] = Uint32(valid_mask)
-                    cute.arch.fence_view_async_shared()
-                    if lane_idx == Int32(0):
-                        cute.arch.mbarrier_arrive(valid_ready_mbar_ptr + valid_stage)
-                    valid_tile = valid_tile + Int32(1)
-        else:
-            if warp_idx >= Int32(4) and warp_idx < Int32(8):
-                producer_tidx = tidx - Int32(4 * self.WARP_SIZE)
-                prime_tile = Int32(0)
-                prime_kv_ptr = sKV_base_ptr
-                prime_tail_ptr = sKV_tail_base_ptr
-                prime_sKV_nope_mma = cute.make_tensor(
-                    cute.recast_ptr(prime_kv_ptr, kv_nope_layout.inner),
-                    kv_nope_layout.outer,
-                )
-                prime_sKV_nope_slice = prime_sKV_nope_mma[(None, None), 0, (None, None), 0]
-                prime_sKV_nope = cute.composition(
-                    prime_sKV_nope_slice,
-                    cute.make_layout((self.BLOCK_TOPK, self.VALUE_DIM)),
-                )
-                prime_sKV_tail_mma = cute.make_tensor(
-                    cute.recast_ptr(prime_tail_ptr, kv_tail_layout.inner),
-                    kv_tail_layout.outer,
-                )
-                prime_sKV_tail = cute.composition(
-                    prime_sKV_tail_mma,
-                    cute.make_layout((self.BLOCK_TOPK, 64)),
-                )
-                prime_sIndex = cute.make_tensor(s_index_base_ptr, vector_layout)
-                prime_sValid = cute.make_tensor(s_valid_base_ptr, valid_layout)
-                self._prepare_indices(
-                    indices,
-                    prime_sIndex,
-                    prime_sValid,
-                    query_idx,
-                    prime_tile,
-                    effective_length,
-                    physical_topk,
-                    kv.shape[0],
-                    producer_tidx,
-                )
-                self.gather_sync_barrier.arrive_and_wait()
-                self._gather_kv(
-                    kv,
-                    prime_sKV_nope,
-                    prime_sKV_tail,
-                    prime_sIndex,
-                    prime_sValid,
-                    warp_idx,
-                    lane_idx,
-                    copy_atom,
-                    thread_copy,
-                )
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.fence_view_async_shared()
-        if const_expr(self.head_dim == 576 and self.use_tma_gather4):
-            if warp_idx >= Int32(10) and warp_idx < Int32(12):
-                self._gather_kv_tail_cpasync(
-                    kv,
-                    indices,
-                    sKV_tail0,
-                    kv_tail_ready_mbar_ptr,
-                    kv_tail_free_mbar_ptr,
-                    query_idx,
-                    Int32(0),
-                    effective_length,
-                    physical_topk,
-                    warp_idx,
-                    lane_idx,
-                    copy_atom,
-                )
-        # The gather4 consumers wait their per-stage TMA/tail barriers.  The
-        # compatibility cp.async path has no cross-warp completion mbarrier,
-        # so it deliberately retains the original CTA-wide prime handoff.
-        if const_expr(not self.use_tma_gather4):
-            cute.arch.sync_threads()
-
-        # Warp 8 owns one dynamic QK/PV issuer loop on the gather4 path.  The
-        # inclusive sentinel iteration drains PV(last): iteration k first
-        # issues QK(k), when it exists, and then issues PV(k-1).  This preserves
-        # the existing p_free/so_ready ordering while keeping exactly one
-        # static QK body and one static PV body in SASS.
-        if const_expr(self.use_tma_gather4):
-            if warp_idx == Int32(8):
-                issuer_tile = Int32(0)
-                while issuer_tile <= tile_count:
-                    if issuer_tile < tile_count:
-                        qk_stage = issuer_tile % Int32(self.num_kv_stages)
-                        qk_stage_elem_offset = qk_stage * kv_stage_elements
-                        qk_kv_ptr = sKV_base_ptr + cute.assume(
-                            qk_stage_elem_offset,
-                            divby=self.COPY_ELEMS,
-                        )
-                        qk_sKV_dual_nope = cute.make_tensor(
-                            cute.recast_ptr(qk_kv_ptr, kv_dual_nope_layout.inner),
-                            kv_dual_nope_layout.outer,
-                        )
-                        qk_sKV_dual_nope_slice = qk_sKV_dual_nope[(None, None), 0, (None, None), 0]
-                        qk_sKV_dual_nope_logical = cute.composition(
-                            qk_sKV_dual_nope_slice,
-                            cute.make_layout((2 * self.BLOCK_TOPK, self.VALUE_DIM // 2)),
-                        )
-                        qk_sKV_dual_tail = cute.make_tensor(
-                            cute.recast_ptr(sKV_tail_base_ptr, kv_dual_tail_layout.inner),
-                            kv_dual_tail_layout.outer,
-                        )
-                        qk_sKV_dual_tail_logical = cute.composition(
-                            qk_sKV_dual_tail,
-                            cute.make_layout((2 * self.BLOCK_TOPK, 32)),
-                        )
-                        self._qk_mma_issue_double_buffered(
-                            tiled_mma_qk,
-                            qk_sKV_dual_nope_logical,
-                            qk_sKV_dual_tail_logical,
-                            mma_done_mbar_ptr,
-                            kv_ready_mbar_ptr + qk_stage * Int32(self.num_kv_parts),
-                            (issuer_tile // Int32(self.num_kv_stages)) % Int32(2),
-                            kv_tail_ready_mbar_ptr,
-                            issuer_tile % Int32(2),
-                            kv_tail_free_mbar_ptr,
-                            q_s2t_done_mbar_ptr,
-                            p_free_mbar_ptr,
-                            issuer_tile,
-                            warp_idx,
-                        )
-
-                    if issuer_tile > Int32(0):
-                        pv_tile = issuer_tile - Int32(1)
-                        pv_stage = pv_tile % Int32(self.num_kv_stages)
-                        pv_stage_elem_offset = pv_stage * kv_stage_elements
-                        pv_kv_ptr = sKV_base_ptr + cute.assume(
-                            pv_stage_elem_offset,
-                            divby=self.COPY_ELEMS,
-                        )
-                        pv_sV_mma0 = cute.make_tensor(
-                            cute.recast_ptr(pv_kv_ptr, v_mma_layout.inner),
-                            v_mma_layout.outer,
-                        )
-                        pv_sV_mma1 = cute.make_tensor(
-                            cute.recast_ptr(pv_kv_ptr + (self.VALUE_DIM // 2) * self.BLOCK_TOPK, v_mma_layout.inner),
-                            v_mma_layout.outer,
-                        )
-                        self._pv_mma_to_tmem(
-                            tiled_mma_pv,
-                            sP_mma,
-                            pv_sV_mma0,
-                            pv_sV_mma1,
-                            so_ready_mbar_ptr,
-                            pv_done_mbar_ptr + pv_stage,
-                            pv_tile,
-                            warp_idx,
-                        )
-                    issuer_tile = issuer_tile + Int32(1)
-
-        scale_log2_e = softmax_scale * Float32(math.log2(math.e))
-        tile_idx = Int32(0)
-        if const_expr(self.use_tma_gather4):
-            if warp_idx >= Int32(4) and warp_idx < Int32(10):
-                # WG1, the MMA issuer, and validity producer all finish in
-                # their independent dynamic loops above.
-                tile_idx = tile_count
-        qk_phase = Int32(0)
-        while tile_idx < tile_count:
-            stage_idx = tile_idx % Int32(self.num_kv_stages)
-            stage_elem_offset = stage_idx * kv_stage_elements
-            stage_valid_offset = stage_idx * Int32(self.BLOCK_TOPK // 8)
-            stage_kv_ptr = sKV_base_ptr + cute.assume(stage_elem_offset, divby=self.COPY_ELEMS)
-            stage_tail_ptr = sKV_tail_base_ptr
-            tail_stage_idx = Int32(0)
+        while has_query != Int32(0):
+            # Stage the regular Q tile with an ordinary 1-CTA TMA.  Sparse KV
+            # remains on the audited predicated gather path below.
+            #
+            # Gather4 stages Q in tile 2's KV stage for a CTA's first query,
+            # else in tile 1's (tile 2's holds the previous O).  That stage's
+            # last reader, PV(tile_base - 2), is done once warp 8 has seen
+            # so_ready(tile_base - 1).
+            q_slot = query_count % Int32(2)
+            q_slot_phase = (query_count // Int32(2)) % Int32(2)
+            if const_expr(self.use_tma_gather4):
+                q_stage_offset = Int32(2) if query_count == Int32(0) else Int32(1)
+                q_stage = (tile_base + q_stage_offset) % Int32(self.num_kv_stages)
+                q_stage_ptr = sKV_base_ptr + cute.assume(q_stage * Int32(kv_nope_elements), divby=kv_nope_elements)
+            else:
+                q_stage_ptr = sQ_base_ptr
+            sQ_nope_mma = cute.make_tensor(cute.recast_ptr(q_stage_ptr, q_nope_layout.inner), q_nope_layout.outer)
+            sQ_dual_nope = cute.composition(
+                cute.make_tensor(cute.recast_ptr(q_stage_ptr, kv_dual_nope_layout.inner), kv_dual_nope_layout.outer)[(None, None), 0, (None, None), 0],
+                cute.make_layout((2 * self.NUM_HEADS, self.VALUE_DIM // 2)),
+            )
+            gQ = cute.local_tile(q_tma, (self.NUM_HEADS, self.VALUE_DIM), (0, 0, query_idx))
+            tAgQ = tiled_mma_qk_storage.get_slice(0).partition_A(gQ)
+            tQsQ, tQgQ = cpasync.tma_partition(
+                tma_atom_q,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sQ_nope_mma, 0, cute.rank(sQ_nope_mma)),
+                cute.group_modes(tAgQ, 0, cute.rank(tAgQ)),
+            )
+            # Gather4: warp 8 loads Q right after the previous query's last PV.
+            if warp_idx == Int32(8 if self.use_tma_gather4 else 0):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(q_ready_mbar_ptr, q_tma_bytes)
+                cute.copy(tma_atom_q, tQgQ, tQsQ, tma_bar_ptr=q_ready_mbar_ptr)
             if const_expr(not self.use_tma_gather4):
-                stage_tail_ptr = sKV_tail_base_ptr + cute.assume(stage_elem_offset, divby=self.COPY_ELEMS)
-                tail_stage_idx = stage_idx
-            sKV_dual_nope = cute.make_tensor(
-                cute.recast_ptr(stage_kv_ptr, kv_dual_nope_layout.inner),
-                kv_dual_nope_layout.outer,
-            )
-            sKV_dual_nope_slice = sKV_dual_nope[(None, None), 0, (None, None), 0]
-            sKV_dual_nope_logical = cute.composition(
-                sKV_dual_nope_slice,
-                cute.make_layout((2 * self.BLOCK_TOPK, self.VALUE_DIM // 2)),
-            )
-            sKV_dual_tail = cute.make_tensor(
-                cute.recast_ptr(stage_tail_ptr, kv_dual_tail_layout.inner),
-                kv_dual_tail_layout.outer,
-            )
-            sKV_dual_tail_logical = cute.composition(
-                sKV_dual_tail,
-                cute.make_layout((2 * self.BLOCK_TOPK, 32)),
-            )
-            sValid = cute.make_tensor(s_valid_base_ptr + stage_valid_offset, valid_layout)
-            sV_mma0 = cute.make_tensor(cute.recast_ptr(stage_kv_ptr, v_mma_layout.inner), v_mma_layout.outer)
-            sV_mma1 = cute.make_tensor(
-                cute.recast_ptr(stage_kv_ptr + (self.VALUE_DIM // 2) * self.BLOCK_TOPK, v_mma_layout.inner),
-                v_mma_layout.outer,
-            )
-
-            if const_expr(not self.use_tma_gather4):
-                # The compatibility path primes tile zero here.  Gather4's
-                # independent warp-8 loop above owns its complete QK chain.
-                if tile_idx == Int32(0):
-                    self._qk_mma_issue_double_buffered(
-                        tiled_mma_qk,
-                        sKV_dual_nope_logical,
-                        sKV_dual_tail_logical,
-                        mma_done_mbar_ptr,
-                        kv_ready_mbar_ptr + stage_idx * Int32(self.num_kv_parts),
-                        (tile_idx // Int32(self.num_kv_stages)) % Int32(2),
-                        kv_tail_ready_mbar_ptr + tail_stage_idx,
-                        tile_idx % Int32(2),
-                        kv_tail_free_mbar_ptr,
-                        q_s2t_done_mbar_ptr,
-                        p_free_mbar_ptr,
-                        tile_idx,
-                        warp_idx,
-                    )
-            pair_mi, pair_li, pair_real_max = self._scores_consume_double_buffered(
-                sPExchange,
-                sPExchangeLinear,
-                sWeight,
-                sValid,
-                mma_done_mbar_ptr,
-                qk_phase,
-                valid_ready_mbar_ptr + stage_idx,
-                (tile_idx // Int32(self.num_kv_stages)) % Int32(2),
-                valid_free_mbar_ptr + stage_idx,
-                p_free_mbar_ptr,
-                pv_done_mbar_ptr,
-                tile_idx,
-                tidx,
-                warp_idx,
-                scale_log2_e,
-                rMi[0],
-                rLi[0],
-                rRealMax[0],
-                sGroupRescale,
-                sScale,
-            )
-            if warp_idx < Int32(4):
-                rMi[0] = pair_mi
-                rLi[0] = pair_li
-                rRealMax[0] = pair_real_max
-                if const_expr(self.indexer_topk > 0):
-                    if tile_idx == Int32(self.indexer_tile):
-                        rMiIndexer[0] = pair_mi
-                        rLiIndexer[0] = pair_li
-            qk_phase = qk_phase ^ Int32(1)
-
-            # Gather4 runs in WG1's independent producer loop above.  The
-            # compatibility path retains its one-tile refill here, while the
-            # independent D576 tail warps and QK issuer keep their existing
-            # pipelines.
-            next_tile = tile_idx + Int32(1)
-            if const_expr(self.num_kv_stages > 1):
-                if const_expr(not self.use_tma_gather4):
-                    # Keep the compatibility producer byte-for-byte equivalent
-                    # to the proven two-stage schedule.  In particular, do not
-                    # route its divergent warpgroup control flow through the
-                    # gather4 path's two-tile prefetch SSA values.
-                    if next_tile < tile_count and warp_idx >= Int32(4) and warp_idx < Int32(8):
-                        next_stage = next_tile % Int32(self.num_kv_stages)
-                        if next_tile >= Int32(self.num_kv_stages):
-                            prior_use = next_tile // Int32(self.num_kv_stages) - Int32(1)
+                cute.arch.mbarrier_wait(q_ready_mbar_ptr, 0)
+            if const_expr(self.head_dim == 576):
+                # The public TMA-A builder decomposes this SW64 tail into 64-byte
+                # destination steps, which violate the bulk TMA load alignment contract.
+                # Copy the small 8-KiB tail with aligned cp.async chunks;
+                # the following S2T path and QK descriptor remain source-exact.
+                # Gather4: warps 10-11 copy it into the P surface after the
+                # previous query's last PV.
+                q_tail_threads = (2 if self.use_tma_gather4 else 4) * self.WARP_SIZE
+                q_tail_tidx = tidx - Int32(10 * self.WARP_SIZE) if self.use_tma_gather4 else tidx
+                if q_tail_tidx >= Int32(0) and q_tail_tidx < Int32(q_tail_threads):
+                    if const_expr(self.use_tma_gather4):
+                        if query_count > Int32(0):
+                            last_tile = tile_base - Int32(1)
                             cute.arch.mbarrier_wait(
-                                pv_done_mbar_ptr + next_stage,
-                                prior_use % Int32(2),
+                                pv_done_mbar_ptr + last_tile % Int32(self.num_kv_stages),
+                                (last_tile // Int32(self.num_kv_stages)) % Int32(2),
                             )
-                        next_stage_elem_offset = next_stage * kv_stage_elements
-                        next_stage_meta_offset = next_stage * Int32(self.BLOCK_TOPK)
-                        next_stage_valid_offset = next_stage * Int32(self.BLOCK_TOPK // 8)
-                        next_kv_ptr = sKV_base_ptr + cute.assume(next_stage_elem_offset, divby=self.COPY_ELEMS)
-                        next_tail_ptr = sKV_tail_base_ptr + cute.assume(
-                            next_stage_elem_offset,
-                            divby=self.COPY_ELEMS,
-                        )
-                        next_sKV_nope_mma = cute.make_tensor(
-                            cute.recast_ptr(next_kv_ptr, kv_nope_layout.inner),
-                            kv_nope_layout.outer,
-                        )
-                        next_sKV_nope_slice = next_sKV_nope_mma[(None, None), 0, (None, None), 0]
-                        next_sKV_nope = cute.composition(
-                            next_sKV_nope_slice,
-                            cute.make_layout((self.BLOCK_TOPK, self.VALUE_DIM)),
-                        )
-                        next_sKV_tail_mma = cute.make_tensor(
-                            cute.recast_ptr(next_tail_ptr, kv_tail_layout.inner),
-                            kv_tail_layout.outer,
-                        )
-                        next_sKV_tail = cute.composition(
-                            next_sKV_tail_mma,
-                            cute.make_layout((self.BLOCK_TOPK, 64)),
-                        )
-                        next_sIndex = cute.make_tensor(
-                            s_index_base_ptr + next_stage_meta_offset,
-                            vector_layout,
-                        )
-                        next_sValid = cute.make_tensor(
-                            s_valid_base_ptr + next_stage_valid_offset,
-                            valid_layout,
-                        )
-                        producer_tidx = tidx - Int32(4 * self.WARP_SIZE)
-                        self._prepare_indices(
-                            indices,
-                            next_sIndex,
-                            next_sValid,
-                            query_idx,
-                            next_tile,
-                            effective_length,
-                            physical_topk,
-                            kv.shape[0],
-                            producer_tidx,
-                        )
-                        self.gather_sync_barrier.arrive_and_wait()
-                        self._gather_kv(
-                            kv,
-                            next_sKV_nope,
-                            next_sKV_tail,
-                            next_sIndex,
-                            next_sValid,
-                            warp_idx,
-                            lane_idx,
-                            copy_atom,
-                            thread_copy,
-                        )
+                    for copy_iter in cutlass.range_constexpr((self.NUM_HEADS * 64 // self.COPY_ELEMS) // q_tail_threads):
+                        linear_chunk = q_tail_tidx + Int32(copy_iter * q_tail_threads)
+                        q_head = linear_chunk // Int32(64 // self.COPY_ELEMS)
+                        q_chunk = linear_chunk % Int32(64 // self.COPY_ELEMS)
+                        g_tail_row = q_tail_global[q_head, None, query_idx]
+                        s_tail_row = sQ_tail[q_head, None]
+                        g_tail_chunk = cute.local_tile(g_tail_row, (self.COPY_ELEMS,), (q_chunk,))
+                        s_tail_chunk = cute.local_tile(s_tail_row, (self.COPY_ELEMS,), (q_chunk,))
+                        cute.copy(copy_atom, g_tail_chunk, s_tail_chunk)
+                    if const_expr(self.use_tma_gather4):
                         cute.arch.cp_async_commit_group()
                         cute.arch.cp_async_wait_group(0)
                         cute.arch.fence_view_async_shared()
-
-                    # Compatibility copies have no transaction-completion
-                    # mbarrier for warp 8.  Keep this path deliberately
-                    # conservative: all roles observe K(next) before QK(next).
-                    cute.arch.sync_threads()
-
-                if const_expr(self.head_dim == 576 and self.use_tma_gather4):
-                    if next_tile < tile_count and warp_idx >= Int32(10) and warp_idx < Int32(12):
-                        self._gather_kv_tail_cpasync(
-                            kv,
-                            indices,
-                            sKV_tail0,
-                            kv_tail_ready_mbar_ptr,
-                            kv_tail_free_mbar_ptr,
-                            query_idx,
-                            next_tile,
-                            effective_length,
-                            physical_topk,
-                            warp_idx,
-                            lane_idx,
-                            copy_atom,
-                        )
-
+                        cute.arch.mbarrier_arrive(q_tail_ready_mbar_ptr)
                 if const_expr(not self.use_tma_gather4):
-                    # Compatibility warp 8 issues QK(k+1) before joining the
-                    # two PV named barriers.  Gather4 uses the independent
-                    # dynamic issuer loop above.
-                    if next_tile < tile_count:
-                        next_stage = next_tile % Int32(self.num_kv_stages)
-                        next_stage_elem_offset = next_stage * kv_stage_elements
-                        next_kv_ptr = sKV_base_ptr + cute.assume(next_stage_elem_offset, divby=self.COPY_ELEMS)
-                        next_tail_ptr = sKV_tail_base_ptr + cute.assume(
-                            next_stage_elem_offset,
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+            if const_expr(not self.use_tma_gather4):
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_threads()
+            if warp_idx == Int32(8):
+                if const_expr(self.use_tma_gather4):
+                    cute.arch.mbarrier_wait(q_ready_mbar_ptr, query_count % Int32(2))
+                    if const_expr(self.head_dim == 576):
+                        cute.arch.mbarrier_wait(q_tail_ready_mbar_ptr, query_count % Int32(2))
+                    cute.arch.fence_view_async_shared()
+                # Earlier QKs read TMEM Q first: tcgen05 runs in issue order.
+                tcgen05_fence_after_thread_sync()
+                copy_q_128xk_f16_s2t_cta1(sQ_dual_nope, tQ_nope)
+                if const_expr(self.head_dim == 576):
+                    copy_q_128xk_f16_s2t_cta1(sQ_dual_tail, tQ_tail)
+                if const_expr(self.use_tma_gather4):
+                    with cute.arch.elect_one():
+                        tcgen05.commit(q_s2t_done_mbar_ptr + q_slot)
+                tcgen05_fence_before_thread_sync()
+            if const_expr(not self.use_tma_gather4):
+                cute.arch.sync_threads()
+
+            physical_topk = Int32(cute.size(indices.shape[1]))
+            effective_length = physical_topk
+            if const_expr(topk_length is not None):
+                effective_length = Int32(topk_length[query_idx])
+            effective_length = effective_length if effective_length > Int32(0) else Int32(0)
+            effective_length = effective_length if effective_length < physical_topk else physical_topk
+            tile_count = (effective_length + Int32(self.BLOCK_TOPK - 1)) // Int32(self.BLOCK_TOPK)
+            tile_count = tile_count if tile_count > Int32(0) else Int32(1)
+
+            # In the double-buffered schedule, WG1 (warps 4-7) is a pure gather
+            # producer, warp 8 is the pure UMMA issuer, and WG0 uses the
+            # two-threads-per-head softmax mapping.
+            rMi.fill(Float32(self.MAX_INIT_VALUE))
+            rLi.fill(Float32(0.0))
+            rRealMax.fill(-Float32.inf)
+            rMiIndexer.fill(Float32(self.MAX_INIT_VALUE))
+            rLiIndexer.fill(Float32(0.0))
+
+            # The gather4 warpgroup owns one dynamic producer loop. It naturally
+            # establishes the two-tile lead (K0/K1/K2
+            # are launched before the first stage-reuse wait) without statically
+            # cloning the 32 gather4 instructions for prime and steady state.
+            # The compatibility path retains its proven one-tile prime/refill flow.
+            kv_stage_elements = Int32(cute.cosize(kv_nope_layout))
+            if const_expr(not self.use_tma_gather4):
+                kv_stage_elements = kv_stage_elements + Int32(cute.cosize(kv_tail_layout) if self.head_dim == 576 else 0)
+            if const_expr(self.use_tma_gather4):
+                if warp_idx >= Int32(4) and warp_idx < Int32(8):
+                    # Wait for the Q copy and the previous O write-back before
+                    # first writing their stages (after the last tile if never
+                    # reached).  Both are two-deep rings by query parity, so a
+                    # lagging producer cannot be lapped.
+                    o_stage = (tile_base + Int32(self.num_kv_stages - 1)) % Int32(self.num_kv_stages)
+                    o_slot = (query_count + Int32(1)) % Int32(2)
+                    o_slot_phase = ((query_count - Int32(1)) // Int32(2)) % Int32(2)
+                    q_pending = Int32(1)
+                    o_pending = Int32(1) if query_count > Int32(0) else Int32(0)
+                    producer_tile = Int32(0)
+                    while producer_tile < tile_count:
+                        producer_global = tile_base + producer_tile
+                        producer_stage = producer_global % Int32(self.num_kv_stages)
+                        if producer_global >= Int32(self.num_kv_stages):
+                            prior_use = producer_global // Int32(self.num_kv_stages) - Int32(1)
+                            cute.arch.mbarrier_wait(
+                                pv_done_mbar_ptr + producer_stage,
+                                prior_use % Int32(2),
+                            )
+                        if q_pending != Int32(0) and producer_stage == q_stage:
+                            cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr + q_slot, q_slot_phase)
+                            q_pending = Int32(0)
+                        if o_pending != Int32(0) and producer_stage == o_stage:
+                            cute.arch.mbarrier_wait(o_writeback_mbar_ptr + o_slot, o_slot_phase)
+                            o_pending = Int32(0)
+
+                        producer_stage_elem_offset = producer_stage * kv_stage_elements
+                        producer_kv_ptr = sKV_base_ptr + cute.assume(
+                            producer_stage_elem_offset,
                             divby=self.COPY_ELEMS,
                         )
-                        next_sKV_dual_nope = cute.make_tensor(
-                            cute.recast_ptr(next_kv_ptr, kv_dual_nope_layout.inner),
-                            kv_dual_nope_layout.outer,
-                        )
-                        next_sKV_dual_nope_slice = next_sKV_dual_nope[(None, None), 0, (None, None), 0]
-                        next_sKV_dual_nope_logical = cute.composition(
-                            next_sKV_dual_nope_slice,
-                            cute.make_layout((2 * self.BLOCK_TOPK, self.VALUE_DIM // 2)),
-                        )
-                        next_sKV_dual_tail = cute.make_tensor(
-                            cute.recast_ptr(next_tail_ptr, kv_dual_tail_layout.inner),
-                            kv_dual_tail_layout.outer,
-                        )
-                        next_sKV_dual_tail_logical = cute.composition(
-                            next_sKV_dual_tail,
-                            cute.make_layout((2 * self.BLOCK_TOPK, 32)),
-                        )
-                        self._qk_mma_issue_double_buffered(
-                            tiled_mma_qk,
-                            next_sKV_dual_nope_logical,
-                            next_sKV_dual_tail_logical,
-                            mma_done_mbar_ptr,
-                            kv_ready_mbar_ptr + next_stage * Int32(self.num_kv_parts),
-                            (next_tile // Int32(self.num_kv_stages)) % Int32(2),
-                            kv_tail_ready_mbar_ptr + next_stage,
-                            next_tile % Int32(2),
-                            kv_tail_free_mbar_ptr,
-                            q_s2t_done_mbar_ptr,
-                            p_free_mbar_ptr,
-                            next_tile,
+                        logical_tile_is_full = Int32(1)
+                        if const_expr(topk_length is not None):
+                            logical_tile_is_full = cute.arch.make_warp_uniform(Int32((producer_tile + Int32(1)) * Int32(self.BLOCK_TOPK) <= effective_length))
+                        self._gather_kv_tma_direct(
+                            indices,
+                            query_idx,
+                            producer_tile,
+                            effective_length,
+                            logical_tile_is_full,
+                            producer_kv_ptr,
+                            tma_atom_kv,
+                            kv_ready_mbar_ptr + producer_stage * Int32(self.num_kv_parts),
+                            kv_tma_bytes,
                             warp_idx,
                         )
+                        producer_tile = producer_tile + Int32(1)
+                    # Claim here, not at query start: early claims unbalance
+                    # ragged lengths.
+                    if warp_idx == Int32(self.CLC_WARP):
+                        clc_pipeline.producer_acquire(clc_producer_state)
+                        tile_sched.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer_state))
+                        clc_producer_state.advance()
+                    if q_pending != Int32(0):
+                        cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr + q_slot, q_slot_phase)
+                    if o_pending != Int32(0):
+                        cute.arch.mbarrier_wait(o_writeback_mbar_ptr + o_slot, o_slot_phase)
 
-            # O persists in TMEM across all sparse tiles.  WG0 publishes P and
-            # a possible O rescale through a one-way mbarrier, then immediately
-            # starts consuming the next score tile.  Warp 8 independently
-            # waits this handoff before issuing the current PV.
-            if warp_idx < Int32(4):
-                if tile_idx > Int32(0):
-                    # Warps 0 and 1 publish the rescale metadata. Synchronize
-                    # all four WG0 warps before any of them consume it.
-                    self.softmax_sync_barrier.arrive_and_wait()
-                    self._rescale_o_tmem(sScale, sGroupRescale, tidx)
-                cute.arch.fence_view_async_shared()
-                cute.arch.mbarrier_arrive(so_ready_mbar_ptr)
-
-            # Gather4's dynamic warp-8 loop owns PV.  The compatibility path
-            # keeps its common-loop issue point and completion protocol.
+                # Warp 9 independently publishes the two packed validity words.
+                # Its three-stage ring is released only after every WG0 thread has
+                # consumed the corresponding half-tile mask.
+                if warp_idx == Int32(9):
+                    valid_tile = Int32(0)
+                    while valid_tile < tile_count:
+                        valid_global = tile_base + valid_tile
+                        valid_stage = valid_global % Int32(self.num_kv_stages)
+                        valid_phase = (valid_global // Int32(self.num_kv_stages)) % Int32(2)
+                        cute.arch.mbarrier_wait(
+                            valid_free_mbar_ptr + valid_stage,
+                            valid_phase ^ Int32(1),
+                        )
+                        for half in cutlass.range_constexpr(self.BLOCK_TOPK // self.WARP_SIZE):
+                            slot = valid_tile * Int32(self.BLOCK_TOPK) + Int32(half * self.WARP_SIZE) + lane_idx
+                            token = Int32(indices[query_idx, slot])
+                            valid = slot < effective_length and token >= Int32(0) and Int64(token) < Int64(kv.shape[0])
+                            valid_mask = cute.arch.vote_ballot_sync(valid)
+                            if lane_idx == Int32(0):
+                                valid_offset = valid_stage * Int32(self.BLOCK_TOPK // self.WARP_SIZE) + Int32(half)
+                                sValidWords[valid_offset] = Uint32(valid_mask)
+                        cute.arch.fence_view_async_shared()
+                        if lane_idx == Int32(0):
+                            cute.arch.mbarrier_arrive(valid_ready_mbar_ptr + valid_stage)
+                        valid_tile = valid_tile + Int32(1)
+            else:
+                if warp_idx >= Int32(4) and warp_idx < Int32(8):
+                    producer_tidx = tidx - Int32(4 * self.WARP_SIZE)
+                    prime_tile = Int32(0)
+                    prime_kv_ptr = sKV_base_ptr
+                    prime_tail_ptr = sKV_tail_base_ptr
+                    prime_sKV_nope_mma = cute.make_tensor(
+                        cute.recast_ptr(prime_kv_ptr, kv_nope_layout.inner),
+                        kv_nope_layout.outer,
+                    )
+                    prime_sKV_nope_slice = prime_sKV_nope_mma[(None, None), 0, (None, None), 0]
+                    prime_sKV_nope = cute.composition(
+                        prime_sKV_nope_slice,
+                        cute.make_layout((self.BLOCK_TOPK, self.VALUE_DIM)),
+                    )
+                    prime_sKV_tail_mma = cute.make_tensor(
+                        cute.recast_ptr(prime_tail_ptr, kv_tail_layout.inner),
+                        kv_tail_layout.outer,
+                    )
+                    prime_sKV_tail = cute.composition(
+                        prime_sKV_tail_mma,
+                        cute.make_layout((self.BLOCK_TOPK, 64)),
+                    )
+                    prime_sIndex = cute.make_tensor(s_index_base_ptr, vector_layout)
+                    prime_sValid = cute.make_tensor(s_valid_base_ptr, valid_layout)
+                    self._prepare_indices(
+                        indices,
+                        prime_sIndex,
+                        prime_sValid,
+                        query_idx,
+                        prime_tile,
+                        effective_length,
+                        physical_topk,
+                        kv.shape[0],
+                        producer_tidx,
+                    )
+                    self.gather_sync_barrier.arrive_and_wait()
+                    self._gather_kv(
+                        kv,
+                        prime_sKV_nope,
+                        prime_sKV_tail,
+                        prime_sIndex,
+                        prime_sValid,
+                        warp_idx,
+                        lane_idx,
+                        copy_atom,
+                        thread_copy,
+                    )
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.fence_view_async_shared()
+            if const_expr(self.head_dim == 576 and self.use_tma_gather4):
+                if warp_idx >= Int32(10) and warp_idx < Int32(12):
+                    self._gather_kv_tail_cpasync(
+                        kv,
+                        indices,
+                        sKV_tail0,
+                        kv_tail_ready_mbar_ptr,
+                        kv_tail_free_mbar_ptr,
+                        query_idx,
+                        Int32(0),
+                        tile_base,
+                        effective_length,
+                        physical_topk,
+                        warp_idx,
+                        lane_idx,
+                        copy_atom,
+                    )
+            # The gather4 consumers wait their per-stage TMA/tail barriers.  The
+            # compatibility cp.async path has no cross-warp completion mbarrier,
+            # so it deliberately retains the original CTA-wide prime handoff.
             if const_expr(not self.use_tma_gather4):
-                self._pv_mma_to_tmem(
-                    tiled_mma_pv,
-                    sP_mma,
-                    sV_mma0,
-                    sV_mma1,
-                    so_ready_mbar_ptr,
-                    pv_done_mbar_ptr + stage_idx,
-                    tile_idx,
-                    warp_idx,
+                cute.arch.sync_threads()
+
+            # Warp 8 owns one dynamic QK/PV issuer loop on the gather4 path.  The
+            # inclusive sentinel iteration drains PV(last): iteration k first
+            # issues QK(k), when it exists, and then issues PV(k-1).  This preserves
+            # the existing p_free/so_ready ordering while keeping exactly one
+            # static QK body and one static PV body in SASS.
+            if const_expr(self.use_tma_gather4):
+                if warp_idx == Int32(8):
+                    issuer_tile = Int32(0)
+                    while issuer_tile <= tile_count:
+                        if issuer_tile < tile_count:
+                            qk_global = tile_base + issuer_tile
+                            qk_stage = qk_global % Int32(self.num_kv_stages)
+                            qk_stage_elem_offset = qk_stage * kv_stage_elements
+                            qk_kv_ptr = sKV_base_ptr + cute.assume(
+                                qk_stage_elem_offset,
+                                divby=self.COPY_ELEMS,
+                            )
+                            qk_sKV_dual_nope = cute.make_tensor(
+                                cute.recast_ptr(qk_kv_ptr, kv_dual_nope_layout.inner),
+                                kv_dual_nope_layout.outer,
+                            )
+                            qk_sKV_dual_nope_slice = qk_sKV_dual_nope[(None, None), 0, (None, None), 0]
+                            qk_sKV_dual_nope_logical = cute.composition(
+                                qk_sKV_dual_nope_slice,
+                                cute.make_layout((2 * self.BLOCK_TOPK, self.VALUE_DIM // 2)),
+                            )
+                            qk_sKV_dual_tail = cute.make_tensor(
+                                cute.recast_ptr(sKV_tail_base_ptr, kv_dual_tail_layout.inner),
+                                kv_dual_tail_layout.outer,
+                            )
+                            qk_sKV_dual_tail_logical = cute.composition(
+                                qk_sKV_dual_tail,
+                                cute.make_layout((2 * self.BLOCK_TOPK, 32)),
+                            )
+                            self._qk_mma_issue_double_buffered(
+                                tiled_mma_qk,
+                                qk_sKV_dual_nope_logical,
+                                qk_sKV_dual_tail_logical,
+                                mma_done_mbar_ptr,
+                                kv_ready_mbar_ptr + qk_stage * Int32(self.num_kv_parts),
+                                (qk_global // Int32(self.num_kv_stages)) % Int32(2),
+                                kv_tail_ready_mbar_ptr,
+                                qk_global % Int32(2),
+                                kv_tail_free_mbar_ptr,
+                                q_s2t_done_mbar_ptr + q_slot,
+                                q_slot_phase,
+                                p_free_mbar_ptr,
+                                issuer_tile,
+                                qk_global,
+                                warp_idx,
+                            )
+
+                        if issuer_tile > Int32(0):
+                            pv_tile = issuer_tile - Int32(1)
+                            pv_global = tile_base + pv_tile
+                            pv_stage = pv_global % Int32(self.num_kv_stages)
+                            pv_stage_elem_offset = pv_stage * kv_stage_elements
+                            pv_kv_ptr = sKV_base_ptr + cute.assume(
+                                pv_stage_elem_offset,
+                                divby=self.COPY_ELEMS,
+                            )
+                            pv_sV_mma0 = cute.make_tensor(
+                                cute.recast_ptr(pv_kv_ptr, v_mma_layout.inner),
+                                v_mma_layout.outer,
+                            )
+                            pv_sV_mma1 = cute.make_tensor(
+                                cute.recast_ptr(pv_kv_ptr + (self.VALUE_DIM // 2) * self.BLOCK_TOPK, v_mma_layout.inner),
+                                v_mma_layout.outer,
+                            )
+                            self._pv_mma_to_tmem(
+                                tiled_mma_pv,
+                                sP_mma,
+                                pv_sV_mma0,
+                                pv_sV_mma1,
+                                so_ready_mbar_ptr,
+                                pv_done_mbar_ptr + pv_stage,
+                                pv_tile,
+                                pv_global,
+                                warp_idx,
+                            )
+                        issuer_tile = issuer_tile + Int32(1)
+
+            scale_log2_e = softmax_scale * Float32(math.log2(math.e))
+            tile_idx = Int32(0)
+            if const_expr(self.use_tma_gather4):
+                if warp_idx >= Int32(4) and warp_idx < Int32(10):
+                    # WG1, the MMA issuer, and validity producer all finish in
+                    # their independent dynamic loops above.
+                    tile_idx = tile_count
+            qk_phase = tile_base % Int32(2)
+            while tile_idx < tile_count:
+                tile_global = tile_base + tile_idx
+                stage_idx = tile_global % Int32(self.num_kv_stages)
+                stage_elem_offset = stage_idx * kv_stage_elements
+                stage_valid_offset = stage_idx * Int32(self.BLOCK_TOPK // 8)
+                stage_kv_ptr = sKV_base_ptr + cute.assume(stage_elem_offset, divby=self.COPY_ELEMS)
+                stage_tail_ptr = sKV_tail_base_ptr
+                tail_stage_idx = Int32(0)
+                if const_expr(not self.use_tma_gather4):
+                    stage_tail_ptr = sKV_tail_base_ptr + cute.assume(stage_elem_offset, divby=self.COPY_ELEMS)
+                    tail_stage_idx = stage_idx
+                sKV_dual_nope = cute.make_tensor(
+                    cute.recast_ptr(stage_kv_ptr, kv_dual_nope_layout.inner),
+                    kv_dual_nope_layout.outer,
+                )
+                sKV_dual_nope_slice = sKV_dual_nope[(None, None), 0, (None, None), 0]
+                sKV_dual_nope_logical = cute.composition(
+                    sKV_dual_nope_slice,
+                    cute.make_layout((2 * self.BLOCK_TOPK, self.VALUE_DIM // 2)),
+                )
+                sKV_dual_tail = cute.make_tensor(
+                    cute.recast_ptr(stage_tail_ptr, kv_dual_tail_layout.inner),
+                    kv_dual_tail_layout.outer,
+                )
+                sKV_dual_tail_logical = cute.composition(
+                    sKV_dual_tail,
+                    cute.make_layout((2 * self.BLOCK_TOPK, 32)),
+                )
+                sValid = cute.make_tensor(s_valid_base_ptr + stage_valid_offset, valid_layout)
+                sV_mma0 = cute.make_tensor(cute.recast_ptr(stage_kv_ptr, v_mma_layout.inner), v_mma_layout.outer)
+                sV_mma1 = cute.make_tensor(
+                    cute.recast_ptr(stage_kv_ptr + (self.VALUE_DIM // 2) * self.BLOCK_TOPK, v_mma_layout.inner),
+                    v_mma_layout.outer,
                 )
 
-            tile_idx = tile_idx + Int32(1)
+                if const_expr(not self.use_tma_gather4):
+                    # The compatibility path primes tile zero here.  Gather4's
+                    # independent warp-8 loop above owns its complete QK chain.
+                    if tile_idx == Int32(0):
+                        self._qk_mma_issue_double_buffered(
+                            tiled_mma_qk,
+                            sKV_dual_nope_logical,
+                            sKV_dual_tail_logical,
+                            mma_done_mbar_ptr,
+                            kv_ready_mbar_ptr + stage_idx * Int32(self.num_kv_parts),
+                            (tile_idx // Int32(self.num_kv_stages)) % Int32(2),
+                            kv_tail_ready_mbar_ptr + tail_stage_idx,
+                            tile_idx % Int32(2),
+                            kv_tail_free_mbar_ptr,
+                            q_s2t_done_mbar_ptr,
+                            Int32(0),
+                            p_free_mbar_ptr,
+                            tile_idx,
+                            tile_global,
+                            warp_idx,
+                        )
+                pair_mi, pair_li, pair_real_max = self._scores_consume_double_buffered(
+                    sPExchange,
+                    sPExchangeLinear,
+                    sWeight,
+                    sValid,
+                    mma_done_mbar_ptr,
+                    qk_phase,
+                    valid_ready_mbar_ptr + stage_idx,
+                    (tile_global // Int32(self.num_kv_stages)) % Int32(2),
+                    valid_free_mbar_ptr + stage_idx,
+                    p_free_mbar_ptr,
+                    pv_done_mbar_ptr,
+                    tile_global,
+                    tidx,
+                    warp_idx,
+                    scale_log2_e,
+                    rMi[0],
+                    rLi[0],
+                    rRealMax[0],
+                    sGroupRescale,
+                    sScale,
+                )
+                if warp_idx < Int32(4):
+                    rMi[0] = pair_mi
+                    rLi[0] = pair_li
+                    rRealMax[0] = pair_real_max
+                    if const_expr(self.indexer_topk > 0):
+                        if tile_idx == Int32(self.indexer_tile):
+                            rMiIndexer[0] = pair_mi
+                            rLiIndexer[0] = pair_li
+                qk_phase = qk_phase ^ Int32(1)
 
-        # The final output read must observe the last PV completion.
-        final_tile = tile_count - Int32(1)
-        final_stage = final_tile % Int32(self.num_kv_stages)
-        final_phase = (final_tile // Int32(self.num_kv_stages)) % Int32(2)
-        if warp_idx < Int32(4):
-            # Only the output consumer needs to observe the final PV. Producer
-            # and issuer roles can retire after publishing their own pipeline
-            # state before the WG0-local epilogue.
-            cute.arch.mbarrier_wait(pv_done_mbar_ptr + final_stage, final_phase)
-            self._epilogue_stats(
-                max_logits,
-                lse,
-                lse_indexer,
-                attn_sink,
-                query_idx,
-                warp_idx,
-                lane_idx,
-                sScale,
-                sPExchangeLinear,
-                rMi,
-                rLi,
-                rRealMax,
-                rMiIndexer,
-                rLiIndexer,
-            )
-        if warp_idx < Int32(4):
-            self._epilogue_o_tma(
-                out_tma,
-                tma_atom_o,
-                query_idx,
-                sO,
-                sScale,
-                tidx,
-                warp_idx,
-            )
+                # Gather4 runs in WG1's independent producer loop above.  The
+                # compatibility path retains its one-tile refill here, while the
+                # independent D576 tail warps and QK issuer keep their existing
+                # pipelines.
+                next_tile = tile_idx + Int32(1)
+                if const_expr(self.num_kv_stages > 1):
+                    if const_expr(not self.use_tma_gather4):
+                        # Keep the compatibility producer byte-for-byte equivalent
+                        # to the proven two-stage schedule.  In particular, do not
+                        # route its divergent warpgroup control flow through the
+                        # gather4 path's two-tile prefetch SSA values.
+                        if next_tile < tile_count and warp_idx >= Int32(4) and warp_idx < Int32(8):
+                            next_stage = next_tile % Int32(self.num_kv_stages)
+                            if next_tile >= Int32(self.num_kv_stages):
+                                prior_use = next_tile // Int32(self.num_kv_stages) - Int32(1)
+                                cute.arch.mbarrier_wait(
+                                    pv_done_mbar_ptr + next_stage,
+                                    prior_use % Int32(2),
+                                )
+                            next_stage_elem_offset = next_stage * kv_stage_elements
+                            next_stage_meta_offset = next_stage * Int32(self.BLOCK_TOPK)
+                            next_stage_valid_offset = next_stage * Int32(self.BLOCK_TOPK // 8)
+                            next_kv_ptr = sKV_base_ptr + cute.assume(next_stage_elem_offset, divby=self.COPY_ELEMS)
+                            next_tail_ptr = sKV_tail_base_ptr + cute.assume(
+                                next_stage_elem_offset,
+                                divby=self.COPY_ELEMS,
+                            )
+                            next_sKV_nope_mma = cute.make_tensor(
+                                cute.recast_ptr(next_kv_ptr, kv_nope_layout.inner),
+                                kv_nope_layout.outer,
+                            )
+                            next_sKV_nope_slice = next_sKV_nope_mma[(None, None), 0, (None, None), 0]
+                            next_sKV_nope = cute.composition(
+                                next_sKV_nope_slice,
+                                cute.make_layout((self.BLOCK_TOPK, self.VALUE_DIM)),
+                            )
+                            next_sKV_tail_mma = cute.make_tensor(
+                                cute.recast_ptr(next_tail_ptr, kv_tail_layout.inner),
+                                kv_tail_layout.outer,
+                            )
+                            next_sKV_tail = cute.composition(
+                                next_sKV_tail_mma,
+                                cute.make_layout((self.BLOCK_TOPK, 64)),
+                            )
+                            next_sIndex = cute.make_tensor(
+                                s_index_base_ptr + next_stage_meta_offset,
+                                vector_layout,
+                            )
+                            next_sValid = cute.make_tensor(
+                                s_valid_base_ptr + next_stage_valid_offset,
+                                valid_layout,
+                            )
+                            producer_tidx = tidx - Int32(4 * self.WARP_SIZE)
+                            self._prepare_indices(
+                                indices,
+                                next_sIndex,
+                                next_sValid,
+                                query_idx,
+                                next_tile,
+                                effective_length,
+                                physical_topk,
+                                kv.shape[0],
+                                producer_tidx,
+                            )
+                            self.gather_sync_barrier.arrive_and_wait()
+                            self._gather_kv(
+                                kv,
+                                next_sKV_nope,
+                                next_sKV_tail,
+                                next_sIndex,
+                                next_sValid,
+                                warp_idx,
+                                lane_idx,
+                                copy_atom,
+                                thread_copy,
+                            )
+                            cute.arch.cp_async_commit_group()
+                            cute.arch.cp_async_wait_group(0)
+                            cute.arch.fence_view_async_shared()
+
+                        # Compatibility copies have no transaction-completion
+                        # mbarrier for warp 8.  Keep this path deliberately
+                        # conservative: all roles observe K(next) before QK(next).
+                        cute.arch.sync_threads()
+
+                    if const_expr(self.head_dim == 576 and self.use_tma_gather4):
+                        if next_tile < tile_count and warp_idx >= Int32(10) and warp_idx < Int32(12):
+                            self._gather_kv_tail_cpasync(
+                                kv,
+                                indices,
+                                sKV_tail0,
+                                kv_tail_ready_mbar_ptr,
+                                kv_tail_free_mbar_ptr,
+                                query_idx,
+                                next_tile,
+                                tile_global + Int32(1),
+                                effective_length,
+                                physical_topk,
+                                warp_idx,
+                                lane_idx,
+                                copy_atom,
+                            )
+
+                    if const_expr(not self.use_tma_gather4):
+                        # Compatibility warp 8 issues QK(k+1) before joining the
+                        # two PV named barriers.  Gather4 uses the independent
+                        # dynamic issuer loop above.
+                        if next_tile < tile_count:
+                            next_stage = next_tile % Int32(self.num_kv_stages)
+                            next_stage_elem_offset = next_stage * kv_stage_elements
+                            next_kv_ptr = sKV_base_ptr + cute.assume(next_stage_elem_offset, divby=self.COPY_ELEMS)
+                            next_tail_ptr = sKV_tail_base_ptr + cute.assume(
+                                next_stage_elem_offset,
+                                divby=self.COPY_ELEMS,
+                            )
+                            next_sKV_dual_nope = cute.make_tensor(
+                                cute.recast_ptr(next_kv_ptr, kv_dual_nope_layout.inner),
+                                kv_dual_nope_layout.outer,
+                            )
+                            next_sKV_dual_nope_slice = next_sKV_dual_nope[(None, None), 0, (None, None), 0]
+                            next_sKV_dual_nope_logical = cute.composition(
+                                next_sKV_dual_nope_slice,
+                                cute.make_layout((2 * self.BLOCK_TOPK, self.VALUE_DIM // 2)),
+                            )
+                            next_sKV_dual_tail = cute.make_tensor(
+                                cute.recast_ptr(next_tail_ptr, kv_dual_tail_layout.inner),
+                                kv_dual_tail_layout.outer,
+                            )
+                            next_sKV_dual_tail_logical = cute.composition(
+                                next_sKV_dual_tail,
+                                cute.make_layout((2 * self.BLOCK_TOPK, 32)),
+                            )
+                            self._qk_mma_issue_double_buffered(
+                                tiled_mma_qk,
+                                next_sKV_dual_nope_logical,
+                                next_sKV_dual_tail_logical,
+                                mma_done_mbar_ptr,
+                                kv_ready_mbar_ptr + next_stage * Int32(self.num_kv_parts),
+                                (next_tile // Int32(self.num_kv_stages)) % Int32(2),
+                                kv_tail_ready_mbar_ptr + next_stage,
+                                next_tile % Int32(2),
+                                kv_tail_free_mbar_ptr,
+                                q_s2t_done_mbar_ptr,
+                                Int32(0),
+                                p_free_mbar_ptr,
+                                next_tile,
+                                next_tile,
+                                warp_idx,
+                            )
+
+                # O persists in TMEM across all sparse tiles.  WG0 publishes P and
+                # a possible O rescale through a one-way mbarrier, then immediately
+                # starts consuming the next score tile.  Warp 8 independently
+                # waits this handoff before issuing the current PV.
+                if warp_idx < Int32(4):
+                    if tile_idx > Int32(0):
+                        # Warps 0 and 1 publish the rescale metadata. Synchronize
+                        # all four WG0 warps before any of them consume it.
+                        self.softmax_sync_barrier.arrive_and_wait()
+                        self._rescale_o_tmem(sScale, sGroupRescale, tidx)
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.mbarrier_arrive(so_ready_mbar_ptr)
+
+                # Gather4's dynamic warp-8 loop owns PV.  The compatibility path
+                # keeps its common-loop issue point and completion protocol.
+                if const_expr(not self.use_tma_gather4):
+                    self._pv_mma_to_tmem(
+                        tiled_mma_pv,
+                        sP_mma,
+                        sV_mma0,
+                        sV_mma1,
+                        so_ready_mbar_ptr,
+                        pv_done_mbar_ptr + stage_idx,
+                        tile_idx,
+                        tile_global,
+                        warp_idx,
+                    )
+
+                tile_idx = tile_idx + Int32(1)
+
+            # The final output read must observe the last PV completion.
+            final_tile = tile_base + tile_count - Int32(1)
+            final_stage = final_tile % Int32(self.num_kv_stages)
+            final_phase = (final_tile // Int32(self.num_kv_stages)) % Int32(2)
+            if warp_idx < Int32(4):
+                # Only the output consumer needs to observe the final PV. Producer
+                # and issuer roles can retire after publishing their own pipeline
+                # state before the WG0-local epilogue.
+                cute.arch.mbarrier_wait(pv_done_mbar_ptr + final_stage, final_phase)
+                self._epilogue_stats(
+                    max_logits,
+                    lse,
+                    lse_indexer,
+                    attn_sink,
+                    query_idx,
+                    warp_idx,
+                    lane_idx,
+                    sScale,
+                    sPExchangeLinear,
+                    rMi,
+                    rLi,
+                    rRealMax,
+                    rMiIndexer,
+                    rLiIndexer,
+                )
+            if warp_idx < Int32(4):
+                sO_query = sO
+                if const_expr(self.use_tma_gather4):
+                    # Stage O in the last tile's KV stage.
+                    o_query_ptr = sKV_base_ptr + cute.assume(final_stage * Int32(kv_nope_elements), divby=kv_nope_elements)
+                    sO_query = cute.make_tensor(cute.recast_ptr(o_query_ptr, o_full_smem_layout.inner), o_full_smem_layout.outer)
+                self._epilogue_o_tma(
+                    out_tma,
+                    tma_atom_o,
+                    query_idx,
+                    sO_query,
+                    sScale,
+                    tidx,
+                    warp_idx,
+                )
+                if const_expr(self.use_tma_gather4):
+                    # Every store issuer has drained its reads of the O stage.
+                    # Only WG0 reaches this rendezvous, so it is unaligned.
+                    prims.barrier_cta_sync(self.softmax_sync_barrier.barrier_id, thread_count=self.softmax_sync_barrier.num_threads)
+                    if warp_idx == Int32(0):
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(o_writeback_mbar_ptr + q_slot)
+
+            tile_base = tile_base + tile_count
+            query_count = query_count + Int32(1)
+            if const_expr(self.use_tma_gather4):
+                # Every thread consumes each claim response.
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work_tile = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
+                query_idx = work_tile.tile_idx[0]
+                has_query = Int32(1) if work_tile.is_valid_tile else Int32(0)
+            else:
+                has_query = Int32(0)
+
+        if const_expr(self.use_tma_gather4):
+            # Drain the claim pipeline before the CTA exits.
+            if warp_idx == Int32(self.CLC_WARP):
+                clc_pipeline.producer_tail(clc_producer_state)
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
@@ -1391,20 +1535,24 @@ class SparseAttentionForwardSm100Head64:
         free_mbar_ptr: cute.Pointer,
         query_idx: Int32,
         tile_idx: Int32,
+        global_tile: Int32,
         effective_length: Int32,
         physical_topk: Int32,
         warp_idx: Int32,
         lane_idx: Int32,
         copy_atom: cute.CopyAtom,
     ):
-        """Copy the D=576 SW64 tail with two dedicated warps."""
+        """Copy the D=576 SW64 tail with two dedicated warps.
+
+        ``tile_idx`` is the query's tile; ``global_tile``, the CTA's tile count, selects the phase.
+        """
 
         if warp_idx >= Int32(10) and warp_idx < Int32(12):
             # The tail has a single physical stage.  Its consumer commits this
             # free barrier immediately after the two tail QK instructions, so
             # copy(k+1) need not wait for the much later PV(k) completion.
-            if tile_idx > Int32(0):
-                cute.arch.mbarrier_wait(free_mbar_ptr, (tile_idx - Int32(1)) % Int32(2))
+            if global_tile > Int32(0):
+                cute.arch.mbarrier_wait(free_mbar_ptr, (global_tile - Int32(1)) % Int32(2))
             producer_tidx = (warp_idx - Int32(10)) * Int32(self.WARP_SIZE) + lane_idx
             row_group = producer_tidx // Int32(8)
             chunk_idx = producer_tidx % Int32(8)
@@ -1537,25 +1685,30 @@ class SparseAttentionForwardSm100Head64:
         kv_tail_phase: Int32,
         kv_tail_free_mbar,
         q_s2t_done_mbar,
+        q_phase: Int32,
         p_free_mbar,
         tile_idx: Int32,
+        global_tile: Int32,
         warp_idx: Int32,
     ):
-        """Issue one QK tile after the prior score readers release TMEM P."""
+        """Issue one QK tile after the prior score readers release TMEM P.
+
+        ``tile_idx`` is the query's tile; ``global_tile``, the CTA's tile count, selects the phases.
+        """
 
         if warp_idx == Int32(8):
             # The score accumulator has one physical TMEM stage.  Tile k may
             # overwrite it only after all 128 WG0 threads have completed their
             # synchronous Ld32x32 reads for tile k-1.
-            if tile_idx > Int32(0):
-                cute.arch.mbarrier_wait(p_free_mbar, (tile_idx - Int32(1)) % Int32(2))
+            if global_tile > Int32(0):
+                cute.arch.mbarrier_wait(p_free_mbar, (global_tile - Int32(1)) % Int32(2))
 
             # On gather4, S2T completion both orders Q before QK0 and publishes
-            # the aliased Q-NoPE stage to the K2 producer.  The fallback keeps
+            # the aliased Q-NoPE stage to the producer.  The fallback keeps
             # its original CTA-synchronized same-warp instruction ordering.
             if const_expr(self.use_tma_gather4):
                 if tile_idx == Int32(0):
-                    cute.arch.mbarrier_wait(q_s2t_done_mbar, 0)
+                    cute.arch.mbarrier_wait(q_s2t_done_mbar, q_phase)
                     tcgen05_fence_after_thread_sync()
 
             # The D=576 producer dedicates warps 10/11 to the SW64 tail. Their
@@ -1628,7 +1781,7 @@ class SparseAttentionForwardSm100Head64:
         valid_free_mbar,
         p_free_mbar,
         pv_done_mbar,
-        tile_idx: Int32,
+        global_tile: Int32,
         tidx: Int32,
         warp_idx: Int32,
         scale_log2_e: Float32,
@@ -1638,7 +1791,10 @@ class SparseAttentionForwardSm100Head64:
         sGroupRescale: cute.Tensor,
         sScale: cute.Tensor,
     ):
-        """Consume one QK result and materialize its online-softmax P tile."""
+        """Consume one QK result and materialize its online-softmax P tile.
+
+        ``global_tile`` is the CTA's tile count; the P store waits for the PV of the previous one.
+        """
 
         new_mi = old_mi
         new_li = old_li
@@ -1654,19 +1810,15 @@ class SparseAttentionForwardSm100Head64:
             head_idx = (local_warp & Int32(1)) * Int32(self.WARP_SIZE) + lane_idx
             # The public M64N128 object models a non-WS accumulator fragment,
             # while mma.ws uses tmem_frg_ws_1sm. Load the two physical
-            # 32-column pieces directly with tmem_ld_32dp32bNx.
-            if const_expr(self.indexer_topk > 0):
-                # Put the warp-owned score half in r_left and the peer partial
-                # in r_right up front.  This keeps the exchange below
-                # straight-line instead of merging two 32-value SSA fragments
-                # at the local-warp role join.
-                owned_half = local_warp // Int32(2)
-                peer_half = owned_half ^ Int32(1)
-                left_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + owned_half * Int32(self.BLOCK_TOPK // 2))
-                right_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + peer_half * Int32(self.BLOCK_TOPK // 2))
-            else:
-                left_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET))
-                right_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET + 32))
+            # 32-column pieces directly with tmem_ld_32dp32bNx.  The
+            # warp-owned score half goes to r_left and the peer partial to
+            # r_right, chosen by the TMEM column, so the masking and exchange
+            # below are straight-line: selecting two 32-value fragments by
+            # the local warp would merge them element by element (SEL/FSEL).
+            owned_half = local_warp // Int32(2)
+            peer_half = owned_half ^ Int32(1)
+            left_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + owned_half * Int32(self.BLOCK_TOPK // 2))
+            right_values = tmem_load_32dp32b32x(Int32(self.TMEM_P_OFFSET) + peer_half * Int32(self.BLOCK_TOPK // 2))
             r_left = cute.make_rmem_tensor((self.BLOCK_TOPK // 2,), Float32)
             r_right = cute.make_rmem_tensor((self.BLOCK_TOPK // 2,), Float32)
             for elem in cutlass.range_constexpr(self.BLOCK_TOPK // 2):
@@ -1692,66 +1844,27 @@ class SparseAttentionForwardSm100Head64:
                 sValid_words_ptr,
                 cute.make_layout((self.BLOCK_TOPK // self.WARP_SIZE,), stride=(1,)),
             )
-            if const_expr(self.indexer_topk > 0):
-                valid_word = Uint32(sValid_words[owned_half])
-            else:
-                valid_word = Uint32(sValid_words[0 if local_warp < Int32(2) else 1])
+            valid_word = Uint32(sValid_words[owned_half])
             if const_expr(self.use_tma_gather4):
                 cute.arch.mbarrier_arrive(valid_free_mbar)
             for elem in cutlass.range_constexpr(self.BLOCK_TOPK // 2):
                 invalid = (valid_word & (Uint32(1) << elem)) == Uint32(0)
-                if const_expr(self.indexer_topk > 0):
-                    r_left[elem] = -Float32.inf if invalid else r_left[elem]
-                else:
-                    mask_left = invalid and local_warp < Int32(2)
-                    mask_right = invalid and local_warp >= Int32(2)
-                    r_left[elem] = -Float32.inf if mask_left else r_left[elem]
-                    r_right[elem] = -Float32.inf if mask_right else r_right[elem]
+                r_left[elem] = -Float32.inf if invalid else r_left[elem]
             half_layout = cute.make_layout((self.BLOCK_TOPK // 2,), stride=(1,))
-            r_left_linear = cute.make_tensor(r_left.iterator, half_layout)
             r_right_linear = cute.make_tensor(r_right.iterator, half_layout)
-            r_left_vectors = cute.flat_divide(r_left_linear, (4,))
             r_right_vectors = cute.flat_divide(r_right_linear, (4,))
             peer_warp = local_warp ^ Int32(2)
-            if const_expr(self.indexer_topk > 0):
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                    cute.autovec_copy(
-                        r_right_vectors[None, vector],
-                        sPExchange[peer_warp, vector, lane_idx, None],
-                    )
-            else:
-                if local_warp < Int32(2):
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            r_right_vectors[None, vector],
-                            sPExchange[peer_warp, vector, lane_idx, None],
-                        )
-                else:
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            r_left_vectors[None, vector],
-                            sPExchange[peer_warp, vector, lane_idx, None],
-                        )
+            for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
+                cute.autovec_copy(
+                    r_right_vectors[None, vector],
+                    sPExchange[peer_warp, vector, lane_idx, None],
+                )
             self.softmax_sync_barrier.arrive_and_wait()
-            if const_expr(self.indexer_topk > 0):
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                    cute.autovec_copy(
-                        sPExchange[local_warp, vector, lane_idx, None],
-                        r_right_vectors[None, vector],
-                    )
-            else:
-                if local_warp < Int32(2):
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            sPExchange[local_warp, vector, lane_idx, None],
-                            r_right_vectors[None, vector],
-                        )
-                else:
-                    for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
-                        cute.autovec_copy(
-                            sPExchange[local_warp, vector, lane_idx, None],
-                            r_left_vectors[None, vector],
-                        )
+            for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 4):
+                cute.autovec_copy(
+                    sPExchange[local_warp, vector, lane_idx, None],
+                    r_right_vectors[None, vector],
+                )
             self.softmax_sync_barrier.arrive_and_wait()
             for elem in cutlass.range_constexpr(0, self.BLOCK_TOPK // 2, 2):
                 r_left[elem], r_left[elem + 1] = cute.arch.add_packed_f32x2(
@@ -1804,8 +1917,8 @@ class SparseAttentionForwardSm100Head64:
             # Keep exp and 16-bit conversion overlapped with PV(k-1).  Only the
             # first store that overwrites the single physical P stage needs to
             # wait for that asynchronous reader to finish.
-            if tile_idx > Int32(0):
-                prior_tile = tile_idx - Int32(1)
+            if global_tile > Int32(0):
+                prior_tile = global_tile - Int32(1)
                 prior_stage = prior_tile % Int32(self.num_kv_stages)
                 prior_phase = (prior_tile // Int32(self.num_kv_stages)) % Int32(2)
                 cute.arch.mbarrier_wait(pv_done_mbar + prior_stage, prior_phase)
@@ -1814,18 +1927,13 @@ class SparseAttentionForwardSm100Head64:
             # uint128 P writes.  Keep the existing K_SW128 P operand layout.
             r_probability_vectors = cute.flat_divide(r_probability, (8,))
             s_weight_vectors = cute.flat_divide(sWeight[head_idx, None], (8,))
-            if local_warp < Int32(2):
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 8):
-                    cute.autovec_copy(
-                        r_probability_vectors[None, vector],
-                        s_weight_vectors[None, vector],
-                    )
-            else:
-                for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 8):
-                    cute.autovec_copy(
-                        r_probability_vectors[None, vector],
-                        s_weight_vectors[None, vector + self.BLOCK_TOPK // 16],
-                    )
+            # Each warp stores its owned 32-token half of P.
+            half_vector_offset = (local_warp // Int32(2)) * Int32(self.BLOCK_TOPK // 16)
+            for vector in cutlass.range_constexpr((self.BLOCK_TOPK // 2) // 8):
+                cute.autovec_copy(
+                    r_probability_vectors[None, vector],
+                    s_weight_vectors[None, half_vector_offset + Int32(vector)],
+                )
             # ``so_ready_mbar`` is initialized with 128 arrivals and every WG0
             # thread executes a generic-proxy fence before arriving below.  Its
             # completion therefore publishes the whole P tile to warp 8; an
@@ -1844,15 +1952,19 @@ class SparseAttentionForwardSm100Head64:
         so_ready_mbar,
         pv_done_mbar,
         tile_idx: Int32,
+        global_tile: Int32,
         warp_idx: Int32,
     ):
-        """Accumulate both 64x256 P@V halves into persistent TMEM O."""
+        """Accumulate both 64x256 P@V halves into persistent TMEM O.
+
+        ``tile_idx`` 0 clears O; ``global_tile``, the CTA's tile count, selects the phase.
+        """
 
         if warp_idx == Int32(8):
             # WG0's 128 arrivals publish both the generic-proxy P stores and a
             # possible TMEM O rescale without forcing either role to execute
             # in lockstep.
-            cute.arch.mbarrier_wait(so_ready_mbar, tile_idx % Int32(2))
+            cute.arch.mbarrier_wait(so_ready_mbar, global_tile % Int32(2))
             tcgen05_fence_after_thread_sync()
             sP_slice = sP_mma[(None, None), 0, None, 0]
             sP_logical = cute.composition(
@@ -1989,7 +2101,7 @@ class SparseAttentionForwardSm100Head64:
         tidx: Int32,
         warp_idx: Int32,
     ):
-        """Stage persistent O in the drained arena and emit eight TMA stores."""
+        """Stage O in ``sO`` and emit eight TMA stores."""
 
         tcgen05_fence_after_thread_sync()
         head_idx = tidx % Int32(self.NUM_HEADS)
