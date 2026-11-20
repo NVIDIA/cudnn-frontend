@@ -524,8 +524,8 @@ st4zero(bf16* p) {
 
 // ---------------------------------------------------------------------------
 // K1 "prep": one CTA per (chunk-slot, head).  Fully parallel.
-// Produces  Amat = (I+M)^-1, wneg = -A*kb, u = A*(v*beta), kg, qg, gn2,
-//           dv_local = tril(Aqk)^T * dO.
+// Produces Amat = (I+M)^-1, wneg = -A*kb, u = A*(v*beta), kg, qg, gn2,
+// dv_local = tril(Aqk)^T * dO. REVERSE_ONLY omits the forward-only Amat/u.
 // 512 threads: the Aqk and M products run on two disjoint halves of the CTA.
 // ---------------------------------------------------------------------------
 static constexpr int PNT = 512;
@@ -535,7 +535,7 @@ static constexpr int MST = 67;  // spread FP32 triangular rows across SMEM banks
 // single barrier between its four products, and they overlap freely.
 static constexpr int SMEM_PREP = 16384 * 4 + 65536 + 8192 * 2 + 64 * GST * 4 + (64 * MST + 64 * 64) * 4 + 256 + 4096;
 
-template <bool FULL>
+template <bool FULL, bool REVERSE_ONLY = false>
 __global__
 __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                                       const bf16* __restrict__ kk,
@@ -744,8 +744,8 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
         }
     }
     __syncthreads();
-    pt.run(SMB + 49152, vv + base, L);          // sB2  <- v
-    pt.run(SMB + 65536 + 16384, dO + base, L);  // sDOt <- dO
+    if constexpr (!REVERSE_ONLY) pt.run(SMB + 49152, vv + base, L);  // sB2  <- v
+    pt.run(SMB + 65536 + 16384, dO + base, L);                       // sDOt <- dO
     cpasync_commit();
 
     // ---- A = (I+M)^-1 : 16x16 forward substitution then block combine
@@ -861,7 +861,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
     __syncthreads();
 
     // ---- store A (swizzled bytes), gn2, kg, qg, and the W operand
-    {
+    if constexpr (!REVERSE_ONLY) {
         bf16* dst                          = Amat + ((size_t)cs * H + h) * 64 * 64;
         reinterpret_cast<uint4*>(dst)[tid] = reinterpret_cast<const uint4*>(sAb)[tid];  // 64*64/8 == PNT
     }
@@ -914,18 +914,19 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
     }
     cpasync_wait<0>();
     __syncthreads();
-    // ---- u = A * (v*beta)
+    // ---- u = A * (v*beta).  The state-only reverse summary neither reads v
+    // nor consumes u, so its specialization removes this load, MMA and store.
+    if constexpr (!REVERSE_ONLY) {
 #pragma unroll
-    for (int m = 0; m < 2; ++m) {
-        const int o   = e8o + m * (32 * 128);
-        F8 vv8        = ld8bf(sB2 + o);
-        const float b = sBeta[e8r + m * 32];
+        for (int m = 0; m < 2; ++m) {
+            const int o   = e8o + m * (32 * 128);
+            F8 vv8        = ld8bf(sB2 + o);
+            const float b = sBeta[e8r + m * 32];
 #pragma unroll
-        for (int t = 0; t < 8; ++t) vv8.v[t] *= b;
-        st8bf(sB1 + o, vv8);
-    }
-    __syncthreads();
-    {
+            for (int t = 0; t < 8; ++t) vv8.v[t] *= b;
+            st8bf(sB1 + o, vv8);
+        }
+        __syncthreads();
         float acc[TL::TPW][4];
         zero_acc<TL::TPW>(acc);
         gemm_acc<64, 128, 64, 16, 0, 1, 64, 128>(acc, sAb, sB1, warp, lane);
@@ -1059,7 +1060,7 @@ static constexpr uint32_t O_GN = O_A + 64 * PCV * 2;
 // accumulator is staged through shared memory as bf16x2 pairs, halving the
 // conversion and store counts.
 // ---------------------------------------------------------------------------
-template <int BV, int NT, bool SINGLE, bool FULL>
+template <int BV, int NT, bool SINGLE, bool FULL, bool REVERSE_ONLY = false>
 __global__
 __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
                                        const bf16* __restrict__ uu,
@@ -1085,7 +1086,7 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
     constexpr int NW  = NT / 32;
     constexpr int C8V = BV / 8;
 
-    const int dir = blockIdx.x / NVB, vb = blockIdx.x % NVB;
+    const int dir = REVERSE_ONLY ? 1 : blockIdx.x / NVB, vb = blockIdx.x % NVB;
     const int nh = blockIdx.y, n = nh / H, h = nh % H;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t gs = (size_t)H * DH;
@@ -1132,20 +1133,27 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
     const int hso    = swz(hr, hc, PCV);
     const size_t vgo = (size_t)rV * gs + vb * BV + cV;
 
-    const float* srcst = (dir == 0) ? ist : dfs;
     float acc[TS::TPW][4];
-    {  // seed state, transposed:  S[d][x] = src[n][h][x][d]
-        const float* p = srcst + ((size_t)nh * DH + vb * BV) * DH;
-        for (int u = tid; u < BV * DH; u += NT) {
-            const int x = u >> 7, d = u & 127;
-            sF[d * 65 + x] = p[(size_t)x * DH + d];
+    if constexpr (REVERSE_ONLY) {
+        // The state-only summary contract is unseeded. Keep its exact zero
+        // seed in registers so this specialization neither owns nor reads a
+        // caller-workspace final-state row.
+        zero_acc<TS::TPW>(acc);
+    } else {
+        const float* srcst = (dir == 0) ? ist : dfs;
+        {  // seed state, transposed:  S[d][x] = src[n][h][x][d]
+            const float* p = srcst + ((size_t)nh * DH + vb * BV) * DH;
+            for (int u = tid; u < BV * DH; u += NT) {
+                const int x = u >> 7, d = u & 127;
+                sF[d * 65 + x] = p[(size_t)x * DH + d];
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < TS::TPW; ++j)
+#pragma unroll
+                for (int r = 0; r < 4; ++r) acc[j][r] = sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)];
+            __syncthreads();
         }
-        __syncthreads();
-#pragma unroll
-        for (int j = 0; j < TS::TPW; ++j)
-#pragma unroll
-            for (int r = 0; r < 4; ++r) acc[j][r] = sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)];
-        __syncthreads();
     }
 
     // ---- prefetch one chunk's operands into stage `st` --------------------
@@ -1231,7 +1239,7 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         // split K so the two halves form independent MMA chains
         gemm_acc<64, BV, 64, NW, 0, 1, 128, PCV>(vacc, (dir == 0) ? pW : pKG, sS, warp, lane);
         gemm_acc<64, BV, 64, NW, 0, 1, 128, PCV>(vac2, ((dir == 0) ? pW : pKG) + 64, sS + 64 * PCV, warp, lane);
-        {
+        if constexpr (!REVERSE_ONLY) {
             bf16* out = ((dir == 0) ? hst : dhst) + ((size_t)cs * H + h) * DH * DH;
 #pragma unroll
             for (int i = 0; i < HIT; ++i)
@@ -1248,7 +1256,7 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
             *reinterpret_cast<uint32_t*>(sB + oB[j] + 8 * PCV) = bf2(vacc[j][2] + av[j][1].x, vacc[j][3] + av[j][1].y);
         }
         __syncthreads();
-        {
+        if constexpr (!REVERSE_ONLY) {
             bf16* dst = (dir == 0) ? vnew : dv2o;
             if (actV && rV < L) *reinterpret_cast<uint4*>(dst + base + vgo) = *reinterpret_cast<const uint4*>(sB + sVo);
         }

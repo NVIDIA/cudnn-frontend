@@ -978,6 +978,186 @@ This changes no kernel arithmetic or default selection.
 Record new goldens in a fresh directory only after numerical and replay checks
 pass, then compare them in a separate process with `CUDNN_DETERMINISM_GOLDENS`.
 
+### SM90 KDA FP32 summaries — 16-token staging, 2026-11-11
+
+The final SM90 path shares a 16-token K/gate/decay/beta tile across 16 rows
+in a 512-thread CTA. Reverse state CTAs also share scaled Q; transition CTAs
+do not read Q, V/dO or the seed. Every row retains the direct FP32 recurrence
+and reduction order. No BF16/TF32 state operands, prefix inverse, global
+scratch, host length read, additional launch or execute-time compile is added.
+This is shared preprocessing, not the experimental block triangular solve.
+
+Rebased on `develop@5887e729f`. The complete summary suite passed all 62 tests
+with no skips on H20-3e with Torch 2.9.1+cu128, CUDA 12.8 and cuDNN
+91002 (3.57 s). The previously committed FP32 goldens passed unchanged, with
+recording disabled. The two physical wide-stride cases used an actual BF16
+token pitch of `2**32 + 128` elements and poisoned wrapped addresses. These
+cases skip only if less than the required approximately 9 GiB is free.
+Existing Hopper apply controls passed **17 tests**, with **1 skipped** because
+the optional cuTile runtime is not installed. The native NVRTC path does not
+use CuTeDSL; CUDA 13 and other GPUs remain unverified for this addition.
+
+Added cases cover 1/15/16/17/31/32/33/65-token boundaries, empty spans and
+zero sequences, zero/near-zero/strong/mixed per-channel gates, variable beta,
+1024-token summaries, large FP32 seeds, nondefault backward scales, and six
+changed-gate graph iterations per direction (three FP64 checks followed by
+three transition-independence replays). All previous strided, INT32/INT64,
+reference, autograd, logical-CP64, concurrent-work, packing, and malformed
+binding checks are retained. Tolerances and existing goldens are unchanged.
+
+Compute Sanitizer memcheck and racecheck each passed **22 cases**, selecting
+strided capture, tile/gate boundaries, changed-gate capture and optional-transition
+empty cases. Memcheck reports 0 errors; racecheck reports 0 errors / 0 warnings.
+Set **both** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` and
+`PYTORCH_ALLOC_CONF=expandable_segments:False`: setting only the newer name
+allowed conftest's legacy default to enable expandable allocation, causing
+`cuMemCreate` permission error 800 under instrumentation before the kernels.
+The successful runs took 21.88 s and 118.61 s. The already-recorded nanobind
+shutdown reference warnings remain; no host-leak fix is claimed.
+
+Reproduction from `test/python` (recording must stay unset):
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_sm90.py -m L0 -q -s
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+PYTORCH_ALLOC_CONF=expandable_segments:False \
+compute-sanitizer --tool racecheck --error-exitcode 78 \
+python -m pytest linear_attention/hopper/test_kda_summary_sm90.py -m L0 -q -s \
+  -k 'strided_rebind_capture or tiled_summary_boundaries or changed_gate_capture or state_only_empty'
+```
+
+Use `--tool memcheck --error-exitcode 77` for the corresponding memory check.
+
+Self-review found a nonnull zero-length `DeviceView` was incorrectly rejected
+as aliasing a live output. The new regression reproduced the rejection in both
+directions before the guard fix, then passed. A Torch empty view alone did not
+expose this because its exported address was normalized; the detector uses a
+real `DeviceView`.
+
+The committed harness `benchmark/linear_attention/benchmark_sm90_summary.py`
+times the public graph plan and optionally a frozen direct FP32 kernel from
+`a136913d`. The frozen source SHA256 is
+`f391eab1e6fb689e66dc52daddf73b08da911e1312986b16dd849b293957e332`.
+All 14 measured forward/reverse cases compare raw output bytes before timing.
+Inputs: CPU seed 713, H=8, K=V=128, normalized BF16 Q/K, BF16 V/dO,
+FP32 g=-0.001 and beta=0.5. Times are median of five groups of 50 CUDA
+Graph replays, in microseconds. Compile and allocation precede capture.
+These are summary-only GPU times, not KDA apply, communication or training E2E.
+
+| THD document lengths | Direct fwd | Staged fwd | Direct reverse | Staged reverse |
+| --- | ---: | ---: | ---: | ---: |
+| 64 | 80.90 | 38.32 | 92.32 | 47.65 |
+| 256 | 314.07 | 143.22 | 358.97 | 181.17 |
+| 1024 | 1246.39 | 563.54 | 1423.09 | 714.73 |
+| 4096 | 6787.15 | 2393.22 | 7920.86 | 3303.29 |
+| 16384 | 29668.12 | 10000.92 | 31626.50 | 13652.56 |
+| 32 × 33 | 915.14 | 521.99 | 1030.05 | 626.81 |
+| 20 × 17 + 1024 + 4096 | 7815.47 | 3202.44 | 8586.86 | 4110.96 |
+
+Workspace is **zero bytes** for every case. Unlike the experimental triangular
+solve, this staging path does not materialize sequence-sized coefficients or
+expand the graph into a host loop over windows. The experimental 1024-token
+window solve was faster on some long weak-decay cases but needed 13.31 MiB
+at N=1/H=8 and did not yet meet the dynamic packed-layout contract; it is not
+part of this PR. CTA sizes 128/256/512/1024 were compared; 512 was retained
+for the measured balance across single-head, strong-gate and short-document
+cases, without adding a public precision or tuning option.
+
+NCU 2025.1 compared direct and staged forward at T=1024/H=8. Under profiler
+replay, duration was 1.93 ms versus 662.66 us; these cold-cache instrumented
+times are distinct from the warm graph table. Average warp cycles per issued
+instruction fell 15.10→10.91. The original path reported 10.5 cycles of
+L1TEX scoreboard waiting per issue (69.7% of its issue interval). Staging
+uses 18.50 kB static shared memory per forward CTA and 48 registers/thread,
+versus 0 shared bytes and 32 registers/thread. Grid/block geometry changed
+512×128→128×512, retaining 65,536 total threads. This supports the shared
+reuse rationale; it does not attribute a percentage of speedup to each change.
+
+Fence audit: passed. Tile writers and readers are generic-proxy CUDA threads
+in one CTA; the first `__syncthreads()` publishes every initialized slot and
+the second protects reuse. The Q predicate is CTA-uniform because no CTA
+straddles the H/M boundary. Every row has one writer, full-warp shuffles
+exchange registers, empty spans bypass both barriers uniformly, and partial
+tiles read only initialized entries. Global input/output ordering follows the
+caller stream. No inter-CTA, async-proxy or device-wide fence is needed.
+
+### SM90 KDA FP32 summaries — original pre-staging validation, 2026-11-11
+
+`linear_attention/hopper/test_kda_summary_sm90.py` adds 35 L0 cases for
+`kimi_delta_attention_summary` and `kimi_delta_attention_summary_bwd`, pinned
+to `kda_summary_hopper_cuda`. BF16 Q/K/V/dO, FP32 gate/beta/state, K=V=128,
+equal head counts and INT32/INT64 offsets are covered. Both FP32 outputs
+(H/G and transition) are compared with an independent FP64 recurrence;
+the reverse summary also matches FP64 autograd. The APIs are non-differentiable
+summaries, not implementations of the ordinary dQ/dK/dV/dG/dBeta backward.
+
+Two determinism cases compare all output bytes over four fixed-input calls
+with fresh storage and concurrent GPU work, then move/duplicate the same
+33-token sequence among empty and 17-token neighbors, including a 23-sequence
+packed batch. `batch_invariant=True` is enabled. Inputs are unchanged and
+the independent reference passes before recording two new runtime goldens.
+No existing golden is replaced. Four CUDA Graph cases cover both directions
+and offset dtypes, with two changed-input/changed-offset replays each, padded
+outer strides, poisoned outputs, and fresh-address eager rebinding.
+Separate tests check 64 logical spans composed in FP64 against a monolithic
+FP64 recurrence; this isolates summary error and is **not** a 64-GPU E2E run.
+Unsupported-feature and malformed-binding tests reject before launch.
+
+On H20-3e (SM90), Torch 2.9.1+cu128, CUDA 12.8, driver 12080 and cuDNN 91002,
+the full suite passed **35 tests, no skips**, both during separate golden
+recording (2.58 s) and final strict checking with recording unset (2.51 s).
+The installed DSL was 4.8.1, but this engine compiles CUDA C++ with NVRTC;
+it does not use CuTeDSL. Imports and the freshly built extension resolved
+to the validation checkout based on `develop@3ac68cf8f`.
+Ten existing Hopper CUDA forward/default-routing/serving-dtype controls
+also passed (1.27 s). Other GPU architectures and CUDA 13 are unverified
+for this addition; existing FROST support is unchanged.
+
+Compute Sanitizer memcheck passed 15 reference/empty/capture cases (9.22 s),
+with `ERROR SUMMARY: 0 errors`. This run used
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`: the first instrumented
+attempt encountered `CUDA_ERROR_NOT_PERMITTED` in Torch's expandable
+allocator `cuMemCreate`, before the test kernels. The instrumented process
+also reports nanobind shutdown reference warnings; an unchanged ordinary
+Hopper forward control reproduces those warnings and passes with zero
+memcheck errors. No memory-leak fix is claimed here.
+
+From `test/python`, after preparing the two runtime goldens separately:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_sm90.py -m L0 -q -s
+python -m pytest linear_attention/hopper/test_kda_sm90_cuda.py -m L0 -q -s \
+  -k 'is_the_default_on_hopper or serving_dtypes or absent_initial_state_is_zeroed'
+```
+
+The new V-independence regression was observed RED on the unmodified base:
+no SM90 summary plan was available. During development, direct FP32 `exp(g)`
+factors still exceeded the unchanged 64-span FP64 tolerance under weak decay;
+using `expm1(g)` with FMA in that regime made both directions pass.
+
+For context, the following measurements use `make_case((T,), heads=8)`
+(seed 713, normalized BF16 Q/K, BF16 V, g=-0.001, beta=0.5), the suite's
+FP64 reference, and median CUDA-event time over five groups of 50 CUDA Graph
+replays. The probe is two ordinary `kda_hopper_cuda` forwards, one with zero
+state and one with identity, followed by state subtraction. Summary timing
+includes H and M, not communication or the full KDA layer.
+
+| Tokens | Probe M relative L2 error | FP32 summary M relative L2 error | Probe time (µs) | FP32 summary time (µs) |
+| --- | --- | --- | --- | --- |
+| 64 | 1.1082e-2 | 2.3770e-7 | 41.58 | 80.84 |
+| 256 | 3.9914e-2 | 5.5151e-7 | 130.62 | 314.68 |
+| 1024 | 8.6890e-1 | 1.1520e-6 | 608.54 | 1247.20 |
+
+This is a precision/coverage addition with a measured latency cost, not a
+performance improvement to the ordinary tensor-core apply kernels.
+
+### Shared suite inventory
+
 These suites check six attention families and the DSA indexer APIs. Run from `test/python`:
 
 ```bash
@@ -8843,3 +9023,83 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+### SM90 KDA state-only reverse scan — 2026-11-18
+
+`linear_attention/hopper/test_kda_summary_scan_sm90.py` qualifies the public
+G-only request (`output_transition=False`) and its internal
+`kda_summary_hopper_scan` lowering. The served SM90 envelope is packed BF16
+K=V=128 inputs, equal heads, FP32 log gate/beta/output, int32 offsets,
+`batch_invariant=True`, and no seed, transition, context, or token gradients.
+The public request automatically prefers this lowering and falls through to a
+different summary provider when an SM90 restriction, such as cu64 offsets, is
+not met. The numerical oracle is independent FP64 with an ordinary-backward
+accuracy bound; the stronger implementation contract compares every G byte
+with the complete Hopper KDA backward's `d_initial_state` before its
+token-gradient kernel runs.
+
+Determinism covers four fixed-input executions under concurrent GPU work,
+moving and duplicating a 33-token sequence among empty and changed neighbors,
+and a 23-sequence packed batch. CUDA Graph coverage poisons the full caller
+workspace with `0xff`, changes Q/dO/g and packed boundaries, replays, then
+rebinds fresh operand/output/workspace addresses. A short observed workspace
+is rejected before the output sentinel changes. Host launch tests pin all
+three scheduler variants: only the reverse half-grid is launched and `k_bwd`
+is absent. The new H20 runtime golden is
+`32cb2f58db95235f/kda_summary_scan_sm90_bwd_bf16.json`; no existing golden was
+replaced.
+
+On H20-3e (SM90, 78 SMs), Torch 2.9.1+cu128, CUDA toolkit/runtime 12.8,
+driver API 12080, cuDNN 91002, CuTe DSL 4.8.1 and TVM FFI 0.1.15.post2, imports
+resolved to the candidate checkout based on
+`e89ebcfaaf54b118257ae109a5afaa7dcff22565`. The recording run passed **1 test,
+no skips**; the strict full suite passed **14 tests, no skips** in 1.20 s. The
+existing Hopper KDA and FP32-summary suites passed **78 tests with 2 resource
+skips** in 3.30 s. SM100/103/107 are unsupported by this plan. CUDA 13
+execution is unverified; the kernel has no new CuTeDSL dependency.
+
+The direct benchmark at T=65,536/H=32 measured the complete ordinary backward
+host at 21.9227 ms and the prep plus reverse-only scan at 9.6383 ms, a 2.2745x
+speedup with bitwise-equal G. In the H20 CP16 1M-token KDA run, packed-apply
+backward fell 44.9961→32.7748 ms and KDA E2E 79.4098→67.4154 ms (1.178x).
+A contemporaneous full KDA+CSA run fell 2866.8384→2857.3909 ms; CSA remained
+dominant at about 2.79 s. Peak allocated memory fell by 2.5117 GiB in that
+same-environment A/B because the state-only plan avoids the five token-gradient
+outputs even though its caller workspace is large. These timings are benchmark
+evidence, not CI thresholds.
+
+A same-day follow-up based on `5999e502a8061280edb8595a835b22ced74f24de`
+compiled the unseeded reverse-only seed to register zero and removed the
+caller-workspace final-state row. The controlled RED ran the new exact-workspace
+assertion against the unchanged source and reported 786,432 instead of 393,216
+bytes; the candidate passed that test. On the same H20-3e software stack with
+driver API 13000, the new runtime golden is
+`27cb37748161a3d5/kda_summary_scan_sm90_bwd_bf16.json`. Its input and output
+hashes are identical to the driver-12080 golden. The recording run passed **1
+test, no skips**, and the strict suite passed **14 tests, no skips** in 1.33 s.
+
+At T=65,536/H=32, alternating unchanged/candidate public-plan runs used ten
+groups of twenty CUDA-event-timed executions per arm. The two unchanged-source
+medians were 8.6492 and 8.6499 ms; the candidate medians were 8.5704 and 8.5694
+ms. The mean of the per-arm medians fell 8.6495→8.5699 ms (0.92%), while exact
+caller workspace fell 2,703,237,632→2,701,140,480 bytes (2 MiB). A two-node,
+eight-rank-per-node CP16 weak-decay distributed comparison then passed the
+monolithic output and q/k/v/g/beta gradient envelopes on every rank. These
+latencies are benchmark evidence, not CI thresholds; SM100/103/107 support is
+unchanged. The adjacent ordinary Hopper KDA and FP32-summary L0 suites passed
+**77 tests with 3 skips** in 4.15 s: two skips are missing driver-13000 goldens
+for the unchanged direct FP32 forward/backward summary paths, and one requires
+the optional `cuda.tile` runtime. Their driver-12080 goldens remain unchanged.
+
+From `test/python`, with a complete CUDA toolkit selected because the pip
+runtime headers omit `crt/mma.h`:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_scan_sm90.py -m L0 -q -s
+CUDA_HOME=/usr/local/cuda-12.8 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_sm90.py \
+  linear_attention/hopper/test_kda_sm90_cuda.py -m L0 -q -s
+```

@@ -85,6 +85,18 @@ The five families support chunkwise context parallelism. We leave the all-gather
 
 Each rank summarizes one boundary sequence. `<op>_summary` for the last local sequence from a zero state for the forward, and `<op>_summary_bwd` on the first local sequence from a zero outgoing-state gradient for the backward. Each returns a state row and the span's transition operator. After the all-gather, the forward on rank `rank` takes `gathered[preceding_rank_start:rank]` and the backward `gathered[rank + 1:following_rank_stop]`, in ascending rank order. The fold is inside the ops. The forward takes the preceding ranks' slices as `preceding_state_update` and `preceding_transition`. The raw backward op `torch.ops.cudnn.<op>_bwd` takes the following ranks' slices as `following_state_grad` and `following_transition` and folds them into the gradient state the last local sequence starts from.
 
+When a KDA caller already retains the packed-forward transition, it can request
+the reverse G term alone with `output_transition=False`. On SM90, a supported
+BF16 packed K=V=128 graph with equal head counts, int32 offsets,
+`batch_invariant=True`, and no final-state gradient automatically prefers a
+state-only plan. The plan specializes the ordinary Hopper backward's
+preparation and reverse scan, omitting the `v`/forward operand work, forward
+scan CTAs, chunk-state materialization, and token-gradient intermediates. The
+returned FP32 state remains byte-for-byte equal to the ordinary reverse scan.
+Unsupported shapes fall through to another G-only summary provider; callers do
+not select a Hopper plan. The selected plan uses caller-owned workspace, so
+query `graph.get_workspace_size()` rather than hard-coding its size.
+
 ## Context Parallelism Example
 
 Below, we show an example of using context parallelism in practice.
