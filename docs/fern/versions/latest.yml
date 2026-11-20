@@ -242,6 +242,9 @@ navigation:
           - page: CuTe MoK (SM100 / SM103)
             path: ../../operations/cutemok.md
             slug: cutemok
+          - page: Streaming Signal Contract (MoE Grouped GEMM)
+            path: ../../operations/moe/streaming_signal_contract.md
+            slug: streaming_signal_contract
       - section: Normalizations
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
