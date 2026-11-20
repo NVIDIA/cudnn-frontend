@@ -63,7 +63,9 @@ The paged-cache cell runs no script: no provider row asks for the paged attentio
 (``state.PagedKvCache``), so no run builds one.  A small program in a fresh interpreter runs the two reference chains of an
 attention layer on a plain cache and on a paged one at the published widths, across the first page boundary, and holds
 the bytes of the two against each other, the pool against index arithmetic of its own, the state's cos / sin table against
-the chain's function on the device, and the kernels the chains launch on the pool to their families.
+the chain's function on the device, and the kernels the chains launch on the pool to their families.  It runs where the
+family serves the GPU and on compute capability 8.0, and is skipped by name on any other class; a host case holds that
+condition on stated compute capabilities.
 
 Every line of a run is read from standard error, which is not the sample's alone: a library may print there first, and
 behind the run's last line.  A cell that reads the header of a run finds it by the script's tag (``_header``), and
@@ -778,8 +780,17 @@ def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_l
     * no kernel the chains launch on the pool has the id of a step's embedding lookup, and none is unnamed: a gather
       through an index tensor would be counted as the embedding's launch by the kernel check of every stack.
 
-    Any CUDA GPU serves it: the chains are PyTorch's.  Where the profiler's records cannot be had the last line says so,
-    and the kernels are uncovered there, not verified."""
+    The chains are PyTorch's, so no row of the family declines a GPU here; the cell is gated all the same.  It runs on
+    the classes the family serves -- compute capability 10.x and 12.x, where the other cells of this module run -- and
+    on compute capability 8.0: a GPU the family serves and one of 8.0 are the two kinds it has run on, and it holds
+    every kernel the chains launch.  On any other class it skips with a sentence that names the classes and the device.
+    Where the profiler's records cannot be had the last line says so, and the kernels are uncovered there, not verified."""
+    cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None  # no GPU: the runner of the program skips
+    if cc is not None and cc[0] not in (10, 12) and cc != (8, 0):
+        pytest.skip(
+            "the cell of the paged cache runs where the family serves the GPU (compute capability 10.x or 12.x) and on compute capability 8.0; "
+            f"this device is {cc[0]}.{cc[1]}, which the family does not serve: uncovered, not passing"
+        )
     out = _program(
         PAGED_PROGRAM,
         "[paged]",
@@ -797,6 +808,48 @@ def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_l
     none = "; 0 with the id of a step's embedding lookup, 0 unnamed, 0 with an id outside the chains' families    PASS"  # the line states its counts
     assert len(observed) == 1 and (observed[0].endswith(none) or observed[0].startswith("  kernels    not observed: ")), observed
     frost_routing.measured("model sample: the reference chains on a paged attention cache, the kernels of the traced steps", observed[0].strip())
+
+
+@pytest.mark.L0
+def test_the_cell_of_the_paged_cache_runs_where_the_family_serves_the_gpu_and_on_compute_capability_8_0(sample, monkeypatch):
+    """Where the cell of the paged cache runs, without a GPU: the cell is called on stated compute capabilities, with a
+    stand-in for the runner of its program.  It reaches its program on every class the family serves -- read here from
+    the family's own table: the classes on which the default stack has a row for every block, which is what lets the
+    other cells of this module run -- and on compute capability 8.0, and on no other class.  There it skips, and the
+    sentence names the classes it runs on and the device.  Without a GPU it asks for no class: the runner skips."""
+    from model_samples.qwen_dense import configs  # on the path while the fixture holds the script
+
+    def served(cc):  # the plan of the default stack declines a class on which one of its blocks has no row
+        return all(any("fe-cublas" in row.stacks and row.serves_class(cc) for row in rows) for rows in configs.PROVIDERS.values())
+
+    class Reached(Exception):
+        pass
+
+    def runner(*_, **__):
+        raise Reached
+
+    def cell(cc):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: cc)
+        try:
+            test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_launch_no_gather()
+        except Reached:
+            return "runs"
+        except pytest.skip.Exception as skipped:
+            return skipped.msg
+
+    monkeypatch.setattr(sys.modules[__name__], "_program", runner)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    classes = [(major, minor) for major in range(7, 14) for minor in range(10)]
+    family = [cc for cc in classes if served(cc)]
+    assert family == [cc for cc in classes if cc[0] in (10, 12)], "the classes the family serves: compute capability 10.x and 12.x"
+    assert [cc for cc in classes if cell(cc) == "runs"] == sorted([(8, 0), *family]), "where the family serves the GPU, and on compute capability 8.0"
+    elsewhere = (
+        "the cell of the paged cache runs where the family serves the GPU (compute capability 10.x or 12.x) and on compute capability 8.0; "
+        "this device is {}.{}, which the family does not serve: uncovered, not passing"
+    )
+    assert all(cell(cc) == elsewhere.format(*cc) for cc in classes if cc != (8, 0) and cc not in family), "a skip names the classes and the device"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert cell(None) == "runs", "without a GPU the cell asks for no class: the runner of its program skips"
 
 
 def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):

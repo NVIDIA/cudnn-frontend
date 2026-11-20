@@ -1877,8 +1877,11 @@ def test_no_provider_asks_for_a_paged_cache_yet_and_every_plan_builds_the_plain_
     readme = " ".join((MODELS / "README.md").read_text(encoding="utf-8").split())
     assert "a session builds the pool where a block of its plans asks for one, and no provider row does yet, so every run builds the first layout" in readme
     assert PAGE == configs.ATTENTION_PAGE and f"(a fixed number of positions each, {PAGE} in the target kernel set; a run of pages per sequence)" in readme
-    # the cell asks for no GPU class (the chains are PyTorch's): a pipeline lane of a class the family does not serve runs it too
-    assert "one GPU the family serves; L0 runs two layers, L1 four; the cell of the paged cache runs on any CUDA GPU |" in readme
+    # the cell is gated: the classes the family serves and compute capability 8.0 (the GPU module holds the condition on stated capabilities)
+    assert (
+        "one GPU the family serves; L0 runs two layers, L1 four; the cell of the paged cache runs there and on compute capability 8.0, "
+        "and is skipped by name on any other class |"
+    ) in readme
 
 
 @contextlib.contextmanager
