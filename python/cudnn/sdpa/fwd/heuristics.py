@@ -3786,9 +3786,10 @@ def select_sm100_d192_half_geometry(facts, knobs):
 # 152 SMs: the exclusive-device measurement at a locked clock (compute capability 10.0). Each value is the part's count of
 # co-resident clusters of that size: every cluster count from 1 up to it has a measured cell with the form ahead of the two
 # launches, and one cluster more is 18 % to 22 % behind them (level only at 2 chunks with a full cache). Timed: BF16, head
-# width 256, a paged cache with Stats, declared lengths of 1,024 to 4,096 keys; the rows apply to every plan of the form's
-# domain by its cluster count. The key carries no compute capability; the form's own domain does, so a 152-SM part of
-# another capability stays unmarked.
+# width 256, a paged cache with Stats, declared lengths of 1,024 to 4,096 keys, and 2-chunk plans also at 8,192 and
+# 12,288 keys in a later session (the timed GPU exclusive, other GPUs of the machine in use); the rows apply to every plan
+# of the form's domain by its cluster count. The key carries no compute capability; the form's own domain does, so a
+# 152-SM part of another capability stays unmarked.
 FUSED_CLUSTER_BOUND: Dict[Tuple[int, int], int] = {
     (148, 2): 16,
     (148, 4): 16,

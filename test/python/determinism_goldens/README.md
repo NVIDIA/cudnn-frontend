@@ -76,13 +76,56 @@ Against the records of the same two cases for the 148-SM part (x86-64 host) in
 those of the inputs included: the aarch64 host draws other operand bytes, as
 in the GH200 record above.
 
+#### The suite on that part at the same commit
+
+The same device, runtime and commit, before the two files were added:
+
+| Selection | Result |
+| --- | --- |
+| `test_sdpa_fwd_decode_cluster_reduce.py` (no device needed; 131 cells) | **131 passed** |
+| `TestClusterReduce` with `CUDNN_DETERMINISM_GOLDENS` set to this directory (68 cells) | **66 passed, 2 failed**: the two golden cells, at the comparison |
+| `TestClusterReduce` against the newly recorded directory | **68 passed** |
+| `test_two_chunks_follow_the_split_order` in 30 fresh processes | **30 of 30 passed** |
+| `test_sdpa_fwd_decode_d256_sm100.py` without the class | **74 passed** |
+| `test_sdpa_fwd_split_kv_sm100.py` and `test_sdpa_split_combine_sm100.py` | **335 passed** |
+| `test_sdpa_fwd_paged_sm100.py` | **351 passed** |
+
+No cell skipped in any of them. In each of the 30 processes the two-chunk cell
+printed `393216 bfloat16 O elements compared and equal in split order; the
+reverse order moves 6 of them`; its seed is fixed, so the 30 processes repeat
+one draw. The nine default-plan cells passed again.
+
+```text
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest $S -q -rs -k TestClusterReduce
+python -m pytest $S -q -rs -s -k "TestClusterReduce and two_chunks"   # once per process
+python -m pytest $S -q -rs -k "not TestClusterReduce"
+python -m pytest sdpa/frost/test_sdpa_fwd_decode_cluster_reduce.py -q -rs
+# the last two with the compiled-plan cache on
+python -m pytest sdpa/frost/test_sdpa_fwd_split_kv_sm100.py sdpa/frost/test_sdpa_split_combine_sm100.py -q -rs
+python -m pytest sdpa/frost/test_sdpa_fwd_paged_sm100.py -q -rs
+```
+
+A default graph at the row of 2 chunks was read outside the suite, with 12,288
+declared keys and one and two tokens. With 24 query heads on 4 KV heads and 19
+sequences, and with 8 on 1 and 76, the first plan is the swap-AB tile split 2
+ways with `CLUSTER_K_REDUCE`: 76 clusters, and one kernel per execution. With
+8 on 1 and 77 sequences the plan carries no knob and an execution launches two
+kernels. All six graphs matched the float64 reference. Through explicit
+records at that split, 64, 72, 76 and 77 clusters with 4,096, 8,192 and 12,288
+declared keys stored equal O and Stats bytes in both forms (98,304 to 233,472
+BF16 O elements per configuration).
+
 ### SM100 D256 swap-AB in-launch reduction on a 152-SM part (2026-11-19)
 
 The suite of the [record below](#sm100-d256-swap-ab-in-launch-reduction-2026-11-18)
 ran on one GB200 (compute capability 10.0, 152 SMs; aarch64 host; CuTe DSL
 4.8.0, cuDNN 9.27 debug libraries, PyTorch 2.14.0+cu130), exclusive to the
 run, after `heuristics.FUSED_CLUSTER_BOUND` gained the rows of that part (76
-clusters of 2 chunks, 36 of 4, 15 of 8).
+clusters of 2 chunks, 36 of 4, 15 of 8). The
+[record above](#sm100-d256-swap-ab-in-launch-reduction-goldens-for-a-152-sm-part-2026-11-20)
+repeats it at a later commit: there the class reads 66 passed and 2 failed
+without the part's golden files and 68 passed with them, and the policy file
+131 passed.
 
 The graph-plan group has nine cells from here on. Each builds the default
 plan of a two-token step with no knob record, reads from the compiled plan's
@@ -94,7 +137,7 @@ of the default plan. On this part the default plan ran in the launch at 4 and
 clusters of 8 with 8/1 heads; it ran two launches at 16 clusters of 8 (24/4
 and 8/1 heads) and at 37 clusters of 4.
 
-| Selection | Result |
+| Selection | Result of this run |
 | --- | --- |
 | `TestClusterReduce` with `CUDNN_DETERMINISM_GOLDENS` set (68 cells) | **65 passed, 3 failed** |
 | `test_sdpa_fwd_decode_d256_sm100.py` without the class | **74 passed** |
@@ -103,12 +146,13 @@ and 8/1 heads) and at 37 clusters of 4.
 The three failures are the same three cells that failed on this device before
 the rows were added:
 
-- Both golden cells: this runtime has no recorded golden for
+- Both golden cells: this runtime had no recorded golden for
   `sdpa-decode-d256-swap-ab-bf16-packed-split8` and
   `sdpa-decode-d256-swap-ab-f16-unpacked-split4`. Everything in front of the
   golden comparison passed in both cells (eight replays per form, the two
   forms byte for byte, the retained CUDA graph, changed inputs). Without the
-  checking mode the comparison is skipped: a coverage gap for this runtime.
+  checking mode the comparison was skipped: a coverage gap for this runtime,
+  which the files of the record above close.
 - `test_two_chunks_commute`: with the inputs this host draws, the separate
   pass reducing two chunks in the reverse order differs from the forward order
   in a few BF16 elements, by one to three units of the last place. The same
@@ -135,8 +179,8 @@ python -m pytest sdpa/frost/test_sdpa_fwd_decode_cluster_reduce.py -q -rs
 The policy file had 116 cells at this run. It has 131 now: five more
 rule-table cells at and past the row of 2 chunks, and ten cells that pin, for
 the nine default-plan steps of the device cell, the form the rules give on a
-148-SM and on a 152-SM part. They need no device; the added cells have not run
-on the 152-SM part.
+148-SM and on a 152-SM part. They need no device; all 131 passed on the 152-SM
+part in the run of the record above.
 
 #### The two-chunk cell after this run
 
@@ -173,9 +217,10 @@ forms and the separate pass in split order over 32 full-cache sequences
 (393,216 BF16 O elements), requires the Stats of the reverse order byte for
 byte, and prints how many O elements the reverse order moves; it makes no
 assertion on those. On the 148-SM part it passed under both `randn` paths, and
-the reverse order moved 6 elements under each. It has not run on a 152-SM
-part. The row "Two chunks commute" of the table in the record below describes
-the cell it replaces.
+the reverse order moved 6 elements under each. On the 152-SM part (aarch64
+host) it passed in the run of the record above, where the reverse order moved
+6 elements as well. The row "Two chunks commute" of the table in the record
+below describes the cell it replaces.
 
 ### SM100 D256 swap-AB in-launch reduction (2026-11-18)
 
@@ -226,9 +271,10 @@ shape as below the control's three thread blocks per SM, and a zero there
 bounds the failure rate weakly. It is finite evidence for the tested shape.
 
 The two golden cases (`sdpa-decode-d256-swap-ab-bf16-packed-split8`,
-`sdpa-decode-d256-swap-ab-f16-unpacked-split4`) are recorded for that runtime
-only. SM103 was not run: the knob is declined there, and the status page says
-unverified. `test_sdpa_fwd_decode_cluster_reduce.py` holds the cells that need
+`sdpa-decode-d256-swap-ab-f16-unpacked-split4`) are recorded for that runtime;
+the records of a 152-SM part were added on 2026-11-20 (first record of this
+suite above). SM103 was not run: the knob is declined there, and the status
+page says unverified. `test_sdpa_fwd_decode_cluster_reduce.py` holds the cells that need
 no device (76 passed): the knob record, the heuristics rule and its tables,
 the recorded cluster bound, the declines, the source pin of the cluster
 barrier and the launch-frame parity of the native and Python binders.

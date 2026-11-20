@@ -195,11 +195,16 @@ run on a 148-SM and on a 152-SM compute capability 10.0 device (x86-64 and
 aarch64 hosts). On the 152-SM device the heuristics' default plan was also run
 in each form -- inside the cluster counts recorded for that part and, at 4 and
 8 chunks, one cluster past them -- and rebuilt from public records with equal
-bytes. SM103 execution is unverified.
+bytes. At 76 and 77 clusters of 2 chunks it ran in the form the count gives
+and matched the reference, and explicit records of both forms stored equal
+bytes there. The two golden cases are recorded for one runtime of each device.
+SM103 execution is unverified.
 See the coverage records of the
-[suite](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18)
-and of its
-[152-SM run](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-on-a-152-sm-part-2026-11-19).
+[suite](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-2026-11-18),
+of its
+[152-SM run](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-on-a-152-sm-part-2026-11-19)
+and of that part's
+[goldens](../../test/python/determinism_goldens/README.md#sm100-d256-swap-ab-in-launch-reduction-goldens-for-a-152-sm-part-2026-11-20).
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
