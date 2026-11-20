@@ -36,6 +36,193 @@ the same operand bytes, so the split follows the host CPU's `randn` path, not
 the PyTorch version. Outputs from these four files are only comparable with
 records drawn on an aarch64 host.
 
+### SM100 D256 swap-AB in-launch reduction goldens for a 152-SM part (2026-11-20)
+
+The two golden cells of `TestClusterReduce`
+(`test_replay_capture_and_golden[bf16-packed-split8-kwargs0]` and
+`[f16-unpacked-split4-kwargs1]`) had no golden for a GB200: with
+`CUDNN_DETERMINISM_GOLDENS` set they failed there at the comparison, their
+last statement (the
+[record below](#sm100-d256-swap-ab-in-launch-reduction-on-a-152-sm-part-2026-11-19)).
+This adds the two files; no kernel or test code changes.
+
+Runtime: NVIDIA GB200 (compute capability 10.0, 152 SMs, aarch64 host),
+PyTorch 2.14.0+cu130, CUDA 13.0, driver API 13020, cuDNN 92700, CuTe DSL
+4.8.0, tvm-ffi 0.1.14.post0, at commit `edbcff2db`, the commit in front of the
+one that adds the files. The goldens are in `52ecb6a4cddc4ab8/`. The key
+carries the cuDNN version and not its build: the libraries were the
+pre-release debug build 9.27.0.21, and a released 9.27 reads 92700 as well.
+
+```
+S=sdpa/frost/test_sdpa_fwd_decode_d256_sm100.py
+G="TestClusterReduce and replay_capture_and_golden"
+CUDNN_DETERMINISM_RECORD=<new directory> pytest $S -k "$G"            # 2 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> pytest $S -k "$G"           # second process: 2 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> pytest $S -k TestClusterReduce  # 68 passed, 0 skipped
+```
+
+Run from `test/python`. Before its hashes are recorded each cell checks both
+forms against the float64 reference, replays each form eight times with fresh
+buffers and concurrent GPU work, compares the two forms byte for byte and
+compares a retained CUDA graph of the in-launch form with eager execution.
+Both forms reproduce the one record of their path.
+
+The two files equal, byte for byte, the candidates recorded the day before on
+another device of the class at an earlier head of
+[PR #2780](https://github.com/NVIDIA/cudnn-frontend/pull/2780), before the
+152-SM rows existed; no rendering of this engine's kernels differs between the
+two heads.
+Against the records of the same two cases for the 148-SM part (x86-64 host) in
+`c84dd9abaee769b4/` the shapes and dtypes are equal and all ten hashes differ,
+those of the inputs included: the aarch64 host draws other operand bytes, as
+in the GH200 record above.
+
+#### The suite on that part at the same commit
+
+The same device, runtime and commit, before the two files were added:
+
+| Selection | Result |
+| --- | --- |
+| `test_sdpa_fwd_decode_cluster_reduce.py` (no device needed; 131 cells) | **131 passed** |
+| `TestClusterReduce` with `CUDNN_DETERMINISM_GOLDENS` set to this directory (68 cells) | **66 passed, 2 failed**: the two golden cells, at the comparison |
+| `TestClusterReduce` against the newly recorded directory | **68 passed** |
+| `test_two_chunks_follow_the_split_order` in 30 fresh processes | **30 of 30 passed** |
+| `test_sdpa_fwd_decode_d256_sm100.py` without the class | **74 passed** |
+| `test_sdpa_fwd_split_kv_sm100.py` and `test_sdpa_split_combine_sm100.py` | **335 passed** |
+| `test_sdpa_fwd_paged_sm100.py` | **351 passed** |
+
+No cell skipped in any of them. In each of the 30 processes the two-chunk cell
+printed `393216 bfloat16 O elements compared and equal in split order; the
+reverse order moves 6 of them`; its seed is fixed, so the 30 processes repeat
+one draw. The nine default-plan cells passed again.
+
+```text
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest $S -q -rs -k TestClusterReduce
+python -m pytest $S -q -rs -s -k "TestClusterReduce and two_chunks"   # once per process
+python -m pytest $S -q -rs -k "not TestClusterReduce"
+python -m pytest sdpa/frost/test_sdpa_fwd_decode_cluster_reduce.py -q -rs
+# the last two with the compiled-plan cache on
+python -m pytest sdpa/frost/test_sdpa_fwd_split_kv_sm100.py sdpa/frost/test_sdpa_split_combine_sm100.py -q -rs
+python -m pytest sdpa/frost/test_sdpa_fwd_paged_sm100.py -q -rs
+```
+
+A default graph at the row of 2 chunks was read outside the suite, with 12,288
+declared keys and one and two tokens. With 24 query heads on 4 KV heads and 19
+sequences, and with 8 on 1 and 76, the first plan is the swap-AB tile split 2
+ways with `CLUSTER_K_REDUCE`: 76 clusters, and one kernel per execution. With
+8 on 1 and 77 sequences the plan carries no knob and an execution launches two
+kernels. All six graphs matched the float64 reference. Through explicit
+records at that split, 64, 72, 76 and 77 clusters with 4,096, 8,192 and 12,288
+declared keys stored equal O and Stats bytes in both forms (98,304 to 233,472
+BF16 O elements per configuration).
+
+### SM100 D256 swap-AB in-launch reduction on a 152-SM part (2026-11-19)
+
+The suite of the [record below](#sm100-d256-swap-ab-in-launch-reduction-2026-11-18)
+ran on one GB200 (compute capability 10.0, 152 SMs; aarch64 host; CuTe DSL
+4.8.0, cuDNN 9.27 debug libraries, PyTorch 2.14.0+cu130), exclusive to the
+run, after `heuristics.FUSED_CLUSTER_BOUND` gained the rows of that part (76
+clusters of 2 chunks, 36 of 4, 15 of 8). The
+[record above](#sm100-d256-swap-ab-in-launch-reduction-goldens-for-a-152-sm-part-2026-11-20)
+repeats it at a later commit: there the class reads 66 passed and 2 failed
+without the part's golden files and 68 passed with them, and the policy file
+131 passed.
+
+The graph-plan group has nine cells from here on. Each builds the default
+plan of a two-token step with no knob record, reads from the compiled plan's
+record which form ran -- the in-launch form where the plan's clusters are
+within the part's row for its split, the two-launch form past the row or on a
+part without one -- and rebuilds both forms from public records with the bytes
+of the default plan. On this part the default plan ran in the launch at 4 and
+8 clusters of 8 chunks, 4 and 36 clusters of 4, 40 clusters of 2, and 15
+clusters of 8 with 8/1 heads; it ran two launches at 16 clusters of 8 (24/4
+and 8/1 heads) and at 37 clusters of 4.
+
+| Selection | Result of this run |
+| --- | --- |
+| `TestClusterReduce` with `CUDNN_DETERMINISM_GOLDENS` set (68 cells) | **65 passed, 3 failed** |
+| `test_sdpa_fwd_decode_d256_sm100.py` without the class | **74 passed** |
+| `test_sdpa_fwd_decode_cluster_reduce.py` (no device needed) | **116 passed** |
+
+The three failures are the same three cells that failed on this device before
+the rows were added:
+
+- Both golden cells: this runtime had no recorded golden for
+  `sdpa-decode-d256-swap-ab-bf16-packed-split8` and
+  `sdpa-decode-d256-swap-ab-f16-unpacked-split4`. Everything in front of the
+  golden comparison passed in both cells (eight replays per form, the two
+  forms byte for byte, the retained CUDA graph, changed inputs). Without the
+  checking mode the comparison was skipped: a coverage gap for this runtime,
+  which the files of the record above close.
+- `test_two_chunks_commute`: with the inputs this host draws, the separate
+  pass reducing two chunks in the reverse order differs from the forward order
+  in a few BF16 elements, by one to three units of the last place. The same
+  difference appears on the
+  two-launch plan's own slab, so it is a property of that pass's two-chunk
+  arithmetic and of the draw, not of the in-launch form; the two forms are
+  byte-equal for that configuration. The cell's premise does not hold for
+  every input; the cell is replaced, see below.
+
+The element-budget, stale-partial, refilled-workspace and batch-invariance
+cells passed, as did the replay and retained-graph steps in front of the two
+golden comparisons, so the statements of the status page hold on this part.
+The warm stress passed behind its control (the unsafe ring failed 200 of 200
+launches at cluster size two); the stressed launch had 72 thread blocks on
+152 SMs, below the control's density, as on the 148-SM part.
+
+```text
+suite=sdpa/frost/test_sdpa_fwd_decode_d256_sm100.py
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest "$suite" -q -rs -k TestClusterReduce
+python -m pytest "$suite" -q -rs -k "not TestClusterReduce"
+python -m pytest sdpa/frost/test_sdpa_fwd_decode_cluster_reduce.py -q -rs
+```
+
+The policy file had 116 cells at this run. It has 131 now: five more
+rule-table cells at and past the row of 2 chunks, and ten cells that pin, for
+the nine default-plan steps of the device cell, the form the rules give on a
+148-SM and on a 152-SM part. They need no device; all 131 passed on the 152-SM
+part in the run of the record above.
+
+#### The two-chunk cell after this run
+
+`test_two_chunks_commute` required the separate pass, run over the in-launch
+slab in the reverse split order, to reproduce the in-launch O bytes. That pass
+accumulates `acc + w * v` from zero as a fused multiply-add: the first chunk's
+product is rounded before the second is added, the second is not. Two chunks
+in the other order therefore give the same Stats (their denominator is one
+FP32 addition of the two weights) and, now and then, another stored O element.
+
+The comparison was repeated on the 148-SM part (x86-64 host) for 385 seeds of
+the cell's runner (4 sequences, 49,152 BF16 O elements per seed) under both
+paths of the host's `torch.randn`: the default vectorised one and the scalar
+one (`ATEN_CPU_CAPABILITY=default`). The scalar path draws the bytes of the
+aarch64 host (Q and K of the twelve seeds compared are equal), and under it
+the 148-SM part reproduced the differing elements of the 152-SM run for those
+twelve seeds: the same count per seed, and the same position and bits in the
+13 of 14 elements compared, seed 7 included.
+
+| `randn` path | Seeds with a differing O element | Differing elements | Largest difference |
+| --- | --- | --- | --- |
+| vectorised (x86-64 default) | 244 of 385 | 369 of 18,923,520 | 15 units of the last place |
+| scalar (the aarch64 host's bytes) | 224 of 385 | 321 of 18,923,520 | 15 units of the last place |
+
+Seed 7, the cell's seed, has no such element on the vectorised path and one
+on the scalar path, which is why the cell passed on the x86-64 host and failed
+on the aarch64 one. In all 770 runs the two forms stored equal O and Stats
+bytes, their partial slabs were equal, the separate pass in split order
+reproduced the in-launch O and Stats, and the reverse order reproduced the
+Stats.
+
+The cell is now `test_two_chunks_follow_the_split_order`. It compares both
+forms and the separate pass in split order over 32 full-cache sequences
+(393,216 BF16 O elements), requires the Stats of the reverse order byte for
+byte, and prints how many O elements the reverse order moves; it makes no
+assertion on those. On the 148-SM part it passed under both `randn` paths, and
+the reverse order moved 6 elements under each. On the 152-SM part (aarch64
+host) it passed in the run of the record above, where the reverse order moved
+6 elements as well. The row "Two chunks commute" of the table in the record
+below describes the cell it replaces.
+
 ### SM100 D256 swap-AB in-launch reduction (2026-11-18)
 
 `sdpa/frost/sdpa_decode_cluster_reduce_sm100.py` (collected through
@@ -85,9 +272,10 @@ shape as below the control's three thread blocks per SM, and a zero there
 bounds the failure rate weakly. It is finite evidence for the tested shape.
 
 The two golden cases (`sdpa-decode-d256-swap-ab-bf16-packed-split8`,
-`sdpa-decode-d256-swap-ab-f16-unpacked-split4`) are recorded for that runtime
-only. SM103 was not run: the knob is declined there, and the status page says
-unverified. `test_sdpa_fwd_decode_cluster_reduce.py` holds the cells that need
+`sdpa-decode-d256-swap-ab-f16-unpacked-split4`) are recorded for that runtime;
+the records of a 152-SM part were added on 2026-11-20 (first record of this
+suite above). SM103 was not run: the knob is declined there, and the status
+page says unverified. `test_sdpa_fwd_decode_cluster_reduce.py` holds the cells that need
 no device (76 passed): the knob record, the heuristics rule and its tables,
 the recorded cluster bound, the declines, the source pin of the cluster
 barrier and the launch-frame parity of the native and Python binders.

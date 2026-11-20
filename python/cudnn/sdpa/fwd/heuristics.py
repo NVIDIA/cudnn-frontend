@@ -3781,10 +3781,22 @@ def select_sm100_d192_half_geometry(facts, knobs):
 # recorded measurement cell on that part with every cluster resident in one wave. A part or a split count without a row is
 # never marked: its plans keep two launches and take the form by an explicit knob only. Recorded values only; the planning
 # path makes no device query. Each row is confirmed or replaced by the exclusive-device measurement of the part.
+#
+# 148 SMs: recorded from cells on a shared device, not yet confirmed by that measurement.
+# 152 SMs: the exclusive-device measurement at a locked clock (compute capability 10.0). Each value is the part's count of
+# co-resident clusters of that size: every cluster count from 1 up to it has a measured cell with the form ahead of the two
+# launches, and one cluster more is 18 % to 22 % behind them (level only at 2 chunks with a full cache). Timed: BF16, head
+# width 256, a paged cache with Stats, declared lengths of 1,024 to 4,096 keys, and 2-chunk plans also at 8,192 and
+# 12,288 keys in a later session (the timed GPU exclusive, other GPUs of the machine in use); the rows apply to every plan
+# of the form's domain by its cluster count. The key carries no compute capability; the form's own domain does, so a
+# 152-SM part of another capability stays unmarked.
 FUSED_CLUSTER_BOUND: Dict[Tuple[int, int], int] = {
     (148, 2): 16,
     (148, 4): 16,
     (148, 8): 8,
+    (152, 2): 76,
+    (152, 4): 36,
+    (152, 8): 15,
 }
 
 
