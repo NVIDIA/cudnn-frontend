@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU admission tests for plan-specific Stats stride override declarations."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -78,14 +79,23 @@ def test_note_excludes_ineligible_graphs(changes):
     assert NOTE not in _notes("sdpa_fwd_sm100_d128_multi_q", _facts(**changes))
 
 
-@pytest.mark.parametrize("name,cc", [("sdpa_fwd_sm120_f16_general", (12, 2))])
-def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, monkeypatch):
-    from cudnn.frost import buffers
-
-    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+@pytest.mark.parametrize("cc", [(12, 0), (12, 1), (12, 2)])
+def test_stats_override_follows_the_implementation_on_every_admitted_cc(cc):
+    # 12.2 is synthetic: changing only the minor CC must not require a second opt-in.
+    name = "sdpa_fwd_sm120_f16_general"
     facts = _facts(device_cc=cc)
     assert engines.mismatch(SPECS[name].capabilities, facts) is None
-    assert NOTE not in _notes(name, facts)
+    assert NOTE in _notes(name, facts)
+
+
+def test_template_opt_in_is_required_even_when_the_graph_and_device_match():
+    owner = SPECS["sdpa_fwd_sm120_f16_general"]
+    facts = _facts(device_cc=(12, 1))
+    assert engines.mismatch(owner.capabilities, facts) is None
+    sibling = engines.EngineSpec("new_template", owner.capabilities, owner.lower)
+    graph = SimpleNamespace(_facts_for=lambda analyzer: facts)
+    engine = FrostSdpaFwdEngine(sibling, 20519)
+    assert NOTE not in engine.get_behavior_notes(graph, PlanConfig(engine.engine_id, None))
 
 
 @pytest.mark.parametrize(
@@ -143,8 +153,6 @@ def test_note_requires_the_native_binder_feature(monkeypatch):
 )
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
 def test_wide_half_notes_follow_selected_plan(name, dq, tile, cluster, cc):
-    from dataclasses import replace
-
     f = _facts(d_qk=dq, d_v=512, device_cc=cc)
     good = engines.SdpaFwdKnobs(tile_m=tile, cga=cluster, split_kv=1, pack_gqa=False)
     assert NOTE in _notes(name, f, good.to_public())

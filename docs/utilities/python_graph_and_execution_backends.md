@@ -960,17 +960,16 @@ accepts legal execution-time Stats stride overrides, including changes to the
 head stride of packed HN Stats. It does not permit changing the packing, dtype,
 or storage capacity, or bypass the plan's ragged-offset and override bounds.
 
-The declaration covers admitted override-enabled FP16/BF16 THD plans
-with packed HN Stats through the prepared THD binder on qualified SM100/SM103
-devices, plus qualified SM107 and SM120-family (cc 12.0 and 12.1) half THD plans.
-The note follows the admitted graph/config and the
-prepared binder, including the new explicit implementation owners; it does not
-apply to every plan on those architectures.
-This includes the explicit D256 lookahead engine and eligible legacy
-half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
-quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
-not serve THD. Backend plans retain their existing notes and do not inherit this
-frontend declaration. `RUNTIME_COMPILATION` remains present on FROST plans.
+Each forward implementation declares whether it can bind a runtime head stride.
+The declaration applies on every device that admits the selected implementation.
+For the half-precision prepared THD binder, the graph must enable shape overrides
+and declare packed head-major FP32 Stats. The selected configuration must use
+that binder, and the installed extension must support the override. Both note
+queries and graph-plan lowering use the same implementation declaration.
+
+For example, the SM120 general half, D256 all-compute and D512 paired
+implementations can advertise the note on both RTX 5080 and GB10. Dense decode,
+quantized, token-major and padded Stats plans keep their existing stride contract.
 
 Callers should use the selected plan's note to choose direct HN execution or
 retain their existing NH fallback. Do not infer support from the engine name or

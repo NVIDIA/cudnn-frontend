@@ -5,6 +5,8 @@
 
 from ..d256_f16_contract import LOOKAHEAD, explicit_geometry
 
+PACKED_HN_STATS_OVERRIDE = True
+
 
 def lower(spec, facts, knobs):
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, lower_dsl_prefill

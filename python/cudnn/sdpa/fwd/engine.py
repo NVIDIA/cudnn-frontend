@@ -76,7 +76,7 @@ class FrostSdpaFwdEngine(BaseEngine):
         return reason
 
     def get_behavior_notes(self, graph: "pygraph", plan: PlanConfig) -> tuple:
-        from .engines import analyze_for, supports_stats_stride_override
+        from .engines import analyze_for
 
         knobs = plan.knobs
         if isinstance(knobs, dict):
@@ -85,7 +85,7 @@ class FrostSdpaFwdEngine(BaseEngine):
             facts, reason = analyze_for(self._spec, graph, knobs)
         except ValueError:
             return self.behavior_notes
-        if reason is None and supports_stats_stride_override(self._spec, facts, knobs):
+        if reason is None and self._spec.supports_stats_stride_override(facts):
             return self.behavior_notes + (behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE,)
         return self.behavior_notes
 

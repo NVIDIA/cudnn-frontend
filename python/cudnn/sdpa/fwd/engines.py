@@ -3112,6 +3112,30 @@ class EngineSpec:
     # Unmigrated legacy rows retain their internal body dispatch.
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
 
+    # The implementation binds a runtime packed HN Stats head stride.
+    packed_hn_stats_override: bool = False
+
+    def supports_stats_stride_override(self, facts: "ga.SdpaGraphFacts") -> bool:
+        """Plan-time contract of the prepared half THD HN binder, after admission.
+
+        This describes changing a packed head stride within the declared override
+        domain, not changing Stats packing, dtype, or storage capacity. Quantized,
+        padded-Stats and ragged-Q dense-decode binders have separate contracts.
+        """
+        if not (self.packed_hn_stats_override and facts.shape_overrides and facts.thd and facts.wants_stats and facts.uniform_dtype):
+            return False
+        if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+            return False
+        stats = facts.stats_t
+        if stats is None or stats.ragged_offset is None:
+            return False
+        stride = stats.get_stride()
+        if ga.thd_stats_packing(stride[1], stride[2], facts.h_q) != "head_major":
+            return False
+        if _thd_decode_leg(self.capabilities, facts):
+            return False
+        return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
+
 
 def _sm100_spec() -> EngineSpec:
     """Legacy f16/bf16 SM100 row for widths/envelopes not yet delegated.
@@ -3250,14 +3274,15 @@ def _sm100_spec() -> EngineSpec:
             score_sum_exp=True,
             score_stats_d_shapes=SM100_SCORE_STATS_SHAPES,
         ),
+        packed_hn_stats_override=True,
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
 def _sm100_d192_half_specs():
     """The D192 multi-Q owner and the shared D64/D128/D192 single-Q owner."""
-    from .kernels.sm100.d192_f16_multi_q.host import lower as lower_multi_q
-    from .kernels.sm100.d128_f16_single_q.host import lower as lower_single_q
+    from .kernels.sm100.d192_f16_multi_q import host as multi_q_host
+    from .kernels.sm100.d128_f16_single_q import host as single_q_host
 
     shape = frozenset({(192, 128)})
     base = replace(
@@ -3313,14 +3338,19 @@ def _sm100_d192_half_specs():
         sched_policies_by_d_shape=(),
     )
     return tuple(
-        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
-        for caps, lower in ((multi_q, lower_multi_q), (single_q, lower_single_q))
+        EngineSpec(
+            caps.implementation,
+            caps,
+            partial(host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
+        )
+        for caps, host in ((multi_q, multi_q_host), (single_q, single_q_host))
     )
 
 
 def _sm100_small_half_specs():
     """Independent multi-Q and quadrant bodies; exact widths retain legal envelopes."""
-    from .kernels.sm100.d128_f16_multi_q.host import lower as lower_multi_q
+    from .kernels.sm100.d128_f16_multi_q import host as multi_q_host
     from .kernels.sm100.d64_f16_quadrant.host import lower as lower_quadrant
 
     shapes = frozenset({(32, 32), (64, 64), (128, 128)})
@@ -3352,7 +3382,8 @@ def _sm100_small_half_specs():
         EngineSpec(
             multi_q.implementation,
             multi_q,
-            partial(lower_multi_q, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs, selected_shape=_selected_d_shape),
+            partial(multi_q_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs, selected_shape=_selected_d_shape),
+            packed_hn_stats_override=multi_q_host.PACKED_HN_STATS_OVERRIDE,
         ),
         EngineSpec(quadrant.implementation, quadrant, partial(lower_quadrant, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs)),
     )
@@ -3360,8 +3391,8 @@ def _sm100_small_half_specs():
 
 def _sm100_d512_specs():
     """Two wide half main implementations with the existing common graph contract."""
-    from .kernels.sm100.d512_f16_role_split.host import lower as lower_role_split
-    from .kernels.sm100.d512_f16_2x2.host import lower as lower_two_by_two
+    from .kernels.sm100.d512_f16_role_split import host as role_split_host
+    from .kernels.sm100.d512_f16_2x2 import host as two_by_two_host
 
     base = replace(
         _sm100_spec().capabilities,
@@ -3395,14 +3426,14 @@ def _sm100_d512_specs():
     )
     two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return (
-        EngineSpec(_D512_ROLE_SPLIT, role_split, lower_role_split),
-        EngineSpec(_D512_TWO_BY_TWO, two_by_two, lower_two_by_two),
+        EngineSpec(_D512_ROLE_SPLIT, role_split, role_split_host.lower, packed_hn_stats_override=role_split_host.PACKED_HN_STATS_OVERRIDE),
+        EngineSpec(_D512_TWO_BY_TWO, two_by_two, two_by_two_host.lower, packed_hn_stats_override=two_by_two_host.PACKED_HN_STATS_OVERRIDE),
     )
 
 
 def _sm100_d256_specs():
     """Two explicit main implementations; common graph support stays shared."""
-    from .kernels.sm100.d256_f16_lookahead.host import lower as lower_lookahead
+    from .kernels.sm100.d256_f16_lookahead import host as lookahead_host
     from .kernels.sm100.d256_f16_swap_ab.host import lower as lower_swap_ab
 
     base = replace(
@@ -3446,7 +3477,7 @@ def _sm100_d256_specs():
         cluster_reduces=frozenset({False, True}),
     )
     return (
-        EngineSpec(_D256_LOOKAHEAD, lookahead, lower_lookahead),
+        EngineSpec(_D256_LOOKAHEAD, lookahead, lookahead_host.lower, packed_hn_stats_override=lookahead_host.PACKED_HN_STATS_OVERRIDE),
         EngineSpec(_D256_SWAP_AB, swap_ab, lower_swap_ab),
     )
 
@@ -3694,32 +3725,33 @@ def _sm107_spec() -> EngineSpec:
             # 128 = min(tile_ns)); the d128 rendering of the same file keeps 128.
             tile_ns_by_d_shape=SM107_TILE_NS_BY_D_SHAPE,
         ),
+        packed_hn_stats_override=True,
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
 def _sm107_half_specs():
     """Five native bodies plus two architecture contracts for shared bodies."""
-    from .kernels.sm107.d128_f16_multi_q.host import lower as lower_multi_q
-    from .kernels.sm107.small_f16_batch_pair.host import lower as lower_pair
-    from .kernels.sm107.d192_f16_multi_q.host import lower as lower_d192
-    from .kernels.sm107.d256_f16_lookahead.host import lower as lower_lookahead
-    from .kernels.sm107.d256_f16_swap_ab.host import lower as lower_swap_ab
-    from .kernels.sm107.shared_f16_single_q.host import lower as lower_shared_single_q
-    from .kernels.sm107.shared_d256_f16_lookahead.host import lower as lower_shared_lookahead
+    from .kernels.sm107.d128_f16_multi_q import host as multi_q_host
+    from .kernels.sm107.small_f16_batch_pair import host as pair_host
+    from .kernels.sm107.d192_f16_multi_q import host as d192_host
+    from .kernels.sm107.d256_f16_lookahead import host as lookahead_host
+    from .kernels.sm107.d256_f16_swap_ab import host as swap_ab_host
+    from .kernels.sm107.shared_f16_single_q import host as shared_single_q_host
+    from .kernels.sm107.shared_d256_f16_lookahead import host as shared_lookahead_host
 
     # The legacy policy owns the legal width envelopes and common features.
     # Each local contract narrows that declaration to one fixed body. Keep
     # the original flavor pool so exact D32 can retain its D64/D128 envelope.
     base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), delegated_envelope=False, sm_hi=107, tile_ms_by_d_shape=())
     rows = (
-        (_sm107_small_half.MULTI_Q, lower_multi_q, frozenset({128})),
-        (_sm107_small_half.BATCH_PAIR, lower_pair, frozenset({128})),
-        (_sm107_mid_half.D192, lower_d192, frozenset({128})),
-        (_sm107_mid_half.LOOKAHEAD, lower_lookahead, frozenset({128})),
-        (_sm107_mid_half.SWAP_AB, lower_swap_ab, frozenset({16, 32, 64})),
-        (_sm107_shared_half.SINGLE_Q, lower_shared_single_q, frozenset({128})),
-        (_sm107_shared_half.LOOKAHEAD, lower_shared_lookahead, frozenset({128})),
+        (_sm107_small_half.MULTI_Q, multi_q_host, frozenset({128})),
+        (_sm107_small_half.BATCH_PAIR, pair_host, frozenset({128})),
+        (_sm107_mid_half.D192, d192_host, frozenset({128})),
+        (_sm107_mid_half.LOOKAHEAD, lookahead_host, frozenset({128})),
+        (_sm107_mid_half.SWAP_AB, swap_ab_host, frozenset({16, 32, 64})),
+        (_sm107_shared_half.SINGLE_Q, shared_single_q_host, frozenset({128})),
+        (_sm107_shared_half.LOOKAHEAD, shared_lookahead_host, frozenset({128})),
     )
     body_shapes = {
         _sm107_small_half.BATCH_PAIR: frozenset({(32, 32), (64, 64)}),
@@ -3745,20 +3777,21 @@ def _sm107_half_specs():
                 **({"d_pad_multiple": 8, "d_envelope_floors": ()} if name in body_shapes else {}),
             ),
             partial(
-                lower,
+                host.lower,
                 lower_impl=lower_dsl_prefill,
                 knob_type=SdpaFwdKnobs,
                 **({"shape_of": _selected_d_shape} if name in _sm107_small_half.IMPLEMENTATIONS else {}),
             ),
+            packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
         )
-        for name, lower, tiles in rows
+        for name, host, tiles in rows
     )
 
 
 def _sm107_wide_half_specs():
     """Native Rubin wide-half owners; common graph semantics stay shared."""
-    from .kernels.sm107.d512_f16_role_split.host import lower as lower_role_split
-    from .kernels.sm107.d512_f16_2x2.host import lower as lower_two_by_two
+    from .kernels.sm107.d512_f16_role_split import host as role_split_host
+    from .kernels.sm107.d512_f16_2x2 import host as two_by_two_host
 
     base = replace(
         _sm107_spec().capabilities,
@@ -3802,8 +3835,13 @@ def _sm107_wide_half_specs():
     )
     two_by_two = replace(base, implementation=_sm107_wide_half.TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return tuple(
-        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
-        for caps, lower in ((role_split, lower_role_split), (two_by_two, lower_two_by_two))
+        EngineSpec(
+            caps.implementation,
+            caps,
+            partial(host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
+        )
+        for caps, host in ((role_split, role_split_host), (two_by_two, two_by_two_host))
     )
 
 
@@ -4893,11 +4931,12 @@ def _sm120_spec() -> EngineSpec:
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | _SM120_HALF_EXACT_SHAPES),
             delegated_envelope=True,
         ),
+        packed_hn_stats_override=True,
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
-def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_ms, host_lower, tile_ns=None) -> EngineSpec:
+def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_ms, host_lower, tile_ns=None, *, packed_hn_stats_override=False) -> EngineSpec:
     """An SM120 body on its native head tiles; shared graph binding and launch. ``tile_ns`` None keeps the legacy domain.
 
     A row that delegates its envelope keeps the padding rule on the owners, so padded graphs land on the owner's tile."""
@@ -4913,15 +4952,22 @@ def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_m
         tile_ms=frozenset(tile_ms),
         tile_ns=legacy.capabilities.tile_ns if tile_ns is None else frozenset(tile_ns),
     )
-    return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs))
+    return EngineSpec(
+        implementation,
+        capabilities,
+        partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs),
+        packed_hn_stats_override=packed_hn_stats_override,
+    )
 
 
 def _sm120_d512_paired_spec() -> EngineSpec:
     from cudnn.sdpa.fwd.config_sm120 import D512_TILE
 
-    from .kernels.sm120.d512_f16_paired.host import lower
+    from .kernels.sm120.d512_f16_paired import host
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, {D512_TILE[0]}, lower, {D512_TILE[1]})
+    return _sm120_explicit_spec(
+        _sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, {D512_TILE[0]}, host.lower, {D512_TILE[1]}, packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE
+    )
 
 
 def _sm120_d512_fp8_paired_spec() -> EngineSpec:
@@ -4956,16 +5002,25 @@ def _sm120_mxfp8_general_spec() -> EngineSpec:
 
 def _sm120_d256_all_compute_spec() -> EngineSpec:
     from .kernels.sm120.d256_f16_all_compute.contract import QUERY_TILES
-    from .kernels.sm120.d256_f16_all_compute.host import lower
+    from .kernels.sm120.d256_f16_all_compute import host
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {_SM120_D256}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(
+        _sm120_spec(), _SM120_D256_ALL_COMPUTE, {_SM120_D256}, QUERY_TILES, host.lower, packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE
+    )
 
 
 def _sm120_f16_general_spec() -> EngineSpec:
     from .kernels.sm120.f16_general.contract import QUERY_TILES
-    from .kernels.sm120.f16_general.host import lower
+    from .kernels.sm120.f16_general import host
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_F16_GENERAL, _SM120_HALF_EXACT_SHAPES - {_SM120_D256}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(
+        _sm120_spec(),
+        _SM120_F16_GENERAL,
+        _SM120_HALF_EXACT_SHAPES - {_SM120_D256},
+        QUERY_TILES,
+        host.lower,
+        packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
+    )
 
 
 def _sm120_decode_key_group_spec() -> EngineSpec:
@@ -4989,33 +5044,6 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if facts is None:
         return None, "graph is not a single sdpa() forward node (optionally followed by O * sigmoid(G))"
     return facts, mismatch(spec.capabilities, facts, knobs)
-
-
-def supports_stats_stride_override(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
-    """Plan-time contract of the prepared half THD HN binder, after admission.
-
-    This describes changing a packed head stride within the declared override
-    domain, not changing Stats packing, dtype, or storage capacity. Quantized,
-    padded-Stats and ragged-Q dense-decode binders have separate contracts.
-    """
-    if not (facts.shape_overrides and facts.thd and facts.wants_stats and facts.uniform_dtype):
-        return False
-    if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
-        return False
-    # Public notes require hardware qualification, not only a shared binder.
-    if (spec.capabilities.sm_lo, facts.device_cc) not in ((100, (10, 0)), (100, (10, 3)), (107, (10, 7)), (120, (12, 0)), (120, (12, 1))):
-        return False
-    stats = facts.stats_t
-    if stats is None or stats.ragged_offset is None:
-        return False
-    stride = stats.get_stride()
-    if ga.thd_stats_packing(stride[1], stride[2], facts.h_q) != "head_major":
-        return False
-    if _thd_decode_leg(spec.capabilities, facts):
-        return False
-    if _prepared_decline_reason(spec.capabilities, facts, _decode_tile_split_kv(knobs)) is not None:
-        return False
-    return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
 
 
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -5729,7 +5757,7 @@ def lower_dsl_prefill(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
         if facts.thd and getattr(api, "_thd_spec", None) is not None:
-            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=facts.shape_overrides)
+            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=spec.supports_stats_stride_override(facts))
         elif getattr(api, "_dense_spec", None) is not None:
             # Dense plans, and the decode tile's ragged-Q leg (a dense split
             # launch whose Q / O / Stats rows come from the bound ragged offsets).

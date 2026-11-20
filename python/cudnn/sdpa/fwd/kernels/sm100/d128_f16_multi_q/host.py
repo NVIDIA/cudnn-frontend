@@ -3,6 +3,8 @@
 
 """Fixed multi-Q entry; shared services resolve its legal width envelope."""
 
+PACKED_HN_STATS_OVERRIDE = True
+
 
 def lower(spec, facts, knobs, *, lower_impl, knob_type, selected_shape, resolve_geometry=None):
     if resolve_geometry is None:
