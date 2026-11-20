@@ -4266,7 +4266,10 @@ Standalone index selection has no backward operator.
 'starts or accepts_strided_inputs'` passed 17 cases on SM90 (PyTorch 2.8.0
 cu128, DSL 4.8.1) and SM103 (PyTorch 2.12.1 cu130, DSL 4.8.0 and 4.8.1).
 The SM103 checks exercised both the CUDA 12.9 and 13.4 DSL compiler flavors.
-SM100, SM107 and SM12x interval coverage is unverified.
+On SM100 with DSL 4.8.0, the same 17 cases passed. Additional bitmap checks
+at K=512 passed for all three dtypes and both tie directions. Memcheck reported
+driver API errors during compilation, so the SM100 sanitizer result is inconclusive.
+SM107 and SM12x interval coverage remains unverified.
 
 ### DSA BF16 indexer: 46 cases
 

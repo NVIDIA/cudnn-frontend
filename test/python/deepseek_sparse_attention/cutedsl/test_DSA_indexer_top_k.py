@@ -1126,6 +1126,7 @@ def test_indexer_top_k_starts_batch_invariance_and_compile_cache(monkeypatch, dt
     """Runtime lower bounds and row regrouping reuse one bounded specialization."""
     from unittest.mock import Mock
 
+    _import_dsa()
     from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_decode_varlen as kernel
     from cudnn.deepseek_sparse_attention.indexer_top_k import api
 
