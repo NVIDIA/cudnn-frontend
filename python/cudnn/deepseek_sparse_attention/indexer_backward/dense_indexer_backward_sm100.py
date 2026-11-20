@@ -1029,10 +1029,10 @@ class DenseIndexerBackward2QGemmSm100:
         if has_q0:
             if warp_idx == self.compute_warp_id[0]:
                 tmem.allocate(self.tmem_alloc_cols)
-            # The MMA, compute and reduce warps rendezvous at one instruction
-            # before splitting into roles that use the allocated TMEM surface.
+            # Use the subset barrier directly: CuTe reconstructs the allocator's
+            # barrier as a plain NamedBarrier, whose wait assumes CTA convergence.
             if warp_idx == self.mma_warp_id or warp_idx in self.compute_warp_id or warp_idx in self.reduce_warp_id:
-                tmem.wait_for_alloc()
+                self.tmem_alloc_barrier.arrive_and_wait()
 
             if warp_idx == self.load_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_wg0)

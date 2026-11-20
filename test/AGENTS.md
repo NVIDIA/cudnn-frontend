@@ -33,6 +33,9 @@ For the dense SM100 indexer backward 2Q GEMM, run
 users rendezvous at one counted instruction before the MMA, compute and
 reduce warp roles diverge. Separate wait sites with the same barrier ID
 can pass numerical tests and still trigger divergent-barrier errors.
+Also run `test_DSA_dense_indexer_backward_tmem_alloc_ptx`: Synccheck
+can pass even when allocator reconstruction changes the subset wait to
+the CTA-aligned PTX alias `bar.sync`.
 
 For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
 invalid after packing. Use unique active indices for deterministic backward,

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import re
+
 import pytest
 import torch
 
@@ -448,6 +450,48 @@ def test_dense_plan_rejects_cross_tensor_shape_mismatch():
     ):
         with pytest.raises(ValueError, match=name):
             DSA.DenseIndexerBackward(**{**thd, f"sample_{name}": bad}).check_support()
+
+
+@pytest.mark.L0
+def test_DSA_dense_indexer_backward_tmem_alloc_ptx(tmp_path):
+    """Only the MMA, compute and reduce warps rendezvous at allocation barrier 4."""
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm100 import DenseIndexerBackward2QGemmSm100
+
+    def tensor(dtype, shape):
+        return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=16)
+
+    q = tensor(cutlass.BFloat16, (32, 64, 64))
+    w = tensor(cutlass.BFloat16, (32, 64))
+    k = tensor(cutlass.BFloat16, (128, 64))
+    dk = tensor(cutlass.Float32, (128, 64))
+    grad = tensor(cutlass.Float32, (32, 128))
+    cu = tensor(cutlass.Int32, (2,))
+    offsets = tensor(cutlass.Int32, (1,))
+    cute.compile(
+        DenseIndexerBackward2QGemmSm100(head_dim=64, heads=64, block_I=128, ratio=1),
+        q,
+        w,
+        k,
+        q,
+        w,
+        dk,
+        grad,
+        cu,
+        cu,
+        offsets,
+        cutlass.Float32(1.0),
+        cutlass.Int32(32),
+        cutlass.Int32(128),
+        cute.runtime.make_fake_stream(),
+        options=f"--enable-tvm-ffi --gpu-arch sm_100a --keep-ptx --dump-dir={tmp_path}",
+    )
+    (ptx,) = tmp_path.glob("*.ptx")
+    # PTX bar.sync is an alias for barrier.sync.aligned. All three roles
+    # must reach one unaligned instruction before retrieving the TMEM pointer.
+    waits = re.findall(r"\b((?:bar|barrier)\.sync(?:\.aligned)?)\s+4\b(?:,\s*(\d+))?\s*;", ptx.read_text())
+    assert waits == [("barrier.sync", "288")]
 
 
 @pytest.mark.L0
