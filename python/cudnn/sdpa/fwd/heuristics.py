@@ -3589,7 +3589,7 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     the dual-KV policy, matching the legacy adapter's final parameter override.
     This selector is not used when replaying a fixed implementation record.
     """
-    from .config_sm100 import supports_d64_fp8_swap_ab, supports_dense_fp8_swap_ab
+    from .config_sm100 import prefer_paged_fp8_dual_kv, supports_d64_fp8_swap_ab, supports_dense_fp8_swap_ab
     from .kernels.sm100.d128_fp8_multi_q.contract import Geometry as MultiQ
     from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
     from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
@@ -3624,6 +3624,11 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     automatic_decode = (
         facts.device_cc == (10, 0) and shape == (128, 128) and cga == 1 and facts.has_paged_kv and not facts.thd and 0 < rows <= 8 and facts.b <= 65535
     )
+    if automatic_decode and facts.s_q == 1 and knobs.pack_gqa and facts.dtype == facts.dtype_o == cudnn.data_type.FP8_E4M3 and fp8_dual_kv_stream_routed():
+        if prefer_paged_fp8_dual_kv(
+            facts.b, facts.s_kv, heads=(facts.h_q, facts.h_kv), dims=(facts.d_qk, facts.d_v), page_size=facts.page_size, splits=knobs.split_kv
+        ):
+            automatic_decode = False
     if decode_semantics and (explicit_decode or automatic_decode):
         return SwapAB(d_flavor=shape[0])
     if fp8_dual_kv_stream_routed() and shape == (128, 128) and knobs.cga == 1 and not facts.thd and rows <= FP8_DUAL_KV_STREAM_MAX_ROWS:
