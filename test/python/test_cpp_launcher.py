@@ -116,6 +116,97 @@ def test_a_kernel_with_many_arguments_is_recorded():
     assert type(recording).__name__ == "_Recording"
 
 
+def test_float_arguments_are_replayed_bit_for_bit():
+    """A kernel's float arguments reach a replay with their bits, the infinities and NaN that JSON cannot carry included."""
+    import math
+    import struct
+
+    import tvm_ffi
+
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    values = (math.inf, -math.inf, math.nan, -0.0, 0.1, 5e-324)
+    bits = [struct.pack("d", v) for v in values]
+    seen = []
+    sink = tvm_ffi.convert(lambda *got: seen.append([struct.pack("d", v) for v in got]))
+
+    @cpp_launched
+    def api(x):
+        launch(sink, *values)
+        return x
+
+    x = torch.zeros(8, device="cuda")
+    for _ in range(4):
+        assert api(x) is x
+    assert seen == [bits] * 4
+    (recording,) = api.recordings.values()
+    assert type(recording).__name__ == "_Recording"
+
+
+class OddFloat(float):
+    """A float whose truth value and repr say nothing of its value."""
+
+    def __bool__(self):
+        raise ValueError("no truth value")
+
+    def __repr__(self):
+        return "odd"
+
+
+@pytest.mark.parametrize("number", ["float", "numpy.float32", "numpy.float64", "OddFloat"])
+def test_a_negative_zero_argument_is_not_the_recorded_zero(number):
+    """0.0 and -0.0 compare equal and are different kernel arguments: each has its own recording, whatever the float's type."""
+    import struct
+
+    import numpy
+    import tvm_ffi
+
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    number = {"float": float, "numpy.float32": numpy.float32, "numpy.float64": numpy.float64, "OddFloat": OddFloat}[number]
+    seen = []
+    sink = tvm_ffi.convert(lambda got: seen.append(struct.pack("d", got)))
+
+    @cpp_launched
+    def api(x, scale):
+        launch(sink, float(scale))
+        return x
+
+    x = torch.zeros(8, device="cuda")
+    scales = [number(v) for v in (0.0, 0.0, 0.0, -0.0, -0.0, -0.0, 1.0, 1.0, 2.0, 2.0)]
+    for scale in scales:
+        assert api(x, scale) is x
+    assert seen == [struct.pack("d", scale) for scale in scales]
+    assert [type(r).__name__ for r in api.recordings.values()] == ["_Recording"] * 4
+
+
+def test_a_number_that_gives_no_double_is_keyed_by_its_value():
+    import struct
+
+    import numpy
+    import tvm_ffi
+
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    class NoDouble(numpy.float32):
+        def __float__(self):
+            raise TypeError("no double")
+
+    seen = []
+    sink = tvm_ffi.convert(lambda got: seen.append(struct.pack("d", got)))
+
+    @cpp_launched
+    def api(x, scale):
+        launch(sink, scale.item())
+        return x
+
+    x = torch.zeros(8, device="cuda")
+    for value in (0.5, 0.5, 0.5, 0.25, 0.25):
+        assert api(x, NoDouble(value)) is x
+    assert seen == [struct.pack("d", value) for value in (0.5, 0.5, 0.5, 0.25, 0.25)]
+    assert [type(r).__name__ for r in api.recordings.values()] == ["_Recording"] * 2
+
+
 def test_a_recorded_function_called_inside_a_recording_runs_its_python():
     """A function with a recording of its own, called while another call is recorded, runs its Python: a replay's launches
     are made in C++, where the outer recording would not see them."""
@@ -467,6 +558,32 @@ def test_verify_mode_checks_every_call(monkeypatch):
     graph.replay()
     torch.testing.assert_close(out, 1 + 0.5 * x, rtol=0, atol=0)
     assert cpp_launcher.VERIFIED["matched"] == matched + 2
+
+
+def test_verify_mode_takes_a_nan_argument_as_unchanged(monkeypatch):
+    """A NaN is not equal to itself, and it is the same argument in the call and in its replay."""
+    import math
+
+    import numpy
+    import tvm_ffi
+
+    from cudnn import cpp_launcher
+    from cudnn.cpp_launcher import launch, cpp_launched
+
+    monkeypatch.setattr(cpp_launcher, "VERIFY", True)
+    monkeypatch.setattr(cpp_launcher, "VERIFIED", cpp_launcher.VERIFIED.copy())
+    sink = tvm_ffi.convert(lambda got: None)
+
+    @cpp_launched
+    def api(x, scale):
+        launch(sink, float(scale))
+        return x
+
+    matched = cpp_launcher.VERIFIED["matched"]
+    x = torch.zeros(8, device="cuda")
+    for nan in (math.nan, float("nan"), numpy.float32("nan"), numpy.float64("nan")):
+        assert api(x, nan) is x
+    assert cpp_launcher.VERIFIED["matched"] == matched + 4
 
 
 def test_a_call_keys_the_same_however_its_arguments_are_passed():

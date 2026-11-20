@@ -31,6 +31,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 
 from ..common import l2norm
 from ..common.host import get_dtype, family_slots
@@ -595,7 +596,7 @@ def build_chain_forward(
                 ),
                 from_dlpack(DeviceView(256, (1, HO, DV, DK), dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_forward_cache[key] = cute.compile(
+        chain_forward_cache[key] = compile_cached(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -670,6 +671,8 @@ def build_chain_forward(
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
             from_dlpack(l2norm_inv_q, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_q is not None else None,
             from_dlpack(l2norm_inv_k, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_k is not None else None,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_forward_cache[key]
@@ -1114,7 +1117,7 @@ def build_chain_summary(
         state_h_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
         state_m_placeholder = from_dlpack(state_m, assumed_align=16)
         state_m_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        chain_summary_cache[key] = cute.compile(
+        chain_summary_cache[key] = compile_cached(
             chain_summary_host,
             int(unit_chunks),
             int(b_t),
@@ -1172,6 +1175,8 @@ def build_chain_summary(
             l2norm_k_slots,
             l2norm_k_expand_num,
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_chain_summary_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_summary_cache[key]
@@ -1217,7 +1222,8 @@ def run_chain_summary(
 ) -> None:
     """Replay the summary chain: one crossing into the DSL for its launches."""
     buffers = locals()
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

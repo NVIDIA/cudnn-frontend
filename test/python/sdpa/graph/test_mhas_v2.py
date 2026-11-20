@@ -2706,6 +2706,7 @@ def test_sdpa_mxfp8_fwd_narrow_band_phantom_frost_L0(env_info, request, cudnn_ha
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=512, rng_seed=1002), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
+@pytest.mark.skipif(cudnn.backend_version() < 92900, reason="Known MXFP8 backward amax issue in cuDNN < 9.29")
 def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("MXFP8 SDPA requires Blackwell (SM100+)")

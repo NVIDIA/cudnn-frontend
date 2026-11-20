@@ -1441,7 +1441,8 @@ def run_uncut_summary(
     tail_buffers=(),
 ) -> None:
     """Replay the uncut summary: one crossing into the DSL."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         k,
         v,
         gate,

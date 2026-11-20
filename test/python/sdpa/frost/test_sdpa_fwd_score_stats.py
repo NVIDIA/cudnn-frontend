@@ -188,7 +188,8 @@ def test_adapter_signatures_append_the_score_kwargs():
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     ctor = inspect.signature(SdpaFwdDsl.__init__).parameters
-    # ... followed by the resident-block operands of the Rubin small tiles (sample_bias / sample_kv_mask) and their knobs.
+    # ... followed by the resident-block operands of the Rubin small tiles (sample_bias / sample_kv_mask) and their knobs,
+    # then the in-launch reduction of a split (cluster_reduce).
     j = list(ctor).index("sample_score_max")
     assert list(ctor)[j:] == [
         "sample_score_max",
@@ -204,6 +205,7 @@ def test_adapter_signatures_append_the_score_kwargs():
         "softmax_wgs",
         "swap_ab",
         "causal_exclude_own_block",
+        "cluster_reduce",
     ], list(ctor)[j:]
     assert ctor["sample_score_max"].default is None and ctor["sample_score_sum_exp"].default is None
     ex = inspect.signature(SdpaFwdDslSm100.execute).parameters

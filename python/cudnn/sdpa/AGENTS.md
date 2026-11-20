@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Check contradictory mask attributes before normalizing legacy spellings. A
+causal flag can overwrite the explicit diagonal alignment and silently change
+non-square attention. Keep Python validation, shared analyzer facts and all six
+compiled SDPA builders consistent. `test_sdpa_causal_alignment.py` covers both
+directions, half/FP8/MXFP8, every architecture's candidate declarations and legal
+mask controls; architecture skips must not hide a host-side semantic regression.
+In synthetic device fixtures, replace both `_device_cc` and `_device_sm_count`;
+leaving either live still probes CUDA, even if Torch device helpers are mocked.
+
 An isolated implementation's thin host entry must not import the engine
 registry that imports it. Inject common lowering and knob construction from
 the registry. Keep historical-domain metadata with engine definitions so
@@ -1124,6 +1133,18 @@ Backward (d512 stage 2):
   IDENTICAL stage-3 GEMMs 10-25 % slower in the second arm at S >= 8K.
 
 ## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
+
+- **A workspace budget does not bound the launch grid.** Check the final
+  GEMM's batch/head product even when stage 2 uses a persistent scheduler.
+  THD's storage batch is one, but its GEMM uses the actual sequence count.
+  Preserve dense half batch chunking and the qualified subgroup path rather
+  than applying a common batch cap to half, FP8 and MXFP8. Detectors in
+  `test_sdpa_bwd_d256_chunk_grid.py` pair impossible whole-group declarations
+  with legal large-batch controls, then check actual THD head chunks and
+  dense whole-group batch chunks against an independent reference and replay.
+  When composing head-envelope and launch predicates, retain valid expanded
+  dense pairs as controls; `test_sm100_head_envelope_and_grid_compose` detects
+  either a lost envelope or a successful head check bypassing grid validation.
 
 - **A head subgroup is legal only when the final reduction covers all global
   per-query-head partials.** The dense BF16 SM100 d256 chain can divide one GQA

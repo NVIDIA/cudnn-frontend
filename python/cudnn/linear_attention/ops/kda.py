@@ -1816,8 +1816,8 @@ def build_kda_summary_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::kimi_delta_attention_summary", mutates_args=())
-def kda_summary(
+@cpp_launched
+def run_kda_summary(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -1965,6 +1965,9 @@ def kda_summary(
     return final_state, transition
 
 
+kda_summary = torch.library.custom_op("cudnn::kimi_delta_attention_summary", run_kda_summary, mutates_args=())
+
+
 @kda_summary.register_fake
 def kda_summary_fake(
     k,
@@ -2101,8 +2104,8 @@ def build_kda_summary_bwd_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::kimi_delta_attention_summary_bwd", mutates_args=())
-def kda_summary_bwd(
+@cpp_launched
+def run_kda_summary_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2270,6 +2273,9 @@ def kda_summary_bwd(
     context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
     execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
     return d_initial_state, transition, context
+
+
+kda_summary_bwd = torch.library.custom_op("cudnn::kimi_delta_attention_summary_bwd", run_kda_summary_bwd, mutates_args=())
 
 
 @kda_summary_bwd.register_fake

@@ -34,6 +34,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.cpp_launcher import cpp_launched
 
 from .common import (
     check_composed_state,
@@ -356,6 +357,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@cpp_launched
 def run_gdn2_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -999,8 +1001,8 @@ def build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_v2_bwd", mutates_args=())
-def gdn2_bwd(
+@cpp_launched
+def run_gdn2_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1249,6 +1251,9 @@ def gdn2_bwd(
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
     return dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias
+
+
+gdn2_bwd = torch.library.custom_op("cudnn::gated_delta_net_v2_bwd", run_gdn2_bwd, mutates_args=())
 
 
 @gdn2_bwd.register_fake
@@ -1797,8 +1802,8 @@ def build_gdn2_summary_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_v2_summary", mutates_args=())
-def gdn2_summary(
+@cpp_launched
+def run_gdn2_summary(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -1954,6 +1959,9 @@ def gdn2_summary(
     return final_state, transition
 
 
+gdn2_summary = torch.library.custom_op("cudnn::gated_delta_net_v2_summary", run_gdn2_summary, mutates_args=())
+
+
 @gdn2_summary.register_fake
 def gdn2_summary_fake(
     k,
@@ -2089,8 +2097,8 @@ def build_gdn2_summary_bwd_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_v2_summary_bwd", mutates_args=())
-def gdn2_summary_bwd(
+@cpp_launched
+def run_gdn2_summary_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2258,6 +2266,9 @@ def gdn2_summary_bwd(
     context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
     execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
     return d_initial_state, transition, context
+
+
+gdn2_summary_bwd = torch.library.custom_op("cudnn::gated_delta_net_v2_summary_bwd", run_gdn2_summary_bwd, mutates_args=())
 
 
 @gdn2_summary_bwd.register_fake

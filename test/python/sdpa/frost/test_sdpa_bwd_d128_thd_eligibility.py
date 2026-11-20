@@ -78,7 +78,7 @@ def test_thd_admission_and_ranking(packing, dtype, causal):
     "overrides,token",
     [
         ({"device_cc": (10, 1)}, "cc 10.0 / 10.3 / 10.7"),
-        ({"device_cc": (11, 0)}, "SM100-107"),  # past the row's range: the range decline fires before the part check
+        ({"device_cc": (11, 5)}, "SM100-107"),  # past the row's range: the range decline fires before the part check
         ({"scale": float("inf")}, "positive"),
         ({"scale": float("nan")}, "positive"),
         ({"scale": 0.0}, "attn_scale = 0"),

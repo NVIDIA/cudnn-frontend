@@ -590,36 +590,35 @@ def test_sm90_blk128_graph_mutable_metadata_no_recompile():
         g = ops.block_sparse_attention_backward(do, q, k, v, f["o_tensor"], f["lse_tensor"], ids, count, q2k_block_nums=counts, sparse_block_size=128)
         return f, g
 
-    with torch.cuda.stream(stream):
-        run()
-        run()
-        sizes_before = len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            f, g = run()
-        # Same pointers now describe an entirely empty graph; all output gradients must be reset.
-        counts.zero_()
-        with no_host_sync():
-            graph.replay()
+    with cuda_graph() as graph:
+        with torch.cuda.stream(stream):
             run()
-    torch.cuda.current_stream().wait_stream(stream)
-    assert sizes_before == (len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache))
-    assert torch.count_nonzero(f["o_tensor"]) == 0
-    assert torch.isneginf(f["lse_tensor"]).all()
-    for t in g:
-        assert torch.count_nonzero(t) == 0
+            run()
+            sizes_before = len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache)
+            with torch.cuda.graph(graph, stream=stream):
+                f, g = run()
+            # Same pointers now describe an entirely empty graph; all output gradients must be reset.
+            counts.zero_()
+            with no_host_sync():
+                graph.replay()
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        assert sizes_before == (len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache))
+        assert torch.count_nonzero(f["o_tensor"]) == 0
+        assert torch.isneginf(f["lse_tensor"]).all()
+        for t in g:
+            assert torch.count_nonzero(t) == 0
 
-    # Change both the graph and counts at the same addresses, then replay again.
-    ids.copy_(torch.arange(count - 1, -1, -1, device=ids.device, dtype=ids.dtype))
-    counts.fill_(count)
-    graph.replay()
-    ro, rl, rg = blk128_reference(q, k, v, ids, counts, None, count, 128**-0.5, "bhsd", do)
-    torch.testing.assert_close(f["o_tensor"].double(), ro, atol=8e-3, rtol=8e-3)
-    torch.testing.assert_close(f["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
-    for got, expected in zip(g, rg):
-        torch.testing.assert_close(got.double(), expected, atol=3e-2, rtol=3e-2)
-    assert sizes_before == (len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache))
-    graph.reset()
+        # Change both the graph and counts at the same addresses, then replay again.
+        ids.copy_(torch.arange(count - 1, -1, -1, device=ids.device, dtype=ids.dtype))
+        counts.fill_(count)
+        graph.replay()
+        ro, rl, rg = blk128_reference(q, k, v, ids, counts, None, count, 128**-0.5, "bhsd", do)
+        torch.testing.assert_close(f["o_tensor"].double(), ro, atol=8e-3, rtol=8e-3)
+        torch.testing.assert_close(f["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
+        for got, expected in zip(g, rg):
+            torch.testing.assert_close(got.double(), expected, atol=3e-2, rtol=3e-2)
+        assert sizes_before == (len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache))
 
 
 @pytest.mark.L1

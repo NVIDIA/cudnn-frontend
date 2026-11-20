@@ -33,7 +33,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 
 from ..common import gate_bwd, head_reduce
 from ..common.host import get_dtype
@@ -663,7 +665,7 @@ def build_chain_backward(
                 ),
                 from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
             ]
-        chain_backward_cache[key] = cute.compile(
+        chain_backward_cache[key] = compile_cached(
             chain_backward_host,
             int(unit_chunks),
             int(b_t),
@@ -739,6 +741,8 @@ def build_chain_backward(
             *fold_placeholders,
             gate_skip_channels,
             *post_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_chain_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_backward_cache[key]
@@ -806,7 +810,8 @@ def run_chain_backward(
     fold_buffers=(None,) * 4,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
@@ -1121,7 +1126,7 @@ def build_chain_summary_backward(
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
         work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        chain_summary_backward_cache[key] = cute.compile(
+        chain_summary_backward_cache[key] = compile_cached(
             chain_summary_backward_host,
             int(unit_chunks),
             int(b_t),
@@ -1161,6 +1166,8 @@ def build_chain_summary_backward(
             from_dlpack(transition, assumed_align=4).mark_layout_dynamic(leading_dim=1) if transition is not None else None,
             cuda.CUstream(int(stream)),
             from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_mamba2_chain_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_summary_backward_cache[key]
@@ -1201,7 +1208,8 @@ def run_chain_summary_backward(
 ) -> None:
     """Replay the backward summary chain: one crossing into the DSL for the three launches."""
     buffers = dict(locals())
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

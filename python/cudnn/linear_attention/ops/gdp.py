@@ -14,6 +14,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.cpp_launcher import cpp_launched
 
 from .common import (
     check_composed_state,
@@ -357,6 +358,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@cpp_launched
 def run_gdp_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1009,8 +1011,8 @@ def build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_bwd", mutates_args=())
-def gdp_bwd(
+@cpp_launched
+def run_gdp_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1274,6 +1276,9 @@ def gdp_bwd(
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
     # dk / dv / dbeta are dense in the expanded row order; the token-major input's shape is a free view of them
     return dq, dk.view(k_in.shape), dv.view(v_in.shape), dg, dbeta.view(beta_in.shape), dstate0, d_a_log, d_dt_bias
+
+
+gdp_bwd = torch.library.custom_op("cudnn::gated_delta_product_bwd", run_gdp_bwd, mutates_args=())
 
 
 @gdp_bwd.register_fake
@@ -1775,8 +1780,8 @@ def build_gdp_summary_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_summary", mutates_args=())
-def gdp_summary(
+@cpp_launched
+def run_gdp_summary(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -1949,6 +1954,9 @@ def gdp_summary(
     return final_state, transition, context
 
 
+gdp_summary = torch.library.custom_op("cudnn::gated_delta_product_summary", run_gdp_summary, mutates_args=())
+
+
 @gdp_summary.register_fake
 def gdp_summary_fake(
     k,
@@ -2092,8 +2100,8 @@ def build_gdp_summary_bwd_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_summary_bwd", mutates_args=())
-def gdp_summary_bwd(
+@cpp_launched
+def run_gdp_summary_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2281,6 +2289,9 @@ def gdp_summary_bwd(
     context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
     execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
     return d_initial_state, transition, context
+
+
+gdp_summary_bwd = torch.library.custom_op("cudnn::gated_delta_product_summary_bwd", run_gdp_summary_bwd, mutates_args=())
 
 
 @gdp_summary_bwd.register_fake

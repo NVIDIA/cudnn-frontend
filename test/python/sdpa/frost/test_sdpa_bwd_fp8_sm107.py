@@ -72,7 +72,7 @@ _SLOT = 5  # engines/manifest.py: EngineSlot(5, opt_in=True) -> FROST_SDPA_BWD_I
 _ENGINE_ID = 20_605
 _D = 256
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)
+_SM_RANGE = (107, 109)
 _FP8 = cudnn.data_type.FP8_E4M3
 _E5M2 = cudnn.data_type.FP8_E5M2
 _BF16 = cudnn.data_type.BFLOAT16

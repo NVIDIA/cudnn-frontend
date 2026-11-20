@@ -87,6 +87,36 @@ class Graph : public ICudnn, public INode {
     // uid -> byte alignment execute() enforces on the caller's pointer (SDPA operands, #1571).
     mutable AlignedOperands cached_aligned_operands;
 
+    // Override checks need each operand's addressing mode as well as its alignment.
+    // Cache it with the existing values so execute still needs only one UID lookup.
+    std::unordered_map<uid_t, std::tuple<int64_t, int64_t, bool>> cached_aligned_stride_operands;
+
+    error_t
+    refresh_aligned_stride_operands_(std::unordered_set<uid_t> const &ragged_uids = {}) {
+        cached_aligned_stride_operands.clear();
+        for (auto const &[uid, value] : cached_aligned_operands) {
+            cached_aligned_stride_operands.emplace(
+                uid, std::make_tuple(value.first, value.second, ragged_uids.count(uid) != 0));
+        }
+        if (cached_aligned_stride_operands.empty()) {
+            return {error_code_t::OK, ""};
+        }
+        std::vector<std::shared_ptr<Tensor_attributes>> tensors;
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensor_attributes_subtree(tensors));
+        tensors.insert(tensors.end(), full_graph_inputs.begin(), full_graph_inputs.end());
+        tensors.insert(tensors.end(), full_graph_outputs.begin(), full_graph_outputs.end());
+        tensors.insert(tensors.end(), deserialized_tensor_properties.begin(), deserialized_tensor_properties.end());
+        for (auto const &tensor : tensors) {
+            if (tensor && tensor->get_ragged_offset()) {
+                auto it = cached_aligned_stride_operands.find(tensor->get_uid());
+                if (it != cached_aligned_stride_operands.end()) {
+                    std::get<2>(it->second) = true;
+                }
+            }
+        }
+        return {error_code_t::OK, ""};
+    }
+
     // Host sources of the host-to-device copies among cached_workspace_modifications (operation 0, e.g.
     // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
     // recorded by populate_cuda_graph()/update_cuda_graph() or by stream capture of execute(), holds a
@@ -1395,6 +1425,7 @@ class Graph : public ICudnn, public INode {
         }
         count_node_producing_workspace_modifications_();
         CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_subtree(cached_aligned_operands));
+        CHECK_CUDNN_FRONTEND_ERROR(refresh_aligned_stride_operands_());
         refresh_host_copy_sources_();
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
@@ -1914,13 +1945,13 @@ class Graph : public ICudnn, public INode {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             n_user > 0 && sorted_user_ptrs == nullptr, error_code_t::INVALID_VARIANT_PACK, "sorted_user_ptrs is null.");
         for (size_t k = 0; k < override_uids.size() && k < override_shapes.size() && k < override_strides.size(); k++) {
-            auto it = cached_aligned_operands.find(override_uids[k]);
-            if (it == cached_aligned_operands.end()) {
+            auto it = cached_aligned_stride_operands.find(override_uids[k]);
+            if (it == cached_aligned_stride_operands.end()) {
                 continue;
             }
-            auto const &[alignment, element_bytes] = it->second;
-            auto const &stride                     = override_strides[k];
-            auto const i = misaligned_stride_dimension(override_shapes[k], stride, element_bytes, alignment);
+            auto const &[alignment, element_bytes, is_ragged] = it->second;
+            auto const &stride                                = override_strides[k];
+            auto const i = misaligned_stride_dimension(override_shapes[k], stride, element_bytes, alignment, is_ragged);
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 i >= 0,
                 error_code_t::INVALID_VARIANT_PACK,
@@ -2215,6 +2246,15 @@ class Graph : public ICudnn, public INode {
         }
         j["aligned_operands"] = aligned_operands_json;
 
+        // Plan-only blobs omit tensors, so retain addressing mode separately from
+        // the legacy two-integer alignment entries. Old readers may ignore this field.
+        std::vector<uid_t> ragged_aligned_uids;
+        for (auto const &[uid, value] : cached_aligned_stride_operands) {
+            if (std::get<2>(value)) ragged_aligned_uids.push_back(uid);
+        }
+        std::sort(ragged_aligned_uids.begin(), ragged_aligned_uids.end());
+        j["ragged_aligned_operands"] = ragged_aligned_uids;
+
         j["variant_pack_replacements"] = variant_pack_replacements;
 
         j["fe_workspace_size"] = fe_workspace_size;
@@ -2444,6 +2484,7 @@ class Graph : public ICudnn, public INode {
         cached_workspace_modifications = deserialized_workspace_modifications;
         count_node_producing_workspace_modifications_();
         cached_aligned_operands = deserialized_aligned_operands;
+        CHECK_CUDNN_FRONTEND_ERROR(refresh_aligned_stride_operands_(metadata.ragged_aligned));
         refresh_host_copy_sources_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the

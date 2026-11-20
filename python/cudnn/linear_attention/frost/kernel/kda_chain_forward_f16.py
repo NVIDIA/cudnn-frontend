@@ -1022,7 +1022,8 @@ def run_chain_summary(
 ) -> None:
     """Replay the summary chain: one crossing into the DSL for the three launches."""
     buffers = locals()
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

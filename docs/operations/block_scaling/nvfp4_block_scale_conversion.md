@@ -71,5 +71,11 @@ Both kernels in this package were authored for cuDNN Frontend from the public
 NVFP4 arithmetic and `F8_128x4` layout contract; they do not embed code copied
 from another framework's quantizer.
 
+For the rows of a decode step -- 1 .. 1024 rows per call, bf16 in, inside a chain
+of dependent launches, with the block scale formed under the global scale before
+any element is multiplied -- use
+[`cudnn.RowQuantizeFp4Decode`](/operations/BlockScaling/row_quantize_fp4_decode):
+another rounding rule with other bytes, and no multiple-of-128 row requirement.
+
 Requires CuTeDSL >= 4.7.0. Older installed versions are rejected before the
 kernel module is imported; the package-wide dependency floor is 4.8.0.

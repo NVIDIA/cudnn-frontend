@@ -499,3 +499,20 @@ def test_fixed_stage2_identity_ignores_legacy_switch(twin, cc, dtype, profile, m
         assert fixed._stage2_file() == expected_file
         assert fixed._stage2_record(fields) == expected_record
         assert Path(api_dsl._sm100_kernel_path(fixed._stage2_file())).is_file()
+
+
+@pytest.mark.parametrize("cc,rubin_arm", [((10, 0), False), ((10, 3), False), ((10, 7), True), ((11, 0), False)])
+def test_stage2_record_levers_follow_the_part(cc, rubin_arm, monkeypatch):
+    """The 2x2 ring levers follow the device's shared memory: the Rubin arm on cc 10.7 only, the SM100 arm elsewhere."""
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+
+    fields = dict(dtype_qkv=DTYPE_BF16, window_right=None, window_left=None, bottom_right=False, thd_varlen=False)
+    expected = TemplateParams2x2(**fields, **(_SM107 if rubin_arm else {}))
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", True)
+    for host_type in (SdpaBwdDslSm100D512TwoByTwo, api_dsl.SdpaBwdDslSm100):
+        host = object.__new__(host_type)
+        host._device_cc = lambda: cc
+        record = host._stage2_record(fields)
+        assert record == expected, (host_type.__name__, cc, record)
+        assert smem_bytes_2x2(make_cfg_d512_2x2(record)) <= record.smem_cap_bytes

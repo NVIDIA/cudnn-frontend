@@ -250,3 +250,27 @@ def test_attn_mask_names_the_alignment_the_graph_is_built_with():
     assert attn_mask("generation", True, 1, 8192, None) == "no_mask"
     assert attn_mask("generation", True, 1, 8192, 128) == "bottom_right"
     assert attn_mask("generation", True, 4, 8192, None) == "bottom_right"
+
+
+@pytest.mark.parametrize(
+    "name,clock_khz,width_bits,expected",
+    [
+        ("NVIDIA GH200 480GB", 2619000, 6144, 4022.784),
+        ("NVIDIA GH200", 3200000, 6144, 4915.2),
+        ("NVIDIA GH200", None, None, None),
+        ("NVIDIA H200", None, None, 4800.0),
+    ],
+)
+def test_peak_bandwidth_for_gh200(monkeypatch, name, clock_khz, width_bits, expected):
+    torch = pytest.importorskip("torch")
+    from benchmark.attention_inference.benchmark_single_attention import get_peak_bw_gbps
+
+    monkeypatch.delenv("CUDNN_BENCH_PEAK_BW_GBPS", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: name)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    props = SimpleNamespace() if clock_khz is None else SimpleNamespace(memory_clock_rate=clock_khz, memory_bus_width=width_bits)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+    assert get_peak_bw_gbps() == expected
+
+    monkeypatch.setenv("CUDNN_BENCH_PEAK_BW_GBPS", "3750")
+    assert get_peak_bw_gbps() == 3750

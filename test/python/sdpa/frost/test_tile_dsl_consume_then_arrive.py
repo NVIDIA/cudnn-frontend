@@ -200,7 +200,8 @@ _PROBE_SRC = textwrap.dedent('''
             scalar = words.subview(tid).load()
             consume_then_arrive(mb, (w64, [tile, half], (byte, scalar)), release_zero(rz_arg))
             acc = acc + cutlass.Int32(scalar)
-        mOut[tid] = acc
+        # Keep steps live in every form so pruning cannot renumber rz_arg.
+        mOut[tid] = acc + steps
 
 
     consume_site_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
