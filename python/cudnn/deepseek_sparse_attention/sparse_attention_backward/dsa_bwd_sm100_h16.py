@@ -6,6 +6,8 @@ import cuda.bindings.driver as cuda
 import math
 from typing import Tuple, Type, Optional
 
+from ._rank_common_sm100 import _partial_cta_sync
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32, Int64
@@ -14,7 +16,6 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils as utils
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
-from ._rank_common_sm100 import _partial_cta_sync
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 
