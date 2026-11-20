@@ -448,6 +448,7 @@ _SM100_FP8_KERNEL_FILES = {
     (192, 128): "sm100/d192_fp8_multi_q/kernel.py",
     (256, 256): "sm100/d256_fp8_single_q/kernel.py",
     (512, 512): "sm100/d512_fp8_role_split/kernel.py",
+    SM100_NATIVE_D576_SHAPE: "sm100/d512_fp8_role_split/kernel.py",
 }
 
 
@@ -456,7 +457,8 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
     if device_cc == (10, 7):
         return frozenset(_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES)
     kernel_files = _SM100_FP8_KERNEL_FILES if pertensor else _SM100_MXFP8_KERNEL_FILES
-    return frozenset(kernel_files)
+    shapes = frozenset(kernel_files)
+    return shapes if device_cc in ((10, 0), (10, 3)) else shapes - {SM100_NATIVE_D576_SHAPE}
 
 
 # Per-native-shape ENVELOPE FLOOR (see engines.Capabilities.d_envelope_floors,
@@ -465,7 +467,7 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
 # smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
 # declined rather than routed onto a kernel whose cga4x1 role-split geometry is
 # tuned for d = 512.
-_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256}
+_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256, SM100_NATIVE_D576_SHAPE: 512}
 
 
 def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
@@ -2863,6 +2865,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # key carries no head-dim entries — engines.thd_d_shapes) and MXFP8
         # stays exact (SF plumbing not audited for zero-padding).
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
+        if self._fp8 and self._pertensor and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
+            self._not_implemented_error_if(self._device_cc not in ((10, 0), (10, 3)) or self.thd, "FP8 D576/V512 requires dense queries on SM100/SM103")
         _fp8_envelope_ok = (
             self._pertensor and not self.thd and _fp8_envelope_covers(int(d_qk), int(d_v), fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
         )
@@ -2946,16 +2950,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 for f in tuple(sorted(_SM100_DENSE_ONLY_D_SHAPES)) + _SM100_FLAVORS
                 if f not in _SM100_DENSE_ONLY_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM100_SMALL_D_CGAS[f]))
             )
-        # The native exact half D576 shape uses the architecture-specific 2x2
-        # body; quantized and THD contracts remain independently gated.
-        if not self._fp8 and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
+        # Exact D576 uses the half 2x2 body or the Blackwell per-tensor FP8
+        # role-split body. Other widths continue through their existing envelopes.
+        if (not self._fp8 or (self._pertensor and self._device_cc in ((10, 0), (10, 3)))) and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
             _flavor_pool += (SM100_NATIVE_D576_SHAPE,)
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.flavor == SM100_NATIVE_D576_SHAPE:
             from cudnn import _pybind_module
 
             self._not_implemented_error_if(
-                not getattr(_pybind_module._SdpaDenseBinder, "supports_native_d576", False),
+                not getattr(_pybind_module._SdpaDenseBinder, "supports_fp8_d576" if self._fp8 else "supports_native_d576", False),
                 "native D576x512 requires the matching cuDNN Frontend native extension",
             )
             self._not_implemented_error_if(
@@ -3558,15 +3562,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "softmax_scale_prefolded is not wired in the paged-KV / packed-split THD / single-CTA THD / shared dense D128 half kernel bodies (they apply the scale in-kernel)"
             )
         if self.paged:
-            # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
-            # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
-            # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d64/d128/d256/d512 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 FP8 flavor, the d512
-            # 2x2-datapath twin) backstops
-            # with a module-scope guard on paged_kv, and these declines keep that
-            # guard unreachable from here.  On cc 10.7: half pools serve THD queries
+            # PAGED_KV requires a page loader in the selected kernel. Check the
+            # architecture and format here before loading the template. Keep these
+            # checks in sync with config_sm100._PAGED_KV_FLAVORS and each engine's paged_d_shapes.
+            # On cc 10.7: half pools serve THD queries
             # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader). Native per-tensor FP8 D512 serves
             # dense Q over pools; other FP8 flavors retain their paging decline.
@@ -3597,8 +3596,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (192, 128), (256, 256), (512, 512)),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d192 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d192 / d256 / d512 / d576 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),

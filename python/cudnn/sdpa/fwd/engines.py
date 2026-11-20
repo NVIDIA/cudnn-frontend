@@ -2623,7 +2623,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     ):
         return "SM120 D576 envelope requires the matching native cuDNN Frontend extension"
     if _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE and not getattr(
-        cudnn._pybind_module._SdpaDenseBinder, "supports_native_d576", False
+        cudnn._pybind_module._SdpaDenseBinder, "supports_fp8_d576" if facts.is_fp8 else "supports_native_d576", False
     ):
         return "native D576x512 requires the matching cuDNN Frontend native extension"
     if (
@@ -3937,13 +3937,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     """
 
     rubin_row = arch == "sm107"
+    native_shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    blackwell_shapes = native_shapes | {SM100_NATIVE_D576_SHAPE}
     return EngineSpec(
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
             delegated_exact=(
                 frozenset(((10, 7), shape) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
                 if rubin_row
-                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
+                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in blackwell_shapes)
             ),
             delegated_envelope=True,
             layouts=frozenset({"bshd", "dense_flex"}),
@@ -3955,7 +3957,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             phase="prefill",
             # Both architectures carry native D64 through their d128 FP8 body.
             # The record selects 64-wide K/O geometry, including packed/split plans.
-            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_shapes=native_shapes if rubin_row else blackwell_shapes,
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -3970,7 +3972,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # keep rank-5. Native SM107 uses rank-4 for both exact and partial heads.
             # Both architecture rows mirror api_dsl._SM100_FP8_ENVELOPE_FLOORS
             # so graph admission and prepared lowering agree.
-            d_envelope_floors=(((512, 512), 256),),
+            d_envelope_floors=(((512, 512), 256),) if rubin_row else (((512, 512), 256), (SM100_NATIVE_D576_SHAPE, 512)),
             # Both lines serve THD at every native flavor.  The Rubin arm keeps a
             # NAMED constant (shared with the standalone adapter's gate, rule 8b')
             # rather than collapsing to `d_shapes`, so a future partial arch line
@@ -3998,13 +4000,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Native per-tensor FP8 page pools on SM100/103: D64, D128, D192/V128,
-            # D256 and D512 use independent K/V block tables and pool strides. Dense Q,
+            # SM100/103 page loaders use independent K/V block tables and pool
+            # strides, including the shared D576/V512 MLA record. Dense Q,
             # scalar-scaled O, padding/causal/windows, sink and legal KV splits
             # compose with the loader. Native Rubin serves dense-Q D512 pools
             # through its role-split pipeline. THD D512 and block-scaled O decline.
             paged_kv=True,
-            paged_d_shapes=frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            paged_d_shapes=(
+                frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE})
+            ),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
@@ -4124,7 +4128,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
-            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
+            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else blackwell_shapes),
             pack_gqas=frozenset({False, True}),
             # Native SM107 per-tensor FP8 flavors pack whole GQA groups,
             # including the D512 role-split pipeline.
@@ -4357,7 +4361,7 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
     """One per-tensor FP8 body; shared graph binding and launch construction."""
     from .kernels.sm100.d512_fp8_role_split.host import lower
 
-    shape = frozenset({(512, 512)})
+    shape = frozenset({(512, 512), SM100_NATIVE_D576_SHAPE})
     capabilities = replace(
         _sm100_fp8_spec().capabilities,
         implementation=_D512_FP8_ROLE_SPLIT,
@@ -4365,8 +4369,8 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         delegated_envelope=False,
         d_shapes=shape,
         d_pad_multiple=16,
-        d_envelope_floors=(((512, 512), 256),),
-        thd_d_shapes=shape,
+        d_envelope_floors=(((512, 512), 256), (SM100_NATIVE_D576_SHAPE, 512)),
+        thd_d_shapes=frozenset({(512, 512)}),
         paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
