@@ -393,7 +393,6 @@ def test_d256_pair_release_dependence(tmp_path, rendering):
     rendering family: both FP8 input types, every mask form (dense, causal, bottom-right, window, lengths, sink), BF16 / FP16 / FP8
     output, with and without Stats and Amax_O."""
     dtype_name, out_name, stats, amax, mask = _PAIR_RENDERINGS[rendering]
-    import json
     import os
     from pathlib import Path
     import subprocess
