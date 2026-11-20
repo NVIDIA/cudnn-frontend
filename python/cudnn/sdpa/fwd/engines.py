@@ -2292,6 +2292,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.split_kv is not None and knobs.split_kv > 1:
             if not capabilities.split_kv_supported:
                 return "split_kv > 1 is not wired in this engine's lowering"
+            if capabilities.sm_lo == 120 and knobs.sched_policy not in (None, SCHED_NATURAL):
+                return "SM120 split_kv > 1 requires SCHED_NATURAL: the split index uses the batch grid axis"
             if facts.has_epilogue_gate and not decode_tile:
                 if facts.shape_overrides and d256_decode_tile_selected(
                     capabilities, replace(facts, shape_overrides=False), _decode_tile_pack_g(facts, knobs), knobs.split_kv
