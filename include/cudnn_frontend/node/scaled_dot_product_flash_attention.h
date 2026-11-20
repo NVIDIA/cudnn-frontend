@@ -44,6 +44,18 @@ promote_1d_index_tensor_to_4d(std::shared_ptr<Tensor_attributes> const& tensor) 
     }
 }
 
+// Byte span of a workspace tensor packed (ragged) over the token axis: the sequence axis is
+// bounded by max_total_seq_len instead of dim[2], every other axis contributes its own extent.
+// Sizing from stride[2] alone under-allocates any layout whose per-token footprint is not
+// stride[2] -- e.g. head-major [h, t] stats, where stride[2] == 1.
+inline int64_t
+ragged_workspace_size(int64_t max_total_seq_len,
+                      std::vector<int64_t> const& dim,
+                      std::vector<int64_t> const& stride,
+                      int64_t elem_size) {
+    return ((max_total_seq_len - 1) * stride[2] + (dim[1] - 1) * stride[1] + (dim[3] - 1) * stride[3] + 1) * elem_size;
+}
+
 namespace attn::score_modifiers {
 
 // clang-format off
@@ -1229,19 +1241,6 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     int64_t softmax_sum_size = 0;
     std::shared_ptr<Tensor_attributes> alibi_slopes;
     int64_t alibi_slopes_size = 0;
-
-    // Byte span of a workspace tensor packed (ragged) over the token axis: the sequence axis is
-    // bounded by max_total_seq_len instead of dim[2], every other axis contributes its own extent.
-    // Sizing from stride[2] alone under-allocates any layout whose per-token footprint is not
-    // stride[2] -- e.g. head-major [h, t] stats, where stride[2] == 1.
-    static int64_t
-    ragged_workspace_size(int64_t max_total_seq_len,
-                          std::vector<int64_t> const& dim,
-                          std::vector<int64_t> const& stride,
-                          int64_t elem_size) {
-        return ((max_total_seq_len - 1) * stride[2] + (dim[1] - 1) * stride[1] + (dim[3] - 1) * stride[3] + 1) *
-               elem_size;
-    }
 
     mutable bool has_workaround_padding_mask         = false;  // Will be edited in pre_validate_node()
     mutable int32_t s_q_for_workaround_padding_mask  = 0;      // Will be edited in pre_validate_node()
