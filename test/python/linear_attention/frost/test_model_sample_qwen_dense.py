@@ -830,6 +830,11 @@ for count in (1, 63, 64, 65, LAST + 1):
 hold("accessors", reads == 10, f"keys and values of the first 1, 63, 64, 65 and {{LAST + 1}} positions, in bf16 and in fp64: {{reads}} of 10 reads are the pool's rows")
 chain = torch.stack([torch.cat(torch_ref.rope_cos_sin(position, g.rotary_dim, g.rope_theta, device)) for position in range(capacity)])
 hold("cos / sin", same(table.cos_sin, chain), f"the table's row of each of {{capacity}} positions is what the chain forms for that position on this device, bit for bit")
+# the unit of the attention preparation's band, on this device: the exact power of two for every binade of a bf16 value (a
+# power function on a CUDA device is not: a unit that is one fp64 unit low refuses an element exactly one unit away)
+binades = range(-125, 128)
+units = torch_ref.bf16_unit(torch.tensor([2.0**e for e in binades], dtype=torch.float64).to(device)).cpu()
+hold("unit", units.tolist() == [2.0 ** (e - 7) for e in binades], f"the bf16 unit of the band of the attention preparation is the exact power of two in each of {{len(binades)}} binades")
 # a step of three tokens per sequence across the boundary: positions 62 to 64, on states of that layout
 several = [DecodeState(kinds, SEQUENCES, capacity, shapes, device, tokens=3, **layout) for layout in ({{}}, {{"page": PAGE}})]
 for position in range(62):
@@ -874,6 +879,7 @@ def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_l
     * the pool, read by index arithmetic written in the program, holds the plain cache's key and value row of every
       position, and the accessors return those rows;
     * the cos / sin table of the state is, row for row, what the chain forms for that position on this device;
+    * the bf16 unit of the attention preparation's band is the exact power of two on this device, in every binade;
     * a step of three tokens per sequence across positions 62 to 64 gives the plain cache's bytes;
     * no kernel the chains launch on the pool has the id of a step's embedding lookup, and none is unnamed: a gather
       through an index tensor would be counted as the embedding's launch by the kernel check of every stack.
@@ -898,7 +904,7 @@ def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_l
     )
     lines = out.splitlines()
     assert any(line.startswith("[paged] ") and line.endswith("positions 0 to 68, the steps at 60 to 68 under the profiler") for line in lines)
-    for name in ("outputs", "pool", "accessors", "cos / sin", "verify"):
+    for name in ("outputs", "pool", "accessors", "cos / sin", "unit", "verify"):
         (line,) = [line for line in lines if line.startswith(f"  {name} ")]
         assert line.endswith("    PASS"), line
     assert "queries, gates and attention outputs of 69 of 69 steps" in out and "138 of 138 rows of the pool" in out and "0 of the 118 rows behind" in out

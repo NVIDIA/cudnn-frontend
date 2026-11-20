@@ -145,9 +145,11 @@ def attention_prepare(qkv: torch.Tensor, cache, position: int, p, eps: float, ac
 
 def bf16_unit(value: torch.Tensor) -> torch.Tensor:
     """One bf16 unit in the last place at the magnitude of ``value`` (fp64): ``2 ** (e - 7)`` for ``2 ** e <= |value| < 2 **
-    (e + 1)``, and not below the unit of the smallest normal fp32 value.  Exact: built from the value's exponent."""
+    (e + 1)``, and not below the unit of the smallest normal fp32 value.  Exact on every device: the power of two is built
+    from its bits.  (A power function is not: on a CUDA device ``torch.pow(2.0, k)`` is one fp64 unit low for some whole
+    ``k``, and a band with such a unit refuses an element that is exactly one unit away.)"""
     exponent = torch.frexp(value.abs().double()).exponent.clamp(min=-125)
-    return torch.pow(torch.tensor(2.0, dtype=torch.float64, device=value.device), (exponent - 8).double())
+    return ((exponent.to(torch.int64) + (1023 - 8)) << 52).view(torch.float64)  # 2 ** (exponent - 8): the fp64 with that exponent field
 
 
 def prepare_rows(x: torch.Tensor, weight: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, eps: float, order: str = "3d"):
