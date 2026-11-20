@@ -79,6 +79,7 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified; gate/up unsupported | Unverified for interleaved input; gate/up unsupported |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `gated_delta_product` (GDP) with `use_qk_l2norm_in_kernel`, at the default `qk_l2norm_eps` and at a custom one | fprop, bprop | BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_forward_jax`, `gated_delta_net_backward_jax` | fprop, bprop | FP16, BF16 | Unsupported | Replay only | Unsupported |

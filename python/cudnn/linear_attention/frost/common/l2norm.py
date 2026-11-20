@@ -9,6 +9,13 @@ workspace buffers and, when the caller carves slots for them, store the fp32
 inverse norms.  Only the bprop needs the norms, for the projection through the
 normalize Jacobian in its dQ/dK epilogues; the prefill and the summaries pass
 no slots and the store compiles out.
+
+The additive epsilon of ``y = x * rsqrt(sum(x * x) + eps)`` is a launch
+argument (``L2_NORM_EPS`` unless the graph sets ``qk_l2norm_eps``), never a
+compile key: a plan of another epsilon reuses the compiled kernel.  The bprop
+projects through ``dx = inv * (dy - y * (y . dy))``, which reads the stored
+``inv`` and ``y`` alone, so the epsilon reaches the gradients through this
+kernel and nowhere else.
 """
 
 from typing import NamedTuple
@@ -19,7 +26,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.device import current_device
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
+from cudnn.frost.tile_dsl.pointwise import L2_NORM_EPS, f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v4
 
@@ -44,6 +51,7 @@ def frost_l2norm_qk(
     n_rows: cutlass.Int32,
     h_q: cutlass.Int32,
     h_k: cutlass.Int32,
+    eps: cutlass.Float32,
     d: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     expand_phase: cutlass.Constexpr[int],
@@ -52,7 +60,7 @@ def frost_l2norm_qk(
 ) -> None:
     """Grid over all q rows then all k rows, FWD_LANES lanes x (d // FWD_LANES)
     elements per row, FWD_ROWS_PER_GROUP consecutive rows per lane group: fp32 sums
-    of squares, rsqrt with the shared additive epsilon, normalized rows to the
+    of squares, rsqrt with the additive epsilon ``eps``, normalized rows to the
     compact io workspace, inverse norms to their fp32 slots when the slots are
     given.  Accesses are
     indexed chunk-major, so the lanes of one access cover a contiguous span of
@@ -127,7 +135,7 @@ def frost_l2norm_qk(
         for c in cutlass.range_constexpr(vec_chunks):
             v = vals[r][c]
             acc = acc + (((v[0] * v[0] + v[1] * v[1]) + (v[2] * v[2] + v[3] * v[3])) + ((v[4] * v[4] + v[5] * v[5]) + (v[6] * v[6] + v[7] * v[7])))
-        inv = l2norm_inv(lane_group_sum(acc, FWD_LANES))
+        inv = l2norm_inv(lane_group_sum(acc, FWD_LANES), eps)
         if rows[r] < n_rows:
             for c in cutlass.range_constexpr(vec_chunks):
                 voff = (cutlass.Int32(c) * cutlass.Int32(FWD_LANES) + lane_idx) * cutlass.Int32(16)
@@ -160,9 +168,10 @@ def l2norm_qk_launch(
     k_slots: cutlass.Constexpr[int],
     k_expand_num: cutlass.Constexpr[int],
     stream: cuda.CUstream,
+    eps: cutlass.Float32,
 ):
     k = expanded_view(k, k_slots, k_expand_num)
-    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, d, expand_num, expand_phase, expand_fill, k_slots).launch(
+    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, eps, d, expand_num, expand_phase, expand_fill, k_slots).launch(
         grid=(n_blocks, 1, 1), block=(THREADS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
     )
 
@@ -182,13 +191,13 @@ class L2NormQkRecipe(NamedTuple):
     n_blocks: int
 
 
-def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
-    """The lowered normalize launch: no validation, no key build."""
-    r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
+def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream, eps=L2_NORM_EPS) -> None:
+    """The lowered normalize launch: no validation, no key build.  ``eps`` is the launch's additive epsilon."""
+    r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)), float(eps))
 
 
 def build_l2norm_qk(
-    q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, skip_k=False, k_slots=1, stream
+    q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, skip_k=False, k_slots=1, stream, eps=L2_NORM_EPS
 ) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
     compact io workspace copies, fp32 inverse norms to their slots.  ``inv_q``
@@ -208,7 +217,8 @@ def build_l2norm_qk(
     own strides; a rank-4 ``k`` carries its rows per token (``num_householder``) as the slot extent, which the view takes
     its row stride from (the ``expand_num`` here is the q-row expansion alone); ``k_n`` is always the dense expanded copy.
     ``skip_k`` walks the q rows alone (the k rows were normalized by the summary and handed over as ``k_n``, which is then
-    never written)."""
+    never written).  ``eps`` is the additive epsilon of the first run; it is a launch argument and absent from the key, so
+    :func:`run_l2norm_qk` may replay the recipe at any other."""
     assert (inv_q is None) == (inv_k is None), "inv_q and inv_k are given together or both None"
     if skip_q:
         q = q_n
@@ -250,10 +260,11 @@ def build_l2norm_qk(
             int(k_slots),
             k_expand_num,
             cu_stream,
+            float(eps),
             options="--enable-tvm-ffi",
         )
     r = L2NormQkRecipe(compiled_cache[key], *args)
-    run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream)
+    run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream, eps)
     return r
 
 
