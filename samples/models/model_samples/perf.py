@@ -86,7 +86,9 @@ FROM_PYTHON = "launched from Python: not the time of a kernel inside a captured 
 #: of cuDNN Frontend, an operator of PyTorch.  An exact kernel of any other origin is a library's, which the plan calls
 #: through an entry of that library
 OWN_ORIGINS = ("cuDNN FE", "PyTorch")
-#: the kinds of a row of the per-kernel table whose launches are one kernel each: a time per launch is printed for them
+#: the kinds of a row of the per-kernel table whose launches are one record of one kind each: the kernel of an entry
+#: of cuDNN Frontend or of an operator of PyTorch (``exact``), a library's kernel (``library``), the host read
+#: (``read``: a copy to the host, not a kernel).  A time per launch is printed for them
 ONE_KERNEL = ("exact", "library", "read")
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number

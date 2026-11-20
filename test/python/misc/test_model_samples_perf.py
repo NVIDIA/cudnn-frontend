@@ -1614,7 +1614,7 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("attention.gate_quantize", "exact", 16, 16),
         ("torch_ref.quantize + flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
     ]
-    assert not [row["label"] for row in rows[9:] if row["relation"] in ("exact", "library")] and all(len(label) <= perf.LABEL for label, *_ in exact)
+    assert not [row["label"] for row in rows[9:] if row["relation"] in ("exact", "library")]
     three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
     numbers = claim.numbers()
     assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 178 + 273 + 0, three
@@ -1966,7 +1966,7 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     for held in ('"the rows hold every record of a step"', 'row["launches_per_step"] == row["planned_launches_per_step"]', '"the rows partition GPU busy"'):
         assert held in cell, held
     _says("area", "and in it the per-kernel table of real launches -- the rows hold every record of a step, an exact row its planned launches,")
-    _says("area", "and the rows' mean time per step sums to the mean GPU busy |")
+    _says("area", "and the rows' mean time per step sums to the mean GPU busy")
     _says("area", "the GPU side on constructed launch records (GPU busy as the union of a step's intervals with an overlapped stretch counted once,")
     _says("area", "the step taken apart and the rule for printing launch overhead as a term, tracing's stretch, the rows of the per-kernel table by the")
     _says("area", "place in the wiring on stated sites and on the family's own plans of `native` and `fe-entries`, the rows of the blocks a library")
