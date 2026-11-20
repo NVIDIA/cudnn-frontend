@@ -3998,13 +3998,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Native per-tensor FP8 page pools on SM100/103: D64, D128,
+            # Native per-tensor FP8 page pools on SM100/103: D64, D128, D192/V128,
             # D256 and D512 use independent K/V block tables and pool strides. Dense Q,
             # scalar-scaled O, padding/causal/windows, sink and legal KV splits
             # compose with the loader. Native Rubin serves dense-Q D512 pools
             # through its role-split pipeline. THD D512 and block-scaled O decline.
             paged_kv=True,
-            paged_d_shapes=frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
+            paged_d_shapes=frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
@@ -4246,8 +4246,8 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
-        paged_kv=False,
-        paged_d_shapes=frozenset(),
+        paged_kv=True,
+        paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
         out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
