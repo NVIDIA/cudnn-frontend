@@ -209,10 +209,11 @@ def test_sm100_module_unchanged():
 
 
 def test_sm107_per_tensor_fp8_native_shapes():
-    """Both architecture lines provide native per-tensor D64 geometry."""
-    shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shapes
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == shapes
+    """Blackwell and Rubin share the D64 through D512 flavors. Blackwell also serves absorbed MLA."""
+    shared = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shared
+    for cc in ((10, 0), (10, 3)):
+        assert _sm100_fp8_shapes(pertensor=True, device_cc=cc) == shared | {(576, 512)}
 
 
 @pytest.mark.parametrize("cga", [1, 2])
@@ -244,17 +245,15 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 109)
     assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
-    assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm100_envelopes.d_shapes == sm107.d_shapes | {(576, 512)}
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
     assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
     assert (64, 64) not in sm107.thd_d_shapes
-    # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
-    # so a row that gains a flavor must gain its floor in the same commit --
-    # otherwise mismatch() admits a graph check_support kills (contract 8b').
-    assert dict(sm107.d_envelope_floors) == dict(sm100_envelopes.d_envelope_floors)
-    # The legacy SM100 envelope row and Rubin retain the D512 floor. The
-    # explicit small-head owner only accepts its exact D64/D128 shapes.
-    assert sm100_envelopes.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    # Both rows share the D512 floor. On Blackwell, the D576 floor prevents narrower
+    # pairs from selecting the exact MLA flavor through the envelope matcher.
+    assert dict(sm107.d_envelope_floors) == {(512, 512): 256}
+    assert dict(sm100_envelopes.d_envelope_floors) == {(512, 512): 256, (576, 512): 512}
     assert sm100.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
