@@ -37,11 +37,11 @@ policy threshold or selected-plan Stats-stride behavior note is added.
 **Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
 graph/config for admitted override-enabled half THD plans with packed HN Stats
 and the matching prepared binder on qualified SM100/SM103, SM107 and SM120
-(cc 12.0) devices. The native owner lifecycle suite covers changing packed
+(cc 12.0 and 12.1) devices. The native owner lifecycle suite covers changing packed
 head strides, fresh bindings, retained captures and both FP16/BF16. This includes
 eligible explicit small, mid and wide half owners and the admitted packed/split
 paths, not swap-AB, dense decode, quantized or all FROST plans. NH, padded Stats
-and override-disabled plans remain unmarked; SM121 remains unqualified.
+and override-disabled plans remain unmarked.
 Detector: `test_sdpa_stats_override_qualified.py`. See [the graph contract](../../../../docs/utilities/python_graph_and_execution_backends.md#plan-specific-stats-stride-override-note).
 
 **SM100/SM103 exact half D256 implementation engines (refactor pilot):**

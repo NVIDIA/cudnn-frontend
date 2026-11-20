@@ -30,8 +30,8 @@ from cudnn.engines import is_python_engine, MANIFEST
 from frost_test_utils import _SM, requires_dsl
 
 requires_thd_frost_row = pytest.mark.skipif(
-    _SM is None or not (100 <= _SM <= 107 or _SM == 120),
-    reason="needs an arch with a frost THD (ragged) SDPA forward row: SM100-line, SM107 or SM120; have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not (100 <= _SM <= 107 or _SM in (120, 121)),
+    reason="needs an arch with a frost THD (ragged) SDPA forward row: SM100-line, SM107 or SM120-family; have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 pytestmark = [pytest.mark.L0, requires_thd_frost_row, requires_dsl]
 

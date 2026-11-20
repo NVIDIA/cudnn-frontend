@@ -78,7 +78,7 @@ def test_note_excludes_ineligible_graphs(changes):
     assert NOTE not in _notes("sdpa_fwd_sm100_d128_multi_q", _facts(**changes))
 
 
-@pytest.mark.parametrize("name,cc", [("sdpa_fwd_sm120_f16_general", (12, 1))])
+@pytest.mark.parametrize("name,cc", [("sdpa_fwd_sm120_f16_general", (12, 2))])
 def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, monkeypatch):
     from cudnn.frost import buffers
 
@@ -165,12 +165,17 @@ QUALIFIED_OVERRIDE_CASES = [
     (107, "sm107_shared_d256_lookahead", 256, 256, 128, 128, 2, 2, 0, 0, False),
     (107, "sm107_d512_role_split", 512, 512, 128, 128, 4, 1, 0, 0, False),
     (107, "sm107_d512_2x2", 512, 512, 64, 128, 4, 1, 0, 0, False),
-    (120, "sm120_f16_general", 64, 64, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_f16_general", 128, 128, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_f16_general", 192, 128, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_d256_all_compute", 256, 256, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_d512_paired", 512, 512, 64, 32, 1, 1, 0, 0, False),
-    (120, "sm120_d512_paired", 576, 512, 64, 32, 1, 1, 0, 0, False),
+] + [
+    (sm, *case)
+    for sm in (120, 121)
+    for case in (
+        ("sm120_f16_general", 64, 64, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_f16_general", 128, 128, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_f16_general", 192, 128, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_d256_all_compute", 256, 256, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_d512_paired", 512, 512, 64, 32, 1, 1, 0, 0, False),
+        ("sm120_d512_paired", 576, 512, 64, 32, 1, 1, 0, 0, False),
+    )
 ]
 
 

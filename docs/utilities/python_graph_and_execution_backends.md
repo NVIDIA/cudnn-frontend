@@ -962,8 +962,8 @@ or storage capacity, or bypass the plan's ragged-offset and override bounds.
 
 The declaration covers admitted override-enabled FP16/BF16 THD plans
 with packed HN Stats through the prepared THD binder on qualified SM100/SM103
-devices, plus qualified SM107 and SM120 (cc 12.0) half THD plans.
-SM121 remains unqualified. The note follows the admitted graph/config and the
+devices, plus qualified SM107 and SM120-family (cc 12.0 and 12.1) half THD plans.
+The note follows the admitted graph/config and the
 prepared binder, including the new explicit implementation owners; it does not
 apply to every plan on those architectures.
 This includes the explicit D256 lookahead engine and eligible legacy

@@ -18,7 +18,7 @@ pytestmark = pytest.mark.L0
 def test_forward_auxiliary_storage_matches_graph(provider, role, strided, monkeypatch):
     if provider == "frost":
         _require_prepared()
-        if torch.cuda.get_device_capability() not in ((8, 0), (10, 0), (10, 3), (10, 7), (12, 0)):
+        if torch.cuda.get_device_capability() not in ((8, 0), (10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
             pytest.skip("pinned forward metadata route requires an available dense FROST engine")
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     original = cudnn.pygraph.create_execution_plans
