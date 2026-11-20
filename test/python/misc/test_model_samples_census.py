@@ -163,7 +163,7 @@ AREA_POLICY = (
     "requests, and are handled by the maintainers of this repository, as for its other requirement files. The packages `constraints-native.txt` "
     "pins are on the ignore list of that entry, each by its name with the three update types of a version update and nothing else: the entry "
     "proposes no version update for them -- not for a pin, and not for the lower bound of `flashinfer-python` in `requirements-flashinfer.txt` "
-    "either, since an item of the list names a package for the whole entry --, and a security update is not ignored. The pins are the versions a "
+    "either, which is covered through the exact pin of the same package --, and a security update is not ignored. The pins are the versions a "
     "family's kernel census was recorded with, and a pin changes only together with a recorded run; a security update of one fails the host tests "
     "until that run is made.",
 )
@@ -8122,11 +8122,15 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
 
     # the census facts of a library kernel are names: a class or a pick that is not one is a file this reader refuses
     data = json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())
-    facts = [call[2] for call in data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["linear_attention_layer"] if len(call) > 2 and "class" in call[2]]
-    assert [fact["class"] for fact in facts] == ["Sm100BlockScaledSplitKGemmKernel"], "the down multiply of a linear-attention layer"
-    for facts[0]["class"] in (7, ""):  # a number, and a name of no characters
-        with pytest.raises(ValueError, match="class and pick of .* are names: a kernel class, a kernel"):
-            census.Target(data)
+    layer = data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["linear_attention_layer"]
+    for name, block, recorded in (("class", "mlp.down", "Sm100BlockScaledSplitKGemmKernel"), ("pick", "projection.fp8.out", NVJET_FP8)):
+        (facts,) = [call[2] for call in layer if len(call) > 2 and name in call[2]]  # the layer's down multiply; its out-projection
+        assert facts[name] == recorded
+        for facts[name] in (7, ""):  # a number, and a name of no characters
+            with pytest.raises(ValueError, match=f"class and pick of {block} are names: a kernel class, a kernel"):
+                census.Target(data)
+        facts[name] = recorded  # the file as it is again: the other name is refused by itself
+    census.Target(data)
 
 
 def test_the_library_rows_under_the_passes_of_a_speculative_step(monkeypatch):

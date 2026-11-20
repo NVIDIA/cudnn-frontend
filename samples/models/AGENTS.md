@@ -109,8 +109,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
     is a version the host tests of the text and weight readers were run against; raise it with evidence, in the same
     change as the code that needs it (for `jinja2`, whose sandbox a checkpoint's template runs in, with a sandbox fix). The
     family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
-    package versions and the GPU class of the last run with a checkpoint. Version updates come through the `pip` entry for
-    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose
+    package versions and the GPU class of the last run with a checkpoint. Version updates come through the `pip` entry
+    for `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose
     kernels a stack calls has a requirement file of its own, a lower bound with its "Validated with" line
     (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the
     versions the launch records of the family's census were recorded with. The maintainers of this area own that list; a

@@ -345,7 +345,8 @@ PROVIDERS = {
         # width are the multiply over a copy below, at both call sites
         *_verify_out_rows(TARGET_STACKS),
         # the library's 8-bit multiply on the stored codes, where the target runs it: both call sites of a step of one token
-        # per sequence, and in a step of several the attention layers' site and every call beyond the rows above
+        # per sequence, and in a step of several the attention layers' site and every call beyond the rows above.
+        # Launch order: a dependent of the fused step or of the gate, which release early; it waits before its first load
         _library_row("projection.fp8.out", BMM_FP8_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 8-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
@@ -390,7 +391,8 @@ PROVIDERS = {
     ],
     "mlp.down": [
         # the library's 4-bit multiply on the stored codes.  The operand is the fused gate / up kernel's output, in the layout
-        # this kernel reads: nothing is launched between the two
+        # this kernel reads: nothing is launched between the two.  Launch order: a dependent of that kernel, which releases
+        # early; it waits before its first load
         _library_row("mlp.down", MM_FP4_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
@@ -416,7 +418,8 @@ PROVIDERS = {
     ],
     "output_head": [
         # the same multiply.  Its operand is the final norm's bf16 rows: the target quantises them with a launch of its own,
-        # which no row serves yet (the census's ``output_head.quantize``), so this block quantises them when it reads them
+        # which no row serves yet (the census's ``output_head.quantize``), so this block quantises them when it reads them.
+        # Launch order: behind PyTorch's launches of that quantiser, none of which releases early
         _library_row("output_head", MM_FP4_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),

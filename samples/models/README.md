@@ -347,7 +347,7 @@ Version updates for `samples/models/requirements.txt` come from the `pip` entry 
 `.github/dependabot.yml`, as pull requests, and are handled by the maintainers of this repository, as for its other
 requirement files. The packages `constraints-native.txt` pins are on the ignore list of that entry, each by its name
 with the three update types of a version update and nothing else: the entry proposes no version update for them -- not
-for a pin, and not for the lower bound of `flashinfer-python` in `requirements-flashinfer.txt` either, since an item of
-the list names a package for the whole entry --, and a security update is not ignored. The pins are the versions a
+for a pin, and not for the lower bound of `flashinfer-python` in `requirements-flashinfer.txt` either, which is covered
+through the exact pin of the same package --, and a security update is not ignored. The pins are the versions a
 family's kernel census was recorded with, and a pin changes only together with a recorded run; a security update of one
 fails the host tests until that run is made.
