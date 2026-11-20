@@ -663,7 +663,39 @@ production kernels gain no debug knob or timing-dependent assertion.
   threshold on whichever `placement_table.FEATURES` scalar (cost proxy, parallel tiles, query rows, KV per request, query tokens per request) fits the training grid best,
   qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
+  When no single feature orders a class (few query rows win over a long cache and lose over a short one), an entry may carry a
+  second condition (`Entry.also`, both must hold to lead) instead of a hand rule. Pre-register the two-feature candidate set, fit
+  it under the same constraint, and score it once on the holdout (`sm80_dense_d128_gqa_v2_20261117`). `benchmark/placement_gen/gen.py
+  --constrained [--two-feature]` and `--score` run both fits and the holdout score from the repo.
+- A twin side with no changed holdout cell is untested, not refuted. It keeps its existing entry and does not block its twin, so
+  pre-register "a twin ships its passing sides when neither side fails" (`gen.py --score` prints both verdicts). The strict both-sides
+  rule failed `sm80_paged_d64_v2_20261117`, whose off-tile refits moved v1's thresholds by 1-2 train cells that no holdout cell fell
+  between.
+- When a study fails on a few cells, pool its train and holdout as the next study's train and score once on a fresh holdout at new
+  head pairs. The failing cells then shape the second condition (`sm80_paged_d192x192_v2_20261117`, `sm80_paged_d256_d192_v3_20261117`).
+- Time on a full-power board and record `power.limit` per shard. A 275 W A100-SXM4-80GB let legs on the identical plan read up to
+  1.5-1.7x apart (`a100_ctx_retime_4d65_fp_20261117` re-checks the 2026-11-17 A100 entries at 400 W).
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
+- Deterministic graphs are unmeasured (the hand rules decide) except on `placement_table.DETERMINISTIC_KEYED_ROWS`, where they
+  key phase `<phase>_det`. Add a row there only with a study that times its deterministic body against the backend's
+  deterministic engine; a row's deterministic body can be a different kernel, so it never inherits the default classes' verdicts.
+- The key does not carry the GQA group, so the train grid must span the group range the holdout and serving can carry: a small
+  group (2 / 3), a non-power of two (5 / 6 / 7) and the served ones; 64/8, 32/4, 16/2 and 8/1 are all group 8. Three narrow fits
+  failed holdouts on a group outside their train range (`sm90_dense_d256_chunk_20261117`: group 2; `sm120_paged_d128_mtp_v3_20261117`:
+  group 5; `sm120_paged_d128_mtp_v4_20261117`, trained on groups 4-8: group 3). For a tiled kernel, include groups that do not divide
+  the tile: the SM120 multi-Q decode tile lost at groups 20 / 24 (s_q 13-15) and at d128 groups 5 / 10 / 12, after power-of-two
+  probes had passed (`sm120_paged_d256_multiq_verify_20261117`, `sm120_paged_d64_d128_verify_20261117`).
+- The off-tile twin needs its own train lattice (the on-tile lattice shifted off the 128-key tile), not a handful of cells or a
+  mirrored on-tile rule: `sm90_mha_mtp_20261117` (10 off-tile cells) and `sm80_det_bwd_d64mha_supp_20261117` (mirrored) each passed on
+  the tile and lost 1.17-1.35x off it.
+- Fit under the criterion, not under geomean regret alone. A regret fit trades the worst changed cell for the geomean, and the
+  holdout's worst <= 1.10 then fails: `sm120_paged_d128_mtp_v5_20261117` raised T for every group (train worst already 1.18) and
+  `sm120_decode_split_v4_20261117` raised both rates (train worst 1.28). Before reading the holdout, print the fit's own changed-train
+  worst. Prefer a constrained fit (changed train cells at worst <= 1.05) and a one-parameter change that can only move the cells
+  the evidence covers.
+- A split-chooser fit times every split the chooser can return (`split_kv_candidates`), or it scores a case only when all of its
+  candidates were timed. `sm120_decode_split_v3_20261117` swept 1-64 while the chooser offers up to 256 on 188 SMs: it passed its
+  holdout, then failed the real-path check (new vs committed chooser on fresh cases) at 1.108. Run that check before committing a chooser change.
 - A refinement can be local to the affected row and part. Keep existing keys for unrelated studies; an unqualified
   new class gets no entry and retains its prior default route. Check both sides of the first placement-tile boundary
   and retain long off-tile controls (`test_sm120_short_square_class_keeps_default_and_long_square_leads`).
