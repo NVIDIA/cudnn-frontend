@@ -4,8 +4,8 @@
 """The order of a launch behind the initialization of an entry-owned allocation (``cudnn.frost.init_order``), host-only, on
 stand-ins for the events, the streams, the driver and the device context (``init_order_schedules.stand_ins``): what a call
 does for one record by its state; which records a launch is ordered behind; what a record of an allocation holds; the
-records of a device as ONE object; host threads; the relaxed capture check of ``cudnn.frost.capture``.  The schedules on a
-device are in the suites of the entries that use the helper."""
+records of a device as ONE object; host threads; where a dropped event is released; the relaxed capture check of
+``cudnn.frost.capture``.  The schedules on a device are in the suites of the entries that use the helper."""
 
 import copy
 import pickle
@@ -315,6 +315,33 @@ def test_host_threads_share_the_records_without_a_lock(monkeypatch):
     for t in threads:
         t.join(60)
     assert not failures and not pending and not any(t.is_alive() for t in threads)
+
+
+def test_a_dropped_event_is_released_while_the_capture_check_is_relaxed(monkeypatch):
+    """The event of a record a walk drops -- complete, or waited for on the host under a capture -- is released INSIDE the
+    walk's relaxed capture check, not when the walk returns behind the restored check (the release of an event is a call
+    of this thread into the driver like its reads).  The stand-in event logs the capture mode the stand-in driver holds
+    when it is released; its reads are not logged (the log would keep it alive)."""
+    s = stand_ins(monkeypatch)
+    pending, launch = init_order.pending_of(DEV), s.Stream(OTHER)
+
+    class Released(s.Event):
+        def query(self):
+            return self.complete
+
+        def synchronize(self):
+            self.complete = True
+
+        def __del__(self):
+            s.calls.append(("released", s.Driver.mode))
+
+    for dropped, complete, written in (("complete, not hit", True, ((5000, 5100),)), ("hit under a capture", False, ((1500, 1600),))):
+        s.capturing = set() if complete else {OTHER}
+        _put(pending, Released(complete))
+        s.calls.clear()
+        init_order.order_behind(pending, launch, written)
+        assert not pending and s.Driver.mode == "global", dropped
+        assert [c[1] for c in s.calls if c[0] == "released"] == ["relaxed"], f"{dropped}: the event was released behind the restored capture check"
 
 
 def test_relaxed_capture_check_exchanges_this_threads_mode_and_restores_it(monkeypatch):

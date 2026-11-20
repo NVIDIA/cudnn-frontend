@@ -22,7 +22,8 @@ that work is still queued.  What every such case must do, or it shows nothing:
 * run inside the ``settled_records`` fixture: the cases of every entry share the device's records.
 
 The HOST stand-ins (:func:`stand_ins`, :func:`host_allocations`) replace what the ordering touches -- events, streams, the
-driver's capture-mode exchange and capture status, the device context -- and keep ONE log of their calls.
+driver's capture-mode exchange and capture status, the device context -- and keep ONE log of their calls; :func:`on_device`
+gives an entry built for a stand-in device its operands.
 
 Not a test module (no ``test_`` prefix): imported by name from the suites (``test/python`` is on their path)."""
 
@@ -34,7 +35,7 @@ import torch
 
 from cudnn.frost import capture, init_order
 
-DELAY = 1_000_000_000  # cycles of the delay kernel: about half a second on the validated part
+DELAY = 1_000_000_000  # cycles of the delay kernel: long enough that the case's calls overlap the parked work
 
 
 def side_stream(dev, *others):
@@ -264,6 +265,16 @@ def host_allocations(monkeypatch, dev, calls):
 
     monkeypatch.setattr(torch, "empty", allocation("empty", torch.empty))
     monkeypatch.setattr(torch, "zeros", allocation("zeros", torch.zeros))
+
+
+def on_device(dev, *tensors):
+    """``tensors`` (host memory) as tensors that report ``dev`` as their device: the operands of an entry built for ``dev``,
+    so a call runs every check it makes in front of its launch without a device."""
+
+    class OnDevice(torch.Tensor):
+        device = property(lambda self: dev)
+
+    return tuple(t.as_subclass(OnDevice) for t in tensors)
 
 
 def spans_of(tensors):
