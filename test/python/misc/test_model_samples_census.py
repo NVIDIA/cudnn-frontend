@@ -9216,8 +9216,12 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     cfg = prepare_decode.make_cfg(
         suite.GEOMETRY, suite.EPS, positions="3d", mrope_section=suite.SECTION, page_size=64, position_dtype="int64", slot_dtype="int64"
     )
-    for kind, tokens, seed in (("random", 7, 0), ("structured", 9, 1), ("edge", 6, 2)):
-        ops = suite.make_operands(tokens, seed=seed, kind=kind)
+    # (1,024 random tokens: among millions of elements a root taken in fp32 moves some to the other bf16 value; and operands whose
+    # rotary products underflow, where the sign of a zero says which product of the second half is the fused one)
+    draws = [(kind, suite.make_operands(tokens, seed=seed, kind=kind)) for kind, tokens, seed in (("random", 7, 0), ("structured", 9, 1), ("edge", 6, 2))]
+    draws += [("random, 1,024 tokens", suite.make_operands(1024, seed=3, kind="random")), ("underflow", suite.underflow_operands(8, seed=4))]
+    for kind, ops in draws:
+        tokens = ops["positions"].shape[-1]
         at = ops["positions"][0].clone()
         ops["positions"] = at.expand(3, tokens).contiguous()  # one position per token: three equal rows, as a text position is
         table = ops["cos_sin"][at]
@@ -9227,6 +9231,11 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
             got, band = torch_ref.prepare_rows(ops[name], ops[weight], cos, sin, suite.EPS)
             assert torch.equal(suite.bits(got), suite.bits(want)), f"{kind}, {name}: the twin is the suite's twin, bit for bit"
             assert band.dtype == torch.float64 and torch.equal(band, want_band), f"{kind}, {name}: and its band is the suite's"
+    one_row = prepare_decode.make_cfg(suite.GEOMETRY, suite.EPS, positions="1d", page_size=64, position_dtype="int64", slot_dtype="int64")
+    three, _ = torch_ref.prepare_rows(ops["q"], ops["q_weight"], cos, sin, suite.EPS)  # the last draw: every rotary product underflows
+    got, _ = torch_ref.prepare_rows(ops["q"], ops["q_weight"], cos, sin, suite.EPS, order="1d")
+    want, _ = suite.twin_rows(ops["q"], ops["q_weight"], at.reshape(1, -1), ops["cos_sin"], one_row)
+    assert torch.equal(suite.bits(got), suite.bits(want)) and not torch.equal(suite.bits(got), suite.bits(three)), "the order of one position row: other zeros"
     values = torch.tensor([0.0, 1.0, 1.5, -3.0, 2.0**-130, 255.0, 256.0, 1e30], dtype=torch.float64)
     assert torch.equal(torch_ref.bf16_unit(values), suite.unit(values)), "one bf16 unit at a magnitude: the suite's"
     assert torch_ref.bf16_unit(torch.tensor([1.0, 1.99, 2.0], dtype=torch.float64)).tolist() == [2.0**-7, 2.0**-7, 2.0**-6]
@@ -9309,6 +9318,9 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
 
     one_off = judged(q=altered(ref[0], (0, 0, 200), 1), pool=ref_after)
     assert one_off.ok and one_off.other_value == 1, "a pass-through element one unit off: inside"
+    toward_zero = -2 if float(ref[0][0, 0, 200]) > 0 else 2  # the unit is taken at the larger magnitude: the twin's
+    two_off = judged(q=altered(ref[0], (0, 0, 200), toward_zero), pool=ref_after)
+    assert not two_off.ok and two_off.outside == 1, "a pass-through element two units off: outside, its band is one unit"
     for name, at in (("a pass-through element", (0, 0, 200)), ("a rotated element", (4, 23, 40))):
         far = ref[0][at].double() + 3 * (torch_ref.bf16_unit(ref[0][at].double()) + twin.terms.q_band[at])
         bad = ref[0].clone()
