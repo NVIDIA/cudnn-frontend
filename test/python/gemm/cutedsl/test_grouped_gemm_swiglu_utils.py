@@ -512,6 +512,8 @@ def run_grouped_gemm_swiglu_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    act_func: str = "swiglu",
+    power_m: float = 2.0,
 ) -> torch.Tensor:
     """Run reference implementation for grouped GEMM SwiGLU.
 
@@ -581,12 +583,21 @@ def run_grouped_gemm_swiglu_ref(
     ref_gate = ref.index_select(1, gate_idx)
     ref_up = ref.index_select(1, up_idx)
 
-    # SwiGLU: up * (gate * sigmoid(gate))
-    ref_gate = ref_gate * torch.sigmoid(ref_gate)
+    if act_func == "powlu":
+        safe_gate = torch.where(ref_gate > 0, ref_gate.clamp_min(torch.finfo(torch.float32).tiny), torch.ones_like(ref_gate))
+        exponent = power_m / (safe_gate.sqrt() + 1.0)
+        positive = torch.pow(safe_gate, exponent) * torch.sigmoid(ref_gate)
+        ref_gate = torch.where(ref_gate > 0, positive, ref_gate * torch.sigmoid(ref_gate))
+    else:
+        # SwiGLU: up * (gate * sigmoid(gate))
+        ref_gate = ref_gate * torch.sigmoid(ref_gate)
     ref_after_swiglu = ref_up * ref_gate
 
     # Step 4: Apply prob
-    ref_after_swiglu = ref_after_swiglu * prob_tensor.expand(-1, n_out, -1)
+    prob = prob_tensor.expand(-1, n_out, -1)
+    ref_after_swiglu = ref_after_swiglu * prob
+    if act_func == "powlu":
+        ref_after_swiglu = torch.where(prob == 0, torch.zeros_like(ref_after_swiglu), ref_after_swiglu)
     ref_tensors["d_ref"] = ref_after_swiglu.clone()
 
     if generate_amax:
@@ -784,6 +795,8 @@ def check_ref_grouped_gemm_swiglu(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        act_func=cfg.get("act_func", "swiglu"),
+        power_m=cfg.get("power_m", 2.0),
     )
 
     torch.cuda.synchronize()

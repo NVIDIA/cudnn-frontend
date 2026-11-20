@@ -114,7 +114,7 @@ always `None`; `c_tensor` is `None` unless `generate_c=True`.
 
 The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
-2. **GLU activation**: Fused SwiGLU, GeGLU, or SiTU-GLU activation applied to the GEMM output
+2. **GLU activation**: Fused SwiGLU, GeGLU, SiTU-GLU, or PowLU activation applied to the GEMM output
 3. **Optional quantized output**: Produces row and column scale factors for downstream quantization
 
 ### Shapes
@@ -133,6 +133,38 @@ where `beta_1 = situ_beta1` and `beta_2 = situ_beta2`, with defaults
 `beta_1 = 4.0` and `beta_2 = 25.0`. `situ_beta1` specializes the compiled kernel
 and is part of its cache key; `situ_beta2` is a runtime FP32 scalar and does not
 create a new compiled-kernel cache entry.
+
+The [PowLU paper](https://arxiv.org/abs/2605.25704) defines the scalar activation
+
+$$
+F_m(x)=\begin{cases}
+x^{1+m/(\sqrt{x}+1)}\sigma(x), & x>0,\\
+x^2\sigma(x), & x\le 0.
+\end{cases}
+$$
+
+For the two-projection GLU form used here, let `G` be the gate branch and `U`
+the up branch. With `act_func="powlu"`, the SM100/SM103 block-scaled epilogue
+computes
+
+$$
+P_m(G)=\begin{cases}
+G^{m/(\sqrt{G}+1)}\sigma(G), & G>0,\\
+G\sigma(G), & G\le 0,
+\end{cases}
+\qquad D=\mathrm{prob}\,U\,P_m(G).
+$$
+
+Setting `U = G = x` recovers the paper's scalar definition. The paper studies
+`0 < m < 10`, evaluates `m` values 2, 3, and 4, and uses `m=3` in its main
+training experiments. This API keeps `power_m` configurable and defaults it to
+`2.0`.
+
+The square root and power use CuTeDSL's native ``cute.math`` operations, and
+the reciprocal is approximate. `power_m` specializes the compiled kernel and
+participates in the wrapper cache key. PowLU is currently supported for torch
+block-scaled inputs on SM100/SM103; BF16, JAX, and Rubin paths reject it before
+compilation.
 
 - **Inputs**
   - `A`: contiguous activation tensor across all groups, shape `(valid_m, K, 1)`

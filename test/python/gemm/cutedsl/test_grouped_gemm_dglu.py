@@ -781,6 +781,7 @@ def _test_grouped_gemm_dglu_dense_wrapper(
     act_func="dswiglu",
     situ_beta1=4.0,
     situ_beta2=25.0,
+    power_m=2.0,
 ):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
@@ -807,6 +808,7 @@ def _test_grouped_gemm_dglu_dense_wrapper(
     cfg["act_func"] = act_func
     cfg["situ_beta1"] = situ_beta1
     cfg["situ_beta2"] = situ_beta2
+    cfg["power_m"] = power_m
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -877,6 +879,7 @@ def _test_grouped_gemm_dglu_dense_wrapper(
                 act_func=act_func,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
@@ -931,6 +934,117 @@ def test_grouped_gemm_dglu_dense_wrapper_dsituglu_mxfp8(request, alpha_beta_dtyp
         act_func="dsituglu",
         situ_beta1=situ_beta1,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+def test_grouped_gemm_dglu_dense_wrapper_dpowlu_mxfp8(request):
+    """Validate dPowLU, dprob, and MXFP8 row/column output."""
+    _test_grouped_gemm_dglu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        act_func="dpowlu",
+        power_m=2.5,
+    )
+
+
+def _run_dpowlu_numerical_case(request, input_mutator, *, skip_ref=False):
+    return _test_grouped_gemm_dglu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        cfg_overrides={"n": 128, "k": 128, "group_m_list": [256], "skip_ref": skip_ref},
+        input_mutator=input_mutator,
+        act_func="dpowlu",
+        power_m=2.5,
+    )
+
+
+def _set_interleaved_gate_up(inputs, cfg, gate, up):
+    gate_idx, up_idx = _interleaved_block_indices(2 * cfg["n"], inputs["c_tensor"].device)
+    inputs["c_tensor"].zero_()
+    inputs["c_tensor"][:, gate_idx, 0] = gate
+    inputs["c_tensor"][:, up_idx, 0] = up
+    inputs["beta_tensor"].fill_(1.0)
+
+
+def _assert_zero_finite_dpowlu_outputs(outputs, valid_m):
+    for name in ("d_row_tensor", "d_col_tensor"):
+        data = outputs[name][:valid_m].float()
+        assert torch.isfinite(data).all(), name
+        assert torch.count_nonzero(data).item() == 0, name
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=31)
+def test_grouped_gemm_dpowlu_zero_upstream_masks_extreme_up(request):
+    """Zero FC2 dgrad must dominate a large up branch without producing NaN."""
+
+    def mutate(inputs, cfg):
+        inputs["a_tensor"].zero_()
+        inputs["a_ref"].zero_()
+        inputs["alpha_tensor"].fill_(1.0)
+        inputs["prob_tensor"].fill_(1.0)
+        _set_interleaved_gate_up(inputs, cfg, 1.1875, torch.finfo(torch.bfloat16).max)
+
+    inputs, outputs, _ = _run_dpowlu_numerical_case(request, mutate)
+    _assert_zero_finite_dpowlu_outputs(outputs, inputs["valid_m"])
+    assert torch.count_nonzero(outputs["dprob_tensor"][: inputs["valid_m"]]).item() == 0
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=32)
+def test_grouped_gemm_dpowlu_zero_prob_masks_activation_gradients(request):
+    """A zero router probability zeros dGate/dUp but not dprob."""
+
+    def mutate(inputs, cfg):
+        inputs["alpha_tensor"].fill_(1.0)
+        inputs["prob_tensor"].zero_()
+        _set_interleaved_gate_up(inputs, cfg, 1.1875, 1.0)
+
+    inputs, outputs, _ = _run_dpowlu_numerical_case(request, mutate)
+    _assert_zero_finite_dpowlu_outputs(outputs, inputs["valid_m"])
+    dprob = outputs["dprob_tensor"][: inputs["valid_m"]]
+    assert not torch.isnan(dprob).any()
+    assert torch.count_nonzero(dprob).item() > 0
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=33)
+def test_grouped_gemm_dpowlu_zero_prob_masks_overflowing_product(request):
+    """Apply prob before the extreme up branch so its zero prevents overflow."""
+
+    def mutate(inputs, cfg):
+        for name in ("a_tensor", "a_ref", "b_tensor", "b_ref", "sfa_tensor", "sfa_ref", "sfb_tensor", "sfb_ref"):
+            inputs[name].fill_(1.0)
+        inputs["alpha_tensor"].fill_(1.0e10)
+        inputs["prob_tensor"].zero_()
+        _set_interleaved_gate_up(inputs, cfg, 1.1875, torch.finfo(torch.bfloat16).max)
+
+    inputs, outputs, _ = _run_dpowlu_numerical_case(request, mutate, skip_ref=True)
+    _assert_zero_finite_dpowlu_outputs(outputs, inputs["valid_m"])
+    assert not torch.isnan(outputs["dprob_tensor"][: inputs["valid_m"]]).any()
 
 
 @pytest.mark.L0
@@ -1426,6 +1540,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
     situ_beta1=4.0,
     situ_beta2=25.0,
     deterministic=False,
+    power_m=2.0,
 ):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
@@ -1451,6 +1566,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
     )
     cfg["situ_beta1"] = situ_beta1
     cfg["situ_beta2"] = situ_beta2
+    cfg["power_m"] = power_m
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1499,6 +1615,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
                 act_func=cfg["act_func"],
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
                 deterministic=deterministic,
@@ -1592,6 +1709,28 @@ def test_grouped_gemm_dglu_discrete_wrapper_dsituglu(
         b_major="k",
         situ_beta1=situ_beta1,
         situ_beta2=situ_beta2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=10)
+def test_grouped_gemm_dglu_discrete_wrapper_dpowlu_mxfp8(request):
+    _test_grouped_gemm_dglu_discrete_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dpowlu",
+        request=request,
+        b_major="k",
+        power_m=2.5,
     )
 
 

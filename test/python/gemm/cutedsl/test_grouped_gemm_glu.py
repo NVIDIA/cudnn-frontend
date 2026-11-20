@@ -33,6 +33,7 @@ from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors,
     allocate_grouped_gemm_output_tensors,
     check_ref_grouped_gemm_swiglu,
+    run_grouped_gemm_swiglu_ref,
 )
 from gemm.cutedsl.test_discrete_grouped_gemm_swiglu_utils import (
     discrete_grouped_gemm_init,
@@ -697,6 +698,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
     act_func="swiglu",
     situ_beta1=4.0,
     situ_beta2=25.0,
+    power_m=2.0,
     skip_reference=False,
 ):
     try:
@@ -724,6 +726,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
     cfg["act_func"] = act_func
     cfg["situ_beta1"] = situ_beta1
     cfg["situ_beta2"] = situ_beta2
+    cfg["power_m"] = power_m
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -777,6 +780,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 act_func=act_func,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
@@ -810,6 +814,97 @@ def test_grouped_gemm_glu_dense_wrapper_situglu_mxfp8(request):
         act_func="situglu",
         skip_reference=True,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_grouped_gemm_glu_dense_wrapper_powlu_mxfp8(request):
+    """Validate fast PowLU with quantization-aware MXFP8 payload checks."""
+    inputs, outputs, cfg = _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        act_func="powlu",
+        power_m=2.5,
+        skip_reference=True,
+    )
+    _check_powlu_mxfp8_reference(inputs, outputs, cfg)
+
+
+def _ordered_e4m3_codes(tensor):
+    """Map finite E4M3 sign-magnitude payloads to monotonic integer codes."""
+    bits = tensor.contiguous().view(torch.uint8).to(torch.int16)
+    return torch.where((bits & 0x80) != 0, 0xFF - bits, bits + 0x80)
+
+
+def _assert_adjacent_e4m3(actual, reference, *, max_mismatch_ratio=1e-5):
+    assert actual.dtype == torch.float8_e4m3fn
+    expected = reference.to(actual.dtype)
+    assert actual.shape == expected.shape
+    actual_f32 = actual.float()
+    expected_f32 = expected.float()
+    assert torch.isfinite(actual_f32).all()
+    assert torch.isfinite(expected_f32).all()
+
+    ulp_diff = (_ordered_e4m3_codes(actual) - _ordered_e4m3_codes(expected)).abs()
+    max_ulp = int(ulp_diff.max().item())
+    mismatch_ratio = float((ulp_diff != 0).float().mean().item())
+    assert max_ulp <= 1, f"PowLU MXFP8 payload differs by {max_ulp} E4M3 ULPs"
+    assert mismatch_ratio <= max_mismatch_ratio, f"PowLU MXFP8 mismatch ratio {mismatch_ratio:.3e} exceeds " f"{max_mismatch_ratio:.3e}"
+
+
+def _check_powlu_mxfp8_reference(inputs, outputs, cfg):
+    """Keep GEMM/scales strict and allow only rare adjacent E4M3 payloads."""
+    reference = run_grouped_gemm_swiglu_ref(
+        a_ref=inputs["a_ref"].to(torch.float32),
+        b_ref=inputs["b_ref"].to(torch.float32),
+        sfa_ref=inputs["sfa_ref"].to(torch.float32),
+        sfb_ref=inputs["sfb_ref"].to(torch.float32),
+        alpha_tensor=inputs["alpha_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        aligned_group_m_list=inputs["aligned_group_m_list"],
+        valid_m=inputs["valid_m"],
+        bias_tensor=inputs.get("bias_tensor"),
+        generate_amax=outputs.get("amax_tensor") is not None,
+        generate_sfd=True,
+        norm_const_tensor=inputs["norm_const_tensor"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        sf_dtype=cfg["sf_dtype"],
+        act_func="powlu",
+        power_m=cfg["power_m"],
+    )
+
+    torch.testing.assert_close(
+        outputs["c_tensor"][: inputs["valid_m"]].cpu().float(),
+        reference["c_ref"].cpu().to(cfg["c_dtype"]).float(),
+        rtol=0.01,
+        atol=0.1,
+    )
+    torch.testing.assert_close(
+        outputs["sfd_row_tensor"].cpu().float(),
+        reference["sfd_row_ref"].cpu().float(),
+        rtol=0,
+        atol=0,
+    )
+    _assert_adjacent_e4m3(outputs["d_tensor"].cpu(), reference["d_ref"].cpu())
+    torch.testing.assert_close(
+        outputs["sfd_col_tensor"].cpu().float(),
+        reference["sfd_col_ref"].cpu().float(),
+        rtol=0,
+        atol=0,
+    )
+    _assert_adjacent_e4m3(outputs["d_col_tensor"].cpu(), reference["d_col_ref"].cpu())
 
 
 @pytest.mark.L0
@@ -1282,6 +1377,7 @@ def _test_grouped_gemm_glu_discrete_wrapper(
     use_dynamic_sched=False,
     situ_beta1=4.0,
     situ_beta2=25.0,
+    power_m=2.0,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -1307,6 +1403,7 @@ def _test_grouped_gemm_glu_discrete_wrapper(
     )
     cfg["situ_beta1"] = situ_beta1
     cfg["situ_beta2"] = situ_beta2
+    cfg["power_m"] = power_m
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1351,6 +1448,7 @@ def _test_grouped_gemm_glu_discrete_wrapper(
                 act_func=cfg["act_func"],
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
             )
@@ -1392,6 +1490,28 @@ def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, sf_dtype, 
         b_major="k",
         situ_beta1=situ_beta1,
         situ_beta2=situ_beta2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=9)
+def test_grouped_gemm_glu_discrete_wrapper_powlu_mxfp8(request):
+    _test_grouped_gemm_glu_discrete_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="powlu",
+        request=request,
+        b_major="k",
+        power_m=2.5,
     )
 
 

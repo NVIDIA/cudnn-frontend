@@ -247,7 +247,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             result = False
         if not (a_major == "k"):
             result = False
-        if act_func not in ["dswiglu", "dgeglu", "dsituglu"]:
+        if act_func not in ["dswiglu", "dgeglu", "dsituglu", "dpowlu"]:
             result = False
         return result
 
@@ -265,6 +265,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
         situ_beta1: float = 4.0,
+        power_m: float = 2.0,
         use_single_group_runtime_offsets: bool = False,
         deterministic: bool = False,
     ):
@@ -383,6 +384,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
 
         self.act_func = act_func
         self.situ_beta1 = float(situ_beta1)
+        self.power_m = float(power_m)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1872,6 +1874,79 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             return d1_vec, d2_vec, dprob_swiglu
 
     @cute.jit
+    def dpowlu(
+        self,
+        acc_vec: cute.Tensor,
+        gate_vec: cute.Tensor,
+        up_vec: cute.Tensor,
+        mProb: cute.Tensor,
+        beta_val: Float32,
+        square_alpha: Float32,
+        dprob_swiglu: Optional[cute.Tensor] = None,
+    ):
+        """Backward for the power-adaptive GLU epilogue."""
+        one = cutlass.Float32(1.0)
+        two = cutlass.Float32(2.0)
+        ln_two = cutlass.Float32(0.6931471805599453)
+        power_m = cutlass.Float32(self.power_m)
+        min_normal = cutlass.Float32(2.0**-126)
+        dgate_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+        dup_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+
+        for i in cutlass.range_constexpr(cute.size(acc_vec)):
+            grad = acc_vec[i] * square_alpha
+            gate = gate_vec[i].to(cutlass.Float32) * beta_val
+            up = up_vec[i].to(cutlass.Float32) * beta_val
+            positive = gate > cutlass.Float32(0.0)
+            # Keep positive subnormals away from sqrt/log/division FTZ hazards without imposing a coarse activation floor.
+            # The non-positive branch uses one so both sides of the select remain numerically valid.
+            safe_gate = cutlass.Float32(cutlass.select_(positive, fmax(gate, min_normal, nan=False), one))
+            sqrt_gate = cute.math.sqrt(safe_gate, fastmath=True)
+            denominator = one + sqrt_gate
+            exponent = power_m * cute.arch.rcp_approx(denominator)
+            # Share one approximate log2 between x**e, x**(e-1), and ln(x).
+            # Computing x**e / x is not equivalent near zero because x**e may underflow first.
+            log2_gate = cute.math.log2(safe_gate, fastmath=True)
+            power = cute.math.exp2(exponent * log2_gate, fastmath=True)
+            term_a_power = cute.math.exp2((exponent - one) * log2_gate, fastmath=True)
+            log_gate = log2_gate * ln_two
+            sigmoid = sigmoid_f32(gate, fastmath=True)
+            # Do not derive this as 1 - sigmoid: cancellation loses the small tail for large positive gates.
+            sigmoid_neg = sigmoid_f32(-gate, fastmath=True)
+            positive_value = power * sigmoid
+            negative_value = gate * sigmoid
+            value = cutlass.Float32(cutlass.select_(positive, positive_value, negative_value))
+
+            # Three-term derivative avoids the unstable power * (exponent / gate) formulation near zero.
+            exponent_grad = -power_m * cute.arch.rcp_approx(two * sqrt_gate * denominator * denominator)
+            term_a = term_a_power * exponent * sigmoid
+            term_b = positive_value * exponent_grad * log_gate
+            term_c = positive_value * sigmoid_neg
+            positive_grad = term_a + term_b + term_c
+            negative_grad = sigmoid * (one + gate * sigmoid_neg)
+            value_grad = cutlass.Float32(cutlass.select_(positive, positive_grad, negative_grad))
+
+            grad_prob = grad
+            if cutlass.const_expr(self.has_prob):
+                # Preserve the hardened Triton order: materialize grad * prob before multiplying by up or value_grad.
+                # Reassociation to (grad * up) * prob can overflow before a small router weight scales the product.
+                grad_prob = grad * mProb
+                grad_prob = cutlass.Float32(cutlass.select_(mProb == cutlass.Float32(0.0), cutlass.Float32(0.0), grad_prob))
+            grad_prob = cutlass.Float32(cutlass.select_(grad == cutlass.Float32(0.0), cutlass.Float32(0.0), grad_prob))
+            dgate = grad_prob * up * value_grad
+            dup = grad_prob * value
+            # Zero upstream/router factors dominate non-finite activation intermediates.
+            dgate_vec[i] = cutlass.Float32(cutlass.select_(grad_prob == cutlass.Float32(0.0), cutlass.Float32(0.0), dgate))
+            dup_vec[i] = cutlass.Float32(cutlass.select_(grad_prob == cutlass.Float32(0.0), cutlass.Float32(0.0), dup))
+            if cutlass.const_expr(self.generate_dprob):
+                dprob_value = grad * up * value
+                dprob_swiglu[i] = cutlass.Float32(cutlass.select_(grad == cutlass.Float32(0.0), cutlass.Float32(0.0), dprob_value))
+
+        if cutlass.const_expr(self.generate_dprob):
+            dprob_swiglu = dprob_swiglu.load()
+        return dgate_vec.load(), dup_vec.load(), dprob_swiglu
+
+    @cute.jit
     def dsituglu(
         self,
         acc_vec: cute.Tensor,
@@ -3187,6 +3262,16 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                             square_alpha,
                             situ_beta1,
                             situ_beta2,
+                            dprob_swiglu,
+                        )
+                    elif cutlass.const_expr(self.act_func == "dpowlu"):
+                        d1_vec, d2_vec, dprob_swiglu = self.dpowlu(
+                            acc_vec,
+                            ab1_vec_load,
+                            ab2_vec_load,
+                            mProb,
+                            beta_val,
+                            square_alpha,
                             dprob_swiglu,
                         )
 

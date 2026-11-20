@@ -49,6 +49,7 @@ from ..moe_kernel_helpers import (
     fmin,
     fmax,
     atomic_max_float32,
+    sigmoid_f32,
     silu_f32,
     silu_f32_geglu_scaled,
     silu_f32_scaled,
@@ -267,6 +268,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
         situ_beta1: float = 4.0,
+        power_m: float = 2.0,
         enable_bias: bool = False,
         use_single_group_runtime_offsets: bool = False,
     ):
@@ -386,7 +388,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
         self.act_func = act_func
         self.situ_beta1 = float(situ_beta1)
-        if act_func not in ["swiglu", "geglu", "situglu"]:
+        self.power_m = float(power_m)
+        if act_func not in ["swiglu", "geglu", "situglu", "powlu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
     def _setup_attributes(self):
@@ -1558,6 +1561,28 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 tCompute[i] = acc_vec_up[i] * silu_f32(acc_vec_gate[i], fastmath=True)
                 if cutlass.const_expr(self.has_prob):
                     tCompute[i] = tCompute[i] * mProb
+
+    @cute.jit
+    def powlu_act(self, tCompute: cute.Tensor, acc_vec_up: cute.Tensor, acc_vec_gate: cute.Tensor, mProb: cute.Tensor):
+        """Power-adaptive GLU epilogue."""
+        one = cutlass.Float32(1.0)
+        power_m = cutlass.Float32(self.power_m)
+        min_normal = cutlass.Float32(2.0**-126)
+        for i in cutlass.range_constexpr(cute.size(tCompute)):
+            gate = acc_vec_gate[i]
+            positive = gate > cutlass.Float32(0.0)
+            safe_gate = cutlass.Float32(cutlass.select_(positive, fmax(gate, min_normal, nan=False), one))
+            sqrt_gate = cute.math.sqrt(safe_gate, fastmath=True)
+            exponent = power_m * cute.arch.rcp_approx(one + sqrt_gate)
+            power = cute.math.pow(safe_gate, exponent, fastmath=True)
+            sigmoid = sigmoid_f32(gate, fastmath=True)
+            base = cutlass.Float32(cutlass.select_(positive, power, gate))
+            value = base * sigmoid * acc_vec_up[i]
+            if cutlass.const_expr(self.has_prob):
+                value = value * mProb
+                # A zero router weight must mask a non-finite unweighted activation.
+                value = cutlass.Float32(cutlass.select_(mProb == cutlass.Float32(0.0), cutlass.Float32(0.0), value))
+            tCompute[i] = value
 
     @cute.jit
     def situglu_act(
@@ -2770,6 +2795,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb)
                     elif cutlass.const_expr(self.act_func == "situglu"):
                         self.situglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, situ_beta1, situ_beta2)
+                    elif cutlass.const_expr(self.act_func == "powlu"):
+                        self.powlu_act(tCompute, acc_vec_up, acc_vec_gate, mProb)
 
                     #
                     # Generate amax

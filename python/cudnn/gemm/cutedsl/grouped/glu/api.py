@@ -5,7 +5,7 @@ Unified API for Grouped GEMM GLU Forward Kernel (SM100+)
 
 This module provides a single API class that supports both contiguous (dense)
 and discrete weight modes for block-scaled grouped GEMM with GLU activation
-(SwiGLU / GeGLU / SiTU-GLU) in MoE (Mixture of Experts) workloads.
+(SwiGLU / GeGLU / SiTU-GLU / PowLU) in MoE (Mixture of Experts) workloads.
 
 Dense mode
     All expert weights are packed contiguously in a 3-D tensor (N, K, L).
@@ -116,6 +116,7 @@ class GluCall:
     m_aligned: int = 256
     discrete_col_sfd: bool = False
     act_func: str = "swiglu"
+    power_m: float = 2.0
     linear_offset: Optional[float] = None
     geglu_alpha: float = 1.702
     glu_clamp_max: float = 7.0
@@ -201,6 +202,7 @@ class GroupedGemmGluSm100(APIBase):
         generate_c: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        power_m: float = 2.0,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -489,7 +491,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
         vector_f32: Use vectorized f32
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
-        act_func: Activation function ("swiglu", "geglu", or block-scaled "situglu")
+        act_func: Activation function ("swiglu", "geglu", or block-scaled "situglu"/"powlu")
         linear_offset: Linear offset applied to the up branch in the
             ``act_func == "geglu"`` activation, i.e.
             ``out = (up + linear_offset) * gate * sigmoid(geglu_alpha * gate)``
@@ -520,6 +522,9 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             the cache key.
         situ_beta2: Positive finite up-branch tanh scale for SiTU-GLU. Default
             ``25.0``. Runtime parameter, intentionally not part of the cache key.
+        power_m: Positive finite PowLU exponent numerator. Default ``2.0``.
+            Compile-time specialization and part of the cache key only when
+            ``act_func == "powlu"``.
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         current_stream: CUDA stream
 
@@ -560,6 +565,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
     discrete_col_sfd = call.discrete_col_sfd
     act_func = call.act_func
     situ_beta1 = call.situ_beta1
+    power_m = call.power_m
     use_dynamic_sched = call.use_dynamic_sched
     use_single_group_runtime_offsets = call.use_single_group_runtime_offsets
 
@@ -637,6 +643,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
     situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
+    power_m_cache_signature = float(power_m) if act_func == "powlu" else None
 
     device_type = get_device_type()
 
@@ -646,6 +653,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             weight_mode,
             act_func,
             situ_beta1_cache_signature,
+            power_m_cache_signature,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
             l if use_full_dynamic else tuple(b_tensor.shape),
@@ -691,6 +699,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             weight_mode,
             act_func,
             situ_beta1_cache_signature,
+            power_m_cache_signature,
             a_tensor.shape[1:],
             stride_order(a_tensor),
             a_tensor.dtype,
@@ -778,6 +787,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
                 situ_beta1=situ_beta1,
+                power_m=power_m,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             )
@@ -810,6 +820,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
                 situ_beta1=situ_beta1,
+                power_m=power_m,
                 b_major=b_major,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
@@ -944,8 +955,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         b_dtype=_convert_to_cutlass_data_type(call.b_dtype) if call.b_dtype is not None else None,
     )
 
-    if call.act_func not in ("swiglu", "geglu", "situglu"):
-        raise ValueError(f"act_func must be 'swiglu', 'geglu', or 'situglu', got {call.act_func}")
+    if call.act_func not in ("swiglu", "geglu", "situglu", "powlu"):
+        raise ValueError(f"act_func must be 'swiglu', 'geglu', 'situglu', or 'powlu', got {call.act_func}")
     if call.act_func == "situglu":
         if not math.isfinite(call.situ_beta1) or call.situ_beta1 <= 0.0:
             raise ValueError(f"situ_beta1 must be finite and positive, got {call.situ_beta1}")
@@ -953,6 +964,11 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
             raise ValueError(f"situ_beta2 must be finite and positive, got {call.situ_beta2}")
         if get_device_type() == "rubin":
             raise NotImplementedError("Rubin grouped GEMM GLU does not support situglu")
+    if call.act_func == "powlu":
+        if not math.isfinite(call.power_m) or call.power_m <= 0.0:
+            raise ValueError(f"power_m must be finite and positive, got {call.power_m}")
+        if get_device_type() == "rubin":
+            raise NotImplementedError("Rubin grouped GEMM GLU does not support powlu")
 
     is_dense = call.b_tensor is not None
     is_discrete = call.b_ptrs is not None
@@ -1045,7 +1061,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     if call.cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {call.cd_major}")
     if call.act_func not in ("swiglu", "geglu"):
-        raise ValueError(f"BF16 act_func must be 'swiglu' or 'geglu'; situglu is block-scaled only, got {call.act_func}")
+        raise ValueError(f"BF16 act_func must be 'swiglu' or 'geglu'; situglu and powlu are block-scaled only, got {call.act_func}")
     if normalized.c_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
         raise ValueError(f"c_dtype must be BF16, FP16, or FP32, got {normalized.c_dtype}")
     if normalized.d_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
@@ -1285,6 +1301,7 @@ def grouped_gemm_glu_wrapper_sm100(
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     *,
     scheduler_counter_tensor: Optional[torch.Tensor] = None,
+    power_m: float = 2.0,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU with metadata caching.
 
@@ -1299,6 +1316,8 @@ def grouped_gemm_glu_wrapper_sm100(
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
     """
+    if act_func == "powlu" and detect_framework(a_tensor) == "jax":
+        raise NotImplementedError("act_func='powlu' is implemented only for torch block-scaled inputs")
     if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_glu_jax_sm100
@@ -1385,6 +1404,7 @@ def grouped_gemm_glu_wrapper_sm100(
         glu_clamp_min,
         situ_beta1,
         situ_beta2,
+        float(power_m) if act_func == "powlu" else None,
         use_dynamic_sched,
         use_single_group_runtime_offsets,
         generate_c,
@@ -1488,6 +1508,7 @@ def grouped_gemm_glu_wrapper_sm100(
         glu_clamp_min=glu_clamp_min,
         situ_beta1=situ_beta1,
         situ_beta2=situ_beta2,
+        power_m=power_m,
         use_dynamic_sched=use_dynamic_sched,
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
