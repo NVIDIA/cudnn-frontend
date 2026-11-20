@@ -153,10 +153,11 @@ class SdpaDenseBinder {
    public:
     explicit SdpaDenseBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(py::object(spec.attr("template")))) {
-        auto integer     = [&](const char *name) { return py::cast<int64_t>(spec.attr(name)); };
-        auto flag        = [&](const char *name) { return py::cast<bool>(spec.attr(name)); };
-        const auto quant = spec.attr("quant");
-        quantized_       = !quant.is_none();
+        auto integer        = [&](const char *name) { return py::cast<int64_t>(spec.attr(name)); };
+        auto flag           = [&](const char *name) { return py::cast<bool>(spec.attr(name)); };
+        const auto quant    = spec.attr("quant");
+        quantized_          = !quant.is_none();
+        bool per_tensor_fp8 = false;
         if (quantized_) {
             const auto sf_count = py::len(py::object(quant.attr("sf_sizes")));
             if (sf_count != 0 && sf_count != 2 && sf_count != 3)
@@ -164,6 +165,7 @@ class SdpaDenseBinder {
             pv_bf16_         = sf_count == 2;
             const auto block = quant.attr("block_output");
             block_output_    = !block.is_none();
+            per_tensor_fp8   = sf_count == 0 && !block_output_;
             if (block_output_) {
                 block_bytes_     = py::cast<int64_t>(block.attr("nbytes"));
                 output_pack_     = py::cast<int64_t>(block.attr("pack"));
@@ -182,9 +184,10 @@ class SdpaDenseBinder {
         // Admitted split plans produce sink-free partials; combine folds it once.
         const auto dq = integer("d_qk"), dv = integer("d_v");
         const bool native_d576 =
-            !quantized_ && dq > 512 && dq <= 576 && dv > 256 && dv <= 512 && dq % 8 == 0 && dv % 8 == 0;
+            (!quantized_ && dq > 512 && dq <= 576 && dv > 256 && dv <= 512 && dq % 8 == 0 && dv % 8 == 0) ||
+            (per_tensor_fp8 && dq == 576 && dv == 512);
         if (!native_d576 && (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8))
-            invalid("native dense binding requires a supported half attention head dimension pair");
+            invalid("native dense binding requires a supported attention head dimension pair");
         fp32_partial_  = flag("fp32_partial");
         ragged_        = flag("ragged");
         ragged_q_lens_ = py::hasattr(spec, "ragged_q_lens") ? integer("ragged_q_lens") : 0;
@@ -1018,6 +1021,7 @@ init_sdpa_dense_binding(py::module_ &m) {
         .def_prop_ro_static("supports_combine_q_lens", [](py::object) { return true; })
         .def_prop_ro_static("supports_ragged_q_lens", [](py::object) { return true; })
         .def_prop_ro_static("supports_quantized_split_sink", [](py::object) { return true; })
+        .def_prop_ro_static("supports_fp8_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_d576_envelope", [](py::object) { return true; })
         .def_prop_ro_static("supports_fused_split", [](py::object) { return true; })

@@ -83,6 +83,11 @@ delegates these exact cells and retains smaller flavors and head envelopes.
 The explicit row reports TILE_M=128 and physical TILE_CGA_M=4, with a fixed
 two-CTA MMA group. Its kernel, configuration, contract and host entry live in
 `sm100/d512_fp8_role_split/`; half and block-scaled kernels keep separate owners.
+Dense queries also support exact D576/V512 for absorbed MLA, including FP8 K/V
+views over one 576-element record. The 512-column V prefix retains the record
+stride in dense and paged storage. The D576 variant uses two score stages and
+requires the matching native dense binder. Paged and dense THD at D576 remain
+outside its domain.
 Dense Q over dense/paged KV retains masks, sinks, whole-group packing and split-KV;
 nonpaged THD retains its existing unsplit contract. Paged THD and block-scaled
 output remain declined. Central selection preserves the old candidate order,
