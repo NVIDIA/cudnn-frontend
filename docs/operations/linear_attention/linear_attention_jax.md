@@ -37,7 +37,8 @@ array: pass the returned state into the next call to continue a sequence.
 
 GDN and GDP use `(q, k, v, g, beta, cu_seqlens, **options)`; GDN2 adds `w`
 between `beta` and `cu_seqlens`. GDP requires `num_householder=n` as a keyword.
-`HO = max(HQ, HV)`; supported grouped heads expand Q/K/V onto the output heads.
+`HO = max(HQ, HV)`. Each Q, K, and V head count must divide `HO` with a
+ratio of 1, 2, 4, or 8, and `HK` must equal `HQ` or `HV`.
 The FROST delta-rule kernels support `K` and `V` of 64 or 128.
 
 | Tensor | GDN | GDN2 | GDP |
@@ -118,7 +119,7 @@ output, final = cudnn.jax.mamba2(
 ```
 
 `x[T,H,64]`, `B[T,G,128]`, and `C[T,G,128]` share BF16 or FP16 dtype;
-`H` is divisible by `G`. `dt[T,H]` holds raw step logits and `A[H]` holds
+`H / G` must be 1, 2, 4, or 8. `dt[T,H]` holds raw step logits and `A[H]` holds
 negative decay rates. Optional `D[H]` or `D[H,64]` supplies the skip weight,
 `dt_bias[H]` supplies the step bias, and `z[T,H,64]` supplies the SiLU output
 gate. `dt`, A, D, and step bias accept FP32/BF16/FP16; z matches x.
@@ -157,11 +158,12 @@ derivatives, `vmap`, and distributed array partitioning are outside this API.
 
 ## Placement and qualification
 
-All operands of a call must reside on one supported GPU. Other GPUs may remain
-visible. For traced calls, select the intended supported device with
-`jax.default_device`; the binding pins the CuTeDSL compiler architecture and
-reads tuning properties from that device. Separate local calls do not require
-a single-process job. The initial public target set is SM100/SM103.
+All operands of a call must reside on one supported GPU. For traced calls
+(including closures that capture every operand), set `jax.default_device` to
+the GPU that JAX will execute on. The binding uses it for CuTeDSL compilation
+and tuning. Without an explicit default, tracing uses JAX's first local
+device and rejects hosts with both SM100 and SM103 visible. Separate local calls
+do not require a single-process job.
 
 `batch_invariant=True` requests the existing per-sequence scheduling mode for
 outputs, recurrent states, and token/state gradients. Shared parameter

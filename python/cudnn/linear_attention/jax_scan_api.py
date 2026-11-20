@@ -314,19 +314,19 @@ def mamba2(
 
 def gated_delta_net_bwd(residual, doutput, *, d_final_state=None):
     """Return DeltaGradients; absent inputs have None gradients."""
-    return _backward(residual, doutput, d_final_state)
+    return _backward(residual, doutput, d_final_state, operation=_Operation.GDN)
 
 
 def gated_delta_net_v2_bwd(residual, doutput, *, d_final_state=None):
     """Return DeltaGradients; absent inputs have None gradients."""
-    return _backward(residual, doutput, d_final_state)
+    return _backward(residual, doutput, d_final_state, operation=_Operation.GDN2)
 
 
 def gated_delta_product_bwd(residual, doutput, *, d_final_state=None):
     """Return DeltaGradients; absent inputs have None gradients."""
-    return _backward(residual, doutput, d_final_state)
+    return _backward(residual, doutput, d_final_state, operation=_Operation.GDP)
 
 
 def mamba2_bwd(residual, doutput, *, d_final_state=None):
     """Return Mamba2Gradients; absent inputs have None gradients."""
-    return _backward(residual, doutput, d_final_state)
+    return _backward(residual, doutput, d_final_state, operation=_Operation.MAMBA2)

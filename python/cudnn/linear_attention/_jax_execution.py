@@ -156,18 +156,39 @@ def _validate(primals, config):
 
 
 def _device(values):
+    from jax.extend import core as jax_extend_core
+
+    from cudnn.frost.device import compute_capability
+
     placed = {device for value in values if isinstance(value, jax.Array) and not isinstance(value, jax.core.Tracer) for device in value.devices()}
     if len(placed) > 1:
         raise ValueError("linear-attention arrays must be on the same GPU")
-    target = next(iter(placed)) if placed else (jax.config.jax_default_device or jax.local_devices()[0])
+
+    # JIT may place a call elsewhere even when every operand is a captured array.
+    trace_state = getattr(jax_extend_core, "get_opaque_trace_state", None)
+    if trace_state is None:  # JAX 0.9.x exports this through jax.core.
+        trace_state = jax.core.get_opaque_trace_state
+    current_trace = trace_state()
+    with jax.core.eval_context():
+        tracing = current_trace != trace_state()
+
+    default = jax.config.jax_default_device
+    target = default if tracing else next(iter(placed), default)
+    candidates = ()
+    if target is None:
+        candidates = jax.local_devices()
+        target = candidates[0]
     if target.platform != "gpu":
         raise NotImplementedError(f"JAX linear attention requires a CUDA GPU; got {target.platform}")
-    from cudnn.frost.device import compute_capability
-
     device = target.local_hardware_id
     capability = compute_capability(device)
-    if capability not in ((10, 0), (10, 3)):
+    supported = {(10, 0), (10, 3)}
+    if capability not in supported:
         raise NotImplementedError(f"JAX linear attention requires SM100 or SM103; got {capability}")
+    if tracing and candidates:
+        visible = {compute_capability(other.local_hardware_id) for other in candidates if other.platform == "gpu"}
+        if len(visible & supported) > 1:
+            raise ValueError("JAX linear attention cannot choose between SM100 and SM103 under tracing; select the execution GPU with jax.default_device")
     return device, f"sm_{capability[0]}{capability[1]}a"
 
 
@@ -259,8 +280,16 @@ def _forward(primals, config):
     return results["O"], results.get("final_state"), residual
 
 
-def _backward(residual, doutput, d_final_state):
+def _backward(residual: ScanResidual, doutput, d_final_state, *, operation: _Operation):
+    if not isinstance(residual, ScanResidual):
+        raise TypeError("residual must come from the matching forward operation")
     config = residual.config
+    if config.operation != operation:
+        raise ValueError(f"{operation.value} backward requires a matching forward residual; got {config.operation.value}")
+    if not isinstance(doutput, (jax.Array, jax.core.Tracer)):
+        raise TypeError("doutput must be a JAX array")
+    if d_final_state is not None and not isinstance(d_final_state, (jax.Array, jax.core.Tracer)):
+        raise TypeError("d_final_state must be a JAX array")
     values = _ports(residual.primals, config)
     q, v, cu = (values[name] for name in ("q", "v", "cu_seqlens"))
     shape = (q.shape[0], max(q.shape[1], v.shape[1]), v.shape[-1])
@@ -297,7 +326,7 @@ def _vjp_forward(primals, config):
 
 
 def _vjp_backward(config, residual, cotangents):
-    grads = _backward(residual, cotangents[0], cotangents[1])
+    grads = _backward(residual, *cotangents, operation=config.operation)
     if config.operation == _Operation.MAMBA2:
         return ((*grads[:5], None, grads.d_initial_state, grads.dd, grads.d_dt_bias, grads.dz),)
     return ((*grads[:6], None, *grads[6:]),)
