@@ -24,11 +24,19 @@ Use the current NVIDIA guides and their platform-specific child pages:
 - [Frontend installation](https://docs.nvidia.com/cudnn/installation/frontend)
 - [Supported platforms and versions](https://docs.nvidia.com/cudnn/latest/reference/support-matrix)
 
-Append `.md` to a documentation page URL to read its Markdown. Read the selected
-checkout's `pyproject.toml`, `CMakeLists.txt`, and `cmake/cuDNN.cmake` before
-forming commands. For a released wheel, check that release's metadata instead
-of applying `develop` dependencies to it. Prefer repo metadata over stale guide
-examples for Python minimums, dependencies, and test paths.
+Append `.md` to a documentation page URL to read its Markdown. For a source
+install, read the selected checkout's
+[pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/develop/pyproject.toml),
+[CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/develop/CMakeLists.txt),
+and [cuDNN CMake discovery](https://github.com/NVIDIA/cudnn-frontend/blob/develop/cmake/cuDNN.cmake)
+before forming commands. These paths belong to the cuDNN Frontend source repo,
+not to this installed skill. Without a checkout, read them from the source
+repo at the selected tag or commit; the links use `develop` for navigation.
+Resolve a selected branch or tag once and use the same commit for all reads.
+For a released wheel, inspect that release's package metadata instead; a wheel
+install does not require cloning the source repo. Do not apply `develop`
+dependencies to a release. If metadata is unavailable, state the gap rather
+than guessing version bounds, extras, or build requirements.
 
 ## Find cuDNN before installing it
 
@@ -37,22 +45,32 @@ is `nvidia-cudnn-frontend`, imported as `cudnn`. Installing the frontend does no
 prove that a usable backend is present.
 
 1. Inspect installed package names, versions, requirements, and file locations
-   with the target interpreter's `importlib.metadata` or `python -m pip`.
+   with the target interpreter's
+   [package metadata API](https://docs.python.org/3/library/importlib.metadata.html)
+   or `python -m pip`.
    Look for `nvidia-cudnn-cu12`, `nvidia-cudnn-cu13`, JIT variants, `torch`,
    `jax`, `jaxlib`, and CUDA-specific JAX plugins. Check Conda packages if used.
 2. GPU builds of PyTorch and JAX require cuDNN and may already supply it through
    bundled libraries or package dependencies. CPU-only builds do not establish
    cuDNN availability. In separate processes, check installed frameworks:
-   - PyTorch: `torch.__version__`, `torch.version.cuda`,
-     `torch.cuda.is_available()`, and `torch.backends.cudnn.version()`.
+   - PyTorch: check the framework, CUDA, device, and backend versions:
+
+     ```python
+     import torch
+
+     print(torch.__version__, torch.version.cuda)
+     print(torch.cuda.is_available(), torch.backends.cudnn.version())
+     ```
+
    - JAX: package/plugin requirements and `jax.devices()`; confirm a CUDA device.
      A package listing or CPU device alone does not prove cuDNN can load.
    Capture import or loader errors; do not interpret them as an absent package.
 3. NVIDIA NGC framework containers often include cuDNN. Check the image tag,
    release notes, `/etc/nvidia-container-release` if present, package records,
    and actual libraries. Do not reinstall solely because pip has no record.
-4. For native installs, check package-manager records, `cudnn_version.h`, and
-   `libcudnn.so*` on Linux or `cudnn64_9.dll` on Windows. Inspect `CUDNN_PATH`,
+4. For native installs, check package-manager records and installed files:
+   cudnn_version.h, libcudnn shared libraries on Linux, or cudnn64_9.dll on
+   Windows. Inspect `CUDNN_PATH`,
    `CUDAToolkit_ROOT`, `LD_LIBRARY_PATH`, and Windows `PATH` as applicable.
    C++ and source builds need headers and development libraries as well as
    runtime libraries. Framework runtime availability alone is insufficient.
@@ -95,7 +113,8 @@ for the detected platform. Follow repository setup and package names from the
 current guide. A pip backend needs explicit include/library paths for native
 use. On Windows, ensure the selected cuDNN `bin` directory is on `PATH`.
 Use `CUDNN_PATH` and `CUDAToolkit_ROOT` for nondefault locations; verify their
-layout against `cmake/cuDNN.cmake`. Do not copy libraries into unrelated CUDA
+layout against the selected source revision's CMake discovery file linked above.
+Do not copy libraries into unrelated CUDA
 or framework directories. For NGC, prefer a compatible image tag over replacing
 its framework-managed stack; explain any requested in-container changes.
 
@@ -111,15 +130,15 @@ Add `--upgrade` if the user selected the latest compatible frontend. For a
 source install, run `python -m pip install -e .` from the selected checkout,
 after checking its build requirements and CUDA/cuDNN development files.
 
-Read these `pyproject.toml` sections rather than installing every group:
+Read these project metadata sections rather than installing every group:
 
 | Section | Use |
 | --- | --- |
-| `project.requires-python` | Enforce the selected revision's Python minimum. |
-| `project.dependencies` | Base runtime dependencies; pip installs them automatically. |
-| `project.optional-dependencies` | Add only extras needed for the requested APIs. |
-| `dependency-groups` | Repo development and framework tools; not wheel extras. |
-| `build-system.requires` | Source build tools; normally supplied by build isolation. |
+| project.requires-python | Enforce the selected revision's Python minimum. |
+| project.dependencies | Base runtime dependencies; pip installs them automatically. |
+| project.optional-dependencies | Add only extras needed for the requested APIs. |
+| dependency-groups | Repo development and framework tools; not wheel extras. |
+| build-system.requires | Source build tools; normally supplied by build isolation. |
 
 At the time this skill was added, the base dependencies are
 `nvidia-cutlass-dsl[cu13]` and `apache-tvm-ffi`, with platform markers. Extras are
@@ -201,8 +220,9 @@ path in these processes too. A successful import alone is not a GPU execution te
 
 For C++, compile and run an existing frontend GPU sample or the backend guide's
 `mnistCUDNN` sample. Report compile-only checks separately from GPU execution.
-Use the selected revision's `test/AGENTS.md` for further repo tests; do not copy
-obsolete test paths from the web guide.
+Use the selected source revision's
+[test guide](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/AGENTS.md)
+for further repo tests; do not copy obsolete test paths from the web guide.
 
 Report the selected environment, frontend/backend versions, library paths,
 installed extras/groups, changes made, and checks passed or unavailable.

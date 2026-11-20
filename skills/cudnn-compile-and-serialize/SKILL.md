@@ -11,17 +11,28 @@ requests, edit the target code and verify it; do not stop with an outline.
 
 ## Read the matching source
 
-Read these files from the user's selected revision before coding:
+Use the user's cuDNN Frontend checkout and selected revision. Source paths are
+relative to that checkout, not to this installed skill. If no checkout is
+available, read the files from
+[NVIDIA/cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend).
+The links below use `develop` for navigation; replace it with the selected tag
+or commit before reading. Resolve a branch or tag to one commit and use that
+commit for all source reads. Do not assume the installed skill is inside the
+source repo. If the source cannot be read, report that limit before giving
+revision-specific code or compatibility claims.
 
-- [Parallel compilation](../../samples/cpp/misc/parallel_compilation.cpp)
-- [Serialization](../../samples/cpp/misc/serialization.cpp)
-- [Deviceless compilation](../../samples/cpp/misc/deviceless_aot_compilation.cpp)
-- [Deviceless workflow](../../docs/utilities/deviceless-ahead-of-time-compilation.md)
-- [Graph APIs](../../include/cudnn_frontend/graph_interface.h) and
-  [plan implementation](../../include/cudnn_frontend/plans.h)
+Read these files at that revision before coding:
 
-Check the applicable `AGENTS.md` before editing code. Use current signatures and
-version guards; samples illustrate a workflow, not a production error policy.
+- [Parallel compilation](https://github.com/NVIDIA/cudnn-frontend/blob/develop/samples/cpp/misc/parallel_compilation.cpp)
+- [Serialization](https://github.com/NVIDIA/cudnn-frontend/blob/develop/samples/cpp/misc/serialization.cpp)
+- [Deviceless compilation](https://github.com/NVIDIA/cudnn-frontend/blob/develop/samples/cpp/misc/deviceless_aot_compilation.cpp)
+- [Deviceless workflow](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/utilities/deviceless-ahead-of-time-compilation.md)
+- [Graph APIs](https://github.com/NVIDIA/cudnn-frontend/blob/develop/include/cudnn_frontend/graph_interface.h) and
+  [plan implementation](https://github.com/NVIDIA/cudnn-frontend/blob/develop/include/cudnn_frontend/plans.h)
+
+Check the target repo's contributor instructions before editing code. Use
+current signatures and version guards; samples illustrate a workflow, not a
+production error policy.
 
 Establish the graph operations, dimensions, strides, datatypes, tensor UIDs,
 target GPU, compiled/runtime cuDNN versions, and workspace limit from the code.
@@ -74,9 +85,9 @@ another valid candidate remains; a failure of every candidate must be reported.
 ## Compile in parallel without sharing mutable graph state
 
 The current sample launches threads calling `build_plan_at_index(i)` on one
-graph. Inspect the implementation before adopting this pattern: at the revision
-used to write this skill, each build writes the same plain `plans.candidate`
-field. Do not treat the sample as a thread-safety guarantee.
+graph. Inspect the implementation before adopting this pattern: each build can
+write the same candidate field in the graph's plan state. Do not treat the
+sample as a thread-safety guarantee.
 
 The `do_multithreaded_builds` argument also exists in the API, but the current
 plan implementation rejects `true`. Do not enable it merely because it compiles.
@@ -218,6 +229,8 @@ when a caller-owned byte vector or file satisfies the request.
   narrowly enable it for the requested measurement; do not report a skip as a pass.
 
 Run focused pre-commit checks on changed files and trim redundant comments in
-the code you edit. Apply the repo's determinism workflow when the conversion
-changes numerical APIs, kernels, datatypes, or supported GPU targets. Report
-commands, actual results, version/device limits, and unavailable coverage.
+the code you edit. When a conversion changes numerical APIs, kernels, datatypes,
+or supported GPU targets, verify replay and batch invariance in both supported
+directions and update the selected source revision's
+[determinism support page](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/determinism.md).
+Report commands, actual results, version/device limits, and unavailable coverage.
