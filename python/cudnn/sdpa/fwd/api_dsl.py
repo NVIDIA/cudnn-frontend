@@ -3562,15 +3562,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "softmax_scale_prefolded is not wired in the paged-KV / packed-split THD / single-CTA THD / shared dense D128 half kernel bodies (they apply the scale in-kernel)"
             )
         if self.paged:
-            # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
-            # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
-            # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d64/d128/d256/d512 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 FP8 flavor, the d512
-            # 2x2-datapath twin) backstops
-            # with a module-scope guard on paged_kv, and these declines keep that
-            # guard unreachable from here.  On cc 10.7: half pools serve THD queries
+            # PAGED_KV requires a page loader in the selected kernel. Check the
+            # architecture and format here before loading the template. Keep these
+            # checks in sync with config_sm100._PAGED_KV_FLAVORS and each engine's paged_d_shapes.
+            # On cc 10.7: half pools serve THD queries
             # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader). Native per-tensor FP8 D512 serves
             # dense Q over pools; other FP8 flavors retain their paging decline.
@@ -3601,8 +3596,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 / d512 / d576 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d192 / d256 / d512 / d576 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),
