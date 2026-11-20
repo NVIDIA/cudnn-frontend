@@ -58,6 +58,9 @@ ARGMAX = "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<BFloat16, 
 SOFTMAX = "void (anonymous namespace)::softmax_warp_forward<double, double, double, 3, false, false, 32>(double*, double const*, int, int, int, ...)"
 ARANGE = "void (anonymous namespace)::elementwise_kernel_with_index<int, at::native::arange_cuda_out(...)::{lambda(long)#1}>(int, ...)"
 NVJET = "nvjet_sm100_tst_64x8_64x16_2x1_v_bz_splitK_TNT"
+# two kernels a library launches for a row of the stack native: a cuBLASLt kernel of 8-bit operands, and the library's 4-bit multiply
+NVJET_FP8 = "nvjet_sm100_qqtst_64x8_128x16_4x1_v_bz_TNT"
+FI_MM_FP4 = "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitKGemmKernel_object_at__TiledMMA_0"
 HOST_READ = "Memcpy DtoH (Device -> Pageable)"
 NO_PROFILER = "this PyTorch build records no kernel activity"
 
@@ -1291,6 +1294,7 @@ def _records(sites, start=0.0, us=4.3, period=0.01, also=()):
     from model_samples.census import FAMILIES, Launch
 
     names = {"embedding_gather": GATHER, "gdn_decode_fused": SYMBOL, "pytorch": ELEMENTWISE, "cublas": NVJET}
+    names.update({"cublaslt_fp8_gemm": NVJET_FP8, "fi_mm_fp4": FI_MM_FP4})  # the exact kernels of the rows a library serves
     names.update({kernel: pattern.pattern.lstrip("^") + "Cfg" for kernel, pattern in FAMILIES if pattern.pattern.startswith("^cudnn_kernel_frost_")})
     records = []
 
@@ -1331,17 +1335,17 @@ def _site(block, layer=-1, *kernels):
     return Site(block, layer, tuple(family.get(name) or Kernel(name, "cuDNN FE", "exact", launches=1) for name in kernels), entry=f"entry of {block}")
 
 
-def _native(monkeypatch):
-    """``(sites, claim)`` of a step of the 64-layer model on the stack ``native``, compute capability 10.0 with 148 SMs,
-    planned on stated facts: the family's own wiring, each call with the census entries of the row that serves it."""
+def _planned(monkeypatch, stack="native"):
+    """``(sites, claim)`` of a step of the 64-layer model on ``stack``, compute capability 10.0 with 148 SMs, planned on
+    stated facts: the family's own wiring, each call with the census entries of the row that serves it."""
     from model_samples import Session, TextIO, blocks, census
     from model_samples.qwen_dense import QwenDense
 
     monkeypatch.setattr(census, "installed_versions", lambda packages: {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"})
     model = QwenDense()
-    session = Session(model, TextIO.synthetic(272), stack="native", device="cpu", capacity=8)
+    session = Session(model, TextIO.synthetic(272), stack=stack, device="cpu", capacity=8)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
-    session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, "native", model=model, options={"device": "cpu"})
+    session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, stack, model=model, options={"device": "cpu"})
     parts = [(name, layer, at, session.plan.at(name, at)[1]) for (name, layer), at in zip(model.wiring(), census.call_sites(model))]
     return [census.Site(name, layer, tuple(block.kernels), block.entry, site=at) for name, layer, at, block in parts], session.claim()
 
@@ -1527,7 +1531,8 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
 def test_rows_by_wiring_position_not_by_name(monkeypatch):
     """A launch record gets its row from its place in the wiring, as the kernel check finds it, never from its kernel's
     name: two blocks that launch the same kernel are two rows, and a library kernel inside a fallback chain is that
-    chain's row wherever else its name is launched.  On the family's own plan the exact rows hold the planned launches."""
+    chain's row wherever else its name is launched.  On the family's own plans the exact rows hold the planned launches,
+    and the row of a block a library serves is named by the library's entry and holds the launches of its kernel."""
     from model_samples import census, perf
 
     sites = [_site("first", 0, "gate_quant"), _site("chain", 0, "pytorch", "cublas"), _site("second", 0, "gate_quant"), _site("tail", -1, "cublas")]
@@ -1558,16 +1563,62 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     ]
     pair = perf.kernel_table(*_walked(twice, [_records(twice)]))["rows"][1]
     assert (pair["launches_per_step"], pair["planned_launches_per_step"], pair["blocks"][0]["calls_per_step"]) == (3, 3, 2), "calls x launches per call"
-    # a block that launches its exact kernel and a chain of its own: the kernel is its exact row, the chain's records the row of the gap they stand in
+    # a block that launches its exact kernel and a chain of its own: the kernel is its exact row; the chain's records are the row of the gap
+    # they stand in, which says what it holds -- no block of it is on a fallback entry -- and prints 0 where nothing was launched there
     mixed = [_site("x", 0, "gate_quant"), _site("both", 0, "swiglu_fp4", "pytorch"), _site("y", 0, "gate_quant")]
     held = perf.kernel_table(*_walked(mixed, [_records(mixed)]))["rows"]
-    assert [(row["label"], row["launches_per_step"]) for row in held] == [("x", 1), ("both", 1), ("y", 1), ("fallback: both", 2), ("host read", 1)]
-    # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches
-    sites, claim = _native(monkeypatch)
+    assert [(row["label"], row["relation"], row["launches_per_step"]) for row in held] == [
+        ("x", "exact", 1),
+        ("both", "exact", 1),
+        ("y", "exact", 1),
+        ("beside its kernel: both", "beside", 2),
+        ("host read", "read", 1),
+    ]
+    alone = [record for record in _records(mixed) if record.name not in (ELEMENTWISE, COPY_IN)]  # the chain launched nothing in this step
+    quiet = perf.kernel_table(*_walked(mixed, [alone]))
+    assert [quiet["rows"][3][key] for key in ("label", "launches_per_step", "ms_per_step", "share_percent", "us_per_launch_added")] == [
+        "beside its kernel: both",
+        0,
+        0.0,
+        0.0,
+        None,
+    ]
+    assert perf._kernel_lines(quiet, "")[6] == f"  {'beside its kernel: both':<58}{0:>9}{'--':>11}{0.0:>9.3f}{'0.0 %':>9}", "a row of the plan, printed"
+    # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches; the row of a block
+    # a library serves carries the library's entry as the plan names it, and holds the launches of the library's kernel
+    sites, claim = _planned(monkeypatch)
     traced, busy = _walked(sites, [_records(sites)], claim)
     rows = perf.kernel_table(traced, busy)["rows"]
-    exact = [(row["label"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows if row["relation"] == "exact"]
+    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:9]]
     assert exact == [
+        ("embedding", "exact", 1, 1),
+        ("add_norm_quantize", "exact", 129, 129),
+        ("projection.fp8.in", "exact", 64, 64),
+        ("linear_attention.step", "exact", 48, 48),
+        ("flashinfer.gemm.bmm_fp8: projection.fp8.out", "library", 64, 64),
+        ("mlp.gate_up", "exact", 64, 64),
+        ("flashinfer.gemm.mm_fp4: mlp.down", "library", 64, 64),
+        ("attention.gate_quantize", "exact", 16, 16),
+        ("torch_ref.quantize + flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
+    ]
+    assert not [row["label"] for row in rows[9:] if row["relation"] in ("exact", "library")] and all(len(label) <= perf.LABEL for label, *_ in exact)
+    three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
+    numbers = claim.numbers()
+    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 178 + 273 + 0, three
+    assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 1, "one launch of the library per call of its three blocks"
+    assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
+    assert rows[4]["blocks"] == [{"block": "projection.fp8.out", "calls_per_step": 64, "entry": "flashinfer.gemm.bmm_fp8", "identity": "target"}]
+    # the file says which kernel the library launched for its row, by the name the profiler gave it, and how often in a step
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[4]["launch_shapes"]] == [(NVJET_FP8, 64)]
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[8]["launch_shapes"][0]["launches"] == 1
+    printed = perf._kernel_lines(perf.kernel_table(traced, busy), "")
+    assert printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'9.7 %':>9}", "one kernel per launch: its time per launch"
+    # the stack fe-entries: the cuDNN Frontend rows of native and no library -- no row of that kind, and the exact rows it had before
+    sites, claim = _planned(monkeypatch, "fe-entries")
+    traced, busy = _walked(sites, [_records(sites)], claim)
+    rows = perf.kernel_table(traced, busy)["rows"]
+    assert not [row["label"] for row in rows if row["relation"] in ("library", "beside")]
+    assert [(row["label"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows if row["relation"] == "exact"] == [
         ("embedding", 1, 1),
         ("add_norm_quantize", 129, 129),
         ("projection.fp8.in", 64, 64),
@@ -1575,9 +1626,7 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("mlp.gate_up", 64, 64),
         ("attention.gate_quantize", 16, 16),
     ]
-    three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
-    assert sum(planned for _, _, planned in exact) == traced.result.exact == 49 + 273 + 0, three
-    assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
+    assert traced.result.exact == 49 + 273 + 0, three
     assert rows[-1]["label"] == "host read" and rows[-1]["launches_per_step"] == 1 and rows[-1]["blocks"] == []
     _defines("kernel_launches", "the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median per step.")
     _corresponds("kernel_launches", "The kernel census of a traced serving step.")
@@ -1587,12 +1636,16 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     )
     _says("area", "A row is a block, found by its place in the wiring, as the kernel check finds it, never by a kernel's name")
     _says("guide", "A row of the per-kernel table is found by its place in the wiring, never by a kernel's name,")
+    _says("area", "the row of a block a library serves carries the entry in front, as the plan names it (`flashinfer.gemm.mm_fp4: mlp.down`),")
+    _says("area", "and holds the launches of the library's kernel, found by their place in the wiring like every exact kernel;")
+    _says("guide", "The row of a block a library serves names the library's entry, as the plan does, never the block alone and never a fallback;")
 
 
 def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     """The records between two exact kernels belong to the blocks the wiring has there on fallback or host entries: such
     blocks are one row together and the row says so; the same blocks in another layer are the same row.  A row of a
-    stack that declares a target kernel set says ``not yet`` where the census says so of its block."""
+    stack that declares a target kernel set says ``not yet`` where the census says so of its block, and what a block
+    launches beside a kernel of its own is a row that says so: no block of it is on a fallback entry."""
     from model_samples import census, perf
 
     sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch"), _site("g", 0, "pytorch", "cublas"), _site("y", 0, "swiglu_fp4"), _site("f", 1, "pytorch")]
@@ -1623,7 +1676,8 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     assert (
         lines[7] == f"  {'host path: choice':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'5.6 %':>9}" and lines[8].startswith("  host read   ") and " 4.30 " in lines[8]
     )
-    _says("area", "the median over the row's launches; not printed for a row of fallback or host blocks, a chain of many kernels.")
+    _says("area", "the median over the row's launches; not printed for a row of fallback or host blocks nor for one of launches beside a kernel,")
+    _says("area", "chains of many kernels.")
     # with the identities a census states for the calls: a declared stand-in says so, a block the census calls not yet says so
     relations = ["stand-in", "not yet", "not yet", "target", "not yet", "stand-in", "not yet", "not yet", "target", "host"]
     stated = census.Claim("a census", "plain", "a device", 1, identities=[census.Identity(relation, reason="a chain") for relation in relations])
@@ -1637,8 +1691,30 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     wide = perf.kernel_table(*_walked(many, [_records(many)]))["rows"][1]
     assert wide["label"] == "fallback: a_block_with_a_long_name_0 + 3 more (one row)" and len(wide["blocks"]) == 4 and len(wide["label"]) <= perf.LABEL
     _says("area", "a list of blocks wider than the column is shortened to its first block and `+ N more`.")
-    # the family's plan: the attention preparation and the attention core of a layer have no exact kernel between them
-    sites, claim = _native(monkeypatch)
+    # the family's plan: the attention preparation and the attention core of a layer have no exact kernel between them.  On the stack native
+    # three blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
+    # out-projection, the reference quantiser in front of the output head's multiply -- is the row of its place in the wiring, and says so
+    sites, claim = _planned(monkeypatch)
+    table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
+    rows = table["rows"]
+    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[9:]]
+    assert behind == [
+        ("beside its kernel: projection.fp8.out", "beside", [64]),
+        ("not yet: attention.prepare + attention.core (one row)", "fallback", [16, 16]),
+        ("beside its kernel: output_head", "beside", [1]),
+        ("beside its kernel: output_head + token_choice (one row)", "beside", [1, 1]),
+        ("host read", "read", []),
+    ]
+    assert not [label for label, *_ in behind if label.startswith("fallback: ")], "no block of this plan is without a stated identity"
+    assert rows[10]["blocks"][0]["identity"].startswith("not yet (") and rows[12]["blocks"] == [
+        {"block": "output_head", "calls_per_step": 1, "entry": "torch_ref.quantize + flashinfer.gemm.mm_fp4", "identity": "target"},
+        {"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax", "identity": "host path, not compared"},
+    ]
+    printed = perf._kernel_lines(table, "")
+    assert printed[14] == f"  {'beside its kernel: output_head':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'0.2 %':>9}", "no time per launch: a chain"
+    assert sum(row["launches_per_step"] for row in rows) == len(_records(sites)), "the rows hold every record of the step, the library's among them"
+    # the stack fe-entries: those three blocks are on their fallback rows there, and the census says `not yet` of them
+    sites, claim = _planned(monkeypatch, "fe-entries")
     rows = perf.kernel_table(*_walked(sites, [_records(sites)], claim))["rows"]
     behind = [(row["label"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows if row["relation"] != "exact"]
     assert behind == [
@@ -1654,6 +1730,10 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
         "entry": "torch.argmax",
         "identity": "host path, not compared",
     }
+    _says("area", "what a block's call launches beside a kernel of its own -- the reference quantiser in front of the output head's multiply,")
+    _says("area", "a further launch of a library's choice -- is the row of its place in the wiring, marked `beside its kernel:` and shared with")
+    _says("area", "whatever else the wiring has there (the records do not tell them apart), and it prints 0 where nothing was launched;")
+    _says("guide", "what a block launches beside a kernel of its own is the row of its place in the wiring and says so.")
     _says("area", "The report file holds every block of every row, with its entry and the identity the census states for it.")
     _says("area", "the blocks served by fallback or host entries that no exact kernel separates share one row, and the row says so (`one row`)")
 
@@ -1854,7 +1934,8 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     fields = "label relation blocks launches_per_step planned_launches_per_step kernels_per_step copies_per_step us_per_launch_added us_per_launch_recorded"
     assert all(list(row) == [*fields.split(), "ms_per_step", "ms_per_step_mean", "share_percent", "launch_shapes"] for row in data["per_kernel"]["rows"])
     _says("area", "`per_kernel` (every row of the table: its blocks, its launches against the planned ones, the added and the recorded time of a launch,")
-    _says("area", "its time per step as median and as mean, its share, the launch shapes of an exact row),")
+    _says("area", "its time per step as median and as mean, its share, the launch shapes of an exact row and of a library's row, there with the")
+    _says("area", "name of the kernel the library launched),")
     # what the GPU cell of the area holds of the table, and the tests of this module that the README's row names
     cells = (MODELS.parents[1] / "test" / "python" / "linear_attention" / "frost" / "test_model_sample_qwen_dense.py").read_text(encoding="utf-8")
     cell = cells.split("def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(", 1)[1].split("@pytest.mark.L1", 1)[0]
@@ -1864,7 +1945,8 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     _says("area", "and the rows' mean time per step sums to the mean GPU busy |")
     _says("area", "the GPU side on constructed launch records (GPU busy as the union of a step's intervals with an overlapped stretch counted once,")
     _says("area", "the step taken apart and the rule for printing launch overhead as a term, tracing's stretch, the rows of the per-kernel table by the")
-    _says("area", "place in the wiring on stated sites and on the family's own plan, blocks on fallback or host entries that share a row,")
+    _says("area", "place in the wiring on stated sites and on the family's own plans of `native` and `fe-entries`, the rows of the blocks a library")
+    _says("area", "serves and of what a block launches beside its kernel, blocks on fallback or host entries that share a row,")
     _says(
         "area", "the rows against GPU busy, a record without a row, whole-microsecond stamps, the launch records of `--dump-census` with their start and end);"
     )
@@ -2449,7 +2531,7 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
         "other processes not observed",
         "clocks not observed",
     ]
-    sites, claim = _native(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
+    sites, claim = _planned(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
     form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
     form["memory"].update(weights_gib=37.3, state_gib=0.5, peak_reserved_gib=40.0)

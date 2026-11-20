@@ -125,7 +125,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
     the device time of a kernel come from kernel activity records of a traced request at the same positions, behind
     the last timed request. The two are never taken from one pass, and a report says which is which. A row of the
     per-kernel table is found by its place in the wiring, never by a kernel's name, and a traced pass whose kernel
-    check does not hold prints no table.
+    check does not hold prints no table. The row of a block a library serves names the library's entry, as the plan
+    does, never the block alone and never a fallback; what a block launches beside a kernel of its own is the row of
+    its place in the wiring and says so.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands

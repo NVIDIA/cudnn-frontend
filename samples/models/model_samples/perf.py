@@ -35,8 +35,11 @@ loop's own host time is its launch overhead (``step_split``), printed as a term 
 larger than GPU busy, which is taken under the profiler and is an upper bound.  The per-kernel table (``kernel_table``)
 gives every row the time its launches add to the GPU's timeline (``added_ms``): a row is a block, found by its place in
 the wiring by the kernel check's own walk (``census.Row``), and the blocks on fallback rows that no exact kernel
-separates are one row.  The added times of a step partition the union, so the rows sum to GPU busy.  A step launched
-from Python says so over its table: a kernel's time there is not its time inside a captured sequence.
+separates are one row.  A row says what serves it (``_row_kind``): the row of a block a library serves carries the
+library's entry as the plan names it and holds the launches of the library's kernel; what a block's call launches
+beside a kernel of its own is the row of its place in the wiring and is named so.  The added times of a step
+partition the union, so the rows sum to GPU busy.  A step launched from Python says so over its table: a kernel's
+time there is not its time inside a captured sequence.
 
 **What a run may call itself** (``record_class``).  A run is a ``controlled`` run only when it observed every condition
 itself -- a checkpoint, every block on a claimed target kernel, a captured launch sequence, the three statements of its
@@ -79,6 +82,12 @@ NOT_THE_PLAN = "the kernels of the traced steps are not the plan's"
 LABEL = 58  # of the per-kernel table: the widest name of a row
 #: what the per-kernel table of a step launched from Python says of itself
 FROM_PYTHON = "launched from Python: not the time of a kernel inside a captured sequence"
+#: who compiled an exact kernel that is no library's, in the words of a census entry (``census.Kernel.origin``): an entry
+#: of cuDNN Frontend, an operator of PyTorch.  An exact kernel of any other origin is a library's, which the plan calls
+#: through an entry of that library
+OWN_ORIGINS = ("cuDNN FE", "PyTorch")
+#: the kinds of a row of the per-kernel table whose launches are one kernel each: a time per launch is printed for them
+ONE_KERNEL = ("exact", "library", "read")
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
 DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
@@ -374,16 +383,39 @@ def time_resolution_us(steps: Sequence[Sequence[census.Launch]]) -> Optional[flo
     return 10.0 ** -max(0, *places) if places else None
 
 
-def _row_label(row: census.Row, relations: Sequence[str]) -> str:
-    """The name of a row of the per-kernel table: its block; for the blocks of a wiring gap their names, with ``(one row)``
-    where they are several, behind what the row is -- ``not yet:`` where the census of the target kernel set says so
-    of one of its block calls (``relations``: the identities of the row's calls), ``fallback:`` where no identity is
-    stated, ``host path:`` for host blocks alone."""
+def _row_kind(row: census.Row, sites: Sequence[census.Site]) -> Tuple[str, str]:
+    """``(kind, entry)`` of a row of the walk in the per-kernel table, decided from the census entries the plan's rows
+    declare for the row's block calls and never from a kernel's name.  The kind is the row's relation, with two
+    exceptions.  ``library``: an exact row whose block calls one entry serves and whose exact kernels are a library's
+    (``OWN_ORIGINS``); ``entry`` is then that entry as the plan names it, and the row holds the launches of the
+    library's kernel, which the walk finds like every exact kernel.  ``beside``: a row of a wiring gap in which every
+    block call that declares a fallback family also has an exact kernel of its own -- its records are what those
+    calls launch beside their kernels, and no block of the row is on a fallback entry."""
+    calls = [sites[index] for index in row.sites]
+    if row.relation == "exact":
+        origins = {kernel.origin for site in calls for kernel in site.kernels if kernel.relation == "exact"}
+        entries = {site.entry for site in calls}
+        return ("library", next(iter(entries))) if len(entries) == 1 and not origins & set(OWN_ORIGINS) else ("exact", "")
+    chains = [site for site in calls if any(kernel.relation == "fallback" for kernel in site.kernels)]
+    if chains and all(any(kernel.relation == "exact" for kernel in site.kernels) for site in chains):
+        return "beside", ""
+    return row.relation, ""
+
+
+def _row_label(row: census.Row, relations: Sequence[str], kind: str = "", entry: str = "") -> str:
+    """The name of a row of the per-kernel table: its block -- behind the entry that serves it, as the plan names it,
+    where that is a library's (``kind`` and ``entry`` of ``_row_kind``); for the blocks of a wiring gap their names,
+    with ``(one row)`` where they are several, behind what the row is -- ``beside its kernel:`` for what block calls
+    launch beside kernels of their own, ``not yet:`` where the census of the target kernel set says so of one of its
+    block calls (``relations``: the identities of the row's calls), ``fallback:`` where no identity is stated,
+    ``host path:`` for host blocks alone."""
     if row.relation == "read":
         return "host read"
     if row.relation == "exact":
-        return (row.blocks[0] + (" (declared stand-in)" if census.STAND_IN in relations else ""))[:LABEL]
-    prefix = "host path: " if row.relation == "host" else ("not yet: " if census.NOT_YET in relations else "fallback: ")
+        served = f"{entry}: " if kind == "library" else ""
+        return (served + row.blocks[0] + (" (declared stand-in)" if census.STAND_IN in relations else ""))[:LABEL]
+    prefix = "not yet: " if census.NOT_YET in relations else "fallback: "
+    prefix = "host path: " if row.relation == "host" else ("beside its kernel: " if kind == "beside" else prefix)
     names = " + ".join(row.blocks) + (" (one row)" if len(row.blocks) > 1 else "")
     if len(prefix + names) > LABEL:
         names = f"{row.blocks[0]} + {len(row.blocks) - 1} more (one row)"
@@ -425,12 +457,12 @@ def kernel_table(traced: Optional[census.Traced], busy: Sequence[float], unobser
             calls = [index for index in row.sites if sites[index].block == name]
             identity = "; ".join(dict.fromkeys(identities[index].text() for index in calls if identities[index] is not None))
             blocks.append({"block": name, "calls_per_step": len(calls), "entry": sites[calls[0]].entry, "identity": identity or None})
-        exact = row.relation == "exact"
+        exact, (kind, entry) = row.relation == "exact", _row_kind(row, sites)
         shapes = Counter((r.name, r.grid, r.block, r.shared_memory) for r, at in zip(steps[0], traced.result.attributed[0]) if exact and at == number)
         made.append(
             {
-                "label": _row_label(row, [identities[index].relation for index in row.sites if identities[index] is not None]),
-                "relation": row.relation,
+                "label": _row_label(row, [identities[index].relation for index in row.sites if identities[index] is not None], kind, entry),
+                "relation": kind,
                 "blocks": blocks,
                 "launches_per_step": median([k + c for k, c in zip(kernels[number], copied[number])]),
                 "planned_launches_per_step": sum(k.launches for index in row.sites for k in sites[index].kernels if k.relation == "exact") if exact else None,
@@ -658,8 +690,9 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
 def _kernel_lines(table: dict, prefix: str) -> List[str]:
     """The per-kernel table of the screen, from the file's ``per_kernel`` section: per row its launches of a step, the time
     a launch adds to the GPU's timeline, the row's time per step and its share of GPU busy; or the one line that says
-    why there is no table.  ``us/launch`` is not printed for a row of fallback or host blocks (a chain of many
-    kernels), nor at all where the profiler's stamps are whole microseconds."""
+    why there is no table.  ``us/launch`` is printed for a row whose launches are one kernel each (``ONE_KERNEL``), not
+    for a row of fallback or host blocks or of launches beside a kernel (chains of many kernels), nor at all where
+    the profiler's stamps are whole microseconds."""
     if table["rows"] is None:
         return _wrapped("per kernel, per step", f"not printed: {table['reason']}")
     fine = table["us_per_launch_printed"]
@@ -668,7 +701,7 @@ def _kernel_lines(table: dict, prefix: str) -> List[str]:
     lines = [f"{f'per kernel, per step ({prefix}traced request)':<{LABEL + 2}}{columns}", f"  {table['launch_path_note']}", f"  us/launch {each}"]
     for row in table["rows"]:
         count, each = row["launches_per_step"], "--"
-        if row["relation"] in ("exact", "read") and row["us_per_launch_added"] is not None:
+        if row["relation"] in ONE_KERNEL and row["us_per_launch_added"] is not None:
             each = f"{row['us_per_launch_added']:.2f}"
         launches = f"{count:,.0f}" if float(count).is_integer() else f"{count:,.1f}"
         share = "--" if row["share_percent"] is None else f"{row['share_percent']:.1f} %"
